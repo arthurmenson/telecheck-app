@@ -264,16 +264,40 @@ CREATE POLICY audit_tenant_isolation ON audit_records
     USING (tenant_id = current_tenant_id())
     WITH CHECK (tenant_id = current_tenant_id());
 
--- Break-glass policy (I-024): permits read access across tenants ONLY when
--- the session has been opened via set_break_glass_context(). That function
--- records the break-glass audit record before allowing the cross-tenant
--- read, so this policy cannot fire silently. Writes are NOT permitted even
--- under break-glass — break-glass is a read-only investigative posture per
--- I-024; cross-tenant writes require a different escalation path.
-CREATE POLICY audit_break_glass_read ON audit_records
-    AS PERMISSIVE
-    FOR SELECT
-    USING (current_setting('app.break_glass_active', true) = 'true');
+-- ---------------------------------------------------------------------------
+-- Break-glass cross-tenant audit access — DEFERRED to a later migration
+-- ---------------------------------------------------------------------------
+-- (Removed v0.3 patch 2026-05-02 per Codex foundation-verify-r2 CRITICAL-2
+--  finding: the prior `audit_break_glass_read` policy gated on
+--  `current_setting('app.break_glass_active', true) = 'true'` — a settable
+--  boolean GUC that any SQL-capable session could assert with a direct
+--  `SET app.break_glass_active = true` to bypass the audited helper path.
+--  In addition, `set_break_glass_context()` in migration 003 never set
+--  this GUC, so the documented audited path did not actually enable the
+--  policy either way.
+--
+--  Cross-tenant break-glass audit reads (per I-024) require:
+--    1. A non-spoofable session-tracking table (e.g., `break_glass_sessions`)
+--       written ONLY by `set_break_glass_context()` (REVOKE all from PUBLIC)
+--       and read by an RLS USING expression that joins against this table
+--       on a session_id verified against the durable audit record paired
+--       to it.
+--    2. A SECURITY DEFINER `is_break_glass_session_valid(session_id)`
+--       function that bypasses RLS to verify the session against the
+--       durable state — running under FORCE ROW LEVEL SECURITY this
+--       requires careful function-owner privilege design.
+--    3. Tests proving (a) the audited helper path enables the policy AND
+--       (b) direct GUC manipulation does NOT enable the policy.
+--
+--  This pattern is the responsibility of the Admin Backend slice (per
+--  EHBG §10 build sequence; Admin Backend Slice PRD v1.1) where break-
+--  glass operator UI and Privacy Officer review workflow live. Until
+--  that slice lands, audit reads are STRICTLY tenant-scoped — there
+--  is no cross-tenant audit retrieval path. This is the safer default
+--  and matches how break-glass actually works at v1.0: an authorized
+--  human exports redacted data via a vetted operational process, not
+--  via a database query.)
+-- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
 -- APPEND-ONLY ENFORCEMENT — I-003

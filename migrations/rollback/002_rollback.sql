@@ -12,6 +12,10 @@
 -- =============================================================================
 
 -- Drop RLS policies first (they reference the table).
+-- Note: `audit_break_glass_read` was REMOVED in the v0.3 patch (Codex
+-- foundation-verify-r2 CRITICAL-2 finding); the DROP IF EXISTS below is
+-- preserved as a no-op so this rollback works against either schema
+-- version (with or without the now-removed break-glass policy).
 DROP POLICY IF EXISTS audit_break_glass_read   ON audit_records;
 DROP POLICY IF EXISTS audit_tenant_isolation   ON audit_records;
 

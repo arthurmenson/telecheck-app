@@ -529,8 +529,14 @@ export async function emitAudit(
     input.target_patient_id,
   );
 
-  // Build the envelope without hash_chain first (needed for record_hash)
-  const auditId = `aud_${Date.now()}`; // STUB: replace with ULID when ulid lib is added
+  // Build the envelope without hash_chain first (needed for record_hash).
+  // audit_id is a UUID v4 to match the audit_records.audit_id UUID column type.
+  // (Patch v0.3 — 2026-05-02 per Codex foundation-verify-r2 CRITICAL-1 finding:
+  //  the prior `aud_${Date.now()}` placeholder violated the DB column type and
+  //  would have aborted every production INSERT with invalid UUID syntax.
+  //  When a ULID library is added, this can be swapped to a ULID string AND
+  //  the migration 002 column type changed to TEXT — both must change together.)
+  const auditId = crypto.randomUUID();
   const partialEnvelope: Omit<AuditEnvelope, 'hash_chain'> = {
     audit_id: auditId,
     ...input,
