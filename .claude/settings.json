@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(npm:*)",
+      "Bash(npx:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git push:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git restore:*)",
+      "Bash(git stash:*)",
+      "Bash(git rebase:*)",
+      "Bash(git merge:*)",
+      "Bash(node:*)",
+      "Bash(tsx:*)",
+      "Bash(prisma:*)",
+      "Bash(jq:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(find:*)",
+      "Bash(echo:*)",
+      "Bash(pwd)",
+      "Bash(which:*)",
+      "Bash(env)",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep"
+    ],
+    "ask": [
+      "Edit(migrations/**)",
+      "Write(migrations/**)",
+      "Bash(npm run migrate:*)",
+      "Bash(prisma migrate*)",
+      "Bash(prisma db push:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(rm:*)"
+    ],
+    "deny": [
+      "Edit(**/audit_records/**)",
+      "Write(**/audit_records/**)",
+      "Edit(**/audit/append_only/**)",
+      "Write(**/audit/append_only/**)",
+      "Bash(*DELETE FROM audit*)",
+      "Bash(*UPDATE audit_records*)",
+      "Bash(*TRUNCATE*audit*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "description": "Pre-commit lint + typecheck. Stdin: {hook_event_name, tool_name, tool_input:{command,description?}}. Fires only when the bash command starts with 'git commit'.",
+            "command": "CMD=$(jq -r '.tool_input.command // \"\"'); case \"$CMD\" in \"git commit\"*) (cd \"$CLAUDE_PROJECT_DIR\" && npm run lint && npm run typecheck) 1>&2 || { echo '{\"decision\":\"block\",\"reason\":\"pre-commit lint/typecheck failed; fix before committing\"}'; exit 0; } ;; *) ;; esac"
+          },
+          {
+            "type": "command",
+            "description": "Warn before bash commands that touch protected paths (migrations/, tests/invariants/, audit/). Stdin same as above.",
+            "command": "CMD=$(jq -r '.tool_input.command // \"\"'); case \"$CMD\" in *migrations/*|*tests/invariants/*|*audit_records*) echo '{\"systemMessage\":\"PROTECTED PATH: command touches migrations/, tests/invariants/, or audit_records. RLS policies + audit append-only invariants apply (I-003, I-023, I-027). Confirm you have spec citation before continuing.\"}' ;; *) ;; esac"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "description": "Secret scanner. Stdin: {hook_event_name, tool_name, tool_input:{file_path, content?|new_string?}}. Scans for common API key shapes and blocks the write if found.",
+            "command": "PAYLOAD=$(jq -r '[.tool_input.content // \"\", .tool_input.new_string // \"\"] | join(\"\\n\")'); MATCH=$(printf '%s' \"$PAYLOAD\" | grep -E -i -o '(sk-(ant|live|test)-[A-Za-z0-9_-]{20,}|aws_secret_access_key\\s*=\\s*[A-Za-z0-9/+=]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|ghp_[A-Za-z0-9]{30,}|ghs_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{50,}|-----BEGIN (RSA |OPENSSH |EC |DSA |PGP )?PRIVATE KEY-----|postgres(ql)?:\\/\\/[^\\s:]+:[^\\s@]+@)' | head -1); if [ -n \"$MATCH\" ]; then echo '{\"decision\":\"block\",\"reason\":\"Secret-shape detected in file content. Move to environment variable or secrets manager and reference via process.env.* — never commit credentials.\"}'; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "description": "Migration reminder. Stdin: {hook_event_name, tool_name, tool_input:{file_path,...}}. Fires only when path matches migrations/*.sql.",
+            "command": "FILE=$(jq -r '.tool_input.file_path // \"\"'); case \"$FILE\" in *migrations/*.sql|*migrations\\\\*.sql) echo '{\"systemMessage\":\"Migration touched. Run: npm run migrate:diff. If you created a tenant-scoped table, verify: (1) tenant_id TEXT NOT NULL REFERENCES tenants(id), (2) ENABLE + FORCE ROW LEVEL SECURITY, (3) tenant_isolation policy. See skill migration-with-rls. (I-023, I-027.)\"}' ;; *) ;; esac"
+          },
+          {
+            "type": "command",
+            "description": "Tenant-scoped table RLS check. Re-reads the migration file and warns if tenant_id is present without ENABLE ROW LEVEL SECURITY.",
+            "command": "FILE=$(jq -r '.tool_input.file_path // \"\"'); case \"$FILE\" in *migrations/*.sql|*migrations\\\\*.sql) if [ -f \"$FILE\" ]; then HAS_TID=$(grep -E -i 'tenant_id' \"$FILE\" | head -1); HAS_RLS=$(grep -E -i 'ENABLE\\s+ROW\\s+LEVEL\\s+SECURITY' \"$FILE\" | head -1); if [ -n \"$HAS_TID\" ] && [ -z \"$HAS_RLS\" ]; then echo '{\"systemMessage\":\"WARNING: migration declares tenant_id but no ENABLE ROW LEVEL SECURITY found. I-023 requires three-layer isolation. Add ALTER TABLE ... ENABLE ROW LEVEL SECURITY; ALTER TABLE ... FORCE ROW LEVEL SECURITY; CREATE POLICY tenant_isolation ... See skill migration-with-rls.\"}'; fi; fi ;; *) ;; esac"
+          },
+          {
+            "type": "command",
+            "description": "OpenAPI validate. Fires on Write/Edit to **/openapi*.{yaml,yml,json}.",
+            "command": "FILE=$(jq -r '.tool_input.file_path // \"\"'); case \"$FILE\" in *openapi*.yaml|*openapi*.yml|*openapi*.json) (cd \"$CLAUDE_PROJECT_DIR\" && npm run openapi:validate) 1>&2 || echo '{\"systemMessage\":\"openapi:validate failed or not yet wired. See package.json scripts.\"}' ;; *) ;; esac"
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "TELECHECK_SPEC_PATH": "../telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE"
+  }
+}

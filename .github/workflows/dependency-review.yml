@@ -1,0 +1,54 @@
+# Telecheck — dependency review on PRs.
+#
+# Runs GitHub's dependency-review-action against the diff. Fails the PR on:
+#   - High or critical severity vulnerabilities in added/updated dependencies
+#   - Dependencies under copyleft licenses incompatible with our proprietary license
+#
+# Allow/deny lists below are the starting position; tighten as legal review settles.
+# The license posture mirrors the proprietary stance in README.md and is consistent
+# with EHBG §9.6 (no secrets in code) and the closed-source build posture in ADR-022.
+
+name: Dependency Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write # required so the action can comment review summaries on the PR
+
+jobs:
+  dependency-review:
+    name: Dependency review (security + license)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          # Block PRs that introduce vulnerabilities at this severity or higher.
+          fail-on-severity: high
+
+          # Copyleft licenses incompatible with proprietary distribution.
+          # Engineering Lead + Legal review required to add an exception.
+          deny-licenses: >-
+            AGPL-1.0,
+            AGPL-1.0-only,
+            AGPL-1.0-or-later,
+            AGPL-3.0,
+            AGPL-3.0-only,
+            AGPL-3.0-or-later,
+            GPL-2.0,
+            GPL-2.0-only,
+            GPL-2.0-or-later,
+            GPL-3.0,
+            GPL-3.0-only,
+            GPL-3.0-or-later,
+            SSPL-1.0
+
+          # Comment the summary on the PR for reviewer visibility.
+          comment-summary-in-pr: on-failure

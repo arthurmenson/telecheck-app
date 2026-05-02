@@ -1,0 +1,63 @@
+# Dependabot config.
+#
+# Weekly cadence keeps noise manageable. Minor + patch updates grouped into a single PR per
+# ecosystem so reviewers see one bump-package PR per week, not 30. Major updates remain
+# individual PRs (intentional — majors carry breaking changes and deserve dedicated review).
+#
+# Reviewer is currently a single name (@arthurmenson) — once @telecheck/engineering-leads
+# team exists in GitHub, swap to that team handle so coverage doesn't depend on one person.
+
+version: 2
+
+updates:
+  # npm — application dependencies.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "arthurmenson"
+    labels:
+      - "dependencies"
+      - "npm"
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+      include: "scope"
+    groups:
+      # One PR per week for non-breaking updates across the dep tree.
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions — keep workflow action versions current.
+  # CI workflows pin by major version (@v4); dependabot will propose minor/patch bumps and
+  # flag majors when they land.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 3
+    reviewers:
+      - "arthurmenson"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"

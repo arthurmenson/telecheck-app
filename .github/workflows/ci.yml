@@ -1,0 +1,114 @@
+# Telecheck — main CI workflow
+#
+# Per Engineering Handoff Build Guide v1.3 §9.4 (CI/CD per ADR-022) and §11 hard rules.
+# Gate sequence: format -> lint -> typecheck -> test (with Postgres) -> coverage upload -> openapi:validate.
+#
+# Postgres service container is required because integration tests run against a real Postgres
+# with RLS policies enabled (per tests/README.md and ADR-023).
+#
+# Action versions: pinned by major version. Bump deliberately in a dedicated PR.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same PR to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege token. Bump only if a step requires write access (e.g. coverage comment bot).
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build, lint, typecheck, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: telecheck_ci
+          POSTGRES_PASSWORD: telecheck_ci
+          POSTGRES_DB: telecheck_test
+        ports:
+          - 5432:5432
+        # Health check ensures Postgres is ready before vitest connects.
+        options: >-
+          --health-cmd "pg_isready -U telecheck_ci -d telecheck_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # Integration test DSN — points at the service container above.
+      # Per tests/README.md: ephemeral DB seeded with two tenants (Telecheck-US, Telecheck-Ghana)
+      # for cross-tenant access tests.
+      TEST_DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_test
+      # Force CI mode in tooling (e.g., disables interactive prompts in any future setup script).
+      CI: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Format check before lint — prettier failures are usually quick fixes;
+      # surfacing them first reduces churn on the PR.
+      - name: Format check (prettier)
+        run: npm run format:check
+
+      - name: Lint (eslint, --max-warnings 0)
+        run: npm run lint
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      # Tests run against the Postgres service container.
+      # vitest setup applies migrations + seeds two tenants per tests/README.md.
+      - name: Test (vitest)
+        run: npm run test
+
+      # Coverage report retained as artifact for reviewer inspection.
+      # Eventually feeds a coverage gate; for now upload-only.
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_id }}
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # OpenAPI validation currently a TODO in package.json (echoes a stub).
+      # continue-on-error: true is intentional during bootstrap — once the OpenAPI source
+      # is wired (swagger-cli validate against ../telecheckONE OpenAPI v0.2), flip this to
+      # continue-on-error: false (or remove the line) so the gate hardens.
+      - name: OpenAPI validate (soft gate during bootstrap)
+        continue-on-error: true
+        run: npm run openapi:validate
+
+# --- Secrets / deployment gap ---
+# This workflow references no secrets. When deployment workflows are added (post-bootstrap):
+#   - AWS_ROLE_TO_ASSUME (OIDC; per ADR-022 cloud posture)
+#   - SENTRY_AUTH_TOKEN (release upload)
+#   - Per-tenant Secrets Manager ARNs are NOT set as Actions secrets — workloads read them
+#     at runtime via their attached IAM role per EHBG §9.6.
+# Deployment workflows (build -> staging -> manual approval -> prod) are explicitly out of
+# scope for this bootstrap workflow; see EHBG §9.4. Add a separate `deploy.yml` when the
+# first deployable slice ships.

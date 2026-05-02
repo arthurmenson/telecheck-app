@@ -1,0 +1,34 @@
+# Telecheck — CODEOWNERS
+#
+# Maps paths to reviewers required for PR approval. Lines further down win.
+# Team handles below (e.g. @telecheck/engineering-leads) are PLACEHOLDERS — the GitHub
+# org and teams have not been created yet. Engineering Lead must create these teams
+# before the first PR lands, or these paths will silently fall back to the default owner.
+#
+# Defaults
+*                                                                       @arthurmenson
+
+# Migrations require an Engineering Lead in addition to the default owner.
+# Per migrations/README.md: every migration is reviewed by Engineering Lead before merge.
+migrations/**                                                           @arthurmenson @telecheck/engineering-leads
+
+# Foundation security-critical libs. Touching tenant context, audit, error envelopes,
+# the I-029 / I-012 gates, or crisis detection requires Security review per the platform
+# invariants (I-003 audit append-only, I-019 crisis detection, I-023 tenant isolation,
+# I-025 error envelope, I-027 audit envelope tenant context, I-029 research export gate).
+src/lib/tenant-context.ts                                               @arthurmenson @telecheck/security
+src/lib/audit.ts                                                        @arthurmenson @telecheck/security
+src/lib/error-envelope.ts                                               @arthurmenson @telecheck/security
+src/lib/i029-gate.ts                                                    @arthurmenson @telecheck/security
+src/lib/i012-gate.ts                                                    @arthurmenson @telecheck/security
+src/lib/crisis-detection.ts                                             @arthurmenson @telecheck/security
+
+# Research module touches consent, DSAs, k-anonymity, signer chains.
+# Per ADR-028 + I-029 / I-030 / I-031 — privacy + clinical safety review required.
+src/modules/research/**                                                 @arthurmenson @telecheck/privacy @telecheck/clinical-safety
+
+# CI/CD and repo config — Engineering Lead only.
+.github/**                                                              @arthurmenson
+
+# CLAUDE.md is the project context Claude Code reads every session — drift here is high-cost.
+CLAUDE.md                                                               @arthurmenson

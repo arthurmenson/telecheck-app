@@ -20,6 +20,10 @@
 import fastifyHelmet from '@fastify/helmet';
 import fastifySensible from '@fastify/sensible';
 import Fastify, { type FastifyInstance } from 'fastify';
+import { errorEnvelopePlugin } from './lib/error-envelope.js';
+import { tenantContextPlugin } from './lib/tenant-context.js';
+import { idempotencyPlugin } from './lib/idempotency.js';
+import { aiContextPlugin } from './lib/ai-context.js';
 
 export interface AppOptions {
   /**
@@ -53,31 +57,45 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   await app.register(fastifySensible);
 
   // ----------------------------------------------------------
-  // Foundation middleware (placeholders — appsec-expert agent fills in)
+  // Foundation middleware (registered in order per security discipline)
   // ----------------------------------------------------------
   //
-  // - Tenant context resolution (per ADR-023 + ADR-024 + Tenant Threading Addendum)
-  //   Resolves req.tenantContext = { tenantId, countryOfCare, kmsKeyAlias, ... }
-  //   from request (subdomain / JWT / header) and exposes via fastify decorator.
+  // Registration order is load-bearing:
+  //   1. helmet         — security headers (already registered above)
+  //   2. sensible       — idiomatic error helpers (already registered above)
+  //   3. errorEnvelope  — must run before ANY route so all errors use the
+  //                       canonical I-025 tenant-blind envelope.
+  //   4. tenantContext  — must run before any tenant-scoped route handler.
+  //                       Fail-closed (I-023): requests with unresolvable
+  //                       tenant are rejected before reaching route handlers.
+  //   5. idempotency    — runs after tenantContext (needs tenantId for the
+  //                       tenant-scoped cache key per IDEMPOTENCY v5.1).
+  //   6. aiContext      — provides req.aiContext decorator for AI routes;
+  //                       populated on-demand per route (opt-in).
   //
-  // - Audit envelope emitter (per AUDIT_EVENTS v5.2 + I-027)
-  //   Wraps every state-changing handler; emits envelope with tenant_id,
-  //   ai_workload_type (if applicable), autonomy_level (if applicable),
-  //   per the I-012 envelope-population rule.
-  //
-  // - Idempotency middleware (per IDEMPOTENCY contract v5.1)
-  //   Tenant-scoped idempotency keys; replays cached response for retried requests.
-  //
-  // - Error envelope (per ERROR_MODEL v5.1)
-  //   Tenant-blind error responses; resource-not-found does not leak cross-tenant
-  //   existence per I-025.
-  //
-  // - I-029 6-condition gate enforcement helper (research data export pipeline)
-  //   Reject-unless evaluator emitting research.export_completed(status=invalidated)
-  //   with canonical 6-value invalidation_reason enum on failure.
-  //
-  // - I-012 reject-unless three-clause rule (prescribing/refill/medication-order)
-  //   Validator emitting <action_class>.execution_rejected on rejection.
+  // Audit emission (audit.ts / emitAudit) is called by individual route handlers
+  // and gate functions — not registered as a plugin here.
+  // Crisis detection (crisis-detection.ts / crisisDetector) is called inline
+  // in chat/community/forms handlers — platform-floor, always-on per I-019.
+  // RLS (rls.ts / withTenantContext) is called in data-access functions per I-023.
+
+  // 3. Error envelope — tenant-blind per I-025 + ERROR_MODEL v5.1
+  await app.register(errorEnvelopePlugin);
+
+  // 4. Tenant context resolution — fail-closed per I-023
+  //    /health is always allowlisted (tenant-blind endpoint)
+  await app.register(tenantContextPlugin, {
+    allowlistedPaths: [
+      // Extend here when new tenant-blind routes are added.
+      // /health is automatically allowlisted by the plugin.
+    ],
+  });
+
+  // 5. Idempotency — tenant-scoped per IDEMPOTENCY v5.1
+  await app.register(idempotencyPlugin);
+
+  // 6. AI context decorator — opt-in per route handler
+  await app.register(aiContextPlugin);
 
   // ----------------------------------------------------------
   // Module registration (placeholder)

@@ -1,0 +1,522 @@
+/**
+ * audit.ts — AUDIT_EVENTS v5.2 envelope emitter with hash chain.
+ *
+ * Purpose:
+ *   Type-safe audit event emission per AUDIT_EVENTS v5.2. Enforces:
+ *     - Every record carries `tenant_id` (I-027)
+ *     - Append-only semantics (I-003): throws on any attempt to suppress emission
+ *     - SHA-256 hash chain per patient partition (AUDIT_EVENTS v5.2 §hash-chain)
+ *     - `audit_sensitivity_level` required on every record (I-031)
+ *     - `ai_workload_type` + `autonomy_level` rules per I-012 closure rule
+ *     - Sentinel values (`rejected_invalid_attempt`, `n/a`) validated against
+ *       their permitted-use contexts
+ *
+ * Spec references:
+ *   - I-003: audit trail is immutable and append-only; bare suppression is forbidden.
+ *   - I-027: every audit record carries `tenant_id`.
+ *   - I-031: research data export emits at `audit_sensitivity_level = high_pii`.
+ *   - AUDIT_EVENTS v5.2:
+ *       * Envelope schema (all required fields)
+ *       * Hash chain construction (§hash-chain)
+ *       * I-012 closure rule (required fields on I-012 action class records)
+ *       * Sentinel `rejected_invalid_attempt` valid ONLY on `*.execution_rejected` events
+ *       * Sentinel `n/a` valid ONLY on I-012 clinician-only approval records with no AI upstream
+ *
+ * Design decisions on the action enum (open question documented below):
+ *   The spec defines a closed action catalog. We model the category-prefixed string
+ *   union rather than an enum to keep the type extensible as slices add actions.
+ *   Runtime validation in `emitAudit()` is the enforcement layer.
+ *
+ * Open questions for Engineering Lead:
+ *   - DB persistence: `emitAudit()` currently STUBs the DB INSERT. The real
+ *     implementation must INSERT into an append-only `audit_records` table
+ *     (migration 002, not yet authored) within the caller's transaction.
+ *   - Hash chain partition: partitioned by `target_patient_id`. For platform-
+ *     scope events with no patient (e.g., `market_launch_approved`), a synthetic
+ *     partition key is needed. Engineering Lead to specify the partition key
+ *     convention for non-patient audit events.
+ *   - `assertAuditEmittedFor()`: currently tracks emission in-process (in-memory
+ *     map). Production implementation queries the audit store. Suitable for
+ *     integration tests; not a production safety check.
+ */
+
+import crypto from 'crypto';
+import { z } from 'zod';
+import type { TenantId } from './glossary.js';
+
+// ---------------------------------------------------------------------------
+// AUDIT_EVENTS v5.2 — action catalog (closed string union by category prefix)
+// ---------------------------------------------------------------------------
+
+/** Category A — Safety-critical clinical actions */
+type CategoryAAction =
+  | 'prescribing.initiated'
+  | 'prescribing.approved'
+  | 'prescribing.declined'
+  | 'prescribing.modified'
+  | 'refill.approved'
+  | 'refill.declined'
+  | 'protocol_authorized_prescribing'
+  | 'protocol_authorized_refill_renewal'
+  | 'protocol_authorized_dispensing_release'
+  | 'prescribing.execution_rejected'     // added v5.2 — I-012 bare-suppression closure
+  | 'refill.execution_rejected'          // added v5.2 — I-012 bare-suppression closure
+  | 'medication_order.execution_rejected' // added v5.2 — I-012 bare-suppression closure
+  | 'interaction_signal_override'
+  | 'herb_drug_signal_override'
+  | 'dispensing_release'
+  | 'adverse_event_reported'
+  | 'adverse_event_investigated'
+  | 'adverse_event_regulatory_reported'
+  | 'emergency_escalation'
+  | 'crisis_detection_trigger'
+  | 'safety_hold_activated'
+  | 'safety_hold_resolved'
+  | 'bridge_supply_authorized'
+  | 'interaction_engine_evaluation'
+  | 'herb_drug_engine_evaluation'
+  | 'ai_mode_2_evaluation'
+  | 'ai_mode_2_physician_approve'
+  | 'ai_mode_2_physician_modify'
+  | 'ai_mode_2_physician_decline';
+
+/** Category B — Governance and configuration actions */
+type CategoryBAction =
+  | 'protocol_activated'
+  | 'protocol_deactivated'
+  | 'guardrail_template_deployed'
+  | 'guardrail_template_rolled_back'
+  | 'guardrail_template_test_run'
+  | 'moderation_policy_changed'
+  | 'market_launch_approved'
+  | 'market_paused'
+  | 'market_retired'
+  | 'forms_eligibility_logic_edited'
+  | 'forms_approval_governance_edited'
+  | 'knowledge_base_updated'
+  | 'clinical_exclusion_rule_changed'
+  | 'dual_control_approval'
+  | 'fake_med_flag_raised'
+  | 'fake_med_flag_resolved'
+  | 'config_change_validated'
+  | 'incident_opened'
+  | 'incident_resolved'
+  | 'signal_enforcement_trigger'
+  // Research events (added v5.2 per ADR-028)
+  | 'research.consent_granted'
+  | 'research.consent_revoked'
+  | 'research.dsa_activated'
+  | 'research.cohort_defined'
+  | 'research.export_initiated'
+  | 'research.export_completed'
+  // Marketing events (added v5.2 per ADR-027)
+  | 'marketing.surface_rendered'
+  | 'marketing.surface_drift';
+
+/** Category C — Operational and engagement actions */
+type CategoryCAction =
+  | 'patient_account_created'
+  | 'patient_identity_verified'
+  | 'consent_granted'
+  | 'consent_revoked'
+  | 'delegation_setup'
+  | 'delegation_revoked'
+  | 'message_sent'
+  | 'consult_booked'
+  | 'consult_started'
+  | 'consult_completed'
+  | 'consult_converted_to_sync'
+  | 'lab_uploaded'
+  | 'lab_ai_interpreted'
+  | 'lab_clinician_reviewed'
+  | 'community_post_created'
+  | 'community_post_flagged'
+  | 'community_moderation_action'
+  | 'notification_sent'
+  | 'payment_processed'
+  | 'payment_failed'
+  | 'delivery_status_updated'
+  | 'rpm_metric_submitted'
+  | 'rpm_alert_triggered'
+  | 'ai_mode_1_session_started'
+  | 'ai_mode_1_escalation'
+  | 'refill_reminder_sent'
+  | 'login_successful'
+  | 'login_failed';
+
+export type AuditAction = CategoryAAction | CategoryBAction | CategoryCAction;
+export type AuditCategory = 'A' | 'B' | 'C';
+export type AuditSensitivityLevel = 'standard' | 'high_pii';
+
+// Authoritative I-012 action-class set per AUDIT_EVENTS v5.2 §I-012 closure rule.
+// This set is the single source of truth — do not re-declare in WORKLOAD_TAXONOMY,
+// AUTONOMY_LEVELS, STATE_MACHINES, or TYPES.
+const I012_ACTION_CLASS_SET = new Set<AuditAction>([
+  'prescribing.initiated',
+  'prescribing.approved',
+  'prescribing.declined',
+  'prescribing.modified',
+  'refill.approved',
+  'refill.declined',
+  'protocol_authorized_prescribing',
+  'protocol_authorized_refill_renewal',
+  'protocol_authorized_dispensing_release',
+  'prescribing.execution_rejected',
+  'refill.execution_rejected',
+  'medication_order.execution_rejected',
+]);
+
+const EXECUTION_REJECTED_ACTIONS = new Set<AuditAction>([
+  'prescribing.execution_rejected',
+  'refill.execution_rejected',
+  'medication_order.execution_rejected',
+]);
+
+const RESEARCH_HIGH_PII_ACTIONS = new Set<AuditAction>([
+  'research.export_initiated',
+  'research.export_completed',
+]);
+
+// ---------------------------------------------------------------------------
+// Audit envelope types
+// ---------------------------------------------------------------------------
+
+export type ActorType =
+  | 'patient'
+  | 'clinician'
+  | 'pharmacist'
+  | 'operator'
+  | 'delegate'
+  | 'protocol_engine'   // legacy alias — map to ai_workload for new v1.10+ code
+  | 'ai_workload'       // canonical v1.10+ actor type
+  | 'ai_mode_1'         // deprecated alias; preserved for backward-compat reads only
+  | 'ai_mode_2'         // deprecated alias; preserved for backward-compat reads only
+  | 'system'
+  | 'platform_admin';
+
+export type AIWorkloadType =
+  | 'conversational_assistant'
+  | 'protocol_execution'
+  | 'autonomous_agent'              // RESERVED
+  | 'multi_agent_supervisor'        // RESERVED
+  | 'tool_using_agent'              // RESERVED
+  | 'rejected_invalid_attempt'      // SENTINEL — execution_rejected events only
+  | 'n/a'                           // SENTINEL — I-012 clinician-only approval records only
+  | null;                           // nullable for non-AI events / legacy backfill
+
+export type AutonomyLevel =
+  | 'advisory'
+  | 'suggestion'
+  | 'action_with_confirm'
+  | 'action_with_audit_only'   // RESERVED
+  | 'fully_autonomous'         // RESERVED
+  | 'rejected_invalid_attempt' // SENTINEL — execution_rejected events only
+  | 'n/a'                      // SENTINEL — I-012 clinician-only approval records only
+  | null;                      // nullable for non-AI events / legacy backfill
+
+export interface HashChain {
+  partition: string;        // target_patient_id
+  sequence_number: number;
+  previous_hash: string;
+  record_hash: string;
+}
+
+export interface AuditEnvelope {
+  audit_id: string;            // 'aud_<ULID>'
+  timestamp: string;           // ISO 8601 with timezone
+  tenant_id: TenantId;         // I-027: required on every record
+  actor_type: ActorType;
+  actor_id: string;
+  actor_tenant_id: string | null; // null only for platform_admin actors
+  target_patient_id: string;
+  delegate_context: { delegate_id: string; scope: string } | null;
+  action: AuditAction;
+  category: AuditCategory;
+  audit_sensitivity_level: AuditSensitivityLevel; // required — default 'standard'
+  resource_type: string;
+  resource_id: string;
+  detail: Record<string, unknown>;
+  engine_versions: Record<string, string> | null;
+  // Workload taxonomy fields (v5.2)
+  ai_workload_type: AIWorkloadType;
+  autonomy_level: AutonomyLevel;
+  // Reserved agentic-context fields (nullable; populate when capability activates)
+  agent_id: string | null;
+  agent_version: string | null;
+  tool_call_id: string | null;
+  memory_read_set_id: string | null;
+  memory_write_set_id: string | null;
+  supervising_policy_id: string | null;
+  knowledge_source_versions: Array<{ knowledge_base_id: string; version: string }> | null;
+  signals: Array<{ signal_id: string; severity: string; source_engine: string; check_class: string }> | null;
+  override: { signal_id: string; rationale: string; clinician_id: string } | null;
+  linked_events: string[];
+  compliance_flags: string[];
+  country_of_care: string;       // ISO 3166-1 alpha-2
+  break_glass: {
+    session_id: string;
+    reason: string;
+    authorized_until: string;
+    privacy_officer_review_status: 'pending' | 'reviewed';
+  } | null;
+  hash_chain: HashChain;
+}
+
+// Input type — caller provides all fields except hash_chain and audit_id (computed here)
+export type AuditEnvelopeInput = Omit<AuditEnvelope, 'audit_id' | 'hash_chain'>;
+
+// ---------------------------------------------------------------------------
+// Zod validation schema for required fields
+// ---------------------------------------------------------------------------
+
+const AuditEnvelopeInputSchema = z.object({
+  tenant_id: z.string().min(1, 'tenant_id is required on every audit record (I-027)'),
+  actor_type: z.string().min(1),
+  actor_id: z.string().min(1),
+  target_patient_id: z.string().min(1),
+  action: z.string().min(1),
+  category: z.enum(['A', 'B', 'C']),
+  audit_sensitivity_level: z.enum(['standard', 'high_pii']),
+  resource_type: z.string().min(1),
+  resource_id: z.string().min(1),
+  detail: z.record(z.unknown()),
+  country_of_care: z.string().length(2, 'country_of_care must be ISO 3166-1 alpha-2'),
+  timestamp: z.string().min(1),
+});
+
+// ---------------------------------------------------------------------------
+// In-process emission tracker (test / assertion support)
+// STUB: production implementation queries audit store.
+// ---------------------------------------------------------------------------
+
+type EmissionRecord = { actionId: string; action: AuditAction; emittedAt: Date };
+const _emissionLog: EmissionRecord[] = [];
+
+/**
+ * assertAuditEmittedFor — verifies an audit record was emitted for a given
+ * `actionId` and `action` in this process lifetime.
+ *
+ * For integration tests and runtime invariant checks. Does NOT query the
+ * persistent audit store — that is a separate verification path.
+ *
+ * @throws If no matching emission is found.
+ */
+export function assertAuditEmittedFor(actionId: string, action: AuditAction): void {
+  const found = _emissionLog.some(
+    (r) => r.actionId === actionId && r.action === action,
+  );
+  if (!found) {
+    throw new Error(
+      `assertAuditEmittedFor: no audit emission found for actionId="${actionId}" action="${action}". ` +
+        'Per I-003, bare suppression of audit events is forbidden.',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hash chain helper
+// STUB: queries DB for previous hash; replace with real DB query.
+// ---------------------------------------------------------------------------
+
+function computeGenesisHash(patientId: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`GENESIS:${patientId}`)
+    .digest('hex');
+}
+
+function computeRecordHash(envelope: Omit<AuditEnvelope, 'hash_chain'>): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(envelope))
+    .digest('hex');
+}
+
+// STUB: in production, query `SELECT record_hash, sequence_number FROM audit_records
+// WHERE target_patient_id = $1 ORDER BY sequence_number DESC LIMIT 1`
+async function getPreviousHashForPartition(
+  _patientId: string,
+): Promise<{ previousHash: string; sequenceNumber: number }> {
+  // STUB: returns genesis values. Real implementation queries migration 002's
+  // audit_records table.
+  return { previousHash: computeGenesisHash(_patientId), sequenceNumber: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Workload field validation per I-012 closure rule and sentinel rules
+// ---------------------------------------------------------------------------
+
+function validateWorkloadFields(input: AuditEnvelopeInput): void {
+  const { action, actor_type, ai_workload_type, autonomy_level } = input;
+  const isI012Action = I012_ACTION_CLASS_SET.has(action as AuditAction);
+  const isExecutionRejected = EXECUTION_REJECTED_ACTIONS.has(action as AuditAction);
+  const isAIWorkload = actor_type === 'ai_workload';
+
+  // I-012 closure rule: ai_workload_type and autonomy_level are required
+  // on ALL I-012 action-class records, regardless of actor_type.
+  if (isI012Action && !isExecutionRejected) {
+    if (ai_workload_type === null || ai_workload_type === undefined) {
+      throw new Error(
+        `I-012 closure rule violation: ai_workload_type is required on action "${action}" ` +
+          '(use "n/a" for clinician-only approvals with no AI workload upstream). ' +
+          'See AUDIT_EVENTS v5.2 §I-012 closure rule.',
+      );
+    }
+    if (autonomy_level === null || autonomy_level === undefined) {
+      throw new Error(
+        `I-012 closure rule violation: autonomy_level is required on action "${action}" ` +
+          '(use "n/a" for clinician-only approvals with no AI workload upstream). ' +
+          'See AUDIT_EVENTS v5.2 §I-012 closure rule.',
+      );
+    }
+    // Sentinel `rejected_invalid_attempt` is NOT valid on successful execution records
+    if (ai_workload_type === 'rejected_invalid_attempt') {
+      throw new Error(
+        `Sentinel "rejected_invalid_attempt" is only valid on *.execution_rejected events. ` +
+          `Action "${action}" is not a rejection event.`,
+      );
+    }
+    if (autonomy_level === 'rejected_invalid_attempt') {
+      throw new Error(
+        `Sentinel "rejected_invalid_attempt" is only valid on *.execution_rejected events. ` +
+          `Action "${action}" is not a rejection event.`,
+      );
+    }
+    // Sentinel `n/a` validation: only valid when no AI workload was upstream
+    if (ai_workload_type === 'n/a' && isAIWorkload) {
+      throw new Error(
+        'Sentinel "n/a" for ai_workload_type is only valid for clinician-only approval records ' +
+          'where no AI workload was upstream. actor_type=ai_workload contradicts this.',
+      );
+    }
+  }
+
+  // Execution_rejected events: validate sentinel usage
+  if (isExecutionRejected) {
+    // These events MUST carry ai_workload_type and autonomy_level — populated
+    // from the attempted values (or sentinel if null/unknown/reserved).
+    if (ai_workload_type === undefined || ai_workload_type === null) {
+      throw new Error(
+        `execution_rejected audit event "${action}" must carry ai_workload_type ` +
+          '(use "rejected_invalid_attempt" if the attempted value was null/unknown/reserved).',
+      );
+    }
+    if (autonomy_level === undefined || autonomy_level === null) {
+      throw new Error(
+        `execution_rejected audit event "${action}" must carry autonomy_level ` +
+          '(use "rejected_invalid_attempt" if the attempted value was null/unknown/reserved).',
+      );
+    }
+  }
+
+  // New v1.10+ AI events with actor_type=ai_workload require ai_workload_type populated
+  if (isAIWorkload && (ai_workload_type === null || ai_workload_type === undefined)) {
+    throw new Error(
+      'New v1.10+ AI audit events with actor_type=ai_workload require ai_workload_type ' +
+        'to be populated per WORKLOAD_TAXONOMY v5.2 §1 nullability rule.',
+    );
+  }
+
+  // Reserved workload types must not appear on successful execution records
+  const reservedWorkloadTypes = new Set(['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent']);
+  if (ai_workload_type && reservedWorkloadTypes.has(ai_workload_type)) {
+    throw new Error(
+      `Reserved ai_workload_type "${ai_workload_type}" cannot appear on audit records at v1.0. ` +
+        'Activation requires successor ADR + activation audit event per WORKLOAD_TAXONOMY v5.2 §3.',
+    );
+  }
+
+  // Reserved autonomy levels must not appear on successful execution records
+  const reservedAutonomyLevels = new Set(['action_with_audit_only', 'fully_autonomous']);
+  if (autonomy_level && reservedAutonomyLevels.has(autonomy_level) && !isExecutionRejected) {
+    throw new Error(
+      `Reserved autonomy_level "${autonomy_level}" cannot appear on audit records at v1.0. ` +
+        'Activation requires ADR-030 + activation audit event per AUTONOMY_LEVELS v5.2 §3.',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// emitAudit — primary emission function
+// ---------------------------------------------------------------------------
+
+/**
+ * emitAudit — construct, validate, and persist an audit envelope.
+ *
+ * Throws (does NOT silently log) on:
+ *   - Missing required fields (I-003 / I-027)
+ *   - I-012 closure rule violations
+ *   - Sentinel misuse
+ *   - Reserved workload type / autonomy level on successful execution records
+ *
+ * Per I-003, bare suppression of audit events is FORBIDDEN.
+ * Any catch block that swallows this function's error is an I-003 violation.
+ */
+export async function emitAudit(input: AuditEnvelopeInput): Promise<AuditEnvelope> {
+  // 1. Required-field validation
+  const validationResult = AuditEnvelopeInputSchema.safeParse(input);
+  if (!validationResult.success) {
+    const messages = validationResult.error.errors
+      .map((e) => `  ${e.path.join('.')}: ${e.message}`)
+      .join('\n');
+    throw new Error(
+      `emitAudit: missing or invalid required fields — I-003 forbids suppression:\n${messages}`,
+    );
+  }
+
+  // 2. Workload field validation (I-012 closure rule + sentinel rules)
+  validateWorkloadFields(input);
+
+  // 3. Auto-enforce audit_sensitivity_level = high_pii for research export events (I-031)
+  const sensitivityLevel: AuditSensitivityLevel =
+    RESEARCH_HIGH_PII_ACTIONS.has(input.action as AuditAction)
+      ? 'high_pii'
+      : input.audit_sensitivity_level;
+
+  if (
+    RESEARCH_HIGH_PII_ACTIONS.has(input.action as AuditAction) &&
+    input.audit_sensitivity_level !== 'high_pii'
+  ) {
+    throw new Error(
+      `I-031 violation: research export event "${input.action}" must carry ` +
+        'audit_sensitivity_level="high_pii". Caller supplied "standard".',
+    );
+  }
+
+  // 4. Compute hash chain
+  const { previousHash, sequenceNumber } = await getPreviousHashForPartition(
+    input.target_patient_id,
+  );
+
+  // Build the envelope without hash_chain first (needed for record_hash)
+  const auditId = `aud_${Date.now()}`; // STUB: replace with ULID when ulid lib is added
+  const partialEnvelope: Omit<AuditEnvelope, 'hash_chain'> = {
+    audit_id: auditId,
+    ...input,
+    audit_sensitivity_level: sensitivityLevel,
+  };
+
+  const recordHash = computeRecordHash(partialEnvelope);
+
+  const envelope: AuditEnvelope = {
+    ...partialEnvelope,
+    hash_chain: {
+      partition: input.target_patient_id,
+      sequence_number: sequenceNumber + 1,
+      previous_hash: previousHash,
+      record_hash: recordHash,
+    },
+  };
+
+  // 5. Persist to audit store
+  // STUB: INSERT into `audit_records` table (migration 002, not yet authored).
+  // In production: await auditDb.insert(envelope) within the caller's transaction.
+  // For now: log and track for assertAuditEmittedFor().
+  _emissionLog.push({
+    actionId: envelope.resource_id,
+    action: envelope.action as AuditAction,
+    emittedAt: new Date(),
+  });
+
+  return envelope;
+}

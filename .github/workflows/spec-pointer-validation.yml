@@ -1,0 +1,105 @@
+# Telecheck — spec pointer validation
+#
+# Catches drift between this repo's CLAUDE.md "Canonical versions" claims and what the
+# spec corpus (arthurmenson/telecheckONE) actually carries. The spec is in a sibling repo
+# precisely so engineering can move independently — but if CLAUDE.md says "Master PRD v1.10"
+# and the spec has moved to v1.11 without this repo following, every Claude Code session
+# starts off mis-anchored.
+#
+# Trigger is narrow: only files that contain canonical-version pointers (CLAUDE.md, README.md,
+# package.json) — keeps this workflow cheap to add new canary checks to without slowing every PR.
+#
+# Strategy is grep-based: cheap, debuggable, no Node deps. Extend by adding canary patterns
+# below as new canonical artifacts land. Pattern: assert that the spec corpus contains the
+# expected version string AND that this repo doesn't reference an older version.
+
+name: Spec Pointer Validation
+
+on:
+  pull_request:
+    paths:
+      - "CLAUDE.md"
+      - "README.md"
+      - "package.json"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-pointers:
+    name: Verify canonical-version pointers match spec corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Soft gate during bootstrap. Flip to false (or remove this line) once the canary set is
+    # stabilized and the spec repo is reliably reachable from the runner.
+    continue-on-error: true
+
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+        with:
+          path: telecheck-app
+
+      # Spec corpus lives in a sibling repo. Public clone is fine for a public repo;
+      # if telecheckONE is made private, swap to actions/checkout@v4 with a PAT-bearing
+      # secret (SPEC_REPO_TOKEN) pointing at arthurmenson/telecheckONE.
+      - name: Clone spec corpus
+        run: |
+          git clone --depth 1 https://github.com/arthurmenson/telecheckONE.git telecheckONE
+          ls telecheckONE/"Telecheck Master Bundle FINAL US REGION BASELINE" | head -20
+
+      # Canary 1: Master PRD canonical version.
+      # The bundle should contain Telecheck_Master_Platform_PRD_v1_10.md and CLAUDE.md
+      # should reference v1.10 (not an older or newer version) as canonical.
+      - name: Canary — Master PRD v1.10
+        run: |
+          set -e
+          BUNDLE="telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE"
+          if [ ! -f "$BUNDLE/Telecheck_Master_Platform_PRD_v1_10.md" ]; then
+            echo "::error::Spec corpus missing Telecheck_Master_Platform_PRD_v1_10.md"
+            exit 1
+          fi
+          if ! grep -q "Master PRD \*\*v1\.10\*\*\|Master Platform PRD v1\.10\|Telecheck_Master_Platform_PRD_v1_10" telecheck-app/CLAUDE.md; then
+            echo "::error::CLAUDE.md does not reference Master PRD v1.10 — pointer drift"
+            exit 1
+          fi
+          echo "OK: Master PRD v1.10 canonical pointer matches"
+
+      # Canary 2: Artifact Registry canonical version.
+      - name: Canary — Artifact Registry v2.10
+        run: |
+          set -e
+          BUNDLE="telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE"
+          if [ ! -f "$BUNDLE/Telecheck_Artifact_Registry_v2_10.md" ]; then
+            echo "::error::Spec corpus missing Telecheck_Artifact_Registry_v2_10.md"
+            exit 1
+          fi
+          if ! grep -q "Artifact Registry \*\*v2\.10\*\*\|Artifact_Registry_v2_10" telecheck-app/CLAUDE.md; then
+            echo "::error::CLAUDE.md does not reference Artifact Registry v2.10 — pointer drift"
+            exit 1
+          fi
+          echo "OK: Artifact Registry v2.10 canonical pointer matches"
+
+      # Canary 3: Contracts Pack v5.2 in headers (post-v1.10 cycle).
+      # We check that at least one Contracts Pack file in the bundle declares v5.2 in its header
+      # and that CLAUDE.md mentions Contracts Pack v5.2.
+      - name: Canary — Contracts Pack v5.2 headers
+        run: |
+          set -e
+          BUNDLE="telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE"
+          if ! grep -l "v5\.2" "$BUNDLE"/Telecheck_Contracts_Pack_v5_00_*.md > /dev/null; then
+            echo "::error::No Contracts Pack file declares v5.2 in header — spec corpus older than expected"
+            exit 1
+          fi
+          if ! grep -q "Contracts Pack \*\*v5\.2\*\*\|Contracts Pack v5\.2" telecheck-app/CLAUDE.md; then
+            echo "::error::CLAUDE.md does not reference Contracts Pack v5.2 — pointer drift"
+            exit 1
+          fi
+          echo "OK: Contracts Pack v5.2 canonical pointer matches"
+
+      # --- How to extend ---
+      # When a new canonical artifact lands (e.g., Master PRD v1.11, Contracts Pack v5.3,
+      # ADR-030, DIC v1.2), add a new "Canary — <artifact>" step above following the pattern:
+      #   1. Assert the expected file exists in the spec bundle
+      #   2. Assert CLAUDE.md references the expected version string
+      # Once stabilized, remove `continue-on-error: true` so this workflow becomes a hard gate.

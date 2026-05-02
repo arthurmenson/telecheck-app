@@ -1,0 +1,15 @@
+# Issue template chooser config.
+#
+# blank_issues_enabled: false steers contributors into one of the structured templates.
+# Anyone with a use case that fits neither template should open a Spec Issue or contact
+# Engineering Lead directly — both routes preserve traceability.
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/arthurmenson/telecheck-app/security/advisories/new
+    about: Report a security vulnerability privately. Do NOT open a public issue. See SECURITY.md.
+  - name: Privacy / PHI exposure
+    url: https://github.com/arthurmenson/telecheck-app/blob/main/.github/SECURITY.md
+    about: Suspected PHI exposure routes via Privacy Officer per Master PRD v1.10 §22.
