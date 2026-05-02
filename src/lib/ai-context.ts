@@ -39,7 +39,7 @@
  *     for all routes? Current design: opt-in to avoid overhead on non-AI routes.
  */
 
-import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 import { config } from './config.js';
 

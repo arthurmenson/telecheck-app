@@ -53,7 +53,10 @@ export interface InvariantAssertionContext {
   auditRecord?: AuditRecord;
   query?: () => Promise<unknown[]>;
   errorEnvelope?: unknown;
-  crisisConfig?: Record<string, unknown>;
+  // Accepts any object shape — i019-crisis-detection.test.ts passes
+  // its own `CrisisDetectionConfig` interface here without an explicit
+  // index signature, so a structural object type is required.
+  crisisConfig?: object;
   i029Result?: I029GateResultStub;
   i012Result?: I012GateResultStub;
 }
@@ -187,7 +190,7 @@ export async function assertI012RejectUnless(ctx: InvariantAssertionContext): Pr
  * drives a more comprehensive check against the actual crisis-detection module.
  */
 export function assertI019CrisisDetection(ctx: InvariantAssertionContext): void {
-  const cfg = ctx.crisisConfig;
+  const cfg = ctx.crisisConfig as Record<string, unknown> | undefined;
   if (cfg === undefined) {
     // No config provided — trivially intact.
     return;

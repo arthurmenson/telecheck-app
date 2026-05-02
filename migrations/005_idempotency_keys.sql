@@ -10,8 +10,13 @@
 --          - ADR-023 (multi-tenancy Model A — same key in different tenants
 --            is independent per IDEMPOTENCY v5.1 §1)
 --          - CDM v1.2 conventions (tenant_id FK, RLS)
--- Summary: PRIMARY KEY is (tenant_id, key) — same key string in different
---          tenants produces independent records per IDEMPOTENCY v5.1 §1.
+-- Summary: PRIMARY KEY is (tenant_id, key, endpoint, actor_id) — same key
+--          string in different tenants, OR for the same tenant on different
+--          endpoints, OR submitted by a different actor, produces independent
+--          records per IDEMPOTENCY v5.1 §1 scoping rules. Only a same-tenant +
+--          same-key + same-endpoint + same-actor + different-body collision
+--          is a 409 Conflict. (PK widened from (tenant_id, key) v0.1 patch
+--          2026-05-02 per Codex foundation-layer review HIGH-2 finding.)
 --          TTL is enforced by a background cleanup job (commented below).
 --          RLS enabled with tenant_isolation policy.
 -- =============================================================================
@@ -35,8 +40,6 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     -- Client-generated ULID string (per IDEMPOTENCY v5.1 key format).
     -- Max length 26 for ULID; TEXT used to accommodate future format changes.
     key                 TEXT        NOT NULL,
-
-    PRIMARY KEY (tenant_id, key),
 
     -- -------------------------------------------------------------------------
     -- Request fingerprint
@@ -90,27 +93,40 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     -- The cleanup job (see comment below) deletes rows where expires_at < NOW().
     -- 24-hour window is sufficient for all retry scenarios including overnight
     -- offline queuing per IDEMPOTENCY v5.1.
-    expires_at          TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours')
+    expires_at          TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours'),
+
+    -- -------------------------------------------------------------------------
+    -- Primary key (4-tuple per IDEMPOTENCY v5.1 §1 scoping rules)
+    -- (changed v0.1 patch 2026-05-02 per Codex foundation-layer review HIGH-2
+    --  finding: prior PK was (tenant_id, key) which collapsed legitimate
+    --  endpoint-distinct and actor-distinct retries into false 409 conflicts.
+    --  Same key reused on a different endpoint or by a different actor MUST
+    --  be an independent record per IDEMPOTENCY v5.1 §1; only a same-tenant +
+    --  same-key + same-endpoint + same-actor + different-body collision is
+    --  a 409 Conflict.)
+    -- -------------------------------------------------------------------------
+    PRIMARY KEY (tenant_id, key, endpoint, actor_id)
 );
 
 -- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
 
--- Cleanup job scan — partial index covering only rows past their TTL.
--- The cleanup job runs periodically:
---   DELETE FROM idempotency_keys WHERE expires_at < NOW();
--- This partial index keeps the scan fast even with a large keys table.
--- The cleanup job itself is NOT implemented here; it belongs in the
--- application-layer background worker (or a pg_cron job in production).
-CREATE INDEX IF NOT EXISTS idx_idempotency_expired
-    ON idempotency_keys (expires_at)
-    WHERE expires_at < NOW() + INTERVAL '0';
--- Note: The predicate `expires_at < NOW()` cannot be used in a static index
--- expression (NOW() is volatile). The index above covers the expires_at column
--- without a volatile predicate, which is still efficient for the cleanup
--- job's WHERE expires_at < NOW() scan. The partial index is a best-effort
--- optimization; the cleanup query plan is acceptable with this index.
+-- Cleanup job scan: a plain btree index on expires_at supports the cleanup
+-- query (DELETE FROM idempotency_keys WHERE expires_at < NOW();) via index
+-- range scan. The cleanup job itself is NOT implemented here; it belongs in
+-- the application-layer background worker (or a pg_cron job in production).
+--
+-- (changed v0.1 patch 2026-05-02 per Codex foundation-layer review HIGH-1
+--  finding: the prior partial-index predicate `WHERE expires_at < NOW() +
+--  INTERVAL '0'` was rejected by PostgreSQL because NOW() is volatile —
+--  index predicates MUST be IMMUTABLE. The migration would fail at apply
+--  time, blocking the entire foundation schema. A plain btree on expires_at
+--  is sufficient: the cleanup query plan is identical for the typical case
+--  where the great majority of rows are unexpired, and the index is also
+--  reused by any future expiry-aware lookup.)
+CREATE INDEX IF NOT EXISTS idx_idempotency_expires_at
+    ON idempotency_keys (expires_at);
 
 -- -------------------------------------------------------------------------
 -- Row-Level Security (I-023)

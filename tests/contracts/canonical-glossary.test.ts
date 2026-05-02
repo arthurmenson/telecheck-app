@@ -30,7 +30,7 @@
  *   - 'customer' is forbidden as a domain term but may appear in
  *     `customer_id` of external payment processor adapters (allowlisted below).
  *   - 'prescription' may appear in patient-facing UI copy strings
- *     (allowed in files under src/modules/*/ui/ per GLOSSARY v5.2 notes).
+ *     (allowed in files under `src/modules/<module>/ui/` per GLOSSARY v5.2 notes).
  *   - bare 'Heros' (not followed by 'Health') as a tenant identifier is
  *     forbidden per Master PRD v1.10 §17; 'Heros Health' is the DBA (allowed).
  *

@@ -44,13 +44,10 @@
 // import { evaluateI029Gate } from '../../src/lib/i029-gate.ts';
 
 import { describe, expect, it } from 'vitest';
-import {
-  assertAuditRecordExists,
-  assertHighPiiSensitivity,
-} from '../helpers/audit-assertions.ts';
+import { assertHighPiiSensitivity } from '../helpers/audit-assertions.ts';
 import type { I029GateResultStub } from '../helpers/invariant-assertions.ts';
 import { assertInvariants } from '../helpers/invariant-assertions.ts';
-import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { TENANT_US } from '../helpers/tenant-fixtures.ts';
 
 // ---------------------------------------------------------------------------
 // Stub I029 gate evaluator (placeholder until src/lib/i029-gate.ts lands)

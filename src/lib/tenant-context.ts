@@ -220,8 +220,9 @@ const tenantContextPluginImpl: FastifyPluginAsync<TenantContextPluginOptions> = 
       consumerDba: entry.consumerDba,
     };
 
-    // @ts-expect-error: Fastify decorateRequest sets up the slot; TS doesn't know
-    // the request type has been extended until module augmentation is in place.
+    // Fastify decorateRequest sets up the slot at registration time; the
+    // request type is extended via module augmentation declared elsewhere
+    // in this file (search for `declare module 'fastify'`).
     request.tenantContext = ctx;
   });
 };

@@ -11,7 +11,11 @@
 --          development schema from scratch.
 -- =============================================================================
 
--- Drop triggers first (they depend on the functions).
+-- Drop RLS policies first (they reference the table).
+DROP POLICY IF EXISTS audit_break_glass_read   ON audit_records;
+DROP POLICY IF EXISTS audit_tenant_isolation   ON audit_records;
+
+-- Drop triggers (they depend on the functions).
 DROP TRIGGER IF EXISTS audit_records_block_delete  ON audit_records;
 DROP TRIGGER IF EXISTS audit_records_block_update  ON audit_records;
 DROP TRIGGER IF EXISTS audit_records_before_insert ON audit_records;
@@ -20,5 +24,5 @@ DROP TRIGGER IF EXISTS audit_records_before_insert ON audit_records;
 DROP FUNCTION IF EXISTS audit_records_block_mutation();
 DROP FUNCTION IF EXISTS audit_records_hash_insert();
 
--- Drop the table (and all its indexes, which CASCADE).
+-- Drop the table (and all its indexes + RLS configuration, which CASCADE).
 DROP TABLE IF EXISTS audit_records;

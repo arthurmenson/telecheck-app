@@ -28,9 +28,6 @@
  *   Runtime validation in `emitAudit()` is the enforcement layer.
  *
  * Open questions for Engineering Lead:
- *   - DB persistence: `emitAudit()` currently STUBs the DB INSERT. The real
- *     implementation must INSERT into an append-only `audit_records` table
- *     (migration 002, not yet authored) within the caller's transaction.
  *   - Hash chain partition: partitioned by `target_patient_id`. For platform-
  *     scope events with no patient (e.g., `market_launch_approved`), a synthetic
  *     partition key is needed. Engineering Lead to specify the partition key
@@ -38,6 +35,14 @@
  *   - `assertAuditEmittedFor()`: currently tracks emission in-process (in-memory
  *     map). Production implementation queries the audit store. Suitable for
  *     integration tests; not a production safety check.
+ *
+ * Resolved (Codex foundation-layer review patch v0.2 — 2026-05-02):
+ *   - DB persistence: `emitAudit()` now performs the durable INSERT into
+ *     `audit_records` (migration 002) when called with a transaction handle.
+ *     In production, calling without a `tx` throws — bare suppression would
+ *     itself be an I-003 violation. Test-only callers may omit `tx` under
+ *     NODE_ENV=test to use the in-memory `_emissionLog` for unit-test
+ *     assertions via `assertAuditEmittedFor()`.
  */
 
 import crypto from 'crypto';
@@ -441,18 +446,54 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
 // ---------------------------------------------------------------------------
 
 /**
+ * Minimal structural type for a Postgres transaction client. Matches the
+ * shape exposed by `pg` (`pg.Client` / `pg.PoolClient`) without importing
+ * the lib here — the lib boundary is `src/lib/db.ts` (future) and this
+ * type-only contract avoids a dep coupling in the audit module.
+ */
+export interface AuditDbClient {
+  query(text: string, values?: ReadonlyArray<unknown>): Promise<{ rows: unknown[]; rowCount: number | null }>;
+}
+
+/**
  * emitAudit — construct, validate, and persist an audit envelope.
+ *
+ * **Durability contract (I-003 bare-suppression-forbidden):**
+ * Production callers MUST provide a `tx` handle so the INSERT into
+ * `audit_records` (migration 002) runs inside the caller's transaction —
+ * if the business state change rolls back, the audit record rolls back
+ * too, preserving the same-transaction guarantee. Without `tx` in
+ * production, this function THROWS rather than silently log: a
+ * non-durable audit emission is itself an I-003 violation, since the
+ * audit chain would have no record of an action that may have changed
+ * business state.
+ *
+ * **Test-only opt-out:** when `process.env.NODE_ENV === 'test'`, omitting
+ * `tx` falls through to the in-memory `_emissionLog` so unit tests that
+ * don't carry a DB context can still assert emission via
+ * `assertAuditEmittedFor()`. Integration tests that exercise persistence
+ * MUST pass a real `tx`.
  *
  * Throws (does NOT silently log) on:
  *   - Missing required fields (I-003 / I-027)
  *   - I-012 closure rule violations
  *   - Sentinel misuse
  *   - Reserved workload type / autonomy level on successful execution records
+ *   - Missing `tx` in non-test environments (I-003 durability)
+ *   - INSERT failure (I-003 durability)
  *
  * Per I-003, bare suppression of audit events is FORBIDDEN.
  * Any catch block that swallows this function's error is an I-003 violation.
+ *
+ * Patch v0.2 — 2026-05-02 per Codex foundation-layer review CRITICAL-2
+ * finding: prior implementation returned the envelope without persisting,
+ * leaving production audit emission non-durable. This patch adds the
+ * required `tx` parameter and gates the in-memory path behind NODE_ENV.
  */
-export async function emitAudit(input: AuditEnvelopeInput): Promise<AuditEnvelope> {
+export async function emitAudit(
+  input: AuditEnvelopeInput,
+  tx?: AuditDbClient,
+): Promise<AuditEnvelope> {
   // 1. Required-field validation
   const validationResult = AuditEnvelopeInputSchema.safeParse(input);
   if (!validationResult.success) {
@@ -508,10 +549,91 @@ export async function emitAudit(input: AuditEnvelopeInput): Promise<AuditEnvelop
     },
   };
 
-  // 5. Persist to audit store
-  // STUB: INSERT into `audit_records` table (migration 002, not yet authored).
-  // In production: await auditDb.insert(envelope) within the caller's transaction.
-  // For now: log and track for assertAuditEmittedFor().
+  // 5. Persist to audit store — durability gate per I-003
+  if (tx) {
+    // Production path: durable INSERT into the caller's transaction.
+    // The DB-side BEFORE INSERT trigger (migration 002) recomputes
+    // record_hash and sequence_number using the canonical serialization,
+    // so any drift between this app-layer hash and the DB-layer hash
+    // surfaces as a constraint or trigger error and aborts the txn.
+    try {
+      await tx.query(
+        `INSERT INTO audit_records (
+            audit_id, tenant_id, category, audit_sensitivity_level, action,
+            actor_type, actor_id, ai_workload_type, autonomy_level,
+            target_patient_id, delegate_context, resource_type, resource_id,
+            country_of_care, break_glass, payload, prev_hash, record_hash,
+            sequence_number, recorded_at
+         ) VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9,
+            $10, $11::jsonb, $12, $13,
+            $14, $15::jsonb, $16::jsonb, decode($17, 'hex'), decode($18, 'hex'),
+            $19, $20
+         )`,
+        [
+          envelope.audit_id,
+          envelope.tenant_id,
+          envelope.category,
+          envelope.audit_sensitivity_level,
+          envelope.action,
+          envelope.actor_type,
+          envelope.actor_id,
+          envelope.ai_workload_type,
+          envelope.autonomy_level,
+          envelope.target_patient_id,
+          envelope.delegate_context ? JSON.stringify(envelope.delegate_context) : null,
+          envelope.resource_type,
+          envelope.resource_id,
+          envelope.country_of_care,
+          envelope.break_glass ? JSON.stringify(envelope.break_glass) : null,
+          JSON.stringify(envelope.detail),
+          envelope.hash_chain.previous_hash,
+          envelope.hash_chain.record_hash,
+          envelope.hash_chain.sequence_number,
+          envelope.timestamp,
+        ],
+      );
+    } catch (err) {
+      // I-003: bare suppression forbidden. Re-throw with context so the
+      // caller's transaction aborts and the upstream business action
+      // rolls back — never let an audit-INSERT failure pass silently.
+      throw new Error(
+        `emitAudit: durable INSERT failed for action "${envelope.action}" ` +
+          `(tenant=${envelope.tenant_id}, audit_id=${envelope.audit_id}): ` +
+          `${err instanceof Error ? err.message : String(err)} — I-003 forbids ` +
+          'suppression; the caller transaction MUST abort.',
+      );
+    }
+
+    // Emission log is also populated under tx so test assertions that run
+    // in integration mode see the same record they'd see in production.
+    if (process.env['NODE_ENV'] === 'test') {
+      _emissionLog.push({
+        actionId: envelope.resource_id,
+        action: envelope.action as AuditAction,
+        emittedAt: new Date(),
+      });
+    }
+
+    return envelope;
+  }
+
+  // No tx provided.
+  if (process.env['NODE_ENV'] !== 'test') {
+    // Production / dev / staging without a transaction handle is an
+    // I-003 violation: an audit record that doesn't reach the durable
+    // chain is bare suppression. Throw rather than emit-and-pretend.
+    throw new Error(
+      `emitAudit: refused to emit "${envelope.action}" without a transaction ` +
+        'handle outside test environments. I-003 requires same-transaction ' +
+        'durable persistence to the audit_records table. Pass a `tx` argument ' +
+        'or run under NODE_ENV=test for unit-test stubs.',
+    );
+  }
+
+  // Test-only path: in-memory emission for unit tests that don't carry a DB context.
+  // Integration tests MUST pass a real tx and exercise the durable path above.
   _emissionLog.push({
     actionId: envelope.resource_id,
     action: envelope.action as AuditAction,

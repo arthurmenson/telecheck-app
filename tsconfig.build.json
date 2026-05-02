@@ -1,4 +1,9 @@
 {
   "extends": "./tsconfig.json",
-  "exclude": ["node_modules", "dist", ".tsbuildinfo", "tests/**/*", "**/*.test.ts"]
+  "compilerOptions": {
+    "noEmit": false,
+    "allowImportingTsExtensions": false,
+    "rootDir": "./src"
+  },
+  "exclude": ["node_modules", "dist", ".tsbuildinfo", "tests/**/*", "**/*.test.ts", "vitest.config.ts"]
 }

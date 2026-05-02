@@ -231,6 +231,51 @@ CREATE INDEX IF NOT EXISTS idx_audit_sensitivity
     WHERE audit_sensitivity_level = 'high_pii';
 
 -- ---------------------------------------------------------------------------
+-- ROW-LEVEL SECURITY — I-023 three-layer tenant isolation
+-- (added v0.1 patch 2026-05-02 per Codex foundation-layer review CRITICAL-1
+--  finding: audit_records was created without RLS, leaving a cross-tenant
+--  audit-PHI leak path. Any role with SELECT on the table could read across
+--  tenants — direct I-023 violation.)
+--
+-- Default policy: tenant-scoped reads via current_tenant_id() (set by
+-- application layer per migration 003 set_tenant_context). FORCE applies the
+-- policy to the table OWNER too (without FORCE, the owner bypasses RLS and
+-- can read across tenants in maintenance contexts).
+--
+-- Platform / break-glass cross-tenant access (I-024) bypasses this policy
+-- via an explicit audited path: callers run set_break_glass_context() first
+-- (migration 003), which records a break-glass audit record AND sets the
+-- session GUC `app.break_glass_active = true` that is checked by a separate
+-- USING expression below. Any cross-tenant audit retrieval is therefore
+-- self-auditing per I-024 — it is impossible to read another tenant's audit
+-- data without producing an audit record of doing so.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE audit_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_records FORCE ROW LEVEL SECURITY;
+
+-- Tenant-scoped policy: ordinary reads/writes scoped to the caller's tenant.
+-- WITH CHECK is identical to USING so writes that would land in another
+-- tenant's row are also rejected (defense in depth against application-layer
+-- bugs that try to insert with a foreign tenant_id).
+CREATE POLICY audit_tenant_isolation ON audit_records
+    AS PERMISSIVE
+    FOR ALL
+    USING (tenant_id = current_tenant_id())
+    WITH CHECK (tenant_id = current_tenant_id());
+
+-- Break-glass policy (I-024): permits read access across tenants ONLY when
+-- the session has been opened via set_break_glass_context(). That function
+-- records the break-glass audit record before allowing the cross-tenant
+-- read, so this policy cannot fire silently. Writes are NOT permitted even
+-- under break-glass — break-glass is a read-only investigative posture per
+-- I-024; cross-tenant writes require a different escalation path.
+CREATE POLICY audit_break_glass_read ON audit_records
+    AS PERMISSIVE
+    FOR SELECT
+    USING (current_setting('app.break_glass_active', true) = 'true');
+
+-- ---------------------------------------------------------------------------
 -- APPEND-ONLY ENFORCEMENT — I-003
 -- Revoke UPDATE and DELETE from PUBLIC and from the expected application role.
 -- Belt: REVOKE at the privilege layer.
