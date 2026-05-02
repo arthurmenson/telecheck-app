@@ -18,8 +18,9 @@
  *     the DB-layer mechanism.
  *   - ADR-023 (multi-tenancy Model A): `tenant_id` on every PHI record;
  *     RLS policies on every PHI-touching table.
- *   - Migration 003 (not yet authored): creates `set_tenant_context(text)` and
- *     `current_tenant_id()` SQL functions used here.
+ *   - Migration 003: creates the private `_session_tenant_context` table,
+ *     `set_tenant_context(text)`, `clear_tenant_context()`, and
+ *     `current_tenant_id()` SECURITY DEFINER functions used here.
  *
  * Design decisions:
  *   - `withTenantContext` takes a generic query callback `fn` rather than
@@ -32,13 +33,17 @@
  *     connection is reused.
  *
  * Open questions for Engineering Lead:
- *   - This module references migration 003 (`set_tenant_context` SQL function)
- *     which has not yet been authored. Engineering Lead must author migration
- *     003 before this module is used in production code paths.
- *     STUB: the SQL call is correct; the function just doesn't exist yet.
- *   - Connection pool behavior: with PgBouncer in transaction mode, session
- *     variables don't persist across transactions. Confirm connection pooler
- *     mode with DevOps before production deployment.
+ *   - Connection pool behavior: with PgBouncer in transaction mode, the
+ *     same PG backend serves many app sessions. The migration-003 binding
+ *     is keyed on pg_backend_pid() with a 5-minute TTL and is upserted on
+ *     every set_tenant_context() call, so the most recent caller's tenant
+ *     is always reflected. Confirm pooler mode with DevOps before
+ *     production deployment; consider RESET ALL between requests.
+ *
+ * Resolved (Codex foundation-verify-r3 patch v0.2 — 2026-05-02):
+ *   - Migration 003 is now authored. The SQL call below targets the
+ *     hardened table-backed binding mechanism (not the prior settable
+ *     GUC, which was bypassable via direct `SET app.current_tenant_id`).
  */
 
 // ---------------------------------------------------------------------------
@@ -81,21 +86,26 @@ export async function withTenantContext<T>(
   tenantId: string,
   fn: (client: DbClient) => Promise<T>,
 ): Promise<T> {
-  // Set the session variable via migration 003's set_tenant_context() function.
-  // STUB: migration 003 (set_tenant_context SQL function) is not yet authored.
-  //       This call will fail until that migration is applied.
+  // Establish the tenant context binding via migration 003's
+  // set_tenant_context() SECURITY DEFINER function. The binding is keyed
+  // on pg_backend_pid() and stored in the private _session_tenant_context
+  // table — NOT a settable GUC — so it cannot be spoofed by a session
+  // doing `SET app.current_tenant_id`.
+  // (v0.2 patch 2026-05-02 per Codex foundation-verify-r3 CRITICAL.)
   await client.query('SELECT set_tenant_context($1)', [tenantId]);
 
   let result: T;
   try {
     result = await fn(client);
   } finally {
-    // Always clear the session variable after the callback, even on error.
-    // Prevents cross-request tenant leakage on pooled connections.
-    // Use a fire-and-forget — if this fails, log and continue (the error from
-    // `fn` is more important to surface).
+    // Always clear the binding after the callback, even on error. Prevents
+    // cross-request tenant leakage on pooled connections. Belt-and-suspenders:
+    // the binding has a 5-minute TTL on the DB side, but explicit cleanup
+    // shortens the leak window for crashes.
+    // Fire-and-forget — if cleanup fails, log and continue (the original
+    // error from `fn` is more important to surface).
     await client
-      .query('SELECT set_tenant_context(NULL)', [])
+      .query('SELECT clear_tenant_context()', [])
       .catch(() => {
         // Intentional: swallow clear-error to avoid masking the original error.
         // Monitoring should alert on repeated clear failures as a pool-leak signal.

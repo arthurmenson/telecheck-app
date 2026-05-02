@@ -10,13 +10,43 @@
 --          - I-025 (error responses must not leak cross-tenant existence)
 --          - ADR-023 (multi-tenancy Model A — logical isolation by tenant_id)
 --          - CDM v1.2 §2 conventions (RLS policy per-table)
---          - Subscriptions CDM example: USING (tenant_id = current_setting('app.tenant_id')::VARCHAR)
--- Summary: Creates three SECURITY DEFINER functions:
---            1. set_tenant_context(tenant_id)  — sets app.current_tenant_id GUC
---            2. current_tenant_id()            — reads GUC; fails closed if unset
---            3. set_break_glass_context(...)   — emits audit record then allows
---                                               cross-tenant query (I-024)
+-- Summary: Creates a non-spoofable tenant-context binding mechanism:
+--            1. _session_tenant_context table — durable per-PG-backend binding
+--               written ONLY by the SECURITY DEFINER set_tenant_context()
+--               function (REVOKE all DML from PUBLIC).
+--            2. set_tenant_context(tenant_id) — validates tenant + upserts
+--               binding for pg_backend_pid() with TTL.
+--            3. current_tenant_id() — looks up binding by pg_backend_pid();
+--               fails closed if unset or expired. Used in RLS USING expressions.
+--            4. set_break_glass_context(...) — emits audit record then allows
+--               cross-tenant query (I-024).
 --          Includes template comment block for canonical per-table RLS policy.
+--
+-- Threat model (Codex foundation-verify-r3 CRITICAL finding 2026-05-02):
+--   The PRIOR design used a GUC-only binding (current_setting('app.current_
+--   tenant_id')). PostgreSQL custom GUCs are settable by any SQL-capable
+--   session, so an attacker with arbitrary-SQL ability (including via SQL
+--   injection in an app handler) could `SET app.current_tenant_id = 'X'`
+--   and bypass RLS for tenant X across every PHI table. The CDM example
+--   referenced this pattern but the example is THREAT-MODEL-DEPENDENT on the
+--   app role lacking arbitrary SQL — a defense-in-depth-only assumption.
+--
+--   This v0.2 patch hardens the binding by replacing the GUC with a
+--   `_session_tenant_context` table keyed on `pg_backend_pid()` (the OS
+--   process ID of the calling PG backend). The app role cannot INSERT,
+--   UPDATE, DELETE, or SELECT this table directly (REVOKE all from PUBLIC);
+--   only the SECURITY DEFINER set_tenant_context()/current_tenant_id()
+--   functions can read or write it. An attacker doing `SET app.current_
+--   tenant_id = 'X'` no longer affects authorization — the policy reads
+--   from the table, not the GUC.
+--
+--   pg_backend_pid() is process-scoped. With a connection pool (pgBouncer
+--   transaction mode, etc.), the same backend PID serves many app sessions
+--   over its lifetime. The binding has a short TTL (default: 5 minutes;
+--   configurable per-deployment) so stale bindings expire automatically;
+--   set_tenant_context() upserts on every request, refreshing the TTL.
+--   Pool callers SHOULD also issue `RESET ALL` between requests (standard
+--   practice) to belt-and-suspender the cleanup.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -26,12 +56,50 @@
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
+-- Table: _session_tenant_context (private session-binding state)
+-- Underscore prefix marks this as platform-internal — not a tenant-scoped
+-- domain entity. Holds (pg_backend_pid → tenant_id, expires_at) bindings
+-- written ONLY by SECURITY DEFINER functions in this migration.
+--
+-- The app role MUST NOT have any direct DML or SELECT permission on this
+-- table — all access flows through set_tenant_context() and
+-- current_tenant_id() which run with elevated SECURITY DEFINER privileges.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS _session_tenant_context (
+    pg_backend_pid  INTEGER     PRIMARY KEY,
+    tenant_id       TEXT        NOT NULL REFERENCES tenants(id),
+    bound_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '5 minutes')
+);
+
+REVOKE ALL ON TABLE _session_tenant_context FROM PUBLIC;
+-- SPEC ISSUE: Application role not yet created. When 006_roles.sql is
+-- authored, the app role explicitly does NOT receive any privileges on this
+-- table — only the SECURITY DEFINER functions below can access it.
+
+-- Index for cleanup of expired bindings (used by a periodic background job
+-- per IDEMPOTENCY-style cleanup pattern; not implemented here).
+CREATE INDEX IF NOT EXISTS idx_session_tenant_context_expires_at
+    ON _session_tenant_context (expires_at);
+
+-- ---------------------------------------------------------------------------
 -- Function 1: set_tenant_context
--- Sets the session-level GUC 'app.current_tenant_id' to the given tenant_id.
--- Called by the application-layer middleware at the start of every request.
--- The GUC is session-scoped — it resets when the connection is returned to
--- the pool. Applications using connection pools MUST call this at the start
--- of every request, not just once per connection.
+-- Establishes the tenant context for the current PG backend by upserting
+-- a row into _session_tenant_context keyed on pg_backend_pid(). Called by
+-- the application-layer middleware at the start of every request.
+--
+-- The binding is per-PG-backend with a TTL so:
+--   - In a non-pooled deployment (one PG backend per app process), the
+--     binding lives for the process lifetime and refreshes on each request.
+--   - In a pooled deployment (pgBouncer transaction mode), the same backend
+--     PID serves many requests; each request's set_tenant_context() upserts
+--     the binding, so the most recent caller's tenant is always reflected.
+--   - Stale bindings (e.g., after a crash) expire after the TTL and cannot
+--     authorize subsequent queries.
+--
+-- Validation per I-025: tenant existence/status check uses a generic error
+-- message that does not differentiate "not found" from "not authorized."
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION set_tenant_context(p_tenant_id TEXT)
@@ -40,9 +108,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 AS $$
 BEGIN
-    -- Validate the tenant_id exists before setting context.
-    -- This prevents an attacker from probing with arbitrary strings.
-    -- Per I-025: do NOT differentiate "tenant not found" from "not authorized".
+    -- Validate the tenant_id exists and is active.
     PERFORM 1
     FROM    tenants
     WHERE   id = p_tenant_id
@@ -55,9 +121,13 @@ BEGIN
             USING HINT = 'The requested tenant context could not be established.';
     END IF;
 
-    PERFORM set_config('app.current_tenant_id', p_tenant_id, FALSE);
-    -- FALSE = session-local (persists for the duration of the session / transaction).
-    -- Connection pool middleware should call this on every acquired connection.
+    -- Upsert the binding for this PG backend.
+    INSERT INTO _session_tenant_context (pg_backend_pid, tenant_id, bound_at, expires_at)
+    VALUES (pg_backend_pid(), p_tenant_id, NOW(), NOW() + INTERVAL '5 minutes')
+    ON CONFLICT (pg_backend_pid) DO UPDATE
+        SET tenant_id  = EXCLUDED.tenant_id,
+            bound_at   = EXCLUDED.bound_at,
+            expires_at = EXCLUDED.expires_at;
 END;
 $$;
 
@@ -67,10 +137,35 @@ REVOKE ALL ON FUNCTION set_tenant_context(TEXT) FROM PUBLIC;
 --   GRANT EXECUTE ON FUNCTION set_tenant_context(TEXT) TO telecheck_app_role;
 
 -- ---------------------------------------------------------------------------
--- Function 2: current_tenant_id
--- Reads 'app.current_tenant_id' GUC. Raises EXCEPTION if not set (fails
--- closed per I-023 — no query proceeds without an established tenant context).
--- Used in RLS USING expressions on all PHI-touching tables.
+-- Function 2: clear_tenant_context
+-- Removes the current backend's binding. Called by the application-layer
+-- middleware at the end of every request as belt-and-suspenders cleanup
+-- (the TTL is the primary safeguard).
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION clear_tenant_context()
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    DELETE FROM _session_tenant_context WHERE pg_backend_pid = pg_backend_pid();
+END;
+$$;
+
+REVOKE ALL ON FUNCTION clear_tenant_context() FROM PUBLIC;
+-- SPEC ISSUE: Grant to telecheck_app_role when 006_roles.sql lands.
+
+-- ---------------------------------------------------------------------------
+-- Function 3: current_tenant_id
+-- Looks up the current backend's tenant binding from _session_tenant_context.
+-- Raises EXCEPTION if no binding exists or the binding has expired (fails
+-- closed per I-023). Used in RLS USING expressions on all PHI tables.
+--
+-- This function is the security boundary: it is the ONLY way for an RLS
+-- policy to learn the calling session's authorized tenant. The binding it
+-- reads is unforgeable — only set_tenant_context() can write it, and that
+-- function validates the tenant exists + is active before binding.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION current_tenant_id()
@@ -82,22 +177,18 @@ AS $$
 DECLARE
     v_tenant_id TEXT;
 BEGIN
-    -- current_setting raises an error if the GUC is unset (third arg = false
-    -- means "do not return empty string on missing; error instead").
-    -- We catch that error to produce a cleaner, policy-aligned exception.
-    BEGIN
-        v_tenant_id := current_setting('app.current_tenant_id', FALSE);
-    EXCEPTION WHEN undefined_object OR invalid_parameter_value THEN
-        RAISE EXCEPTION 'tenant_context_not_set'
-            USING HINT = 'A tenant context must be established via set_tenant_context() '
-                         'before any tenant-scoped query can execute. '
-                         'This is a three-layer isolation requirement per I-023.';
-    END;
+    SELECT tenant_id
+      INTO v_tenant_id
+      FROM _session_tenant_context
+     WHERE pg_backend_pid = pg_backend_pid()
+       AND expires_at > NOW();
 
-    IF v_tenant_id IS NULL OR v_tenant_id = '' THEN
+    IF v_tenant_id IS NULL THEN
         RAISE EXCEPTION 'tenant_context_not_set'
-            USING HINT = 'app.current_tenant_id GUC is empty. '
-                         'Call set_tenant_context() with a valid tenant_id before querying.';
+            USING HINT = 'No active tenant binding for this PG backend. '
+                         'Call set_tenant_context() with a valid tenant_id before '
+                         'querying any tenant-scoped table. This is a three-layer '
+                         'isolation requirement per I-023.';
     END IF;
 
     RETURN v_tenant_id;
@@ -106,8 +197,9 @@ $$;
 
 -- current_tenant_id() is called inside RLS policies, which run as the table
 -- owner. Grant to PUBLIC so the RLS USING expression can invoke it.
--- SECURITY DEFINER ensures it always runs with the function owner's privileges,
--- not the invoking session's — preventing privilege escalation.
+-- SECURITY DEFINER ensures it always runs with the function owner's
+-- privileges, so the SELECT on _session_tenant_context succeeds even though
+-- the calling session has no direct privileges on that table.
 GRANT EXECUTE ON FUNCTION current_tenant_id() TO PUBLIC;
 
 -- ---------------------------------------------------------------------------
@@ -206,12 +298,35 @@ BEGIN
         NOW()
     );
 
-    -- Set the cross-tenant GUC after the audit record is committed.
-    -- The break-glass GUC includes the session_id for downstream traceability.
-    PERFORM set_config('app.current_tenant_id',         p_target_tenant, FALSE);
-    PERFORM set_config('app.break_glass_session_id',    v_session_id,    FALSE);
-    PERFORM set_config('app.break_glass_actor_id',      p_actor_id,      FALSE);
-    PERFORM set_config('app.break_glass_until',         p_authorized_until, FALSE);
+    -- Bind the cross-tenant context after the audit record is committed.
+    -- Uses the same hardened _session_tenant_context table as set_tenant_
+    -- context(); the audit record above is the durable evidence of why the
+    -- binding was established for a tenant the actor doesn't normally own.
+    -- (v0.2 patch 2026-05-02 per Codex foundation-verify-r3 CRITICAL: prior
+    --  code used set_config('app.current_tenant_id', ...) which is now a
+    --  no-op since current_tenant_id() reads from the binding table.)
+    INSERT INTO _session_tenant_context (pg_backend_pid, tenant_id, bound_at, expires_at)
+    VALUES (
+        pg_backend_pid(),
+        p_target_tenant,
+        NOW(),
+        LEAST(
+            NOW() + INTERVAL '5 minutes',                  -- normal binding TTL
+            COALESCE(p_authorized_until::TIMESTAMPTZ, NOW() + INTERVAL '5 minutes')
+        )
+    )
+    ON CONFLICT (pg_backend_pid) DO UPDATE
+        SET tenant_id  = EXCLUDED.tenant_id,
+            bound_at   = EXCLUDED.bound_at,
+            expires_at = EXCLUDED.expires_at;
+
+    -- Break-glass session metadata GUCs are still set for downstream code
+    -- that wants to read session_id / actor_id for trace correlation. These
+    -- are NOT used by the RLS policy; they're read-only diagnostics. Setting
+    -- them is settable by anyone, so they are NEVER a security boundary.
+    PERFORM set_config('app.break_glass_session_id', v_session_id,       FALSE);
+    PERFORM set_config('app.break_glass_actor_id',   p_actor_id,         FALSE);
+    PERFORM set_config('app.break_glass_until',      p_authorized_until, FALSE);
 END;
 $$;
 

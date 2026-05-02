@@ -9,4 +9,10 @@
 
 DROP FUNCTION IF EXISTS set_break_glass_context(TEXT, TEXT, TEXT, TEXT);
 DROP FUNCTION IF EXISTS current_tenant_id();
+DROP FUNCTION IF EXISTS clear_tenant_context();
 DROP FUNCTION IF EXISTS set_tenant_context(TEXT);
+
+-- Drop the session-binding table (added v0.2 patch 2026-05-02 per Codex
+-- foundation-verify-r3 CRITICAL — replaces the prior GUC-based current_
+-- tenant_id() pattern with a non-spoofable per-PG-backend binding).
+DROP TABLE IF EXISTS _session_tenant_context;
