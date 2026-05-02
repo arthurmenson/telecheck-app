@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+.tsbuildinfo
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/sessions/
+.claude/transcripts/
+
+# Prisma
+prisma/migrations/
+prisma/.env
+
+# Local Postgres
+*.db
+*.sqlite
+*.sqlite3
+postgres-data/
+
+# Secrets / certs
+*.pem
+*.key
+*.crt
+secrets/
+
+# Generated OpenAPI client
+src/generated/

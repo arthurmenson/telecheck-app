@@ -1,0 +1,47 @@
+{
+  "name": "telecheck-app",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Telecheck multi-tenant AI-powered telehealth platform — implementation of the spec corpus in arthurmenson/telecheckONE",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0",
+    "lint:fix": "eslint . --ext .ts,.tsx --fix",
+    "format": "prettier --write \"src/**/*.{ts,tsx,json}\" \"tests/**/*.{ts,tsx}\" \"*.{json,md}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx,json}\" \"tests/**/*.{ts,tsx}\" \"*.{json,md}\"",
+    "typecheck": "tsc --noEmit",
+    "openapi:validate": "echo 'TODO: wire swagger-cli validate against ../telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_OpenAPI_v0_2.md'",
+    "migrate:diff": "echo 'TODO: wire prisma migrate diff against current schema'",
+    "prepare": "echo 'TODO: husky install once first slice begins'"
+  },
+  "dependencies": {
+    "@fastify/helmet": "^12.0.0",
+    "@fastify/sensible": "^6.0.0",
+    "fastify": "^5.0.0",
+    "pino": "^9.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@typescript-eslint/eslint-plugin": "^7.16.0",
+    "@typescript-eslint/parser": "^7.16.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "eslint": "^8.57.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.29.0",
+    "prettier": "^3.3.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
