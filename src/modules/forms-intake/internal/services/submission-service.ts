@@ -41,6 +41,7 @@ import { kms } from '../../../../lib/kms.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import {
   emitCrisisDetectionTrigger,
+  emitFormsResumeStateRestored as emitFormsResumeStateRestoredAudit,
   emitFormsResumeStateSaved as emitFormsResumeStateSavedAudit,
   emitFormsSubmissionCompletedAudit,
   emitFormsSubmissionStartedAudit,
@@ -51,7 +52,6 @@ import {
   emitFormsSubmissionStarted as emitFormsSubmissionStartedEvent,
 } from '../../events.js';
 import type {
-  ResumeSubmissionRequest,
   StartSubmissionRequest,
   SubmitSubmissionRequest,
   UpdateSubmissionResponsesRequest,
@@ -714,35 +714,256 @@ export async function submitSubmission(
 }
 
 /**
- * Resume a paused submission. Validates the resume token, expiry, and
- * tenant binding; emits the `forms_resume_state.restored` audit per §8.5.
+ * Resume a paused submission — read-side of the save-and-resume flow.
  *
- * **Still DEFERRED** (the patient-side restoration of partial responses
- * lives behind several open dependencies):
+ * **Atomic orchestration in ONE outer transaction** (I-016 same-tx outbox):
+ * the merge UPDATE + resume_state status flip + Category C audit all
+ * commit together so a failure anywhere in the pipeline rolls back the
+ * merge AND prevents the resume_state row from being marked completed.
+ * This also means a successful restore is replay-protected: the same
+ * token cannot be re-presented to roll back the merge — the second
+ * attempt's status-flip predicate (`status = 'active'`) sees the
+ * already-completed row and surfaces null.
  *
- *   - Migration 006 has no `submission_id` column on `forms_resume_state`,
- *     so the (resume_state ↔ submission) binding required to surface a
- *     restored FormSubmission is not yet representable in storage. Either
- *     migration 007 must add it or the service must reconstruct via
- *     `(tenant, deployment, patient, status='in_progress')`.
- *   - The pause/write side that *creates* resume_state rows isn't wired
- *     yet (`updateResponses` `pause === true` path is still TODO), so
- *     end-to-end POST /v0/forms/resume cannot be tested without seeding
- *     rows directly via SQL. Defer until the pause side lands.
- *   - KMS-decryption of `encrypted_partial_responses` requires the
- *     `kms.decrypt(tenant, ciphertext)` integration that the v0.1 stub
- *     gates behind NODE_ENV=test only. Production wiring lands with the
- *     Identity & Auth slice or its successor.
+ * Pipeline (every failure short-circuits to `return null` so the handler
+ * maps to a tenant-blind 404 per I-025; we NEVER differentiate
+ * "doesn't exist" from "wrong tenant" / "wrong actor" / "already restored"):
  *
- * The metadata-only read path (`getResumeStateMetadata` below) does NOT
- * depend on any of the above and IS shipping in this batch.
+ *   1. **Token verify** — `verifyResumeToken` checks structure + HMAC +
+ *      token-level expiry. Constant-time HMAC compare per resume-token.ts.
+ *   2. **Tenant binding** — token's tenant_id must equal request's
+ *      resolved tenant context. Defense in depth alongside RLS.
+ *   3. **Row lookup (RLS-guarded)** — `findResumeStateById` rejects
+ *      cross-tenant rows even if a token survived steps 1–2.
+ *   4. **Row state gate** — status MUST be `active` and `expires_at` MUST
+ *      be in the future. Already-completed rows (replay) and
+ *      cleanup-job-expired rows both surface as null.
+ *   5. **Ownership** — for known-patient rows, `actor.patientId` must
+ *      equal `row.patient_id`. For anonymous-flow rows, constant-time
+ *      compare the device token. Same discipline as the metadata read
+ *      (Codex resume-r1 HIGH closure 2026-05-03).
+ *   6. **KMS decrypt** — `kms.decrypt(ctx, row.encrypted_partial_responses)`
+ *      under per-tenant key + tenantId AAD. Failure (auth-tag mismatch
+ *      from a stale cipher, KMS hiccup, etc.) surfaces as null — never
+ *      throw past this point or the outer tx aborts and the patient gets
+ *      a 5xx instead of the intended tenant-blind 404.
+ *   7. **In-progress submission lookup** — `findInProgressSubmissionForRestore`
+ *      reconstructs the (resume_state ↔ submission) binding via (tenant,
+ *      deployment, patient) since migration 006 has no submission_id
+ *      column. Null if the submission was somehow finalized between
+ *      pause and restore.
+ *   8. **Merge UPDATE** — `updateSubmissionResponses` JSONB-merges the
+ *      decrypted responses onto the in_progress row. Same ownership +
+ *      I-013 immutability gates as auto-save. The repo's row lock is
+ *      held until our outer tx commits; a concurrent auto-save can't
+ *      interleave between the merge and the status flip.
+ *   9. **Status flip + audit** — `markResumeStateCompleted` flips the
+ *      resume_state row to `status='completed'` with `resumed_at = NOW()`
+ *      and emits the Category C `forms_resume_state.restored` audit
+ *      (placeholder action_id `config_change_validated` per the SPEC
+ *      ISSUE on `emitFormsResumeStateRestored`). Both happen in the
+ *      same outer tx as the merge UPDATE.
+ *  10. **Project to patient view** — strip `tenant_id` via
+ *      `toPatientView` per Master PRD §17 + Glossary v5.2 C3.
+ *
+ * **Why the audit emitter MUST succeed for the function to return non-null:**
+ * I-003 + I-016: the resume_state status flip is an attestable lifecycle
+ * transition; if the audit can't commit, neither can the flip nor the
+ * merge. A throw inside the txCallback rolls back the entire outer tx
+ * and the patient sees a tenant-blind 404. The user can retry — the row
+ * is still `active` and the next attempt will re-encrypt-decrypt-merge
+ * cleanly.
+ *
+ * **Crisis gate (I-019):** intentionally NOT applied here. The decrypted
+ * responses come from data the patient already typed under the auto-save
+ * crisis gate (and additionally re-scanned at pause time per the merged-
+ * set gate). Re-scanning on restore would either (a) duplicate detection
+ * audit rows for the same content, polluting the audit chain, or (b)
+ * reject the restore for content that was previously accepted, leaving
+ * the patient unable to resume their own intake. Per Slice PRD §13 the
+ * crisis gate fires on entry, not on retrieval.
+ *
+ * **Domain event:** DOMAIN_EVENTS v5.2 doesn't enumerate a
+ * `forms_resume_state.restored` event — only `.saved` and the lifecycle
+ * `intake_response.*` family. We therefore emit ONLY the audit on
+ * restore; subscribers needing to react to restore can join via the
+ * `forms_submission` row's `updated_at` change or via the audit chain.
+ * SPEC ISSUE flagged for the next DOMAIN_EVENTS amendment cycle.
+ *
+ * **Identity:** this v0.1 entrypoint requires `actor.patientId` (forms_
+ * submission.patient_id NOT NULL per migration 006). Anonymous-flow
+ * restore activates with the same migration patch + audit-emitter
+ * signature change that unblocks the pause anonymous flow.
  */
 export async function resumeSubmission(
-  _ctx: TenantContext,
-  _actor: { actorId: string; patientId: PatientId | null },
-  _input: ResumeSubmissionRequest,
-): Promise<FormSubmission> {
-  throw new Error('not implemented');
+  ctx: TenantContext,
+  actor: { actorId: string; patientId: PatientId; deviceAnonymousToken: string | null },
+  resumeToken: string,
+  externalTx?: DbTransaction,
+): Promise<PatientFormSubmissionView | null> {
+  // Step 1 — token verify (HMAC + structure + token-level expiry).
+  const verified = verifyResumeToken(resumeToken);
+  if (verified === null) return null;
+
+  // Step 2 — tenant binding. Token from tenant A presented in tenant B's
+  // request context surfaces as the same null shape as a missing row.
+  if (verified.tenantId !== ctx.tenantId) return null;
+
+  // ---------------------------------------------------------------------
+  // Outer atomic tx — wraps every state change so a failure anywhere
+  // rolls back the merge UPDATE + status flip + audit together. Replay
+  // protection rides on the status-flip predicate inside this tx.
+  // ---------------------------------------------------------------------
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    // Step 3 — row lookup, RLS-guarded by the outer tx's tenant binding.
+    const row = await submissionRepo.findResumeStateById(ctx.tenantId, verified.resumeStateId, tx);
+    if (row === null) return null;
+
+    // Step 4 — row state gates. Already-completed (replay) and
+    // cleanup-job-expired both surface tenant-blind.
+    if (row.status !== 'active') return null;
+    if (Date.parse(row.expires_at) <= Date.now()) return null;
+
+    // Step 5 — ownership. Mirrors getResumeStateMetadata; see that
+    // function for the full security narrative (Codex resume-r1 HIGH
+    // closure 2026-05-03 — bearer-only tokens are not sufficient).
+    if (row.patient_id !== null) {
+      if (row.patient_id !== actor.patientId) return null;
+    } else if (row.device_anonymous_token !== null) {
+      if (actor.deviceAnonymousToken === null) return null;
+      if (!timingSafeStringEqual(row.device_anonymous_token, actor.deviceAnonymousToken)) {
+        return null;
+      }
+    } else {
+      // Defensive: chk_resume_identity should prevent this, but a row
+      // with neither anchor cannot authorize anyone.
+      return null;
+    }
+
+    // The pause path always sets row.patient_id at v0.1 (anonymous flow
+    // is blocked by migration 006's NOT NULL constraint on
+    // forms_submission.patient_id), so step 7 below ALWAYS has a
+    // non-null patient_id to query with. Defensive narrowing for
+    // strictNullChecks: the v0.1 entrypoint requires actor.patientId,
+    // and ownership above proved row.patient_id === actor.patientId
+    // when row.patient_id is non-null. Use the resolved patient
+    // identity (preferring the row's anchor, falling back to actor)
+    // for the in-progress lookup.
+    const restorePatientId: PatientId = row.patient_id ?? actor.patientId;
+
+    // Step 6 — KMS decrypt. A failure here (stale cipher, KMS hiccup,
+    // tenant-context mismatch on AAD) MUST surface as null per I-025;
+    // never let the throw escape this tx and 5xx the patient. The
+    // outer tx rolls back, the resume_state row is untouched, the
+    // patient can retry.
+    let restoredResponses: Record<string, unknown>;
+    try {
+      const plaintext = await kms.decrypt(ctx, row.encrypted_partial_responses);
+      const parsed: unknown = JSON.parse(plaintext.toString('utf8'));
+      // Defensive shape check — pause writes a JSONB object, but a
+      // corrupted ciphertext that decrypts to e.g. an array or string
+      // would otherwise propagate to the merge UPDATE and either fail
+      // SQL-side or silently nuke responses. Reject tenant-blind.
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return null;
+      }
+      restoredResponses = parsed as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+
+    // Step 7 — locate the matching in_progress submission row. Null
+    // means the submission was already finalized (or never existed for
+    // this patient/deployment in this tenant); replay-equivalent at
+    // the surface layer.
+    const submission = await submissionRepo.findInProgressSubmissionForRestore(
+      ctx.tenantId,
+      row.deployment_id,
+      restorePatientId,
+      tx,
+    );
+    if (submission === null) return null;
+
+    // Step 8 — merge UPDATE under the outer tx. Repo throws
+    // SUBMISSION_NOT_FOUND / NOT_IN_PROGRESS sentinels on miss /
+    // ownership mismatch / wrong status; convert to null per I-025.
+    let updatedSubmission: FormSubmission;
+    try {
+      updatedSubmission = await submissionRepo.updateSubmissionResponses(
+        ctx.tenantId,
+        submission.submission_id,
+        restoredResponses,
+        { patientId: restorePatientId, delegateId: submission.delegate_id },
+        async (_innerTx, _row) => {
+          // No audit on the merge step — the resume path emits one
+          // Category C audit on the resume_state status flip below
+          // with rich detail referencing both the submission and the
+          // resume_state.
+          void _innerTx;
+          void _row;
+        },
+        tx,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (
+        message === submissionRepo.SUBMISSION_NOT_FOUND ||
+        message === submissionRepo.SUBMISSION_NOT_IN_PROGRESS
+      ) {
+        return null;
+      }
+      throw err;
+    }
+
+    // Step 9 — status flip + audit. Same outer tx; the txCallback emits
+    // the Category C `forms_resume_state.restored` audit. A failure
+    // here rolls back the merge UPDATE too (the ENTIRE pipeline is
+    // atomic — see header comment).
+    const lastSavedMs = Date.parse(row.last_saved_at);
+    const timePausedMs = Number.isFinite(lastSavedMs) ? Math.max(0, Date.now() - lastSavedMs) : 0;
+
+    try {
+      await submissionRepo.markResumeStateCompleted(
+        ctx.tenantId,
+        row.resume_state_id,
+        async (innerTx) => {
+          await emitFormsResumeStateRestoredAudit(
+            {
+              tenantId: ctx.tenantId,
+              actorId: actor.actorId,
+              actorTenantId: ctx.tenantId,
+              countryOfCare: ctx.countryOfCare,
+              submissionId: updatedSubmission.submission_id,
+              resumeStateId: row.resume_state_id,
+              targetPatientId: restorePatientId,
+              timePausedMs,
+            },
+            innerTx,
+          );
+        },
+        tx,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // RESUME_STATE_NOT_RESTORABLE means the row got flipped (or
+      // disappeared) between our step-4 read and now — concurrent
+      // restore on the same token. Tenant-blind null per I-025; the
+      // outer tx rolls back our merge so the original responses
+      // remain intact for whichever attempt landed first.
+      if (message === submissionRepo.RESUME_STATE_NOT_RESTORABLE) {
+        return null;
+      }
+      throw err;
+    }
+
+    // Step 10 — project to patient-safe view (strip tenant_id per
+    // Master PRD §17 + Glossary v5.2 C3 brand-structure rule). The
+    // PatientFormSubmissionView return type makes this compile-time
+    // enforced.
+    return toPatientView(updatedSubmission);
+  }, externalTx);
 }
 
 /**

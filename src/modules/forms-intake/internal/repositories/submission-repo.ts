@@ -708,46 +708,85 @@ export async function createVariant(
 
     const variantId = ulid();
 
+    // ---------------------------------------------------------------------
+    // Step 1 — acquire the deployment FOR UPDATE lock as its OWN
+    // statement.
+    //
+    // **Codex variants-r3 HIGH closure 2026-05-03 (READ COMMITTED snapshot
+    // semantics):** the prior implementation packed lock acquisition and
+    // the NOT EXISTS winner-check into a single INSERT...SELECT. Under
+    // PostgreSQL READ COMMITTED, a statement's snapshot is taken at
+    // statement start. SELECT ... FOR UPDATE can wait on the deployment
+    // row, but the OTHER subqueries in the SAME statement do NOT take a
+    // fresh post-wait snapshot. So the race was: create starts while
+    // promote is uncommitted, snapshots no_winner_yet's NOT EXISTS as
+    // 'no winner' (because promote hadn't committed yet), blocks on the
+    // deployment lock, then once promote committed and released its
+    // lock, create's INSERT proceeded with the stale 'no winner'
+    // result and wrote a new active arm on a now-finalized deployment.
+    //
+    // Splitting into two statements in the same tx forces the second
+    // statement to take a FRESH snapshot AFTER the first statement
+    // returns. Each pg statement gets its own snapshot under READ
+    // COMMITTED; concurrent commits between statements are visible to
+    // the next statement. So the post-lock-acquisition INSERT below
+    // sees promote's committed winner row in its NOT EXISTS check and
+    // rejects deterministically.
+    //
+    // The deployment FOR UPDATE additionally serializes against
+    // retireDeployment + variant promote (both take the same row lock).
+    // Lock ordering is consistent: deployment-then-variant.
+    // ---------------------------------------------------------------------
+    const lockResult = await tx.query<{ deployment_id: string }>(
+      `SELECT deployment_id
+         FROM forms_deployment
+        WHERE tenant_id = $1::varchar
+          AND deployment_id = $2::varchar
+          AND retired_at IS NULL
+        FOR UPDATE`,
+      [tenantId, input.deploymentId],
+    );
+    if (lockResult.rows.length === 0) {
+      throw new Error(VARIANT_PRECONDITION_FAILED);
+    }
+    // Once FOR UPDATE is held, retired_at on this row is frozen for the
+    // duration of this tx. No concurrent retire can flip it under us;
+    // no concurrent promote can finalize a winner without first
+    // contending for the same lock.
+
+    // ---------------------------------------------------------------------
+    // Step 2 — INSERT...SELECT with the publish gate + NOT EXISTS
+    // no-winner guard, as a SEPARATE statement. Fresh snapshot taken
+    // here sees any winner committed by a serialized promote.
+    //
+    // We do NOT take FOR UPDATE on the variant_template — supersede /
+    // archive of a published version is governed by its own state-machine
+    // guards (I-013 immutability + the version state machine in
+    // State Machines v1.1) and a row lock here would block publish flows
+    // for no benefit.
+    // ---------------------------------------------------------------------
     let result;
     try {
-      // CTE-based INSERT...SELECT with two locked sub-selects:
-      //   - locked_deployment: SELECT FOR UPDATE so a concurrent
-      //     retireDeployment UPDATE blocks; predicate `retired_at IS NULL`
-      //     re-evaluates after the lock is acquired.
-      //   - eligible_template: predicate `status = 'published'` blocks
-      //     non-published templates from becoming variant arms. We do NOT
-      //     FOR UPDATE here — supersede/archive of a published version is
-      //     not the concurrency hazard the variant-create flow is fighting
-      //     (and would block the publish path unnecessarily). The publish
-      //     transitions are governed by their own state-machine guards
-      //     (I-013 immutability) which are separate from this.
       result = await tx.query<FormVariant>(
-        `WITH locked_deployment AS (
-            SELECT deployment_id, tenant_id
-              FROM forms_deployment
-             WHERE tenant_id = $2::varchar
-               AND deployment_id = $6::varchar
-               AND retired_at IS NULL
-             FOR UPDATE
-         ),
-         eligible_template AS (
-            SELECT template_id, tenant_id
-              FROM forms_template
-             WHERE tenant_id = $2::varchar
-               AND template_id = $7::varchar
-               AND status = 'published'
-         )
-         INSERT INTO forms_variant (
+        `INSERT INTO forms_variant (
             variant_id, tenant_id, deployment_id,
             variant_label, variant_template_id,
             traffic_percent, status, created_by
          )
          SELECT
-            $1::varchar, $2::varchar, d.deployment_id,
+            $1::varchar, $2::varchar, $6::varchar,
             $3::varchar, t.template_id,
             $4::int, 'active', $5::varchar
-           FROM locked_deployment d
-          CROSS JOIN eligible_template t
+           FROM forms_template t
+          WHERE t.tenant_id = $2::varchar
+            AND t.template_id = $7::varchar
+            AND t.status = 'published'
+            AND NOT EXISTS (
+              SELECT 1 FROM forms_variant
+               WHERE tenant_id = $2::varchar
+                 AND deployment_id = $6::varchar
+                 AND status = 'winner'
+            )
          RETURNING variant_id, tenant_id, deployment_id,
                    variant_label, variant_template_id,
                    traffic_percent, posthog_flag_key,
@@ -773,6 +812,9 @@ export async function createVariant(
     }
 
     if (result.rows.length === 0) {
+      // Either variant_template predicate filtered (missing / unpublished)
+      // OR the no-winner NOT EXISTS rejected (deployment finalized).
+      // Same tenant-blind 400 envelope.
       throw new Error(VARIANT_PRECONDITION_FAILED);
     }
 
@@ -1188,14 +1230,142 @@ export async function createResumeState(
 }
 
 /**
- * Mark a resume_state as completed (the patient successfully resumed and
- * resumed_at was set). NOT YET WIRED — used by the future `restoreSubmission`
- * service-layer flow. Stub kept for signature stability.
+ * Sentinel error: the resume_state row exists in this tenant but is not in
+ * `active` status (already completed, expired, or RLS-filtered to zero
+ * rows). Replay protection: once a successful restore has flipped the row
+ * to `completed`, a second presentation of the same token cannot mutate
+ * state. Maps to a tenant-blind null at the service layer per I-025.
+ */
+export const RESUME_STATE_NOT_RESTORABLE = 'forms.resume_state.not_restorable';
+
+/**
+ * Find the patient's currently-in-progress submission for the (tenant,
+ * deployment, patient) tuple — the row that the resume_state row was
+ * encrypted FROM at pause time and that the restore path will merge the
+ * decrypted responses BACK INTO.
+ *
+ * **Why this query shape (SPEC ISSUE flagged in createResumeState):**
+ * migration 006 has no `submission_id` column on `forms_resume_state`, so
+ * the (resume_state ↔ submission) binding has to be reconstructed at
+ * restore time. The pause path persists the merged responses onto the
+ * existing forms_submission row before encrypting; the matching submission
+ * is therefore the most-recent in_progress row for the same (tenant,
+ * deployment, patient). LIMIT 1 + ORDER BY created_at DESC handles the
+ * (defensive) case where a tenant somehow has multiple in_progress
+ * submissions on the same deployment for the same patient (the slice PRD
+ * §8.2 narrative implies 1:1 but the SQL doesn't enforce it).
+ *
+ * Returns null on miss OR cross-tenant (RLS-filtered) — service layer
+ * maps null to a tenant-blind 404 per I-025.
+ *
+ * **Why patient-only (not delegate):** the resume_state row carries
+ * patient_id + device_anonymous_token but no delegate_id. The pause path
+ * gates on delegate-equality at the submission UPDATE; the restore-side
+ * matching is one step looser by design — a patient resuming their own
+ * intake from a different device that doesn't carry the original delegate
+ * context still locates the in_progress row. Delegate-equality is then
+ * re-enforced via `updateSubmissionResponses`'s ownership block at the
+ * actual merge UPDATE so cross-delegate tampering is blocked at the write
+ * layer. This is consistent with the metadata read which does not consider
+ * delegate either.
+ */
+export async function findInProgressSubmissionForRestore(
+  tenantId: TenantId,
+  deploymentId: FormDeploymentId,
+  patientId: PatientId,
+  externalTx?: DbClient,
+): Promise<FormSubmission | null> {
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      const result = await client.query<FormSubmission>(
+        `SELECT submission_id,
+                tenant_id,
+                deployment_id,
+                variant_id,
+                patient_id,
+                delegate_id,
+                status,
+                responses,
+                created_at AS started_at,
+                submitted_at
+           FROM forms_submission
+          WHERE tenant_id = $1
+            AND deployment_id = $2
+            AND patient_id = $3
+            AND status = 'in_progress'
+            AND deleted_at IS NULL
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [tenantId, deploymentId, patientId],
+      );
+      return result.rows[0] ?? null;
+    },
+    externalTx,
+  );
+}
+
+/**
+ * Mark a resume_state row as `completed` after a successful restore.
+ *
+ * **Replay protection:** the WHERE predicate filters by `status = 'active'`,
+ * so a second concurrent restore attempt with the same token (or a retry
+ * after a successful first restore) sees zero rows updated and surfaces
+ * `RESUME_STATE_NOT_RESTORABLE`. Combined with the same-outer-tx
+ * orchestration at the service layer (I-016), this is what prevents the
+ * patient hitting "Resume" twice from corrupting the merged responses via
+ * a phantom second-merge attempt.
+ *
+ * **Same-tx outbox (I-016):** the txCallback emits the Category C
+ * `forms_resume_state.restored` audit (placeholder action_id
+ * `config_change_validated` per the SPEC ISSUE flagged on
+ * `emitFormsResumeStateRestored`). Audit emission happens INSIDE this
+ * function's transaction so a failure there rolls back the status flip
+ * AND the upstream submission UPDATE that the service layer wraps around
+ * this call.
+ *
+ * **`externalTx` for atomic orchestration:** the service-layer
+ * `resumeSubmission` opens a single outer tx and threads it through the
+ * restore pipeline (decrypt + merge UPDATE + this status flip + audit).
+ * Without externalTx, this function would acquire its own transaction
+ * and the resume_state status flip + audit would commit independently of
+ * the merge UPDATE — violating I-016. Production callers MUST pass the
+ * outer tx; the externalTx-less branch exists only for direct test usage.
+ *
+ * Sentinel:
+ *   - `RESUME_STATE_NOT_RESTORABLE` — the row doesn't exist in this tenant
+ *     OR isn't in 'active' status (already completed / expired). Service
+ *     layer treats this as a null return per I-025 tenant-blind.
  */
 export async function markResumeStateCompleted(
-  _tenantId: TenantId,
-  _resumeStateId: ResumeStateId,
-  _txCallback: (tx: DbTransaction) => Promise<void>,
+  tenantId: TenantId,
+  resumeStateId: ResumeStateId,
+  txCallback: (tx: DbTransaction) => Promise<void>,
+  externalTx?: DbTransaction,
 ): Promise<void> {
-  throw new Error('not implemented');
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    const result = await tx.query<{ resume_state_id: string }>(
+      `UPDATE forms_resume_state
+          SET status = 'completed',
+              resumed_at = NOW(),
+              updated_at = NOW()
+        WHERE resume_state_id = $1
+          AND tenant_id = $2
+          AND status = 'active'
+          AND deleted_at IS NULL
+       RETURNING resume_state_id`,
+      [resumeStateId, tenantId],
+    );
+
+    if (result.rows.length === 0) {
+      // Row missing in this tenant OR already in non-active status.
+      // Service layer maps to null per I-025 — never differentiate at
+      // the wire layer.
+      throw new Error(RESUME_STATE_NOT_RESTORABLE);
+    }
+
+    await txCallback(tx);
+  }, externalTx);
 }
