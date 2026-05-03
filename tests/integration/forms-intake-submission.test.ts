@@ -691,6 +691,83 @@ describe('forms-intake updateResponses — recursive crisis scan (verify-r1 HIGH
       ),
     ).rejects.toThrow(submissionService.CRISIS_DETECTED);
   });
+
+  // verify-r2 HIGH closure 2026-05-03: a deeply-nested response under
+  // Fastify's body limit used to overflow the recursive scanner's call
+  // stack and surface as a 5xx, bypassing I-019 escalation. The scanner
+  // is now iterative; depth 30 is well under the 64 budget so the crisis
+  // text at the leaf MUST still be detected.
+  it('detects crisis text nested 30 levels deep', async () => {
+    const programId = `prog_dp_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_dp', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // Build a 30-level-deep nested object with crisis text at the leaf.
+    let nested: Record<string, unknown> = { narrative: 'I want to kill myself' };
+    for (let i = 0; i < 30; i += 1) {
+      nested = { wrap: nested };
+    }
+
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.updateResponses(
+          US_CTX,
+          { actorId: 'op_dp', patientId, delegateId: null },
+          submission.submission_id,
+          { responses: nested },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionService.CRISIS_DETECTED);
+  });
+
+  // verify-r2 HIGH closure 2026-05-03: a payload that exceeds the depth
+  // budget MUST surface as a deterministic RESPONSE_PAYLOAD_TOO_LARGE
+  // sentinel (handler maps to HTTP 413), NOT as a 5xx stack overflow.
+  // The detection skip is not a crisis-detection bypass: no string was
+  // ever scanned, so there's no detection to suppress; the rejection
+  // gates the whole write.
+  it('rejects an over-deep payload with RESPONSE_PAYLOAD_TOO_LARGE', async () => {
+    const programId = `prog_ov_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_ov', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // 100 levels — exceeds the MAX_RESPONSE_DEPTH budget (64).
+    let nested: Record<string, unknown> = { leaf: 'benign' };
+    for (let i = 0; i < 100; i += 1) {
+      nested = { wrap: nested };
+    }
+
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.updateResponses(
+          US_CTX,
+          { actorId: 'op_ov', patientId, delegateId: null },
+          submission.submission_id,
+          { responses: nested },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionService.RESPONSE_PAYLOAD_TOO_LARGE);
+  });
 });
 
 describe('forms-intake updateResponses — JSONB merge preserves prior keys (HIGH closure)', () => {

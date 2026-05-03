@@ -30,7 +30,7 @@ import {
   SUBMISSION_NOT_FOUND,
   SUBMISSION_NOT_IN_PROGRESS,
 } from '../repositories/submission-repo.js';
-import { CRISIS_DETECTED } from '../services/submission-service.js';
+import { CRISIS_DETECTED, RESPONSE_PAYLOAD_TOO_LARGE } from '../services/submission-service.js';
 import * as submissionService from '../services/submission-service.js';
 import type { PatientId } from '../types.js';
 
@@ -237,6 +237,20 @@ export async function updateSubmissionResponsesHandler(
       // audit was already committed before this throw.
       throw req.server.httpErrors.conflict(
         'Crisis content was detected in the response payload; escalation required.',
+      );
+    }
+    if (message === RESPONSE_PAYLOAD_TOO_LARGE) {
+      // Closes Codex submissions-r1 verify-r2 HIGH 2026-05-03: a deeply
+      // nested response payload (within Fastify's 1 MiB body limit) used
+      // to overflow the recursive crisis scanner's call stack and surface
+      // as a 5xx — bypassing I-019 escalation. The scanner is now
+      // iterative with explicit depth + node-count budgets; payloads
+      // exceeding either budget surface here and reject with HTTP 413.
+      // The Category A audit is NOT emitted on this path because no
+      // string was scanned — there's no detection to record. The rejection
+      // is documented at the I-025 envelope layer as a malformed payload.
+      throw req.server.httpErrors.payloadTooLarge(
+        'The response payload is too deeply nested or too large to process.',
       );
     }
     if (isHandledSentinel(message)) {

@@ -144,54 +144,96 @@ export async function startSubmission(
 export const CRISIS_DETECTED = 'forms.submission.crisis_detected';
 
 /**
- * Recursively walk a response payload and call the platform-singleton
+ * Sentinel error code thrown by `scanResponsesForCrisis` when an incoming
+ * response payload exceeds the depth or node-count budget. The handler
+ * maps this to HTTP 413 Payload Too Large.
+ *
+ * **Why this exists (Codex submissions-r1 verify-r2 HIGH closure
+ * 2026-05-03):** the previous recursive walker leaned on JS call-stack
+ * recursion; an attacker-controlled payload of thousands of nested
+ * objects/arrays (well within the 1 MiB Fastify body limit) could trigger
+ * `RangeError: Maximum call stack size exceeded` BEFORE any string was
+ * examined. The RangeError isn't `CRISIS_DETECTED`, so the calling
+ * `updateResponses` would have thrown it as an internal server error —
+ * the I-019 escalation audit + 409 crisis-resources surface would never
+ * fire even when the payload contained crisis text. The iterative
+ * traversal below cannot blow the call stack, and the explicit budget
+ * gives a deterministic 4xx (with audit) instead of a 5xx.
+ */
+export const RESPONSE_PAYLOAD_TOO_LARGE = 'forms.submission.response_payload_too_large';
+
+/** Maximum nesting depth tolerated in a response payload. Realistic forms
+ * with group/repeater hierarchies stay well under 10; 64 is generous. */
+const MAX_RESPONSE_DEPTH = 64;
+
+/** Maximum total node count examined during crisis scan. 50_000 covers
+ * even pathologically-large legitimate payloads while bounding work. */
+const MAX_RESPONSE_NODES = 50_000;
+
+/**
+ * Iteratively walk a response payload and call the platform-singleton
  * `crisisDetector` on every string value found at any depth. Returns the
  * first positive detection (narrowed to the `crisisDetected: true`
  * variant) or null.
  *
- * **Why recursive (Codex submissions-r1 verify-r1 HIGH closure
+ * **Why iterate (Codex submissions-r1 verify-r2 HIGH closure
  * 2026-05-03):** the request schema is `responses: z.record(z.unknown())`
- * — values may be objects, arrays, strings, or any JSON. The prior
- * implementation only scanned top-level string values, so a client
- * could embed crisis text inside `{ "field_x": { "child": "..." } }`
- * or `{ "field_x": ["..."] }` and bypass detection. Walking the full
- * tree closes the bypass.
+ * — values may be objects, arrays, strings, or any JSON. A recursive
+ * walker (the previous shape) was bypassable by submitting a deeply
+ * nested payload that overflowed the call stack before any string was
+ * examined. Stack-based traversal with explicit depth + node-count
+ * bounds closes the bypass; payloads exceeding the bounds throw
+ * `RESPONSE_PAYLOAD_TOO_LARGE` and are rejected with HTTP 413, never
+ * silently swallowed.
  *
- * Recursion stops at primitives — objects + arrays + strings only. A
- * very deep nested response could OOM, but the request body is already
- * bounded by Fastify's `bodyLimit` (1 MiB at the app layer), so the
- * walk is bounded by extension.
+ * **Why pre-existing schema validation isn't enough:** Zod's
+ * `z.record(z.unknown())` deliberately admits arbitrary structure —
+ * Forms Engine v5.2 requires this to support extensible field types.
+ * The depth/node bound here is a Defense-in-Depth gate at the I-019
+ * detection layer, not a schema constraint.
  */
 function scanResponsesForCrisis(
   tenantId: string,
   responses: Record<string, unknown>,
 ): { crisisType: string } | null {
-  function walk(value: unknown): { crisisType: string } | null {
+  type Frame = { value: unknown; depth: number };
+  const stack: Frame[] = [{ value: responses, depth: 0 }];
+  let nodesExamined = 0;
+
+  while (stack.length > 0) {
+    const frame = stack.pop();
+    if (frame === undefined) break; // unreachable; for type narrowing
+    nodesExamined += 1;
+    if (nodesExamined > MAX_RESPONSE_NODES) {
+      throw new Error(RESPONSE_PAYLOAD_TOO_LARGE);
+    }
+    if (frame.depth > MAX_RESPONSE_DEPTH) {
+      throw new Error(RESPONSE_PAYLOAD_TOO_LARGE);
+    }
+    const { value, depth } = frame;
+
     if (typeof value === 'string') {
       const outcome = crisisDetector.detect(value, tenantId, 'form_response');
       if (outcome.crisisDetected) {
         return { crisisType: outcome.crisisType };
       }
-      return null;
+      continue;
     }
     if (Array.isArray(value)) {
       for (const item of value) {
-        const hit = walk(item);
-        if (hit !== null) return hit;
+        stack.push({ value: item, depth: depth + 1 });
       }
-      return null;
+      continue;
     }
     if (value !== null && typeof value === 'object') {
       for (const child of Object.values(value as Record<string, unknown>)) {
-        const hit = walk(child);
-        if (hit !== null) return hit;
+        stack.push({ value: child, depth: depth + 1 });
       }
-      return null;
+      continue;
     }
     // Numbers, booleans, null, undefined — no crisis text possible.
-    return null;
   }
-  return walk(responses);
+  return null;
 }
 
 /**
