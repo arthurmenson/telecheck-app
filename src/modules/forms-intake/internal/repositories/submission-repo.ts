@@ -812,12 +812,128 @@ export async function findVariantById(
   );
 }
 
+/**
+ * Sentinel error: the target variant doesn't exist in this tenant. Same
+ * tenant-blind 400 mapping pattern as VARIANT_PRECONDITION_FAILED;
+ * preserves operator-facing distinction for observability.
+ */
+export const VARIANT_NOT_FOUND = 'forms.variant.not_found';
+
+/**
+ * Sentinel error: the target variant exists but isn't in `active` status.
+ * Per Slice PRD §14.5, only active variants are eligible for winner-promotion;
+ * a retired or already-winner variant rejects the transition.
+ */
+export const VARIANT_NOT_ACTIVE = 'forms.variant.not_active';
+
+/**
+ * Promote a winner variant + retire all other active variants on the same
+ * deployment. Per Slice PRD §14.5:
+ *   - The target variant transitions `active → winner`.
+ *   - All OTHER active variants on the same (tenant, deployment) pair
+ *     transition `active → retired` with `retired_by` + `retired_reason`
+ *     captured for audit.
+ *   - In-progress submissions assigned to losing variants are NOT
+ *     touched — they complete on their assigned variant per Pattern A
+ *     immutability (no mid-flow switching, same discipline as deployment
+ *     retire).
+ *
+ * Concurrent-safety:
+ *   - The target variant SELECT uses `FOR UPDATE` so a concurrent
+ *     promote-the-same-variant or retire-the-same-variant deterministically
+ *     serializes. Mirrors the variant-create lock discipline (closes the
+ *     analogous TOCTOU class addressed in variants-r1 HIGH-1).
+ *   - The losers' UPDATE uses a predicate `status = 'active' AND variant_id
+ *     != $target` so any concurrent winner-promotion that already retired
+ *     a sibling won't re-write its `retired_at`.
+ *
+ * Sentinels (handler maps both to tenant-blind 400 per I-025):
+ *   - VARIANT_NOT_FOUND — target variant not in tenant.
+ *   - VARIANT_NOT_ACTIVE — target exists but isn't active.
+ *
+ * The txCallback receives the promoted variant and the IDs of retired
+ * losers so the service layer can emit one Category B audit per retire
+ * alongside the winner-promotion audit, all in the same transaction.
+ */
 export async function promoteVariantToWinner(
-  _tenantId: TenantId,
-  _variantId: FormVariantId,
-  _txCallback: (tx: DbTransaction) => Promise<void>,
+  tenantId: TenantId,
+  variantId: FormVariantId,
+  retiredBy: string,
+  rationale: string,
+  txCallback: (
+    tx: DbTransaction,
+    promoted: FormVariant,
+    retiredLoserIds: FormVariantId[],
+  ) => Promise<void>,
+  externalTx?: DbTransaction,
 ): Promise<FormVariant> {
-  throw new Error('not implemented');
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    // Lock the target variant row up-front so concurrent promote/retire
+    // calls against the same variant serialize. Predicate filters by tenant
+    // (RLS would too; explicit equality is belt-and-suspenders).
+    const target = await tx.query<{ status: string; deployment_id: string }>(
+      `SELECT status, deployment_id
+         FROM forms_variant
+        WHERE variant_id = $1 AND tenant_id = $2
+        FOR UPDATE`,
+      [variantId, tenantId],
+    );
+    if (target.rows.length === 0) {
+      throw new Error(VARIANT_NOT_FOUND);
+    }
+    const targetRow = target.rows[0]!;
+    if (targetRow.status !== 'active') {
+      throw new Error(VARIANT_NOT_ACTIVE);
+    }
+
+    // Promote the target.
+    const promoteResult = await tx.query<FormVariant>(
+      `UPDATE forms_variant
+          SET status = 'winner', updated_at = NOW()
+        WHERE variant_id = $1 AND tenant_id = $2 AND status = 'active'
+       RETURNING variant_id, tenant_id, deployment_id,
+                 variant_label, variant_template_id,
+                 traffic_percent, posthog_flag_key,
+                 status, created_by, retired_by, retired_reason,
+                 created_at, updated_at, retired_at`,
+      [variantId, tenantId],
+    );
+    if (promoteResult.rows.length === 0) {
+      // The FOR UPDATE above proved status === 'active' under our lock;
+      // if zero rows came back the only explanation is RLS swap or a
+      // concurrent transaction that broke the lock contract. Surface
+      // tenant-blind.
+      throw new Error(VARIANT_NOT_ACTIVE);
+    }
+    const promoted = promoteResult.rows[0]!;
+
+    // Retire all OTHER active variants on the same deployment. Predicate
+    // `status = 'active'` is intentional — concurrent winner-promotions
+    // on a sibling variant of the same deployment would have already
+    // acquired their own FOR UPDATE locks; if a sibling already retired
+    // by such a concurrent transaction, this UPDATE skips it (no double
+    // retire-stamp).
+    const retireResult = await tx.query<{ variant_id: string }>(
+      `UPDATE forms_variant
+          SET status = 'retired',
+              retired_at = NOW(),
+              retired_by = $3,
+              retired_reason = $4,
+              updated_at = NOW()
+        WHERE tenant_id = $1
+          AND deployment_id = $2
+          AND variant_id != $5
+          AND status = 'active'
+       RETURNING variant_id`,
+      [tenantId, targetRow.deployment_id, retiredBy, rationale, variantId],
+    );
+    const retiredLoserIds = retireResult.rows.map((r) => r.variant_id);
+
+    await txCallback(tx, promoted, retiredLoserIds);
+    return promoted;
+  }, externalTx);
 }
 
 // ---------------------------------------------------------------------------

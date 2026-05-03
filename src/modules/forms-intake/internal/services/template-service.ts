@@ -28,6 +28,8 @@ import {
   emitFormsTemplateCreated as emitFormsTemplateCreatedAudit,
   emitFormsTemplateVersionPublished as emitFormsTemplateVersionPublishedAudit,
   emitFormsVariantCreated as emitFormsVariantCreatedAudit,
+  emitFormsVariantRetired as emitFormsVariantRetiredAudit,
+  emitFormsVariantWinnerPromoted as emitFormsVariantWinnerPromotedAudit,
 } from '../../audit.js';
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedEvent,
@@ -39,6 +41,7 @@ import type {
   CreateDeploymentRequest,
   CreateTemplateRequest,
   CreateVariantRequest,
+  PromoteVariantRequest,
   PublishVersionRequest,
 } from '../../schemas.js';
 import * as submissionRepo from '../repositories/submission-repo.js';
@@ -559,4 +562,81 @@ export async function getVariant(
   externalTx?: DbClient,
 ): Promise<FormVariant | null> {
   return submissionRepo.findVariantById(ctx.tenantId, variantId, externalTx);
+}
+
+/**
+ * Promote a variant to winner. Per Slice PRD §14.5:
+ *   - Target variant transitions `active → winner`.
+ *   - All sibling active variants on the same deployment transition to
+ *     `retired` with `retired_by` + `retired_reason` captured.
+ *   - In-progress submissions on losers complete on assigned variants
+ *     (Pattern A immutability — no mid-flow switching).
+ *
+ * Atomicity: the repo opens a transaction, locks the target row with
+ * `FOR UPDATE`, runs the promote + retire UPDATEs, and the txCallback
+ * emits one Category B winner-promotion audit + one Category B retire
+ * audit per loser inside the same transaction. Rollback discards
+ * everything if any audit emission fails.
+ *
+ * **Statistical-significance gate:** the request body carries `pValue` +
+ * `sampleSize` + `rationale` per slice §14.5. The engine RECORDS those
+ * values in the audit detail block but does NOT enforce a p-value
+ * threshold here — that's tenant-policy-config land (e.g., a tenant might
+ * want p < 0.05 with min sample 1000; another might tolerate p < 0.10
+ * with min 500). The admin UI is expected to surface a guardrail; this
+ * service trusts the admin's claim and records it for governance.
+ *
+ * Sentinels mapped (handler maps both to tenant-blind 400 per I-025):
+ *   - VARIANT_NOT_FOUND — target variant not in tenant.
+ *   - VARIANT_NOT_ACTIVE — target exists but isn't active (already
+ *     retired / already winner).
+ */
+export async function promoteVariant(
+  ctx: TenantContext,
+  actorId: string,
+  variantId: FormVariantId,
+  input: PromoteVariantRequest,
+  externalTx?: DbTransaction,
+): Promise<FormVariant> {
+  return submissionRepo.promoteVariantToWinner(
+    ctx.tenantId,
+    variantId,
+    actorId,
+    input.rationale,
+    async (tx, promoted, retiredLoserIds) => {
+      await emitFormsVariantWinnerPromotedAudit(
+        {
+          tenantId: ctx.tenantId,
+          actorId,
+          actorTenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          variantId: promoted.variant_id,
+          deploymentId: promoted.deployment_id,
+          sampleSize: input.sampleSize,
+          pValue: input.pValue,
+          rationale: input.rationale,
+          retiredLoserIds,
+        },
+        tx,
+      );
+      // One retire audit per loser so each retirement is independently
+      // attributable in the audit chain.
+      for (const loserId of retiredLoserIds) {
+        await emitFormsVariantRetiredAudit(
+          {
+            tenantId: ctx.tenantId,
+            actorId,
+            actorTenantId: ctx.tenantId,
+            countryOfCare: ctx.countryOfCare,
+            variantId: loserId,
+            deploymentId: promoted.deployment_id,
+            rationale: input.rationale,
+            promotedWinnerId: promoted.variant_id,
+          },
+          tx,
+        );
+      }
+    },
+    externalTx,
+  );
 }

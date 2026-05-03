@@ -514,3 +514,302 @@ describe('forms-intake getVariant — hit + tenant-blind miss', () => {
     expect(fetched).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// promoteVariant — winner promotion + losing-arm batch retire
+// ---------------------------------------------------------------------------
+
+describe('forms-intake promoteVariant — winner promotion', () => {
+  it('promotes target variant, retires sibling actives, emits one audit per row', async () => {
+    const programId = `prog_var_promote_${ulid().slice(0, 8)}`;
+    const { templateId, deploymentId } = await seedActiveDeployment({
+      ctx: US_CTX,
+      programId,
+    });
+    const altTemplateId = await seedAdditionalTemplate({ ctx: US_CTX, programId });
+
+    // Three active variants on the same deployment: control + A + B.
+    const control = await withTenantContext(TENANT_US, () =>
+      templateService.createVariant(
+        US_CTX,
+        'op_promote_setup',
+        {
+          deploymentId,
+          variantTemplateId: templateId,
+          label: 'control',
+          trafficPercent: 50,
+        },
+        getTestClient(),
+      ),
+    );
+    const armA = await withTenantContext(TENANT_US, () =>
+      templateService.createVariant(
+        US_CTX,
+        'op_promote_setup',
+        {
+          deploymentId,
+          variantTemplateId: altTemplateId,
+          label: 'A',
+          trafficPercent: 25,
+        },
+        getTestClient(),
+      ),
+    );
+    const armB = await withTenantContext(TENANT_US, () =>
+      templateService.createVariant(
+        US_CTX,
+        'op_promote_setup',
+        {
+          deploymentId,
+          variantTemplateId: altTemplateId,
+          label: 'B',
+          trafficPercent: 25,
+        },
+        getTestClient(),
+      ),
+    );
+
+    // Promote arm A as winner.
+    const promoted = await withTenantContext(TENANT_US, () =>
+      templateService.promoteVariant(
+        US_CTX,
+        'op_promote',
+        armA.variant_id,
+        {
+          rationale: 'Arm A converted 12% better; p < 0.01 over n=2000 sessions.',
+          sampleSize: 2000,
+          pValue: 0.005,
+        },
+        getTestClient(),
+      ),
+    );
+    expect(promoted.status).toBe('winner');
+    expect(promoted.variant_id).toBe(armA.variant_id);
+
+    // Verify control + arm B both retired.
+    const controlAfter = await withTenantContext(TENANT_US, () =>
+      templateService.getVariant(US_CTX, control.variant_id, getTestClient()),
+    );
+    const armBAfter = await withTenantContext(TENANT_US, () =>
+      templateService.getVariant(US_CTX, armB.variant_id, getTestClient()),
+    );
+    expect(controlAfter?.status).toBe('retired');
+    expect(controlAfter?.retired_by).toBe('op_promote');
+    expect(armBAfter?.status).toBe('retired');
+    expect(armBAfter?.retired_by).toBe('op_promote');
+
+    // Winner-promotion audit (Category B, target_patient_id null).
+    await withTenantContext(TENANT_US, () =>
+      assertAuditRecordExists(
+        TENANT_US,
+        (rec) =>
+          rec.action === ('forms_variant_winner_promoted' as typeof rec.action) &&
+          rec.category === 'B' &&
+          rec.resource_id === armA.variant_id &&
+          rec.target_patient_id === null,
+      ),
+    );
+    // One retire audit per loser.
+    await withTenantContext(TENANT_US, () =>
+      assertAuditRecordExists(
+        TENANT_US,
+        (rec) =>
+          rec.action === ('forms_variant_retired' as typeof rec.action) &&
+          rec.category === 'B' &&
+          rec.resource_id === control.variant_id &&
+          rec.target_patient_id === null,
+      ),
+    );
+    await withTenantContext(TENANT_US, () =>
+      assertAuditRecordExists(
+        TENANT_US,
+        (rec) =>
+          rec.action === ('forms_variant_retired' as typeof rec.action) &&
+          rec.category === 'B' &&
+          rec.resource_id === armB.variant_id &&
+          rec.target_patient_id === null,
+      ),
+    );
+  });
+});
+
+describe('forms-intake promoteVariant — failure modes', () => {
+  it('rejects a missing variant with VARIANT_NOT_FOUND', async () => {
+    const fakeVariantId = ulid();
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        templateService.promoteVariant(
+          US_CTX,
+          'op_promote_missing',
+          fakeVariantId,
+          {
+            rationale: 'forced',
+            sampleSize: 100,
+            pValue: 0.05,
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.VARIANT_NOT_FOUND);
+  });
+
+  it('rejects an already-winner variant with VARIANT_NOT_ACTIVE', async () => {
+    const programId = `prog_var_promote_dup_${ulid().slice(0, 8)}`;
+    const { templateId, deploymentId } = await seedActiveDeployment({
+      ctx: US_CTX,
+      programId,
+    });
+
+    const control = await withTenantContext(TENANT_US, () =>
+      templateService.createVariant(
+        US_CTX,
+        'op_pdsetup',
+        {
+          deploymentId,
+          variantTemplateId: templateId,
+          label: 'control',
+          trafficPercent: 100,
+        },
+        getTestClient(),
+      ),
+    );
+
+    // First promote: control → winner.
+    await withTenantContext(TENANT_US, () =>
+      templateService.promoteVariant(
+        US_CTX,
+        'op_pd_first',
+        control.variant_id,
+        {
+          rationale: 'first promote',
+          sampleSize: 500,
+          pValue: 0.01,
+        },
+        getTestClient(),
+      ),
+    );
+
+    // Second promote on the same (now winner) variant rejects.
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        templateService.promoteVariant(
+          US_CTX,
+          'op_pd_second',
+          control.variant_id,
+          {
+            rationale: 'second promote',
+            sampleSize: 500,
+            pValue: 0.01,
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.VARIANT_NOT_ACTIVE);
+  });
+
+  it('rejects a retired variant with VARIANT_NOT_ACTIVE', async () => {
+    const programId = `prog_var_promote_ret_${ulid().slice(0, 8)}`;
+    const { templateId, deploymentId } = await seedActiveDeployment({
+      ctx: US_CTX,
+      programId,
+    });
+    const altTemplateId = await seedAdditionalTemplate({ ctx: US_CTX, programId });
+
+    const winner = await withTenantContext(TENANT_US, () =>
+      templateService.createVariant(
+        US_CTX,
+        'op_ret_setup',
+        {
+          deploymentId,
+          variantTemplateId: templateId,
+          label: 'control',
+          trafficPercent: 50,
+        },
+        getTestClient(),
+      ),
+    );
+    const loser = await withTenantContext(TENANT_US, () =>
+      templateService.createVariant(
+        US_CTX,
+        'op_ret_setup',
+        {
+          deploymentId,
+          variantTemplateId: altTemplateId,
+          label: 'A',
+          trafficPercent: 50,
+        },
+        getTestClient(),
+      ),
+    );
+
+    // Promote winner → retires loser.
+    await withTenantContext(TENANT_US, () =>
+      templateService.promoteVariant(
+        US_CTX,
+        'op_ret_promote',
+        winner.variant_id,
+        {
+          rationale: 'r',
+          sampleSize: 100,
+          pValue: 0.04,
+        },
+        getTestClient(),
+      ),
+    );
+
+    // Now attempt to promote the retired loser — must fail.
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        templateService.promoteVariant(
+          US_CTX,
+          'op_ret_attempt',
+          loser.variant_id,
+          {
+            rationale: 'belated',
+            sampleSize: 100,
+            pValue: 0.04,
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.VARIANT_NOT_ACTIVE);
+  });
+
+  it('rejects a cross-tenant promote attempt with VARIANT_NOT_FOUND', async () => {
+    const programId = `prog_var_promote_xt_${ulid().slice(0, 8)}`;
+    const { templateId, deploymentId } = await seedActiveDeployment({
+      ctx: US_CTX,
+      programId,
+    });
+    const usVariant = await withTenantContext(TENANT_US, () =>
+      templateService.createVariant(
+        US_CTX,
+        'op_xt_setup',
+        {
+          deploymentId,
+          variantTemplateId: templateId,
+          label: 'control',
+          trafficPercent: 100,
+        },
+        getTestClient(),
+      ),
+    );
+
+    // Ghana attempt to promote the US variant — RLS rejects.
+    await expect(
+      withTenantContext(TENANT_GHANA, () =>
+        templateService.promoteVariant(
+          GH_CTX,
+          'op_xt_attempt',
+          usVariant.variant_id,
+          {
+            rationale: 'cross-tenant',
+            sampleSize: 100,
+            pValue: 0.04,
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.VARIANT_NOT_FOUND);
+  });
+});

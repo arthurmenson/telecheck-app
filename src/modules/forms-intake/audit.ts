@@ -768,10 +768,15 @@ export async function emitFormsVariantDeployed(
 }
 
 /**
- * Emit a variant winner-promotion audit. Per Slice PRD §14.5/§14.6, captures
- * sample size, p-value, and rationale.
+ * Emit a `forms_variant_winner_promoted` audit when a tenant admin promotes
+ * a statistically-significant winner variant to new Control. Per Slice PRD
+ * §14.5/§14.6, captures sample size, p-value, and rationale. Category B,
+ * admin-scope event (`target_patient_id: null` per the same pattern as
+ * other admin emitters).
  *
- * SPEC ISSUE: action 'forms_variant_winner_promoted' is not canonical.
+ * SPEC ISSUE per EHBG §12: action ID `forms_variant_winner_promoted` is
+ * not canonical in AUDIT_EVENTS v5.2 — flagged with `as AuditAction`
+ * cast pending Engineering Lead ratification.
  */
 export async function emitFormsVariantWinnerPromoted(
   args: {
@@ -780,29 +785,74 @@ export async function emitFormsVariantWinnerPromoted(
     actorTenantId: string;
     countryOfCare: string;
     variantId: FormVariantId;
-    targetPatientId: PatientId;
+    deploymentId: FormDeploymentId;
     sampleSize: number;
     pValue: number;
     rationale: string;
+    retiredLoserIds: FormVariantId[];
   },
-  tx?: AuditDbClient,
+  tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope('config_change_validated', 'B', {
+    buildEnvelope('forms_variant_winner_promoted' as AuditAction, 'B', {
       tenant_id: args.tenantId,
       actor_type: 'operator',
       actor_id: args.actorId,
       actor_tenant_id: args.actorTenantId,
-      target_patient_id: args.targetPatientId,
+      target_patient_id: null, // platform-scope event
       country_of_care: args.countryOfCare,
       resource_type: 'form_variant',
       resource_id: args.variantId,
       detail: {
-        intent: 'forms_variant_winner_promoted',
         variant_id: args.variantId,
+        deployment_id: args.deploymentId,
         sample_size: args.sampleSize,
         p_value: args.pValue,
         rationale: args.rationale,
+        retired_loser_ids: args.retiredLoserIds,
+      },
+    }),
+    tx,
+  );
+}
+
+/**
+ * Emit a `forms_variant_retired` audit when a sibling variant is retired
+ * as part of a winner-promotion (Slice PRD §14.5 — losers retire when a
+ * winner is promoted). Category B, admin-scope, target_patient_id null.
+ *
+ * One audit row per retired loser so each retirement is independently
+ * attributable in the audit chain.
+ */
+export async function emitFormsVariantRetired(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    variantId: FormVariantId;
+    deploymentId: FormDeploymentId;
+    rationale: string;
+    promotedWinnerId: FormVariantId;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildEnvelope('forms_variant_retired' as AuditAction, 'B', {
+      tenant_id: args.tenantId,
+      actor_type: 'operator',
+      actor_id: args.actorId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: null, // platform-scope event
+      country_of_care: args.countryOfCare,
+      resource_type: 'form_variant',
+      resource_id: args.variantId,
+      detail: {
+        variant_id: args.variantId,
+        deployment_id: args.deploymentId,
+        rationale: args.rationale,
+        promoted_winner_id: args.promotedWinnerId,
+        retired_as_part_of: 'winner_promotion',
       },
     }),
     tx,

@@ -17,9 +17,11 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { CreateVariantRequestSchema } from '../../schemas.js';
+import { CreateVariantRequestSchema, PromoteVariantRequestSchema } from '../../schemas.js';
 import {
   VARIANT_LABEL_CONFLICT,
+  VARIANT_NOT_ACTIVE,
+  VARIANT_NOT_FOUND,
   VARIANT_PRECONDITION_FAILED,
 } from '../repositories/submission-repo.js';
 import * as templateService from '../services/template-service.js';
@@ -121,19 +123,52 @@ export async function getVariantHandler(
 /**
  * POST /v0/forms/variants/:variantId/promote — promote a statistically
  * significant winner to new Control. Per Slice PRD §14.5 retires losing
- * variants; in-progress submissions complete on assigned variant.
+ * variants; in-progress submissions complete on assigned variant
+ * (Pattern A immutability).
  *
- * **Still STUBBED** at this commit — promotion has additional dependencies
- * (statistical-significance gate, batch-retire of losers, in-progress
- * submission preservation discipline). Tracked in the next Forms/Intake
- * batch.
+ * Sentinel error mapping (tenant-blind 400 per I-025):
+ *   - VARIANT_NOT_FOUND — target variant not in tenant.
+ *   - VARIANT_NOT_ACTIVE — target exists but isn't active (retired /
+ *     already winner). Both surface as the same byte-identical 400
+ *     envelope; structured codes preserve operator-facing distinction.
  */
 export async function promoteVariantHandler(
   req: FastifyRequest,
-  _reply: FastifyReply,
+  reply: FastifyReply,
 ): Promise<unknown> {
-  void requireTenantContext(req);
-  throw req.server.httpErrors.notImplemented(
-    'POST /v0/forms/variants/:variantId/promote is not yet wired.',
-  );
+  const ctx = requireTenantContext(req);
+  const actorId = resolveActorId(req);
+
+  const params = req.params as Record<string, unknown>;
+  const variantIdParam = params['variantId'];
+  if (typeof variantIdParam !== 'string' || variantIdParam.length === 0) {
+    throw req.server.httpErrors.badRequest('Path param `variantId` is required.');
+  }
+
+  const parsed = PromoteVariantRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    throw req.server.httpErrors.badRequest(
+      `Invalid request body: ${parsed.error.errors
+        .map((e) => `${e.path.join('.')}: ${e.message}`)
+        .join('; ')}`,
+    );
+  }
+
+  try {
+    const promoted = await templateService.promoteVariant(
+      ctx,
+      actorId,
+      variantIdParam,
+      parsed.data,
+    );
+    return reply.code(200).send(promoted);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === VARIANT_NOT_FOUND || message === VARIANT_NOT_ACTIVE) {
+      throw req.server.httpErrors.badRequest(
+        'The requested variant cannot be promoted in its current state.',
+      );
+    }
+    throw err;
+  }
 }
