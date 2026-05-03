@@ -27,6 +27,7 @@ import {
 } from '../../schemas.js';
 import {
   DEPLOYMENT_NOT_FOUND,
+  RESUME_STATE_IDENTITY_REQUIRED,
   SUBMISSION_NOT_FOUND,
   SUBMISSION_NOT_IN_PROGRESS,
 } from '../repositories/submission-repo.js';
@@ -101,7 +102,8 @@ function isHandledSentinel(message: string): boolean {
   return (
     message === DEPLOYMENT_NOT_FOUND ||
     message === SUBMISSION_NOT_FOUND ||
-    message === SUBMISSION_NOT_IN_PROGRESS
+    message === SUBMISSION_NOT_IN_PROGRESS ||
+    message === RESUME_STATE_IDENTITY_REQUIRED
   );
 }
 
@@ -187,12 +189,42 @@ export async function getSubmissionHandler(
 
 /**
  * PATCH /v0/forms/submissions/:submissionId/responses — auto-save partial
- * responses or explicit save-and-leave. Crisis detection runs first per
- * I-019 (currently DEFERRED — wiring stub in service layer).
+ * responses (`pause` undefined or false) OR explicit save-and-leave
+ * (`pause === true`). Branches on `parsed.data.pause`:
  *
- * Sentinel error mapping:
- *   - SUBMISSION_NOT_FOUND       → 400
- *   - SUBMISSION_NOT_IN_PROGRESS → 400 (I-013 immutability)
+ *   - `pause !== true`: routes to `submissionService.updateResponses`,
+ *     which does the merge + auto-save (no audit, no event, no
+ *     resume_state row).
+ *   - `pause === true`: routes to `submissionService.pauseSubmission`,
+ *     which merges + encrypts + creates the resume_state row + emits
+ *     the Category C audit + the `forms_resume_state.saved` domain
+ *     event in a single same-tx outbox path (I-016). The response
+ *     shape includes the resume token so the patient app can render
+ *     the resume URL immediately.
+ *
+ * Crisis detection runs FIRST in BOTH branches per I-019 platform-floor.
+ * A positive detection emits the Category A audit and surfaces 409
+ * crisis_detected; no merge, no resume_state row.
+ *
+ * Sentinel error mapping (tenant-blind 400 per I-025):
+ *   - SUBMISSION_NOT_FOUND            → 400
+ *   - SUBMISSION_NOT_IN_PROGRESS      → 400 (I-013 immutability)
+ *   - RESUME_STATE_IDENTITY_REQUIRED  → 400 (defensive — v0.1 entrypoint
+ *     always supplies patient identity)
+ *
+ * **No tenant_id leak** in either branch — pause response carries only
+ * the submission state (already tenant_id-bearing at the type layer
+ * because FormSubmission includes it; SPEC ISSUE flagged below) and the
+ * resume metadata (no tenant_id).
+ *
+ * **SPEC ISSUE flag (preserved):** the `FormSubmission` type still carries
+ * `tenant_id` — which the auto-save endpoint already returns. The
+ * patient-surface rule (Master PRD §17 + Glossary v5.2 C3) calls for
+ * `tenant_id` removal on patient surfaces; the existing endpoint is in
+ * scope for that closure separately. The pause path's NEW surface (the
+ * `resumeState` block) deliberately omits tenant_id; the legacy
+ * `submission` block matches whatever the auto-save endpoint already
+ * returns to keep client compatibility.
  */
 export async function updateSubmissionResponsesHandler(
   req: FastifyRequest,
@@ -218,6 +250,17 @@ export async function updateSubmissionResponsesHandler(
   }
 
   try {
+    if (parsed.data.pause === true) {
+      // Explicit save-and-leave path — slice PRD §8.2.
+      const result = await submissionService.pauseSubmission(
+        ctx,
+        { actorId, patientId, delegateId },
+        submissionIdParam,
+        parsed.data,
+      );
+      return reply.code(200).send(result);
+    }
+
     const submission = await submissionService.updateResponses(
       ctx,
       { actorId, patientId, delegateId },

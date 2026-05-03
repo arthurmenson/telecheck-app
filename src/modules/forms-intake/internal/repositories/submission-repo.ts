@@ -878,36 +878,149 @@ export async function findResumeStateById(
 }
 
 /**
- * Insert a new resume_state row. Currently NOT YET WIRED — the patient-side
- * pause path (`updateResponses` with `pause === true`) is still TODO; once
- * that path is implemented this function will be its repo backing.
+ * Sentinel error: caller did not supply at least one identity anchor. The
+ * migration's `chk_resume_identity` CHECK requires `patient_id IS NOT NULL OR
+ * device_anonymous_token IS NOT NULL`. We pre-validate at the repo layer so
+ * the caller gets a structured sentinel rather than a raw 23514
+ * check_violation surfacing at the SQL boundary. Maps to a tenant-blind 400
+ * at the handler.
+ */
+export const RESUME_STATE_IDENTITY_REQUIRED = 'forms.resume_state.identity_required';
+
+/**
+ * Insert a new resume_state row + run the caller's `txCallback` (which
+ * commits the audit + domain event) inside the same transaction.
  *
- * **SPEC ISSUE per EHBG §12** (flagged 2026-05-03):
+ * **Same-tx outbox discipline (I-016):** the audit-record INSERT and the
+ * domain-event-outbox INSERT live inside `txCallback`; if either throws,
+ * the resume_state row is rolled back too. Callers MUST NOT swallow the
+ * throw.
+ *
+ * **Identity guard (CHECK chk_resume_identity):** at least one of
+ * `patientId` or `deviceAnonymousToken` must be non-null. Both null surfaces
+ * as the `RESUME_STATE_IDENTITY_REQUIRED` sentinel before SQL runs.
+ *
+ * **Composite-FK alignment:** the migration's `fk_resume_state_deployment`
+ * is `(tenant_id, deployment_id) → forms_deployment` and
+ * `fk_resume_state_variant` is the triple-composite
+ * `(tenant_id, deployment_id, variant_id) → forms_variant` (only fires when
+ * `variant_id IS NOT NULL`). Both are tenant-bound at the DB layer; this
+ * function adds an explicit `set_tenant_context` for layer-2 RLS coverage.
+ *
+ * **SPEC ISSUE per EHBG §12** (preserved from prior stub):
  *
  *   - migration 006 has no `submission_id` column on `forms_resume_state`,
  *     yet the slice §8 narrative implies a 1:1 binding from a paused
- *     submission to its resume_state. Either migration 007 must add the
- *     column, or the service layer must reconstruct the binding via
- *     `(tenant_id, deployment_id, patient_id, status='in_progress')` on
- *     `forms_submission`.
+ *     submission to its resume_state. The service layer reconstructs the
+ *     binding via `(tenant_id, deployment_id, patient_id, status='in_progress')`
+ *     on `forms_submission` until migration 007 adds the column.
  *
  *   - `device_anonymous_token` (anonymous-flow path) intersects the broader
  *     §8.2 device-anonymous flow that today is blocked by
- *     `forms_submission.patient_id NOT NULL`. Both gaps land together.
+ *     `forms_submission.patient_id NOT NULL`. The pause path therefore
+ *     only exercises `patientId IS NOT NULL` end-to-end at v0.1; the
+ *     `deviceAnonymousToken` parameter is plumbed through for forward-
+ *     compat with the anonymous flow once the migration patch lands.
  *
- * Until the pause path is wired, callers reach this function only through
- * tests that seed rows directly via SQL.
+ * Type casts on the SELECT params close the same pg parameter type-
+ * inference hazard handled in `createSubmission` — every projected param
+ * is pinned to its expected type so a parameter that appears in both a
+ * SELECT projection and a WHERE comparison resolves consistently.
  */
 export async function createResumeState(
-  _tenantId: TenantId,
-  _input: {
-    submissionId: FormSubmissionId;
+  tenantId: TenantId,
+  input: {
     patientId: PatientId | null;
+    deviceAnonymousToken: string | null;
+    deploymentId: FormDeploymentId;
+    variantId: FormVariantId | null;
+    encryptedPartialResponses: Buffer;
+    currentSectionIndex: number;
+    progressPercent: number;
     expiresAt: string;
   },
-  _txCallback: (tx: DbTransaction, resumeState: ResumeState) => Promise<void>,
+  txCallback: (tx: DbTransaction, resumeState: ResumeState) => Promise<void>,
+  externalTx?: DbTransaction,
 ): Promise<ResumeState> {
-  throw new Error('not implemented');
+  if (input.patientId === null && input.deviceAnonymousToken === null) {
+    // Migration's chk_resume_identity would also reject this with a 23514
+    // — but the structured sentinel preserves the operator-facing error
+    // code and lets the handler map to a tenant-blind 400.
+    throw new Error(RESUME_STATE_IDENTITY_REQUIRED);
+  }
+
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    const resumeStateId = ulid();
+
+    // Explicit casts on every parameter close the pg type-inference hazard
+    // documented on `createSubmission` (a $n that appears in both a
+    // projection AND a comparison without context fails with "inconsistent
+    // types deduced for parameter $n"). Pinned types: $5::bytea for the
+    // encrypted payload, $9::timestamptz for the expiry, smallint for
+    // progress_percent (matches the migration's SMALLINT column).
+    const result = await tx.query<ResumeState>(
+      `INSERT INTO forms_resume_state (
+          resume_state_id, tenant_id,
+          patient_id, device_anonymous_token,
+          deployment_id, variant_id,
+          encrypted_partial_responses,
+          current_section_index, progress_percent,
+          status, expires_at,
+          created_at, updated_at, last_saved_at
+       )
+       VALUES (
+          $1::varchar, $2::varchar,
+          $3::varchar, $4::text,
+          $5::varchar, $6::varchar,
+          $7::bytea,
+          $8::int, $9::smallint,
+          'active', $10::timestamptz,
+          NOW(), NOW(), NOW()
+       )
+       RETURNING resume_state_id,
+                 tenant_id,
+                 patient_id,
+                 device_anonymous_token,
+                 deployment_id,
+                 variant_id,
+                 encrypted_partial_responses,
+                 current_section_index,
+                 progress_percent,
+                 status,
+                 expires_at,
+                 created_at,
+                 updated_at,
+                 last_saved_at,
+                 resumed_at`,
+      [
+        resumeStateId,
+        tenantId,
+        input.patientId,
+        input.deviceAnonymousToken,
+        input.deploymentId,
+        input.variantId,
+        input.encryptedPartialResponses,
+        input.currentSectionIndex,
+        input.progressPercent,
+        input.expiresAt,
+      ],
+    );
+
+    // RETURNING on a plain INSERT...VALUES never returns zero rows on
+    // success; a zero-row outcome would mean the INSERT was filtered (it
+    // can't be — there's no SELECT predicate) or threw. Defensive guard
+    // surfaces a clear error rather than a confusing TS narrowing failure
+    // downstream.
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error('forms.resume_state.insert_returned_zero_rows');
+    }
+
+    await txCallback(tx, row);
+    return row;
+  }, externalTx);
 }
 
 /**
