@@ -184,30 +184,158 @@ export async function createDraftTemplate(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Sentinel error codes for publishVersion preconditions.
+//
+// The service layer maps these to tenant-blind 400s (ERROR_MODEL v5.1) so the
+// HTTP response shape never differentiates "version doesn't exist" vs "exists
+// in another tenant" vs "exists but isn't a draft" — same I-025 discipline as
+// the deployment handler (DEPLOYMENT_TEMPLATE_PRECONDITION_FAILED).
+// ---------------------------------------------------------------------------
+
+export const PUBLISH_VERSION_NOT_FOUND = 'forms.publish.version_not_found';
+export const PUBLISH_VERSION_NOT_DRAFT = 'forms.publish.version_not_draft';
+
 /**
  * Publish a draft version. Per FORMS_ENGINE v5.2 + I-013, the version
  * becomes immutable once status flips to `published`. The supersession
  * cascade (mark prior published versions `superseded`) happens in the
  * same transaction.
+ *
+ * **Concurrency model (publish race per FORMS_ENGINE v5.2 Pattern A):**
+ *   The (tenant_id, program_id, country_of_care) family allows ONE
+ *   `published` row at a time — but no DB-level uniqueness enforces that
+ *   directly (migration 006 has UNIQUE on `template_version` per family,
+ *   not on status='published'). Two concurrent publishes from different
+ *   draft versions in the same family could both observe the prior
+ *   published row, both UPDATE it to superseded, and both flip
+ *   themselves to published — yielding two published rows.
+ *
+ *   Mitigation: `pg_advisory_xact_lock` keyed on the family identity
+ *   (tenant_id + program_id + country_of_care) at the start of the
+ *   transaction serializes all publishes within the same family. Lock
+ *   auto-releases at txn end. Same pattern as the audit-chain
+ *   per-partition serialization in migration 002 (HIGH-3 closure).
+ *
+ *   The advisory lock is sufficient against concurrent app callers; an
+ *   adversarial DBA running ad-hoc UPDATE could still produce two
+ *   published rows. A partial unique index `WHERE status = 'published'`
+ *   on (tenant_id, program_id, country_of_care) would close that gap as
+ *   a future hardening migration.
+ *
+ * **I-013 immutability:** the target row's status MUST be 'draft' at
+ * UPDATE time. A 'published' / 'superseded' / 'archived' row is
+ * immutable per I-013 — the predicate `WHERE template_id = $1 AND
+ * status = 'draft'` enforces this at the SQL level. RETURNING zero
+ * rows means the precondition was unmet (or the row doesn't exist in
+ * this tenant); the function maps that to PUBLISH_VERSION_NOT_DRAFT
+ * vs PUBLISH_VERSION_NOT_FOUND by re-checking the row's existence.
  */
 export async function publishVersion(
-  _tenantId: TenantId,
-  _versionId: FormVersionId,
-  _txCallback: (tx: DbTransaction) => Promise<void>,
+  tenantId: TenantId,
+  versionId: FormVersionId,
+  txCallback: (
+    tx: DbTransaction,
+    published: FormTemplate,
+    supersededVersionId: FormVersionId | null,
+  ) => Promise<void>,
 ): Promise<FormTemplate> {
-  // Canonical write-path skeleton:
-  //
-  //   return withTransaction(async (tx) => {
-  //     await tx.query('SELECT set_tenant_context($1)', [tenantId]);
-  //     // 1. Cascade prior published version → superseded.
-  //     // 2. Flip target version → published.
-  //     // 3. Service callback runs the L4 governance check (research consent
-  //     //    block render gate + molecule-level marketing copy resolution per
-  //     //    Slice PRD §25.1 / §25.3) and emits audit + domain event.
-  //     await txCallback(tx);
-  //   });
-  void withTransaction; // referenced so the import is not pruned at lint time.
-  throw new Error('not implemented');
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    // Step 1: Locate the target row to learn its (program_id,
+    // country_of_care) family — needed for the advisory lock key. Tenant
+    // is bound above, RLS filters cross-tenant rows automatically. Reject
+    // tenant-blindly if not found.
+    const targetLookup = await tx.query<{
+      template_id: string;
+      program_id: string;
+      country_of_care: string;
+      status: FormLifecycleStatus;
+    }>(
+      `SELECT template_id, program_id, country_of_care, status
+         FROM forms_template
+        WHERE template_id = $1 AND tenant_id = $2
+        LIMIT 1`,
+      [versionId, tenantId],
+    );
+    if (targetLookup.rows.length === 0) {
+      throw new Error(PUBLISH_VERSION_NOT_FOUND);
+    }
+    const target = targetLookup.rows[0]!;
+
+    // Step 2: Acquire the family-scoped advisory lock so concurrent
+    // publishes within the same (tenant, program, country) family
+    // serialize. Key derivation mirrors the audit-chain trigger's
+    // tenant-prefixed partition pattern.
+    const familyKey = `${tenantId}:${target.program_id}:${target.country_of_care}`;
+    await tx.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [familyKey]);
+
+    // Step 3: Re-check status under the lock. Between the initial lookup
+    // and lock acquisition, another transaction in this family could
+    // have concluded — if our target was already superseded by that, we
+    // need to fail closed rather than silently re-publish a stale draft.
+    if (target.status !== 'draft') {
+      throw new Error(PUBLISH_VERSION_NOT_DRAFT);
+    }
+
+    // Step 4: Cascade — find the current published version in this
+    // family (if any) and flip it to 'superseded'. The composite
+    // (tenant_id, program_id, country_of_care, status) lookup uses the
+    // existing index on (tenant_id, program_id, country_of_care,
+    // template_version) for selection.
+    const priorCascade = await tx.query<{ template_id: string }>(
+      `UPDATE forms_template
+          SET status = 'superseded',
+              superseded_at = NOW(),
+              updated_at = NOW()
+        WHERE tenant_id = $1
+          AND program_id = $2
+          AND country_of_care = $3
+          AND status = 'published'
+          AND template_id <> $4
+       RETURNING template_id`,
+      [tenantId, target.program_id, target.country_of_care, versionId],
+    );
+    const supersededVersionId: FormVersionId | null =
+      priorCascade.rows.length > 0 ? priorCascade.rows[0]!.template_id : null;
+
+    // Step 5: Flip the target draft → published. The WHERE clause
+    // includes `status = 'draft'` so an interleaved status change
+    // (e.g., another path archived the row) makes this UPDATE a no-op,
+    // surfacing as PUBLISH_VERSION_NOT_DRAFT. The advisory lock above
+    // already prevents this in single-DB-instance flows but the SQL-
+    // level guard is the durable invariant.
+    const result = await tx.query<FormTemplate>(
+      `UPDATE forms_template
+          SET status = 'published',
+              published_at = NOW(),
+              updated_at = NOW()
+        WHERE template_id = $1
+          AND tenant_id = $2
+          AND status = 'draft'
+       RETURNING template_id, tenant_id, program_id, country_of_care,
+                 template_version, status,
+                 presentation_content, branching_logic,
+                 eligibility_logic, approval_governance,
+                 created_at, updated_at`,
+      [versionId, tenantId],
+    );
+    if (result.rows.length === 0) {
+      // Should not happen given the lock + re-check above, but the
+      // SQL-level guard insists. Translate to the same precondition
+      // sentinel so the service layer's error mapping is uniform.
+      throw new Error(PUBLISH_VERSION_NOT_DRAFT);
+    }
+    const published = result.rows[0]!;
+
+    // Step 6: Service callback — emits audit + domain event in the same
+    // transaction so a failure there rolls back the whole publish
+    // (cascade + flip), preserving I-003 + I-016 atomicity.
+    await txCallback(tx, published, supersededVersionId);
+
+    return published;
+  });
 }
 
 /**

@@ -93,6 +93,56 @@ export async function emitFormsTemplateCreated(
 }
 
 /**
+ * Emit `forms_template.version_published` — tenant admin promoted a draft
+ * version to `published`, with optional supersession of a prior published
+ * version in the same family. Per Slice PRD §6.2 publish workflow + I-013
+ * immutability semantics.
+ *
+ * Same SPEC ISSUE caveat as emitFormsTemplateCreated: DOMAIN_EVENTS v5.2
+ * doesn't enumerate this event_type on the forms_template aggregate;
+ * pending Engineering Lead ratification per EHBG §12.
+ *
+ * Subscribers (Pharmacy / Refill / analytics): when `prior_published_version_id`
+ * is non-null, deployments still pointing at the prior version remain valid
+ * for in-progress submissions per FORMS_ENGINE v5.2 (no mid-flow switch);
+ * new submissions get the freshly-published version. Subscribers that route
+ * by deployment-active-template SHOULD treat the prior version as superseded
+ * once they observe this event.
+ */
+export async function emitFormsTemplateVersionPublished(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    templateId: FormTemplateId;
+    versionId: FormVersionId;
+    programId: string;
+    countryOfCare: string;
+    templateVersion: number;
+    priorPublishedVersionId: FormVersionId | null;
+    actorId: string;
+    changeNotes: string | null;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_TEMPLATE_AGGREGATE,
+    aggregate_id: args.versionId,
+    event_type: 'forms_template.version_published',
+    payload: {
+      template_id: args.templateId,
+      version_id: args.versionId,
+      program_id: args.programId,
+      country_of_care: args.countryOfCare,
+      template_version: args.templateVersion,
+      prior_published_version_id: args.priorPublishedVersionId,
+      actor_id: args.actorId,
+      change_notes: args.changeNotes,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
+
+/**
  * Emit `forms_deployment.created` — tenant admin deployed a published
  * template to a program. Per Slice PRD §6.2 deployment workflow.
  *

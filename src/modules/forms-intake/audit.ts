@@ -183,6 +183,66 @@ export async function emitFormsTemplateCreated(
 }
 
 /**
+ * Emit `forms_template_version_published` — tenant admin promoted a draft
+ * template version to `published`, simultaneously superseding any prior
+ * published version in the same (tenant, program, country) family.
+ * Category B (governance / config).
+ *
+ * Same SPEC ISSUE caveat as emitFormsTemplateCreated: AUDIT_EVENTS v5.2
+ * doesn't enumerate `forms_template_version_published`; the closest
+ * Engineering-Lead-ratified action is `config_change_validated`. Using the
+ * descriptive action ID here (typed via `as AuditAction`) preserves the
+ * SPEC-ISSUE flag — grep for `as AuditAction` to find unratified action
+ * IDs awaiting Engineering Lead amendment per EHBG §12.
+ *
+ * `priorPublishedVersionId` is null when this publish is the first
+ * published version for the family (no prior to supersede). When non-null,
+ * the supersession cascade ran in the same transaction; the audit detail
+ * captures both ends of the cascade so a chain walker can reconstruct the
+ * lifecycle without joining additional tables.
+ */
+export async function emitFormsTemplateVersionPublished(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    templateId: FormTemplateId;
+    versionId: FormVersionId;
+    programId: string;
+    templateVersion: number;
+    priorPublishedVersionId: FormVersionId | null;
+    changeNotes: string | null;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    {
+      ...buildEnvelope('forms_template_version_published' as AuditAction, 'B', {
+        tenant_id: args.tenantId,
+        actor_type: 'operator',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: null, // platform-scope event
+        country_of_care: args.countryOfCare,
+        resource_type: 'forms_template',
+        resource_id: args.versionId,
+        detail: {
+          template_id: args.templateId,
+          version_id: args.versionId,
+          program_id: args.programId,
+          template_version: args.templateVersion,
+          status: 'published',
+          prior_published_version_id: args.priorPublishedVersionId,
+          change_notes: args.changeNotes,
+        },
+      }),
+    },
+    tx,
+  );
+}
+
+/**
  * Emit `forms_deployment_created` — tenant admin deployed a published
  * template to a program market. Category B (governance / config).
  *

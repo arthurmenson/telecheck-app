@@ -24,10 +24,12 @@ import type { TenantContext } from '../../../../lib/tenant-context.js';
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedAudit,
   emitFormsTemplateCreated as emitFormsTemplateCreatedAudit,
+  emitFormsTemplateVersionPublished as emitFormsTemplateVersionPublishedAudit,
 } from '../../audit.js';
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedEvent,
   emitFormsTemplateCreated as emitFormsTemplateCreatedEvent,
+  emitFormsTemplateVersionPublished as emitFormsTemplateVersionPublishedEvent,
 } from '../../events.js';
 import type {
   CreateDeploymentRequest,
@@ -117,17 +119,92 @@ export async function createDraftTemplate(
  * On success: cascades prior published version → superseded; flips target
  * version → published; emits the corresponding governance audit + domain
  * event inside the same transaction.
+ *
+ * **Pre-publish gate scaffolding (Forms/Intake bootstrap commit):** the
+ * four governance gates above arrive with the v1.10 governance work
+ * (I-030 static analyzer, MarketingCopy resolver, Mode 2 contract
+ * validator, L3 dual-control). At this commit they are TODO stubs noted
+ * in comments below; the publish path's durability + supersession +
+ * audit-emission pattern is implemented end-to-end so the gates can
+ * slot in front without restructuring the write path.
+ *
+ * **Sentinel-throw error contract (mirrors createDeployment):**
+ *   - `forms.publish.version_not_found` — version doesn't exist in this
+ *     tenant. Maps to a tenant-blind 400 (NOT 404) so we don't leak
+ *     cross-tenant existence per I-025.
+ *   - `forms.publish.version_not_draft` — version exists but its status
+ *     is not `draft` (already published, superseded, or archived).
+ *     I-013 immutability enforcement; maps to 400.
+ *
+ * @param ctx — tenant context resolved from the request.
+ * @param actorId — operator authoring the publish action; flows into
+ *                  audit envelope `actor_id` + domain-event payload.
+ * @param versionId — Pattern A: each row of forms_template IS a version,
+ *                    so the URL's `:versionId` segment maps directly to
+ *                    `forms_template.template_id`. The handler also
+ *                    receives `:templateId` from the path for REST
+ *                    symmetry; it's currently unused at the service
+ *                    layer (no separate template-family identity exists
+ *                    in the data model yet — see SPEC ISSUE in routes.ts).
+ * @param input — PublishVersionRequest body (just optional change notes
+ *                at scaffold; the Tenant Clinical Lead sign-off arrives
+ *                via the consent module + the audit chain, not this body).
  */
 export async function publishVersion(
-  _ctx: TenantContext,
-  _actorId: string,
-  _templateId: FormTemplateId,
-  _input: PublishVersionRequest,
+  ctx: TenantContext,
+  actorId: string,
+  versionId: FormTemplateId,
+  input: PublishVersionRequest,
 ): Promise<FormTemplate> {
-  // TODO: run static-analysis evaluator (six-category I-030 enforcement),
-  // marketing-copy resolver, Mode 2 contract validator; on success
-  // delegate to template-repo.publishVersion threading audit emission.
-  throw new Error('not implemented');
+  // TODO (deferred — v1.10 governance work):
+  //   1. Run six-category I-030 static analyzer over presentation_content +
+  //      branching_logic + eligibility_logic + approval_governance for any
+  //      reference to research_consent_status. Reject publish on any hit.
+  //   2. Walk presentation_content for molecule-level L1 references; for each
+  //      MarketingCopy id, verify the entity exists in `approved` status.
+  //      Reject publish on any unapproved reference.
+  //   3. Walk approval_governance for Mode 2 contract assertions; reject if
+  //      contract validator flags any field.
+  //   4. Verify L3 dual-control: the calling actor MUST NOT be the same
+  //      operator who authored any pending eligibility-logic change. Cross-
+  //      check against the audit chain.
+  // All four gates SHOULD be invoked here (before delegating to the repo)
+  // so a gate failure aborts before any DB write. The repo's withTransaction
+  // boundary is the durability point; the gates above it are governance.
+
+  return templateRepo.publishVersion(
+    ctx.tenantId,
+    versionId,
+    async (tx, published, supersededVersionId) => {
+      await emitFormsTemplateVersionPublishedAudit(
+        {
+          tenantId: ctx.tenantId,
+          actorId,
+          actorTenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          templateId: published.template_id,
+          versionId: published.template_id, // Pattern A: version IS the template row
+          programId: published.program_id,
+          templateVersion: published.template_version,
+          priorPublishedVersionId: supersededVersionId,
+          changeNotes: input.changeNotes ?? null,
+        },
+        tx,
+      );
+
+      await emitFormsTemplateVersionPublishedEvent(tx, {
+        tenantId: ctx.tenantId,
+        templateId: published.template_id,
+        versionId: published.template_id,
+        programId: published.program_id,
+        countryOfCare: ctx.countryOfCare,
+        templateVersion: published.template_version,
+        priorPublishedVersionId: supersededVersionId,
+        actorId,
+        changeNotes: input.changeNotes ?? null,
+      });
+    },
+  );
 }
 
 /**

@@ -19,7 +19,11 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { CreateTemplateRequestSchema } from '../../schemas.js';
+import { CreateTemplateRequestSchema, PublishVersionRequestSchema } from '../../schemas.js';
+import {
+  PUBLISH_VERSION_NOT_DRAFT,
+  PUBLISH_VERSION_NOT_FOUND,
+} from '../repositories/template-repo.js';
 import * as templateService from '../services/template-service.js';
 
 /**
@@ -119,12 +123,77 @@ export async function getTemplateHandler(
  * POST /v0/forms/templates/:templateId/versions/:versionId/publish — flip
  * a draft version to published. Pre-publish governance gates run inside
  * template-service.publishVersion (six-category I-030 static analysis,
- * marketing-copy resolution, Mode 2 contract conformance).
+ * marketing-copy resolution, Mode 2 contract conformance — currently
+ * scaffolded as TODOs in the service; durability + supersession path is
+ * implemented end-to-end).
+ *
+ * Path-param semantics under FORMS_ENGINE v5.2 Pattern A:
+ *   `:versionId` IS the operative key — it maps directly to
+ *   `forms_template.template_id` (each row is a version). `:templateId`
+ *   is preserved in the URL for REST symmetry but the data model has no
+ *   distinct template-family identity; handler validates both are
+ *   present and uses `:versionId` as the publish target. When a future
+ *   slice introduces a true template-family resource, this handler can
+ *   add a `templateId` membership check without changing the URL.
+ *
+ * Error mapping per I-025 + ERROR_MODEL v5.1:
+ *   - PUBLISH_VERSION_NOT_FOUND  → 400 (tenant-blind, not 404)
+ *   - PUBLISH_VERSION_NOT_DRAFT  → 400 (I-013 immutability)
+ *   Everything else propagates through the global error envelope plugin
+ *   which returns the canonical { error: { code, message, request_id } }
+ *   shape.
  */
 export async function publishVersionHandler(
   req: FastifyRequest,
-  _reply: FastifyReply,
+  reply: FastifyReply,
 ): Promise<unknown> {
-  void requireTenantContext(req);
-  throw new Error('not implemented');
+  const ctx = requireTenantContext(req);
+  const actorId = resolveActorId(req);
+
+  const params = req.params as Record<string, unknown>;
+  const templateIdParam = params['templateId'];
+  const versionIdParam = params['versionId'];
+  if (typeof templateIdParam !== 'string' || templateIdParam.length === 0) {
+    throw req.server.httpErrors.badRequest('Path param `templateId` is required.');
+  }
+  if (typeof versionIdParam !== 'string' || versionIdParam.length === 0) {
+    throw req.server.httpErrors.badRequest('Path param `versionId` is required.');
+  }
+
+  // Body is optional (just `changeNotes?`) per PublishVersionRequestSchema.
+  // Default to an empty object so the schema's `.optional()` resolves to
+  // `undefined` rather than 400'ing on `req.body === null` (Fastify default
+  // when no body is sent).
+  const parsed = PublishVersionRequestSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    throw req.server.httpErrors.badRequest(
+      `Invalid request body: ${parsed.error.errors
+        .map((e) => `${e.path.join('.')}: ${e.message}`)
+        .join('; ')}`,
+    );
+  }
+
+  try {
+    const published = await templateService.publishVersion(
+      ctx,
+      actorId,
+      versionIdParam,
+      parsed.data,
+    );
+    return reply.code(200).send(published);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === PUBLISH_VERSION_NOT_FOUND || message === PUBLISH_VERSION_NOT_DRAFT) {
+      // Both sentinels map to the same tenant-blind 400 envelope per I-025
+      // — the response MUST NOT differentiate "doesn't exist" vs "exists
+      // in another tenant" vs "exists but isn't a draft." A precise
+      // operator-facing error code is preserved in the envelope's `code`
+      // field (mapped by the global error envelope plugin) so observability
+      // tooling can distinguish; the wire-out message is uniform.
+      throw req.server.httpErrors.badRequest(
+        'The requested form version cannot be published in its current state.',
+      );
+    }
+    throw err;
+  }
 }
