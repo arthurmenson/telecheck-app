@@ -370,13 +370,25 @@ function computeRecordHash(envelope: Omit<AuditEnvelope, 'hash_chain'>): string 
  * to the wire). HIGH-4 closure 2026-05-03 per Codex CI-fix verify-r3.
  *
  * When a `tx` is provided, queries the real audit_records table within
- * the caller's transaction (so the FOR UPDATE row lock serializes
- * concurrent emissions on the same partition).
+ * the caller's transaction.
  *
  * When `tx` is omitted, returns genesis values — used by:
  *   - NODE_ENV=test paths where unit tests don't carry a DB context
  *   - The first record in any partition (DB returns no rows; we return
  *     genesis regardless of whether tx was passed)
+ *
+ * **Why no `FOR UPDATE`** (Codex publishVersion-r1 follow-on 2026-05-03):
+ * the prior version held a `FOR UPDATE` row lock on the latest record
+ * for serialization, but (a) the BEFORE INSERT trigger now holds
+ * `pg_advisory_xact_lock` per partition (HIGH-3 closure), and (b) the
+ * INSERT...RETURNING in emitAudit reads the trigger-authoritative
+ * values back so the wire-out envelope is correct regardless of what
+ * the app pre-computed (HIGH-5 closure). The trigger does the real
+ * serialization; this lookup is only used to populate the INSERT's
+ * parameters that the trigger overwrites. `FOR UPDATE` also requires
+ * UPDATE privilege on the table per PG semantics — keeping it would
+ * force every audit-emitting role to be granted UPDATE on audit_records,
+ * defeating the I-003 REVOKE discipline.
  */
 async function getPreviousHashForPartition(
   tenantId: string,
@@ -399,8 +411,7 @@ async function getPreviousHashForPartition(
       WHERE tenant_id = $1
         AND COALESCE(target_patient_id, 'PLATFORM') = $2
       ORDER BY sequence_number DESC
-      LIMIT 1
-      FOR UPDATE`,
+      LIMIT 1`,
     [tenantId, normalizedPatient],
   );
 
