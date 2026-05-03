@@ -71,6 +71,12 @@ interface ForbiddenAlias {
   allowMarker?: string;
 }
 
+// `lib/glossary.ts` is the canonical enumeration of forbidden aliases — by
+// design it contains every forbidden literal (string union members + runtime
+// Set entries + brand-typed error messages). Allow it in every alias path-rule
+// below; the file's purpose IS to define what is forbidden.
+const GLOSSARY_DEFINITION_FILE = /^lib\/glossary\.ts$/;
+
 const FORBIDDEN_ALIASES: ForbiddenAlias[] = [
   // ----- medication_request / prescription -----
   {
@@ -85,12 +91,13 @@ const FORBIDDEN_ALIASES: ForbiddenAlias[] = [
       /modules\/.*\/ui\//,
       // Test fixtures that explain forbidden usage.
       /\.test\.ts$/,
+      GLOSSARY_DEFINITION_FILE,
     ],
   },
   {
     description: 'Rx (forbidden alias for medication_request)',
     pattern: /\bRx\b(?!.*GLOSSARY-ALLOW)/,
-    allowedInPaths: [/\.test\.ts$/],
+    allowedInPaths: [/\.test\.ts$/, GLOSSARY_DEFINITION_FILE],
   },
 
   // ----- Mode 1 / Mode 2 / chatbot -----
@@ -98,17 +105,17 @@ const FORBIDDEN_ALIASES: ForbiddenAlias[] = [
     description:
       'chatbot (forbidden alias for Mode 1 / conversational_assistant per GLOSSARY v5.2)',
     pattern: /\bchatbot\b/i,
-    allowedInPaths: [/\.test\.ts$/],
+    allowedInPaths: [/\.test\.ts$/, GLOSSARY_DEFINITION_FILE],
   },
   {
     description: 'AI doctor / virtual doctor (forbidden alias for Mode 1 per GLOSSARY v5.2)',
     pattern: /\b(ai[\s_-]*doctor|virtual[\s_-]*doctor)\b/i,
-    allowedInPaths: [/\.test\.ts$/],
+    allowedInPaths: [/\.test\.ts$/, GLOSSARY_DEFINITION_FILE],
   },
   {
     description: 'AI prescriber / auto-prescriber / robot doctor (forbidden alias for Mode 2)',
     pattern: /\b(ai[\s_-]*prescriber|auto[\s_-]*prescriber|robot[\s_-]*doctor)\b/i,
-    allowedInPaths: [/\.test\.ts$/],
+    allowedInPaths: [/\.test\.ts$/, GLOSSARY_DEFINITION_FILE],
   },
 
   // ----- tenant identifier: bare 'Heros' -----
@@ -122,6 +129,7 @@ const FORBIDDEN_ALIASES: ForbiddenAlias[] = [
     allowedInPaths: [
       // Comments explaining the rule are fine.
       /\.test\.ts$/,
+      GLOSSARY_DEFINITION_FILE,
     ],
   },
 

@@ -52,6 +52,17 @@ jobs:
       # Per tests/README.md: ephemeral DB seeded with two tenants (Telecheck-US, Telecheck-Ghana)
       # for cross-tenant access tests.
       TEST_DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_test
+      # src/lib/config.ts validates DATABASE_URL + REDIS_URL at module load time
+      # (any test that transitively imports app.ts → tenant-context → config triggers
+      # the singleton). Point them at the same Postgres service container plus a
+      # syntactically-valid Redis URL — no Redis service is wired in CI yet because
+      # no test actually opens a Redis connection (idempotency module is stubbed).
+      DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_test
+      REDIS_URL: redis://localhost:6379
+      # NODE_ENV=test gates the audit emitter's in-memory fallback path
+      # (src/lib/audit.ts emitAudit) so tests that exercise the emitter without a
+      # transaction handle don't trip the production-only "I-003 violation" guard.
+      NODE_ENV: "test"
       # Force CI mode in tooling (e.g., disables interactive prompts in any future setup script).
       CI: "true"
 

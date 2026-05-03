@@ -35,8 +35,19 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { assertInvariants } from '../helpers/invariant-assertions.ts';
+import {
+  assertI025TenantBlindEnvelope,
+  assertInvariants,
+} from '../helpers/invariant-assertions.ts';
 import { TENANT_GHANA, TENANT_US } from '../helpers/tenant-fixtures.ts';
+
+// `assertInvariants` is async, so `expect(() => assertInvariants(...)).toThrow(...)`
+// silently passes — the closure returns an unawaited rejected promise rather than
+// throwing synchronously, which Vitest's sync `.toThrow` matcher cannot observe.
+// For pure I-025 envelope shape checks (which are synchronous), call the
+// `assertI025TenantBlindEnvelope` helper directly so `expect(() => ...).toThrow`
+// observes the throw. The `assertInvariants` dispatcher is preserved for the
+// happy-path tests where async coordination matters.
 
 // ---------------------------------------------------------------------------
 // Canonical error envelope shape
@@ -90,7 +101,7 @@ describe('error envelope — non-existent resource (I-025)', () => {
     };
 
     expect(() => {
-      assertInvariants(['I-025'], { errorEnvelope: leakyEnvelope });
+      assertI025TenantBlindEnvelope({ errorEnvelope: leakyEnvelope });
     }).toThrow(/I-025 VIOLATION/);
   });
 });
@@ -136,7 +147,7 @@ describe('error envelope — cross-tenant existence leak prevention (I-025)', ()
     };
 
     expect(() => {
-      assertInvariants(['I-025'], { errorEnvelope: verboseEnvelope });
+      assertI025TenantBlindEnvelope({ errorEnvelope: verboseEnvelope });
     }).toThrow(/I-025 VIOLATION/);
   });
 });
@@ -168,7 +179,7 @@ describe('error envelope — schema conformance (I-025)', () => {
     };
 
     expect(() => {
-      assertInvariants(['I-025'], { errorEnvelope: malformed });
+      assertI025TenantBlindEnvelope({ errorEnvelope: malformed });
     }).toThrow(/I-025 VIOLATION.*"error" key/);
   });
 

@@ -32,7 +32,15 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { assertInvariants } from '../helpers/invariant-assertions.ts';
+import { assertI019CrisisDetection, assertInvariants } from '../helpers/invariant-assertions.ts';
+
+// `assertInvariants` is async (returns Promise<void>); a synchronous throw inside
+// an async function becomes a rejected promise, not a sync throw, so
+// `expect(() => assertInvariants(...)).toThrow(...)` cannot observe the error.
+// I-019 checks are pure (no I/O), so call the sync `assertI019CrisisDetection`
+// helper directly when asserting throws. `assertInvariants` is preserved for
+// happy-path checks where the dispatcher convenience matters more than
+// observable throw semantics.
 
 // DEPENDS ON: src/lib/crisis-detection.ts (appsec-expert agent).
 // import { isCrisisDetectionActive, type CrisisDetectionConfig } from '../../src/lib/crisis-detection.ts';
@@ -93,14 +101,14 @@ describe('I-019 — crisis detection config: disabled=true and enabled=false bot
     expect(() => isCrisisDetectionActiveStub(cfg)).toThrow(/I-019 VIOLATION/);
 
     // assertI019CrisisDetection should also catch this.
-    expect(() => assertInvariants(['I-019'], { crisisConfig: cfg })).toThrow(/I-019 VIOLATION/);
+    expect(() => assertI019CrisisDetection({ crisisConfig: cfg })).toThrow(/I-019 VIOLATION/);
   });
 
   it('should throw when crisis detection config has enabled=false', () => {
     const cfg: CrisisDetectionConfig = { enabled: false };
 
     expect(() => isCrisisDetectionActiveStub(cfg)).toThrow(/I-019 VIOLATION/);
-    expect(() => assertInvariants(['I-019'], { crisisConfig: cfg })).toThrow(/I-019 VIOLATION/);
+    expect(() => assertI019CrisisDetection({ crisisConfig: cfg })).toThrow(/I-019 VIOLATION/);
   });
 });
 
@@ -113,7 +121,7 @@ describe('I-019 — tenant override: crisis detection cannot be weakened per ten
     const cfg: CrisisDetectionConfig = { tenantOverrideable: true };
 
     expect(() => isCrisisDetectionActiveStub(cfg)).toThrow(/I-019 VIOLATION/);
-    expect(() => assertInvariants(['I-019'], { crisisConfig: cfg })).toThrow(/I-019 VIOLATION/);
+    expect(() => assertI019CrisisDetection({ crisisConfig: cfg })).toThrow(/I-019 VIOLATION/);
   });
 });
 
