@@ -20,7 +20,7 @@
  *   - INVARIANT I-030 (no care-touching dependency on `research_consent_status`)
  */
 
-import type { DbTransaction } from '../../../../lib/db.js';
+import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedAudit,
@@ -273,16 +273,20 @@ export async function publishVersion(
 export async function getTemplate(
   ctx: TenantContext,
   templateId: FormTemplateId,
+  externalTx?: DbClient,
 ): Promise<FormTemplate | null> {
-  return templateRepo.findTemplateById(ctx.tenantId, templateId);
+  return templateRepo.findTemplateById(ctx.tenantId, templateId, externalTx);
 }
 
 /**
  * List all templates for the active tenant. Pagination is not implemented
  * at the scaffold layer — service signature reserves room for it.
  */
-export async function listTemplates(ctx: TenantContext): Promise<FormTemplate[]> {
-  return templateRepo.listTemplatesForTenant(ctx.tenantId);
+export async function listTemplates(
+  ctx: TenantContext,
+  externalTx?: DbClient,
+): Promise<FormTemplate[]> {
+  return templateRepo.listTemplatesForTenant(ctx.tenantId, externalTx);
 }
 
 // ---------------------------------------------------------------------------
@@ -390,8 +394,9 @@ export async function createDeployment(
 export async function getDeployment(
   ctx: TenantContext,
   deploymentId: FormDeploymentId,
+  externalTx?: DbClient,
 ): Promise<FormDeployment | null> {
-  return submissionRepo.findDeploymentById(ctx.tenantId, deploymentId);
+  return submissionRepo.findDeploymentById(ctx.tenantId, deploymentId, externalTx);
 }
 
 /**

@@ -143,7 +143,7 @@ describe('forms-intake getTemplate', () => {
     const templateId = await insertTemplate({ ctx: US_CTX, programId, templateVersion: 1 });
 
     const result = await withTenantContext(TENANT_US, () =>
-      templateService.getTemplate(US_CTX, templateId),
+      templateService.getTemplate(US_CTX, templateId, getTestClient()),
     );
 
     expect(result).not.toBeNull();
@@ -155,7 +155,7 @@ describe('forms-intake getTemplate', () => {
   it('returns null when the template does not exist (tenant-blind miss)', async () => {
     const fakeId = ulid();
     const result = await withTenantContext(TENANT_US, () =>
-      templateService.getTemplate(US_CTX, fakeId),
+      templateService.getTemplate(US_CTX, fakeId, getTestClient()),
     );
     expect(result).toBeNull();
   });
@@ -166,7 +166,7 @@ describe('forms-intake getTemplate', () => {
 
     // Same template_id, queried under TENANT_GHANA — RLS hides the row.
     const result = await withTenantContext(TENANT_GHANA, () =>
-      templateService.getTemplate(GH_CTX, templateId),
+      templateService.getTemplate(GH_CTX, templateId, getTestClient()),
     );
     expect(result).toBeNull();
   });
@@ -188,7 +188,9 @@ describe('forms-intake listTemplates', () => {
     const gh = await insertTemplate({ ctx: GH_CTX, programId: ghProgram, templateVersion: 1 });
 
     // Under TENANT_US context: see both US templates, NOT the GH template.
-    const usList = await withTenantContext(TENANT_US, () => templateService.listTemplates(US_CTX));
+    const usList = await withTenantContext(TENANT_US, () =>
+      templateService.listTemplates(US_CTX, getTestClient()),
+    );
     const usIds = new Set(usList.map((t) => t.template_id));
     expect(usIds.has(usA)).toBe(true);
     expect(usIds.has(usB)).toBe(true);
@@ -196,7 +198,7 @@ describe('forms-intake listTemplates', () => {
 
     // Under TENANT_GHANA context: see only the GH template.
     const ghList = await withTenantContext(TENANT_GHANA, () =>
-      templateService.listTemplates(GH_CTX),
+      templateService.listTemplates(GH_CTX, getTestClient()),
     );
     const ghIds = new Set(ghList.map((t) => t.template_id));
     expect(ghIds.has(gh)).toBe(true);
@@ -218,7 +220,7 @@ describe('forms-intake getDeployment', () => {
     });
 
     const result = await withTenantContext(TENANT_US, () =>
-      templateService.getDeployment(US_CTX, deploymentId),
+      templateService.getDeployment(US_CTX, deploymentId, getTestClient()),
     );
 
     expect(result).not.toBeNull();
@@ -230,7 +232,7 @@ describe('forms-intake getDeployment', () => {
   it('returns null when the deployment does not exist (tenant-blind miss)', async () => {
     const fakeId = ulid();
     const result = await withTenantContext(TENANT_US, () =>
-      templateService.getDeployment(US_CTX, fakeId),
+      templateService.getDeployment(US_CTX, fakeId, getTestClient()),
     );
     expect(result).toBeNull();
   });

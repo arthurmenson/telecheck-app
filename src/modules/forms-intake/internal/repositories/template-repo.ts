@@ -49,25 +49,30 @@ import type { FormLifecycleStatus, FormTemplate, FormTemplateId, FormVersionId }
 export async function findTemplateById(
   tenantId: TenantId,
   templateId: FormTemplateId,
+  externalTx?: DbClient,
 ): Promise<FormTemplate | null> {
-  return withTenantBoundConnection(tenantId, async (client: DbClient) => {
-    // Aligned to migration 006 column set (Codex slice-scaffold-r1
-    // MEDIUM finding closure 2026-05-02): singular table name
-    // `forms_template`, primary key `template_id`, fields per
-    // FORMS_ENGINE v5.2 four-layer architecture.
-    const result = await client.query<FormTemplate>(
-      `SELECT template_id, tenant_id, program_id, country_of_care,
-              template_version, status,
-              presentation_content, branching_logic,
-              eligibility_logic, approval_governance,
-              created_at, updated_at
-         FROM forms_template
-        WHERE template_id = $1 AND tenant_id = $2
-        LIMIT 1`,
-      [templateId, tenantId],
-    );
-    return result.rows[0] ?? null;
-  });
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      // Aligned to migration 006 column set (Codex slice-scaffold-r1
+      // MEDIUM finding closure 2026-05-02): singular table name
+      // `forms_template`, primary key `template_id`, fields per
+      // FORMS_ENGINE v5.2 four-layer architecture.
+      const result = await client.query<FormTemplate>(
+        `SELECT template_id, tenant_id, program_id, country_of_care,
+                template_version, status,
+                presentation_content, branching_logic,
+                eligibility_logic, approval_governance,
+                created_at, updated_at
+           FROM forms_template
+          WHERE template_id = $1 AND tenant_id = $2
+          LIMIT 1`,
+        [templateId, tenantId],
+      );
+      return result.rows[0] ?? null;
+    },
+    externalTx,
+  );
 }
 
 /**
@@ -82,21 +87,28 @@ export async function findTemplateById(
  * builder slice ships and templates accumulate per-tenant, add LIMIT +
  * OFFSET (or keyset cursor) here and update the service signature.
  */
-export async function listTemplatesForTenant(tenantId: TenantId): Promise<FormTemplate[]> {
-  return withTenantBoundConnection(tenantId, async (client: DbClient) => {
-    const result = await client.query<FormTemplate>(
-      `SELECT template_id, tenant_id, program_id, country_of_care,
-              template_version, status,
-              presentation_content, branching_logic,
-              eligibility_logic, approval_governance,
-              created_at, updated_at
-         FROM forms_template
-        WHERE tenant_id = $1
-        ORDER BY program_id ASC, country_of_care ASC, template_version ASC`,
-      [tenantId],
-    );
-    return result.rows;
-  });
+export async function listTemplatesForTenant(
+  tenantId: TenantId,
+  externalTx?: DbClient,
+): Promise<FormTemplate[]> {
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      const result = await client.query<FormTemplate>(
+        `SELECT template_id, tenant_id, program_id, country_of_care,
+                template_version, status,
+                presentation_content, branching_logic,
+                eligibility_logic, approval_governance,
+                created_at, updated_at
+           FROM forms_template
+          WHERE tenant_id = $1
+          ORDER BY program_id ASC, country_of_care ASC, template_version ASC`,
+        [tenantId],
+      );
+      return result.rows;
+    },
+    externalTx,
+  );
 }
 
 export async function findVersionById(

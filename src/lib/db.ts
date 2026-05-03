@@ -149,7 +149,26 @@ export async function withConnection<T>(fn: (client: DbClient) => Promise<T>): P
 export async function withTenantBoundConnection<T>(
   tenantId: string,
   fn: (client: DbClient) => Promise<T>,
+  /**
+   * Test-only opt-in: when supplied, `fn` runs against the caller's
+   * connection/transaction handle instead of acquiring a fresh pool
+   * connection. The caller owns the tenant-context binding lifecycle —
+   * a typical test driver wraps the call in `withTenantContext(tenant,
+   * () => helperFn(..., getTestClient()))` so the binding is set before
+   * the helper runs.
+   *
+   * Mirror of the `withTransaction(fn, externalTx?)` pattern from
+   * publishVersion-r1 MEDIUM closure 2026-05-03. Production callers
+   * MUST NOT supply this — RLS binding cleanup happens in the pool
+   * branch's `finally`, but the externalTx branch deliberately doesn't
+   * touch the binding (caller's responsibility).
+   */
+  externalTx?: DbClient,
 ): Promise<T> {
+  if (externalTx !== undefined) {
+    // Caller owns binding + connection lifecycle. We just run `fn`.
+    return fn(externalTx);
+  }
   return withConnection(async (client) => {
     await client.query('SELECT set_tenant_context($1)', [tenantId]);
     try {

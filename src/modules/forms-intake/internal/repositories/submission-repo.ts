@@ -80,18 +80,23 @@ export async function findActiveDeployment(
 export async function findDeploymentById(
   tenantId: TenantId,
   deploymentId: FormDeploymentId,
+  externalTx?: DbClient,
 ): Promise<FormDeployment | null> {
-  return withTenantBoundConnection(tenantId, async (client: DbClient) => {
-    const result = await client.query<FormDeployment>(
-      `SELECT deployment_id, tenant_id, template_id, program_id,
-              deployed_at, retired_at
-         FROM forms_deployment
-        WHERE deployment_id = $1 AND tenant_id = $2
-        LIMIT 1`,
-      [deploymentId, tenantId],
-    );
-    return result.rows[0] ?? null;
-  });
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      const result = await client.query<FormDeployment>(
+        `SELECT deployment_id, tenant_id, template_id, program_id,
+                deployed_at, retired_at
+           FROM forms_deployment
+          WHERE deployment_id = $1 AND tenant_id = $2
+          LIMIT 1`,
+        [deploymentId, tenantId],
+      );
+      return result.rows[0] ?? null;
+    },
+    externalTx,
+  );
 }
 
 // ---------------------------------------------------------------------------
