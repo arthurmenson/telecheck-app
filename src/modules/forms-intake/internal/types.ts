@@ -120,13 +120,25 @@ export interface FormSubmission {
  * with". Snapshots are append-only (REVOKE UPDATE/DELETE FROM PUBLIC + raise-
  * exception trigger per migration 006).
  */
+/**
+ * forms_snapshot row shape — aligned 1:1 with migration 006 §TABLE 4
+ * (Codex snapshot-r1 schema-mismatch closure 2026-05-03). The prior scaffold
+ * had `captured_at` which doesn't exist (migration uses `created_at`) and
+ * was missing `template_version` (the integer that pins which template
+ * version was rendered alongside the JSONB `presented_content`).
+ *
+ * Append-only per migration: `REVOKE UPDATE ON forms_snapshot FROM PUBLIC`
+ * + `REVOKE DELETE ON forms_snapshot FROM PUBLIC`. No `updated_at` or
+ * `deleted_at` columns by design — snapshots never change.
+ */
 export interface FormSnapshot {
   snapshot_id: FormSnapshotId;
   tenant_id: TenantId;
   submission_id: FormSubmissionId; // composite FK (tenant_id, submission_id) → forms_submission
   template_id: FormTemplateId; // composite FK (tenant_id, template_id) → forms_template
+  template_version: number; // pins which template version was rendered (>= 1)
   presented_content: unknown; // full rendered template + branching + L4 governance + CCR keys + research_consent_text_version per FORMS_ENGINE v5.2
-  captured_at: string;
+  created_at: string;
 }
 
 /**

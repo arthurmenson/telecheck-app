@@ -54,7 +54,7 @@ export async function findSnapshotBySubmissionId(
       // §4.1 seed).
       const result = await client.query<FormSnapshot>(
         `SELECT snapshot_id, tenant_id, submission_id, template_id,
-              presented_content, captured_at
+                template_version, presented_content, created_at
          FROM forms_snapshot
         WHERE submission_id = $1 AND tenant_id = $2
         LIMIT 1`,
@@ -81,7 +81,7 @@ export async function findSnapshotById(
     async (client: DbClient) => {
       const result = await client.query<FormSnapshot>(
         `SELECT snapshot_id, tenant_id, submission_id, template_id,
-                presented_content, captured_at
+                  template_version, presented_content, created_at
            FROM forms_snapshot
           WHERE snapshot_id = $1 AND tenant_id = $2
           LIMIT 1`,
