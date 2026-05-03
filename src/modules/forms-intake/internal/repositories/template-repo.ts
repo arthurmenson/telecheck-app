@@ -111,6 +111,10 @@ export async function createDraftTemplate(
   input: {
     programId: string;
     countryOfCare: 'US' | 'GH';
+    /** Human-readable label per migration 006 (NOT NULL). */
+    name: string;
+    /** Authoring tenant_user_id (ULID) per migration 006 (NOT NULL). */
+    createdBy: string;
     presentationContent: unknown;
     branchingLogic: unknown;
     eligibilityLogic: unknown;
@@ -133,18 +137,25 @@ export async function createDraftTemplate(
     const templateId = ulid();
     const templateVersion = 1;
 
+    // Migration 006 declares `name` (TEXT NOT NULL) and `created_by`
+    // (VARCHAR(26) NOT NULL — tenant_user_id ULID); the prior INSERT
+    // omitted both, which would fail in any environment with the
+    // migration applied. Both are now propagated from the input.
+    // (Patch 2026-05-03: closed in the same commit as the publishVersion
+    //  test caught the latent bug; createDraftTemplate had no integration
+    //  test exercising this path before today.)
     const result = await tx.query<FormTemplate>(
       `INSERT INTO forms_template (
           template_id, tenant_id, program_id, country_of_care,
-          template_version, status,
+          template_version, status, name, created_by,
           presentation_content, branching_logic,
           eligibility_logic, approval_governance,
           created_at, updated_at
        ) VALUES (
           $1, $2, $3, $4,
-          $5, 'draft',
-          $6::jsonb, $7::jsonb,
+          $5, 'draft', $6, $7,
           $8::jsonb, $9::jsonb,
+          $10::jsonb, $11::jsonb,
           NOW(), NOW()
        )
        RETURNING template_id, tenant_id, program_id, country_of_care,
@@ -158,6 +169,8 @@ export async function createDraftTemplate(
         input.programId,
         input.countryOfCare,
         templateVersion,
+        input.name,
+        input.createdBy,
         JSON.stringify(input.presentationContent ?? {}),
         JSON.stringify(input.branchingLogic ?? {}),
         JSON.stringify(input.eligibilityLogic ?? {}),

@@ -67,6 +67,12 @@ export async function createDraftTemplate(
     {
       programId: input.programCatalogEntryId,
       countryOfCare: ctx.countryOfCare,
+      name: input.name,
+      // The actorId resolved by the handler is the authoring tenant_user_id
+      // and lands in the NOT NULL `created_by` column. Once the Identity
+      // slice replaces the header shim with real session resolution,
+      // actorId will be a validated ULID by construction.
+      createdBy: actorId,
       presentationContent: input.layout,
       branchingLogic: input.branchingLogic,
       eligibilityLogic: input.eligibilityLogic,
