@@ -32,8 +32,10 @@
  */
 
 import { createHash } from 'node:crypto';
-import type { TenantId } from './tenant-fixtures.ts';
+
 import { getTestClient } from '../setup.ts';
+
+import type { TenantId } from './tenant-fixtures.ts';
 
 // ---------------------------------------------------------------------------
 // AuditRecord — minimal shape matching AUDIT_EVENTS v5.2 schema

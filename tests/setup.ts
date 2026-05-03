@@ -51,6 +51,7 @@
 
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+
 import { Client, type ClientConfig } from 'pg';
 import { afterEach, beforeAll, beforeEach } from 'vitest';
 

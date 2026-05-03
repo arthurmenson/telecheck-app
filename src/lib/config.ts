@@ -40,32 +40,64 @@ const FeatureFlagsSchema = z.object({
   ENABLE_AUTONOMOUS_AGENT: z
     .string()
     .transform((v) => v === 'true')
-    .pipe(z.literal(false, { errorMap: () => ({ message: 'ENABLE_AUTONOMOUS_AGENT must be false at v1.0 — requires ADR-030' }) }))
+    .pipe(
+      z.literal(false, {
+        errorMap: () => ({
+          message: 'ENABLE_AUTONOMOUS_AGENT must be false at v1.0 — requires ADR-030',
+        }),
+      }),
+    )
     .default('false'),
 
   ENABLE_MULTI_AGENT_SUPERVISOR: z
     .string()
     .transform((v) => v === 'true')
-    .pipe(z.literal(false, { errorMap: () => ({ message: 'ENABLE_MULTI_AGENT_SUPERVISOR must be false at v1.0 — requires ADR-033' }) }))
+    .pipe(
+      z.literal(false, {
+        errorMap: () => ({
+          message: 'ENABLE_MULTI_AGENT_SUPERVISOR must be false at v1.0 — requires ADR-033',
+        }),
+      }),
+    )
     .default('false'),
 
   ENABLE_TOOL_USING_AGENT: z
     .string()
     .transform((v) => v === 'true')
-    .pipe(z.literal(false, { errorMap: () => ({ message: 'ENABLE_TOOL_USING_AGENT must be false at v1.0 — requires ADR-031 + ADR-030' }) }))
+    .pipe(
+      z.literal(false, {
+        errorMap: () => ({
+          message: 'ENABLE_TOOL_USING_AGENT must be false at v1.0 — requires ADR-031 + ADR-030',
+        }),
+      }),
+    )
     .default('false'),
 
   // Reserved autonomy levels (AUTONOMY_LEVELS v5.2 §3).
   ENABLE_ACTION_WITH_AUDIT_ONLY: z
     .string()
     .transform((v) => v === 'true')
-    .pipe(z.literal(false, { errorMap: () => ({ message: 'ENABLE_ACTION_WITH_AUDIT_ONLY must be false at v1.0 — requires ADR-030 + PolicyAuthorization framework + I-012 successor invariant' }) }))
+    .pipe(
+      z.literal(false, {
+        errorMap: () => ({
+          message:
+            'ENABLE_ACTION_WITH_AUDIT_ONLY must be false at v1.0 — requires ADR-030 + PolicyAuthorization framework + I-012 successor invariant',
+        }),
+      }),
+    )
     .default('false'),
 
   ENABLE_FULLY_AUTONOMOUS: z
     .string()
     .transform((v) => v === 'true')
-    .pipe(z.literal(false, { errorMap: () => ({ message: 'ENABLE_FULLY_AUTONOMOUS must be false at v1.0 — requires ADR-030 + named successor invariant superseding I-012' }) }))
+    .pipe(
+      z.literal(false, {
+        errorMap: () => ({
+          message:
+            'ENABLE_FULLY_AUTONOMOUS must be false at v1.0 — requires ADR-030 + named successor invariant superseding I-012',
+        }),
+      }),
+    )
     .default('false'),
 });
 
@@ -107,7 +139,10 @@ const ConfigSchema = z.object({
   DATABASE_SSL_MODE: z.enum(['disable', 'require']).default('disable'),
 
   // Redis (idempotency cache + queues)
-  REDIS_URL: z.string().min(1, 'REDIS_URL is required').url('REDIS_URL must be a valid Redis connection string'),
+  REDIS_URL: z
+    .string()
+    .min(1, 'REDIS_URL is required')
+    .url('REDIS_URL must be a valid Redis connection string'),
 
   // KMS — dev-only local key; prod uses AWS KMS via `kmsKeyAlias` from tenants table
   TENANT_KMS_LOCAL_DEV_KEY: z.string().optional(),
@@ -131,9 +166,7 @@ const ConfigSchema = z.object({
   ENABLE_FULLY_AUTONOMOUS: z.string().default('false'),
 
   // Research data partnership (per ADR-028) — Stage 2 gate
-  RESEARCH_DATA_PARTNERSHIP_ACTIVE: z
-    .enum(['active', 'inactive'])
-    .default('inactive'),
+  RESEARCH_DATA_PARTNERSHIP_ACTIVE: z.enum(['active', 'inactive']).default('inactive'),
 });
 
 // ---------------------------------------------------------------------------

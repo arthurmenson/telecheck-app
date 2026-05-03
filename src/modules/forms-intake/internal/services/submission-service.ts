@@ -22,18 +22,13 @@
  */
 
 import type { TenantContext } from '../../../../lib/tenant-context.js';
-
 import type {
   ResumeSubmissionRequest,
   StartSubmissionRequest,
   SubmitSubmissionRequest,
   UpdateSubmissionResponsesRequest,
 } from '../../schemas.js';
-import type {
-  FormSubmission,
-  FormSubmissionId,
-  PatientId,
-} from '../types.js';
+import type { FormSubmission, FormSubmissionId, PatientId } from '../types.js';
 
 /**
  * Begin a new submission. Resolves variant assignment via PostHog feature

@@ -125,20 +125,20 @@ export type Mode2WorkloadType = 'protocol_execution';
 export type AIWorkloadType =
   | Mode1WorkloadType
   | Mode2WorkloadType
-  | 'autonomous_agent'       // RESERVED per WORKLOAD_TAXONOMY v5.2 §3.1
+  | 'autonomous_agent' // RESERVED per WORKLOAD_TAXONOMY v5.2 §3.1
   | 'multi_agent_supervisor' // RESERVED per WORKLOAD_TAXONOMY v5.2 §3.2
-  | 'tool_using_agent'       // RESERVED per WORKLOAD_TAXONOMY v5.2 §3.3
+  | 'tool_using_agent' // RESERVED per WORKLOAD_TAXONOMY v5.2 §3.3
   | 'rejected_invalid_attempt' // SENTINEL — audit envelope only on *.execution_rejected events
-  | 'n/a';                   // SENTINEL — I-012 clinician-only approval records only
+  | 'n/a'; // SENTINEL — I-012 clinician-only approval records only
 
 export type AutonomyLevel =
-  | 'advisory'              // active at v1.0
-  | 'suggestion'            // active at v1.0
-  | 'action_with_confirm'   // active at v1.0
+  | 'advisory' // active at v1.0
+  | 'suggestion' // active at v1.0
+  | 'action_with_confirm' // active at v1.0
   | 'action_with_audit_only' // RESERVED — requires ADR-030
-  | 'fully_autonomous'       // RESERVED — requires ADR-030 + I-012 successor
+  | 'fully_autonomous' // RESERVED — requires ADR-030 + I-012 successor
   | 'rejected_invalid_attempt' // SENTINEL — audit envelope only on *.execution_rejected
-  | 'n/a';                   // SENTINEL — I-012 clinician-only approval records only
+  | 'n/a'; // SENTINEL — I-012 clinician-only approval records only
 
 // ---------------------------------------------------------------------------
 // Forbidden-alias detection helper (compile-time)
@@ -170,10 +170,10 @@ const FORBIDDEN_RUNTIME_ALIASES: ReadonlySet<string> = new Set([
   'prescriptionid',
   'chatbot',
   'customer',
-  'heros',           // bare Heros (case-insensitive check below)
+  'heros', // bare Heros (case-insensitive check below)
   'heros-health',
-  'ai_mode_1',       // deprecated actor_type alias — new code MUST use actor_type=ai_workload
-  'ai_mode_2',       // deprecated actor_type alias — new code MUST use actor_type=ai_workload
+  'ai_mode_1', // deprecated actor_type alias — new code MUST use actor_type=ai_workload
+  'ai_mode_2', // deprecated actor_type alias — new code MUST use actor_type=ai_workload
 ]);
 
 /**

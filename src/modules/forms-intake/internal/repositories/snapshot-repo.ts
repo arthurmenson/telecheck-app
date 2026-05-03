@@ -28,13 +28,7 @@ import {
   withTransaction,
 } from '../../../../lib/db.js';
 import type { TenantId } from '../../../../lib/glossary.js';
-
-import type {
-  FormSnapshot,
-  FormSnapshotId,
-  FormSubmissionId,
-  FormVersionId,
-} from '../types.js';
+import type { FormSnapshot, FormSnapshotId, FormSubmissionId, FormVersionId } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Reads

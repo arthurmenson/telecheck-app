@@ -33,6 +33,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+
 import { assertInvariants } from '../helpers/invariant-assertions.ts';
 import {
   createTenant,
@@ -176,10 +177,7 @@ describe('idempotency_keys — cross-tenant isolation (I-023)', () => {
 
     // TENANT_US should see only their row.
     const usRows = await withTenantContext(TENANT_US, async () => {
-      const r = await client.query(
-        `SELECT * FROM idempotency_keys WHERE key = $1`,
-        [sharedKey],
-      );
+      const r = await client.query(`SELECT * FROM idempotency_keys WHERE key = $1`, [sharedKey]);
       return r.rows as unknown[];
     });
     expect(usRows).toHaveLength(1);
@@ -187,10 +185,7 @@ describe('idempotency_keys — cross-tenant isolation (I-023)', () => {
 
     // TENANT_GHANA should see only their row.
     const ghRows = await withTenantContext(TENANT_GHANA, async () => {
-      const r = await client.query(
-        `SELECT * FROM idempotency_keys WHERE key = $1`,
-        [sharedKey],
-      );
+      const r = await client.query(`SELECT * FROM idempotency_keys WHERE key = $1`, [sharedKey]);
       return r.rows as unknown[];
     });
     expect(ghRows).toHaveLength(1);
@@ -212,10 +207,7 @@ describe('idempotency_keys — cross-tenant isolation (I-023)', () => {
     });
 
     await expectCrossTenantDenial(TENANT_US, TENANT_GHANA, async () => {
-      const result = await client.query(
-        `SELECT * FROM idempotency_keys WHERE key = $1`,
-        [key],
-      );
+      const result = await client.query(`SELECT * FROM idempotency_keys WHERE key = $1`, [key]);
       return result.rows as unknown[];
     });
   });

@@ -31,6 +31,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+
 import { assertInvariants } from '../helpers/invariant-assertions.ts';
 
 // DEPENDS ON: src/lib/crisis-detection.ts (appsec-expert agent).
@@ -68,14 +69,10 @@ function isCrisisDetectionActiveStub(cfg: CrisisDetectionConfig): boolean {
     );
   }
   if (cfg.tenantOverrideable === true) {
-    throw new Error(
-      'I-019 VIOLATION: crisis detection cannot be made tenant-overrideable',
-    );
+    throw new Error('I-019 VIOLATION: crisis detection cannot be made tenant-overrideable');
   }
   if (cfg.guardrailTemplate?.disable_crisis_detection === true) {
-    throw new Error(
-      'I-019 VIOLATION: guardrail template cannot disable crisis detection',
-    );
+    throw new Error('I-019 VIOLATION: guardrail template cannot disable crisis detection');
   }
   if (cfg.moderationPolicy?.crisis_detection_enabled === false) {
     throw new Error(

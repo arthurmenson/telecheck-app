@@ -70,9 +70,7 @@ export type I029InvalidationReason =
   | 'consent_revocation_mid_export'
   | 'grant_artifact_invalidated';
 
-export type I029GateResult =
-  | { pass: true }
-  | { pass: false; reason: I029InvalidationReason };
+export type I029GateResult = { pass: true } | { pass: false; reason: I029InvalidationReason };
 
 // ---------------------------------------------------------------------------
 // Export context input type
@@ -157,10 +155,7 @@ function evaluateCondition3(ctx: I029ExportContext): I029GateResult {
 }
 
 function evaluateCondition4(ctx: I029ExportContext): I029GateResult {
-  if (
-    ctx.consent_cohort_snapshot_hash_completed !==
-    ctx.consent_cohort_snapshot_hash_initiated
-  ) {
+  if (ctx.consent_cohort_snapshot_hash_completed !== ctx.consent_cohort_snapshot_hash_initiated) {
     return { pass: false, reason: 'consent_cohort_change' };
   }
   return { pass: true };

@@ -41,6 +41,7 @@
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 // ---------------------------------------------------------------------------
@@ -100,14 +101,12 @@ const FORBIDDEN_ALIASES: ForbiddenAlias[] = [
     allowedInPaths: [/\.test\.ts$/],
   },
   {
-    description:
-      'AI doctor / virtual doctor (forbidden alias for Mode 1 per GLOSSARY v5.2)',
+    description: 'AI doctor / virtual doctor (forbidden alias for Mode 1 per GLOSSARY v5.2)',
     pattern: /\b(ai[\s_-]*doctor|virtual[\s_-]*doctor)\b/i,
     allowedInPaths: [/\.test\.ts$/],
   },
   {
-    description:
-      'AI prescriber / auto-prescriber / robot doctor (forbidden alias for Mode 2)',
+    description: 'AI prescriber / auto-prescriber / robot doctor (forbidden alias for Mode 2)',
     pattern: /\b(ai[\s_-]*prescriber|auto[\s_-]*prescriber|robot[\s_-]*doctor)\b/i,
     allowedInPaths: [/\.test\.ts$/],
   },

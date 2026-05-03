@@ -146,7 +146,7 @@ const SUBDOMAIN_TENANT_MAP: Record<string, SubdomainTenantEntry> = {
     consumerSubdomain: 'ghana.heroshealth.com',
   },
   // Local dev / test
-  'localhost': {
+  localhost: {
     tenantId: 'Telecheck-US',
     displayName: 'Telecheck-US',
     countryOfCare: 'US',
@@ -421,10 +421,7 @@ const tenantContextPluginImpl: FastifyPluginAsync<TenantContextPluginOptions> = 
   fastify: FastifyInstance,
   opts: TenantContextPluginOptions,
 ) => {
-  const allowlist = new Set<string>([
-    '/health',
-    ...(opts.allowlistedPaths ?? []),
-  ]);
+  const allowlist = new Set<string>(['/health', ...(opts.allowlistedPaths ?? [])]);
 
   // Decorate the request with a tenantContext slot.
   // Default value is undefined; resolution populates it in the hook below.

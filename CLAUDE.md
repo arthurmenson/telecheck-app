@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is the **Telecheck application code repo** — the implementation of the spec corpus described in the Telecheck Master Bundle.
 
 Telecheck is a multi-tenant AI-powered telehealth platform. At launch, two operating tenants are active:
+
 - **Telecheck-US** (operating tenant, US, greenfield; operated by Telecheck Health LLC; trading patient-facing as **Heros Health** consumer DBA at heroshealth.com)
 - **Telecheck-Ghana** (operating tenant, Ghana, chronic-care anchor; operated by Telecheck-Ghana Ltd.; trading patient-facing as **Heros Health Ghana** consumer DBA at ghana.heroshealth.com)
 

@@ -104,12 +104,10 @@ export async function withTenantContext<T>(
     // shortens the leak window for crashes.
     // Fire-and-forget — if cleanup fails, log and continue (the original
     // error from `fn` is more important to surface).
-    await client
-      .query('SELECT clear_tenant_context()', [])
-      .catch(() => {
-        // Intentional: swallow clear-error to avoid masking the original error.
-        // Monitoring should alert on repeated clear failures as a pool-leak signal.
-      });
+    await client.query('SELECT clear_tenant_context()', []).catch(() => {
+      // Intentional: swallow clear-error to avoid masking the original error.
+      // Monitoring should alert on repeated clear failures as a pool-leak signal.
+    });
   }
 
   return result;
@@ -125,7 +123,7 @@ export async function withTenantContext<T>(
  */
 export async function assertRlsActive(client: DbClient): Promise<void> {
   // STUB: migration 003 required.
-  const result = await client.query('SELECT current_tenant_id() AS tid') as {
+  const result = (await client.query('SELECT current_tenant_id() AS tid')) as {
     rows: Array<{ tid: string | null }>;
   };
   const rows = result as unknown as { rows: Array<{ tid: string | null }> };

@@ -32,12 +32,9 @@ function resolveActorId(req: FastifyRequest): string {
     );
   }
   const headerValue = req.headers['x-actor-id'];
-  const actorId =
-    typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : null;
+  const actorId = typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : null;
   if (actorId === null) {
-    throw req.server.httpErrors.unauthorized(
-      'No actor identity resolved for this request.',
-    );
+    throw req.server.httpErrors.unauthorized('No actor identity resolved for this request.');
   }
   return actorId;
 }

@@ -16,9 +16,7 @@ import fp from 'fastify-plugin';
 
 import { registerFormsIntakeRoutes } from './routes.js';
 
-const formsIntakePluginImpl: FastifyPluginAsync = async (
-  app: FastifyInstance,
-): Promise<void> => {
+const formsIntakePluginImpl: FastifyPluginAsync = async (app: FastifyInstance): Promise<void> => {
   await app.register(registerFormsIntakeRoutes, { prefix: '/v0/forms' });
 };
 

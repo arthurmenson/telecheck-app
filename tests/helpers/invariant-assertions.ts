@@ -36,11 +36,16 @@
  *   - src/lib/crisis-detection.ts (CrisisDetectionConfig — written by appsec-expert agent)
  */
 
+import { getTestClient } from '../setup.ts';
+
 import type { AuditRecord } from './audit-assertions.ts';
-import { assertAuditChainIntact, assertAuditRecordExists, assertHighPiiSensitivity } from './audit-assertions.ts';
+import {
+  assertAuditChainIntact,
+  assertAuditRecordExists,
+  assertHighPiiSensitivity,
+} from './audit-assertions.ts';
 import type { TenantId } from './tenant-fixtures.ts';
 import { expectCrossTenantDenial } from './tenant-fixtures.ts';
-import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
 // assertInvariants — dispatcher
@@ -107,7 +112,16 @@ export async function assertInvariants(
   }
 }
 
-export type InvariantId = 'I-003' | 'I-012' | 'I-019' | 'I-023' | 'I-024' | 'I-025' | 'I-027' | 'I-029' | 'I-031';
+export type InvariantId =
+  | 'I-003'
+  | 'I-012'
+  | 'I-019'
+  | 'I-023'
+  | 'I-024'
+  | 'I-025'
+  | 'I-027'
+  | 'I-029'
+  | 'I-031';
 
 // ---------------------------------------------------------------------------
 // I-003 — Audit trail is immutable and append-only
@@ -347,7 +361,11 @@ export async function assertI027AuditTenantId(ctx: InvariantAssertionContext): P
     [tenantId],
   );
 
-  for (const row of result.rows as Array<{ audit_id: string; action: string; tenant_id: string | null }>) {
+  for (const row of result.rows as Array<{
+    audit_id: string;
+    action: string;
+    tenant_id: string | null;
+  }>) {
     if (row.tenant_id === null) {
       throw new Error(
         `I-027 VIOLATION: audit record ${row.audit_id} (action=${row.action}) ` +

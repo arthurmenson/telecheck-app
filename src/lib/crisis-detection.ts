@@ -79,7 +79,12 @@ export type CrisisType =
   | 'medical_emergency'
   | 'general_crisis';
 
-export type DetectionSource = 'ai_chat' | 'community_post' | 'form_response' | 'messaging' | 'voice_transcript';
+export type DetectionSource =
+  | 'ai_chat'
+  | 'community_post'
+  | 'form_response'
+  | 'messaging'
+  | 'voice_transcript';
 
 export interface CrisisDetectionResult {
   crisisDetected: true;
@@ -135,9 +140,7 @@ export class CrisisDetector {
     // I-019: this guard throws if anyone passes a truthy disable flag.
     // The `never` type above is a compile-time block; this is the runtime block.
     if (_disabledByConfig !== undefined) {
-      throw new DisabledCrisisDetectionError(
-        'constructor called with disabledByConfig argument',
-      );
+      throw new DisabledCrisisDetectionError('constructor called with disabledByConfig argument');
     }
   }
 
@@ -152,11 +155,7 @@ export class CrisisDetector {
    * @param source       Which platform surface produced this text.
    * @returns            `CrisisDetectionResult` if crisis detected; `NoCrisisResult` otherwise.
    */
-  detect(
-    text: string,
-    tenantId: string,
-    source: DetectionSource,
-  ): CrisisDetectionOutcome {
+  detect(text: string, tenantId: string, source: DetectionSource): CrisisDetectionOutcome {
     if (!text || text.trim().length === 0) {
       return { crisisDetected: false };
     }
@@ -186,7 +185,9 @@ export class CrisisDetector {
 
   private classifyCrisisType(text: string): CrisisType {
     const lower = text.toLowerCase();
-    if (/suicid|kill\s+myself|end\s+my\s+life|want\s+to\s+die|don'?t\s+want\s+to\s+live/.test(lower)) {
+    if (
+      /suicid|kill\s+myself|end\s+my\s+life|want\s+to\s+die|don'?t\s+want\s+to\s+live/.test(lower)
+    ) {
       return 'suicidal_ideation';
     }
     if (/self[\s-]?harm|cutting|hurt\s+myself|burning\s+myself/.test(lower)) {

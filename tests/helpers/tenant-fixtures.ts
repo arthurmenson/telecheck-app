@@ -40,10 +40,10 @@ import { getTestClient } from '../setup.ts';
 // ---------------------------------------------------------------------------
 
 /** Operating-tenant identifier for the US tenant. */
-export const TENANT_US = 'Telecheck-US' as const;
+export const TENANT_US = 'Telecheck-US';
 
 /** Operating-tenant identifier for the Ghana tenant. */
-export const TENANT_GHANA = 'Telecheck-Ghana' as const;
+export const TENANT_GHANA = 'Telecheck-Ghana';
 
 export type TenantId = string;
 
@@ -98,13 +98,13 @@ export async function createTenant(overrides: Partial<TenantInput> = {}): Promis
 
   const input: TenantInput = {
     id: defaultId,
-    display_name: defaultId,                          // operating-tenant label per CDM §4.1; mirrors id by default
+    display_name: defaultId, // operating-tenant label per CDM §4.1; mirrors id by default
     // consumer_dba MUST start with 'Heros Health' per the consumer_dba_starts_heros_health
     // CHECK constraint added in 001_tenants.sql post-P-010 closure (commit 74b53b4).
     // Test DBAs use the form 'Heros Health Test {suffix}' to satisfy the constraint
     // while remaining clearly distinguishable from canonical day-1 tenants.
     consumer_dba: `Heros Health Test ${suffix}`,
-    legal_entity: `Telecheck Test ${suffix} Inc.`,    // synthetic legal entity for ephemeral test rows
+    legal_entity: `Telecheck Test ${suffix} Inc.`, // synthetic legal entity for ephemeral test rows
     consumer_subdomain: `test-${suffix.toLowerCase()}.heroshealth.com`,
     country_of_care: 'US',
     kms_key_alias: `alias/telecheck-test-${suffix.toLowerCase()}-data-key`,

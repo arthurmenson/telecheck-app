@@ -44,6 +44,7 @@
 // import { evaluateI029Gate } from '../../src/lib/i029-gate.ts';
 
 import { describe, expect, it } from 'vitest';
+
 import { assertHighPiiSensitivity } from '../helpers/audit-assertions.ts';
 import type { I029GateResultStub } from '../helpers/invariant-assertions.ts';
 import { assertInvariants } from '../helpers/invariant-assertions.ts';

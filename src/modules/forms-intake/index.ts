@@ -16,8 +16,9 @@
  *   - Slice PRD v2.1 §17 (`intake_subscription_intent` event consumed by Pharmacy + Refill)
  */
 
-import { findActiveDeployment } from './internal/repositories/submission-repo.js';
 import type { TenantId } from '../../lib/glossary.js';
+
+import { findActiveDeployment } from './internal/repositories/submission-repo.js';
 import type { FormDeployment, ProgramCatalogEntryId } from './internal/types.js';
 
 // ---------------------------------------------------------------------------

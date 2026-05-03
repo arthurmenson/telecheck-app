@@ -34,6 +34,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+
 import { assertInvariants } from '../helpers/invariant-assertions.ts';
 import { TENANT_GHANA, TENANT_US } from '../helpers/tenant-fixtures.ts';
 
@@ -121,9 +122,7 @@ describe('error envelope — cross-tenant existence leak prevention (I-025)', ()
     // structural leakage (tenant_id key). A message-content scan would be
     // an additional check in a future PR.
     // This test documents the INTENT even if the message-scan isn't wired yet.
-    expect(
-      (existenceLeakingEnvelope.error.message as string).includes(TENANT_US),
-    ).toBe(true); // Confirming the fixture is correct for documentation purposes.
+    expect(existenceLeakingEnvelope.error.message.includes(TENANT_US)).toBe(true); // Confirming the fixture is correct for documentation purposes.
   });
 
   it('should reject an envelope that contains extra undocumented fields', () => {

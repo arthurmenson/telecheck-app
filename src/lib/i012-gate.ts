@@ -115,16 +115,9 @@ export interface I012ActionContext {
 // Reserved/forbidden autonomy levels for I-012 gate
 // ---------------------------------------------------------------------------
 
-const RESERVED_AUTONOMY_LEVELS = new Set([
-  'action_with_audit_only',
-  'fully_autonomous',
-]);
+const RESERVED_AUTONOMY_LEVELS = new Set(['action_with_audit_only', 'fully_autonomous']);
 
-const ACTIVE_AUTONOMY_LEVELS_FOR_I012 = new Set([
-  'advisory',
-  'suggestion',
-  'action_with_confirm',
-]);
+const ACTIVE_AUTONOMY_LEVELS_FOR_I012 = new Set(['advisory', 'suggestion', 'action_with_confirm']);
 
 // ---------------------------------------------------------------------------
 // Sentinel computation helpers
@@ -144,10 +137,19 @@ function resolveEnvelopeWorkloadType(attempted: string | null | undefined): stri
 
 function resolveEnvelopeAutonomyLevel(attempted: string | null | undefined): string {
   const activeAndKnown = new Set([
-    'advisory', 'suggestion', 'action_with_confirm', 'n/a',
-    'action_with_audit_only', 'fully_autonomous', // reserved but known — still sentinel on rejection
+    'advisory',
+    'suggestion',
+    'action_with_confirm',
+    'n/a',
+    'action_with_audit_only',
+    'fully_autonomous', // reserved but known — still sentinel on rejection
   ]);
-  if (attempted === null || attempted === undefined || attempted === '' || !activeAndKnown.has(attempted)) {
+  if (
+    attempted === null ||
+    attempted === undefined ||
+    attempted === '' ||
+    !activeAndKnown.has(attempted)
+  ) {
     return 'rejected_invalid_attempt';
   }
   return attempted;
@@ -167,7 +169,9 @@ async function checkAuditChainConfirmation(
     throw new Error(
       'I-012 clause 2 (audit chain confirmation event check) is STUBBED. ' +
         'Real implementation queries the audit_records table for a prior ' +
-        'prescribing.approved (or equivalent) event with action_id=' + actionId + '. ' +
+        'prescribing.approved (or equivalent) event with action_id=' +
+        actionId +
+        '. ' +
         'This requires migration 002 (audit_records table). ' +
         'See i012-gate.ts open questions.',
     );
@@ -196,7 +200,9 @@ async function checkRbacAuthorization(
     throw new Error(
       'I-012 clause 3 (RBAC role authorization check) is STUBBED. ' +
         'Real implementation queries the RBAC catalog per RBAC v1.1 for ' +
-        'the confirming actor\'s role against action class "' + actionClass + '". ' +
+        'the confirming actor\'s role against action class "' +
+        actionClass +
+        '". ' +
         'See i012-gate.ts open questions.',
     );
   }
@@ -247,11 +253,19 @@ export async function evaluateI012Gate(ctx: I012ActionContext): Promise<I012Gate
 
   if (attempted === 'action_with_confirm') {
     clause1Pass = true;
-  } else if (attempted !== null && attempted !== undefined && RESERVED_AUTONOMY_LEVELS.has(attempted)) {
+  } else if (
+    attempted !== null &&
+    attempted !== undefined &&
+    RESERVED_AUTONOMY_LEVELS.has(attempted)
+  ) {
     // Reserved level — explicitly rejected; also set reserved_level violation
     violated.push('reserved_level_without_activation_audit_event');
     violated.push('autonomy_level_string_equality');
-  } else if (attempted !== null && attempted !== undefined && ACTIVE_AUTONOMY_LEVELS_FOR_I012.has(attempted)) {
+  } else if (
+    attempted !== null &&
+    attempted !== undefined &&
+    ACTIVE_AUTONOMY_LEVELS_FOR_I012.has(attempted)
+  ) {
     // Active level but not action_with_confirm (advisory/suggestion) — wrong level
     violated.push('autonomy_level_string_equality');
   } else {
@@ -259,37 +273,28 @@ export async function evaluateI012Gate(ctx: I012ActionContext): Promise<I012Gate
     violated.push('autonomy_level_string_equality');
   }
 
-  // Clause 2: explicit clinician confirmation event in audit chain
-  let confirmationEventState: ConfirmationEventState = 'absent';
-  let clause2Pass = false;
-  try {
-    const c2 = await checkAuditChainConfirmation(
-      ctx.action_id,
-      ctx.action_class,
-      ctx.confirming_actor,
-    );
-    confirmationEventState = c2.state;
-    clause2Pass = c2.pass;
-    if (!c2.pass) {
-      violated.push('audit_chain_confirmation_event_missing');
-    }
-  } catch (err) {
-    // Stub throws in production — re-throw (do not suppress; per I-003)
-    throw err;
+  // Clause 2: explicit clinician confirmation event in audit chain.
+  // Per I-003, the underlying stub throws in production rather than
+  // suppressing — that throw propagates here without need for an
+  // explicit re-throw wrapper (was previously a no-useless-catch lint hit).
+  const c2 = await checkAuditChainConfirmation(
+    ctx.action_id,
+    ctx.action_class,
+    ctx.confirming_actor,
+  );
+  const confirmationEventState: ConfirmationEventState = c2.state;
+  const clause2Pass = c2.pass;
+  if (!c2.pass) {
+    violated.push('audit_chain_confirmation_event_missing');
   }
 
-  // Clause 3: confirming actor RBAC authorized
-  let rbacResult: RbacRoleCheckResult = 'role_not_found';
-  let clause3Pass = false;
-  try {
-    const c3 = await checkRbacAuthorization(ctx.action_class, ctx.confirming_actor);
-    rbacResult = c3.result;
-    clause3Pass = c3.pass;
-    if (!c3.pass) {
-      violated.push('confirming_actor_rbac_unauthorized');
-    }
-  } catch (err) {
-    throw err;
+  // Clause 3: confirming actor RBAC authorized. Same bare-suppression
+  // discipline — RBAC check throws propagate as-is.
+  const c3 = await checkRbacAuthorization(ctx.action_class, ctx.confirming_actor);
+  const rbacResult: RbacRoleCheckResult = c3.result;
+  const clause3Pass = c3.pass;
+  if (!c3.pass) {
+    violated.push('confirming_actor_rbac_unauthorized');
   }
 
   if (clause1Pass && clause2Pass && clause3Pass) {

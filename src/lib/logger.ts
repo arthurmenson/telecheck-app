@@ -35,6 +35,7 @@
  */
 
 import pino, { type Logger, type TransportSingleOptions } from 'pino';
+
 import { config } from './config.js';
 
 // ---------------------------------------------------------------------------
@@ -66,9 +67,7 @@ function buildPinoOptions(): pino.LoggerOptions {
   const additionalPaths = config.logRedactPaths;
 
   // Merge always-redacted with env-configured paths, deduplicated
-  const allRedactPaths = Array.from(
-    new Set([...ALWAYS_REDACTED, ...additionalPaths]),
-  );
+  const allRedactPaths = Array.from(new Set([...ALWAYS_REDACTED, ...additionalPaths]));
 
   const options: pino.LoggerOptions = {
     level: config.logLevel,

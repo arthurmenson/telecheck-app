@@ -49,6 +49,7 @@
 // import { evaluateI012Gate } from '../../src/lib/i012-gate.ts';
 
 import { describe, expect, it } from 'vitest';
+
 import type { I012GateResultStub } from '../helpers/invariant-assertions.ts';
 import { assertInvariants } from '../helpers/invariant-assertions.ts';
 import { TENANT_US } from '../helpers/tenant-fixtures.ts';
@@ -148,7 +149,9 @@ describe('I-012 gate — clause 1: autonomy_level must equal "action_with_confir
     const result = evaluateI012GateStub(input);
 
     expect(result.passed).toBe(false);
-    expect(result.violatedClauses).toContain('autonomy_level_string_equality' satisfies ViolatedClause);
+    expect(result.violatedClauses).toContain(
+      'autonomy_level_string_equality' satisfies ViolatedClause,
+    );
 
     assertInvariants(['I-012'], {
       tenantId: TENANT_US,

@@ -46,7 +46,9 @@
  */
 
 import crypto from 'crypto';
+
 import { z } from 'zod';
+
 import type { TenantId } from './glossary.js';
 
 // ---------------------------------------------------------------------------
@@ -64,8 +66,8 @@ type CategoryAAction =
   | 'protocol_authorized_prescribing'
   | 'protocol_authorized_refill_renewal'
   | 'protocol_authorized_dispensing_release'
-  | 'prescribing.execution_rejected'     // added v5.2 — I-012 bare-suppression closure
-  | 'refill.execution_rejected'          // added v5.2 — I-012 bare-suppression closure
+  | 'prescribing.execution_rejected' // added v5.2 — I-012 bare-suppression closure
+  | 'refill.execution_rejected' // added v5.2 — I-012 bare-suppression closure
   | 'medication_order.execution_rejected' // added v5.2 — I-012 bare-suppression closure
   | 'interaction_signal_override'
   | 'herb_drug_signal_override'
@@ -192,48 +194,48 @@ export type ActorType =
   | 'pharmacist'
   | 'operator'
   | 'delegate'
-  | 'protocol_engine'   // legacy alias — map to ai_workload for new v1.10+ code
-  | 'ai_workload'       // canonical v1.10+ actor type
-  | 'ai_mode_1'         // deprecated alias; preserved for backward-compat reads only
-  | 'ai_mode_2'         // deprecated alias; preserved for backward-compat reads only
+  | 'protocol_engine' // legacy alias — map to ai_workload for new v1.10+ code
+  | 'ai_workload' // canonical v1.10+ actor type
+  | 'ai_mode_1' // deprecated alias; preserved for backward-compat reads only
+  | 'ai_mode_2' // deprecated alias; preserved for backward-compat reads only
   | 'system'
   | 'platform_admin';
 
 export type AIWorkloadType =
   | 'conversational_assistant'
   | 'protocol_execution'
-  | 'autonomous_agent'              // RESERVED
-  | 'multi_agent_supervisor'        // RESERVED
-  | 'tool_using_agent'              // RESERVED
-  | 'rejected_invalid_attempt'      // SENTINEL — execution_rejected events only
-  | 'n/a'                           // SENTINEL — I-012 clinician-only approval records only
-  | null;                           // nullable for non-AI events / legacy backfill
+  | 'autonomous_agent' // RESERVED
+  | 'multi_agent_supervisor' // RESERVED
+  | 'tool_using_agent' // RESERVED
+  | 'rejected_invalid_attempt' // SENTINEL — execution_rejected events only
+  | 'n/a' // SENTINEL — I-012 clinician-only approval records only
+  | null; // nullable for non-AI events / legacy backfill
 
 export type AutonomyLevel =
   | 'advisory'
   | 'suggestion'
   | 'action_with_confirm'
-  | 'action_with_audit_only'   // RESERVED
-  | 'fully_autonomous'         // RESERVED
+  | 'action_with_audit_only' // RESERVED
+  | 'fully_autonomous' // RESERVED
   | 'rejected_invalid_attempt' // SENTINEL — execution_rejected events only
-  | 'n/a'                      // SENTINEL — I-012 clinician-only approval records only
-  | null;                      // nullable for non-AI events / legacy backfill
+  | 'n/a' // SENTINEL — I-012 clinician-only approval records only
+  | null; // nullable for non-AI events / legacy backfill
 
 export interface HashChain {
-  partition: string;        // target_patient_id
+  partition: string; // target_patient_id
   sequence_number: number;
   previous_hash: string;
   record_hash: string;
 }
 
 export interface AuditEnvelope {
-  audit_id: string;            // 'aud_<ULID>'
-  timestamp: string;           // ISO 8601 with timezone
-  tenant_id: TenantId;         // I-027: required on every record
+  audit_id: string; // 'aud_<ULID>'
+  timestamp: string; // ISO 8601 with timezone
+  tenant_id: TenantId; // I-027: required on every record
   actor_type: ActorType;
   actor_id: string;
   actor_tenant_id: string | null; // null only for platform_admin actors
-  target_patient_id: string | null;          // null for platform-scope events (e.g., forms_template_created); the DB trigger uses 'PLATFORM' sentinel for the hash-chain partition in that case (matching the SQL COALESCE(target_patient_id, 'PLATFORM') in migration 002 audit_records_hash_insert)
+  target_patient_id: string | null; // null for platform-scope events (e.g., forms_template_created); the DB trigger uses 'PLATFORM' sentinel for the hash-chain partition in that case (matching the SQL COALESCE(target_patient_id, 'PLATFORM') in migration 002 audit_records_hash_insert)
   delegate_context: { delegate_id: string; scope: string } | null;
   action: AuditAction;
   category: AuditCategory;
@@ -253,11 +255,16 @@ export interface AuditEnvelope {
   memory_write_set_id: string | null;
   supervising_policy_id: string | null;
   knowledge_source_versions: Array<{ knowledge_base_id: string; version: string }> | null;
-  signals: Array<{ signal_id: string; severity: string; source_engine: string; check_class: string }> | null;
+  signals: Array<{
+    signal_id: string;
+    severity: string;
+    source_engine: string;
+    check_class: string;
+  }> | null;
   override: { signal_id: string; rationale: string; clinician_id: string } | null;
   linked_events: string[];
   compliance_flags: string[];
-  country_of_care: string;       // ISO 3166-1 alpha-2
+  country_of_care: string; // ISO 3166-1 alpha-2
   break_glass: {
     session_id: string;
     reason: string;
@@ -314,9 +321,7 @@ const _emissionLog: EmissionRecord[] = [];
  * @throws If no matching emission is found.
  */
 export function assertAuditEmittedFor(actionId: string, action: AuditAction): void {
-  const found = _emissionLog.some(
-    (r) => r.actionId === actionId && r.action === action,
-  );
+  const found = _emissionLog.some((r) => r.actionId === actionId && r.action === action);
   if (!found) {
     throw new Error(
       `assertAuditEmittedFor: no audit emission found for actionId="${actionId}" action="${action}". ` +
@@ -338,17 +343,11 @@ export function assertAuditEmittedFor(actionId: string, action: AuditAction): vo
  * emitAudit is byte-identical to what the DB stored.
  */
 function computeGenesisHash(partitionKey: string): string {
-  return crypto
-    .createHash('sha256')
-    .update(`GENESIS:${partitionKey}`)
-    .digest('hex');
+  return crypto.createHash('sha256').update(`GENESIS:${partitionKey}`).digest('hex');
 }
 
 function computeRecordHash(envelope: Omit<AuditEnvelope, 'hash_chain'>): string {
-  return crypto
-    .createHash('sha256')
-    .update(JSON.stringify(envelope))
-    .digest('hex');
+  return crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
 }
 
 /**
@@ -424,8 +423,8 @@ async function getPreviousHashForPartition(
 
 function validateWorkloadFields(input: AuditEnvelopeInput): void {
   const { action, actor_type, ai_workload_type, autonomy_level } = input;
-  const isI012Action = I012_ACTION_CLASS_SET.has(action as AuditAction);
-  const isExecutionRejected = EXECUTION_REJECTED_ACTIONS.has(action as AuditAction);
+  const isI012Action = I012_ACTION_CLASS_SET.has(action);
+  const isExecutionRejected = EXECUTION_REJECTED_ACTIONS.has(action);
   const isAIWorkload = actor_type === 'ai_workload';
 
   // I-012 closure rule: ai_workload_type and autonomy_level are required
@@ -494,7 +493,11 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
   }
 
   // Reserved workload types must not appear on successful execution records
-  const reservedWorkloadTypes = new Set(['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent']);
+  const reservedWorkloadTypes = new Set([
+    'autonomous_agent',
+    'multi_agent_supervisor',
+    'tool_using_agent',
+  ]);
   if (ai_workload_type && reservedWorkloadTypes.has(ai_workload_type)) {
     throw new Error(
       `Reserved ai_workload_type "${ai_workload_type}" cannot appear on audit records at v1.0. ` +
@@ -523,7 +526,10 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
  * type-only contract avoids a dep coupling in the audit module.
  */
 export interface AuditDbClient {
-  query(text: string, values?: ReadonlyArray<unknown>): Promise<{ rows: unknown[]; rowCount: number | null }>;
+  query(
+    text: string,
+    values?: ReadonlyArray<unknown>,
+  ): Promise<{ rows: unknown[]; rowCount: number | null }>;
 }
 
 /**
@@ -580,15 +586,11 @@ export async function emitAudit(
   validateWorkloadFields(input);
 
   // 3. Auto-enforce audit_sensitivity_level = high_pii for research export events (I-031)
-  const sensitivityLevel: AuditSensitivityLevel =
-    RESEARCH_HIGH_PII_ACTIONS.has(input.action as AuditAction)
-      ? 'high_pii'
-      : input.audit_sensitivity_level;
+  const sensitivityLevel: AuditSensitivityLevel = RESEARCH_HIGH_PII_ACTIONS.has(input.action)
+    ? 'high_pii'
+    : input.audit_sensitivity_level;
 
-  if (
-    RESEARCH_HIGH_PII_ACTIONS.has(input.action as AuditAction) &&
-    input.audit_sensitivity_level !== 'high_pii'
-  ) {
+  if (RESEARCH_HIGH_PII_ACTIONS.has(input.action) && input.audit_sensitivity_level !== 'high_pii') {
     throw new Error(
       `I-031 violation: research export event "${input.action}" must carry ` +
         'audit_sensitivity_level="high_pii". Caller supplied "standard".',
@@ -603,10 +605,7 @@ export async function emitAudit(
   //    'PLATFORM') in migration 002 audit_records_hash_insert. This keeps
   //    the app-side and DB-side hash chains aligned for the platform partition.
   const partitionInput = input.target_patient_id ?? 'PLATFORM';
-  const { previousHash, sequenceNumber } = await getPreviousHashForPartition(
-    partitionInput,
-    tx,
-  );
+  const { previousHash, sequenceNumber } = await getPreviousHashForPartition(partitionInput, tx);
 
   // Build the envelope without hash_chain first (needed for record_hash).
   // audit_id is a UUID v4 to match the audit_records.audit_id UUID column type.
@@ -696,7 +695,7 @@ export async function emitAudit(
     if (process.env['NODE_ENV'] === 'test') {
       _emissionLog.push({
         actionId: envelope.resource_id,
-        action: envelope.action as AuditAction,
+        action: envelope.action,
         emittedAt: new Date(),
       });
     }
@@ -721,7 +720,7 @@ export async function emitAudit(
   // Integration tests MUST pass a real tx and exercise the durable path above.
   _emissionLog.push({
     actionId: envelope.resource_id,
-    action: envelope.action as AuditAction,
+    action: envelope.action,
     emittedAt: new Date(),
   });
 

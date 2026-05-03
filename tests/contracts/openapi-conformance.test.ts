@@ -40,6 +40,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 // ---------------------------------------------------------------------------
@@ -49,8 +50,9 @@ import { describe, expect, it } from 'vitest';
 //   <workspace>/telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/
 // ---------------------------------------------------------------------------
 
-const SPEC_BUNDLE_DIR = process.env['TELECHECK_SPEC_PATH']
-  ?? resolve(
+const SPEC_BUNDLE_DIR =
+  process.env['TELECHECK_SPEC_PATH'] ??
+  resolve(
     import.meta.dirname ?? __dirname,
     '../../../Telecheck Master Bundle FINAL US REGION BASELINE',
   );
@@ -158,11 +160,17 @@ describe('OpenAPI conformance — endpoint coverage (skeleton; promote it.todo()
 
   // Prescribing / medication_request
   it.todo('POST /medication-requests — initiates medication_request; triggers I-012 gate');
-  it.todo('POST /medication-requests/{mr_id}/approve — clinician approval; emits prescribing.approved');
-  it.todo('POST /medication-requests/{mr_id}/decline — clinician decline; emits prescribing.declined');
+  it.todo(
+    'POST /medication-requests/{mr_id}/approve — clinician approval; emits prescribing.approved',
+  );
+  it.todo(
+    'POST /medication-requests/{mr_id}/decline — clinician decline; emits prescribing.declined',
+  );
 
   // Research exports (I-029)
-  it.todo('POST /research/exports/initiate — initiates export; validates 6-condition initiation guard');
+  it.todo(
+    'POST /research/exports/initiate — initiates export; validates 6-condition initiation guard',
+  );
   it.todo('POST /research/exports/{export_id}/complete — completion; triggers I-029 gate');
 
   // Audit

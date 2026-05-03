@@ -59,15 +59,15 @@ export type SubmissionStatus =
 export interface FormTemplate {
   template_id: FormTemplateId;
   tenant_id: TenantId;
-  program_id: ProgramCatalogEntryId;       // mirrors forms_template.program_id
-  country_of_care: 'US' | 'GH';            // ISO 3166-1 alpha-2 per CDM §4.1
-  template_version: number;                // monotonic per (tenant, program, country) per Pattern A
+  program_id: ProgramCatalogEntryId; // mirrors forms_template.program_id
+  country_of_care: 'US' | 'GH'; // ISO 3166-1 alpha-2 per CDM §4.1
+  template_version: number; // monotonic per (tenant, program, country) per Pattern A
   status: FormLifecycleStatus;
   // Four FORMS_ENGINE v5.2 functional layers stored as JSONB.
-  presentation_content: unknown;           // L1
-  branching_logic: unknown;                // L2
-  eligibility_logic: unknown;              // L3 — clinical safety
-  approval_governance: unknown;            // L4 — pricing/market gates
+  presentation_content: unknown; // L1
+  branching_logic: unknown; // L2
+  eligibility_logic: unknown; // L3 — clinical safety
+  approval_governance: unknown; // L4 — pricing/market gates
   created_at: string;
   updated_at: string;
 }
@@ -75,21 +75,21 @@ export interface FormTemplate {
 export interface FormDeployment {
   deployment_id: FormDeploymentId;
   tenant_id: TenantId;
-  template_id: FormTemplateId;             // composite FK (tenant_id, template_id) → forms_template
+  template_id: FormTemplateId; // composite FK (tenant_id, template_id) → forms_template
   program_id: ProgramCatalogEntryId;
   deployed_at: string;
-  retired_at: string | null;               // NULL = currently active (no separate `status` column)
+  retired_at: string | null; // NULL = currently active (no separate `status` column)
 }
 
 export interface FormSubmission {
   submission_id: FormSubmissionId;
   tenant_id: TenantId;
-  deployment_id: FormDeploymentId;         // composite FK (tenant_id, deployment_id) → forms_deployment
-  variant_id: FormVariantId | null;        // triple-composite FK (tenant_id, deployment_id, variant_id) → forms_variant when set
-  patient_id: PatientId | null;            // null when pre-account device-anonymous
-  delegate_id: string | null;              // delegate context per slice PRD §3
+  deployment_id: FormDeploymentId; // composite FK (tenant_id, deployment_id) → forms_deployment
+  variant_id: FormVariantId | null; // triple-composite FK (tenant_id, deployment_id, variant_id) → forms_variant when set
+  patient_id: PatientId | null; // null when pre-account device-anonymous
+  delegate_id: string | null; // delegate context per slice PRD §3
   status: SubmissionStatus;
-  responses: Record<string, unknown>;      // dynamic per template_version; reconstruction via snapshot
+  responses: Record<string, unknown>; // dynamic per template_version; reconstruction via snapshot
   started_at: string;
   submitted_at: string | null;
 }
@@ -104,9 +104,9 @@ export interface FormSubmission {
 export interface FormSnapshot {
   snapshot_id: FormSnapshotId;
   tenant_id: TenantId;
-  submission_id: FormSubmissionId;         // composite FK (tenant_id, submission_id) → forms_submission
-  template_id: FormTemplateId;             // composite FK (tenant_id, template_id) → forms_template
-  presented_content: unknown;              // full rendered template + branching + L4 governance + CCR keys + research_consent_text_version per FORMS_ENGINE v5.2
+  submission_id: FormSubmissionId; // composite FK (tenant_id, submission_id) → forms_submission
+  template_id: FormTemplateId; // composite FK (tenant_id, template_id) → forms_template
+  presented_content: unknown; // full rendered template + branching + L4 governance + CCR keys + research_consent_text_version per FORMS_ENGINE v5.2
   captured_at: string;
 }
 

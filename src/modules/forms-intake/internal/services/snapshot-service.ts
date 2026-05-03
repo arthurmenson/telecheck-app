@@ -16,13 +16,7 @@
  */
 
 import type { TenantContext } from '../../../../lib/tenant-context.js';
-
-import type {
-  FormSnapshot,
-  FormSnapshotId,
-  FormSubmissionId,
-  FormVersionId,
-} from '../types.js';
+import type { FormSnapshot, FormSnapshotId, FormSubmissionId, FormVersionId } from '../types.js';
 
 /**
  * Build and persist a snapshot at submission time. Captures the rendered

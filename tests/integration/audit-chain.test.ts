@@ -32,7 +32,9 @@
  */
 
 import { createHash } from 'node:crypto';
+
 import { describe, expect, it } from 'vitest';
+
 import { assertAuditChainIntact } from '../helpers/audit-assertions.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
@@ -54,7 +56,8 @@ interface AuditRow {
 
 function computeRecordHash(body: Record<string, unknown>): string {
   const keys = Object.keys(body).sort();
-  const canonical = '{' + keys.map((k) => `${JSON.stringify(k)}:${JSON.stringify(body[k])}`).join(',') + '}';
+  const canonical =
+    '{' + keys.map((k) => `${JSON.stringify(k)}:${JSON.stringify(body[k])}`).join(',') + '}';
   return createHash('sha256').update(canonical, 'utf8').digest('hex');
 }
 
@@ -203,9 +206,7 @@ describe('audit chain — DELETE forbidden by trigger (I-003)', () => {
     const client = getTestClient();
 
     await expect(
-      client.query(
-        `DELETE FROM audit_records WHERE audit_id = 'aud_chain_test_delete_target'`,
-      ),
+      client.query(`DELETE FROM audit_records WHERE audit_id = 'aud_chain_test_delete_target'`),
     ).rejects.toThrow();
   });
 });

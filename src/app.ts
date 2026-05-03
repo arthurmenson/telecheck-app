@@ -20,10 +20,11 @@
 import fastifyHelmet from '@fastify/helmet';
 import fastifySensible from '@fastify/sensible';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { errorEnvelopePlugin } from './lib/error-envelope.js';
-import { tenantContextPlugin } from './lib/tenant-context.js';
-import { idempotencyPlugin } from './lib/idempotency.js';
+
 import { aiContextPlugin } from './lib/ai-context.js';
+import { errorEnvelopePlugin } from './lib/error-envelope.js';
+import { idempotencyPlugin } from './lib/idempotency.js';
+import { tenantContextPlugin } from './lib/tenant-context.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
 
 export interface AppOptions {

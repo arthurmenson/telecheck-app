@@ -29,15 +29,9 @@ import {
   withTenantBoundConnection,
   withTransaction,
 } from '../../../../lib/db.js';
-import { ulid } from '../../../../lib/ulid.js';
 import type { TenantId } from '../../../../lib/glossary.js';
-
-import type {
-  FormLifecycleStatus,
-  FormTemplate,
-  FormTemplateId,
-  FormVersionId,
-} from '../types.js';
+import { ulid } from '../../../../lib/ulid.js';
+import type { FormLifecycleStatus, FormTemplate, FormTemplateId, FormVersionId } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Reads
@@ -76,9 +70,7 @@ export async function findTemplateById(
   });
 }
 
-export async function listTemplatesForTenant(
-  _tenantId: TenantId,
-): Promise<FormTemplate[]> {
+export async function listTemplatesForTenant(_tenantId: TenantId): Promise<FormTemplate[]> {
   // TODO: SELECT under withTenantBoundConnection following findTemplateById pattern.
   throw new Error('not implemented');
 }

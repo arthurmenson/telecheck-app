@@ -58,10 +58,7 @@ import type { TenantContext } from './tenant-context.js';
  *         Per the security discipline, a stub that silently passes
  *         production traffic would itself be an isolation-layer violation.
  */
-export async function kmsEncrypt(
-  tenant: TenantContext,
-  plain: Buffer,
-): Promise<Buffer> {
+export async function kmsEncrypt(tenant: TenantContext, plain: Buffer): Promise<Buffer> {
   if (process.env['NODE_ENV'] !== 'test') {
     throw new Error(
       `kms.kmsEncrypt: AWS KMS integration not yet wired. The application ` +
@@ -85,10 +82,7 @@ export async function kmsEncrypt(
  *
  * @throws Same as kmsEncrypt in non-test environments.
  */
-export async function kmsDecrypt(
-  tenant: TenantContext,
-  cipher: Buffer,
-): Promise<Buffer> {
+export async function kmsDecrypt(tenant: TenantContext, cipher: Buffer): Promise<Buffer> {
   if (process.env['NODE_ENV'] !== 'test') {
     throw new Error(
       `kms.kmsDecrypt: AWS KMS integration not yet wired. Cannot decrypt for ` +

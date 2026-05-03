@@ -34,6 +34,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+
 import { assertInvariants } from '../helpers/invariant-assertions.ts';
 import {
   createTenant,

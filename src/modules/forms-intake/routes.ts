@@ -23,10 +23,7 @@ import {
   getDeploymentHandler,
   retireDeploymentHandler,
 } from './internal/handlers/deployments.js';
-import {
-  getResumeStateHandler,
-  resumeSubmissionHandler,
-} from './internal/handlers/resume.js';
+import { getResumeStateHandler, resumeSubmissionHandler } from './internal/handlers/resume.js';
 import {
   getSubmissionHandler,
   startSubmissionHandler,
@@ -56,10 +53,7 @@ export const registerFormsIntakeRoutes: FastifyPluginAsync = async (
   app.post('/templates', createTemplateHandler);
   app.get('/templates', listTemplatesHandler);
   app.get('/templates/:templateId', getTemplateHandler);
-  app.post(
-    '/templates/:templateId/versions/:versionId/publish',
-    publishVersionHandler,
-  );
+  app.post('/templates/:templateId/versions/:versionId/publish', publishVersionHandler);
 
   // ---- Deployments ----
   app.post('/deployments', createDeploymentHandler);
@@ -69,10 +63,7 @@ export const registerFormsIntakeRoutes: FastifyPluginAsync = async (
   // ---- Submissions (patient/delegate-facing) ----
   app.post('/submissions', startSubmissionHandler);
   app.get('/submissions/:submissionId', getSubmissionHandler);
-  app.patch(
-    '/submissions/:submissionId/responses',
-    updateSubmissionResponsesHandler,
-  );
+  app.patch('/submissions/:submissionId/responses', updateSubmissionResponsesHandler);
   app.post('/submissions/:submissionId/submit', submitSubmissionHandler);
 
   // ---- Variants (A/B test administration) ----

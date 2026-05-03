@@ -32,7 +32,9 @@
  */
 
 import { createHash } from 'node:crypto';
+
 import { describe, expect, it } from 'vitest';
+
 import { assertAuditChainIntact } from '../helpers/audit-assertions.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
@@ -59,7 +61,13 @@ async function insertMinimalAuditRecord(
     detail: {},
   };
 
-  const bodyStr = '{' + Object.keys(body).sort().map((k) => `${JSON.stringify(k)}:${JSON.stringify(body[k])}`).join(',') + '}';
+  const bodyStr =
+    '{' +
+    Object.keys(body)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${JSON.stringify(body[k])}`)
+      .join(',') +
+    '}';
   const recordHash = createHash('sha256').update(bodyStr, 'utf8').digest('hex');
 
   await client.query(
@@ -163,9 +171,7 @@ describe('I-003 — trigger: UPDATE and DELETE must raise EXCEPTION', () => {
 
     const client = getTestClient();
     await expect(
-      client.query(
-        `DELETE FROM audit_records WHERE audit_id = 'aud_i003_del_target'`,
-      ),
+      client.query(`DELETE FROM audit_records WHERE audit_id = 'aud_i003_del_target'`),
     ).rejects.toThrow();
   });
 });
@@ -199,7 +205,13 @@ describe('I-003 — correction pattern: append a new record referencing the orig
         resource_id: 'mr_correction_001',
         detail: { corrects_audit_id: 'aud_i003_correction_original' },
       };
-      const bodyStr = '{' + Object.keys(body).sort().map((k) => `${JSON.stringify(k)}:${JSON.stringify(body[k])}`).join(',') + '}';
+      const bodyStr =
+        '{' +
+        Object.keys(body)
+          .sort()
+          .map((k) => `${JSON.stringify(k)}:${JSON.stringify(body[k])}`)
+          .join(',') +
+        '}';
       const recordHash = createHash('sha256').update(bodyStr, 'utf8').digest('hex');
 
       await client.query(

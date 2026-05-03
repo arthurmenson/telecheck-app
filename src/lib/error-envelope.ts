@@ -68,17 +68,36 @@ function defaultsForStatus(statusCode: number): ErrorDefaults {
     case 401:
       return { code: 'internal.auth.unauthenticated', message: 'Authentication is required.' };
     case 403:
-      return { code: 'internal.auth.insufficient_scope', message: 'You are not authorized to perform this action.' };
+      return {
+        code: 'internal.auth.insufficient_scope',
+        message: 'You are not authorized to perform this action.',
+      };
     case 404:
-      return { code: 'internal.resource.not_found', message: 'The requested resource was not found.' };
+      return {
+        code: 'internal.resource.not_found',
+        message: 'The requested resource was not found.',
+      };
     case 409:
-      return { code: 'internal.resource.conflict', message: 'The request conflicts with the current state of the resource.' };
+      return {
+        code: 'internal.resource.conflict',
+        message: 'The request conflicts with the current state of the resource.',
+      };
     case 422:
-      return { code: 'internal.request.semantically_invalid', message: 'The request was semantically invalid.' };
+      return {
+        code: 'internal.request.semantically_invalid',
+        message: 'The request was semantically invalid.',
+      };
     case 429:
-      return { code: 'internal.rate_limit.exceeded', message: 'Rate limit exceeded. Please wait before retrying.' };
+      return {
+        code: 'internal.rate_limit.exceeded',
+        message: 'Rate limit exceeded. Please wait before retrying.',
+      };
     case 503:
-      return { code: 'internal.service.unavailable', message: 'The service is temporarily unavailable.', retryAfter: 'PT30S' };
+      return {
+        code: 'internal.service.unavailable',
+        message: 'The service is temporarily unavailable.',
+        retryAfter: 'PT30S',
+      };
     case 500:
     default:
       return { code: 'internal.service.error', message: 'An internal error occurred.' };
@@ -143,9 +162,10 @@ function buildErrorEnvelope(
   const envelope: ErrorEnvelope = {
     error: {
       code: error.code ?? defaults.code,
-      message: isProd && statusCode >= 500
-        ? defaults.message          // Never leak internal detail in prod 5xx
-        : (error.message || defaults.message),
+      message:
+        isProd && statusCode >= 500
+          ? defaults.message // Never leak internal detail in prod 5xx
+          : error.message || defaults.message,
       trace_id: traceId,
       timestamp: new Date().toISOString(),
     },
@@ -174,33 +194,28 @@ function buildErrorEnvelope(
 const errorEnvelopePluginImpl = async (fastify: FastifyInstance): Promise<void> => {
   const isProd = process.env['NODE_ENV'] === 'production';
 
-  fastify.setErrorHandler(
-    (error: FastifyError, request: FastifyRequest, reply: FastifyReply) => {
-      const { statusCode, envelope } = buildErrorEnvelope(error, request, isProd);
+  fastify.setErrorHandler((error: FastifyError, request: FastifyRequest, reply: FastifyReply) => {
+    const { statusCode, envelope } = buildErrorEnvelope(error, request, isProd);
 
-      // Log at appropriate level. 5xx logs include the full error for server-side
-      // investigation; 4xx logs at warn.
-      if (statusCode >= 500) {
-        request.log.error(
-          {
-            err: error,
-            statusCode,
-            requestId: request.id,
-            // Intentionally NO tenant info in the log field name that appears
-            // in centralized aggregators accessible to tenant operators (I-023 discipline).
-          },
-          'Internal server error',
-        );
-      } else {
-        request.log.warn(
-          { statusCode, code: error.code, requestId: request.id },
-          'Request error',
-        );
-      }
+    // Log at appropriate level. 5xx logs include the full error for server-side
+    // investigation; 4xx logs at warn.
+    if (statusCode >= 500) {
+      request.log.error(
+        {
+          err: error,
+          statusCode,
+          requestId: request.id,
+          // Intentionally NO tenant info in the log field name that appears
+          // in centralized aggregators accessible to tenant operators (I-023 discipline).
+        },
+        'Internal server error',
+      );
+    } else {
+      request.log.warn({ statusCode, code: error.code, requestId: request.id }, 'Request error');
+    }
 
-      void reply.code(statusCode).type('application/json').send(envelope);
-    },
-  );
+    void reply.code(statusCode).type('application/json').send(envelope);
+  });
 
   // Fastify 5.x: also handle not-found at the plugin level for uniform envelope
   fastify.setNotFoundHandler((request: FastifyRequest, reply: FastifyReply) => {

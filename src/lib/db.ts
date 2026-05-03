@@ -113,9 +113,7 @@ export async function closePool(): Promise<void> {
  * For tenant-scoped queries, prefer `rls.ts withTenantContext()` which
  * also sets the RLS session binding before running `fn`.
  */
-export async function withConnection<T>(
-  fn: (client: DbClient) => Promise<T>,
-): Promise<T> {
+export async function withConnection<T>(fn: (client: DbClient) => Promise<T>): Promise<T> {
   const pool = getPool();
   const client = await pool.connect();
   try {
@@ -183,9 +181,7 @@ export async function withTenantBoundConnection<T>(
  * to roll back so the upstream business action is reverted — this helper
  * is the mechanism.
  */
-export async function withTransaction<T>(
-  fn: (tx: DbTransaction) => Promise<T>,
-): Promise<T> {
+export async function withTransaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
   const pool = getPool();
   const client = await pool.connect();
   try {

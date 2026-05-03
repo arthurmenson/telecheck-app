@@ -41,6 +41,7 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
+
 import { config } from './config.js';
 
 // ---------------------------------------------------------------------------
@@ -50,20 +51,20 @@ import { config } from './config.js';
 export type AIWorkloadType =
   | 'conversational_assistant'
   | 'protocol_execution'
-  | 'autonomous_agent'              // RESERVED
-  | 'multi_agent_supervisor'        // RESERVED
-  | 'tool_using_agent'              // RESERVED
-  | 'rejected_invalid_attempt'      // SENTINEL — not for runtime AI workloads
-  | 'n/a';                          // SENTINEL — not for runtime AI workloads
+  | 'autonomous_agent' // RESERVED
+  | 'multi_agent_supervisor' // RESERVED
+  | 'tool_using_agent' // RESERVED
+  | 'rejected_invalid_attempt' // SENTINEL — not for runtime AI workloads
+  | 'n/a'; // SENTINEL — not for runtime AI workloads
 
 export type AutonomyLevel =
   | 'advisory'
   | 'suggestion'
   | 'action_with_confirm'
-  | 'action_with_audit_only'   // RESERVED
-  | 'fully_autonomous'         // RESERVED
+  | 'action_with_audit_only' // RESERVED
+  | 'fully_autonomous' // RESERVED
   | 'rejected_invalid_attempt' // SENTINEL
-  | 'n/a';                     // SENTINEL
+  | 'n/a'; // SENTINEL
 
 export interface AIContext {
   ai_workload_type: AIWorkloadType;
@@ -179,11 +180,7 @@ export function resolveAutonomyLevel(raw: string): AutonomyLevel {
   }
 
   // Active at v1.0
-  if (
-    raw === 'advisory' ||
-    raw === 'suggestion' ||
-    raw === 'action_with_confirm'
-  ) {
+  if (raw === 'advisory' || raw === 'suggestion' || raw === 'action_with_confirm') {
     return raw;
   }
 
@@ -208,10 +205,7 @@ export function resolveAutonomyLevel(raw: string): AutonomyLevel {
  * @throws `ReservedAutonomyLevelError` if autonomy level is reserved.
  * @throws `Error` if the (workload_type, autonomy_level) pair is not permitted.
  */
-export function resolveAiContext(
-  workloadTypeRaw: string,
-  autonomyLevelRaw: string,
-): AIContext {
+export function resolveAiContext(workloadTypeRaw: string, autonomyLevelRaw: string): AIContext {
   const workloadType = resolveWorkloadType(workloadTypeRaw);
   const autonomyLevel = resolveAutonomyLevel(autonomyLevelRaw);
 

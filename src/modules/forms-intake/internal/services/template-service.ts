@@ -21,7 +21,6 @@
  */
 
 import type { TenantContext } from '../../../../lib/tenant-context.js';
-
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedAudit,
   emitFormsTemplateCreated as emitFormsTemplateCreatedAudit,
@@ -184,10 +183,7 @@ export async function createDeployment(
   input: CreateDeploymentRequest,
 ): Promise<FormDeployment> {
   // Precondition 1: template must exist in this tenant.
-  const template = await templateRepo.findTemplateById(
-    ctx.tenantId,
-    input.templateId as FormTemplateId,
-  );
+  const template = await templateRepo.findTemplateById(ctx.tenantId, input.templateId);
   if (template === null) {
     throw new Error('forms.deployment.template_not_found');
   }
@@ -207,34 +203,34 @@ export async function createDeployment(
   // repo's atomic check is the correctness guarantee.
   try {
     return await submissionRepo.createActiveDeployment(
-    ctx.tenantId,
-    {
-      templateId: input.templateId as FormTemplateId,
-    },
-    async (tx, deployment) => {
-      await emitFormsDeploymentCreatedAudit(
-        {
+      ctx.tenantId,
+      {
+        templateId: input.templateId,
+      },
+      async (tx, deployment) => {
+        await emitFormsDeploymentCreatedAudit(
+          {
+            tenantId: ctx.tenantId,
+            actorId,
+            actorTenantId: ctx.tenantId,
+            countryOfCare: ctx.countryOfCare,
+            deploymentId: deployment.deployment_id,
+            templateId: deployment.template_id,
+            programId: deployment.program_id,
+          },
+          tx,
+        );
+
+        await emitFormsDeploymentCreatedEvent(tx, {
           tenantId: ctx.tenantId,
-          actorId,
-          actorTenantId: ctx.tenantId,
-          countryOfCare: ctx.countryOfCare,
           deploymentId: deployment.deployment_id,
           templateId: deployment.template_id,
           programId: deployment.program_id,
-        },
-        tx,
-      );
-
-      await emitFormsDeploymentCreatedEvent(tx, {
-        tenantId: ctx.tenantId,
-        deploymentId: deployment.deployment_id,
-        templateId: deployment.template_id,
-        programId: deployment.program_id,
-        countryOfCare: ctx.countryOfCare,
-        actorId,
-      });
-    },
-  );
+          countryOfCare: ctx.countryOfCare,
+          actorId,
+        });
+      },
+    );
   } catch (err) {
     // The repo throws DEPLOYMENT_TEMPLATE_PRECONDITION_FAILED when its
     // INSERT...SELECT predicate filters out the template (TOCTOU race
