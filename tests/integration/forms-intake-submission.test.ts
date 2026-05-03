@@ -288,7 +288,8 @@ describe('forms-intake updateResponses — happy path', () => {
 
 describe('forms-intake updateResponses — NOT_IN_PROGRESS / NOT_FOUND', () => {
   it('rejects updates after the submission is submitted', async () => {
-    const programId = `prog_sub_upd_locked_${ulid().slice(0, 8)}`;
+    // Keep prefix short — forms_template.program_id is VARCHAR(26).
+    const programId = `prog_lk_${ulid().slice(0, 8)}`;
     const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
     const patientId = ulid();
 
