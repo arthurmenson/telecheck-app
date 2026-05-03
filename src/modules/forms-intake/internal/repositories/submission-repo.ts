@@ -393,6 +393,12 @@ export async function createSubmission(
     // pattern). Variant validation is deferred — variants are scaffolded
     // but the FK is added by ALTER post-table-create and the assignment
     // logic isn't wired yet.
+    // Explicit type casts on the SELECT-target params close a pg parameter
+    // type-inference hazard: when the same `$2` (tenant_id) appears in both
+    // the SELECT projection (no type context) AND the WHERE comparison
+    // (varchar context), pg fails with "inconsistent types deduced for
+    // parameter $2." The casts pin every projected param to varchar so
+    // both usages resolve consistently.
     const result = await tx.query<FormSubmission>(
       `INSERT INTO forms_submission (
           submission_id, tenant_id, deployment_id, variant_id,
@@ -401,13 +407,13 @@ export async function createSubmission(
           created_at, updated_at
        )
        SELECT
-          $1, $2, d.deployment_id, $3,
-          $4, $5,
+          $1::varchar, $2::varchar, d.deployment_id, $3::varchar,
+          $4::varchar, $5::varchar,
           'in_progress', '{}'::jsonb, FALSE,
           NOW(), NOW()
          FROM forms_deployment d
-        WHERE d.tenant_id = $2
-          AND d.deployment_id = $6
+        WHERE d.tenant_id = $2::varchar
+          AND d.deployment_id = $6::varchar
           AND d.retired_at IS NULL
        RETURNING submission_id, tenant_id, deployment_id, variant_id,
                  patient_id, delegate_id, status, responses,
