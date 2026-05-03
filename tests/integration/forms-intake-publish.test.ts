@@ -78,22 +78,36 @@ interface DraftTemplateInput {
 async function insertDraftTemplate(input: DraftTemplateInput): Promise<string> {
   const client = getTestClient();
   const templateId = ulid();
+  // forms_template's NOT NULL columns include `name` and `created_by`
+  // (per migration 006). Caller doesn't care about either for these tests
+  // — synthesize stable values keyed off the templateId so the row is
+  // unambiguously identifiable in any debug dump.
+  const name = `test-publish-${templateId.slice(0, 8)}`;
+  const createdBy = ulid(); // tenant_user_id stand-in (ULID format)
   await withTenantContext(input.tenantId, async () => {
     await client.query(
       `INSERT INTO forms_template (
           template_id, tenant_id, program_id, country_of_care,
-          template_version, status,
+          template_version, status, name, created_by,
           presentation_content, branching_logic,
           eligibility_logic, approval_governance,
           created_at, updated_at
        ) VALUES (
           $1, $2, $3, $4,
-          $5, 'draft',
+          $5, 'draft', $6, $7,
           '{}'::jsonb, '{}'::jsonb,
           '{}'::jsonb, '{}'::jsonb,
           NOW(), NOW()
        )`,
-      [templateId, input.tenantId, input.programId, input.countryOfCare, input.templateVersion],
+      [
+        templateId,
+        input.tenantId,
+        input.programId,
+        input.countryOfCare,
+        input.templateVersion,
+        name,
+        createdBy,
+      ],
     );
   });
   return templateId;
