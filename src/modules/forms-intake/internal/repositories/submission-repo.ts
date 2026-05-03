@@ -298,6 +298,26 @@ export async function retireDeployment(
 export const SUBMISSION_NOT_FOUND = 'forms.submission.not_found';
 export const SUBMISSION_NOT_IN_PROGRESS = 'forms.submission.not_in_progress';
 
+/**
+ * Sentinel error: a patient already has an in_progress submission for the
+ * same (tenant, deployment) tuple. Surfaces from migration 008's partial
+ * unique index `uq_forms_submission_one_in_progress_per_tuple`. Translated
+ * from a `23505` unique-violation in `createSubmission`.
+ *
+ * **Why this matters (Codex resume-restore-r1 HIGH closure 2026-05-03):**
+ * the save-and-resume restore flow reconstructs the (resume_state ↔
+ * submission) binding via (tenant, deployment, patient, status='in_progress')
+ * because migration 006 has no `submission_id` column on
+ * `forms_resume_state`. With multiple in-progress submissions on the same
+ * tuple the LIMIT 1 was ambiguous — restore could write decrypted paused
+ * responses to a fresh-start submission, silently corrupting it. The
+ * partial unique index makes the tuple lookup unambiguous; this sentinel
+ * is the friendly translation of the constraint violation.
+ *
+ * Handler maps to tenant-blind 400 per I-025.
+ */
+export const IN_PROGRESS_SUBMISSION_EXISTS = 'forms.submission.in_progress_exists';
+
 // ---------------------------------------------------------------------------
 // Submission reads
 // ---------------------------------------------------------------------------
@@ -399,34 +419,57 @@ export async function createSubmission(
     // (varchar context), pg fails with "inconsistent types deduced for
     // parameter $2." The casts pin every projected param to varchar so
     // both usages resolve consistently.
-    const result = await tx.query<FormSubmission>(
-      `INSERT INTO forms_submission (
-          submission_id, tenant_id, deployment_id, variant_id,
-          patient_id, delegate_id,
-          status, responses, mode_2_eligible,
-          created_at, updated_at
-       )
-       SELECT
-          $1::varchar, $2::varchar, d.deployment_id, $3::varchar,
-          $4::varchar, $5::varchar,
-          'in_progress', '{}'::jsonb, FALSE,
-          NOW(), NOW()
-         FROM forms_deployment d
-        WHERE d.tenant_id = $2::varchar
-          AND d.deployment_id = $6::varchar
-          AND d.retired_at IS NULL
-       RETURNING submission_id, tenant_id, deployment_id, variant_id,
-                 patient_id, delegate_id, status, responses,
-                 created_at AS started_at, submitted_at`,
-      [
-        submissionId,
-        tenantId,
-        input.variantId,
-        input.patientId,
-        input.delegateId,
-        input.deploymentId,
-      ],
-    );
+    let result;
+    try {
+      result = await tx.query<FormSubmission>(
+        `INSERT INTO forms_submission (
+            submission_id, tenant_id, deployment_id, variant_id,
+            patient_id, delegate_id,
+            status, responses, mode_2_eligible,
+            created_at, updated_at
+         )
+         SELECT
+            $1::varchar, $2::varchar, d.deployment_id, $3::varchar,
+            $4::varchar, $5::varchar,
+            'in_progress', '{}'::jsonb, FALSE,
+            NOW(), NOW()
+           FROM forms_deployment d
+          WHERE d.tenant_id = $2::varchar
+            AND d.deployment_id = $6::varchar
+            AND d.retired_at IS NULL
+         RETURNING submission_id, tenant_id, deployment_id, variant_id,
+                   patient_id, delegate_id, status, responses,
+                   created_at AS started_at, submitted_at`,
+        [
+          submissionId,
+          tenantId,
+          input.variantId,
+          input.patientId,
+          input.delegateId,
+          input.deploymentId,
+        ],
+      );
+    } catch (err: unknown) {
+      // 23505 = unique_violation. The only relevant unique constraint that
+      // can fire on this INSERT is migration 008's partial unique index
+      // `uq_forms_submission_one_in_progress_per_tuple` —
+      // (tenant, deployment, patient) with at most one in_progress row.
+      // Translates to IN_PROGRESS_SUBMISSION_EXISTS so the handler maps
+      // to a tenant-blind 400 with structured code that preserves
+      // operator-facing distinction from DEPLOYMENT_NOT_FOUND. Closes
+      // Codex resume-restore-r1 HIGH 2026-05-03.
+      //
+      // Defense-in-depth: a malformed `submission_id` collision (variant_id
+      // is also fresh) would also raise 23505, but `submissionId = ulid()`
+      // makes that probabilistically impossible (122 bits of entropy). If
+      // someone hits both unique constraints in one INSERT, the
+      // application-layer message is still safe to render — the tuple
+      // gate is the dominant cause.
+      if (typeof err === 'object' && err !== null && 'code' in err && err.code === '23505') {
+        throw new Error(IN_PROGRESS_SUBMISSION_EXISTS);
+      }
+      throw err;
+    }
 
     if (result.rows.length === 0) {
       // Zero rows from RETURNING means the SELECT predicate filtered:
@@ -1249,11 +1292,23 @@ export const RESUME_STATE_NOT_RESTORABLE = 'forms.resume_state.not_restorable';
  * the (resume_state ↔ submission) binding has to be reconstructed at
  * restore time. The pause path persists the merged responses onto the
  * existing forms_submission row before encrypting; the matching submission
- * is therefore the most-recent in_progress row for the same (tenant,
- * deployment, patient). LIMIT 1 + ORDER BY created_at DESC handles the
- * (defensive) case where a tenant somehow has multiple in_progress
- * submissions on the same deployment for the same patient (the slice PRD
- * §8.2 narrative implies 1:1 but the SQL doesn't enforce it).
+ * is therefore the in_progress row for the (tenant, deployment, patient)
+ * tuple.
+ *
+ * **Disambiguity invariant (Codex resume-restore-r1 HIGH closure
+ * 2026-05-03):** migration 008 added a partial unique index
+ * `uq_forms_submission_one_in_progress_per_tuple ON forms_submission
+ * (tenant_id, deployment_id, patient_id) WHERE status = 'in_progress'
+ * AND deleted_at IS NULL`, so AT MOST ONE row matches the tuple at any
+ * time. Without that index, a patient who started a fresh submission
+ * after pausing an earlier one would have two in_progress rows; the
+ * LIMIT 1 below would pick the most recent (the fresh start) and
+ * restore would silently overwrite the fresh start's progress with the
+ * decrypted paused responses. The unique index makes the LIMIT 1
+ * unambiguous; `createSubmission` translates the constraint violation
+ * into the IN_PROGRESS_SUBMISSION_EXISTS sentinel so the second start
+ * rejects with a clear error. ORDER BY created_at DESC + LIMIT 1 is
+ * preserved as belt-and-suspenders.
  *
  * Returns null on miss OR cross-tenant (RLS-filtered) — service layer
  * maps null to a tenant-blind 404 per I-025.

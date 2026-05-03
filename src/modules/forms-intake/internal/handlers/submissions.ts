@@ -27,6 +27,7 @@ import {
 } from '../../schemas.js';
 import {
   DEPLOYMENT_NOT_FOUND,
+  IN_PROGRESS_SUBMISSION_EXISTS,
   RESUME_STATE_IDENTITY_REQUIRED,
   SUBMISSION_NOT_FOUND,
   SUBMISSION_NOT_IN_PROGRESS,
@@ -103,7 +104,8 @@ function isHandledSentinel(message: string): boolean {
     message === DEPLOYMENT_NOT_FOUND ||
     message === SUBMISSION_NOT_FOUND ||
     message === SUBMISSION_NOT_IN_PROGRESS ||
-    message === RESUME_STATE_IDENTITY_REQUIRED
+    message === RESUME_STATE_IDENTITY_REQUIRED ||
+    message === IN_PROGRESS_SUBMISSION_EXISTS
   );
 }
 

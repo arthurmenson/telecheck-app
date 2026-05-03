@@ -217,6 +217,126 @@ describe('forms-intake startSubmission — DEPLOYMENT_NOT_FOUND', () => {
 });
 
 // ---------------------------------------------------------------------------
+// startSubmission — IN_PROGRESS_SUBMISSION_EXISTS (Codex resume-restore-r1
+// HIGH closure 2026-05-03)
+//
+// Migration 008 added a partial unique index preventing more than one
+// in_progress submission for the same (tenant, deployment, patient) tuple.
+// Without this constraint, the save-and-resume restore path's tuple-based
+// (resume_state ↔ submission) reconstruction had an ambiguity bug — a
+// patient who started a fresh submission after pausing an earlier one
+// would have two in_progress rows, and restore would silently overwrite
+// the fresh-start row with the decrypted paused responses.
+//
+// These tests prove the constraint fires at the application layer with
+// the IN_PROGRESS_SUBMISSION_EXISTS sentinel rather than leaking the raw
+// `23505` error.
+// ---------------------------------------------------------------------------
+
+describe('forms-intake startSubmission — IN_PROGRESS_SUBMISSION_EXISTS', () => {
+  it('rejects a second start on the same (deployment, patient) tuple while one is in progress', async () => {
+    const programId = `prog_sub_dup_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    // First start succeeds.
+    const first = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_dup_first', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+    expect(first.status).toBe('in_progress');
+
+    // Second start on the SAME (deployment, patient) tuple while first is
+    // still in_progress must reject deterministically — not silently
+    // create a sibling row that would later confuse restore.
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.startSubmission(
+          US_CTX,
+          { actorId: 'op_dup_second', patientId, delegateId: null },
+          { deploymentId },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.IN_PROGRESS_SUBMISSION_EXISTS);
+  });
+
+  it('allows a fresh start after the prior submission completes', async () => {
+    // Once the first submission is `submitted`, the partial unique index's
+    // predicate (`status = 'in_progress'`) no longer matches the prior row
+    // so a fresh start succeeds. Confirms the index is genuinely partial
+    // and doesn't over-constrain the legitimate one-submission-per-visit
+    // pattern.
+    const programId = `prog_sub_seq_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    const first = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_seq_a', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+    await withTenantContext(TENANT_US, () =>
+      submissionService.submitSubmission(
+        US_CTX,
+        { actorId: 'op_seq_a', patientId, delegateId: null },
+        first.submission_id,
+        {},
+        getTestClient(),
+      ),
+    );
+
+    // Now fresh start succeeds.
+    const second = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_seq_b', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+    expect(second.status).toBe('in_progress');
+    expect(second.submission_id).not.toBe(first.submission_id);
+  });
+
+  it('allows concurrent in_progress submissions for different patients on the same deployment', async () => {
+    // The unique index is on (tenant, deployment, patient) — a different
+    // patient on the same deployment is unconstrained.
+    const programId = `prog_sub_two_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientA = ulid();
+    const patientB = ulid();
+
+    const a = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_two_a', patientId: patientA, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+    const b = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_two_b', patientId: patientB, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+    expect(a.status).toBe('in_progress');
+    expect(b.status).toBe('in_progress');
+    expect(a.submission_id).not.toBe(b.submission_id);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getSubmission
 // ---------------------------------------------------------------------------
 
