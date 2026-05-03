@@ -49,11 +49,16 @@ export async function findSnapshotBySubmissionId(
   submissionId: FormSubmissionId,
 ): Promise<FormSnapshot | null> {
   return withTenantBoundConnection(tenantId, async (client: DbClient) => {
+    // Aligned to migration 006 column set (Codex slice-scaffold-r1
+    // MEDIUM finding closure 2026-05-02): singular table name
+    // `forms_snapshot`, primary key `snapshot_id`, references
+    // `template_id` (no version_id; the template_version is captured
+    // inside presented_content per FORMS_ENGINE v5.2 + the canonical
+    // §4.1 seed).
     const result = await client.query<FormSnapshot>(
-      `SELECT id, tenant_id, submission_id, version_id,
-              rendered_layout, rendered_branching, rendered_eligibility,
-              rendered_approval_governance, ccr_resolution_pack, created_at
-         FROM forms_snapshots
+      `SELECT snapshot_id, tenant_id, submission_id, template_id,
+              presented_content, captured_at
+         FROM forms_snapshot
         WHERE submission_id = $1 AND tenant_id = $2
         LIMIT 1`,
       [submissionId, tenantId],

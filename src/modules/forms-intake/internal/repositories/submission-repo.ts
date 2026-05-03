@@ -55,16 +55,20 @@ export async function findActiveDeployment(
   programCatalogEntryId: string,
 ): Promise<FormDeployment | null> {
   return withTenantBoundConnection(tenantId, async (client: DbClient) => {
-    // SCAFFOLD: column names assumed canonical from FORMS_ENGINE v5.2.
+    // Aligned to migration 006 column set (Codex slice-scaffold-r1
+    // MEDIUM finding closure 2026-05-02): singular table names; the
+    // active-deployment semantic is retired_at IS NULL (no `status`
+    // column on forms_deployment); join on the composite (tenant_id,
+    // template_id) FK that the v0.2 composite-FK refactor established.
     const result = await client.query<FormDeployment>(
-      `SELECT d.id, d.tenant_id, d.template_id, d.version_id,
-              d.program_market_policy_id, d.status,
-              d.deployed_at, d.retired_at
-         FROM forms_deployments d
-         JOIN forms_templates t ON t.id = d.template_id
+      `SELECT d.deployment_id, d.tenant_id, d.template_id,
+              d.program_id, d.deployed_at, d.retired_at
+         FROM forms_deployment d
+         JOIN forms_template t
+           ON t.tenant_id = d.tenant_id AND t.template_id = d.template_id
         WHERE d.tenant_id = $1
-          AND t.program_catalog_entry_id = $2
-          AND d.status = 'active'
+          AND t.program_id = $2
+          AND d.retired_at IS NULL
         ORDER BY d.deployed_at DESC
         LIMIT 1`,
       [tenantId, programCatalogEntryId],

@@ -33,6 +33,15 @@
 --
 -- RLS pattern: mirror of migrations 003–005.
 -- Snapshot append-only: mirror of audit_records in migration 002.
+--
+-- v0.2 — Composite-FK tenant isolation hardening (Codex slice-scaffold-r1 HIGH
+--         finding closure). Every parent table gains UNIQUE (tenant_id, <pk>)
+--         and every child FK to a parent is rewritten as a composite
+--         FOREIGN KEY (tenant_id, <fk_col>) REFERENCES parent (tenant_id, <pk>).
+--         This makes cross-tenant binding structurally impossible at the DB
+--         level (a child INSERT with tenant_id='Telecheck-A' pointing at a
+--         parent row owned by 'Telecheck-B' fails with FK violation), which
+--         complements but does not replace the RLS WITH CHECK guard.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -234,7 +243,17 @@ CREATE TABLE IF NOT EXISTS forms_template (
     -- -------------------------------------------------------------------------
 
     CONSTRAINT uq_template_version
-        UNIQUE (tenant_id, program_id, country_of_care, template_version)
+        UNIQUE (tenant_id, program_id, country_of_care, template_version),
+
+    -- -------------------------------------------------------------------------
+    -- Composite lookup key (v0.2 composite-FK hardening)
+    -- Required so that child tables can express a composite FK
+    --   FOREIGN KEY (tenant_id, template_id) REFERENCES forms_template (tenant_id, template_id)
+    -- preventing cross-tenant template binding at the DB level.
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT uq_template_tenant_id
+        UNIQUE (tenant_id, template_id)
 );
 
 -- ---------------------------------------------------------------------------
@@ -292,11 +311,13 @@ CREATE TABLE IF NOT EXISTS forms_deployment (
     program_id          VARCHAR(26)     NOT NULL,
 
     -- -------------------------------------------------------------------------
-    -- Template version binding (FK to forms_template)
+    -- Template version binding (FK to forms_template — composite v0.2)
     -- -------------------------------------------------------------------------
 
-    template_id         VARCHAR(26)     NOT NULL
-                            REFERENCES forms_template(template_id),
+    -- No inline REFERENCES here; composite FK is declared at table level below
+    -- to bind (tenant_id, template_id) together, preventing cross-tenant
+    -- template binding.
+    template_id         VARCHAR(26)     NOT NULL,
 
     -- -------------------------------------------------------------------------
     -- Deployment window
@@ -319,7 +340,22 @@ CREATE TABLE IF NOT EXISTS forms_deployment (
     -- -------------------------------------------------------------------------
 
     created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    -- -------------------------------------------------------------------------
+    -- Composite lookup key (v0.2 composite-FK hardening)
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT uq_deployment_tenant_id
+        UNIQUE (tenant_id, deployment_id),
+
+    -- -------------------------------------------------------------------------
+    -- Composite FK: template must belong to the same tenant (v0.2 hardening)
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT fk_deployment_template
+        FOREIGN KEY (tenant_id, template_id)
+        REFERENCES forms_template (tenant_id, template_id)
 );
 
 -- ---------------------------------------------------------------------------
@@ -373,11 +409,13 @@ CREATE TABLE IF NOT EXISTS forms_submission (
                             REFERENCES tenants(id),
 
     -- -------------------------------------------------------------------------
-    -- Relationship to deployment
+    -- Relationship to deployment (composite FK declared at table level — v0.2)
     -- -------------------------------------------------------------------------
 
-    deployment_id       VARCHAR(26)     NOT NULL
-                            REFERENCES forms_deployment(deployment_id),
+    -- No inline REFERENCES here; composite FK is declared at table level below
+    -- to bind (tenant_id, deployment_id) together, preventing cross-tenant
+    -- deployment binding.
+    deployment_id       VARCHAR(26)     NOT NULL,
 
     -- -------------------------------------------------------------------------
     -- Patient and delegate identifiers (PHI)
@@ -455,7 +493,29 @@ CREATE TABLE IF NOT EXISTS forms_submission (
     -- Soft deletion (clinical entity per CDM v1.2 §2)
     -- -------------------------------------------------------------------------
 
-    deleted_at          TIMESTAMPTZ     NULL
+    deleted_at          TIMESTAMPTZ     NULL,
+
+    -- -------------------------------------------------------------------------
+    -- Composite lookup key (v0.2 composite-FK hardening)
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT uq_submission_tenant_id
+        UNIQUE (tenant_id, submission_id),
+
+    -- -------------------------------------------------------------------------
+    -- Composite FK: deployment must belong to the same tenant (v0.2 hardening)
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT fk_submission_deployment
+        FOREIGN KEY (tenant_id, deployment_id)
+        REFERENCES forms_deployment (tenant_id, deployment_id)
+
+    -- NOTE: composite FK for variant_id (fk_submission_variant) is added via
+    -- ALTER TABLE after forms_variant is created below, preserving the
+    -- deferred-creation pattern required by the circular-dependency between
+    -- forms_submission (references forms_variant) and forms_variant
+    -- (references forms_deployment which is already created). The ALTER TABLE
+    -- statement below is updated to the composite form in v0.2.
 );
 
 -- ---------------------------------------------------------------------------
@@ -517,18 +577,18 @@ CREATE TABLE IF NOT EXISTS forms_snapshot (
                             REFERENCES tenants(id),
 
     -- -------------------------------------------------------------------------
-    -- Submission binding (one snapshot per submission)
+    -- Submission binding (composite FK declared at table level — v0.2)
     -- -------------------------------------------------------------------------
 
-    submission_id       VARCHAR(26)     NOT NULL
-                            REFERENCES forms_submission(submission_id),
+    -- No inline REFERENCES; composite FK declared below.
+    submission_id       VARCHAR(26)     NOT NULL,
 
     -- -------------------------------------------------------------------------
-    -- Template version that was presented
+    -- Template version that was presented (composite FK declared at table level — v0.2)
     -- -------------------------------------------------------------------------
 
-    template_id         VARCHAR(26)     NOT NULL
-                            REFERENCES forms_template(template_id),
+    -- No inline REFERENCES; composite FK declared below.
+    template_id         VARCHAR(26)     NOT NULL,
 
     template_version    INTEGER         NOT NULL
                             CHECK (template_version >= 1),
@@ -551,7 +611,20 @@ CREATE TABLE IF NOT EXISTS forms_snapshot (
     -- Timestamps (append-only; no updated_at — snapshots never change)
     -- -------------------------------------------------------------------------
 
-    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    -- -------------------------------------------------------------------------
+    -- Composite FKs (v0.2 composite-FK hardening)
+    -- Both parent tables must be owned by the same tenant as the snapshot row.
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT fk_snapshot_submission
+        FOREIGN KEY (tenant_id, submission_id)
+        REFERENCES forms_submission (tenant_id, submission_id),
+
+    CONSTRAINT fk_snapshot_template
+        FOREIGN KEY (tenant_id, template_id)
+        REFERENCES forms_template (tenant_id, template_id)
 );
 
 -- ---------------------------------------------------------------------------
@@ -646,11 +719,11 @@ CREATE TABLE IF NOT EXISTS forms_variant (
                             REFERENCES tenants(id),
 
     -- -------------------------------------------------------------------------
-    -- Deployment binding
+    -- Deployment binding (composite FK declared at table level — v0.2)
     -- -------------------------------------------------------------------------
 
-    deployment_id       VARCHAR(26)     NOT NULL
-                            REFERENCES forms_deployment(deployment_id),
+    -- No inline REFERENCES; composite FK declared below.
+    deployment_id       VARCHAR(26)     NOT NULL,
 
     -- -------------------------------------------------------------------------
     -- Variant identity
@@ -662,14 +735,14 @@ CREATE TABLE IF NOT EXISTS forms_variant (
                             CHECK (variant_label IN ('control', 'A', 'B', 'C', 'D')),
 
     -- -------------------------------------------------------------------------
-    -- Template binding
+    -- Template binding (composite FK declared at table level — v0.2)
     -- Each variant arm is backed by a forms_template version. The 'control'
     -- variant uses the same template_id as the deployment's primary template;
     -- alternative variants use modified template versions.
     -- -------------------------------------------------------------------------
 
-    variant_template_id VARCHAR(26)     NOT NULL
-                            REFERENCES forms_template(template_id),
+    -- No inline REFERENCES; composite FK declared below.
+    variant_template_id VARCHAR(26)     NOT NULL,
 
     -- -------------------------------------------------------------------------
     -- Traffic split (percentage 0–100)
@@ -718,14 +791,41 @@ CREATE TABLE IF NOT EXISTS forms_variant (
     -- -------------------------------------------------------------------------
 
     CONSTRAINT uq_variant_label_per_deployment
-        UNIQUE (deployment_id, variant_label)
+        UNIQUE (deployment_id, variant_label),
+
+    -- -------------------------------------------------------------------------
+    -- Composite lookup key (v0.2 composite-FK hardening)
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT uq_variant_tenant_id
+        UNIQUE (tenant_id, variant_id),
+
+    -- -------------------------------------------------------------------------
+    -- Composite FKs (v0.2 composite-FK hardening)
+    -- Both deployment and variant_template must belong to the same tenant.
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT fk_variant_deployment
+        FOREIGN KEY (tenant_id, deployment_id)
+        REFERENCES forms_deployment (tenant_id, deployment_id),
+
+    CONSTRAINT fk_variant_template
+        FOREIGN KEY (tenant_id, variant_template_id)
+        REFERENCES forms_template (tenant_id, template_id)
 );
 
--- Add the FK from forms_submission to forms_variant now that forms_variant exists.
+-- Add the composite FK from forms_submission to forms_variant now that
+-- forms_variant exists. This deferred-ALTER pattern is required because
+-- forms_submission is created before forms_variant (due to the snapshot table
+-- between them), so the FK can only be expressed after forms_variant is created.
+-- v0.2: upgraded to composite (tenant_id, variant_id) → forms_variant
+-- (tenant_id, variant_id) to close the cross-tenant binding gap. A NULL
+-- variant_id (no A/B test active) is still permitted — the FK only fires
+-- when variant_id IS NOT NULL.
 ALTER TABLE forms_submission
     ADD CONSTRAINT fk_submission_variant
-        FOREIGN KEY (variant_id)
-        REFERENCES forms_variant(variant_id);
+        FOREIGN KEY (tenant_id, variant_id)
+        REFERENCES forms_variant (tenant_id, variant_id);
 
 -- ---------------------------------------------------------------------------
 -- Indexes for forms_variant
@@ -802,21 +902,22 @@ CREATE TABLE IF NOT EXISTS forms_resume_state (
         CHECK (patient_id IS NOT NULL OR device_anonymous_token IS NOT NULL),
 
     -- -------------------------------------------------------------------------
-    -- Deployment binding
+    -- Deployment binding (composite FK declared at table level — v0.2)
     -- -------------------------------------------------------------------------
 
-    deployment_id       VARCHAR(26)     NOT NULL
-                            REFERENCES forms_deployment(deployment_id),
+    -- No inline REFERENCES; composite FK declared below.
+    deployment_id       VARCHAR(26)     NOT NULL,
 
     -- -------------------------------------------------------------------------
     -- Variant arm (which A/B variant this partial session is assigned to)
     -- Sticky assignment per slice PRD §14.2 — once assigned, patient sees the
     -- same variant on resume.
     -- NULL when no A/B test is active.
+    -- Composite FK declared at table level (v0.2).
     -- -------------------------------------------------------------------------
 
-    variant_id          VARCHAR(26)     NULL
-                            REFERENCES forms_variant(variant_id),
+    -- No inline REFERENCES; composite FK declared below.
+    variant_id          VARCHAR(26)     NULL,
 
     -- -------------------------------------------------------------------------
     -- Encrypted partial responses
@@ -871,7 +972,21 @@ CREATE TABLE IF NOT EXISTS forms_resume_state (
     -- Soft deletion (CDM v1.2 §2 convention)
     -- -------------------------------------------------------------------------
 
-    deleted_at          TIMESTAMPTZ     NULL
+    deleted_at          TIMESTAMPTZ     NULL,
+
+    -- -------------------------------------------------------------------------
+    -- Composite FKs (v0.2 composite-FK hardening)
+    -- Both deployment and variant (when set) must belong to the same tenant.
+    -- The variant FK is nullable — only fires when variant_id IS NOT NULL.
+    -- -------------------------------------------------------------------------
+
+    CONSTRAINT fk_resume_state_deployment
+        FOREIGN KEY (tenant_id, deployment_id)
+        REFERENCES forms_deployment (tenant_id, deployment_id),
+
+    CONSTRAINT fk_resume_state_variant
+        FOREIGN KEY (tenant_id, variant_id)
+        REFERENCES forms_variant (tenant_id, variant_id)
 );
 
 -- ---------------------------------------------------------------------------

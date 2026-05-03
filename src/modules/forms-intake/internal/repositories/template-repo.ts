@@ -57,14 +57,18 @@ export async function findTemplateById(
   templateId: FormTemplateId,
 ): Promise<FormTemplate | null> {
   return withTenantBoundConnection(tenantId, async (client: DbClient) => {
-    // SCAFFOLD: column names assumed from FORMS_ENGINE v5.2; will reconcile
-    // when migration 006 lands. The pattern below is the canonical one for
-    // future repos to copy.
+    // Aligned to migration 006 column set (Codex slice-scaffold-r1
+    // MEDIUM finding closure 2026-05-02): singular table name
+    // `forms_template`, primary key `template_id`, fields per
+    // FORMS_ENGINE v5.2 four-layer architecture.
     const result = await client.query<FormTemplate>(
-      `SELECT id, tenant_id, program_catalog_entry_id, name,
-              current_version_id, created_at, updated_at
-         FROM forms_templates
-        WHERE id = $1 AND tenant_id = $2
+      `SELECT template_id, tenant_id, program_id, country_of_care,
+              template_version, status,
+              presentation_content, branching_logic,
+              eligibility_logic, approval_governance,
+              created_at, updated_at
+         FROM forms_template
+        WHERE template_id = $1 AND tenant_id = $2
         LIMIT 1`,
       [templateId, tenantId],
     );
