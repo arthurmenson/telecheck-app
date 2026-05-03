@@ -398,14 +398,23 @@ export interface I029GateResultStub {
     | null;
   failedCondition: 1 | 2 | 3 | 4 | 5 | 6 | null;
   /**
-   * Resource ID of the export this gate result applies to. Required for
-   * audit-emission-mode assertions in `assertI029ResearchGate` so the
-   * helper can correlate the `research.export_completed(invalidated)`
-   * audit and the paired `signal_enforcement_trigger` Category B audit
-   * to the SAME export and reject stale or unrelated rows
-   * (Codex CI-fix verify-r2 MEDIUM-3 closure 2026-05-03).
+   * Resource ID of the export this gate result applies to.
    */
   exportId?: string;
+  /**
+   * Audit IDs the gate emitted FOR THIS attempt — required for
+   * audit-emission-mode assertions so the helper looks up THIS attempt's
+   * audits by exact audit_id rather than by resource_id alone (which
+   * accumulates rows across retries on the same export).
+   *
+   * Codex verify-r3 MEDIUM-5 closure 2026-05-03: the prior predicate
+   * could be satisfied by stale `research.export_completed(invalidated)`
+   * + `signal_enforcement_trigger` rows from a previous attempt on the
+   * same export. Correlating by exact audit_id makes "this attempt
+   * emitted both required audits" provable rather than inferred.
+   */
+  invalidationAuditId?: string;
+  signalAuditId?: string;
 }
 
 /**
@@ -476,25 +485,33 @@ export async function assertI029ResearchGate(ctx: InvariantAssertionContext): Pr
     const tenantId = ctx.tenantId ?? ctx.tenantA;
     if (tenantId !== undefined) {
       const exportId = result.exportId;
-      if (exportId === undefined) {
+      const invalidationAuditId = result.invalidationAuditId;
+      const signalAuditId = result.signalAuditId;
+      if (
+        exportId === undefined ||
+        invalidationAuditId === undefined ||
+        signalAuditId === undefined
+      ) {
         throw new Error(
-          'assertI029ResearchGate: ctx.i029Result.exportId is required when ' +
-            'tenantId is provided (audit-emission mode). The exportId is used ' +
-            'to correlate the research.export_completed(invalidated) audit and ' +
-            'the paired signal_enforcement_trigger to THIS specific export — ' +
-            'without it the audit-emission check could pass on a stale or ' +
-            'unrelated record. (Per Codex CI-fix verify-r2 MEDIUM-3 closure.)',
+          'assertI029ResearchGate: ctx.i029Result.exportId, .invalidationAuditId, ' +
+            'and .signalAuditId are all required when tenantId is provided ' +
+            '(audit-emission mode). The audit_ids correlate THIS attempt — without ' +
+            'them, stale audits from a previous failure on the same export could ' +
+            'satisfy the predicate. (Per Codex CI-fix verify-r3 MEDIUM-5 closure.)',
         );
       }
 
-      // Bare-suppression check: research.export_completed audit MUST exist
-      // FOR THIS EXPORT, with status=invalidated, audit_sensitivity_level=high_pii
-      // (I-031), AND with the canonical invalidation_reason + failed_condition
-      // matching the gate result. A stale successful export or an invalidated
-      // record from a different export is not an acceptable substitute.
+      // Bare-suppression check: the EXACT research.export_completed audit
+      // emitted by this attempt MUST exist with status=invalidated,
+      // audit_sensitivity_level=high_pii (I-031), the canonical
+      // invalidation_reason + failed_condition from the gate result, and
+      // resource_id matching the export. Looking up by audit_id makes the
+      // assertion specific to THIS attempt; the structural fields verify
+      // the row is shaped correctly for an I-029 invalidation.
       await assertAuditRecordExists(
         tenantId,
         (r) =>
+          r.audit_id === invalidationAuditId &&
           r.action === 'research.export_completed' &&
           r.tenant_id === tenantId &&
           r.audit_sensitivity_level === 'high_pii' &&
@@ -504,15 +521,21 @@ export async function assertI029ResearchGate(ctx: InvariantAssertionContext): Pr
           r.detail['failed_condition'] === result.failedCondition,
       );
 
-      // Paired enforcement signal per AUDIT_EVENTS v5.2 §I-029 binding —
-      // MUST be Category B, MUST correlate to the same export by resource_id.
+      // Paired enforcement signal — looked up by exact audit_id; required
+      // to be Category B, correlated to the same export, AND to carry the
+      // same invalidation_reason / failed_condition in detail (so the
+      // pairing isn't just "any signal for this export" — it's the
+      // signal that captures THIS specific I-029 invalidation).
       await assertAuditRecordExists(
         tenantId,
         (r) =>
+          r.audit_id === signalAuditId &&
           r.action === 'signal_enforcement_trigger' &&
           r.tenant_id === tenantId &&
           r.category === 'B' &&
-          r.resource_id === exportId,
+          r.resource_id === exportId &&
+          r.detail['invalidation_reason'] === result.invalidationReason &&
+          r.detail['failed_condition'] === result.failedCondition,
       );
     }
   } else {

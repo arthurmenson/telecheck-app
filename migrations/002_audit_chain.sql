@@ -190,7 +190,15 @@ CREATE TABLE IF NOT EXISTS audit_records (
     -- The patient this action affects, if applicable. NULL for non-patient
     -- actions (e.g., tenant configuration, market launch governance events).
     -- Also used as the hash-chain partition key — see trigger below.
-    target_patient_id   TEXT        NULL,
+    --
+    -- The literal 'PLATFORM' is reserved as the partition sentinel for
+    -- non-patient events (see hash trigger's COALESCE(target_patient_id,
+    -- 'PLATFORM') derivation). A real patient_id of 'PLATFORM' would
+    -- co-partition with platform-scope events under the unique index
+    -- `uq_audit_tenant_partition_seq` and weaken chain independence.
+    -- (Constraint added 2026-05-03 per Codex CI-fix verify-r3 MEDIUM-4.)
+    target_patient_id   TEXT        NULL
+                            CHECK (target_patient_id IS NULL OR target_patient_id <> 'PLATFORM'),
 
     -- Delegate context (serialized as JSONB per AUDIT_EVENTS v5.2 envelope).
     -- Shape: { "delegate_id": "...", "scope": "..." } | null

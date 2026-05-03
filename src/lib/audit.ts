@@ -341,6 +341,11 @@ export function assertAuditEmittedFor(actionId: string, action: AuditAction): vo
  * (audit_records_hash_insert in migration 002) computes the same value
  * canonically; this app-side helper exists so the envelope returned by
  * emitAudit is byte-identical to what the DB stored.
+ *
+ * The partition key is `tenant_id || ':' || COALESCE(target_patient_id,
+ * 'PLATFORM')` per the trigger's HIGH-1 closure 2026-05-03 — keeping the
+ * app- and DB-side derivations aligned is what lets the chain walker
+ * verify both layers with a single canonicalization function.
  */
 function computeGenesisHash(partitionKey: string): string {
   return crypto.createHash('sha256').update(`GENESIS:${partitionKey}`).digest('hex');
@@ -352,8 +357,17 @@ function computeRecordHash(envelope: Omit<AuditEnvelope, 'hash_chain'>): string 
 
 /**
  * Look up the most recent record_hash + sequence_number for a partition
- * (target_patient_id, with 'PLATFORM' sentinel for non-patient events
- * matching the migration 002 trigger convention).
+ * within the caller's tenant.
+ *
+ * Partition key = `tenant_id || ':' || COALESCE(target_patient_id, 'PLATFORM')`
+ * per the trigger's HIGH-1 closure 2026-05-03. The DB query MUST also
+ * filter by tenant_id — when the calling transaction can see rows from
+ * multiple tenants (e.g., during break-glass or platform-admin work),
+ * a tenant-blind partition lookup would return another tenant's
+ * record_hash and the returned envelope's `hash_chain.previous_hash`
+ * would be wrong (the DB trigger then overwrites the storage value, but
+ * the envelope returned to the caller carries the wrong value through
+ * to the wire). HIGH-4 closure 2026-05-03 per Codex CI-fix verify-r3.
  *
  * When a `tx` is provided, queries the real audit_records table within
  * the caller's transaction (so the FOR UPDATE row lock serializes
@@ -363,16 +377,14 @@ function computeRecordHash(envelope: Omit<AuditEnvelope, 'hash_chain'>): string 
  *   - NODE_ENV=test paths where unit tests don't carry a DB context
  *   - The first record in any partition (DB returns no rows; we return
  *     genesis regardless of whether tx was passed)
- *
- * (Patch v0.4 — 2026-05-02: replaces the prior unconditional-genesis stub
- *  with a real DB lookup when tx is available, closing the foundation-
- *  layer wire-up gap.)
  */
 async function getPreviousHashForPartition(
+  tenantId: string,
   patientId: string,
   tx?: AuditDbClient,
 ): Promise<{ previousHash: string; sequenceNumber: number }> {
-  const partitionKey = patientId.length > 0 ? patientId : 'PLATFORM';
+  const normalizedPatient = patientId.length > 0 ? patientId : 'PLATFORM';
+  const partitionKey = `${tenantId}:${normalizedPatient}`;
 
   if (tx === undefined) {
     return {
@@ -384,11 +396,12 @@ async function getPreviousHashForPartition(
   const result = await tx.query(
     `SELECT encode(record_hash, 'hex') AS record_hash_hex, sequence_number
        FROM audit_records
-      WHERE COALESCE(target_patient_id, 'PLATFORM') = $1
+      WHERE tenant_id = $1
+        AND COALESCE(target_patient_id, 'PLATFORM') = $2
       ORDER BY sequence_number DESC
       LIMIT 1
       FOR UPDATE`,
-    [partitionKey],
+    [tenantId, normalizedPatient],
   );
 
   const rows = result.rows as Array<{
@@ -604,8 +617,21 @@ export async function emitAudit(
   //    'PLATFORM' sentinel matching the DB trigger's COALESCE(target_patient_id,
   //    'PLATFORM') in migration 002 audit_records_hash_insert. This keeps
   //    the app-side and DB-side hash chains aligned for the platform partition.
+  //
+  //    The lookup is tenant-scoped (HIGH-4 closure 2026-05-03): when the
+  //    transaction can see rows from multiple tenants (break-glass; platform-
+  //    admin; multi-tenant test setups), a tenant-blind partition match would
+  //    return another tenant's record_hash. The trigger's tenant-scoped
+  //    storage write would silently overwrite that to the correct value, but
+  //    the envelope returned from `emitAudit` to the caller — which is what
+  //    flows to logs, downstream consumers, and assertion helpers — would
+  //    carry the wrong previous_hash.
   const partitionInput = input.target_patient_id ?? 'PLATFORM';
-  const { previousHash, sequenceNumber } = await getPreviousHashForPartition(partitionInput, tx);
+  const { previousHash, sequenceNumber } = await getPreviousHashForPartition(
+    input.tenant_id,
+    partitionInput,
+    tx,
+  );
 
   // Build the envelope without hash_chain first (needed for record_hash).
   // audit_id is a UUID v4 to match the audit_records.audit_id UUID column type.
@@ -626,7 +652,10 @@ export async function emitAudit(
   const envelope: AuditEnvelope = {
     ...partialEnvelope,
     hash_chain: {
-      partition: partitionInput, // 'PLATFORM' for platform-scope events; otherwise target_patient_id
+      // Partition matches the DB trigger derivation: tenant_id-prefixed
+      // (HIGH-1 closure 2026-05-03) to keep the chain tenant-scoped even
+      // when two tenants share a target_patient_id.
+      partition: `${input.tenant_id}:${partitionInput}`,
       sequence_number: sequenceNumber + 1,
       previous_hash: previousHash,
       record_hash: recordHash,
