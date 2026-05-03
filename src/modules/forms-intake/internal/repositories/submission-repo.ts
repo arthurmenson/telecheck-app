@@ -443,12 +443,25 @@ export async function createSubmission(
 }
 
 /**
- * Persist partial-progress responses (Slice PRD §8.1 auto-save). The
- * response payload REPLACES the existing `responses` JSONB rather than
- * patching keys — auto-save sends the full current state, which keeps the
- * SQL deterministic and avoids JSONB merge edge cases (deleted keys, type
- * coercion, nested objects). Service-level merging is documented as a
- * future enhancement under §8.1's "delta" comment.
+ * Persist partial-progress responses (Slice PRD §8.1 auto-save).
+ *
+ * **Merge semantics (Codex submissions-r1 HIGH closure 2026-05-03):**
+ * the prior implementation replaced the entire `responses` JSONB
+ * wholesale, so a PATCH client sending a delta of changed fields
+ * would silently wipe every previously-saved key. The route is
+ * `PATCH` and the schema docstring says "partial-progress save"; the
+ * SQL now uses `responses || $1::jsonb` (top-level shallow merge) so
+ * a delta preserves prior keys. Nested objects are still replaced
+ * wholesale by `||` — that's a known PG JSONB-merge limitation; the
+ * top-level shape is flat (`field_<id>: value`) per migration 006
+ * comments so this is acceptable for v1.
+ *
+ * **Ownership enforcement (Codex submissions-r1 CRITICAL-2 closure
+ * 2026-05-03):** the WHERE clause now also filters by `patient_id`
+ * (and, when set, `delegate_id`) so a different patient in the same
+ * tenant can't tamper with another patient's intake. A mismatch
+ * surfaces as the same SUBMISSION_NOT_FOUND sentinel as a missing
+ * row — tenant-blind per I-025.
  *
  * I-013 immutability: only `in_progress` submissions accept responses
  * updates. The WHERE clause includes `status = 'in_progress'`; a
@@ -460,6 +473,7 @@ export async function updateSubmissionResponses(
   tenantId: TenantId,
   submissionId: FormSubmissionId,
   responsePatch: Record<string, unknown>,
+  ownership: { patientId: PatientId; delegateId: string | null },
   txCallback: (tx: DbTransaction, submission: FormSubmission) => Promise<void>,
   externalTx?: DbTransaction,
 ): Promise<FormSubmission> {
@@ -468,27 +482,47 @@ export async function updateSubmissionResponses(
 
     const result = await tx.query<FormSubmission>(
       `UPDATE forms_submission
-          SET responses = $1::jsonb,
+          SET responses = COALESCE(responses, '{}'::jsonb) || $1::jsonb,
               updated_at = NOW()
         WHERE submission_id = $2
           AND tenant_id = $3
+          AND patient_id = $4
+          AND ($5::varchar IS NULL OR delegate_id = $5::varchar)
           AND status = 'in_progress'
           AND deleted_at IS NULL
        RETURNING submission_id, tenant_id, deployment_id, variant_id,
                  patient_id, delegate_id, status, responses,
                  created_at AS started_at, submitted_at`,
-      [JSON.stringify(responsePatch), submissionId, tenantId],
+      [
+        JSON.stringify(responsePatch),
+        submissionId,
+        tenantId,
+        ownership.patientId,
+        ownership.delegateId,
+      ],
     );
 
     if (result.rows.length === 0) {
-      const existence = await tx.query<{ status: string }>(
-        `SELECT status FROM forms_submission
+      const existence = await tx.query<{ status: string; patient_id: string }>(
+        `SELECT status, patient_id FROM forms_submission
           WHERE submission_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
         [submissionId, tenantId],
       );
-      throw new Error(
-        existence.rows.length === 0 ? SUBMISSION_NOT_FOUND : SUBMISSION_NOT_IN_PROGRESS,
-      );
+      // Two ways to land here:
+      //   - Row doesn't exist in this tenant at all → NOT_FOUND.
+      //   - Row exists but the actor isn't its owner → also NOT_FOUND
+      //     (tenant-blind per I-025; we never differentiate "you don't
+      //     own this" from "doesn't exist" — would leak existence).
+      //   - Row exists, owner matches, but status isn't in_progress →
+      //     NOT_IN_PROGRESS.
+      if (existence.rows.length === 0) {
+        throw new Error(SUBMISSION_NOT_FOUND);
+      }
+      const row = existence.rows[0]!;
+      if (row.patient_id !== ownership.patientId) {
+        throw new Error(SUBMISSION_NOT_FOUND);
+      }
+      throw new Error(SUBMISSION_NOT_IN_PROGRESS);
     }
 
     const submission = result.rows[0]!;
@@ -516,6 +550,7 @@ export async function transitionSubmissionStatus(
   tenantId: TenantId,
   submissionId: FormSubmissionId,
   newStatus: SubmissionStatus,
+  ownership: { patientId: PatientId; delegateId: string | null },
   txCallback: (tx: DbTransaction, submission: FormSubmission) => Promise<void>,
   externalTx?: DbTransaction,
 ): Promise<FormSubmission> {
@@ -541,23 +576,31 @@ export async function transitionSubmissionStatus(
               updated_at = NOW()
         WHERE submission_id = $1
           AND tenant_id = $2
+          AND patient_id = $3
+          AND ($4::varchar IS NULL OR delegate_id = $4::varchar)
           AND status = 'in_progress'
           AND deleted_at IS NULL
        RETURNING submission_id, tenant_id, deployment_id, variant_id,
                  patient_id, delegate_id, status, responses,
                  created_at AS started_at, submitted_at`,
-      [submissionId, tenantId],
+      [submissionId, tenantId, ownership.patientId, ownership.delegateId],
     );
 
     if (result.rows.length === 0) {
-      const existence = await tx.query<{ status: string }>(
-        `SELECT status FROM forms_submission
+      const existence = await tx.query<{ status: string; patient_id: string }>(
+        `SELECT status, patient_id FROM forms_submission
           WHERE submission_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
         [submissionId, tenantId],
       );
-      throw new Error(
-        existence.rows.length === 0 ? SUBMISSION_NOT_FOUND : SUBMISSION_NOT_IN_PROGRESS,
-      );
+      if (existence.rows.length === 0) {
+        throw new Error(SUBMISSION_NOT_FOUND);
+      }
+      const row = existence.rows[0]!;
+      if (row.patient_id !== ownership.patientId) {
+        // Tenant-blind: don't differentiate "not yours" from "doesn't exist."
+        throw new Error(SUBMISSION_NOT_FOUND);
+      }
+      throw new Error(SUBMISSION_NOT_IN_PROGRESS);
     }
 
     const submission = result.rows[0]!;

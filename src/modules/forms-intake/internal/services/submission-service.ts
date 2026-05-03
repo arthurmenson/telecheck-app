@@ -33,9 +33,14 @@
  * the type was tightened here to match the SQL truth.
  */
 
-import type { DbClient, DbTransaction } from '../../../../lib/db.js';
+import { crisisDetector } from '../../../../lib/crisis-detection.js';
+import { type DbClient, type DbTransaction, withTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
-import { emitFormsSubmissionCompletedAudit, emitFormsSubmissionStartedAudit } from '../../audit.js';
+import {
+  emitCrisisDetectionTrigger,
+  emitFormsSubmissionCompletedAudit,
+  emitFormsSubmissionStartedAudit,
+} from '../../audit.js';
 import {
   emitFormsSubmissionCompleted as emitFormsSubmissionCompletedEvent,
   emitFormsSubmissionStarted as emitFormsSubmissionStartedEvent,
@@ -126,17 +131,57 @@ export async function startSubmission(
 }
 
 /**
+ * Sentinel error code thrown by `updateResponses` when the I-019 crisis
+ * detector fires on a free-text response value. The Category A
+ * `crisis_detection_trigger` audit is committed BEFORE this throw — the
+ * audit is the authoritative escalation record per Slice PRD §13 and
+ * I-003 forbids bare-suppressing the detection. The handler maps this
+ * sentinel to a specific HTTP envelope so the patient surface gets a
+ * crisis-resources prompt rather than a generic 4xx.
+ *
+ * Closes Codex submissions-r1 CRITICAL-1 2026-05-03.
+ */
+export const CRISIS_DETECTED = 'forms.submission.crisis_detected';
+
+/**
+ * Walk a response payload and call the platform-singleton `crisisDetector`
+ * on every string value. Returns the first positive detection (narrowed
+ * to the `crisisDetected: true` variant) or null. Top-level scan only —
+ * nested objects/arrays are not currently scanned by the forms-intake
+ * surface (the slice PRD's free-text fields are flat). When the visual
+ * builder ships nested branching, this scanner extends to walk arbitrary
+ * depth.
+ */
+function scanResponsesForCrisis(
+  tenantId: string,
+  responses: Record<string, unknown>,
+): { crisisType: string } | null {
+  for (const value of Object.values(responses)) {
+    if (typeof value !== 'string') continue;
+    const outcome = crisisDetector.detect(value, tenantId, 'form_response');
+    if (outcome.crisisDetected) {
+      return { crisisType: outcome.crisisType };
+    }
+  }
+  return null;
+}
+
+/**
  * Persist partial-progress responses (auto-save per §8.1 or explicit
  * "Save and continue later" per §8.2). When `pause === true`, also creates
  * the ResumeState + emits `forms_resume_state.saved` domain event.
  *
- * **Crisis detection (I-019):** the slice PRD calls for crisis detection
- * to run over any free-text response BEFORE the write commits. The
- * platform-floor `crisisDetector` from `src/lib/crisis-detection.ts` is
- * also stubbed; this commit wires the call site (commented) so the wiring
- * is unambiguous when crisis-detection lands. Per I-019, the service
- * MUST NOT swallow a triggered detection — it surfaces a hard
- * escalation path to the patient + clinician notification queue.
+ * **Crisis detection (I-019 platform-floor — Codex submissions-r1
+ * CRITICAL-1 closure 2026-05-03):** every string value in the response
+ * payload is scanned by the platform-singleton `crisisDetector` BEFORE
+ * the responses persist. On detection:
+ *   1. Emit Category A `crisis_detection_trigger` audit in its OWN
+ *      transaction (the audit MUST be durable even though the response
+ *      write doesn't proceed — bare suppression forbidden per I-003).
+ *   2. Throw the `CRISIS_DETECTED` sentinel; the handler maps it to a
+ *      HTTP response that surfaces crisis resources to the patient
+ *      (Slice PRD §13 escalation pathway).
+ *   3. The responses write does NOT commit — escalation takes precedence.
  *
  * **Auto-save vs pause** (Slice PRD §8.1 vs §8.2):
  *   - `pause === false | undefined`: silent auto-save; no audit (would
@@ -148,30 +193,54 @@ export async function startSubmission(
  *     commit (resume-state path lives in a separate handler series).
  *
  * Sentinels:
+ *   - `forms.submission.crisis_detected` — I-019 detection fired.
  *   - `forms.submission.not_found` — submission doesn't exist in this
- *     tenant. Tenant-blind 400.
+ *     tenant OR isn't owned by the resolved actor. Tenant-blind 400.
  *   - `forms.submission.not_in_progress` — submission exists but its
- *     status isn't `in_progress`. I-013 immutability (you can't update
- *     responses on a submitted/withdrawn row). Tenant-blind 400.
+ *     status isn't `in_progress`. I-013 immutability. Tenant-blind 400.
  */
 export async function updateResponses(
   ctx: TenantContext,
-  _actor: { actorId: string; patientId: PatientId; delegateId: string | null },
+  actor: { actorId: string; patientId: PatientId; delegateId: string | null },
   submissionId: FormSubmissionId,
   input: UpdateSubmissionResponsesRequest,
   externalTx?: DbTransaction,
 ): Promise<FormSubmission> {
-  // TODO (I-019 — platform-floor): run crisisDetector over input.responses
-  // free-text fields BEFORE the write commits. On a positive detection,
-  // emit Category A audit + escalate per Slice PRD §13. Until the
-  // crisis-detection module is wired, this is a no-op and the auto-save
-  // proceeds. Bare suppression is forbidden (I-003) — when the module
-  // lands, the call MUST throw on detection; never silent-skip.
+  // I-019 platform-floor scan (always-on; never disabled).
+  const crisis = scanResponsesForCrisis(ctx.tenantId, input.responses);
+  if (crisis !== null) {
+    // Emit the Category A audit in its own transaction so it commits even
+    // though the response write below does NOT run. The escalation event
+    // MUST be durable per I-003 + I-019; we cannot let it ride on the
+    // same tx that we're about to abort.
+    //
+    // When externalTx is supplied (test mode), share that tx — the audit
+    // commits with the test's outer transaction same as anything else.
+    await withTransaction(async (tx) => {
+      await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+      await emitCrisisDetectionTrigger(
+        {
+          tenantId: ctx.tenantId,
+          actorId: actor.actorId,
+          actorTenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          targetPatientId: actor.patientId,
+          detectionSource: 'form_response',
+          crisisType: crisis.crisisType,
+          resourceType: 'forms_submission',
+          resourceId: submissionId,
+        },
+        tx,
+      );
+    }, externalTx);
+    throw new Error(CRISIS_DETECTED);
+  }
 
   return submissionRepo.updateSubmissionResponses(
     ctx.tenantId,
     submissionId,
     input.responses,
+    { patientId: actor.patientId, delegateId: actor.delegateId },
     async (_tx, _submission) => {
       // No audit + no domain event on plain auto-save (slice header
       // note + audit-chain blast radius). When `input.pause === true`
@@ -217,6 +286,7 @@ export async function submitSubmission(
     ctx.tenantId,
     submissionId,
     'submitted',
+    { patientId: actor.patientId, delegateId: actor.delegateId },
     async (tx, submission) => {
       const submittedAt = submission.submitted_at ?? new Date().toISOString();
 
@@ -285,12 +355,39 @@ export async function resumeSubmission(
 
 /**
  * Read a submission by ID. Tenant-blind 404 per I-025 — returns null when
- * not found OR when found in a different tenant.
+ * not found, in a different tenant, OR not owned by the resolved actor
+ * (Codex submissions-r1 CRITICAL-2 closure 2026-05-03 — patient-level
+ * access enforcement; the prior implementation only checked tenant scope
+ * via RLS, so any patient in the same tenant could read another
+ * patient's PHI by guessing a submission_id).
+ *
+ * `ownership` is required: the caller MUST identify whose data is being
+ * read. If the row's `patient_id` doesn't match `ownership.patientId`,
+ * the function returns null (NOT a thrown sentinel) so the surface
+ * shape matches "row absent" exactly per I-025.
  */
 export async function getSubmission(
   ctx: TenantContext,
+  ownership: { patientId: PatientId; delegateId: string | null },
   submissionId: FormSubmissionId,
   externalTx?: DbClient,
 ): Promise<FormSubmission | null> {
-  return submissionRepo.findSubmissionById(ctx.tenantId, submissionId, externalTx);
+  const submission = await submissionRepo.findSubmissionById(
+    ctx.tenantId,
+    submissionId,
+    externalTx,
+  );
+  if (submission === null) {
+    return null;
+  }
+  // Patient-level access check — must match the row's owner. Delegate
+  // path: when the row carries a delegate_id, the actor's delegateId
+  // must also match (no rotating delegates mid-flow).
+  if (submission.patient_id !== ownership.patientId) {
+    return null;
+  }
+  if (submission.delegate_id !== null && submission.delegate_id !== ownership.delegateId) {
+    return null;
+  }
+  return submission;
 }

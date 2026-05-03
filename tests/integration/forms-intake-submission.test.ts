@@ -236,7 +236,12 @@ describe('forms-intake getSubmission', () => {
     );
 
     const fetched = await withTenantContext(TENANT_US, () =>
-      submissionService.getSubmission(US_CTX, submission.submission_id, getTestClient()),
+      submissionService.getSubmission(
+        US_CTX,
+        { patientId, delegateId: null },
+        submission.submission_id,
+        getTestClient(),
+      ),
     );
     expect(fetched).not.toBeNull();
     expect(fetched!.submission_id).toBe(submission.submission_id);
@@ -245,8 +250,14 @@ describe('forms-intake getSubmission', () => {
 
   it('returns null on tenant-blind miss', async () => {
     const fakeId = ulid();
+    const fakePatient = ulid();
     const result = await withTenantContext(TENANT_US, () =>
-      submissionService.getSubmission(US_CTX, fakeId, getTestClient()),
+      submissionService.getSubmission(
+        US_CTX,
+        { patientId: fakePatient, delegateId: null },
+        fakeId,
+        getTestClient(),
+      ),
     );
     expect(result).toBeNull();
   });
@@ -401,6 +412,194 @@ describe('forms-intake submitSubmission — happy path', () => {
     });
     expect(event).toBeDefined();
     expect(event!.payload['mode_2_eligible']).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex submissions-r1 regression tests (CRITICAL-1, CRITICAL-2, HIGH)
+// ---------------------------------------------------------------------------
+
+describe('forms-intake updateResponses — I-019 crisis detection (CRITICAL-1 closure)', () => {
+  it('rejects responses containing crisis text and emits Category A audit', async () => {
+    const programId = `prog_crisis_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_crisis', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // A phrase from CRISIS_PATTERNS.suicidal_ideation regex per
+    // crisis-detection.ts.
+    const crisisPhrase = 'I want to kill myself';
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.updateResponses(
+          US_CTX,
+          { actorId: 'op_crisis', patientId, delegateId: null },
+          submission.submission_id,
+          { responses: { field_open_text: crisisPhrase } },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionService.CRISIS_DETECTED);
+
+    // The Category A `crisis_detection_trigger` audit MUST exist regardless
+    // — the responses didn't persist, but the detection event MUST.
+    await withTenantContext(TENANT_US, () =>
+      assertAuditRecordExists(
+        TENANT_US,
+        (rec) =>
+          rec.action === 'crisis_detection_trigger' &&
+          rec.category === 'A' &&
+          rec.target_patient_id === patientId &&
+          rec.resource_id === submission.submission_id,
+      ),
+    );
+
+    // The submission row's responses are unchanged (still the empty
+    // initial state).
+    const client = getTestClient();
+    const row = await withTenantContext(TENANT_US, async () => {
+      const r = await client.query<{ responses: Record<string, unknown> }>(
+        `SELECT responses FROM forms_submission WHERE submission_id = $1`,
+        [submission.submission_id],
+      );
+      return r.rows[0];
+    });
+    expect(row!.responses).toEqual({});
+  });
+});
+
+describe('forms-intake — patient ownership (CRITICAL-2 closure)', () => {
+  it('returns null when getSubmission is called by a different patient in the same tenant', async () => {
+    const programId = `prog_own_get_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientA = ulid();
+    const patientB = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_a', patientId: patientA, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // Patient B requests Patient A's submission — service returns null
+    // (tenant-blind, indistinguishable from "doesn't exist").
+    const result = await withTenantContext(TENANT_US, () =>
+      submissionService.getSubmission(
+        US_CTX,
+        { patientId: patientB, delegateId: null },
+        submission.submission_id,
+        getTestClient(),
+      ),
+    );
+    expect(result).toBeNull();
+  });
+
+  it('rejects updateResponses when called by a different patient in the same tenant', async () => {
+    const programId = `prog_own_upd_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientA = ulid();
+    const patientB = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_a', patientId: patientA, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.updateResponses(
+          US_CTX,
+          { actorId: 'op_b', patientId: patientB, delegateId: null },
+          submission.submission_id,
+          { responses: { field_1: 'hijack attempt' } },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.SUBMISSION_NOT_FOUND);
+  });
+
+  it('rejects submitSubmission when called by a different patient in the same tenant', async () => {
+    const programId = `prog_own_sub_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientA = ulid();
+    const patientB = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_a', patientId: patientA, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.submitSubmission(
+          US_CTX,
+          { actorId: 'op_b', patientId: patientB, delegateId: null },
+          submission.submission_id,
+          {},
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.SUBMISSION_NOT_FOUND);
+  });
+});
+
+describe('forms-intake updateResponses — JSONB merge preserves prior keys (HIGH closure)', () => {
+  it('does not wipe existing keys when a delta is sent', async () => {
+    const programId = `prog_merge_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_merge', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // First save: two fields.
+    await withTenantContext(TENANT_US, () =>
+      submissionService.updateResponses(
+        US_CTX,
+        { actorId: 'op_merge', patientId, delegateId: null },
+        submission.submission_id,
+        { responses: { field_age: 30, field_name: 'Pat' } },
+        getTestClient(),
+      ),
+    );
+
+    // Second save: only `field_age` updated. `field_name` MUST be
+    // preserved (this was the prior-implementation data-loss bug).
+    const after = await withTenantContext(TENANT_US, () =>
+      submissionService.updateResponses(
+        US_CTX,
+        { actorId: 'op_merge', patientId, delegateId: null },
+        submission.submission_id,
+        { responses: { field_age: 31 } },
+        getTestClient(),
+      ),
+    );
+    expect(after.responses).toEqual({ field_age: 31, field_name: 'Pat' });
   });
 });
 

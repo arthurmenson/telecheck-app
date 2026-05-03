@@ -30,6 +30,7 @@ import {
   SUBMISSION_NOT_FOUND,
   SUBMISSION_NOT_IN_PROGRESS,
 } from '../repositories/submission-repo.js';
+import { CRISIS_DETECTED } from '../services/submission-service.js';
 import * as submissionService from '../services/submission-service.js';
 import type { PatientId } from '../types.js';
 
@@ -148,21 +149,24 @@ export async function startSubmissionHandler(
 /**
  * GET /v0/forms/submissions/:submissionId — read submission state.
  *
- * 200 hit / 404 tenant-blind miss. Same pattern as getTemplate +
- * getDeployment.
+ * 200 hit / 404 tenant-blind miss. Patient ownership is enforced — if
+ * the resolved actor's `patientId` doesn't match the submission's
+ * `patient_id`, the service returns null and the handler emits the
+ * same 404 envelope as a missing row (Codex submissions-r1 CRITICAL-2
+ * closure 2026-05-03; the prior implementation didn't resolve patient
+ * identity on this endpoint at all, so any patient in the tenant could
+ * read any other patient's PHI by guessing submission_id).
  *
- * **Patient-level access (DEFERRED to Identity slice):** today the only
- * scoping is RLS (tenant). A future enhancement requires the resolved
- * actor + patient to MATCH the submission's `(patient_id, delegate_id)` —
- * otherwise a tenant_admin reading a patient's intake is allowed (which
- * may be intended for support flows but should be audited as
- * break-glass-equivalent per I-024).
+ * Tenant-admin support flows that need to read across patients within
+ * a tenant arrive via a separate (audited, break-glass-style) read
+ * path per I-024 — they are NOT this endpoint.
  */
 export async function getSubmissionHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
+  const { patientId, delegateId } = resolvePatient(req);
 
   const params = req.params as Record<string, unknown>;
   const submissionIdParam = params['submissionId'];
@@ -170,7 +174,11 @@ export async function getSubmissionHandler(
     throw req.server.httpErrors.badRequest('Path param `submissionId` is required.');
   }
 
-  const submission = await submissionService.getSubmission(ctx, submissionIdParam);
+  const submission = await submissionService.getSubmission(
+    ctx,
+    { patientId, delegateId },
+    submissionIdParam,
+  );
   if (submission === null) {
     throw req.server.httpErrors.notFound('Form submission not found.');
   }
@@ -219,6 +227,18 @@ export async function updateSubmissionResponsesHandler(
     return reply.code(200).send(submission);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (message === CRISIS_DETECTED) {
+      // Per I-019 platform-floor, a positive crisis detection is NOT a
+      // generic 400. The patient surface needs to render crisis
+      // resources + emergency-contact paths (Slice PRD §13). We use
+      // HTTP 409 Conflict with a structured error code so the client
+      // can branch — the response is intentionally distinguishable
+      // from other 4xx classes. The Category A `crisis_detection_trigger`
+      // audit was already committed before this throw.
+      throw req.server.httpErrors.conflict(
+        'Crisis content was detected in the response payload; escalation required.',
+      );
+    }
     if (isHandledSentinel(message)) {
       throw req.server.httpErrors.badRequest(
         'The requested form submission cannot be updated in its current state.',

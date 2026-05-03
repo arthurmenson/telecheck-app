@@ -471,6 +471,62 @@ export async function emitFormsSubmissionStartedAudit(
 }
 
 /**
+ * Emit `crisis_detection_trigger` — the I-019 platform-floor detector
+ * fired on a patient-facing text input. Category A safety-critical;
+ * **MUST be emitted even when the originating action is rejected**
+ * (Slice PRD §13 escalation; I-003 bare-suppression-forbidden).
+ *
+ * The action ID `crisis_detection_trigger` IS canonical in AUDIT_EVENTS
+ * v5.2 §Category A — no SPEC ISSUE flag needed here. Emitted from the
+ * forms-intake module when an autosave / final-submit path detects
+ * crisis text; the same audit is also emitted from chat / community /
+ * other surfaces (each calls into this same emitter via a thin
+ * surface-specific wrapper).
+ */
+export async function emitCrisisDetectionTrigger(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    targetPatientId: PatientId;
+    /** Surface that produced the text (form_response, ai_chat, community, etc.). */
+    detectionSource: string;
+    /** Crisis-type classification per crisis-detection.ts. */
+    crisisType: string;
+    /** The submission / message / aggregate the text came from (PHI carrier). */
+    resourceType: string;
+    resourceId: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    {
+      ...buildEnvelope('crisis_detection_trigger' as AuditAction, 'A', {
+        tenant_id: args.tenantId,
+        actor_type: 'patient',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: args.targetPatientId,
+        country_of_care: args.countryOfCare,
+        resource_type: args.resourceType,
+        resource_id: args.resourceId,
+        detail: {
+          detection_source: args.detectionSource,
+          crisis_type: args.crisisType,
+          // The text content itself is intentionally NOT captured in the
+          // audit detail — the source row holds the PHI; the audit chain
+          // records that a detection fired (per I-019) without
+          // duplicating the text into a second store. The source row is
+          // recoverable via (tenant_id, resource_type, resource_id).
+        },
+      }),
+    },
+    tx,
+  );
+}
+
+/**
  * Emit `forms_submission_completed` — patient finalized the intake.
  * Category C operational; corresponds to the AUDIT_EVENTS v5.2 §Category C
  * `intake_completed` action. The corresponding `intake_response.submitted`
