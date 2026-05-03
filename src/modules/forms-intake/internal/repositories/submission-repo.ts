@@ -31,9 +31,9 @@ import type {
   FormDeploymentId,
   FormSubmission,
   FormSubmissionId,
+  FormTemplateId,
   FormVariant,
   FormVariantId,
-  FormVersionId,
   PatientId,
   ResumeState,
   ResumeStateId,
@@ -633,25 +633,150 @@ export async function transitionSubmissionStatus(
 // Variant repo (A/B test infrastructure per Slice PRD §14)
 // ---------------------------------------------------------------------------
 
+/**
+ * Sentinel error: the deployment + variant_template precondition didn't
+ * hold at INSERT time — either the deployment doesn't exist in this
+ * tenant, the deployment is retired, OR the variant_template doesn't
+ * exist in this tenant. The composite FKs at the DB layer enforce
+ * tenant alignment (variant_template_id MUST belong to the same
+ * tenant as deployment_id); a violation surfaces here.
+ *
+ * Same tenant-blind-400 mapping pattern as DEPLOYMENT_TEMPLATE_PRECONDITION_FAILED.
+ */
+export const VARIANT_PRECONDITION_FAILED = 'forms.variant.precondition_failed';
+
+/**
+ * Sentinel error: a variant with the same (deployment_id, label) already
+ * exists. Per migration 006 §uq_variant_label_per_deployment a
+ * deployment may carry at most one Control + at most one each of A/B/C/D.
+ * Surfaces from the unique-constraint violation; service layer maps to
+ * a tenant-blind 400.
+ */
+export const VARIANT_LABEL_CONFLICT = 'forms.variant.label_conflict';
+
+/**
+ * Create a new A/B variant arm for a deployment. Same INSERT...SELECT
+ * concurrency-safe precondition pattern as `createActiveDeployment`:
+ *
+ *   - The SELECT clause restricts to a deployment that exists in this
+ *     tenant AND is not retired AND a variant_template that exists in
+ *     this tenant.
+ *   - If any of those preconditions fails between the service-layer
+ *     pre-check and the INSERT (TOCTOU), the SELECT returns zero rows,
+ *     INSERT writes nothing, RETURNING is empty, and the repo throws
+ *     `VARIANT_PRECONDITION_FAILED`.
+ *   - The composite FK `(tenant_id, variant_template_id) → forms_template`
+ *     provides the cross-tenant guarantee independently.
+ *
+ * The unique-label-per-deployment constraint surfaces as a `23505`
+ * SQLSTATE; we translate it to `VARIANT_LABEL_CONFLICT` so the service
+ * layer can map both preconditions to the same tenant-blind 400 envelope
+ * with operator-distinguishable codes.
+ */
 export async function createVariant(
-  _tenantId: TenantId,
-  _input: {
-    templateId: string;
-    parentVersionId: FormVersionId;
-    label: string;
-    trafficSplitPercent: number;
+  tenantId: TenantId,
+  input: {
+    deploymentId: FormDeploymentId;
+    variantTemplateId: FormTemplateId;
+    label: 'control' | 'A' | 'B' | 'C' | 'D';
+    trafficPercent: number;
+    createdBy: string;
   },
-  _txCallback: (tx: DbTransaction, variant: FormVariant) => Promise<void>,
+  txCallback: (tx: DbTransaction, variant: FormVariant) => Promise<void>,
+  externalTx?: DbTransaction,
 ): Promise<FormVariant> {
-  throw new Error('not implemented');
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    const variantId = ulid();
+
+    let result;
+    try {
+      // INSERT...SELECT: deployment must exist + not be retired, AND
+      // variant_template must exist (both in this tenant). Composite FKs
+      // provide cross-tenant defense; the SELECT predicate provides the
+      // active-deployment + same-tenant template guarantee atomically with
+      // the INSERT.
+      result = await tx.query<FormVariant>(
+        `INSERT INTO forms_variant (
+            variant_id, tenant_id, deployment_id,
+            variant_label, variant_template_id,
+            traffic_percent, status, created_by
+         )
+         SELECT
+            $1::varchar, $2::varchar, d.deployment_id,
+            $3::varchar, t.template_id,
+            $4::int, 'active', $5::varchar
+           FROM forms_deployment d
+           JOIN forms_template t
+             ON t.tenant_id = d.tenant_id
+           WHERE d.tenant_id = $2::varchar
+             AND d.deployment_id = $6::varchar
+             AND d.retired_at IS NULL
+             AND t.tenant_id = $2::varchar
+             AND t.template_id = $7::varchar
+         RETURNING variant_id, tenant_id, deployment_id,
+                   variant_label, variant_template_id,
+                   traffic_percent, posthog_flag_key,
+                   status, created_by, retired_by, retired_reason,
+                   created_at, updated_at, retired_at`,
+        [
+          variantId,
+          tenantId,
+          input.label,
+          input.trafficPercent,
+          input.createdBy,
+          input.deploymentId,
+          input.variantTemplateId,
+        ],
+      );
+    } catch (err: unknown) {
+      // 23505 = unique_violation. The only unique constraint that fires here
+      // is `uq_variant_label_per_deployment` (variant_id is a fresh ULID).
+      if (typeof err === 'object' && err !== null && 'code' in err && err.code === '23505') {
+        throw new Error(VARIANT_LABEL_CONFLICT);
+      }
+      throw err;
+    }
+
+    if (result.rows.length === 0) {
+      throw new Error(VARIANT_PRECONDITION_FAILED);
+    }
+
+    const variant = result.rows[0]!;
+    await txCallback(tx, variant);
+    return variant;
+  }, externalTx);
 }
 
+/**
+ * Read a variant by primary key under the caller's tenant via RLS. Returns
+ * null on miss or cross-tenant — handler maps null to a tenant-blind 404
+ * per I-025. Same canonical pattern as `findSubmissionById`.
+ */
 export async function findVariantById(
-  _tenantId: TenantId,
-  _variantId: FormVariantId,
+  tenantId: TenantId,
+  variantId: FormVariantId,
+  externalTx?: DbClient,
 ): Promise<FormVariant | null> {
-  // TODO: SELECT under withTenantBoundConnection.
-  throw new Error('not implemented');
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      const result = await client.query<FormVariant>(
+        `SELECT variant_id, tenant_id, deployment_id,
+                variant_label, variant_template_id,
+                traffic_percent, posthog_flag_key,
+                status, created_by, retired_by, retired_reason,
+                created_at, updated_at, retired_at
+           FROM forms_variant
+          WHERE variant_id = $1 AND tenant_id = $2
+          LIMIT 1`,
+        [variantId, tenantId],
+      );
+      return result.rows[0] ?? null;
+    },
+    externalTx,
+  );
 }
 
 export async function promoteVariantToWinner(

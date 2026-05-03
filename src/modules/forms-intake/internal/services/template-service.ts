@@ -27,6 +27,7 @@ import {
   emitFormsDeploymentRetired as emitFormsDeploymentRetiredAudit,
   emitFormsTemplateCreated as emitFormsTemplateCreatedAudit,
   emitFormsTemplateVersionPublished as emitFormsTemplateVersionPublishedAudit,
+  emitFormsVariantCreated as emitFormsVariantCreatedAudit,
 } from '../../audit.js';
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedEvent,
@@ -37,6 +38,7 @@ import {
 import type {
   CreateDeploymentRequest,
   CreateTemplateRequest,
+  CreateVariantRequest,
   PublishVersionRequest,
 } from '../../schemas.js';
 import * as submissionRepo from '../repositories/submission-repo.js';
@@ -47,6 +49,8 @@ import type {
   FormTemplate,
   FormTemplateId,
   FormTemplateSummary,
+  FormVariant,
+  FormVariantId,
 } from '../types.js';
 
 /**
@@ -477,4 +481,82 @@ export async function retireDeployment(
     },
     externalTx,
   );
+}
+
+/**
+ * Create an A/B variant arm for a deployment. Tenant admin operation per
+ * Slice PRD §14 (A/B testing native).
+ *
+ * Same atomicity discipline as `createDeployment`: the repo opens a
+ * transaction, the INSERT...SELECT predicate enforces (tenant-match +
+ * deployment-active + same-tenant variant_template) atomically with the
+ * write, and the txCallback emits the Category B audit inside the same
+ * transaction so rollback discards both the row and the audit.
+ *
+ * Sentinels mapped (handler maps both to tenant-blind 400 per I-025):
+ *   - VARIANT_PRECONDITION_FAILED — deployment missing/retired OR
+ *     variant_template missing in tenant.
+ *   - VARIANT_LABEL_CONFLICT — same (deployment, label) already exists.
+ *
+ * **DEFERRED at this commit:** PostHog feature-flag setup (the variant
+ * row's `posthog_flag_key` column stays NULL until the analytics adapter
+ * is wired). The slice PRD §14.2 calls for sticky-per-patient assignment
+ * via PostHog flags; the variant row exists in the DB but it's not yet
+ * routing traffic. Submission-time variant assignment in
+ * `submission-service.startSubmission` continues to return null until
+ * that integration lands.
+ *
+ * **DEFERRED at this commit:** no domain event emitted. DOMAIN_EVENTS v5.2
+ * doesn't enumerate `forms_variant.created`; Engineering Lead must ratify
+ * before adding. The audit IS sufficient for governance/observability
+ * purposes today (variants are admin operations, not consumed by other
+ * modules at v1.0).
+ */
+export async function createVariant(
+  ctx: TenantContext,
+  actorId: string,
+  input: CreateVariantRequest,
+  externalTx?: DbTransaction,
+): Promise<FormVariant> {
+  return submissionRepo.createVariant(
+    ctx.tenantId,
+    {
+      deploymentId: input.deploymentId,
+      variantTemplateId: input.variantTemplateId,
+      label: input.label,
+      trafficPercent: input.trafficPercent,
+      createdBy: actorId,
+    },
+    async (tx, variant) => {
+      const auditEnvelope = await emitFormsVariantCreatedAudit(
+        {
+          tenantId: ctx.tenantId,
+          actorId,
+          actorTenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          variantId: variant.variant_id,
+          deploymentId: variant.deployment_id,
+          variantTemplateId: variant.variant_template_id,
+          label: variant.variant_label,
+          trafficPercent: variant.traffic_percent,
+        },
+        tx,
+      );
+      // audit_id retained for future domain-event correlation (see header).
+      void auditEnvelope;
+    },
+    externalTx,
+  );
+}
+
+/**
+ * Read a variant by ID under the caller's tenant. Returns null on miss
+ * or cross-tenant — handler maps null to a tenant-blind 404 per I-025.
+ */
+export async function getVariant(
+  ctx: TenantContext,
+  variantId: FormVariantId,
+  externalTx?: DbClient,
+): Promise<FormVariant | null> {
+  return submissionRepo.findVariantById(ctx.tenantId, variantId, externalTx);
 }

@@ -8,42 +8,132 @@
  *
  * Variant lifecycle audit is Category B per Slice PRD §14.6 — the service
  * layer threads the audit emit through the same transaction as the DB write.
+ *
+ * **Actor identity:** tenant admin operations. Same `x-actor-id` header shim
+ * as templates.ts; production fail-closed per `ALLOW_ACTOR_HEADER_AUTH`.
+ * Replaced by Identity & Auth slice once that lands.
  */
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
+import { CreateVariantRequestSchema } from '../../schemas.js';
+import {
+  VARIANT_LABEL_CONFLICT,
+  VARIANT_PRECONDITION_FAILED,
+} from '../repositories/submission-repo.js';
+import * as templateService from '../services/template-service.js';
 
-/** POST /v0/forms/variants — create an A/B variant of a deployed template. */
-export async function createVariantHandler(
-  req: FastifyRequest,
-  _reply: FastifyReply,
-): Promise<unknown> {
-  void requireTenantContext(req);
-  // TODO: validate body via CreateVariantRequestSchema; call repo write
-  // with audit-emit txCallback; PostHog feature-flag setup deferred to
-  // analytics adapter.
-  throw new Error('not implemented');
+/**
+ * Resolve the acting tenant admin's identity. Same shim + production-fail-closed
+ * gate as the other handler files (kept duplicated rather than extracted
+ * to keep each handler-file's auth boundary obvious; centralization happens
+ * when the Identity & Auth slice lands).
+ */
+function resolveActorId(req: FastifyRequest): string {
+  const isProd = process.env['NODE_ENV'] === 'production';
+  const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
+  if (isProd && !optIn) {
+    throw req.server.httpErrors.unauthorized(
+      'Actor identity could not be authenticated for this request.',
+    );
+  }
+  const headerValue = req.headers['x-actor-id'];
+  const actorId = typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : null;
+  if (actorId === null) {
+    throw req.server.httpErrors.unauthorized('No actor identity resolved for this request.');
+  }
+  return actorId;
 }
 
-/** GET /v0/forms/variants/:variantId — read variant state + traffic split. */
+/**
+ * Map repo-layer sentinel errors to canonical 4xx responses per I-025 +
+ * ERROR_MODEL v5.1. Both sentinels resolve to a uniform 400 envelope; the
+ * structured code preserves operator-facing distinction for observability.
+ */
+function isHandledVariantSentinel(message: string): boolean {
+  return message === VARIANT_PRECONDITION_FAILED || message === VARIANT_LABEL_CONFLICT;
+}
+
+/**
+ * POST /v0/forms/variants — create an A/B variant of a deployed template.
+ *
+ * Sentinel error mapping (tenant-blind 400 per I-025):
+ *   - VARIANT_PRECONDITION_FAILED — deployment missing/retired OR
+ *     variant_template missing in tenant.
+ *   - VARIANT_LABEL_CONFLICT — duplicate (deployment, label) pair.
+ */
+export async function createVariantHandler(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const ctx = requireTenantContext(req);
+  const actorId = resolveActorId(req);
+
+  const parsed = CreateVariantRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    throw req.server.httpErrors.badRequest(
+      `Invalid request body: ${parsed.error.errors
+        .map((e) => `${e.path.join('.')}: ${e.message}`)
+        .join('; ')}`,
+    );
+  }
+
+  try {
+    const variant = await templateService.createVariant(ctx, actorId, parsed.data);
+    return reply.code(201).send(variant);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (isHandledVariantSentinel(message)) {
+      throw req.server.httpErrors.badRequest(
+        'The requested variant cannot be created in its current state.',
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * GET /v0/forms/variants/:variantId — read variant state + traffic split.
+ *
+ * 200 hit / 404 tenant-blind miss per I-025 (cross-tenant resolves to the
+ * same envelope as missing).
+ */
 export async function getVariantHandler(
   req: FastifyRequest,
-  _reply: FastifyReply,
+  reply: FastifyReply,
 ): Promise<unknown> {
-  void requireTenantContext(req);
-  throw new Error('not implemented');
+  const ctx = requireTenantContext(req);
+
+  const params = req.params as Record<string, unknown>;
+  const variantIdParam = params['variantId'];
+  if (typeof variantIdParam !== 'string' || variantIdParam.length === 0) {
+    throw req.server.httpErrors.badRequest('Path param `variantId` is required.');
+  }
+
+  const variant = await templateService.getVariant(ctx, variantIdParam);
+  if (variant === null) {
+    throw req.server.httpErrors.notFound('Form variant not found.');
+  }
+  return reply.code(200).send(variant);
 }
 
 /**
  * POST /v0/forms/variants/:variantId/promote — promote a statistically
  * significant winner to new Control. Per Slice PRD §14.5 retires losing
  * variants; in-progress submissions complete on assigned variant.
+ *
+ * **Still STUBBED** at this commit — promotion has additional dependencies
+ * (statistical-significance gate, batch-retire of losers, in-progress
+ * submission preservation discipline). Tracked in the next Forms/Intake
+ * batch.
  */
 export async function promoteVariantHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
   void requireTenantContext(req);
-  throw new Error('not implemented');
+  throw req.server.httpErrors.notImplemented(
+    'POST /v0/forms/variants/:variantId/promote is not yet wired.',
+  );
 }

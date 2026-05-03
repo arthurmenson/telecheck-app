@@ -679,12 +679,57 @@ export async function emitFormsResumeStateRestored(
 // ---------------------------------------------------------------------------
 
 /**
- * Emit a variant deployment audit. Per Slice PRD §14.6, this MUST capture
- * tenant admin actor, variant identifier, sample-size config, traffic split.
+ * Emit a `forms_variant_created` audit when a tenant admin authors a new
+ * A/B variant arm. Category B (governance / config). Admin-scope event:
+ * `target_patient_id: null`.
  *
- * SPEC ISSUE: action 'forms_variant_deployed' is not canonical in
- * AUDIT_EVENTS v5.2. Using `config_change_validated` as the placeholder
- * Category B action; replace once a canonical action is added.
+ * SPEC ISSUE per EHBG §12: AUDIT_EVENTS v5.2 doesn't canonicalize
+ * `forms_variant_created` — flagged with `as AuditAction` cast pending
+ * Engineering Lead ratification. Same pattern as `forms_template_created`
+ * et al. that this slice has been using throughout.
+ */
+export async function emitFormsVariantCreated(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    variantId: FormVariantId;
+    deploymentId: FormDeploymentId;
+    variantTemplateId: FormTemplateId;
+    label: string;
+    trafficPercent: number;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildEnvelope('forms_variant_created' as AuditAction, 'B', {
+      tenant_id: args.tenantId,
+      actor_type: 'operator',
+      actor_id: args.actorId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: null, // platform-scope event
+      country_of_care: args.countryOfCare,
+      resource_type: 'form_variant',
+      resource_id: args.variantId,
+      detail: {
+        variant_id: args.variantId,
+        deployment_id: args.deploymentId,
+        variant_template_id: args.variantTemplateId,
+        label: args.label,
+        traffic_percent: args.trafficPercent,
+      },
+    }),
+    tx,
+  );
+}
+
+/**
+ * Legacy emitter retained as a thin wrapper around the canonical
+ * `emitFormsVariantCreated` so existing call sites keep compiling. New
+ * code should call `emitFormsVariantCreated` directly.
+ *
+ * @deprecated Use `emitFormsVariantCreated`.
  */
 export async function emitFormsVariantDeployed(
   args: {

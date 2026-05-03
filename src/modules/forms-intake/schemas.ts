@@ -150,11 +150,32 @@ export type SubmitSubmissionRequest = z.infer<typeof SubmitSubmissionRequestSche
 // Variant request bodies
 // ---------------------------------------------------------------------------
 
+/**
+ * CreateVariantRequest — tenant admin creates an A/B variant of a deployed
+ * template.
+ *
+ * Aligned to migration 006 §TABLE 5 columns 2026-05-03:
+ *   - `deploymentId` — which deployment this variant binds to (required).
+ *   - `variantTemplateId` — the template that backs this variant arm. The
+ *     Control variant uses the deployment's primary template; A/B/C/D
+ *     variants point at separately-authored modified templates. Composite
+ *     FK at the DB layer enforces tenant alignment (variant_template_id
+ *     must belong to the same tenant as the variant's deployment).
+ *   - `label` — control / A / B / C / D (one Control + 1–4 alternatives
+ *     per Slice PRD §14.1; UNIQUE per deployment at the DB layer).
+ *   - `trafficPercent` — 0..100. Sum across all active variants for a
+ *     deployment SHOULD equal 100; enforced at the application layer
+ *     (PostHog feature-flag config), not the DB.
+ *
+ * Removed legacy fields `templateId` + `parentVersionId` that don't exist
+ * in the migration. Pattern A versioning means each variant arm gets its
+ * own template row, not a "version" pointer.
+ */
 export const CreateVariantRequestSchema = z.object({
-  templateId: z.string().min(1),
-  parentVersionId: z.string().min(1),
+  deploymentId: z.string().min(1),
+  variantTemplateId: z.string().min(1),
   label: z.enum(['control', 'A', 'B', 'C', 'D']),
-  trafficSplitPercent: z.number().int().min(0).max(100),
+  trafficPercent: z.number().int().min(0).max(100),
 });
 
 export type CreateVariantRequest = z.infer<typeof CreateVariantRequestSchema>;

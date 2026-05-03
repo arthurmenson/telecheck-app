@@ -129,15 +129,36 @@ export interface FormSnapshot {
   captured_at: string;
 }
 
+/**
+ * forms_variant row shape — aligned 1:1 with migration 006 columns
+ * (Codex variants-r0 alignment 2026-05-03; the prior scaffold type used
+ * `parent_version_id` + `traffic_split_percent` which don't exist in the
+ * actual table).
+ *
+ * Per migration 006 §TABLE 5: variants are scoped to a (tenant_id,
+ * deployment_id) tuple. Each variant arm is backed by an independent
+ * forms_template (the `variant_template_id`) — Pattern A versioning
+ * means a variant gets its own template row rather than referencing a
+ * "version" of the parent. The Control variant uses the same
+ * variant_template_id as the deployment's primary template; A/B/C/D
+ * variants point at modified templates the tenant admin authored
+ * separately (visual-builder slice scope).
+ */
 export interface FormVariant {
-  id: FormVariantId;
+  variant_id: FormVariantId;
   tenant_id: TenantId;
-  template_id: FormTemplateId;
-  parent_version_id: FormVersionId;
-  label: 'control' | 'A' | 'B' | 'C' | 'D';
-  traffic_split_percent: number; // 0..100
-  status: 'active' | 'retired' | 'winner_promoted';
+  deployment_id: FormDeploymentId;
+  variant_label: 'control' | 'A' | 'B' | 'C' | 'D';
+  variant_template_id: FormTemplateId;
+  traffic_percent: number; // 0..100
+  posthog_flag_key: string | null;
+  status: 'active' | 'retired' | 'winner';
+  created_by: string;
+  retired_by: string | null;
+  retired_reason: string | null;
   created_at: string;
+  updated_at: string;
+  retired_at: string | null;
 }
 
 /**
