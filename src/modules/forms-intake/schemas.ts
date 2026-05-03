@@ -83,10 +83,19 @@ export type PublishVersionRequest = z.infer<typeof PublishVersionRequestSchema>;
 // Deployment request bodies
 // ---------------------------------------------------------------------------
 
+/**
+ * CreateDeploymentRequest — tenant admin deploys a published template version
+ * to a program market. Per FORMS_ENGINE v5.2 Pattern A, only `published`-
+ * status templates may be deployed; the deployment binds a (tenant, template,
+ * country_of_care) trio (template carries program_id + template_version
+ * inline post-CDM-§4.1 alignment).
+ *
+ * (Updated v0.2 patch 2026-05-02: removed legacy versionId + programMarket
+ * PolicyId fields per the post-types.ts-alignment shape — template now
+ * carries version + program inline; deployment just references the template.)
+ */
 export const CreateDeploymentRequestSchema = z.object({
   templateId: z.string().min(1),
-  versionId: z.string().min(1),
-  programMarketPolicyId: z.string().min(1),
 });
 
 export type CreateDeploymentRequest = z.infer<typeof CreateDeploymentRequestSchema>;

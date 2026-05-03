@@ -22,11 +22,22 @@
 
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 
-import { emitFormsTemplateCreated as emitFormsTemplateCreatedAudit } from '../../audit.js';
-import { emitFormsTemplateCreated as emitFormsTemplateCreatedEvent } from '../../events.js';
-import type { CreateTemplateRequest, PublishVersionRequest } from '../../schemas.js';
+import {
+  emitFormsDeploymentCreated as emitFormsDeploymentCreatedAudit,
+  emitFormsTemplateCreated as emitFormsTemplateCreatedAudit,
+} from '../../audit.js';
+import {
+  emitFormsDeploymentCreated as emitFormsDeploymentCreatedEvent,
+  emitFormsTemplateCreated as emitFormsTemplateCreatedEvent,
+} from '../../events.js';
+import type {
+  CreateDeploymentRequest,
+  CreateTemplateRequest,
+  PublishVersionRequest,
+} from '../../schemas.js';
+import * as submissionRepo from '../repositories/submission-repo.js';
 import * as templateRepo from '../repositories/template-repo.js';
-import type { FormTemplate, FormTemplateId } from '../types.js';
+import type { FormDeployment, FormTemplate, FormTemplateId } from '../types.js';
 
 /**
  * Create a draft template under the active tenant context. Returns the
@@ -138,4 +149,84 @@ export async function getTemplate(
  */
 export async function listTemplates(_ctx: TenantContext): Promise<FormTemplate[]> {
   throw new Error('not implemented');
+}
+
+// ---------------------------------------------------------------------------
+// Deployment lifecycle (Pattern A: published-template → market deployment)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deploy a published template to its program's market binding.
+ *
+ * Cross-table precondition (enforced here at the service layer, NOT the DB):
+ *   - The referenced template MUST exist in this tenant.
+ *   - The template's status MUST be `published`. Drafts cannot deploy.
+ *
+ * Atomicity: same canonical pattern as createDraftTemplate. The deployment
+ * INSERT, the audit emission, and the domain event INSERT all run in one
+ * transaction. The composite FK (tenant_id, template_id) → forms_template
+ * (tenant_id, template_id) makes cross-tenant binding structurally
+ * impossible at write time per the slice scaffold R2 hardening.
+ *
+ * Throws BAD_REQUEST-equivalent errors that the handler maps to 400 via
+ * the global error envelope:
+ *   - 'forms.deployment.template_not_found' if the referenced template
+ *     does not exist in this tenant
+ *   - 'forms.deployment.template_not_published' if the template exists
+ *     but its status is not 'published'
+ *
+ * The handler should wrap these into Fastify httpErrors.badRequest with
+ * the canonical error code per ERROR_MODEL v5.1.
+ */
+export async function createDeployment(
+  ctx: TenantContext,
+  actorId: string,
+  input: CreateDeploymentRequest,
+): Promise<FormDeployment> {
+  // Precondition 1: template must exist in this tenant.
+  const template = await templateRepo.findTemplateById(
+    ctx.tenantId,
+    input.templateId as FormTemplateId,
+  );
+  if (template === null) {
+    throw new Error('forms.deployment.template_not_found');
+  }
+
+  // Precondition 2: template must be published. Per FORMS_ENGINE v5.2
+  // Pattern A, only a published version is deployable; drafts and
+  // superseded/archived versions are not eligible.
+  if (template.status !== 'published') {
+    throw new Error('forms.deployment.template_not_published');
+  }
+
+  return submissionRepo.createActiveDeployment(
+    ctx.tenantId,
+    {
+      templateId: input.templateId as FormTemplateId,
+      programId: template.program_id,
+    },
+    async (tx, deployment) => {
+      await emitFormsDeploymentCreatedAudit(
+        {
+          tenantId: ctx.tenantId,
+          actorId,
+          actorTenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          deploymentId: deployment.deployment_id,
+          templateId: deployment.template_id,
+          programId: deployment.program_id,
+        },
+        tx,
+      );
+
+      await emitFormsDeploymentCreatedEvent(tx, {
+        tenantId: ctx.tenantId,
+        deploymentId: deployment.deployment_id,
+        templateId: deployment.template_id,
+        programId: deployment.program_id,
+        countryOfCare: ctx.countryOfCare,
+        actorId,
+      });
+    },
+  );
 }

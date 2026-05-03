@@ -45,6 +45,7 @@ import {
 import type { TenantId } from '../../lib/glossary.js';
 
 import type {
+  FormDeploymentId,
   FormSubmissionId,
   FormTemplateId,
   FormVariantId,
@@ -174,6 +175,47 @@ export async function emitFormsTemplateCreated(
           program_id: args.programId,
           template_version: args.templateVersion,
           status: 'draft',
+        },
+      }),
+    },
+    tx,
+  );
+}
+
+/**
+ * Emit `forms_deployment_created` — tenant admin deployed a published
+ * template to a program market. Category B (governance / config).
+ *
+ * Same SPEC ISSUE caveat as emitFormsTemplateCreated: AUDIT_EVENTS v5.2
+ * doesn't canonicalize this action ID — pending Engineering Lead ratification.
+ */
+export async function emitFormsDeploymentCreated(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    deploymentId: FormDeploymentId;
+    templateId: FormTemplateId;
+    programId: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    {
+      ...buildEnvelope('forms_deployment_created' as AuditAction, 'B', {
+        tenant_id: args.tenantId,
+        actor_type: 'operator',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: null, // platform-scope: no patient target
+        country_of_care: args.countryOfCare,
+        resource_type: 'forms_deployment',
+        resource_id: args.deploymentId,
+        detail: {
+          deployment_id: args.deploymentId,
+          template_id: args.templateId,
+          program_id: args.programId,
         },
       }),
     },

@@ -30,6 +30,7 @@ import { emitDomainEvent, type DbTransaction } from '../../lib/domain-events.js'
 import type { TenantId } from '../../lib/glossary.js';
 
 import type {
+  FormDeploymentId,
   FormSubmissionId,
   FormTemplateId,
   FormVersionId,
@@ -44,6 +45,7 @@ import type {
 const INTAKE_RESPONSE_AGGREGATE = 'intake_response';
 const RESUME_STATE_AGGREGATE = 'forms_resume_state';
 const FORMS_TEMPLATE_AGGREGATE = 'forms_template';
+const FORMS_DEPLOYMENT_AGGREGATE = 'forms_deployment';
 
 // ---------------------------------------------------------------------------
 // Template lifecycle event emitters
@@ -84,6 +86,41 @@ export async function emitFormsTemplateCreated(
       program_id: args.programId,
       country_of_care: args.countryOfCare,
       template_version: args.templateVersion,
+      actor_id: args.actorId,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Emit `forms_deployment.created` — tenant admin deployed a published
+ * template to a program. Per Slice PRD §6.2 deployment workflow.
+ *
+ * Same SPEC ISSUE caveat as emitFormsTemplateCreated: DOMAIN_EVENTS v5.2
+ * doesn't canonicalize the forms_deployment aggregate; pending Engineering
+ * Lead ratification.
+ */
+export async function emitFormsDeploymentCreated(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    deploymentId: FormDeploymentId;
+    templateId: FormTemplateId;
+    programId: string;
+    countryOfCare: string;
+    actorId: string;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_DEPLOYMENT_AGGREGATE,
+    aggregate_id: args.deploymentId,
+    event_type: 'forms_deployment.created',
+    payload: {
+      deployment_id: args.deploymentId,
+      template_id: args.templateId,
+      program_id: args.programId,
+      country_of_care: args.countryOfCare,
       actor_id: args.actorId,
     },
     occurred_at: new Date().toISOString(),

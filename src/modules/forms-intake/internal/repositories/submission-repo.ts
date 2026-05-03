@@ -25,6 +25,7 @@ import {
   withTransaction,
 } from '../../../../lib/db.js';
 import type { TenantId } from '../../../../lib/glossary.js';
+import { ulid } from '../../../../lib/ulid.js';
 
 import type {
   FormDeployment,
@@ -78,11 +79,81 @@ export async function findActiveDeployment(
 }
 
 export async function findDeploymentById(
-  _tenantId: TenantId,
-  _deploymentId: FormDeploymentId,
+  tenantId: TenantId,
+  deploymentId: FormDeploymentId,
 ): Promise<FormDeployment | null> {
-  // TODO: SELECT under withTenantBoundConnection following findActiveDeployment.
-  throw new Error('not implemented');
+  return withTenantBoundConnection(tenantId, async (client: DbClient) => {
+    const result = await client.query<FormDeployment>(
+      `SELECT deployment_id, tenant_id, template_id, program_id,
+              deployed_at, retired_at
+         FROM forms_deployment
+        WHERE deployment_id = $1 AND tenant_id = $2
+        LIMIT 1`,
+      [deploymentId, tenantId],
+    );
+    return result.rows[0] ?? null;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Deployment writes
+// ---------------------------------------------------------------------------
+
+/**
+ * Create an active deployment binding a published template to its program.
+ * The composite FK (tenant_id, template_id) → forms_template (tenant_id,
+ * template_id) is enforced at INSERT — a tenant cannot bind to another
+ * tenant's template even if the template_id is known.
+ *
+ * Service-layer precondition: the caller MUST verify the referenced
+ * template is in 'published' status before calling. The DB does not enforce
+ * the published-status precondition (no CHECK / FK on status); doing so
+ * here would couple deployment to template lifecycle in a way that
+ * complicates supersession. The service layer is the correct enforcement
+ * point.
+ *
+ * Same atomicity discipline as createDraftTemplate: txCallback emits audit
+ * + domain event inside the same transaction; failure rolls back the INSERT.
+ */
+export async function createActiveDeployment(
+  tenantId: TenantId,
+  input: {
+    templateId: FormDeploymentId;
+    programId: string;
+  },
+  txCallback: (tx: DbTransaction, deployment: FormDeployment) => Promise<void>,
+): Promise<FormDeployment> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    const deploymentId = ulid();
+
+    const result = await tx.query<FormDeployment>(
+      `INSERT INTO forms_deployment (
+          deployment_id, tenant_id, template_id, program_id,
+          deployed_at, retired_at
+       ) VALUES (
+          $1, $2, $3, $4,
+          NOW(), NULL
+       )
+       RETURNING deployment_id, tenant_id, template_id, program_id,
+                 deployed_at, retired_at`,
+      [deploymentId, tenantId, input.templateId, input.programId],
+    );
+
+    if (result.rows.length === 0) {
+      throw new Error(
+        `forms-intake submission-repo.createActiveDeployment: INSERT returned no row ` +
+          `for tenant=${tenantId}, template=${input.templateId}. The composite FK ` +
+          `to forms_template (tenant_id, template_id) likely failed — verify the ` +
+          `template exists in this tenant.`,
+      );
+    }
+
+    const deployment = result.rows[0]!;
+    await txCallback(tx, deployment);
+    return deployment;
+  });
 }
 
 // ---------------------------------------------------------------------------
