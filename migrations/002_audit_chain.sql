@@ -330,6 +330,7 @@ CREATE OR REPLACE FUNCTION audit_records_hash_insert()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_partition_key     TEXT;
@@ -342,9 +343,10 @@ BEGIN
     v_partition_key := COALESCE(NEW.target_patient_id, 'PLATFORM');
 
     -- Fetch the most recent record in this partition.
+    -- Schema-qualified per Codex foundation-verify-r4 HIGH: pg_temp shadow attack.
     SELECT sequence_number, record_hash
     INTO   v_prev_record
-    FROM   audit_records
+    FROM   public.audit_records
     WHERE  COALESCE(target_patient_id, 'PLATFORM') = v_partition_key
     ORDER BY sequence_number DESC
     LIMIT  1
@@ -407,6 +409,7 @@ CREATE OR REPLACE FUNCTION audit_records_block_mutation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
     RAISE EXCEPTION

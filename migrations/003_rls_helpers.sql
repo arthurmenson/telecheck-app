@@ -106,11 +106,17 @@ CREATE OR REPLACE FUNCTION set_tenant_context(p_tenant_id TEXT)
 RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
     -- Validate the tenant_id exists and is active.
+    -- All table refs are schema-qualified per Codex foundation-verify-r4
+    -- HIGH finding: an attacker with CREATE on pg_temp could otherwise
+    -- shadow `tenants` or `_session_tenant_context` to spoof validation.
+    -- The SET search_path above pins resolution to pg_catalog + public,
+    -- and the `public.` qualifier is belt-and-suspenders.
     PERFORM 1
-    FROM    tenants
+    FROM    public.tenants
     WHERE   id = p_tenant_id
       AND   status = 'active';
 
@@ -122,7 +128,7 @@ BEGIN
     END IF;
 
     -- Upsert the binding for this PG backend.
-    INSERT INTO _session_tenant_context (pg_backend_pid, tenant_id, bound_at, expires_at)
+    INSERT INTO public._session_tenant_context (pg_backend_pid, tenant_id, bound_at, expires_at)
     VALUES (pg_backend_pid(), p_tenant_id, NOW(), NOW() + INTERVAL '5 minutes')
     ON CONFLICT (pg_backend_pid) DO UPDATE
         SET tenant_id  = EXCLUDED.tenant_id,
@@ -147,9 +153,10 @@ CREATE OR REPLACE FUNCTION clear_tenant_context()
 RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
-    DELETE FROM _session_tenant_context WHERE pg_backend_pid = pg_backend_pid();
+    DELETE FROM public._session_tenant_context WHERE pg_backend_pid = pg_backend_pid();
 END;
 $$;
 
@@ -173,13 +180,14 @@ RETURNS TEXT
 LANGUAGE plpgsql
 SECURITY DEFINER
 STABLE
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_tenant_id TEXT;
 BEGIN
     SELECT tenant_id
       INTO v_tenant_id
-      FROM _session_tenant_context
+      FROM public._session_tenant_context
      WHERE pg_backend_pid = pg_backend_pid()
        AND expires_at > NOW();
 
@@ -226,15 +234,16 @@ CREATE OR REPLACE FUNCTION set_break_glass_context(
 RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_session_id    TEXT;
     v_payload       JSONB;
 BEGIN
     -- Validate target tenant exists (active status).
-    -- Again generic error per I-025.
+    -- Schema-qualified per Codex foundation-verify-r4 HIGH: pg_temp shadow attack.
     PERFORM 1
-    FROM    tenants
+    FROM    public.tenants
     WHERE   id = p_target_tenant
       AND   status = 'active';
 
@@ -252,6 +261,40 @@ BEGIN
     -- Generate a session ID for the break-glass session.
     v_session_id := uuid_generate_v4()::TEXT;
 
+    -- ---------------------------------------------------------------
+    -- ORDERING NOTE — bind the target tenant context FIRST, then emit
+    -- the audit record. (Reordered v0.3 patch 2026-05-02 per Codex
+    -- foundation-verify-r4 HIGH-2 finding: audit_records has FORCE RLS
+    -- with WITH CHECK (tenant_id = current_tenant_id()), so the audit
+    -- INSERT FAILS CLOSED if no binding for p_target_tenant exists yet
+    -- — making the documented hardened path non-functional in the
+    -- prior implementation. Binding-first ensures the WITH CHECK
+    -- predicate evaluates `current_tenant_id() = p_target_tenant`
+    -- and the audit row is accepted.)
+    --
+    -- Atomicity: this function body runs as a single PostgreSQL
+    -- transaction (or as part of an enclosing one). If the audit
+    -- insert below fails for any reason, the binding insert above
+    -- rolls back too — there is no observable state where binding
+    -- exists without a paired audit record. I-024 self-auditing
+    -- guarantee preserved.
+    -- ---------------------------------------------------------------
+
+    INSERT INTO public._session_tenant_context (pg_backend_pid, tenant_id, bound_at, expires_at)
+    VALUES (
+        pg_backend_pid(),
+        p_target_tenant,
+        NOW(),
+        LEAST(
+            NOW() + INTERVAL '5 minutes',                  -- normal binding TTL
+            COALESCE(p_authorized_until::TIMESTAMPTZ, NOW() + INTERVAL '5 minutes')
+        )
+    )
+    ON CONFLICT (pg_backend_pid) DO UPDATE
+        SET tenant_id  = EXCLUDED.tenant_id,
+            bound_at   = EXCLUDED.bound_at,
+            expires_at = EXCLUDED.expires_at;
+
     -- Build the break-glass audit payload.
     v_payload := jsonb_build_object(
         'break_glass_session_id',           v_session_id,
@@ -263,11 +306,10 @@ BEGIN
         'initiated_at',                     NOW()::TEXT
     );
 
-    -- EMIT AUDIT RECORD BEFORE granting cross-tenant access (I-024).
-    -- The audit record is scoped to the TARGET tenant_id per I-027:
-    -- "audit records created by Platform Admin actions on a specific tenant
-    -- carry the target tenant's ID, not a null or platform-scope ID."
-    INSERT INTO audit_records (
+    -- Emit audit record. With binding established above, audit_records'
+    -- WITH CHECK (tenant_id = current_tenant_id()) now evaluates true
+    -- because current_tenant_id() returns p_target_tenant.
+    INSERT INTO public.audit_records (
         tenant_id,
         category,
         audit_sensitivity_level,
@@ -298,29 +340,7 @@ BEGIN
         NOW()
     );
 
-    -- Bind the cross-tenant context after the audit record is committed.
-    -- Uses the same hardened _session_tenant_context table as set_tenant_
-    -- context(); the audit record above is the durable evidence of why the
-    -- binding was established for a tenant the actor doesn't normally own.
-    -- (v0.2 patch 2026-05-02 per Codex foundation-verify-r3 CRITICAL: prior
-    --  code used set_config('app.current_tenant_id', ...) which is now a
-    --  no-op since current_tenant_id() reads from the binding table.)
-    INSERT INTO _session_tenant_context (pg_backend_pid, tenant_id, bound_at, expires_at)
-    VALUES (
-        pg_backend_pid(),
-        p_target_tenant,
-        NOW(),
-        LEAST(
-            NOW() + INTERVAL '5 minutes',                  -- normal binding TTL
-            COALESCE(p_authorized_until::TIMESTAMPTZ, NOW() + INTERVAL '5 minutes')
-        )
-    )
-    ON CONFLICT (pg_backend_pid) DO UPDATE
-        SET tenant_id  = EXCLUDED.tenant_id,
-            bound_at   = EXCLUDED.bound_at,
-            expires_at = EXCLUDED.expires_at;
-
-    -- Break-glass session metadata GUCs are still set for downstream code
+    -- Break-glass session metadata GUCs are set for downstream code
     -- that wants to read session_id / actor_id for trace correlation. These
     -- are NOT used by the RLS policy; they're read-only diagnostics. Setting
     -- them is settable by anyone, so they are NEVER a security boundary.
