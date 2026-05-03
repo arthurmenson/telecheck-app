@@ -35,6 +35,42 @@
 -- PRECONDITION: 001_tenants.sql must have been applied (tenants table).
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Forward declaration: current_tenant_id() stub
+--
+-- The RLS policy on audit_records (added below) references current_tenant_id()
+-- in its USING / WITH CHECK expressions. Postgres validates policy expressions
+-- at CREATE POLICY time, so the function must already exist when this
+-- migration runs — but the real implementation lives in migration 003
+-- (it depends on the _session_tenant_context table which 003 also creates).
+--
+-- Stub it here as a fail-closed RAISE so any accidental call prior to 003
+-- being applied behaves identically to "no tenant binding". Migration 003
+-- replaces this stub via CREATE OR REPLACE FUNCTION with the real
+-- session-binding lookup. Adding this stub closed CI failure
+-- "Migration 002_audit_chain.sql failed: function current_tenant_id() does
+-- not exist" observed on commit f2c7581.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION current_tenant_id()
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+    RAISE EXCEPTION 'tenant_context_not_set'
+        USING HINT = 'current_tenant_id() stub from migration 002 was invoked. '
+                     'Migration 003_rls_helpers.sql replaces this stub with the '
+                     'real implementation; if you see this error in production, '
+                     'migration 003 was not applied. This is a three-layer '
+                     'isolation requirement per I-023.';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION current_tenant_id() TO PUBLIC;
+
 CREATE TABLE IF NOT EXISTS audit_records (
     -- -------------------------------------------------------------------------
     -- Identity
