@@ -257,9 +257,20 @@ CREATE INDEX IF NOT EXISTS idx_audit_tenant_action_time
     ON audit_records (tenant_id, action, recorded_at);
 
 -- Patient-partition chain walk (verification + patient self-access per AUDIT_EVENTS v5.2).
-CREATE INDEX IF NOT EXISTS idx_audit_patient_partition
-    ON audit_records (target_patient_id, sequence_number)
+-- Composite (tenant_id, target_patient_id, sequence_number) so the trigger's
+-- "previous record in partition" lookup (now tenant-scoped per HIGH-1 fix
+-- 2026-05-03) hits an index instead of a sequential scan; also serves the
+-- patient-self-access read pattern.
+CREATE INDEX IF NOT EXISTS idx_audit_tenant_patient_partition
+    ON audit_records (tenant_id, target_patient_id, sequence_number)
     WHERE target_patient_id IS NOT NULL;
+
+-- Platform-scope chain walk: same partition shape but for events with no
+-- target_patient_id. Predicate matches the trigger's COALESCE(NULL, 'PLATFORM')
+-- branch.
+CREATE INDEX IF NOT EXISTS idx_audit_tenant_platform_partition
+    ON audit_records (tenant_id, sequence_number)
+    WHERE target_patient_id IS NULL;
 
 -- High-PII audit retrieval (research data governance queries, ethics boards).
 CREATE INDEX IF NOT EXISTS idx_audit_sensitivity
@@ -357,9 +368,87 @@ REVOKE DELETE ON audit_records FROM PUBLIC;
 -- migration is authored.
 
 -- ---------------------------------------------------------------------------
+-- HASH-CHAIN CANONICAL HASH FUNCTION
+--
+-- Returns the SHA-256 record_hash that the trigger would compute for a row
+-- if it were inserted with the given prev_hash + sequence_number. This is the
+-- single source of truth for the canonical serialization — both the BEFORE
+-- INSERT trigger AND the test-side / application-side chain walker call this
+-- function, so trigger and walker can never drift.
+--
+-- (Added 2026-05-03 per Codex CI-fix adversarial review HIGH-2: the test
+--  walker had been simplified to link-only verification, accepting forged
+--  record_hashes that were re-signed without breaking link sequence. By
+--  exposing the canonicalization as an IMMUTABLE SQL function, the walker
+--  can recompute and verify each row's record_hash without mirroring the
+--  trigger's `concat_ws('|', ...)` format in TS — that mirror is what the
+--  walker simplification was avoiding because it doesn't survive schema
+--  additions. The function is the schema-additions choke point: change the
+--  serialization here once and trigger + walker stay in lockstep.)
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION audit_records_canonical_hash(
+    p_audit_id            UUID,
+    p_tenant_id           TEXT,
+    p_category            TEXT,
+    p_audit_sensitivity_level TEXT,
+    p_action              TEXT,
+    p_actor_type          TEXT,
+    p_actor_id            TEXT,
+    p_ai_workload_type    TEXT,
+    p_autonomy_level      TEXT,
+    p_target_patient_id   TEXT,
+    p_delegate_context    JSONB,
+    p_resource_type       TEXT,
+    p_resource_id         TEXT,
+    p_country_of_care     TEXT,
+    p_break_glass         JSONB,
+    p_payload             JSONB,
+    p_prev_hash           BYTEA,
+    p_sequence_number     BIGINT,
+    p_recorded_at         TIMESTAMPTZ
+)
+RETURNS BYTEA
+LANGUAGE sql
+IMMUTABLE
+SET search_path = pg_catalog, public
+AS $$
+    SELECT digest(
+        concat_ws('|',
+            p_audit_id::TEXT,
+            p_tenant_id,
+            p_category,
+            p_audit_sensitivity_level,
+            p_action,
+            p_actor_type,
+            p_actor_id,
+            COALESCE(p_ai_workload_type,  ''),
+            COALESCE(p_autonomy_level,    ''),
+            COALESCE(p_target_patient_id, ''),
+            COALESCE(p_delegate_context::TEXT, ''),
+            COALESCE(p_resource_type,     ''),
+            COALESCE(p_resource_id,       ''),
+            COALESCE(p_country_of_care,   ''),
+            COALESCE(p_break_glass::TEXT, ''),
+            p_payload::TEXT,
+            p_prev_hash::TEXT,
+            p_sequence_number::TEXT,
+            p_recorded_at::TEXT
+        ),
+        'sha256'
+    );
+$$;
+
+GRANT EXECUTE ON FUNCTION audit_records_canonical_hash(
+    UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT,
+    JSONB, TEXT, TEXT, TEXT, JSONB, JSONB, BYTEA, BIGINT, TIMESTAMPTZ
+) TO PUBLIC;
+
+-- ---------------------------------------------------------------------------
 -- HASH-CHAIN INSERT TRIGGER
 -- Computes prev_hash and record_hash on every INSERT per AUDIT_EVENTS v5.2
--- hash-chain construction rules.
+-- hash-chain construction rules. Calls audit_records_canonical_hash() for the
+-- record_hash so trigger + walker share canonicalization (HIGH-2 fix).
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION audit_records_hash_insert()
@@ -371,25 +460,40 @@ AS $$
 DECLARE
     v_partition_key     TEXT;
     v_prev_record       RECORD;
-    v_raw               TEXT;
 BEGIN
     -- Determine the partition key.
-    -- Partitioned by target_patient_id per AUDIT_EVENTS v5.2.
-    -- Platform-scope events (no patient target) use sentinel partition 'PLATFORM'.
-    v_partition_key := COALESCE(NEW.target_patient_id, 'PLATFORM');
+    -- Partitioned by (tenant_id, target_patient_id) per AUDIT_EVENTS v5.2 +
+    -- I-023/I-027 cross-tenant-isolation discipline. Platform-scope events
+    -- (no patient target) use sentinel suffix 'PLATFORM'; the tenant_id
+    -- prefix keeps tenants' chains independent even at the platform-scope
+    -- partition.
+    --
+    -- (Patch v0.4 — 2026-05-03 per Codex CI-fix adversarial review HIGH-1:
+    --  the prior partition was target_patient_id alone, which let two
+    --  tenants that ever shared a target_patient_id — or both emitted any
+    --  platform-scope record — cross-contaminate hash chains. The trigger
+    --  is SECURITY DEFINER and queries public.audit_records directly,
+    --  bypassing the caller's RLS view, so the cross-tenant link could
+    --  not be detected by tenant-scoped verification. Tenant-scoping the
+    --  partition restores I-023/I-027 cryptographic independence.)
+    v_partition_key := NEW.tenant_id || ':' || COALESCE(NEW.target_patient_id, 'PLATFORM');
 
-    -- Fetch the most recent record in this partition.
+    -- Fetch the most recent record in this partition (now scoped to the
+    -- caller's tenant — see partition-key comment above).
     -- Schema-qualified per Codex foundation-verify-r4 HIGH: pg_temp shadow attack.
     SELECT sequence_number, record_hash
     INTO   v_prev_record
     FROM   public.audit_records
-    WHERE  COALESCE(target_patient_id, 'PLATFORM') = v_partition_key
+    WHERE  tenant_id = NEW.tenant_id
+      AND  COALESCE(target_patient_id, 'PLATFORM') = COALESCE(NEW.target_patient_id, 'PLATFORM')
     ORDER BY sequence_number DESC
     LIMIT  1
     FOR    UPDATE;  -- serialise concurrent INSERTs within the same partition
 
     IF v_prev_record IS NULL THEN
         -- First record in this partition: use genesis seed per AUDIT_EVENTS v5.2.
+        -- Genesis seed includes tenant_id so two tenants' first records in the
+        -- same patient slot get distinct genesis hashes.
         NEW.prev_hash       := digest('GENESIS:' || v_partition_key, 'sha256');
         NEW.sequence_number := 1;
     ELSE
@@ -397,34 +501,30 @@ BEGIN
         NEW.sequence_number := v_prev_record.sequence_number + 1;
     END IF;
 
-    -- Compute record_hash as SHA-256 of all payload fields EXCEPT the
-    -- hash_chain fields themselves (prev_hash, record_hash, sequence_number).
-    -- We hash a deterministic text representation of the canonical fields.
-    -- Production note: the application layer SHOULD independently verify this
-    -- hash using the same field set before trusting the stored value.
-    v_raw := concat_ws('|',
-        NEW.audit_id::TEXT,
+    -- Compute record_hash via the shared canonicalization function so the
+    -- chain walker (tests/helpers/audit-assertions.ts) can recompute the
+    -- exact same value via SQL and verify per-row integrity.
+    NEW.record_hash := audit_records_canonical_hash(
+        NEW.audit_id,
         NEW.tenant_id,
         NEW.category,
         NEW.audit_sensitivity_level,
         NEW.action,
         NEW.actor_type,
         NEW.actor_id,
-        COALESCE(NEW.ai_workload_type,  ''),
-        COALESCE(NEW.autonomy_level,    ''),
-        COALESCE(NEW.target_patient_id, ''),
-        COALESCE(NEW.delegate_context::TEXT, ''),
-        COALESCE(NEW.resource_type,     ''),
-        COALESCE(NEW.resource_id,       ''),
-        COALESCE(NEW.country_of_care,   ''),
-        COALESCE(NEW.break_glass::TEXT, ''),
-        NEW.payload::TEXT,
-        NEW.prev_hash::TEXT,
-        NEW.sequence_number::TEXT,
-        NEW.recorded_at::TEXT
+        NEW.ai_workload_type,
+        NEW.autonomy_level,
+        NEW.target_patient_id,
+        NEW.delegate_context,
+        NEW.resource_type,
+        NEW.resource_id,
+        NEW.country_of_care,
+        NEW.break_glass,
+        NEW.payload,
+        NEW.prev_hash,
+        NEW.sequence_number,
+        NEW.recorded_at
     );
-
-    NEW.record_hash := digest(v_raw, 'sha256');
 
     RETURN NEW;
 END;

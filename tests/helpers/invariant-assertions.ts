@@ -103,7 +103,7 @@ export async function assertInvariants(
         await assertI027AuditTenantId(ctx);
         break;
       case 'I-029':
-        assertI029ResearchGate(ctx);
+        await assertI029ResearchGate(ctx);
         break;
       case 'I-031':
         assertI031HighPiiSensitivity(ctx);
@@ -402,17 +402,32 @@ export interface I029GateResultStub {
 /**
  * Assert the I-029 6-condition gate result.
  *
- * When gate fails:
- *   - `invalidationReason` must be one of the 6 canonical enum values.
- *   - `failedCondition` must be non-null.
- *   - A `research.export_completed(status=invalidated)` audit MUST exist.
- *   - A `signal_enforcement_trigger` Category B audit MUST exist (paired).
+ * Two modes:
+ *   - **Structural mode** (no `ctx.tenantId`): validates the I029GateResult
+ *     enum/nullability shape only. Used by stub-based gate tests where no
+ *     audit emission has happened — verifies the gate evaluator returned
+ *     a well-formed result.
+ *   - **Audit-emission mode** (`ctx.tenantId` provided): in addition to the
+ *     structural checks, queries audit_records to verify the bare-suppression-
+ *     forbidden discipline. When `i029Result.passed === false`, BOTH
+ *     `research.export_completed` (status=invalidated, audit_sensitivity_level=
+ *     high_pii per I-031) AND a paired `signal_enforcement_trigger` Category B
+ *     record MUST exist for that tenant. Used by real integration tests that
+ *     drive `src/lib/i029-gate.ts` end-to-end.
  *
- * When gate passes:
- *   - `invalidationReason` must be null.
- *   - `failedCondition` must be null.
+ * (Hardened 2026-05-03 per Codex CI-fix adversarial review MEDIUM-2: the
+ *  dispatcher had only validated enum fields, so a gate that rejected an
+ *  export without emitting any audit record could still pass CI. Now the
+ *  audit-emission check runs whenever a tenantId is supplied. Stub-based
+ *  unit tests omit tenantId by design — their assertion is structural and
+ *  the audit-emission discipline is a separate, integration-level test.)
+ *
+ * When gate fails AND tenantId is provided:
+ *   - `research.export_completed` audit MUST exist for the tenant with
+ *     `audit_sensitivity_level = 'high_pii'` per I-031.
+ *   - `signal_enforcement_trigger` Category B audit MUST exist for the tenant.
  */
-export function assertI029ResearchGate(ctx: InvariantAssertionContext): void {
+export async function assertI029ResearchGate(ctx: InvariantAssertionContext): Promise<void> {
   const result = ctx.i029Result;
   if (result === undefined) {
     throw new Error('assertI029ResearchGate: ctx.i029Result is required');
@@ -445,6 +460,24 @@ export function assertI029ResearchGate(ctx: InvariantAssertionContext): void {
       throw new Error(
         'I-029 VIOLATION: gate returned passed=false but failedCondition is null. ' +
           'The failed condition (1–6) must be identified.',
+      );
+    }
+
+    // Audit-emission mode: only when caller supplied a tenantId.
+    const tenantId = ctx.tenantId ?? ctx.tenantA;
+    if (tenantId !== undefined) {
+      // Bare-suppression check: research.export_completed at high_pii.
+      await assertAuditRecordExists(
+        tenantId,
+        (r) =>
+          r.action === 'research.export_completed' &&
+          r.audit_sensitivity_level === 'high_pii' &&
+          r.tenant_id === tenantId,
+      );
+      // Paired enforcement signal per AUDIT_EVENTS v5.2 §I-029 binding.
+      await assertAuditRecordExists(
+        tenantId,
+        (r) => r.action === 'signal_enforcement_trigger' && r.tenant_id === tenantId,
       );
     }
   } else {

@@ -238,4 +238,93 @@ describe('audit chain — cross-tenant isolation (I-023, I-027)', () => {
     // Sanity: the inserted IDs are distinct (catches a generator collision).
     expect(usAuditId).not.toBe(ghAuditId);
   });
+
+  it('should keep tenant chains independent when two tenants share a target_patient_id', async () => {
+    // Regression for Codex CI-fix adversarial review HIGH-1 (2026-05-03):
+    // the audit_records BEFORE INSERT trigger originally partitioned the hash
+    // chain by `COALESCE(target_patient_id, 'PLATFORM')` alone, so two tenants
+    // using the same target_patient_id would cross-couple — Tenant B's first
+    // record's prev_hash would point to Tenant A's record_hash, leaking a
+    // cross-tenant link inside an immutable structure that tenant-scoped
+    // verification could not see (the trigger is SECURITY DEFINER and reads
+    // public.audit_records directly, bypassing RLS).
+    //
+    // The patch in migration 002 prefixes the partition with tenant_id, so the
+    // genesis seed AND the previous-record lookup are tenant-scoped. This test
+    // proves: same target_patient_id under two tenants → two independent
+    // genesis records, each with sequence_number=1, neither linking to the
+    // other.
+    const sharedPatient = `pat_xtenant_chain_${randomUUID().slice(0, 8)}`;
+
+    const usAudit1 = await withTenantContext(TENANT_US, () =>
+      insertAuditRecord({
+        tenant_id: TENANT_US,
+        target_patient_id: sharedPatient,
+        action: 'prescribing.initiated',
+        category: 'A',
+        resource_id: `mr_xtenant_us_${sharedPatient}_1`,
+      }),
+    );
+
+    const ghAudit1 = await withTenantContext(TENANT_GHANA, () =>
+      insertAuditRecord({
+        tenant_id: TENANT_GHANA,
+        target_patient_id: sharedPatient,
+        action: 'prescribing.initiated',
+        category: 'A',
+        resource_id: `mr_xtenant_gh_${sharedPatient}_1`,
+      }),
+    );
+
+    const client = getTestClient();
+
+    // Read the chain rows directly — bypass RLS by checking via tenant context
+    // for each tenant; the trigger is what we are testing here, not RLS.
+    const usRow = await withTenantContext(TENANT_US, async () => {
+      const r = await client.query<{
+        sequence_number: string;
+        prev_hash_hex: string;
+        record_hash_hex: string;
+      }>(
+        `SELECT sequence_number,
+                encode(prev_hash, 'hex')   AS prev_hash_hex,
+                encode(record_hash, 'hex') AS record_hash_hex
+           FROM audit_records WHERE audit_id = $1`,
+        [usAudit1],
+      );
+      return r.rows[0];
+    });
+
+    const ghRow = await withTenantContext(TENANT_GHANA, async () => {
+      const r = await client.query<{
+        sequence_number: string;
+        prev_hash_hex: string;
+        record_hash_hex: string;
+      }>(
+        `SELECT sequence_number,
+                encode(prev_hash, 'hex')   AS prev_hash_hex,
+                encode(record_hash, 'hex') AS record_hash_hex
+           FROM audit_records WHERE audit_id = $1`,
+        [ghAudit1],
+      );
+      return r.rows[0];
+    });
+
+    // Both inserts are the FIRST record in their own tenant chain for this
+    // shared patient. Each must be sequence_number=1 (genesis position).
+    expect(usRow).toBeDefined();
+    expect(ghRow).toBeDefined();
+    expect(Number(usRow!.sequence_number)).toBe(1);
+    expect(Number(ghRow!.sequence_number)).toBe(1);
+
+    // Critical cross-tenant invariant: Ghana's prev_hash MUST NOT equal US's
+    // record_hash. If the trigger had patient-only partitioning, Ghana's
+    // genesis would have linked back to the US record because that was the
+    // most-recent row in the patient-only partition.
+    expect(ghRow!.prev_hash_hex).not.toBe(usRow!.record_hash_hex);
+
+    // Each tenant's genesis is derived from a tenant-prefixed partition key,
+    // so the two genesis values themselves must also differ.
+    expect(usRow!.prev_hash_hex).not.toBe(ghRow!.prev_hash_hex);
+  });
 });

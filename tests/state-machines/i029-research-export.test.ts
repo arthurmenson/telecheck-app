@@ -135,8 +135,14 @@ const BASE_VALID_INPUT: I029GateInput = {
 // Condition 1: DSA not active → dsa_inactive
 // ---------------------------------------------------------------------------
 
+// `assertInvariants(['I-029'], { i029Result })` is awaited in every test below
+// (the dispatcher is async — see invariant-assertions.ts MEDIUM-2 closure).
+// These calls run in **structural mode** (no `tenantId` supplied) so the
+// dispatcher only validates I029GateResult shape; the audit-emission discipline
+// is verified separately by the integration tests (it.todo blocks below) once
+// `src/lib/i029-gate.ts` wires emitAudit() end-to-end.
 describe('I-029 gate — condition 1: DSA must be active', () => {
-  it('should reject with invalidation_reason=dsa_inactive when DSA is expired', () => {
+  it('should reject with invalidation_reason=dsa_inactive when DSA is expired', async () => {
     const input: I029GateInput = { ...BASE_VALID_INPUT, dsa_status_at_export: 'expired' };
     const result = evaluateI029GateStub(input);
 
@@ -144,7 +150,7 @@ describe('I-029 gate — condition 1: DSA must be active', () => {
     expect(result.invalidationReason).toBe('dsa_inactive' satisfies InvalidationReason);
     expect(result.failedCondition).toBe(1);
 
-    assertInvariants(['I-029'], { i029Result: result });
+    await assertInvariants(['I-029'], { i029Result: result });
   });
 
   it('should reject with dsa_inactive when DSA is suspended', () => {
@@ -161,7 +167,7 @@ describe('I-029 gate — condition 1: DSA must be active', () => {
 // ---------------------------------------------------------------------------
 
 describe('I-029 gate — condition 2: k-anonymity floor must be met', () => {
-  it('should reject with k_anonymity_violation when k_threshold_actual < k_min_required', () => {
+  it('should reject with k_anonymity_violation when k_threshold_actual < k_min_required', async () => {
     const input: I029GateInput = {
       ...BASE_VALID_INPUT,
       k_threshold_actual: 8,
@@ -173,7 +179,7 @@ describe('I-029 gate — condition 2: k-anonymity floor must be met', () => {
     expect(result.invalidationReason).toBe('k_anonymity_violation' satisfies InvalidationReason);
     expect(result.failedCondition).toBe(2);
 
-    assertInvariants(['I-029'], { i029Result: result });
+    await assertInvariants(['I-029'], { i029Result: result });
   });
 
   it('should pass when k_threshold_actual exactly equals k_min_required (boundary)', () => {
@@ -194,7 +200,7 @@ describe('I-029 gate — condition 2: k-anonymity floor must be met', () => {
 // ---------------------------------------------------------------------------
 
 describe('I-029 gate — condition 3: permitted data domains must match initiation snapshot', () => {
-  it('should reject with permitted_domain_drift when domains drift from initiation snapshot', () => {
+  it('should reject with permitted_domain_drift when domains drift from initiation snapshot', async () => {
     const input: I029GateInput = {
       ...BASE_VALID_INPUT,
       permitted_domains_at_export: ['ncd_surveillance'],
@@ -206,7 +212,7 @@ describe('I-029 gate — condition 3: permitted data domains must match initiati
     expect(result.invalidationReason).toBe('permitted_domain_drift' satisfies InvalidationReason);
     expect(result.failedCondition).toBe(3);
 
-    assertInvariants(['I-029'], { i029Result: result });
+    await assertInvariants(['I-029'], { i029Result: result });
   });
 });
 
@@ -215,7 +221,7 @@ describe('I-029 gate — condition 3: permitted data domains must match initiati
 // ---------------------------------------------------------------------------
 
 describe('I-029 gate — condition 4: consent cohort must not change during export', () => {
-  it('should reject with consent_cohort_change when cohort hash changes mid-export', () => {
+  it('should reject with consent_cohort_change when cohort hash changes mid-export', async () => {
     const input: I029GateInput = {
       ...BASE_VALID_INPUT,
       consent_cohort_hash_initiated: 'abc123',
@@ -227,7 +233,7 @@ describe('I-029 gate — condition 4: consent cohort must not change during expo
     expect(result.invalidationReason).toBe('consent_cohort_change' satisfies InvalidationReason);
     expect(result.failedCondition).toBe(4);
 
-    assertInvariants(['I-029'], { i029Result: result });
+    await assertInvariants(['I-029'], { i029Result: result });
   });
 });
 
@@ -236,7 +242,7 @@ describe('I-029 gate — condition 4: consent cohort must not change during expo
 // ---------------------------------------------------------------------------
 
 describe('I-029 gate — condition 5: per-patient active consent required at completion', () => {
-  it('should reject with consent_revocation_mid_export when a patient revokes during export', () => {
+  it('should reject with consent_revocation_mid_export when a patient revokes during export', async () => {
     const input: I029GateInput = {
       ...BASE_VALID_INPUT,
       all_patients_have_active_consent: false,
@@ -249,7 +255,7 @@ describe('I-029 gate — condition 5: per-patient active consent required at com
     );
     expect(result.failedCondition).toBe(5);
 
-    assertInvariants(['I-029'], { i029Result: result });
+    await assertInvariants(['I-029'], { i029Result: result });
   });
 });
 
@@ -259,7 +265,7 @@ describe('I-029 gate — condition 5: per-patient active consent required at com
 // ---------------------------------------------------------------------------
 
 describe('I-029 gate — condition 6: per-export grant artifact must be valid at completion', () => {
-  it('should reject with grant_artifact_invalidated when grant is expired at completion-time', () => {
+  it('should reject with grant_artifact_invalidated when grant is expired at completion-time', async () => {
     const input: I029GateInput = {
       ...BASE_VALID_INPUT,
       grant_artifact_unexpired: false, // grant expired between initiation and completion
@@ -272,7 +278,7 @@ describe('I-029 gate — condition 6: per-export grant artifact must be valid at
     );
     expect(result.failedCondition).toBe(6);
 
-    assertInvariants(['I-029'], { i029Result: result });
+    await assertInvariants(['I-029'], { i029Result: result });
   });
 
   it('should reject with grant_artifact_invalidated when signer chain is rescinded', () => {
@@ -293,14 +299,14 @@ describe('I-029 gate — condition 6: per-export grant artifact must be valid at
 // ---------------------------------------------------------------------------
 
 describe('I-029 gate — all conditions pass: delivery succeeds', () => {
-  it('should pass when all 6 conditions are met', () => {
+  it('should pass when all 6 conditions are met', async () => {
     const result = evaluateI029GateStub(BASE_VALID_INPUT);
 
     expect(result.passed).toBe(true);
     expect(result.invalidationReason).toBeNull();
     expect(result.failedCondition).toBeNull();
 
-    assertInvariants(['I-029'], { i029Result: result });
+    await assertInvariants(['I-029'], { i029Result: result });
   });
 
   it.todo(

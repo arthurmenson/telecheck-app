@@ -45,6 +45,8 @@
  *   - migrations/002_audit_chain.sql (audit_records table; trigger; append-only guard)
  */
 
+import { createHash } from 'node:crypto';
+
 import { getTestClient } from '../setup.ts';
 
 import type { TenantId } from './tenant-fixtures.ts';
@@ -92,6 +94,17 @@ export interface AuditRecord {
  * Canonical SELECT that aliases DB columns onto the envelope shape and
  * encodes the bytea hash columns as hex text. Used by every helper here so
  * the field-rename mapping lives in exactly one place.
+ *
+ * The `expected_record_hash` column re-derives the canonical hash by calling
+ * the shared `audit_records_canonical_hash(...)` SQL function (migration 002).
+ * The trigger uses the same function on INSERT — so a row whose stored
+ * `record_hash` no longer matches `expected_record_hash` has been tampered
+ * with. The chain walker uses this to detect forged-and-resigned records
+ * even when the tampering kept link sequence intact (HIGH-2 closure 2026-05-03).
+ *
+ * The partition key now mirrors the trigger: `tenant_id || ':' ||
+ * COALESCE(target_patient_id, 'PLATFORM')`. This keeps the walker aligned
+ * with the trigger after the HIGH-1 fix that tenant-scopes the partition.
  */
 const ENVELOPE_SELECT = `
   SELECT
@@ -110,10 +123,20 @@ const ENVELOPE_SELECT = `
     payload                               AS detail,
     ai_workload_type,
     autonomy_level,
-    COALESCE(target_patient_id, 'PLATFORM') AS partition,
+    tenant_id || ':' || COALESCE(target_patient_id, 'PLATFORM') AS partition,
     sequence_number,
     encode(prev_hash, 'hex')              AS previous_hash,
-    encode(record_hash, 'hex')            AS record_hash
+    encode(record_hash, 'hex')            AS record_hash,
+    encode(
+      audit_records_canonical_hash(
+        audit_id, tenant_id, category, audit_sensitivity_level, action,
+        actor_type, actor_id, ai_workload_type, autonomy_level,
+        target_patient_id, delegate_context, resource_type, resource_id,
+        country_of_care, break_glass, payload, prev_hash, sequence_number,
+        recorded_at
+      ),
+      'hex'
+    )                                     AS expected_record_hash
   FROM audit_records
 `;
 
@@ -137,9 +160,15 @@ interface RawRow {
   sequence_number: number | string;
   previous_hash: string;
   record_hash: string;
+  /** SHA-256 the trigger would compute right now from this row's columns. */
+  expected_record_hash: string;
 }
 
-function rawRowToAuditRecord(row: RawRow): AuditRecord {
+interface AuditRecordWithExpected extends AuditRecord {
+  expected_record_hash: string;
+}
+
+function rawRowToAuditRecord(row: RawRow): AuditRecordWithExpected {
   return {
     audit_id: row.audit_id,
     timestamp: row.timestamp,
@@ -166,6 +195,7 @@ function rawRowToAuditRecord(row: RawRow): AuditRecord {
       previous_hash: row.previous_hash,
       record_hash: row.record_hash,
     },
+    expected_record_hash: row.expected_record_hash,
   };
 }
 
@@ -175,18 +205,26 @@ function rawRowToAuditRecord(row: RawRow): AuditRecord {
 
 /**
  * Walk all audit records for `tenantId` ordered by partition + sequence_number
- * and verify that the SHA-256 hash chain LINKS are intact:
- *   for each record after the first in a partition,
- *     record.hash_chain.previous_hash MUST equal the prior record.hash_chain.record_hash.
+ * and verify two things per record:
  *
- * Throws with a precise message identifying the first broken link:
- *   "I-003 VIOLATION: audit chain broken at audit_id=<id>: ..."
+ *   1. Per-record hash integrity: each row's stored `record_hash` MUST equal
+ *      what `audit_records_canonical_hash(...)` would compute right now from
+ *      the row's other columns. Detects forged-and-resigned tampering where a
+ *      column was changed and the hash was hand-rewritten (the link sequence
+ *      could still pass otherwise). HIGH-2 closure 2026-05-03.
  *
- * The first record in a partition uses a genesis seed derived by the DB
- * trigger as `digest('GENESIS:' || partition_key, 'sha256')`. Tests that need
- * to check the genesis derivation explicitly should compute that value
- * themselves; the walker only requires the genesis previous_hash to be
- * non-empty (the trigger will not insert a NULL).
+ *   2. Chain link integrity: each record after the first in a partition MUST
+ *      have `previous_hash` equal to the prior record's `record_hash`. The
+ *      first record in a partition MUST equal the trigger's genesis seed
+ *      `SHA-256('GENESIS:' || tenant_id || ':' ||
+ *      COALESCE(target_patient_id, 'PLATFORM'))` — same derivation the trigger
+ *      uses, so an injected fake-genesis (e.g., one that points to another
+ *      tenant's record_hash) is detected.
+ *
+ * Throws with a precise message identifying the first broken record/link:
+ *   "I-003 VIOLATION: ..."
+ *
+ * Partition matches the trigger's HIGH-1 fix (tenant-scoped chain).
  *
  * @param tenantId - Tenant whose audit records are walked.
  */
@@ -194,7 +232,8 @@ export async function assertAuditChainIntact(tenantId: TenantId): Promise<void> 
   const client = getTestClient();
 
   const result = await client.query<RawRow>(
-    `${ENVELOPE_SELECT} WHERE tenant_id = $1 ORDER BY COALESCE(target_patient_id, 'PLATFORM'), sequence_number`,
+    `${ENVELOPE_SELECT} WHERE tenant_id = $1
+     ORDER BY tenant_id || ':' || COALESCE(target_patient_id, 'PLATFORM'), sequence_number`,
     [tenantId],
   );
 
@@ -203,8 +242,26 @@ export async function assertAuditChainIntact(tenantId: TenantId): Promise<void> 
     return; // No records to walk — vacuously intact.
   }
 
+  // Per-record hash integrity check (closes the HIGH-2 forged-and-resigned
+  // gap). Done up front for every row so any tamper surfaces precisely
+  // before we evaluate the link sequence.
+  for (const rec of records) {
+    if (rec.expected_record_hash !== rec.hash_chain.record_hash) {
+      throw new Error(
+        `I-003 VIOLATION: record_hash mismatch at audit_id=${rec.audit_id} ` +
+          `(tenant=${rec.tenant_id}, partition=${rec.hash_chain.partition}, ` +
+          `seq=${rec.hash_chain.sequence_number}). ` +
+          `Stored record_hash=${rec.hash_chain.record_hash}, ` +
+          `recomputed=${rec.expected_record_hash}. ` +
+          'The trigger that computes record_hash on insert and the ' +
+          'recomputation here both call audit_records_canonical_hash() — ' +
+          'a mismatch means the row was modified after insertion.',
+      );
+    }
+  }
+
   // Group by partition to walk each chain independently.
-  const partitions = new Map<string, AuditRecord[]>();
+  const partitions = new Map<string, AuditRecordWithExpected[]>();
   for (const rec of records) {
     const partition = rec.hash_chain.partition;
     let chain = partitions.get(partition);
@@ -216,26 +273,23 @@ export async function assertAuditChainIntact(tenantId: TenantId): Promise<void> 
   }
 
   for (const [partition, chain] of partitions) {
-    // Track the previous record's record_hash. For the first record we accept
-    // whatever previous_hash the trigger wrote (the trigger uses a genesis
-    // seed derived from the partition key — verifying the seed value would
-    // require duplicating the trigger's text format here).
-    let expectedPreviousHash: string | null = null;
+    // First record in a partition must use the trigger's genesis seed. Mirror
+    // the trigger derivation so a forged genesis (e.g., one pointing at
+    // another tenant's record_hash) is detected even when intra-chain links
+    // would otherwise look intact.
+    const expectedGenesis = sha256Hex(`GENESIS:${partition}`);
+    let expectedPreviousHash: string = expectedGenesis;
 
     for (const rec of chain) {
-      if (rec.hash_chain.previous_hash === undefined || rec.hash_chain.previous_hash.length === 0) {
-        throw new Error(
-          `I-003 VIOLATION: audit record ${rec.audit_id} (partition=${partition}, ` +
-            `seq=${rec.hash_chain.sequence_number}) has empty previous_hash. ` +
-            'The DB trigger should have written a genesis seed or a real prior hash.',
-        );
-      }
-
-      if (expectedPreviousHash !== null && rec.hash_chain.previous_hash !== expectedPreviousHash) {
+      if (rec.hash_chain.previous_hash !== expectedPreviousHash) {
+        const hint =
+          expectedPreviousHash === expectedGenesis
+            ? 'expected genesis seed'
+            : 'expected prior record_hash';
         throw new Error(
           `I-003 VIOLATION: audit chain link broken at audit_id=${rec.audit_id} ` +
             `(partition=${partition}, seq=${rec.hash_chain.sequence_number}). ` +
-            `Expected previous_hash=${expectedPreviousHash}, ` +
+            `Expected previous_hash=${expectedPreviousHash} (${hint}), ` +
             `actual previous_hash=${rec.hash_chain.previous_hash}`,
         );
       }
@@ -243,6 +297,10 @@ export async function assertAuditChainIntact(tenantId: TenantId): Promise<void> 
       expectedPreviousHash = rec.hash_chain.record_hash;
     }
   }
+}
+
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input, 'utf8').digest('hex');
 }
 
 // ---------------------------------------------------------------------------

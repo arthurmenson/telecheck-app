@@ -88,11 +88,15 @@ async function insertMinimalAuditRecord(opts: {
 // ---------------------------------------------------------------------------
 
 describe('I-003 — REVOKE: application role must not have UPDATE/DELETE on audit_records', () => {
+  // Strict zero-row checks 2026-05-03 (Codex CI-fix adversarial review MEDIUM-1):
+  // tests/setup.ts now REVOKEs UPDATE/DELETE on audit_records from telecheck_test_app
+  // explicitly. The append-only trigger remains as belt + suspenders, but the
+  // privilege layer alone must already deny mutation — that's the production
+  // shape I-003 requires.
+
   it('should confirm UPDATE privilege is revoked from the application DB role', async () => {
     const client = getTestClient();
 
-    // Query information_schema to check if the current role has UPDATE on audit_records.
-    // If the migration has run REVOKE UPDATE, this must return 0 rows.
     const result = await client.query<{ privilege_type: string }>(`
       SELECT privilege_type
       FROM information_schema.role_table_grants
@@ -101,19 +105,7 @@ describe('I-003 — REVOKE: application role must not have UPDATE/DELETE on audi
         AND privilege_type = 'UPDATE'
     `);
 
-    if (result.rows.length > 0) {
-      // REVOKE not yet applied — flag as a warning in skeleton state.
-      // Once migrations/002_audit_chain.sql lands with REVOKE UPDATE, this must be 0.
-      console.warn(
-        '[I-003] UPDATE privilege on audit_records not yet revoked for current role. ' +
-          'Ensure migrations/002_audit_chain.sql includes REVOKE UPDATE ON audit_records.',
-      );
-    }
-
-    // In the target state: 0 rows. Mark this as a soft expectation so the test
-    // suite can run before the REVOKE migration lands.
-    // TODO: change to strict expect(result.rows).toHaveLength(0) once 002_audit_chain.sql lands.
-    expect(result.rows.length).toBeLessThanOrEqual(1);
+    expect(result.rows).toHaveLength(0);
   });
 
   it('should confirm DELETE privilege is revoked from the application DB role', async () => {
@@ -127,13 +119,7 @@ describe('I-003 — REVOKE: application role must not have UPDATE/DELETE on audi
         AND privilege_type = 'DELETE'
     `);
 
-    if (result.rows.length > 0) {
-      console.warn(
-        '[I-003] DELETE privilege on audit_records not yet revoked for current role. ' +
-          'Ensure migrations/002_audit_chain.sql includes REVOKE DELETE ON audit_records.',
-      );
-    }
-    expect(result.rows.length).toBeLessThanOrEqual(1);
+    expect(result.rows).toHaveLength(0);
   });
 });
 

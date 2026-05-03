@@ -35,19 +35,16 @@
 
 import { describe, expect, it } from 'vitest';
 
-import {
-  assertI025TenantBlindEnvelope,
-  assertInvariants,
-} from '../helpers/invariant-assertions.ts';
+import { assertI025TenantBlindEnvelope } from '../helpers/invariant-assertions.ts';
 import { TENANT_GHANA, TENANT_US } from '../helpers/tenant-fixtures.ts';
 
-// `assertInvariants` is async, so `expect(() => assertInvariants(...)).toThrow(...)`
-// silently passes — the closure returns an unawaited rejected promise rather than
-// throwing synchronously, which Vitest's sync `.toThrow` matcher cannot observe.
-// For pure I-025 envelope shape checks (which are synchronous), call the
-// `assertI025TenantBlindEnvelope` helper directly so `expect(() => ...).toThrow`
-// observes the throw. The `assertInvariants` dispatcher is preserved for the
-// happy-path tests where async coordination matters.
+// `assertInvariants` is async — `expect(() => assertInvariants(...)).toThrow(...)`
+// silently passes because the closure returns an unawaited rejected promise
+// instead of throwing synchronously, and Vitest's sync `.toThrow` matcher
+// cannot observe a Promise rejection. I-025 envelope shape checks are pure
+// (no I/O), so this file calls the sync `assertI025TenantBlindEnvelope` helper
+// directly throughout — both for `.toThrow` (rejection paths) and `.not.toThrow`
+// (happy paths). The dispatcher is unused here.
 
 // ---------------------------------------------------------------------------
 // Canonical error envelope shape
@@ -90,7 +87,7 @@ describe('error envelope — non-existent resource (I-025)', () => {
 
     // assertI025TenantBlindEnvelope should not throw.
     expect(() => {
-      assertInvariants(['I-025'], { errorEnvelope: envelope });
+      assertI025TenantBlindEnvelope({ errorEnvelope: envelope });
     }).not.toThrow();
   });
 
@@ -167,7 +164,7 @@ describe('error envelope — schema conformance (I-025)', () => {
     };
 
     expect(() => {
-      assertInvariants(['I-025'], { errorEnvelope: conforming });
+      assertI025TenantBlindEnvelope({ errorEnvelope: conforming });
     }).not.toThrow();
   });
 
@@ -190,8 +187,10 @@ describe('error envelope — schema conformance (I-025)', () => {
     const crossTenantResource = makeEnvelope('NOT_FOUND', 'Resource not found', 'req_007');
 
     // Both should validate cleanly.
-    expect(() => assertInvariants(['I-025'], { errorEnvelope: missingResource })).not.toThrow();
-    expect(() => assertInvariants(['I-025'], { errorEnvelope: crossTenantResource })).not.toThrow();
+    expect(() => assertI025TenantBlindEnvelope({ errorEnvelope: missingResource })).not.toThrow();
+    expect(() =>
+      assertI025TenantBlindEnvelope({ errorEnvelope: crossTenantResource }),
+    ).not.toThrow();
 
     // The codes must be identical (same shape, same code).
     expect(missingResource.error.code).toBe(crossTenantResource.error.code);

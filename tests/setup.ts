@@ -167,15 +167,43 @@ async function installTestAppRole(client: Client): Promise<void> {
   `);
 
   // Schema + table grants — broad enough for tests to INSERT / SELECT against
-  // every PHI table; RLS still filters cross-tenant rows. UPDATE/DELETE on
-  // audit_records and forms_snapshot remain forbidden via the per-table
-  // append-only triggers (those run regardless of GRANT).
+  // every PHI table; RLS still filters cross-tenant rows.
   await client.query(`GRANT USAGE ON SCHEMA public TO ${TEST_APP_ROLE}`);
   await client.query(
     `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${TEST_APP_ROLE}`,
   );
   await client.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${TEST_APP_ROLE}`);
   await client.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${TEST_APP_ROLE}`);
+
+  // Strip UPDATE / DELETE on append-only tables to mirror the production
+  // privilege posture per I-003 (and the matching forms-engine snapshot
+  // append-only discipline). The append-only triggers in migration 002 +
+  // forms-intake snapshot migration would also block mutation, but having
+  // both REVOKE + trigger is the platform-floor pattern: a privilege
+  // assertion test (i003-audit-append-only.test.ts) verifies the privilege
+  // layer alone is denying.
+  //
+  // (Patch 2026-05-03 per Codex CI-fix adversarial review MEDIUM-1: the
+  //  prior broad `GRANT ... ON ALL TABLES` left audit_records mutation
+  //  privileges granted to the test role, and the I-003 privilege test
+  //  was using `toBeLessThanOrEqual(1)` so CI passed even with the grant
+  //  active. The combination normalized a production shape where the app
+  //  role can attempt audit mutation — a layer of belt that I-003 expects
+  //  to be in place independently of the suspenders.)
+  await client.query(`REVOKE UPDATE, DELETE ON audit_records FROM ${TEST_APP_ROLE}`);
+  // forms_snapshot is also append-only per Forms/Intake slice; revoke
+  // pre-emptively if the table exists. The IF EXISTS pattern via DO block
+  // tolerates skeleton-state runs where forms_snapshot hasn't been created
+  // by the slice migration yet.
+  await client.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'forms_snapshot' AND relkind = 'r') THEN
+        EXECUTE 'REVOKE UPDATE, DELETE ON forms_snapshot FROM ${TEST_APP_ROLE}';
+      END IF;
+    END
+    $$;
+  `);
 }
 
 // ---------------------------------------------------------------------------
