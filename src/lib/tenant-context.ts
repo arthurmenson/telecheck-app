@@ -164,57 +164,105 @@ function resolveHostFromMap(host: string): SubdomainTenantEntry | null {
 }
 
 /**
- * Look up a tenant by `consumer_subdomain` against the migration 001
- * `tenants` table. Returns a SubdomainTenantEntry on hit, null on miss.
+ * Tri-state result from the DB tenant lookup so the caller can distinguish
+ * "DB confirmed this tenant is inactive or unknown" (fail closed; do NOT
+ * fall back to the hardcoded map) from "DB was unreachable" (fall back to
+ * the map for bootstrap / dev resilience).
  *
- * (Patch v0.2 — 2026-05-02: previously, only the hardcoded SUBDOMAIN_TENANT_MAP
- *  was consulted, so any tenant created at runtime via `POST /v0/tenants` was
- *  unresolvable until a code change added it to the map. Now the map is the
- *  fast-path for the two day-1 tenants + localhost dev; misses fall through
- *  to a DB query so dynamically-provisioned tenants are first-class.)
- *
- * Throws on connection / query failure — fail-closed per I-023; a silent
- * null return on DB error could let a request through with `unknown` tenant.
+ * (Added v0.4 patch 2026-05-02 per Codex foundation-wiring-r2 HIGH finding:
+ *  the prior null-vs-throw discrimination conflated DB miss with DB error,
+ *  letting a deactivated production tenant continue to resolve via the
+ *  hardcoded map. The hardcoded map IS the production hot path for the
+ *  day-1 tenants, so a successful DB query that returns zero rows MUST
+ *  override the map with a fail-closed result.)
  */
-async function resolveHostFromDb(host: string): Promise<SubdomainTenantEntry | null> {
+type DbResolution =
+  | { kind: 'found'; entry: SubdomainTenantEntry }
+  | { kind: 'inactive_or_unknown' }
+  | { kind: 'unreachable' };
+
+/**
+ * Look up a tenant by `consumer_subdomain` against the migration 001
+ * `tenants` table. Returns a tri-state DbResolution.
+ *
+ * On DB query success with one or more rows → 'found'.
+ * On DB query success with zero rows (tenant doesn't exist OR is inactive)
+ *   → 'inactive_or_unknown' — the caller MUST fail closed and NOT fall
+ *   back to any hardcoded map.
+ * On DB query failure (connection refused, network drop, etc.) →
+ *   'unreachable' — the caller MAY fall back to the hardcoded bootstrap
+ *   map for resilience during DB outages or local-dev-without-DB cases.
+ */
+async function resolveHostFromDb(host: string): Promise<DbResolution> {
   const hostname = host.split(':')[0]?.toLowerCase() ?? '';
-  if (hostname === '') return null;
+  if (hostname === '') return { kind: 'inactive_or_unknown' };
 
-  return withConnection(async (client) => {
-    const result = await client.query<{
-      id: string;
-      display_name: string;
-      consumer_dba: string;
-      legal_entity: string;
-      consumer_subdomain: string;
-      country_of_care: string;
-      kms_key_alias: string;
-    }>(
-      `SELECT id, display_name, consumer_dba, legal_entity, consumer_subdomain,
-              country_of_care, kms_key_alias
-         FROM tenants
-        WHERE LOWER(consumer_subdomain) = $1
-          AND status = 'active'
-        LIMIT 1`,
-      [hostname],
-    );
-
-    if (result.rows.length === 0) return null;
-    const row = result.rows[0];
-    if (row === undefined) return null;
-
-    if (row.country_of_care !== 'US' && row.country_of_care !== 'GH') {
-      // Defensive: the DB CHECK constraint should already enforce this set,
-      // but if the constraint is widened in a future migration without
-      // updating this discriminated union, the request must fail closed.
-      throw new Error(
-        `tenant-context: unsupported country_of_care '${row.country_of_care}' ` +
-          `for tenant '${row.id}'. Update the SubdomainTenantEntry union when ` +
-          `adding new countries.`,
+  let result: Awaited<ReturnType<typeof withConnection<{ rows: unknown[] }>>>;
+  try {
+    result = await withConnection(async (client) => {
+      return client.query<{
+        id: string;
+        display_name: string;
+        consumer_dba: string;
+        legal_entity: string;
+        consumer_subdomain: string;
+        country_of_care: string;
+        kms_key_alias: string;
+        status: string;
+      }>(
+        // Note: NO `status = 'active'` filter here — we look up the tenant
+        // unconditionally, then explicitly check status below. This way, a
+        // suspended/archived tenant returns 'inactive_or_unknown' (fail
+        // closed) rather than 'no row' which the legacy implementation
+        // conflated with 'tenant doesn't exist at all'.
+        `SELECT id, display_name, consumer_dba, legal_entity, consumer_subdomain,
+                country_of_care, kms_key_alias, status
+           FROM tenants
+          WHERE LOWER(consumer_subdomain) = $1
+          LIMIT 1`,
+        [hostname],
       );
-    }
+    });
+  } catch {
+    // DB connection / query failure. Fall back to map at the call site.
+    return { kind: 'unreachable' };
+  }
 
-    return {
+  if (result.rows.length === 0) return { kind: 'inactive_or_unknown' };
+  const row = result.rows[0] as
+    | {
+        id: string;
+        display_name: string;
+        consumer_dba: string;
+        legal_entity: string;
+        consumer_subdomain: string;
+        country_of_care: string;
+        kms_key_alias: string;
+        status: string;
+      }
+    | undefined;
+  if (row === undefined) return { kind: 'inactive_or_unknown' };
+
+  // Explicit status check (the SQL deliberately does NOT filter so we can
+  // distinguish "tenant doesn't exist" from "tenant is suspended/archived"
+  // — both fail closed, but the future audit-trail logging may want to
+  // surface the distinction).
+  if (row.status !== 'active') return { kind: 'inactive_or_unknown' };
+
+  if (row.country_of_care !== 'US' && row.country_of_care !== 'GH') {
+    // Defensive: the DB CHECK constraint should already enforce this set,
+    // but if the constraint is widened in a future migration without
+    // updating this discriminated union, the request must fail closed.
+    throw new Error(
+      `tenant-context: unsupported country_of_care '${row.country_of_care}' ` +
+        `for tenant '${row.id}'. Update the SubdomainTenantEntry union when ` +
+        `adding new countries.`,
+    );
+  }
+
+  return {
+    kind: 'found',
+    entry: {
       tenantId: row.id,
       displayName: row.display_name,
       countryOfCare: row.country_of_care,
@@ -222,50 +270,41 @@ async function resolveHostFromDb(host: string): Promise<SubdomainTenantEntry | n
       consumerDba: row.consumer_dba,
       legalEntity: row.legal_entity,
       consumerSubdomain: row.consumer_subdomain,
-    };
-  });
+    },
+  };
 }
 
 /**
- * Two-tier resolver with DB-first authority: queries the migration 001
- * `tenants` table FIRST (so tenant `status = 'active'` and any rotated
- * `kms_key_alias` / consumer_dba / etc. are honored), and falls back to
- * the hardcoded SUBDOMAIN_TENANT_MAP only when the DB query is unreachable
- * (e.g., DB down during boot, or a `localhost` dev environment with no
- * DB at all).
+ * Two-tier resolver with DB as the AUTHORITATIVE status check + the
+ * hardcoded SUBDOMAIN_TENANT_MAP as a bootstrap-only fallback:
  *
- * (Patch v0.3 — 2026-05-02 per Codex foundation-wiring MEDIUM finding
- *  closure: prior resolver returned the hardcoded entry first, so a
- *  tenant deactivated in the DB was still served via the map. The DB
- *  must be the authoritative status check; the map is a bootstrap
- *  fallback only.)
+ *   - DB query 'found' → return the DB entry (authoritative; status =
+ *     'active' confirmed).
+ *   - DB query 'inactive_or_unknown' → return null (FAIL CLOSED — do NOT
+ *     fall back to the map; a tenant deactivated in the DB MUST stop
+ *     resolving even if it appears in the hardcoded map).
+ *   - DB query 'unreachable' → fall back to the map for bootstrap +
+ *     local-dev-without-DB resilience. Returns null if the map also
+ *     misses; the caller (the Fastify hook) returns 400 — fail closed
+ *     per I-023.
  *
- * Failure semantics:
- *   - DB query succeeds with a row → return it (authoritative, includes
- *     status check).
- *   - DB query succeeds with no row → fall through to the map (the
- *     hostname might be a localhost dev case OR an invalid host).
- *   - DB query throws (connection refused, etc.) → fall through to the
- *     map. If the map also misses, the caller (the Fastify hook) returns
- *     400 — the request fails closed per I-023.
- *   - The map returning a result when the DB returned no row is logged
- *     as a divergence: it likely means the DB seed migration hasn't run,
- *     or a hardcoded-only entry (like `localhost`) is being used. NOT
- *     an error per se, but worth noting in production logs.
+ * (Tightened v0.4 patch 2026-05-02 per Codex foundation-wiring-r2 HIGH
+ *  finding closure: the prior null-on-zero-rows path let the hardcoded
+ *  map override DB deactivation for the day-1 hosts.)
  */
 async function resolveHostToTenant(host: string): Promise<SubdomainTenantEntry | null> {
-  try {
-    const fromDb = await resolveHostFromDb(host);
-    if (fromDb !== null) return fromDb;
-  } catch {
-    // DB unreachable — fall through to map fallback. The error itself
-    // is not surfaced here because tenant resolution is a per-request
-    // hot path; persistent DB failures should surface via health-check
-    // monitoring + logged elsewhere via the pool error handler in db.ts.
+  const dbResult = await resolveHostFromDb(host);
+  switch (dbResult.kind) {
+    case 'found':
+      return dbResult.entry;
+    case 'inactive_or_unknown':
+      // Fail closed — DB is authoritative.
+      return null;
+    case 'unreachable':
+      // Bootstrap fallback only — covers local dev without DB and
+      // brief connection blips during boot.
+      return resolveHostFromMap(host);
   }
-  // DB miss or unreachable — try the bootstrap map. Returns null if
-  // the host isn't in the map either, and the caller fails closed.
-  return resolveHostFromMap(host);
 }
 
 // ---------------------------------------------------------------------------
