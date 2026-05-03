@@ -736,6 +736,34 @@ export async function createVariant(
              WHERE tenant_id = $2::varchar
                AND template_id = $7::varchar
                AND status = 'published'
+         ),
+         no_winner_yet AS (
+            -- Closes Codex variants-promote-r2 HIGH 2026-05-03: once any
+            -- variant on this deployment is in winner status, the
+            -- experiment is finalized and no further active arms may be
+            -- created. Without this guard, a concurrent promote-then-
+            -- create on the same deployment would survive: the deployment
+            -- FOR UPDATE lock blocks create behind an in-flight promote,
+            -- but once promote commits and the lock releases, the
+            -- pre-existing predicate (deployment retired_at IS NULL +
+            -- template status published) still passes. Result: a
+            -- deployment with one winner plus a newly-active arm the
+            -- promote never retired.
+            --
+            -- The NOT EXISTS subquery evaluates UNDER the deployment
+            -- FOR UPDATE lock (held by locked_deployment above), so a
+            -- create serialized AFTER a committed promote sees the
+            -- just-committed winner and the cross-join returns 0 rows ->
+            -- INSERT writes nothing -> VARIANT_PRECONDITION_FAILED.
+            -- Concurrent promote-vs-create races collapse
+            -- deterministically to the promote winning.
+            SELECT 1
+             WHERE NOT EXISTS (
+               SELECT 1 FROM forms_variant
+                WHERE tenant_id = $2::varchar
+                  AND deployment_id = $6::varchar
+                  AND status = 'winner'
+             )
          )
          INSERT INTO forms_variant (
             variant_id, tenant_id, deployment_id,
@@ -748,6 +776,7 @@ export async function createVariant(
             $4::int, 'active', $5::varchar
            FROM locked_deployment d
           CROSS JOIN eligible_template t
+          CROSS JOIN no_winner_yet
          RETURNING variant_id, tenant_id, deployment_id,
                    variant_label, variant_template_id,
                    traffic_percent, posthog_flag_key,

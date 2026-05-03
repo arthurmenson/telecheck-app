@@ -419,6 +419,66 @@ describe('forms-intake createVariant — failure modes', () => {
     ).rejects.toThrow(submissionRepo.VARIANT_PRECONDITION_FAILED);
   });
 
+  // Codex variants-promote-r2 HIGH closure 2026-05-03 — once a winner
+  // has been promoted on a deployment, no further active arms may be
+  // created. The deployment-level FOR UPDATE lock alone serialized
+  // promote-vs-create, but createVariant's predicate `retired_at IS NULL`
+  // didn't reject on its own once the lock released. The new
+  // `no_winner_yet` CTE finalizes the experiment.
+  it('rejects creating a new variant after a winner has been promoted on the deployment', async () => {
+    const programId = `prog_var_postwinner_${ulid().slice(0, 8)}`;
+    const { templateId, deploymentId } = await seedActiveDeployment({
+      ctx: US_CTX,
+      programId,
+    });
+    const altTemplateId = await seedAdditionalTemplate({ ctx: US_CTX, programId });
+
+    // Set up + promote winner.
+    const winner = await withTenantContext(TENANT_US, () =>
+      templateService.createVariant(
+        US_CTX,
+        'op_postwin_setup',
+        {
+          deploymentId,
+          variantTemplateId: templateId,
+          label: 'control',
+          trafficPercent: 100,
+        },
+        getTestClient(),
+      ),
+    );
+    await withTenantContext(TENANT_US, () =>
+      templateService.promoteVariant(
+        US_CTX,
+        'op_postwin_promote',
+        winner.variant_id,
+        {
+          rationale: 'first',
+          sampleSize: 1000,
+          pValue: 0.01,
+        },
+        getTestClient(),
+      ),
+    );
+
+    // Attempt to create a new active variant on the now-finalized deployment.
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        templateService.createVariant(
+          US_CTX,
+          'op_postwin_late',
+          {
+            deploymentId,
+            variantTemplateId: altTemplateId,
+            label: 'A',
+            trafficPercent: 25,
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.VARIANT_PRECONDITION_FAILED);
+  });
+
   it('rejects an archived variant_template with VARIANT_PRECONDITION_FAILED', async () => {
     const programId = `prog_var_arch_${ulid().slice(0, 8)}`;
     const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
