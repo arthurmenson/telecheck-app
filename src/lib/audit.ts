@@ -626,12 +626,20 @@ export async function emitAudit(
   //    the envelope returned from `emitAudit` to the caller — which is what
   //    flows to logs, downstream consumers, and assertion helpers — would
   //    carry the wrong previous_hash.
+  //
+  //    HIGH-5 closure 2026-05-03 (Codex CI-fix verify-r4): even with the
+  //    tenant-scoped pre-lookup, two concurrent inserts on an empty partition
+  //    both observed NULL and both pre-computed seq=1 + genesis prev_hash.
+  //    The DB advisory lock made one of them sequence=2 in storage, but the
+  //    SECOND caller's emitAudit returned an envelope still claiming seq=1
+  //    + genesis prev_hash. The wire-out envelope is what production code
+  //    surfaces (logs, downstream events, test assertion helpers), so it has
+  //    to match the trigger's actual computed values. The fix below uses
+  //    `INSERT ... RETURNING` to read the trigger-computed columns back and
+  //    overwrite the pre-computed envelope with the authoritative values.
   const partitionInput = input.target_patient_id ?? 'PLATFORM';
-  const { previousHash, sequenceNumber } = await getPreviousHashForPartition(
-    input.tenant_id,
-    partitionInput,
-    tx,
-  );
+  const { previousHash: prePreviousHash, sequenceNumber: preSequenceNumber } =
+    await getPreviousHashForPartition(input.tenant_id, partitionInput, tx);
 
   // Build the envelope without hash_chain first (needed for record_hash).
   // audit_id is a UUID v4 to match the audit_records.audit_id UUID column type.
@@ -647,18 +655,20 @@ export async function emitAudit(
     audit_sensitivity_level: sensitivityLevel,
   };
 
-  const recordHash = computeRecordHash(partialEnvelope);
-
-  const envelope: AuditEnvelope = {
+  // Pre-compute hash_chain for the no-tx (test/unwired) path. When tx is
+  // provided, these values are OVERWRITTEN by INSERT ... RETURNING below
+  // with whatever the trigger actually wrote.
+  const preRecordHash = computeRecordHash(partialEnvelope);
+  let envelope: AuditEnvelope = {
     ...partialEnvelope,
     hash_chain: {
       // Partition matches the DB trigger derivation: tenant_id-prefixed
       // (HIGH-1 closure 2026-05-03) to keep the chain tenant-scoped even
       // when two tenants share a target_patient_id.
       partition: `${input.tenant_id}:${partitionInput}`,
-      sequence_number: sequenceNumber + 1,
-      previous_hash: previousHash,
-      record_hash: recordHash,
+      sequence_number: preSequenceNumber + 1,
+      previous_hash: prePreviousHash,
+      record_hash: preRecordHash,
     },
   };
 
@@ -666,11 +676,13 @@ export async function emitAudit(
   if (tx) {
     // Production path: durable INSERT into the caller's transaction.
     // The DB-side BEFORE INSERT trigger (migration 002) recomputes
-    // record_hash and sequence_number using the canonical serialization,
-    // so any drift between this app-layer hash and the DB-layer hash
-    // surfaces as a constraint or trigger error and aborts the txn.
+    // record_hash, prev_hash, and sequence_number — under the trigger's
+    // pg_advisory_xact_lock per partition — and writes those to the row.
+    // We then SELECT them back via RETURNING so the returned envelope
+    // matches the stored row exactly, even when concurrent same-partition
+    // inserts race on an empty partition.
     try {
-      await tx.query(
+      const result = await tx.query(
         `INSERT INTO audit_records (
             audit_id, tenant_id, category, audit_sensitivity_level, action,
             actor_type, actor_id, ai_workload_type, autonomy_level,
@@ -683,7 +695,11 @@ export async function emitAudit(
             $10, $11::jsonb, $12, $13,
             $14, $15::jsonb, $16::jsonb, decode($17, 'hex'), decode($18, 'hex'),
             $19, $20
-         )`,
+         )
+         RETURNING
+           encode(prev_hash,   'hex') AS prev_hash_hex,
+           encode(record_hash, 'hex') AS record_hash_hex,
+           sequence_number`,
         [
           envelope.audit_id,
           envelope.tenant_id,
@@ -707,6 +723,30 @@ export async function emitAudit(
           envelope.timestamp,
         ],
       );
+
+      // Overwrite the pre-computed hash_chain with the trigger-authoritative
+      // values. This is the HIGH-5 closure: the wire-out envelope now
+      // matches the stored row regardless of concurrent-insert races.
+      const rows = result.rows as Array<{
+        prev_hash_hex: string;
+        record_hash_hex: string;
+        sequence_number: number | string;
+      }>;
+      const stored = rows[0];
+      if (stored !== undefined) {
+        envelope = {
+          ...envelope,
+          hash_chain: {
+            partition: envelope.hash_chain.partition,
+            sequence_number:
+              typeof stored.sequence_number === 'string'
+                ? Number.parseInt(stored.sequence_number, 10)
+                : stored.sequence_number,
+            previous_hash: stored.prev_hash_hex,
+            record_hash: stored.record_hash_hex,
+          },
+        };
+      }
     } catch (err) {
       // I-003: bare suppression forbidden. Re-throw with context so the
       // caller's transaction aborts and the upstream business action

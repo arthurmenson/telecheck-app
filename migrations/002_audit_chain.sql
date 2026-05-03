@@ -197,6 +197,19 @@ CREATE TABLE IF NOT EXISTS audit_records (
     -- co-partition with platform-scope events under the unique index
     -- `uq_audit_tenant_partition_seq` and weaken chain independence.
     -- (Constraint added 2026-05-03 per Codex CI-fix verify-r3 MEDIUM-4.)
+    --
+    -- NOTE on migration replay: this CHECK is written as a column-level
+    -- inline constraint, so it only attaches when the table is created
+    -- fresh. CREATE TABLE IF NOT EXISTS does NOT add the constraint to
+    -- a pre-existing audit_records (e.g., a long-running staging DB that
+    -- had migration 002 applied before 2026-05-03). For those, a
+    -- follow-up ALTER migration is required:
+    --   ALTER TABLE audit_records ADD CONSTRAINT chk_target_patient_not_platform
+    --     CHECK (target_patient_id IS NULL OR target_patient_id <> 'PLATFORM');
+    -- CI runs against a fresh DB on every run, so this is not currently
+    -- a deployment blocker, but the follow-up ALTER must land before any
+    -- environment that pre-dates this commit can be considered I-023-
+    -- compliant for the PLATFORM-co-partition hazard.
     target_patient_id   TEXT        NULL
                             CHECK (target_patient_id IS NULL OR target_patient_id <> 'PLATFORM'),
 
