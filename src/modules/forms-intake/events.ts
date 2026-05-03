@@ -31,6 +31,7 @@ import type { TenantId } from '../../lib/glossary.js';
 
 import type {
   FormSubmissionId,
+  FormTemplateId,
   FormVersionId,
   PatientId,
   ResumeStateId,
@@ -42,6 +43,52 @@ import type {
 
 const INTAKE_RESPONSE_AGGREGATE = 'intake_response';
 const RESUME_STATE_AGGREGATE = 'forms_resume_state';
+const FORMS_TEMPLATE_AGGREGATE = 'forms_template';
+
+// ---------------------------------------------------------------------------
+// Template lifecycle event emitters
+//
+// SPEC ISSUE: DOMAIN_EVENTS v5.2 catalog enumerates the `intake_response`
+// aggregate but does NOT canonicalize a `forms_template` aggregate or its
+// lifecycle events (`forms_template.created`, `.published`, `.superseded`,
+// `.archived`). The slice PRD §6 visual-builder workflows clearly require
+// these — added here pending Engineering Lead ratification per EHBG §12
+// SI/DSI escalation.
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit `forms_template.created` — tenant admin created a new draft template.
+ * Per Slice PRD §6.1 visual-builder workflow. Always emitted at draft creation
+ * (status='draft' per FORMS_ENGINE v5.2 lifecycle); subsequent edits do NOT
+ * re-emit `created` — they emit `forms_eligibility_logic_edited` (audit) or
+ * other change events as appropriate.
+ */
+export async function emitFormsTemplateCreated(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    templateId: FormTemplateId;
+    programId: string;
+    countryOfCare: string;
+    templateVersion: number;
+    actorId: string;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_TEMPLATE_AGGREGATE,
+    aggregate_id: args.templateId,
+    event_type: 'forms_template.created',
+    payload: {
+      template_id: args.templateId,
+      program_id: args.programId,
+      country_of_care: args.countryOfCare,
+      template_version: args.templateVersion,
+      actor_id: args.actorId,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle event emitters per DOMAIN_EVENTS v5.2 intake_response aggregate

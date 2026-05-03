@@ -22,24 +22,73 @@
 
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 
+import { emitFormsTemplateCreated as emitFormsTemplateCreatedAudit } from '../../audit.js';
+import { emitFormsTemplateCreated as emitFormsTemplateCreatedEvent } from '../../events.js';
 import type { CreateTemplateRequest, PublishVersionRequest } from '../../schemas.js';
+import * as templateRepo from '../repositories/template-repo.js';
 import type { FormTemplate, FormTemplateId } from '../types.js';
 
 /**
  * Create a draft template under the active tenant context. Returns the
- * template + the v1 draft version. Audit emission (`forms_*_edited` per
- * AUDIT_EVENTS v5.2) happens inside the transaction the repository opens.
+ * fully-populated FormTemplate row.
+ *
+ * Atomicity (per I-003 + I-016 + same-tx outbox): the template INSERT,
+ * the audit emission, and the domain event INSERT all run in the same
+ * transaction the repository opens. If audit OR domain event fails, the
+ * template INSERT rolls back too — there is no observable state where
+ * the template exists without paired audit + event records.
+ *
+ * TODO (deferred): validate input.programId resolves to an active
+ * ProgramCatalogEntry per Master PRD v1.10 §10.5 Layer 1. The
+ * ProgramCatalog repository doesn't exist yet (separate slice); this
+ * service currently trusts the caller's programId. When the program
+ * catalog slice lands, add the lookup as the first step here so an
+ * invalid program rejects with 400 before the INSERT.
  */
 export async function createDraftTemplate(
-  _ctx: TenantContext,
-  _actorId: string,
-  _input: CreateTemplateRequest,
+  ctx: TenantContext,
+  actorId: string,
+  input: CreateTemplateRequest,
 ): Promise<FormTemplate> {
-  // TODO: validate program_catalog_entry_id resolves to an active
-  // ProgramCatalogEntry (per Master PRD v1.10 §10.5 Layer 1) before insert;
-  // delegate write to template-repo.createDraftTemplate, threading audit
-  // emission inside the same transaction.
-  throw new Error('not implemented');
+  return templateRepo.createDraftTemplate(
+    ctx.tenantId,
+    {
+      programId: input.programCatalogEntryId,
+      countryOfCare: ctx.countryOfCare,
+      presentationContent: input.layout,
+      branchingLogic: input.branchingLogic,
+      eligibilityLogic: input.eligibilityLogic,
+      approvalGovernance: input.approvalGovernance,
+    },
+    async (tx, template) => {
+      // Audit FIRST so a failure here aborts the transaction before the
+      // domain event INSERT (matching the pattern in foundation
+      // set_break_glass_context).
+      await emitFormsTemplateCreatedAudit(
+        {
+          tenantId: ctx.tenantId,
+          actorId,
+          actorTenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          templateId: template.template_id,
+          programId: template.program_id,
+          templateVersion: template.template_version,
+        },
+        tx,
+      );
+
+      // Domain event for the outbox (consumed by analytics + downstream
+      // module subscribers per Slice PRD §17 handoff pattern).
+      await emitFormsTemplateCreatedEvent(tx, {
+        tenantId: ctx.tenantId,
+        templateId: template.template_id,
+        programId: template.program_id,
+        countryOfCare: ctx.countryOfCare,
+        templateVersion: template.template_version,
+        actorId,
+      });
+    },
+  );
 }
 
 /**

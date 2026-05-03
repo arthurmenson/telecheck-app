@@ -29,6 +29,7 @@ import {
   withTenantBoundConnection,
   withTransaction,
 } from '../../../../lib/db.js';
+import { ulid } from '../../../../lib/ulid.js';
 import type { TenantId } from '../../../../lib/glossary.js';
 
 import type {
@@ -104,32 +105,91 @@ export async function findVersionById(
  *      same `tx` so the audit INSERT is durable in the same atomic step.
  *   2. NOT swallowing any errors — bare suppression is forbidden per I-003.
  */
+/**
+ * Insert a draft forms_template row + run the caller's txCallback (which
+ * emits the audit envelope + domain event) inside the same transaction.
+ *
+ * Atomicity guarantee: if the audit emission OR domain event INSERT fails,
+ * the transaction rolls back the template INSERT too — per I-003 (audit
+ * durability) + I-016 (domain event durability). This is the canonical
+ * write-path pattern every other forms-intake repo write should mirror.
+ */
 export async function createDraftTemplate(
-  _tenantId: TenantId,
-  _input: {
-    programCatalogEntryId: string;
-    name: string;
-    layout: unknown;
+  tenantId: TenantId,
+  input: {
+    programId: string;
+    countryOfCare: 'US' | 'GH';
+    presentationContent: unknown;
     branchingLogic: unknown;
     eligibilityLogic: unknown;
     approvalGovernance: unknown;
   },
-  _txCallback: (tx: DbTransaction) => Promise<void>,
+  txCallback: (tx: DbTransaction, template: FormTemplate) => Promise<void>,
 ): Promise<FormTemplate> {
-  // Canonical pattern (illustrative — body still throws):
-  //
-  //   return withTransaction(async (tx) => {
-  //     await tx.query('SELECT set_tenant_context($1)', [tenantId]);
-  //     const template = await tx.query(...INSERT...);
-  //     const version = await tx.query(...INSERT...);
-  //     await txCallback(tx); // service emits audit + domain event under same tx
-  //     return { template, version };
-  //   });
-  //
-  // The await on `txCallback` ensures audit/domain event INSERTs propagate
-  // their failures through the transaction and roll back the writes if
-  // anything fails — per I-003 + I-016.
-  throw new Error('not implemented');
+  return withTransaction(async (tx) => {
+    // Bind tenant context inside the transaction so RLS policies on
+    // forms_template (and any tables the txCallback touches) authorize
+    // correctly. The binding lives for the transaction lifetime + 5min TTL
+    // per migration 003.
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    // template_version starts at 1; subsequent versions for the same
+    // (tenant, program, country_of_care) trio increment per Pattern A.
+    // Real implementation looks up MAX(template_version) + 1 under a row
+    // lock to handle concurrent draft creation; v0 uses 1 unconditionally
+    // (suitable for the first-template-per-program demonstration).
+    const templateId = ulid();
+    const templateVersion = 1;
+
+    const result = await tx.query<FormTemplate>(
+      `INSERT INTO forms_template (
+          template_id, tenant_id, program_id, country_of_care,
+          template_version, status,
+          presentation_content, branching_logic,
+          eligibility_logic, approval_governance,
+          created_at, updated_at
+       ) VALUES (
+          $1, $2, $3, $4,
+          $5, 'draft',
+          $6::jsonb, $7::jsonb,
+          $8::jsonb, $9::jsonb,
+          NOW(), NOW()
+       )
+       RETURNING template_id, tenant_id, program_id, country_of_care,
+                 template_version, status,
+                 presentation_content, branching_logic,
+                 eligibility_logic, approval_governance,
+                 created_at, updated_at`,
+      [
+        templateId,
+        tenantId,
+        input.programId,
+        input.countryOfCare,
+        templateVersion,
+        JSON.stringify(input.presentationContent ?? {}),
+        JSON.stringify(input.branchingLogic ?? {}),
+        JSON.stringify(input.eligibilityLogic ?? {}),
+        JSON.stringify(input.approvalGovernance ?? {}),
+      ],
+    );
+
+    if (result.rows.length === 0) {
+      throw new Error(
+        `forms-intake template-repo.createDraftTemplate: INSERT returned no row ` +
+          `for tenant=${tenantId}, program=${input.programId}. The RLS WITH CHECK ` +
+          `predicate may have rejected the row (tenant context mismatch).`,
+      );
+    }
+
+    const template = result.rows[0]!;
+
+    // Run the caller's txCallback under the same transaction. The service
+    // typically emits audit + domain event here; failure propagates through
+    // the transaction and rolls back the template INSERT above.
+    await txCallback(tx, template);
+
+    return template;
+  });
 }
 
 /**

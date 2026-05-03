@@ -46,6 +46,7 @@ import type { TenantId } from '../../lib/glossary.js';
 
 import type {
   FormSubmissionId,
+  FormTemplateId,
   FormVariantId,
   FormVersionId,
   PatientId,
@@ -108,6 +109,70 @@ function buildEnvelope(
     country_of_care: common.country_of_care,
     break_glass: null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Template lifecycle audit
+//
+// SPEC ISSUE: AUDIT_EVENTS v5.2 catalog enumerates `forms_eligibility_logic_
+// edited` and `forms_approval_governance_edited` (Category B governance)
+// but does NOT canonicalize a `forms_template_created` action ID. The slice
+// PRD §6.1 visual-builder workflow REQUIRES audit on template creation
+// (every state-changing operation must audit per I-027 + I-003 spirit).
+// Added here under the placeholder action ID `forms_template_created`,
+// Category B (governance — tenant-admin authoring); pending Engineering
+// Lead ratification per EHBG §12 SI/DSI escalation. The audit envelope
+// shape and tx-threading discipline match the canonical pattern; only
+// the action ID is unratified.
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit `forms_template_created` — tenant admin created a draft template.
+ * Category B (governance / config). Always emitted at template creation
+ * (status='draft' per FORMS_ENGINE v5.2 lifecycle); subsequent edits emit
+ * `forms_eligibility_logic_edited` / `forms_approval_governance_edited` /
+ * etc. as appropriate.
+ *
+ * Per the canonical durability discipline: tx is required in production
+ * (foundation audit.ts throws without it outside NODE_ENV=test).
+ * target_patient_id is null for template-creation events (no patient
+ * involved); audit_records.target_patient_id allows NULL for non-patient
+ * platform-scope events (the trigger uses 'PLATFORM' sentinel for the
+ * hash chain partition in that case).
+ */
+export async function emitFormsTemplateCreated(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    templateId: FormTemplateId;
+    programId: string;
+    templateVersion: number;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    {
+      ...buildEnvelope('forms_template_created' as AuditAction, 'B', {
+        tenant_id: args.tenantId,
+        actor_type: 'operator',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: '' as PatientId, // platform-scope event; no patient target
+        country_of_care: args.countryOfCare,
+        resource_type: 'forms_template',
+        resource_id: args.templateId,
+        detail: {
+          template_id: args.templateId,
+          program_id: args.programId,
+          template_version: args.templateVersion,
+          status: 'draft',
+        },
+      }),
+    },
+    tx,
+  );
 }
 
 // ---------------------------------------------------------------------------
