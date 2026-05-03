@@ -487,7 +487,7 @@ export async function updateSubmissionResponses(
         WHERE submission_id = $2
           AND tenant_id = $3
           AND patient_id = $4
-          AND ($5::varchar IS NULL OR delegate_id = $5::varchar)
+          AND delegate_id IS NOT DISTINCT FROM $5::varchar
           AND status = 'in_progress'
           AND deleted_at IS NULL
        RETURNING submission_id, tenant_id, deployment_id, variant_id,
@@ -503,23 +503,35 @@ export async function updateSubmissionResponses(
     );
 
     if (result.rows.length === 0) {
-      const existence = await tx.query<{ status: string; patient_id: string }>(
-        `SELECT status, patient_id FROM forms_submission
+      const existence = await tx.query<{
+        status: string;
+        patient_id: string;
+        delegate_id: string | null;
+      }>(
+        `SELECT status, patient_id, delegate_id FROM forms_submission
           WHERE submission_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
         [submissionId, tenantId],
       );
-      // Two ways to land here:
+      // Three ways to land here, mapped to two sentinels:
       //   - Row doesn't exist in this tenant at all → NOT_FOUND.
-      //   - Row exists but the actor isn't its owner → also NOT_FOUND
-      //     (tenant-blind per I-025; we never differentiate "you don't
+      //   - Row exists but ownership doesn't match (patient_id mismatch
+      //     OR delegate_id null-safe mismatch) → also NOT_FOUND
+      //     (tenant-blind per I-025; never differentiate "you don't
       //     own this" from "doesn't exist" — would leak existence).
-      //   - Row exists, owner matches, but status isn't in_progress →
+      //   - Row exists, ownership matches, but status isn't in_progress →
       //     NOT_IN_PROGRESS.
       if (existence.rows.length === 0) {
         throw new Error(SUBMISSION_NOT_FOUND);
       }
       const row = existence.rows[0]!;
       if (row.patient_id !== ownership.patientId) {
+        throw new Error(SUBMISSION_NOT_FOUND);
+      }
+      // Null-safe delegate equality. Mirrors the SQL `IS NOT DISTINCT FROM`
+      // on the UPDATE WHERE so a wrong-delegate or null-vs-non-null
+      // mismatch surfaces tenant-blind, not as NOT_IN_PROGRESS.
+      // (Codex submissions-r1 verify-r1 HIGH closure 2026-05-03.)
+      if (row.delegate_id !== ownership.delegateId) {
         throw new Error(SUBMISSION_NOT_FOUND);
       }
       throw new Error(SUBMISSION_NOT_IN_PROGRESS);
@@ -577,7 +589,7 @@ export async function transitionSubmissionStatus(
         WHERE submission_id = $1
           AND tenant_id = $2
           AND patient_id = $3
-          AND ($4::varchar IS NULL OR delegate_id = $4::varchar)
+          AND delegate_id IS NOT DISTINCT FROM $4::varchar
           AND status = 'in_progress'
           AND deleted_at IS NULL
        RETURNING submission_id, tenant_id, deployment_id, variant_id,
@@ -587,8 +599,12 @@ export async function transitionSubmissionStatus(
     );
 
     if (result.rows.length === 0) {
-      const existence = await tx.query<{ status: string; patient_id: string }>(
-        `SELECT status, patient_id FROM forms_submission
+      const existence = await tx.query<{
+        status: string;
+        patient_id: string;
+        delegate_id: string | null;
+      }>(
+        `SELECT status, patient_id, delegate_id FROM forms_submission
           WHERE submission_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
         [submissionId, tenantId],
       );
@@ -598,6 +614,10 @@ export async function transitionSubmissionStatus(
       const row = existence.rows[0]!;
       if (row.patient_id !== ownership.patientId) {
         // Tenant-blind: don't differentiate "not yours" from "doesn't exist."
+        throw new Error(SUBMISSION_NOT_FOUND);
+      }
+      // Null-safe delegate equality (verify-r1 HIGH closure).
+      if (row.delegate_id !== ownership.delegateId) {
         throw new Error(SUBMISSION_NOT_FOUND);
       }
       throw new Error(SUBMISSION_NOT_IN_PROGRESS);

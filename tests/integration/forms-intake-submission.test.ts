@@ -562,6 +562,137 @@ describe('forms-intake — patient ownership (CRITICAL-2 closure)', () => {
   });
 });
 
+describe('forms-intake — delegate ownership null-safety (verify-r1 HIGH closure)', () => {
+  it('rejects a non-delegate update on a delegate-bound submission', async () => {
+    const programId = `prog_d_null_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+    const delegateId = ulid();
+
+    // Submission created BY a delegate — row.delegate_id is non-null.
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_d', patientId, delegateId },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // Patient (no delegate) tries to update — must be rejected. Prior to
+    // the verify-r1 closure, the SQL `($n IS NULL OR delegate_id = $n)`
+    // would short-circuit to TRUE on null delegateId and let the patient
+    // self-update through the row. `IS NOT DISTINCT FROM` closes that.
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.updateResponses(
+          US_CTX,
+          { actorId: 'op_self', patientId, delegateId: null },
+          submission.submission_id,
+          { responses: { field_1: 'self-bypass-attempt' } },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.SUBMISSION_NOT_FOUND);
+  });
+
+  it('rejects a wrong-delegate update on a delegate-bound submission', async () => {
+    const programId = `prog_d_wrong_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+    const delegateA = ulid();
+    const delegateB = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_da', patientId, delegateId: delegateA },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // Different delegate (same patient) tries to update — rejected.
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.updateResponses(
+          US_CTX,
+          { actorId: 'op_db', patientId, delegateId: delegateB },
+          submission.submission_id,
+          { responses: { field_1: 'wrong-delegate-attempt' } },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.SUBMISSION_NOT_FOUND);
+  });
+});
+
+describe('forms-intake updateResponses — recursive crisis scan (verify-r1 HIGH closure)', () => {
+  it('detects crisis text nested inside an object value', async () => {
+    const programId = `prog_nest_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_nest', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // Crisis text nested inside an object value — top-level scanner
+    // would have missed this; the recursive walker catches it.
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.updateResponses(
+          US_CTX,
+          { actorId: 'op_nest', patientId, delegateId: null },
+          submission.submission_id,
+          {
+            responses: {
+              field_open: { meta: 'fine', narrative: 'I want to kill myself' },
+            },
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionService.CRISIS_DETECTED);
+  });
+
+  it('detects crisis text nested inside an array value', async () => {
+    const programId = `prog_arr_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_arr', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        submissionService.updateResponses(
+          US_CTX,
+          { actorId: 'op_arr', patientId, delegateId: null },
+          submission.submission_id,
+          {
+            responses: {
+              symptoms: ['headache', 'I want to kill myself', 'fatigue'],
+            },
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionService.CRISIS_DETECTED);
+  });
+});
+
 describe('forms-intake updateResponses — JSONB merge preserves prior keys (HIGH closure)', () => {
   it('does not wipe existing keys when a delta is sent', async () => {
     const programId = `prog_merge_${ulid().slice(0, 8)}`;

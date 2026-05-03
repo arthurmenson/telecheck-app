@@ -144,26 +144,54 @@ export async function startSubmission(
 export const CRISIS_DETECTED = 'forms.submission.crisis_detected';
 
 /**
- * Walk a response payload and call the platform-singleton `crisisDetector`
- * on every string value. Returns the first positive detection (narrowed
- * to the `crisisDetected: true` variant) or null. Top-level scan only —
- * nested objects/arrays are not currently scanned by the forms-intake
- * surface (the slice PRD's free-text fields are flat). When the visual
- * builder ships nested branching, this scanner extends to walk arbitrary
- * depth.
+ * Recursively walk a response payload and call the platform-singleton
+ * `crisisDetector` on every string value found at any depth. Returns the
+ * first positive detection (narrowed to the `crisisDetected: true`
+ * variant) or null.
+ *
+ * **Why recursive (Codex submissions-r1 verify-r1 HIGH closure
+ * 2026-05-03):** the request schema is `responses: z.record(z.unknown())`
+ * — values may be objects, arrays, strings, or any JSON. The prior
+ * implementation only scanned top-level string values, so a client
+ * could embed crisis text inside `{ "field_x": { "child": "..." } }`
+ * or `{ "field_x": ["..."] }` and bypass detection. Walking the full
+ * tree closes the bypass.
+ *
+ * Recursion stops at primitives — objects + arrays + strings only. A
+ * very deep nested response could OOM, but the request body is already
+ * bounded by Fastify's `bodyLimit` (1 MiB at the app layer), so the
+ * walk is bounded by extension.
  */
 function scanResponsesForCrisis(
   tenantId: string,
   responses: Record<string, unknown>,
 ): { crisisType: string } | null {
-  for (const value of Object.values(responses)) {
-    if (typeof value !== 'string') continue;
-    const outcome = crisisDetector.detect(value, tenantId, 'form_response');
-    if (outcome.crisisDetected) {
-      return { crisisType: outcome.crisisType };
+  function walk(value: unknown): { crisisType: string } | null {
+    if (typeof value === 'string') {
+      const outcome = crisisDetector.detect(value, tenantId, 'form_response');
+      if (outcome.crisisDetected) {
+        return { crisisType: outcome.crisisType };
+      }
+      return null;
     }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const hit = walk(item);
+        if (hit !== null) return hit;
+      }
+      return null;
+    }
+    if (value !== null && typeof value === 'object') {
+      for (const child of Object.values(value as Record<string, unknown>)) {
+        const hit = walk(child);
+        if (hit !== null) return hit;
+      }
+      return null;
+    }
+    // Numbers, booleans, null, undefined — no crisis text possible.
+    return null;
   }
-  return null;
+  return walk(responses);
 }
 
 /**
