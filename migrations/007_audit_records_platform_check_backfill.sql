@@ -38,6 +38,15 @@
 --     needs explicit attention rather than silent backfill.
 -- ---------------------------------------------------------------------------
 
+-- Provenance marker for rollback safety (verify-r8 HIGH-8 closure):
+-- when this DO block is the agent that ADDs the constraint, it tags the
+-- constraint with COMMENT ON CONSTRAINT '...added_by_migration_007...'.
+-- The rollback companion (migrations/rollback/007_rollback.sql) only
+-- DROPs the constraint when this exact comment is present, so on a
+-- fresh-create environment where 002's inline column CHECK already
+-- attached the constraint (without this comment), 007's rollback is a
+-- no-op — preserving the baseline I-023 invariant rather than weakening
+-- the schema below the pre-007 state.
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -50,6 +59,9 @@ BEGIN
         ALTER TABLE public.audit_records
             ADD CONSTRAINT chk_target_patient_not_platform
             CHECK (target_patient_id IS NULL OR target_patient_id <> 'PLATFORM');
+        COMMENT ON CONSTRAINT chk_target_patient_not_platform
+            ON public.audit_records
+            IS 'added_by_migration_007_audit_records_platform_check_backfill';
     END IF;
 END
 $$;
