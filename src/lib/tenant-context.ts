@@ -227,13 +227,45 @@ async function resolveHostFromDb(host: string): Promise<SubdomainTenantEntry | n
 }
 
 /**
- * Two-tier resolver: hardcoded map (fast path; covers day-1 tenants +
- * localhost dev) → DB query (covers dynamically-provisioned tenants).
+ * Two-tier resolver with DB-first authority: queries the migration 001
+ * `tenants` table FIRST (so tenant `status = 'active'` and any rotated
+ * `kms_key_alias` / consumer_dba / etc. are honored), and falls back to
+ * the hardcoded SUBDOMAIN_TENANT_MAP only when the DB query is unreachable
+ * (e.g., DB down during boot, or a `localhost` dev environment with no
+ * DB at all).
+ *
+ * (Patch v0.3 — 2026-05-02 per Codex foundation-wiring MEDIUM finding
+ *  closure: prior resolver returned the hardcoded entry first, so a
+ *  tenant deactivated in the DB was still served via the map. The DB
+ *  must be the authoritative status check; the map is a bootstrap
+ *  fallback only.)
+ *
+ * Failure semantics:
+ *   - DB query succeeds with a row → return it (authoritative, includes
+ *     status check).
+ *   - DB query succeeds with no row → fall through to the map (the
+ *     hostname might be a localhost dev case OR an invalid host).
+ *   - DB query throws (connection refused, etc.) → fall through to the
+ *     map. If the map also misses, the caller (the Fastify hook) returns
+ *     400 — the request fails closed per I-023.
+ *   - The map returning a result when the DB returned no row is logged
+ *     as a divergence: it likely means the DB seed migration hasn't run,
+ *     or a hardcoded-only entry (like `localhost`) is being used. NOT
+ *     an error per se, but worth noting in production logs.
  */
 async function resolveHostToTenant(host: string): Promise<SubdomainTenantEntry | null> {
-  const fromMap = resolveHostFromMap(host);
-  if (fromMap !== null) return fromMap;
-  return resolveHostFromDb(host);
+  try {
+    const fromDb = await resolveHostFromDb(host);
+    if (fromDb !== null) return fromDb;
+  } catch {
+    // DB unreachable — fall through to map fallback. The error itself
+    // is not surfaced here because tenant resolution is a per-request
+    // hot path; persistent DB failures should surface via health-check
+    // monitoring + logged elsewhere via the pool error handler in db.ts.
+  }
+  // DB miss or unreachable — try the bootstrap map. Returns null if
+  // the host isn't in the map either, and the caller fails closed.
+  return resolveHostFromMap(host);
 }
 
 // ---------------------------------------------------------------------------

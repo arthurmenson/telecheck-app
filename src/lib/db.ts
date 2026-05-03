@@ -126,6 +126,50 @@ export async function withConnection<T>(
 }
 
 /**
+ * Acquire a connection from the pool, set the tenant context binding via
+ * `set_tenant_context($1)` (migration 003 SECURITY DEFINER function), run
+ * `fn(client)`, then clear the binding and release the connection. Use
+ * this for queries against tenant-scoped tables (under RLS) that aren't
+ * inside a larger transaction.
+ *
+ * Per I-023, fresh pool connections have NO tenant context binding —
+ * queries against RLS-enabled tables would otherwise fail closed with
+ * `tenant_context_not_set`. This helper closes that gap for the
+ * "single tenant-scoped read or write outside a business transaction"
+ * code paths.
+ *
+ * For business actions that touch multiple tables, use `withTransaction`
+ * + a tenant-context call as the first statement instead — the
+ * transaction lifetime keeps the binding active for the whole atomic
+ * operation.
+ *
+ * (Added v0.2 patch 2026-05-02 per Codex foundation-wiring HIGH finding:
+ *  the prior `withConnection` usage in idempotency.ts bypassed RLS
+ *  binding and would have failed closed against migration 005's
+ *  `tenant_isolation` policy.)
+ */
+export async function withTenantBoundConnection<T>(
+  tenantId: string,
+  fn: (client: DbClient) => Promise<T>,
+): Promise<T> {
+  return withConnection(async (client) => {
+    await client.query('SELECT set_tenant_context($1)', [tenantId]);
+    try {
+      return await fn(client);
+    } finally {
+      // Clear the binding before the connection returns to the pool so the
+      // next caller doesn't inherit it. The TTL on the binding (5 min per
+      // migration 003) is the primary safeguard, but explicit cleanup
+      // shortens the leak window.
+      await client.query('SELECT clear_tenant_context()').catch(() => {
+        // Swallow cleanup error — the original `fn` result is more important
+        // to surface; if the connection itself died, the pool will discard it.
+      });
+    }
+  });
+}
+
+/**
  * Run `fn(tx)` inside a transaction. BEGIN/COMMIT on success;
  * BEGIN/ROLLBACK on any thrown error. The error is re-thrown after
  * rollback so callers see it.

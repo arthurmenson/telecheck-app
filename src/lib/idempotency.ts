@@ -44,7 +44,7 @@ import crypto from 'crypto';
 import fp from 'fastify-plugin';
 import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 
-import { withConnection } from './db.js';
+import { withTenantBoundConnection } from './db.js';
 
 // ---------------------------------------------------------------------------
 // Idempotency store — DB-backed against migration 005 idempotency_keys table
@@ -83,7 +83,12 @@ async function lookupIdempotencyRecord(
   endpoint: string,
   actorId: string,
 ): Promise<CachedResponse | null> {
-  return withConnection(async (client) => {
+  // Bind tenant context on the acquired connection BEFORE querying — the
+  // idempotency_keys table has FORCE RLS with tenant_isolation policy
+  // (migration 005), so a query without binding fails closed with
+  // tenant_context_not_set. (Patch v0.3 — 2026-05-02 per Codex
+  // foundation-wiring HIGH finding closure.)
+  return withTenantBoundConnection(tenantId, async (client) => {
     const result = await client.query<{
       response_status: number;
       response_body: unknown;
@@ -132,7 +137,9 @@ async function storeIdempotencyRecord(
   statusCode: number,
   body: unknown,
 ): Promise<void> {
-  await withConnection(async (client) => {
+  // Same RLS gating as lookupIdempotencyRecord — bind tenant context
+  // before INSERTing into the FORCE RLS table. (Patch v0.3 — 2026-05-02.)
+  await withTenantBoundConnection(tenantId, async (client) => {
     await client.query(
       `INSERT INTO idempotency_keys (
           tenant_id, key, endpoint, actor_id,
@@ -286,29 +293,54 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
     // ON CONFLICT DO NOTHING handles the race between two concurrent
     // requests with the same 4-tuple key — first INSERT wins.
     //
-    // We do NOT throw on a write failure here. The request itself already
-    // succeeded (we are inside onSend); failing at the cache write would
-    // surface a 500 to the client even though the business action
-    // committed. Instead, log and continue. Subsequent duplicate retries
-    // would re-execute the business action, which is the documented
-    // degradation mode for this scenario per IDEMPOTENCY v5.1
-    // crash-semantics.
-    try {
-      await storeIdempotencyRecord(
-        idempotencyCtx.tenantId,
-        idempotencyCtx.key,
-        idempotencyCtx.endpoint,
-        idempotencyCtx.actorId,
-        idempotencyCtx.bodyHash,
-        reply.statusCode,
-        payload,
-      );
-    } catch (err) {
-      request.log.error(
-        { err, idempotencyCtx },
-        'idempotency: cache write failed; subsequent retries will re-execute',
-      );
-    }
+    // ARCHITECTURAL LIMITATION (Codex foundation-wiring CRITICAL flagged
+    // 2026-05-02; deferred redesign): the current preHandler/onSend split
+    // pattern is NOT a transactionally-safe idempotency implementation.
+    // Two concurrent requests with the same 4-tuple key both pass the
+    // preHandler lookup (no record yet), both execute the business action,
+    // both attempt the onSend INSERT — ON CONFLICT DO NOTHING means only
+    // one wins the cache, but BOTH already committed business state.
+    // For state-changing endpoints, this is duplicate execution — not the
+    // exactly-once guarantee IDEMPOTENCY v5.1 §1 requires.
+    //
+    // The correct pattern is reserve-then-execute:
+    //   1. INSERT idempotency_keys (..., processing_state='pending') as the
+    //      first statement INSIDE the business transaction. UNIQUE constraint
+    //      on the 4-tuple PK serializes concurrent same-key requests; the
+    //      second one gets a duplicate-key error and rejects with 409
+    //      (or replays the cached response if processing_state='completed').
+    //   2. Run the business logic.
+    //   3. UPDATE idempotency_keys SET processing_state='completed',
+    //      response_status=$X, response_body=$Y as the LAST statement of
+    //      the same transaction.
+    //   4. Commit. If the request fails, the rollback removes BOTH the
+    //      idempotency record AND the business state — clean retry.
+    //
+    // That pattern requires the request handler to drive the transaction
+    // (not a Fastify hook bracketing it). It is a slice-implementation
+    // concern, not a plugin concern. This middleware version is good
+    // enough for v0 single-request-at-a-time flows; the first slice with
+    // serious concurrent-write semantics MUST migrate to reserve-then-
+    // execute. Open issue: filed as `idempotency-redesign-reserve-then-
+    // execute` per EHBG §12 SI/DSI escalation.
+    //
+    // Per the bare-suppression-forbidden discipline (I-003 spirit, even
+    // though I-003 strictly governs audit), the cache write now THROWS
+    // on failure rather than silently logging. The request has already
+    // returned to the client by the time onSend fires (in Fastify, the
+    // response is being serialized; throwing here surfaces in the
+    // server log + crash trace + reply lifecycle as an error, but does
+    // not retroactively change the response code). The point is to make
+    // the failure observable rather than silent.
+    await storeIdempotencyRecord(
+      idempotencyCtx.tenantId,
+      idempotencyCtx.key,
+      idempotencyCtx.endpoint,
+      idempotencyCtx.actorId,
+      idempotencyCtx.bodyHash,
+      reply.statusCode,
+      payload,
+    );
 
     return payload;
   });
