@@ -233,7 +233,7 @@ export interface AuditEnvelope {
   actor_type: ActorType;
   actor_id: string;
   actor_tenant_id: string | null; // null only for platform_admin actors
-  target_patient_id: string;
+  target_patient_id: string | null;          // null for platform-scope events (e.g., forms_template_created); the DB trigger uses 'PLATFORM' sentinel for the hash-chain partition in that case (matching the SQL COALESCE(target_patient_id, 'PLATFORM') in migration 002 audit_records_hash_insert)
   delegate_context: { delegate_id: string; scope: string } | null;
   action: AuditAction;
   category: AuditCategory;
@@ -278,7 +278,14 @@ const AuditEnvelopeInputSchema = z.object({
   tenant_id: z.string().min(1, 'tenant_id is required on every audit record (I-027)'),
   actor_type: z.string().min(1),
   actor_id: z.string().min(1),
-  target_patient_id: z.string().min(1),
+  // Nullable for platform-scope events (e.g., forms_template_created,
+  // market_launch_approved); the DB trigger maps NULL to the 'PLATFORM'
+  // hash-chain partition sentinel per migration 002. (Patch v0.4 — 2026-05-02
+  // per Codex first-handler-implementation CRITICAL finding closure: prior
+  // schema rejected null and forced callers to pass a synthetic empty string
+  // that itself failed `min(1)` validation, breaking every platform-scope
+  // audit emission end-to-end.)
+  target_patient_id: z.union([z.string().min(1), z.null()]),
   action: z.string().min(1),
   category: z.enum(['A', 'B', 'C']),
   audit_sensitivity_level: z.enum(['standard', 'high_pii']),
@@ -590,9 +597,14 @@ export async function emitAudit(
 
   // 4. Compute hash chain (queries audit_records under tx for FOR UPDATE
   //    serialization on the same partition; falls back to genesis when no tx
-  //    is provided per the test/unwired path)
+  //    is provided per the test/unwired path).
+  //    For platform-scope events with target_patient_id=null, use the
+  //    'PLATFORM' sentinel matching the DB trigger's COALESCE(target_patient_id,
+  //    'PLATFORM') in migration 002 audit_records_hash_insert. This keeps
+  //    the app-side and DB-side hash chains aligned for the platform partition.
+  const partitionInput = input.target_patient_id ?? 'PLATFORM';
   const { previousHash, sequenceNumber } = await getPreviousHashForPartition(
-    input.target_patient_id,
+    partitionInput,
     tx,
   );
 
@@ -615,7 +627,7 @@ export async function emitAudit(
   const envelope: AuditEnvelope = {
     ...partialEnvelope,
     hash_chain: {
-      partition: input.target_patient_id,
+      partition: partitionInput, // 'PLATFORM' for platform-scope events; otherwise target_patient_id
       sequence_number: sequenceNumber + 1,
       previous_hash: previousHash,
       record_hash: recordHash,

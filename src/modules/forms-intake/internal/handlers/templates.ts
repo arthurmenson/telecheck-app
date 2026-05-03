@@ -25,16 +25,34 @@ import * as templateService from '../services/template-service.js';
 /**
  * Resolve the acting actor's identity. PLACEHOLDER pending the Identity &
  * Auth slice — currently reads `x-actor-id` header. Production will source
- * this from `req.user.id` populated by an auth plugin. Throws a tenant-blind
- * 401-style error if no actor can be resolved.
+ * this from `req.user.id` populated by an auth plugin.
  *
- * SPEC ISSUE: this header-based shim is for the foundation+slice scaffold
- * demonstration only. The Identity & Auth Spec v1.0 defines the canonical
- * resolution path; this function MUST be replaced before any non-test
- * deployment. Filed inline so engineering escalation per EHBG §12 catches
- * it during the Identity slice's authoring.
+ * **Hardened production gate (per Codex first-handler-implementation HIGH
+ * finding closure 2026-05-02):** the header path is FAIL-CLOSED in non-test
+ * environments unless the `ALLOW_ACTOR_HEADER_AUTH` env flag is explicitly
+ * set to `'true'`. Without that opt-in, production requests get 401 with
+ * a tenant-blind error envelope — no audit-actor forgery is possible from
+ * an unauthenticated client. Local dev / integration tests opt in via the
+ * env flag; the Identity slice replaces the entire function once it lands.
+ *
+ * SPEC ISSUE: the header-based shim itself is for the scaffold demonstration
+ * only. The Identity & Auth Spec v1.0 defines the canonical resolution path;
+ * this function MUST be replaced before any production deployment. Filed
+ * inline so engineering escalation per EHBG §12 catches it during the
+ * Identity slice's authoring.
  */
 function resolveActorId(req: FastifyRequest): string {
+  // Production fail-closed: refuse to use the header shim in production
+  // unless the deployment explicitly opts in. This prevents an inadvertent
+  // production rollout from silently accepting forged audit actors.
+  const isProd = process.env['NODE_ENV'] === 'production';
+  const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
+  if (isProd && !optIn) {
+    throw req.server.httpErrors.unauthorized(
+      'Actor identity could not be authenticated for this request.',
+    );
+  }
+
   const headerValue = req.headers['x-actor-id'];
   const actorId =
     typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : null;

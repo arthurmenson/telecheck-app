@@ -66,7 +66,13 @@ interface FormsAuditCommon {
   actor_type: 'patient' | 'delegate' | 'operator' | 'system';
   actor_id: string;
   actor_tenant_id: string | null;
-  target_patient_id: PatientId;
+  // Nullable for platform-scope events (e.g., template authoring,
+  // not patient-related); the foundation audit emitter maps null to the
+  // 'PLATFORM' hash-chain sentinel matching the DB trigger COALESCE.
+  // (Patch v0.2 — 2026-05-02 per Codex first-handler-implementation
+  //  CRITICAL closure: prior type forced PatientId, blocking platform-
+  //  scope event emission entirely.)
+  target_patient_id: PatientId | null;
   country_of_care: string; // ISO 3166-1 alpha-2
   resource_type: string;
   resource_id: string;
@@ -159,7 +165,7 @@ export async function emitFormsTemplateCreated(
         actor_type: 'operator',
         actor_id: args.actorId,
         actor_tenant_id: args.actorTenantId,
-        target_patient_id: '' as PatientId, // platform-scope event; no patient target
+        target_patient_id: null, // platform-scope event; foundation audit emitter maps null to the 'PLATFORM' hash-chain sentinel
         country_of_care: args.countryOfCare,
         resource_type: 'forms_template',
         resource_id: args.templateId,
