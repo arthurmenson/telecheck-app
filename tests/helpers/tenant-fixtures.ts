@@ -53,7 +53,10 @@ export type TenantId = string;
 
 export interface TenantInput {
   id: TenantId;
+  display_name: string;
   consumer_dba: string;
+  legal_entity: string;
+  consumer_subdomain: string;
   country_of_care: 'US' | 'GH';
   kms_key_alias: string;
   status: 'active' | 'suspended' | 'archived';
@@ -95,7 +98,14 @@ export async function createTenant(overrides: Partial<TenantInput> = {}): Promis
 
   const input: TenantInput = {
     id: defaultId,
-    consumer_dba: `Test Tenant ${suffix}`,
+    display_name: defaultId,                          // operating-tenant label per CDM §4.1; mirrors id by default
+    // consumer_dba MUST start with 'Heros Health' per the consumer_dba_starts_heros_health
+    // CHECK constraint added in 001_tenants.sql post-P-010 closure (commit 74b53b4).
+    // Test DBAs use the form 'Heros Health Test {suffix}' to satisfy the constraint
+    // while remaining clearly distinguishable from canonical day-1 tenants.
+    consumer_dba: `Heros Health Test ${suffix}`,
+    legal_entity: `Telecheck Test ${suffix} Inc.`,    // synthetic legal entity for ephemeral test rows
+    consumer_subdomain: `test-${suffix.toLowerCase()}.heroshealth.com`,
     country_of_care: 'US',
     kms_key_alias: `alias/telecheck-test-${suffix.toLowerCase()}-data-key`,
     status: 'active',
@@ -103,10 +113,22 @@ export async function createTenant(overrides: Partial<TenantInput> = {}): Promis
   };
 
   await client.query(
-    `INSERT INTO tenants (id, consumer_dba, country_of_care, kms_key_alias, status, activated_at)
-     VALUES ($1, $2, $3, $4, $5, NOW())
+    `INSERT INTO tenants (
+        id, display_name, consumer_dba, legal_entity, consumer_subdomain,
+        country_of_care, kms_key_alias, status, activated_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
      ON CONFLICT (id) DO NOTHING`,
-    [input.id, input.consumer_dba, input.country_of_care, input.kms_key_alias, input.status],
+    [
+      input.id,
+      input.display_name,
+      input.consumer_dba,
+      input.legal_entity,
+      input.consumer_subdomain,
+      input.country_of_care,
+      input.kms_key_alias,
+      input.status,
+    ],
   );
 
   return input.id;
