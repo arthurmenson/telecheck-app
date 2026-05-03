@@ -15,8 +15,17 @@
  *   - INVARIANT I-013 (immutable published versions; analogous floor here)
  */
 
+import type { DbClient } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
-import type { FormSnapshot, FormSnapshotId, FormSubmissionId, FormVersionId } from '../types.js';
+import * as snapshotRepo from '../repositories/snapshot-repo.js';
+import * as submissionRepo from '../repositories/submission-repo.js';
+import type {
+  FormSnapshot,
+  FormSnapshotId,
+  FormSubmissionId,
+  FormVersionId,
+  PatientId,
+} from '../types.js';
 
 /**
  * Build and persist a snapshot at submission time. Captures the rendered
@@ -39,18 +48,70 @@ export async function buildAndPersistSnapshot(
 }
 
 /**
- * Read a snapshot by submission ID. Used by clinician case review surfaces.
+ * Read a snapshot by submission ID. Used by clinician case-review surfaces.
+ *
+ * **Patient-level access enforcement (mirrors the
+ * `submission-service.getSubmission` pattern landed via the submissions-r1
+ * CRITICAL-2 closure 2026-05-03):** RLS scopes by tenant, but a tenant
+ * admin / clinician request must additionally prove ownership semantics.
+ * This service is consumed by clinician review surfaces today, where the
+ * clinician's authorization isn't patient-level (per RBAC v1.1, clinicians
+ * have tenant-scope review rights). For PATIENT-facing access (a patient
+ * viewing their own snapshot post-submit), the caller MUST pass
+ * `ownership.patientId` and we cross-check against the underlying
+ * submission's patient_id; mismatch returns null per I-025.
+ *
+ * `ownership.patientId === null` means "tenant-admin / clinician path —
+ * skip patient-level check; rely on RLS". Both modes return null on miss.
  */
 export async function getSnapshotForSubmission(
-  _ctx: TenantContext,
-  _submissionId: FormSubmissionId,
+  ctx: TenantContext,
+  submissionId: FormSubmissionId,
+  ownership: { patientId: PatientId | null },
+  externalTx?: DbClient,
 ): Promise<FormSnapshot | null> {
-  throw new Error('not implemented');
+  const snapshot = await snapshotRepo.findSnapshotBySubmissionId(
+    ctx.tenantId,
+    submissionId,
+    externalTx,
+  );
+  if (snapshot === null) return null;
+
+  if (ownership.patientId !== null) {
+    // Patient-facing access — confirm the underlying submission belongs to
+    // this patient. Tenant-blind null on mismatch per I-025.
+    const submission = await submissionRepo.findSubmissionById(
+      ctx.tenantId,
+      submissionId,
+      externalTx,
+    );
+    if (submission === null || submission.patient_id !== ownership.patientId) {
+      return null;
+    }
+  }
+
+  return snapshot;
 }
 
 export async function getSnapshotById(
-  _ctx: TenantContext,
-  _snapshotId: FormSnapshotId,
+  ctx: TenantContext,
+  snapshotId: FormSnapshotId,
+  ownership: { patientId: PatientId | null },
+  externalTx?: DbClient,
 ): Promise<FormSnapshot | null> {
-  throw new Error('not implemented');
+  const snapshot = await snapshotRepo.findSnapshotById(ctx.tenantId, snapshotId, externalTx);
+  if (snapshot === null) return null;
+
+  if (ownership.patientId !== null) {
+    const submission = await submissionRepo.findSubmissionById(
+      ctx.tenantId,
+      snapshot.submission_id,
+      externalTx,
+    );
+    if (submission === null || submission.patient_id !== ownership.patientId) {
+      return null;
+    }
+  }
+
+  return snapshot;
 }

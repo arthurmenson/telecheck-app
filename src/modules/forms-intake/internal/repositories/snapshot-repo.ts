@@ -41,32 +41,56 @@ import type { FormSnapshot, FormSnapshotId, FormSubmissionId, FormVersionId } fr
 export async function findSnapshotBySubmissionId(
   tenantId: TenantId,
   submissionId: FormSubmissionId,
+  externalTx?: DbClient,
 ): Promise<FormSnapshot | null> {
-  return withTenantBoundConnection(tenantId, async (client: DbClient) => {
-    // Aligned to migration 006 column set (Codex slice-scaffold-r1
-    // MEDIUM finding closure 2026-05-02): singular table name
-    // `forms_snapshot`, primary key `snapshot_id`, references
-    // `template_id` (no version_id; the template_version is captured
-    // inside presented_content per FORMS_ENGINE v5.2 + the canonical
-    // §4.1 seed).
-    const result = await client.query<FormSnapshot>(
-      `SELECT snapshot_id, tenant_id, submission_id, template_id,
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      // Aligned to migration 006 column set (Codex slice-scaffold-r1
+      // MEDIUM finding closure 2026-05-02): singular table name
+      // `forms_snapshot`, primary key `snapshot_id`, references
+      // `template_id` (no version_id; the template_version is captured
+      // inside presented_content per FORMS_ENGINE v5.2 + the canonical
+      // §4.1 seed).
+      const result = await client.query<FormSnapshot>(
+        `SELECT snapshot_id, tenant_id, submission_id, template_id,
               presented_content, captured_at
          FROM forms_snapshot
         WHERE submission_id = $1 AND tenant_id = $2
         LIMIT 1`,
-      [submissionId, tenantId],
-    );
-    return result.rows[0] ?? null;
-  });
+        [submissionId, tenantId],
+      );
+      return result.rows[0] ?? null;
+    },
+    externalTx,
+  );
 }
 
+/**
+ * Fetch a snapshot by primary key under the caller's tenant via RLS.
+ * Returns null on miss or cross-tenant — handler maps null to a tenant-blind
+ * 404 per I-025. Same canonical pattern as `findSubmissionById`.
+ */
 export async function findSnapshotById(
-  _tenantId: TenantId,
-  _snapshotId: FormSnapshotId,
+  tenantId: TenantId,
+  snapshotId: FormSnapshotId,
+  externalTx?: DbClient,
 ): Promise<FormSnapshot | null> {
-  // TODO: SELECT under withTenantBoundConnection.
-  throw new Error('not implemented');
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      const result = await client.query<FormSnapshot>(
+        `SELECT snapshot_id, tenant_id, submission_id, template_id,
+                presented_content, captured_at
+           FROM forms_snapshot
+          WHERE snapshot_id = $1 AND tenant_id = $2
+          LIMIT 1`,
+        [snapshotId, tenantId],
+      );
+      return result.rows[0] ?? null;
+    },
+    externalTx,
+  );
 }
 
 // ---------------------------------------------------------------------------
