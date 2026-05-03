@@ -133,6 +133,52 @@ async function seedMinimalRbac(client: Client): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Non-superuser test role for RLS enforcement
+//
+// Postgres SUPERUSER bypasses Row-Level Security regardless of FORCE ROW LEVEL
+// SECURITY on the table — that's a hard kernel rule, not a policy choice. The
+// CI workflow's `telecheck_ci` user is a superuser (default for postgres-alpine),
+// so all RLS-enforcement tests would silently pass through to all rows when
+// running migrations + queries as that user.
+//
+// Workaround: after migrations run as superuser, create a non-superuser /
+// non-bypass-RLS role and SET SESSION AUTHORIZATION to it for the rest of
+// the test process. Migrations run with elevated permissions; tests run with
+// realistic RLS-applicable permissions.
+//
+// Future state: when the production RBAC role migration (006_roles.sql) lands,
+// this test role can be replaced with the real `telecheck_app_role` referenced
+// in 002 and 003 migration comments.
+// ---------------------------------------------------------------------------
+
+const TEST_APP_ROLE = 'telecheck_test_app';
+
+async function installTestAppRole(client: Client): Promise<void> {
+  // Idempotent across test-process restarts: DROP-then-CREATE would invalidate
+  // grants from a prior run; CREATE IF NOT EXISTS uses DO block.
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${TEST_APP_ROLE}') THEN
+        CREATE ROLE ${TEST_APP_ROLE} NOLOGIN NOSUPERUSER NOBYPASSRLS;
+      END IF;
+    END
+    $$;
+  `);
+
+  // Schema + table grants — broad enough for tests to INSERT / SELECT against
+  // every PHI table; RLS still filters cross-tenant rows. UPDATE/DELETE on
+  // audit_records and forms_snapshot remain forbidden via the per-table
+  // append-only triggers (those run regardless of GRANT).
+  await client.query(`GRANT USAGE ON SCHEMA public TO ${TEST_APP_ROLE}`);
+  await client.query(
+    `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${TEST_APP_ROLE}`,
+  );
+  await client.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${TEST_APP_ROLE}`);
+  await client.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${TEST_APP_ROLE}`);
+}
+
+// ---------------------------------------------------------------------------
 // Global beforeAll — connect + migrate + seed
 // ---------------------------------------------------------------------------
 
@@ -150,11 +196,18 @@ beforeAll(async () => {
   _client = new Client(config);
   await _client.connect();
 
-  // Apply all migrations idempotently.
+  // Apply all migrations idempotently. Runs as superuser — required for
+  // CREATE EXTENSION, CREATE FUNCTION ... SECURITY DEFINER, etc.
   await applyMigrations(_client);
 
   // Seed minimal RBAC stubs for I-012 tests.
   await seedMinimalRbac(_client);
+
+  // Switch the session to a non-superuser role so RLS actually applies for
+  // tests. SET SESSION AUTHORIZATION persists across savepoints and across
+  // every BEGIN/COMMIT cycle on this connection.
+  await installTestAppRole(_client);
+  await _client.query(`SET SESSION AUTHORIZATION ${TEST_APP_ROLE}`);
 });
 
 // ---------------------------------------------------------------------------
