@@ -196,21 +196,12 @@ CREATE TABLE IF NOT EXISTS audit_records (
     -- 'PLATFORM') derivation). A real patient_id of 'PLATFORM' would
     -- co-partition with platform-scope events under the unique index
     -- `uq_audit_tenant_partition_seq` and weaken chain independence.
-    -- (Constraint added 2026-05-03 per Codex CI-fix verify-r3 MEDIUM-4.)
-    --
-    -- NOTE on migration replay: this CHECK is written as a column-level
-    -- inline constraint, so it only attaches when the table is created
-    -- fresh. CREATE TABLE IF NOT EXISTS does NOT add the constraint to
-    -- a pre-existing audit_records (e.g., a long-running staging DB that
-    -- had migration 002 applied before 2026-05-03). For those, a
-    -- follow-up ALTER migration is required:
-    --   ALTER TABLE audit_records ADD CONSTRAINT chk_target_patient_not_platform
-    --     CHECK (target_patient_id IS NULL OR target_patient_id <> 'PLATFORM');
-    -- CI runs against a fresh DB on every run, so this is not currently
-    -- a deployment blocker, but the follow-up ALTER must land before any
-    -- environment that pre-dates this commit can be considered I-023-
-    -- compliant for the PLATFORM-co-partition hazard.
+    -- (Constraint added 2026-05-03 per Codex CI-fix verify-r3 MEDIUM-4;
+    --  follow-up idempotent ALTER added below 2026-05-03 per verify-r5
+    --  HIGH-6 — closes the migration-replay gap so existing environments
+    --  that ran migration 002 before this patch also get the CHECK.)
     target_patient_id   TEXT        NULL
+                            CONSTRAINT chk_target_patient_not_platform
                             CHECK (target_patient_id IS NULL OR target_patient_id <> 'PLATFORM'),
 
     -- Delegate context (serialized as JSONB per AUDIT_EVENTS v5.2 envelope).
@@ -264,6 +255,44 @@ CREATE TABLE IF NOT EXISTS audit_records (
 
     recorded_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ---------------------------------------------------------------------------
+-- Idempotent ALTER: install chk_target_patient_not_platform on existing
+-- environments that ran migration 002 before the constraint was added
+-- (verify-r5 HIGH-6 closure 2026-05-03).
+--
+-- The inline CHECK on the column above only attaches at table-create time;
+-- CREATE TABLE IF NOT EXISTS is a no-op against a pre-existing table and
+-- does not retroactively add constraints. This block validates whether
+-- the constraint is already present (by name) and adds it if not — using
+-- ADD CONSTRAINT with NOT VALID first if there might be conflicting rows
+-- so the migration doesn't fail on stale data, but in our case there
+-- should be no rows with target_patient_id = 'PLATFORM' (it's a sentinel,
+-- never a real patient id), so we can VALIDATE inline.
+--
+-- If a pre-existing environment somehow contains a real
+-- target_patient_id = 'PLATFORM' row, this block raises an EXCEPTION on
+-- the ADD CONSTRAINT — which is the correct behavior: that row is an
+-- I-023 hash-chain violation and the operator must reconcile before the
+-- constraint can attach.
+-- ---------------------------------------------------------------------------
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM   pg_constraint c
+        JOIN   pg_class t ON t.oid = c.conrelid
+        WHERE  c.conname = 'chk_target_patient_not_platform'
+          AND  t.relname = 'audit_records'
+          AND  c.contype = 'c'
+    ) THEN
+        ALTER TABLE audit_records
+            ADD CONSTRAINT chk_target_patient_not_platform
+            CHECK (target_patient_id IS NULL OR target_patient_id <> 'PLATFORM');
+    END IF;
+END
+$$;
 
 -- ---------------------------------------------------------------------------
 -- Indexes per AUDIT_EVENTS v5.2 query patterns
