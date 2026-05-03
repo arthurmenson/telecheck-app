@@ -39,11 +39,12 @@ export default defineConfig({
      */
     setupFiles: ['./tests/setup.ts'],
 
-    /**
-     * Include patterns:
-     *   - tests/**               integration + state-machine + contract + invariant tests
-     *   - src/**/*.test.ts       unit tests alongside source (per CLAUDE.md convention)
-     */
+    // Include patterns:
+    //   - tests (recursive) .test.ts files: integration + state-machine + contract + invariant
+    //   - src   (recursive) .test.ts files: unit tests alongside source per CLAUDE.md convention
+    // NOTE: glob literals are kept out of the JSDoc above because esbuild's
+    // block-comment scanner treats the `*/` inside `**/*` as a comment terminator,
+    // which produces a parse error at config-load time (vitest.config.ts:45 in CI).
     include: ['tests/**/*.test.ts', 'src/**/*.test.ts'],
 
     /**
