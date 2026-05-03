@@ -15,6 +15,10 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateDeploymentRequestSchema } from '../../schemas.js';
+import {
+  DEPLOYMENT_ALREADY_RETIRED,
+  DEPLOYMENT_NOT_FOUND,
+} from '../repositories/submission-repo.js';
 import * as templateService from '../services/template-service.js';
 
 /**
@@ -94,24 +98,70 @@ export async function createDeploymentHandler(
   }
 }
 
-/** GET /v0/forms/deployments/:deploymentId — read a deployment. */
+/**
+ * GET /v0/forms/deployments/:deploymentId — read a deployment.
+ *
+ * Returns 200 + body on hit. Returns 404 (tenant-blind per I-025) when
+ * the deployment doesn't exist in this tenant.
+ */
 export async function getDeploymentHandler(
   req: FastifyRequest,
-  _reply: FastifyReply,
+  reply: FastifyReply,
 ): Promise<unknown> {
-  void requireTenantContext(req);
-  throw new Error('not implemented');
+  const ctx = requireTenantContext(req);
+
+  const params = req.params as Record<string, unknown>;
+  const deploymentIdParam = params['deploymentId'];
+  if (typeof deploymentIdParam !== 'string' || deploymentIdParam.length === 0) {
+    throw req.server.httpErrors.badRequest('Path param `deploymentId` is required.');
+  }
+
+  const deployment = await templateService.getDeployment(ctx, deploymentIdParam);
+  if (deployment === null) {
+    throw req.server.httpErrors.notFound('Form deployment not found.');
+  }
+  return reply.code(200).send(deployment);
 }
 
 /**
  * POST /v0/forms/deployments/:deploymentId/retire — retire an active
  * deployment. In-progress submissions complete on their assigned version
  * per Slice PRD §14.5 supersession discipline.
+ *
+ * Sentinel error mapping (tenant-blind per I-025):
+ *   - DEPLOYMENT_NOT_FOUND       → 400 with canonical code
+ *   - DEPLOYMENT_ALREADY_RETIRED → 400 with canonical code
+ *
+ * Both map to the same wire-out 400 envelope so the response NEVER
+ * differentiates "doesn't exist" from "exists but already retired" from
+ * "exists in another tenant." The structured error code preserves the
+ * operator-facing distinction for observability tooling.
  */
 export async function retireDeploymentHandler(
   req: FastifyRequest,
-  _reply: FastifyReply,
+  reply: FastifyReply,
 ): Promise<unknown> {
-  void requireTenantContext(req);
-  throw new Error('not implemented');
+  const ctx = requireTenantContext(req);
+  const actorId = resolveActorId(req);
+
+  const params = req.params as Record<string, unknown>;
+  const deploymentIdParam = params['deploymentId'];
+  if (typeof deploymentIdParam !== 'string' || deploymentIdParam.length === 0) {
+    throw req.server.httpErrors.badRequest('Path param `deploymentId` is required.');
+  }
+
+  try {
+    const retired = await templateService.retireDeployment(ctx, actorId, deploymentIdParam);
+    return reply.code(200).send(retired);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === DEPLOYMENT_NOT_FOUND || message === DEPLOYMENT_ALREADY_RETIRED) {
+      // Tenant-blind 400 per I-025 — the response shape is identical for
+      // "doesn't exist" / "exists in another tenant" / "already retired."
+      throw req.server.httpErrors.badRequest(
+        'The requested form deployment cannot be retired in its current state.',
+      );
+    }
+    throw err;
+  }
 }

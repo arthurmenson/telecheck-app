@@ -102,22 +102,49 @@ export async function createTemplateHandler(
   return reply.code(201).send(template);
 }
 
-/** GET /v0/forms/templates — list templates for the active tenant. */
+/**
+ * GET /v0/forms/templates — list templates for the active tenant.
+ *
+ * Pagination is not implemented at the scaffold layer — the row count
+ * per tenant is bounded by program × version × country and stays well
+ * under any pagination horizon for v1.0. Add LIMIT/OFFSET (or keyset
+ * cursor) in this handler + the service signature when the visual
+ * builder slice ships and templates accumulate.
+ */
 export async function listTemplatesHandler(
   req: FastifyRequest,
-  _reply: FastifyReply,
+  reply: FastifyReply,
 ): Promise<unknown> {
-  void requireTenantContext(req);
-  throw new Error('not implemented');
+  const ctx = requireTenantContext(req);
+  const templates = await templateService.listTemplates(ctx);
+  return reply.code(200).send({ items: templates });
 }
 
-/** GET /v0/forms/templates/:templateId — read a single template. */
+/**
+ * GET /v0/forms/templates/:templateId — read a single template.
+ *
+ * Returns 200 + body on hit. Returns 404 (tenant-blind per I-025) when
+ * the template doesn't exist in this tenant — the response shape is the
+ * same whether the template is genuinely absent or exists in another
+ * tenant the caller can't see (RLS filtered).
+ */
 export async function getTemplateHandler(
   req: FastifyRequest,
-  _reply: FastifyReply,
+  reply: FastifyReply,
 ): Promise<unknown> {
-  void requireTenantContext(req);
-  throw new Error('not implemented');
+  const ctx = requireTenantContext(req);
+
+  const params = req.params as Record<string, unknown>;
+  const templateIdParam = params['templateId'];
+  if (typeof templateIdParam !== 'string' || templateIdParam.length === 0) {
+    throw req.server.httpErrors.badRequest('Path param `templateId` is required.');
+  }
+
+  const template = await templateService.getTemplate(ctx, templateIdParam);
+  if (template === null) {
+    throw req.server.httpErrors.notFound('Form template not found.');
+  }
+  return reply.code(200).send(template);
 }
 
 /**

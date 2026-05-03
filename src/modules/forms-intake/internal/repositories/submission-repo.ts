@@ -190,6 +190,99 @@ export async function createActiveDeployment(
 }
 
 // ---------------------------------------------------------------------------
+// Deployment retire — sentinel error codes
+//
+// Same tenant-blind 400 mapping pattern as createActiveDeployment +
+// publishVersion: the handler maps both to the canonical I-025 envelope so
+// the response NEVER differentiates "doesn't exist" from "exists in another
+// tenant" from "exists but already retired."
+// ---------------------------------------------------------------------------
+
+export const DEPLOYMENT_NOT_FOUND = 'forms.deployment.not_found';
+export const DEPLOYMENT_ALREADY_RETIRED = 'forms.deployment.already_retired';
+
+/**
+ * Retire an active deployment. Per Slice PRD §6.2 + §14.5 supersession
+ * discipline + Pattern A immutability:
+ *   - In-progress submissions assigned to this deployment continue to
+ *     completion against the version they were assigned at start time
+ *     (no mid-flow switching, no force-stop).
+ *   - The deployment row stays in the table forever (audit trail per I-013);
+ *     `retired_at` IS NOT NULL is the "retired" predicate that
+ *     `findActiveDeployment` filters out.
+ *
+ * **Spec issue (filed inline 2026-05-03 per EHBG §12 SI/DSI escalation):**
+ * the spec corpus (slice PRD v2.1 + AUDIT_EVENTS / DOMAIN_EVENTS v5.2)
+ * does NOT enumerate canonical state transitions, audit actions, or
+ * domain events for `forms_deployment.retire`. The route is registered
+ * in the scaffold so a placeholder action ID (`forms_deployment_retired`)
+ * is used here, mirroring the SPEC ISSUE pattern Engineering Lead
+ * approved for `forms_template_created` / `forms_template_version_published`
+ * pending Contracts Pack ratification. Engineering Lead must:
+ *   - Add a FormDeployment state machine (active → retired) to State
+ *     Machines v1.1, OR
+ *   - Confirm the `retired_at IS NULL` predicate is the canonical state
+ *     model (no enum), AND
+ *   - Add `forms_deployment_retired` to AUDIT_EVENTS Category B + the
+ *     corresponding DOMAIN_EVENTS aggregate event.
+ *
+ * **Idempotency:** the UPDATE has `WHERE retired_at IS NULL`. Retiring an
+ * already-retired deployment surfaces as `DEPLOYMENT_ALREADY_RETIRED`
+ * via the post-UPDATE existence re-check.
+ *
+ * @param tenantId — caller's tenant; RLS scoped by `set_tenant_context`.
+ * @param deploymentId — deployment row to retire.
+ * @param txCallback — emits audit + domain event in the same transaction;
+ *                     failure rolls back the retire flip.
+ * @param externalTx — test-only: shares the caller's transaction handle
+ *                     instead of acquiring a fresh pool connection.
+ *                     Mirror of the createDraftTemplate / publishVersion
+ *                     pattern from Codex publishVersion-r1 MEDIUM closure.
+ */
+export async function retireDeployment(
+  tenantId: TenantId,
+  deploymentId: FormDeploymentId,
+  txCallback: (tx: DbTransaction, retired: FormDeployment) => Promise<void>,
+  externalTx?: DbTransaction,
+): Promise<FormDeployment> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    const result = await tx.query<FormDeployment>(
+      `UPDATE forms_deployment
+          SET retired_at = NOW()
+        WHERE deployment_id = $1
+          AND tenant_id = $2
+          AND retired_at IS NULL
+       RETURNING deployment_id, tenant_id, template_id, program_id,
+                 deployed_at, retired_at`,
+      [deploymentId, tenantId],
+    );
+
+    if (result.rows.length === 0) {
+      // Either the deployment doesn't exist in this tenant OR it's
+      // already retired. Disambiguate via a tenant-bound existence
+      // re-check; both branches map to a tenant-blind 400 at the
+      // handler so the choice is for the operator-facing error code,
+      // not the wire-out shape.
+      const existence = await tx.query<{ retired_at: Date | null }>(
+        `SELECT retired_at FROM forms_deployment
+          WHERE deployment_id = $1 AND tenant_id = $2`,
+        [deploymentId, tenantId],
+      );
+      if (existence.rows.length === 0) {
+        throw new Error(DEPLOYMENT_NOT_FOUND);
+      }
+      throw new Error(DEPLOYMENT_ALREADY_RETIRED);
+    }
+
+    const retired = result.rows[0]!;
+    await txCallback(tx, retired);
+    return retired;
+  }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
 // Submission writes
 // ---------------------------------------------------------------------------
 

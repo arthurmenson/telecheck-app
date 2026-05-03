@@ -24,11 +24,13 @@ import type { DbTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedAudit,
+  emitFormsDeploymentRetired as emitFormsDeploymentRetiredAudit,
   emitFormsTemplateCreated as emitFormsTemplateCreatedAudit,
   emitFormsTemplateVersionPublished as emitFormsTemplateVersionPublishedAudit,
 } from '../../audit.js';
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedEvent,
+  emitFormsDeploymentRetired as emitFormsDeploymentRetiredEvent,
   emitFormsTemplateCreated as emitFormsTemplateCreatedEvent,
   emitFormsTemplateVersionPublished as emitFormsTemplateVersionPublishedEvent,
 } from '../../events.js';
@@ -39,7 +41,7 @@ import type {
 } from '../../schemas.js';
 import * as submissionRepo from '../repositories/submission-repo.js';
 import * as templateRepo from '../repositories/template-repo.js';
-import type { FormDeployment, FormTemplate, FormTemplateId } from '../types.js';
+import type { FormDeployment, FormDeploymentId, FormTemplate, FormTemplateId } from '../types.js';
 
 /**
  * Create a draft template under the active tenant context. Returns the
@@ -269,18 +271,18 @@ export async function publishVersion(
  * binding plus the WHERE clause both enforce isolation).
  */
 export async function getTemplate(
-  _ctx: TenantContext,
-  _templateId: FormTemplateId,
+  ctx: TenantContext,
+  templateId: FormTemplateId,
 ): Promise<FormTemplate | null> {
-  throw new Error('not implemented');
+  return templateRepo.findTemplateById(ctx.tenantId, templateId);
 }
 
 /**
  * List all templates for the active tenant. Pagination is not implemented
  * at the scaffold layer — service signature reserves room for it.
  */
-export async function listTemplates(_ctx: TenantContext): Promise<FormTemplate[]> {
-  throw new Error('not implemented');
+export async function listTemplates(ctx: TenantContext): Promise<FormTemplate[]> {
+  return templateRepo.listTemplatesForTenant(ctx.tenantId);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,4 +380,77 @@ export async function createDeployment(
     }
     throw err;
   }
+}
+
+/**
+ * Resolve a deployment by ID. Returns null when not found OR when found in
+ * a different tenant (tenant-blind 404 per I-025; the repository's RLS
+ * binding plus the WHERE clause both enforce isolation).
+ */
+export async function getDeployment(
+  ctx: TenantContext,
+  deploymentId: FormDeploymentId,
+): Promise<FormDeployment | null> {
+  return submissionRepo.findDeploymentById(ctx.tenantId, deploymentId);
+}
+
+/**
+ * Retire an active deployment. Per Slice PRD §6.2 supersession discipline +
+ * Pattern A immutability, retirement does not halt in-progress submissions
+ * on this deployment's template version — those continue to completion.
+ * The deployment row stays in the table (audit trail per I-013); the
+ * `retired_at IS NULL` predicate in `findActiveDeployment` filters it out
+ * for new intakes.
+ *
+ * Sentinel errors thrown:
+ *   - `forms.deployment.not_found` — deployment doesn't exist in this
+ *     tenant. Tenant-blind per I-025.
+ *   - `forms.deployment.already_retired` — exists, but `retired_at` is
+ *     already populated. Idempotency-respecting clients SHOULD treat this
+ *     as a no-op rather than an error; the handler still maps it to 400
+ *     with the canonical code so observability can distinguish.
+ *
+ * **Spec issue (per submission-repo.retireDeployment header):** the slice
+ * PRD + Contracts Pack do not enumerate the deployment retire transition,
+ * audit action, or domain event. Engineering Lead amendment pending per
+ * EHBG §12 SI/DSI escalation.
+ */
+export async function retireDeployment(
+  ctx: TenantContext,
+  actorId: string,
+  deploymentId: FormDeploymentId,
+  externalTx?: DbTransaction,
+): Promise<FormDeployment> {
+  return submissionRepo.retireDeployment(
+    ctx.tenantId,
+    deploymentId,
+    async (tx, retired) => {
+      // Capture audit envelope; thread audit_id into the domain event for
+      // correlation per the publishVersion-r1 HIGH closure pattern.
+      const auditEnvelope = await emitFormsDeploymentRetiredAudit(
+        {
+          tenantId: ctx.tenantId,
+          actorId,
+          actorTenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          deploymentId: retired.deployment_id,
+          templateId: retired.template_id,
+          programId: retired.program_id,
+          retiredAt: retired.retired_at ?? new Date().toISOString(),
+        },
+        tx,
+      );
+
+      await emitFormsDeploymentRetiredEvent(tx, {
+        tenantId: ctx.tenantId,
+        deploymentId: retired.deployment_id,
+        templateId: retired.template_id,
+        programId: retired.program_id,
+        countryOfCare: ctx.countryOfCare,
+        actorId,
+        auditId: auditEnvelope.audit_id,
+      });
+    },
+    externalTx,
+  );
 }

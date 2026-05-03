@@ -188,6 +188,51 @@ export async function emitFormsDeploymentCreated(
   });
 }
 
+/**
+ * Emit `forms_deployment.retired` — tenant admin retired an active
+ * deployment. Per Slice PRD §6.2 retire workflow (filed inline per EHBG
+ * §12 SI/DSI escalation; spec corpus does not yet enumerate this event).
+ *
+ * Subscribers (Pharmacy / Refill): retirement does NOT halt in-progress
+ * submissions on this deployment's template version (Pattern A
+ * immutability — submissions complete on their assigned version).
+ * Subscribers that route by deployment-active SHOULD treat this
+ * deployment as no longer eligible for NEW intakes once they observe
+ * this event.
+ *
+ * `audit_id` is required for correlation per the publishVersion-r1 HIGH
+ * closure pattern — the corresponding Category B audit row is the
+ * authoritative governance record; the event is just the wire signal.
+ */
+export async function emitFormsDeploymentRetired(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    deploymentId: FormDeploymentId;
+    templateId: FormTemplateId;
+    programId: string;
+    countryOfCare: string;
+    actorId: string;
+    auditId: string;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_DEPLOYMENT_AGGREGATE,
+    aggregate_id: args.deploymentId,
+    event_type: 'forms_deployment.retired',
+    payload: {
+      deployment_id: args.deploymentId,
+      template_id: args.templateId,
+      program_id: args.programId,
+      country_of_care: args.countryOfCare,
+      actor_id: args.actorId,
+      audit_id: args.auditId,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle event emitters per DOMAIN_EVENTS v5.2 intake_response aggregate
 // ---------------------------------------------------------------------------

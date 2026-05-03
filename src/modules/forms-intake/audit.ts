@@ -283,6 +283,59 @@ export async function emitFormsDeploymentCreated(
   );
 }
 
+/**
+ * Emit `forms_deployment_retired` — tenant admin retired an active
+ * deployment. Category B (governance / config).
+ *
+ * Same SPEC ISSUE caveat as the createTemplate / versionPublished family:
+ * AUDIT_EVENTS v5.2 doesn't enumerate `forms_deployment_retired` and
+ * neither State Machines v1.1 nor the slice PRD canonicalize the
+ * deployment lifecycle (active → retired). The action ID is type-cast
+ * via `as AuditAction` so grep finds unratified action IDs awaiting
+ * Engineering Lead amendment per EHBG §12 SI/DSI escalation.
+ *
+ * Per Slice PRD §14.5 supersession discipline + Pattern A immutability,
+ * retiring a deployment does NOT halt in-progress submissions assigned
+ * to its template version — those continue to completion. Retirement
+ * means the deployment is no longer offered to NEW intakes (the
+ * `findActiveDeployment` query filters by `retired_at IS NULL`).
+ */
+export async function emitFormsDeploymentRetired(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    deploymentId: FormDeploymentId;
+    templateId: FormTemplateId;
+    programId: string;
+    retiredAt: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    {
+      ...buildEnvelope('forms_deployment_retired' as AuditAction, 'B', {
+        tenant_id: args.tenantId,
+        actor_type: 'operator',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: null,
+        country_of_care: args.countryOfCare,
+        resource_type: 'forms_deployment',
+        resource_id: args.deploymentId,
+        detail: {
+          deployment_id: args.deploymentId,
+          template_id: args.templateId,
+          program_id: args.programId,
+          retired_at: args.retiredAt,
+        },
+      }),
+    },
+    tx,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Governance edits (Category B per AUDIT_EVENTS v5.2)
 // ---------------------------------------------------------------------------

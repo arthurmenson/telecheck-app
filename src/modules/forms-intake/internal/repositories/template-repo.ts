@@ -70,9 +70,33 @@ export async function findTemplateById(
   });
 }
 
-export async function listTemplatesForTenant(_tenantId: TenantId): Promise<FormTemplate[]> {
-  // TODO: SELECT under withTenantBoundConnection following findTemplateById pattern.
-  throw new Error('not implemented');
+/**
+ * List all templates for a tenant ordered by program then version (ascending),
+ * latest version last per family. RLS handles tenant isolation; the explicit
+ * `tenant_id = $1` filter is belt + suspenders so a missing/expired
+ * `set_tenant_context` binding can't accidentally widen the result set.
+ *
+ * Pagination is not implemented at the scaffold layer — the FormTemplate
+ * row count per tenant is bounded by the program × version × country grid
+ * and is well under any pagination horizon for v1.0. When the visual
+ * builder slice ships and templates accumulate per-tenant, add LIMIT +
+ * OFFSET (or keyset cursor) here and update the service signature.
+ */
+export async function listTemplatesForTenant(tenantId: TenantId): Promise<FormTemplate[]> {
+  return withTenantBoundConnection(tenantId, async (client: DbClient) => {
+    const result = await client.query<FormTemplate>(
+      `SELECT template_id, tenant_id, program_id, country_of_care,
+              template_version, status,
+              presentation_content, branching_logic,
+              eligibility_logic, approval_governance,
+              created_at, updated_at
+         FROM forms_template
+        WHERE tenant_id = $1
+        ORDER BY program_id ASC, country_of_care ASC, template_version ASC`,
+      [tenantId],
+    );
+    return result.rows;
+  });
 }
 
 export async function findVersionById(
