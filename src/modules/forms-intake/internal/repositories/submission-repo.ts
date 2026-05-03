@@ -870,9 +870,55 @@ export async function promoteVariantToWinner(
   return withTransaction(async (tx) => {
     await tx.query('SELECT set_tenant_context($1)', [tenantId]);
 
-    // Lock the target variant row up-front so concurrent promote/retire
-    // calls against the same variant serialize. Predicate filters by tenant
-    // (RLS would too; explicit equality is belt-and-suspenders).
+    // Step 1 — read the target variant to learn which deployment it
+    // belongs to. Read-only; no lock yet because we need the deployment_id
+    // to take the deployment-level lock first (consistent lock ordering
+    // with createVariant per Codex variants-promote-r1 HIGH closure
+    // 2026-05-03).
+    const targetMeta = await tx.query<{ deployment_id: string }>(
+      `SELECT deployment_id
+         FROM forms_variant
+        WHERE variant_id = $1 AND tenant_id = $2`,
+      [variantId, tenantId],
+    );
+    if (targetMeta.rows.length === 0) {
+      throw new Error(VARIANT_NOT_FOUND);
+    }
+    const deploymentId = targetMeta.rows[0]!.deployment_id;
+
+    // Step 2 — DEPLOYMENT-LEVEL serialization lock. createVariant already
+    // takes `SELECT ... FOR UPDATE` on the same forms_deployment row
+    // before inserting an active variant arm. Acquiring it here in the
+    // promote path serializes promote vs. concurrent create on the same
+    // deployment: either (a) create commits before this lock is acquired,
+    // and the new arm is included in our sibling-retire below, OR (b)
+    // create blocks behind us, and after we commit the deployment is
+    // already in a winner state — create's INSERT...SELECT predicate on
+    // forms_variant doesn't gate by deployment status, but its CROSS JOIN
+    // with the deployment lock means the create transaction sees our
+    // committed promotion before its own predicate evaluates. (Closes
+    // Codex variants-promote-r1 HIGH 2026-05-03 — corrupted-experiment
+    // race where a sibling created mid-promotion would survive as an
+    // un-retired active arm.)
+    //
+    // Lock ordering: deployment then variant. Both promote AND create
+    // take this exact order; concurrent promote-vs-promote on different
+    // deployments cannot deadlock (different rows); concurrent
+    // promote-vs-promote on the same deployment serializes through the
+    // deployment lock; concurrent promote-vs-create on the same
+    // deployment serializes through the deployment lock.
+    await tx.query(
+      `SELECT 1 FROM forms_deployment
+        WHERE deployment_id = $1 AND tenant_id = $2
+        FOR UPDATE`,
+      [deploymentId, tenantId],
+    );
+
+    // Step 3 — re-read the target variant under FOR UPDATE so concurrent
+    // promote-vs-promote on the same target serializes here. Status is
+    // re-validated under the lock; a concurrent promote that completed
+    // first will have flipped status to 'winner' and our re-read sees
+    // it as such.
     const target = await tx.query<{ status: string; deployment_id: string }>(
       `SELECT status, deployment_id
          FROM forms_variant
@@ -881,6 +927,8 @@ export async function promoteVariantToWinner(
       [variantId, tenantId],
     );
     if (target.rows.length === 0) {
+      // Variant deleted between step 1 and step 3 (shouldn't happen given
+      // forms_variant has no DELETE path today, but defensive).
       throw new Error(VARIANT_NOT_FOUND);
     }
     const targetRow = target.rows[0]!;

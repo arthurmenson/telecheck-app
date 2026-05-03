@@ -78,24 +78,41 @@ const RESUME_STATE_DEFAULT_TTL_DAYS = 30;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /**
- * Shape returned by `pauseSubmission`. Carries the merged-then-encrypted
- * submission state PLUS the patient-held resume token so the patient app
- * can render the pause confirmation + the resume URL in one round trip.
+ * Patient-safe projection of a FormSubmission. Strips the operating-tenant
+ * identifier (`tenant_id`) so the patient surface MUST NOT render it
+ * (Master PRD v1.10 §17 + Glossary v5.2 C3 brand-structure rule).
  *
- * **No `tenant_id` leak:** the patient surface MUST NOT render
- * operating-tenant identifiers per Master PRD v1.10 §17 + Glossary v5.2 C3
- * brand-structure rule (same discipline that the resume read-path closure
- * landed on the metadata projection). The shape below carries no tenant_id
- * field; callers that surface this through the HTTP layer pass it through
- * as-is.
+ * Codex pause-r1 MEDIUM closure 2026-05-03: the prior PauseSubmissionResult
+ * carried a full FormSubmission whose `tenant_id` field bled through to
+ * the HTTP response. Type-level projection here makes the gate compile-time
+ * enforced — service callers can't accidentally pass an unstripped row to
+ * the handler.
+ */
+export type PatientFormSubmissionView = Omit<FormSubmission, 'tenant_id'>;
+
+/**
+ * Shape returned by `pauseSubmission`. Carries the merged-then-encrypted
+ * submission state (in patient-safe view form) PLUS the patient-held resume
+ * token so the patient app can render the pause confirmation + the resume
+ * URL in one round trip.
  */
 export interface PauseSubmissionResult {
-  submission: FormSubmission;
+  submission: PatientFormSubmissionView;
   resumeState: {
     resumeStateId: ResumeStateId;
     resumeToken: string;
     expiresAt: string;
   };
+}
+
+/**
+ * Project a full FormSubmission to the patient-safe view. Drops `tenant_id`
+ * by destructuring; never copy the field by mistake.
+ */
+function toPatientView(submission: FormSubmission): PatientFormSubmissionView {
+  const { tenant_id: _stripped, ...patientView } = submission;
+  void _stripped;
+  return patientView;
 }
 
 /**
@@ -440,112 +457,177 @@ export async function pauseSubmission(
   input: UpdateSubmissionResponsesRequest,
   externalTx?: DbTransaction,
 ): Promise<PauseSubmissionResult> {
-  // Step 1 — I-019 crisis gate runs BEFORE any state mutation. Identical
-  // ordering to auto-save's crisis path; a positive detection aborts
-  // early so no resume_state row is created.
+  // First-pass I-019 crisis gate on the incoming patch. Identical ordering
+  // to auto-save — catches the common case (patient typing crisis text in
+  // *this* request) and avoids opening a tx for a payload we'd reject.
+  // The merged-set gate inside the atomic tx below is the authoritative
+  // gate for the resume_state write per Codex pause-r1 HIGH-2 closure.
   await runCrisisGate(ctx, actor, submissionId, input.responses, externalTx);
 
-  // Step 2 — merge responses + persist. Repo enforces ownership + I-013
-  // in_progress; throws SUBMISSION_NOT_FOUND / SUBMISSION_NOT_IN_PROGRESS
-  // sentinels which the handler maps to tenant-blind 400.
-  const merged = await submissionRepo.updateSubmissionResponses(
-    ctx.tenantId,
-    submissionId,
-    input.responses,
-    { patientId: actor.patientId, delegateId: actor.delegateId },
-    async (_tx, _submission) => {
-      // No audit on the merge step — the Category C audit fires once,
-      // on the resume_state INSERT below, with rich detail referencing
-      // both the submission and the resume_state. Two audits would
-      // double-count the pause action.
-      void _tx;
-      void _submission;
-    },
-    externalTx,
-  );
+  // ---------------------------------------------------------------------
+  // Atomic orchestration (Codex pause-r1 HIGH-1 closure 2026-05-03)
+  //
+  // Wraps the merge UPDATE + KMS encrypt + resume_state INSERT + audit +
+  // outbox in ONE transaction so:
+  //   - A KMS / INSERT / audit / event failure rolls back the merge,
+  //     leaving the submission row in its pre-pause state. The patient
+  //     never sees "your responses persisted but no resume token" again.
+  //   - A concurrent auto-save on the same submission cannot interleave
+  //     between the merge and the resume_state INSERT — the row lock
+  //     held by `updateSubmissionResponses`'s UPDATE persists until this
+  //     outer tx commits.
+  //   - Crisis detection on the FULL merged response set (not just the
+  //     incoming patch) gates the resume_state write per HIGH-2. If the
+  //     submission row already contained crisis text and the patch is
+  //     benign, the merge would have copied that text into the encrypted
+  //     resume_state without scanning. Re-scanning the merged set closes
+  //     that bypass.
+  // ---------------------------------------------------------------------
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
 
-  // Step 3 — encrypt merged responses under per-tenant KMS (ADR-024
-  // three-layer isolation). The merged state is what restore needs to
-  // rehydrate without re-reading the submission row, so we encrypt the
-  // FULL `merged.responses` here, not just the delta. The kms.encrypt
-  // signature accepts the full TenantContext; tenantId is encoded into
-  // the encryption context (AAD) so a stolen ciphertext can't be
-  // decrypted under another tenant's key.
-  const plaintextJson = Buffer.from(JSON.stringify(merged.responses), 'utf8');
-  const encryptedPartialResponses = await kms.encrypt(ctx, plaintextJson);
+    // Step A — merge responses + persist via the existing repo. The repo
+    // takes our outer tx as `externalTx`, so its UPDATE runs inside this
+    // transaction and the row lock is held until our commit. Repo throws
+    // SUBMISSION_NOT_FOUND / SUBMISSION_NOT_IN_PROGRESS sentinels which
+    // bubble up unchanged.
+    const merged = await submissionRepo.updateSubmissionResponses(
+      ctx.tenantId,
+      submissionId,
+      input.responses,
+      { patientId: actor.patientId, delegateId: actor.delegateId },
+      async (_innerTx, _submission) => {
+        // No audit/event on the merge step — the pause emits a single
+        // Category C audit on the resume_state INSERT below, with rich
+        // detail referencing both the submission and the resume_state.
+        void _innerTx;
+        void _submission;
+      },
+      tx,
+    );
 
-  // Step 4 — same-tx outbox (I-016): repo opens the tx and runs the
-  // txCallback inside it. Audit + domain event emit there so a failure
-  // anywhere in the callback rolls back the resume_state INSERT too.
-  const expiresAt = new Date(Date.now() + RESUME_STATE_DEFAULT_TTL_DAYS * MS_PER_DAY).toISOString();
+    // Step B — re-scan the FULL merged response set. Closes Codex
+    // pause-r1 HIGH-2 (the patch-only gate above misses crisis text
+    // already present in the row from legacy data, detector-rule
+    // changes, earlier bugs, or out-of-band repair). On detection,
+    // emit the Category A audit in its OWN transaction (must commit
+    // even though THIS tx rolls back) and throw — the throw triggers
+    // rollback of the merge UPDATE. The patient sees a 409 + crisis
+    // resources, NOT a successful pause with crisis content stashed
+    // in resume_state.
+    const mergedResponsesObj: Record<string, unknown> = merged.responses ?? {};
+    let mergedCrisis: { crisisType: string } | null;
+    try {
+      mergedCrisis = scanResponsesForCrisis(ctx.tenantId, mergedResponsesObj);
+    } catch (err: unknown) {
+      // RESPONSE_PAYLOAD_TOO_LARGE — the merged set exceeds the depth/node
+      // budget. Same handling as the patch-side: rollback (by re-throwing)
+      // surfaces as 413 at the handler.
+      if (err instanceof Error && err.message === RESPONSE_PAYLOAD_TOO_LARGE) {
+        throw err;
+      }
+      throw err;
+    }
+    if (mergedCrisis !== null) {
+      // Audit MUST commit independently of the outer rollback (I-003 +
+      // I-019). Use a fresh tx — withTransaction without externalTx opens
+      // a brand-new connection.
+      await withTransaction(async (auditTx) => {
+        await auditTx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+        await emitCrisisDetectionTrigger(
+          {
+            tenantId: ctx.tenantId,
+            actorId: actor.actorId,
+            actorTenantId: ctx.tenantId,
+            countryOfCare: ctx.countryOfCare,
+            targetPatientId: actor.patientId,
+            detectionSource: 'form_response',
+            crisisType: mergedCrisis.crisisType,
+            resourceType: 'forms_submission',
+            resourceId: submissionId,
+          },
+          auditTx,
+        );
+      });
+      throw new Error(CRISIS_DETECTED);
+    }
 
-  // Total time in intake — used by the audit detail block for funnel
-  // analysis. Computed best-effort from started_at; a malformed value
-  // surfaces as 0 rather than blowing up the audit.
-  const startedAtMs = Date.parse(merged.started_at);
-  const timeInIntakeMs = Number.isFinite(startedAtMs) ? Math.max(0, Date.now() - startedAtMs) : 0;
+    // Step C — KMS encrypt the merged responses. Inside the tx so a
+    // KMS failure rolls back the merge UPDATE. The tenantId is encoded
+    // into the AAD (encryption context) so a stolen ciphertext cannot
+    // be decrypted under another tenant's key (ADR-024).
+    const plaintextJson = Buffer.from(JSON.stringify(merged.responses), 'utf8');
+    const encryptedPartialResponses = await kms.encrypt(ctx, plaintextJson);
 
-  const resumeState = await submissionRepo.createResumeState(
-    ctx.tenantId,
-    {
-      patientId: actor.patientId,
-      deviceAnonymousToken: null,
-      deploymentId: merged.deployment_id,
-      variantId: merged.variant_id,
-      encryptedPartialResponses,
-      // Section index + progress percent are not yet exposed on the
-      // request schema (slice scaffold). Defaulted to 0 / 0 — the
-      // metadata read path surfaces both values and the patient app
-      // ignores them when they're zero. The visual-builder slice will
-      // wire the real progress capture when it lands.
-      currentSectionIndex: 0,
-      progressPercent: 0,
-      expiresAt,
-    },
-    async (tx, row) => {
-      await emitFormsResumeStateSavedAudit(
-        {
+    // Step D — INSERT resume_state with the encrypted bytes. Same outer
+    // tx; the repo's txCallback emits audit + domain event in this tx
+    // per I-016 same-tx outbox.
+    const expiresAt = new Date(
+      Date.now() + RESUME_STATE_DEFAULT_TTL_DAYS * MS_PER_DAY,
+    ).toISOString();
+
+    const startedAtMs = Date.parse(merged.started_at);
+    const timeInIntakeMs = Number.isFinite(startedAtMs) ? Math.max(0, Date.now() - startedAtMs) : 0;
+
+    const resumeState = await submissionRepo.createResumeState(
+      ctx.tenantId,
+      {
+        patientId: actor.patientId,
+        deviceAnonymousToken: null,
+        deploymentId: merged.deployment_id,
+        variantId: merged.variant_id,
+        encryptedPartialResponses,
+        currentSectionIndex: 0,
+        progressPercent: 0,
+        expiresAt,
+      },
+      async (innerTx, row) => {
+        await emitFormsResumeStateSavedAudit(
+          {
+            tenantId: ctx.tenantId,
+            actorId: actor.actorId,
+            actorTenantId: ctx.tenantId,
+            countryOfCare: ctx.countryOfCare,
+            submissionId: merged.submission_id,
+            resumeStateId: row.resume_state_id,
+            targetPatientId: actor.patientId,
+            sectionIndex: row.current_section_index,
+            timeInIntakeMs,
+          },
+          innerTx,
+        );
+        await emitFormsResumeStateSavedEvent(innerTx, {
           tenantId: ctx.tenantId,
-          actorId: actor.actorId,
-          actorTenantId: ctx.tenantId,
-          countryOfCare: ctx.countryOfCare,
           submissionId: merged.submission_id,
           resumeStateId: row.resume_state_id,
-          targetPatientId: actor.patientId,
-          sectionIndex: row.current_section_index,
-          timeInIntakeMs,
-        },
-        tx,
-      );
-      await emitFormsResumeStateSavedEvent(tx, {
-        tenantId: ctx.tenantId,
-        submissionId: merged.submission_id,
-        resumeStateId: row.resume_state_id,
-        patientId: actor.patientId,
-        expiresAt: row.expires_at,
-      });
-    },
-    externalTx,
-  );
+          patientId: actor.patientId,
+          expiresAt: row.expires_at,
+        });
+      },
+      tx,
+    );
 
-  // Step 5 — issue the patient-held resume token. HMAC-self-contained:
-  // verifyResumeToken on the read path will recompute the signature and
-  // compare in constant time. Token expiry == row expiry (defense-in-
-  // depth — both gates must pass at restore time).
-  const resumeToken = issueResumeToken(
-    resumeState.resume_state_id,
-    ctx.tenantId,
-    resumeState.expires_at,
-  );
+    // Step E — issue the patient-held resume token. HMAC-self-contained;
+    // expiresAt mirrors the row column (defense-in-depth on restore).
+    const resumeToken = issueResumeToken(
+      resumeState.resume_state_id,
+      ctx.tenantId,
+      resumeState.expires_at,
+    );
 
-  return {
-    submission: merged,
-    resumeState: {
-      resumeStateId: resumeState.resume_state_id,
-      resumeToken,
-      expiresAt: resumeState.expires_at,
-    },
-  };
+    // Step F — project to patient-safe view (drops tenant_id per
+    // Codex pause-r1 MEDIUM closure). Type system enforces this — the
+    // PauseSubmissionResult.submission field is PatientFormSubmissionView,
+    // not FormSubmission.
+    return {
+      submission: toPatientView(merged),
+      resumeState: {
+        resumeStateId: resumeState.resume_state_id,
+        resumeToken,
+        expiresAt: resumeState.expires_at,
+      },
+    };
+  }, externalTx);
 }
 
 /**
