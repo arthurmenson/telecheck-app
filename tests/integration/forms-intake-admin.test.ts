@@ -117,17 +117,22 @@ async function insertTemplateAndDeployment(opts: {
   });
   const deploymentId = ulid();
   await withTenantContext(opts.ctx.tenantId, async () => {
+    // forms_deployment columns per migration 006: deployment_id, tenant_id,
+    // template_id, program_id, deployed_at, retired_at, deployed_by,
+    // created_at, updated_at. Note country_of_care lives on forms_template
+    // (the family identifier), NOT on forms_deployment — the deployment
+    // inherits it via the composite FK.
     await client.query(
       `INSERT INTO forms_deployment (
           deployment_id, tenant_id, template_id, program_id,
-          country_of_care, deployed_by, deployed_at, retired_at,
+          deployed_by, deployed_at, retired_at,
           created_at, updated_at
        ) VALUES (
           $1, $2, $3, $4,
-          $5, $6, NOW(), NULL,
+          $5, NOW(), NULL,
           NOW(), NOW()
        )`,
-      [deploymentId, opts.ctx.tenantId, templateId, opts.programId, opts.ctx.countryOfCare, ulid()],
+      [deploymentId, opts.ctx.tenantId, templateId, opts.programId, ulid()],
     );
   });
   return { templateId, deploymentId };
