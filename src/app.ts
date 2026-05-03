@@ -24,6 +24,7 @@ import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { aiContextPlugin } from './lib/ai-context.js';
+import { formsIntakePlugin } from './modules/forms-intake/index.js';
 
 export interface AppOptions {
   /**
@@ -98,12 +99,17 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   await app.register(aiContextPlugin);
 
   // ----------------------------------------------------------
-  // Module registration (placeholder)
+  // Module registration
   // ----------------------------------------------------------
   //
   // Modules per System Architecture v1.2 §13. Each module registers its routes
-  // via app.register(moduleNamePlugin, { prefix: '/<module>' }).
-  // No modules registered yet — this is the bootstrap commit.
+  // via its own Fastify plugin. Registration order matters when modules
+  // subscribe to each other's domain events — producers register before
+  // consumers. The forms-intake module is the foundational v1.0 slice (per
+  // EHBG §10b sprint plan); subsequent slices register after it.
+
+  // Forms / Intake Engine Slice PRD v2.1 — routes mounted under /v0/forms.
+  await app.register(formsIntakePlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
