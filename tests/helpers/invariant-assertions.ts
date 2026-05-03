@@ -397,6 +397,15 @@ export interface I029GateResultStub {
     | 'grant_artifact_invalidated'
     | null;
   failedCondition: 1 | 2 | 3 | 4 | 5 | 6 | null;
+  /**
+   * Resource ID of the export this gate result applies to. Required for
+   * audit-emission-mode assertions in `assertI029ResearchGate` so the
+   * helper can correlate the `research.export_completed(invalidated)`
+   * audit and the paired `signal_enforcement_trigger` Category B audit
+   * to the SAME export and reject stale or unrelated rows
+   * (Codex CI-fix verify-r2 MEDIUM-3 closure 2026-05-03).
+   */
+  exportId?: string;
 }
 
 /**
@@ -466,18 +475,44 @@ export async function assertI029ResearchGate(ctx: InvariantAssertionContext): Pr
     // Audit-emission mode: only when caller supplied a tenantId.
     const tenantId = ctx.tenantId ?? ctx.tenantA;
     if (tenantId !== undefined) {
-      // Bare-suppression check: research.export_completed at high_pii.
+      const exportId = result.exportId;
+      if (exportId === undefined) {
+        throw new Error(
+          'assertI029ResearchGate: ctx.i029Result.exportId is required when ' +
+            'tenantId is provided (audit-emission mode). The exportId is used ' +
+            'to correlate the research.export_completed(invalidated) audit and ' +
+            'the paired signal_enforcement_trigger to THIS specific export — ' +
+            'without it the audit-emission check could pass on a stale or ' +
+            'unrelated record. (Per Codex CI-fix verify-r2 MEDIUM-3 closure.)',
+        );
+      }
+
+      // Bare-suppression check: research.export_completed audit MUST exist
+      // FOR THIS EXPORT, with status=invalidated, audit_sensitivity_level=high_pii
+      // (I-031), AND with the canonical invalidation_reason + failed_condition
+      // matching the gate result. A stale successful export or an invalidated
+      // record from a different export is not an acceptable substitute.
       await assertAuditRecordExists(
         tenantId,
         (r) =>
           r.action === 'research.export_completed' &&
+          r.tenant_id === tenantId &&
           r.audit_sensitivity_level === 'high_pii' &&
-          r.tenant_id === tenantId,
+          r.resource_id === exportId &&
+          r.detail['status'] === 'invalidated' &&
+          r.detail['invalidation_reason'] === result.invalidationReason &&
+          r.detail['failed_condition'] === result.failedCondition,
       );
-      // Paired enforcement signal per AUDIT_EVENTS v5.2 §I-029 binding.
+
+      // Paired enforcement signal per AUDIT_EVENTS v5.2 §I-029 binding —
+      // MUST be Category B, MUST correlate to the same export by resource_id.
       await assertAuditRecordExists(
         tenantId,
-        (r) => r.action === 'signal_enforcement_trigger' && r.tenant_id === tenantId,
+        (r) =>
+          r.action === 'signal_enforcement_trigger' &&
+          r.tenant_id === tenantId &&
+          r.category === 'B' &&
+          r.resource_id === exportId,
       );
     }
   } else {

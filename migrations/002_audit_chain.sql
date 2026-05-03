@@ -256,21 +256,25 @@ CREATE INDEX IF NOT EXISTS idx_audit_tenant_time
 CREATE INDEX IF NOT EXISTS idx_audit_tenant_action_time
     ON audit_records (tenant_id, action, recorded_at);
 
--- Patient-partition chain walk (verification + patient self-access per AUDIT_EVENTS v5.2).
--- Composite (tenant_id, target_patient_id, sequence_number) so the trigger's
--- "previous record in partition" lookup (now tenant-scoped per HIGH-1 fix
--- 2026-05-03) hits an index instead of a sequential scan; also serves the
--- patient-self-access read pattern.
-CREATE INDEX IF NOT EXISTS idx_audit_tenant_patient_partition
-    ON audit_records (tenant_id, target_patient_id, sequence_number)
-    WHERE target_patient_id IS NOT NULL;
-
--- Platform-scope chain walk: same partition shape but for events with no
--- target_patient_id. Predicate matches the trigger's COALESCE(NULL, 'PLATFORM')
--- branch.
-CREATE INDEX IF NOT EXISTS idx_audit_tenant_platform_partition
-    ON audit_records (tenant_id, sequence_number)
-    WHERE target_patient_id IS NULL;
+-- Hash-chain UNIQUENESS: belt + suspenders for the trigger's
+-- pg_advisory_xact_lock per-partition serialization (HIGH-3 closure
+-- 2026-05-03). The advisory lock prevents the fork hazard at write
+-- time; the unique index makes a fork physically impossible at the
+-- storage layer — if the lock is ever bypassed (mid-DR replay, debug
+-- session that turns off advisory locks, etc.), a duplicate
+-- (tenant_id, partition, sequence_number) tuple errors the second
+-- INSERT instead of silently writing a sibling-of-same-prev row.
+--
+-- The index doubles as the lookup index for the trigger's "latest in
+-- partition" SELECT, replacing the prior idx_audit_tenant_patient_partition
+-- and idx_audit_tenant_platform_partition split (both replaced by this
+-- single unique index over the COALESCE-normalized partition).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_tenant_partition_seq
+    ON audit_records (
+        tenant_id,
+        COALESCE(target_patient_id, 'PLATFORM'),
+        sequence_number
+    );
 
 -- High-PII audit retrieval (research data governance queries, ethics boards).
 CREATE INDEX IF NOT EXISTS idx_audit_sensitivity
@@ -478,8 +482,20 @@ BEGIN
     --  partition restores I-023/I-027 cryptographic independence.)
     v_partition_key := NEW.tenant_id || ':' || COALESCE(NEW.target_patient_id, 'PLATFORM');
 
+    -- Concurrency serialization per partition.
+    -- (Patch v0.5 — 2026-05-03 per Codex CI-fix verify-r2 HIGH-3:
+    --  the prior `FOR UPDATE` on the latest row could not serialize the
+    --  empty-partition case — two concurrent transactions both saw NULL,
+    --  both used the genesis seed, both wrote sequence_number=1, forking
+    --  the chain into two children of one hash. pg_advisory_xact_lock on
+    --  the partition-key hash now serializes inserts unconditionally; the
+    --  lock is auto-released at txn end. The lock-key derivation uses
+    --  hashtextextended() so the keyspace is BIGINT-shaped.)
+    PERFORM pg_advisory_xact_lock(hashtextextended(v_partition_key, 0));
+
     -- Fetch the most recent record in this partition (now scoped to the
-    -- caller's tenant — see partition-key comment above).
+    -- caller's tenant — see partition-key comment above). FOR UPDATE
+    -- remains as a secondary defence for the non-empty case.
     -- Schema-qualified per Codex foundation-verify-r4 HIGH: pg_temp shadow attack.
     SELECT sequence_number, record_hash
     INTO   v_prev_record
@@ -488,7 +504,7 @@ BEGIN
       AND  COALESCE(target_patient_id, 'PLATFORM') = COALESCE(NEW.target_patient_id, 'PLATFORM')
     ORDER BY sequence_number DESC
     LIMIT  1
-    FOR    UPDATE;  -- serialise concurrent INSERTs within the same partition
+    FOR    UPDATE;
 
     IF v_prev_record IS NULL THEN
         -- First record in this partition: use genesis seed per AUDIT_EVENTS v5.2.
