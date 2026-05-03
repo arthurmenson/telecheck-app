@@ -35,33 +35,46 @@
 --   the §17 contextual carve-outs. It is not a valid tenant.id value.
 -- ---------------------------------------------------------------------------
 
--- SPEC ISSUE: CDM v1.2 §4.1 defines `tenants.id` as VARCHAR(26) with ULID
--- format (prefix `tnt_01H...`). The charter for this migration and Master
--- PRD v1.10 §17 C3 brand-structure rules define `tenants.id` as TEXT in the
--- format `Telecheck-{ISO2}` (e.g., `Telecheck-US`). These two representations
--- are mutually incompatible. This migration follows the charter + PRD §17
--- requirement (TEXT `Telecheck-{country}` format) because:
---   (a) The charter instruction is explicit and specific.
---   (b) §17 tenant-identifier format is load-bearing — it appears in audit
---       records, KMS key aliases, CCR runtime keys, and RBAC policies.
---   (c) CDM §4.1 uses ULID-prefix convention designed for patient-facing
---       entities, not for the platform's internal operating-tenant registry.
--- This divergence requires Engineering Lead review and a CDM v1.2 errata
--- or v1.3 patch to resolve the §4.1 vs §17 conflict explicitly.
--- Escalation path: SI/DSI per EHBG §12.
+-- SPEC ISSUE RESOLVED 2026-05-02 (Promotion Ledger P-010 in spec corpus):
+--   CDM v1.2 §4.1 was previously inconsistent with Master PRD v1.10 §17 (ULID
+--   prefix `tnt_01H...` vs operating-tenant `Telecheck-{country}` format).
+--   The SoT hierarchy resolution (Master PRD outranks engineering specs)
+--   set the canonical state to `Telecheck-{country}`. CDM §4.1 has been
+--   physically updated in the spec corpus (telecheckONE @ 509071c) with
+--   the canonical SQL DDL — including the 3 columns the v1.10.1 hygiene
+--   cycle promised but never merged: display_name, legal_entity,
+--   consumer_subdomain. This migration is now consistent with that
+--   canonical schema. The column type difference (TEXT here vs VARCHAR(26)
+--   in CDM) is functionally identical for the values in use.
 
 CREATE TABLE IF NOT EXISTS tenants (
-    -- Operating-tenant identifier in `Telecheck-{ISO2}` format per Master PRD §17.
-    -- Format enforced by CHECK constraint below.
-    -- Examples: 'Telecheck-US', 'Telecheck-Ghana' (note: 'GH' not 'Ghana' per ISO 3166-1 alpha-2,
-    -- but the actual value 'Telecheck-Ghana' is used as the canonical seeded value;
-    -- see SPEC ISSUE note below on alpha-2 vs full-country-name).
+    -- Operating-tenant identifier in `Telecheck-{country}` format per Master PRD v1.10 §17.
+    -- Examples: 'Telecheck-US', 'Telecheck-Ghana'.
+    -- (CDM v1.2 §4.1 SPEC ISSUE P-010 RESOLVED 2026-05-02 — see Promotion Ledger
+    --  P-010 in the spec corpus. CDM §4.1 now canonically specifies the
+    --  Telecheck-{country} format with VARCHAR(26) column type; this migration
+    --  uses TEXT which is functionally identical at the values used.)
     id                  TEXT        PRIMARY KEY,
 
-    -- Consumer-facing DBA name sourced for all patient-facing rendering.
+    -- Operating-tenant display label shown in platform-admin UI per CDM §4.1.
+    -- Typically equals `id` (e.g., 'Telecheck-US'); separate column allows
+    -- richer admin-side rendering without polluting the canonical identifier.
+    display_name        TEXT        NOT NULL,
+
+    -- Consumer-facing DBA name sourced for all patient-facing rendering per C3.
     -- Examples: 'Heros Health' (US), 'Heros Health Ghana' (Ghana).
     -- NEVER use tenant.id for patient-facing copy — always use consumer_dba.
     consumer_dba        TEXT        NOT NULL,
+
+    -- Per-country incorporated legal entity per CDM §4.1.
+    -- Examples: 'Telecheck Health LLC' (US), 'Telecheck-Ghana Ltd.' (Ghana).
+    -- Used by audit-export, regulatory filings, contract metadata (BAAs etc.).
+    legal_entity        TEXT        NOT NULL,
+
+    -- Country-instanced consumer subdomain serving the DBA's web/mobile UI.
+    -- Examples: 'heroshealth.com' (US), 'ghana.heroshealth.com' (Ghana).
+    -- Drives subdomain-based tenant resolution in src/lib/tenant-context.ts.
+    consumer_subdomain  TEXT        NOT NULL,
 
     -- ISO 3166-1 alpha-2 country code driving CCR runtime resolution.
     -- Constrained to active countries at launch; extend via migration when
@@ -93,23 +106,24 @@ CREATE TABLE IF NOT EXISTS tenants (
     -- Internal notes for platform admin use only (never patient-facing).
     notes               TEXT,
 
-    -- Enforce `Telecheck-{ISO2}` format.
-    -- Regex: starts with 'Telecheck-', followed by exactly 2 uppercase letters.
-    -- SPEC ISSUE: The seeded value 'Telecheck-Ghana' does NOT match the
-    -- pattern `^Telecheck-[A-Z]{2}$` (it uses a full country name, not ISO 3166-1
-    -- alpha-2 code 'GH'). The charter explicitly seeds 'Telecheck-Ghana' (not
-    -- 'Telecheck-GH'), creating a conflict between the regex constraint in the
-    -- charter and the seeded value also in the charter. This migration adopts
-    -- the following resolution: the CHECK constraint uses the pattern
-    -- `^Telecheck-[A-Z]{2,}$` (2 or more uppercase letters) to accommodate
-    -- both 'Telecheck-US' and 'Telecheck-Ghana'. Engineering Lead must decide
-    -- whether to normalize to strict ISO 3166-1 alpha-2 codes ('Telecheck-GH')
-    -- or to document the full-name convention as intentional. Until resolved,
-    -- the seeded data matches what other spec files reference ('Telecheck-Ghana'
-    -- appears in AUDIT_EVENTS, DOMAIN_EVENTS examples). This is an SI escalation
-    -- per EHBG §12.
-    CONSTRAINT tenant_id_format
-        CHECK (id ~ '^Telecheck-[A-Z][A-Za-z]+$')
+    -- Enforce `Telecheck-{country}` format per CDM §4.1 + Master PRD §17.
+    -- Regex permits 2+ uppercase letters or a leading uppercase + mixed-case
+    -- to cover both ISO 3166-1 alpha-2 codes ('Telecheck-US') and full
+    -- country names ('Telecheck-Ghana') — both are canonical per spec.
+    CONSTRAINT tenant_id_format_valid
+        CHECK (id ~ '^Telecheck-[A-Z][A-Za-z]+$'),
+
+    -- Anti-pattern: bare 'Heros' as a tenant identifier is forbidden per
+    -- Glossary v5.2 + Master PRD §17. Consumer brand 'Heros Health' belongs
+    -- in consumer_dba ONLY.
+    CONSTRAINT tenant_id_no_bare_heros
+        CHECK (id NOT ILIKE 'Heros%'),
+
+    -- C3 invariant: consumer_dba must start with 'Heros Health' (e.g.,
+    -- 'Heros Health', 'Heros Health Ghana'). A future market would extend
+    -- this CHECK to permit additional country variants.
+    CONSTRAINT consumer_dba_starts_heros_health
+        CHECK (consumer_dba LIKE 'Heros Health%')
 );
 
 -- Index for status-based lookups (admin surface, health checks).
@@ -132,11 +146,14 @@ CREATE INDEX IF NOT EXISTS idx_tenants_country_of_care
 -- key ARNs must be provisioned in AWS before application startup.
 -- ---------------------------------------------------------------------------
 
-INSERT INTO tenants (id, consumer_dba, country_of_care, kms_key_alias, status, activated_at)
+INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain, country_of_care, kms_key_alias, status, activated_at)
 VALUES
     (
         'Telecheck-US',
-        'Heros Health',
+        'Telecheck-US',                      -- operating-tenant label per CDM §4.1; NOT the consumer DBA
+        'Heros Health',                      -- consumer DBA per C3 brand structure
+        'Telecheck Health LLC',              -- per-country incorporated subsidiary
+        'heroshealth.com',                   -- country-instanced consumer subdomain
         'US',
         'alias/telecheck-us-data-key',
         'active',
@@ -144,7 +161,10 @@ VALUES
     ),
     (
         'Telecheck-Ghana',
-        'Heros Health Ghana',
+        'Telecheck-Ghana',                   -- operating-tenant label per CDM §4.1
+        'Heros Health Ghana',                -- consumer DBA per C3 brand structure
+        'Telecheck-Ghana Ltd.',              -- per-country incorporated subsidiary
+        'ghana.heroshealth.com',             -- country-instanced consumer subdomain
         'GH',
         'alias/telecheck-gh-data-key',
         'active',

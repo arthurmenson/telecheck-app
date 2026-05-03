@@ -56,8 +56,15 @@ import { type TenantId, asTenantId } from './glossary.js';
 // ---------------------------------------------------------------------------
 
 export interface TenantContext {
-  /** Operating-tenant identifier in `Telecheck-{Country}` format. */
+  /** Operating-tenant identifier in `Telecheck-{Country}` format. Mirrors `tenants.id`. */
   tenantId: TenantId;
+  /**
+   * Operating-tenant display label for platform-admin UI. Mirrors
+   * `tenants.display_name`. Typically equals `tenantId`.
+   * (Added 2026-05-02 per Codex spec-r3 MEDIUM closure aligning runtime
+   * TenantContext with TYPES v5.2 + CDM v1.2 §4.1 field set.)
+   */
+  displayName: string;
   /** ISO 3166-1 alpha-2 country code driving CCR resolution. */
   countryOfCare: 'US' | 'GH';
   /**
@@ -66,11 +73,25 @@ export interface TenantContext {
    */
   kmsKeyAlias: string;
   /**
-   * Consumer-facing DBA name (e.g., "Heros Health").
-   * Source: `tenant.consumer_dba`. NEVER render `tenantId` to patients —
+   * Consumer-facing DBA name (e.g., "Heros Health"). Mirrors
+   * `tenants.consumer_dba`. NEVER render `tenantId` to patients —
    * always use `consumerDba` for patient-facing surfaces.
    */
   consumerDba: string;
+  /**
+   * Per-country incorporated legal entity (e.g., "Telecheck Health LLC").
+   * Mirrors `tenants.legal_entity`. Used by audit-export, regulatory
+   * filings, contract metadata (BAAs etc.).
+   * (Added 2026-05-02 per Codex spec-r3 MEDIUM closure.)
+   */
+  legalEntity: string;
+  /**
+   * Country-instanced consumer subdomain (e.g., "heroshealth.com").
+   * Mirrors `tenants.consumer_subdomain`. Drives the subdomain-based
+   * tenant resolution below.
+   * (Added 2026-05-02 per Codex spec-r3 MEDIUM closure.)
+   */
+  consumerSubdomain: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,13 +99,17 @@ export interface TenantContext {
 // STUB: Real implementation queries the `tenants` table via DB connection.
 //       This stub is safe only for bootstrap; it throws at runtime on any
 //       tenant not in the hardcoded list, which is correct fail-closed behavior.
+//       Field set mirrors CDM v1.2 §4.1 1:1 per CDM SPEC ISSUE P-010 closure.
 // ---------------------------------------------------------------------------
 
 type SubdomainTenantEntry = {
   tenantId: string;
+  displayName: string;
   countryOfCare: 'US' | 'GH';
   kmsKeyAlias: string;
   consumerDba: string;
+  legalEntity: string;
+  consumerSubdomain: string;
 };
 
 /** Maps hostname pattern → tenant entry. Case-insensitive on lookup. */
@@ -92,29 +117,41 @@ const SUBDOMAIN_TENANT_MAP: Record<string, SubdomainTenantEntry> = {
   // Telecheck-US: heroshealth.com (consumer DBA: Heros Health)
   'heroshealth.com': {
     tenantId: 'Telecheck-US',
+    displayName: 'Telecheck-US',
     countryOfCare: 'US',
     kmsKeyAlias: 'alias/telecheck-us-data-key',
     consumerDba: 'Heros Health',
+    legalEntity: 'Telecheck Health LLC',
+    consumerSubdomain: 'heroshealth.com',
   },
   'www.heroshealth.com': {
     tenantId: 'Telecheck-US',
+    displayName: 'Telecheck-US',
     countryOfCare: 'US',
     kmsKeyAlias: 'alias/telecheck-us-data-key',
     consumerDba: 'Heros Health',
+    legalEntity: 'Telecheck Health LLC',
+    consumerSubdomain: 'heroshealth.com',
   },
   // Telecheck-Ghana: ghana.heroshealth.com (consumer DBA: Heros Health Ghana)
   'ghana.heroshealth.com': {
     tenantId: 'Telecheck-Ghana',
+    displayName: 'Telecheck-Ghana',
     countryOfCare: 'GH',
     kmsKeyAlias: 'alias/telecheck-gh-data-key',
     consumerDba: 'Heros Health Ghana',
+    legalEntity: 'Telecheck-Ghana Ltd.',
+    consumerSubdomain: 'ghana.heroshealth.com',
   },
   // Local dev / test
   'localhost': {
     tenantId: 'Telecheck-US',
+    displayName: 'Telecheck-US',
     countryOfCare: 'US',
     kmsKeyAlias: 'alias/telecheck-us-data-key',
     consumerDba: 'Heros Health',
+    legalEntity: 'Telecheck Health LLC',
+    consumerSubdomain: 'heroshealth.com',
   },
 };
 
@@ -212,12 +249,15 @@ const tenantContextPluginImpl: FastifyPluginAsync<TenantContextPluginOptions> = 
       return;
     }
 
-    // Populate the decorator.
+    // Populate the decorator with the full CDM §4.1 field set.
     const ctx: TenantContext = {
       tenantId,
+      displayName: entry.displayName,
       countryOfCare: entry.countryOfCare,
       kmsKeyAlias: entry.kmsKeyAlias,
       consumerDba: entry.consumerDba,
+      legalEntity: entry.legalEntity,
+      consumerSubdomain: entry.consumerSubdomain,
     };
 
     // Fastify decorateRequest sets up the slot at registration time; the
