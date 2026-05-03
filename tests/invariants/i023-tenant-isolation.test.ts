@@ -57,7 +57,7 @@ import { getTestClient } from '../setup.ts';
 // ---------------------------------------------------------------------------
 
 describe('I-023 Layer 1 (RLS) — queries without tenant context return 0 rows for PHI tables', () => {
-  it('should return 0 rows from audit_records when no tenant context is set', async () => {
+  it('should reject reads from audit_records when no tenant context is set', async () => {
     const client = getTestClient();
     const auditId = randomUUID();
 
@@ -76,14 +76,22 @@ describe('I-023 Layer 1 (RLS) — queries without tenant context return 0 rows f
       );
     });
 
-    // Without setting tenant context: RLS must block reads.
-    // Reset the session variable to simulate no tenant context.
-    await client.query(`SET LOCAL app.current_tenant_id = ''`);
+    // Drop the binding installed by withTenantContext above. The RLS policy
+    // on audit_records evaluates `tenant_id = current_tenant_id()`, and
+    // current_tenant_id() (migration 003) reads the binding from
+    // _session_tenant_context — when no row exists for pg_backend_pid(),
+    // the function RAISEs `tenant_context_not_set` per I-023 fail-closed
+    // discipline. The whole SELECT then aborts with that exception.
+    //
+    // (The original assertion expected `result.rows.length === 0`, but
+    // RLS doesn't silently filter when the policy expression itself
+    // throws — it propagates the throw. The fail-closed semantics here
+    // are stronger than "0 rows" and are the correct I-023 behavior.)
+    await client.query(`SELECT clear_tenant_context()`);
 
-    const result = await client.query(`SELECT * FROM audit_records WHERE audit_id = $1`, [auditId]);
-
-    // RLS should filter the row — 0 results without a valid tenant context.
-    expect(result.rows).toHaveLength(0);
+    await expect(
+      client.query(`SELECT * FROM audit_records WHERE audit_id = $1`, [auditId]),
+    ).rejects.toThrow(/tenant_context_not_set/);
   });
 
   it('should return own rows from audit_records when correct tenant context is set', async () => {
