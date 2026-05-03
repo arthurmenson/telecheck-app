@@ -100,26 +100,43 @@ export async function findDeploymentById(
 // ---------------------------------------------------------------------------
 
 /**
+ * Sentinel error code thrown by createActiveDeployment when the
+ * INSERT...SELECT predicate filters the template (because the template
+ * doesn't exist OR isn't in 'published' status). The service layer's
+ * pre-check normally catches both cases with nicer error mapping; this
+ * sentinel covers the TOCTOU race where the template status flips
+ * between the pre-check and the INSERT.
+ */
+export const DEPLOYMENT_TEMPLATE_PRECONDITION_FAILED =
+  'forms.deployment.template_precondition_failed';
+
+/**
  * Create an active deployment binding a published template to its program.
+ *
+ * **Concurrency-safe precondition (Codex handler-2 HIGH closure
+ * 2026-05-02):** the prior implementation accepted programId as a
+ * parameter and trusted the service-layer pre-check that the template
+ * was published. Between the pre-check and the INSERT, another request
+ * could supersede or archive the template, leaving an active deployment
+ * pointing at a non-deployable template.
+ *
+ * This implementation uses INSERT ... SELECT ... WHERE so the
+ * `published` status check + the program_id read happen atomically in
+ * the same statement that writes the deployment row. RETURNING zero
+ * rows means the predicate filtered (template missing OR status !=
+ * 'published') — the service layer maps this to a tenant-blind 400.
+ *
  * The composite FK (tenant_id, template_id) → forms_template (tenant_id,
- * template_id) is enforced at INSERT — a tenant cannot bind to another
- * tenant's template even if the template_id is known.
+ * template_id) provides the cross-tenant guarantee independently.
  *
- * Service-layer precondition: the caller MUST verify the referenced
- * template is in 'published' status before calling. The DB does not enforce
- * the published-status precondition (no CHECK / FK on status); doing so
- * here would couple deployment to template lifecycle in a way that
- * complicates supersession. The service layer is the correct enforcement
- * point.
- *
- * Same atomicity discipline as createDraftTemplate: txCallback emits audit
- * + domain event inside the same transaction; failure rolls back the INSERT.
+ * Same atomicity discipline as createDraftTemplate: txCallback emits
+ * audit + domain event inside the same transaction; failure rolls back
+ * the INSERT.
  */
 export async function createActiveDeployment(
   tenantId: TenantId,
   input: {
     templateId: FormDeploymentId;
-    programId: string;
   },
   txCallback: (tx: DbTransaction, deployment: FormDeployment) => Promise<void>,
 ): Promise<FormDeployment> {
@@ -128,26 +145,43 @@ export async function createActiveDeployment(
 
     const deploymentId = ulid();
 
+    // INSERT ... SELECT pattern: the SELECT enforces both tenant-match AND
+    // status='published' AT THE TIME OF THE INSERT. If another transaction
+    // flipped the template's status between any prior service-layer check
+    // and this statement, the SELECT returns zero rows → INSERT writes
+    // nothing → RETURNING is empty → we throw the sentinel error which the
+    // service layer maps to a tenant-blind 400.
+    //
+    // FOR UPDATE on the inner SELECT would also work but is unnecessary
+    // here: the row-level lock that PostgreSQL acquires on the inserted
+    // row is not what protects us — the SELECT predicate is. If a
+    // concurrent UPDATE on the template runs between two such INSERTs,
+    // both INSERTs see snapshot-consistent state per their own
+    // transactions and either both succeed (status was still 'published'
+    // for both) or one fails (the template was unpublished before the
+    // second SELECT ran). Both outcomes are correct.
     const result = await tx.query<FormDeployment>(
       `INSERT INTO forms_deployment (
           deployment_id, tenant_id, template_id, program_id,
           deployed_at, retired_at
-       ) VALUES (
-          $1, $2, $3, $4,
-          NOW(), NULL
        )
+       SELECT
+          $1, t.tenant_id, t.template_id, t.program_id,
+          NOW(), NULL
+         FROM forms_template t
+        WHERE t.tenant_id = $2
+          AND t.template_id = $3
+          AND t.status = 'published'
        RETURNING deployment_id, tenant_id, template_id, program_id,
                  deployed_at, retired_at`,
-      [deploymentId, tenantId, input.templateId, input.programId],
+      [deploymentId, tenantId, input.templateId],
     );
 
     if (result.rows.length === 0) {
-      throw new Error(
-        `forms-intake submission-repo.createActiveDeployment: INSERT returned no row ` +
-          `for tenant=${tenantId}, template=${input.templateId}. The composite FK ` +
-          `to forms_template (tenant_id, template_id) likely failed — verify the ` +
-          `template exists in this tenant.`,
-      );
+      // Template either doesn't exist in this tenant OR isn't published
+      // (TOCTOU race or service-layer pre-check skipped). Throw the
+      // sentinel; the service layer maps to a tenant-blind 400.
+      throw new Error(DEPLOYMENT_TEMPLATE_PRECONDITION_FAILED);
     }
 
     const deployment = result.rows[0]!;

@@ -199,11 +199,17 @@ export async function createDeployment(
     throw new Error('forms.deployment.template_not_published');
   }
 
-  return submissionRepo.createActiveDeployment(
+  // The repo uses INSERT ... SELECT with status='published' in the predicate
+  // so the precondition is re-verified atomically with the INSERT — closing
+  // the TOCTOU race where a concurrent supersession could fire between this
+  // service-layer check and the actual write. The pre-check above is for
+  // clean error mapping (distinguishing not_found vs not_published); the
+  // repo's atomic check is the correctness guarantee.
+  try {
+    return await submissionRepo.createActiveDeployment(
     ctx.tenantId,
     {
       templateId: input.templateId as FormTemplateId,
-      programId: template.program_id,
     },
     async (tx, deployment) => {
       await emitFormsDeploymentCreatedAudit(
@@ -229,4 +235,18 @@ export async function createDeployment(
       });
     },
   );
+  } catch (err) {
+    // The repo throws DEPLOYMENT_TEMPLATE_PRECONDITION_FAILED when its
+    // INSERT...SELECT predicate filters out the template (TOCTOU race
+    // between our service-layer pre-check and the atomic INSERT). Map
+    // back to the canonical service-layer error so the handler maps it
+    // to a tenant-blind 400 the same as the pre-check failures.
+    if (
+      err instanceof Error &&
+      err.message === submissionRepo.DEPLOYMENT_TEMPLATE_PRECONDITION_FAILED
+    ) {
+      throw new Error('forms.deployment.template_not_published');
+    }
+    throw err;
+  }
 }
