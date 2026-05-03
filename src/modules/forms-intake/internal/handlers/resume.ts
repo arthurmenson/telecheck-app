@@ -20,6 +20,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
+import { ResumeSubmissionRequestSchema } from '../../schemas.js';
 import * as submissionService from '../services/submission-service.js';
 import type { PatientId } from '../types.js';
 
@@ -68,28 +69,103 @@ function resolveResumeOwnership(req: FastifyRequest): {
 }
 
 /**
+ * Resolve the acting actor's identity. Mirrors `submissions.ts resolveActorId`
+ * — kept duplicated rather than extracted so each handler-file's auth
+ * boundary is obvious. Centralization happens when the Identity & Auth
+ * slice lands.
+ *
+ * Required for the restore-write path because the audit emission needs an
+ * `actor_id` distinct from the patient identity (an actor may pause/resume
+ * on behalf of themselves OR via delegate-context — the delegate flow
+ * isn't gated through resume_state today but the audit emitter's signature
+ * carries actorId so future delegate-restore lands without a service
+ * signature change).
+ */
+function resolveActorId(req: FastifyRequest): string {
+  const isProd = process.env['NODE_ENV'] === 'production';
+  const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
+  if (isProd && !optIn) {
+    throw req.server.httpErrors.unauthorized(
+      'Actor identity could not be authenticated for this request.',
+    );
+  }
+  const headerValue = req.headers['x-actor-id'];
+  const actorId = typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : null;
+  if (actorId === null) {
+    throw req.server.httpErrors.unauthorized('No actor identity resolved for this request.');
+  }
+  return actorId;
+}
+
+/**
  * POST /v0/forms/resume — resume a paused submission via token.
  *
- * **Still STUBBED** at this commit; the response-restoration flow has
- * unresolved dependencies documented at `submissionService.resumeSubmission`:
- *   - migration 006 lacks the (resume_state ↔ submission) binding column,
- *   - the pause/write path is not yet wired,
- *   - KMS-decryption of `encrypted_partial_responses` is gated to
- *     NODE_ENV=test only at v0.1.
+ * Pipeline (every step's failure mode surfaces as a tenant-blind 404 per
+ * I-025; the service returns null on every gate trip):
  *
- * The handler is preserved so route registration continues to compile and
- * a single coherent slice header documents the deferral. The metadata-only
- * `GET /v0/forms/resume/:resumeToken` IS live and IS the preview-of-resume
- * the patient app uses today.
+ *   1. Resolve tenant context (`requireTenantContext` fails closed per
+ *      I-023).
+ *   2. Resolve actor + ownership identity via the local shims (production
+ *      fail-closed unless `ALLOW_ACTOR_HEADER_AUTH=true`).
+ *   3. Parse + validate body (`ResumeSubmissionRequestSchema`).
+ *   4. Call `submissionService.resumeSubmission` which atomically:
+ *      verifies the token, decrypts the partial responses, merges them
+ *      onto the in-progress submission row, flips the resume_state to
+ *      `completed` (replay-protection), and emits the Category C audit —
+ *      all in a single same-tx outbox path (I-016).
+ *   5. Map null → 404 with the canonical "form resume state not found."
+ *      message. Per I-025 the response is byte-identical regardless of
+ *      which underlying gate tripped.
+ *
+ * The successful response is the patient-facing submission view
+ * (`PatientFormSubmissionView` — no `tenant_id`).
+ *
+ * **v0.1 identity caveat:** the service requires `actor.patientId`
+ * non-null because migration 006 declares `forms_submission.patient_id
+ * NOT NULL` and the merge UPDATE reuses that constraint. The shim
+ * delivers either patientId or deviceAnonymousToken; for the restore
+ * path we only proceed if patientId resolves. Anonymous-flow restore
+ * activates with the same migration patch that unblocks anonymous-flow
+ * pause.
  */
 export async function resumeSubmissionHandler(
   req: FastifyRequest,
-  _reply: FastifyReply,
+  reply: FastifyReply,
 ): Promise<unknown> {
-  void requireTenantContext(req);
-  throw req.server.httpErrors.notImplemented(
-    'POST /v0/forms/resume is not yet wired; use GET /v0/forms/resume/:resumeToken for metadata.',
+  const ctx = requireTenantContext(req);
+  const actorId = resolveActorId(req);
+  const ownership = resolveResumeOwnership(req);
+
+  const parsed = ResumeSubmissionRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    throw req.server.httpErrors.badRequest(
+      `Invalid request body: ${parsed.error.errors
+        .map((e) => `${e.path.join('.')}: ${e.message}`)
+        .join('; ')}`,
+    );
+  }
+
+  // The service signature requires a non-null patientId at v0.1 (see
+  // file-level identity caveat above). If only the device-anonymous
+  // token is presented, surface the same tenant-blind 404 — anonymous-
+  // flow restore is not yet wired.
+  if (ownership.patientId === null) {
+    throw req.server.httpErrors.notFound('Form resume state not found.');
+  }
+
+  const restored = await submissionService.resumeSubmission(
+    ctx,
+    {
+      actorId,
+      patientId: ownership.patientId,
+      deviceAnonymousToken: ownership.deviceAnonymousToken,
+    },
+    parsed.data.resumeToken,
   );
+  if (restored === null) {
+    throw req.server.httpErrors.notFound('Form resume state not found.');
+  }
+  return reply.code(200).send(restored);
 }
 
 /**
