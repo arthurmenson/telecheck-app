@@ -33,6 +33,8 @@
  * the type was tightened here to match the SQL truth.
  */
 
+import crypto from 'crypto';
+
 import { crisisDetector } from '../../../../lib/crisis-detection.js';
 import { type DbClient, type DbTransaction, withTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
@@ -444,9 +446,12 @@ export async function resumeSubmission(
  * Read the metadata view of a resume_state — what the patient app surfaces
  * on the dashboard ("[N]% complete · Resume") before the patient clicks.
  * Metadata only: deployment_id, progress, section, expiry, last_saved_at —
- * NEVER decrypts `encrypted_partial_responses`.
+ * NEVER decrypts `encrypted_partial_responses`, NEVER returns tenant_id
+ * (per Master PRD §17 + Glossary v5.2 patient-surface rule: internal
+ * operating-tenant identifiers must not render in patient APIs).
  *
- * Token validation pipeline:
+ * Token validation pipeline (Codex resume-r1 closure 2026-05-03 elevated
+ * the token from sole-bearer-of-authorization to one factor among several):
  *
  *   1. `verifyResumeToken` checks structure + HMAC signature + token-level
  *      expiry. Returns null on any failure (constant-time HMAC compare).
@@ -457,11 +462,20 @@ export async function resumeSubmission(
  *   3. The repo lookup (`findResumeStateById`) is RLS-guarded. Even if a
  *      token survived steps 1-2 with cross-tenant identity (it shouldn't,
  *      but defense-in-depth), RLS rejects the row.
- *   4. The row's `status` must be `active`. `completed` (already restored)
+ *   4. **Patient/device ownership** (Codex resume-r1 HIGH closure): the
+ *      row's identity anchor MUST match the request's resolved actor.
+ *      For known-patient rows (`patient_id NOT NULL`), `ownership.patientId`
+ *      must equal `row.patient_id`. For anonymous-flow rows
+ *      (`device_anonymous_token NOT NULL`), `ownership.deviceAnonymousToken`
+ *      must equal `row.device_anonymous_token`. Without this gate the URL
+ *      token is a single-factor bearer credential — anyone who scrapes
+ *      a forwarded link or browser-history entry could read same-tenant
+ *      resume metadata. Mismatch surfaces as null per I-025.
+ *   5. The row's `status` must be `active`. `completed` (already restored)
  *      and `expired` (cleanup-job processed) both surface as null per
  *      I-025; we never differentiate "wrong state" from "missing" in the
  *      patient surface.
- *   5. The row's `expires_at` must be in the future. The token-level
+ *   6. The row's `expires_at` must be in the future. The token-level
  *      expiry from step 1 SHOULD agree with this, but defense-in-depth:
  *      if a token expiry is somehow ahead of the row expiry, the row
  *      check still rejects.
@@ -471,6 +485,7 @@ export async function resumeSubmission(
  */
 export async function getResumeStateMetadata(
   ctx: TenantContext,
+  ownership: { patientId: PatientId | null; deviceAnonymousToken: string | null },
   resumeToken: string,
   externalTx?: DbClient,
 ): Promise<ResumeStateMetadata | null> {
@@ -489,15 +504,42 @@ export async function getResumeStateMetadata(
   );
   if (row === null) return null;
 
-  // Step 4: status gate.
+  // Step 4: patient/device ownership gate (Codex resume-r1 HIGH closure).
+  // The row carries exactly one identity anchor (the migration's CHECK
+  // constraint enforces `patient_id IS NOT NULL OR device_anonymous_token
+  // IS NOT NULL`). Match the request's resolved actor against whichever
+  // anchor is present; reject otherwise.
+  if (row.patient_id !== null) {
+    // Known-patient row: actor must be that patient.
+    if (ownership.patientId === null) return null;
+    if (row.patient_id !== ownership.patientId) return null;
+  } else if (row.device_anonymous_token !== null) {
+    // Anonymous-flow row: actor must hold the device-anonymous token.
+    // Compared with constant-time equality so token equality timing
+    // cannot be probed — same discipline as the HMAC compare.
+    if (ownership.deviceAnonymousToken === null) return null;
+    if (!timingSafeStringEqual(row.device_anonymous_token, ownership.deviceAnonymousToken)) {
+      return null;
+    }
+  } else {
+    // Defensive: a row with neither identity anchor shouldn't exist
+    // (DB CHECK constraint), but if one slipped in via another path we
+    // refuse to surface metadata. Safe-by-default.
+    return null;
+  }
+
+  // Step 5: status gate.
   if (row.status !== 'active') return null;
 
-  // Step 5: row-level expiry gate (defense-in-depth alongside token-level).
+  // Step 6: row-level expiry gate (defense-in-depth alongside token-level).
   if (Date.parse(row.expires_at) <= Date.now()) return null;
 
+  // Per the patient-surface rule (Master PRD §17 + Glossary v5.2 C3),
+  // tenant_id is internal operating-tenant identity and MUST NOT appear
+  // in patient-facing API responses. We project only the non-internal
+  // fields the dashboard needs to render the "[N]% complete · Resume" tile.
   return {
     resume_state_id: row.resume_state_id,
-    tenant_id: row.tenant_id,
     deployment_id: row.deployment_id,
     current_section_index: row.current_section_index,
     progress_percent: row.progress_percent,
@@ -505,6 +547,18 @@ export async function getResumeStateMetadata(
     expires_at: row.expires_at,
     last_saved_at: row.last_saved_at,
   };
+}
+
+/**
+ * Constant-time string equality. Wraps `crypto.timingSafeEqual` with the
+ * length check that crypto's primitive throws on, so callers can pass two
+ * potentially-mismatched-length strings without an exception.
+ */
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 /**

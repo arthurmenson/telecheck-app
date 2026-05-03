@@ -186,10 +186,18 @@ export interface ResumeState {
 /**
  * Patient-app metadata view of a resume_state row — what the dashboard
  * surfaces ("[N]% complete · Resume") without decrypting partial responses.
+ *
+ * **No `tenant_id`** (Codex resume-r1 MEDIUM closure 2026-05-03): per
+ * Master PRD v1.10 §17 + Glossary v5.2 C3 brand-structure rules, internal
+ * operating-tenant identifiers (`tenant.id` like `Telecheck-US`) MUST NOT
+ * render in patient-facing API responses. The patient surface uses
+ * `tenant.consumer_dba` (e.g., "Heros Health") when brand context is
+ * needed, never the operating-tenant id. Even if the UI hides the field,
+ * shipping it in the patient API makes the internal id part of the public
+ * contract.
  */
 export interface ResumeStateMetadata {
   resume_state_id: ResumeStateId;
-  tenant_id: TenantId;
   deployment_id: FormDeploymentId;
   current_section_index: number;
   progress_percent: number;

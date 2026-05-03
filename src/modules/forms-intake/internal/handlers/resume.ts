@@ -21,6 +21,51 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import * as submissionService from '../services/submission-service.js';
+import type { PatientId } from '../types.js';
+
+/**
+ * Resolve the request's patient identity for the resume metadata read.
+ *
+ * Mirrors the same shim pattern as `submissions.ts` (production fail-closed
+ * unless `ALLOW_ACTOR_HEADER_AUTH=true`); the Identity & Auth slice
+ * replaces both shims when it lands.
+ *
+ * **Anonymous-flow caveat:** for the device-anonymous resume path
+ * (Slice PRD §8.2), the patient is not yet registered and identity is
+ * carried by `x-device-anonymous-token` instead of `x-patient-id`. This
+ * shim reads BOTH headers and returns whichever is present; the service
+ * layer matches against the row's identity anchor (patient_id OR
+ * device_anonymous_token, never both).
+ *
+ * Either header is required — bearing only the resume token is no longer
+ * sufficient (Codex resume-r1 HIGH closure 2026-05-03).
+ */
+function resolveResumeOwnership(req: FastifyRequest): {
+  patientId: PatientId | null;
+  deviceAnonymousToken: string | null;
+} {
+  const isProd = process.env['NODE_ENV'] === 'production';
+  const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
+  if (isProd && !optIn) {
+    throw req.server.httpErrors.unauthorized(
+      'Patient identity could not be authenticated for this request.',
+    );
+  }
+  const patientHeader = req.headers['x-patient-id'];
+  const patientId =
+    typeof patientHeader === 'string' && patientHeader.length > 0 ? patientHeader : null;
+
+  const deviceHeader = req.headers['x-device-anonymous-token'];
+  const deviceAnonymousToken =
+    typeof deviceHeader === 'string' && deviceHeader.length > 0 ? deviceHeader : null;
+
+  if (patientId === null && deviceAnonymousToken === null) {
+    throw req.server.httpErrors.unauthorized(
+      'No patient or device-anonymous identity resolved for this request.',
+    );
+  }
+  return { patientId, deviceAnonymousToken };
+}
 
 /**
  * POST /v0/forms/resume — resume a paused submission via token.
@@ -52,14 +97,18 @@ export async function resumeSubmissionHandler(
  * (without restoring). Used by the patient app to render
  * "[N]% complete · Resume" before the user clicks.
  *
- * Token verification + tenant-blind 404 mapping is owned by the service
- * layer. The handler:
+ * Token verification + ownership + tenant-blind 404 mapping is owned by
+ * the service layer. The handler:
  *   1. Resolves the request's tenant via `requireTenantContext` (I-023
  *      fail-closed).
- *   2. Extracts the token from the path param (string-required).
- *   3. Calls `getResumeStateMetadata` which returns null on any failure
- *      mode (bad signature, expired, cross-tenant, wrong status, missing).
- *   4. Maps null → 404 with the canonical "form resume state not found"
+ *   2. Resolves patient OR device-anonymous identity via the auth shim
+ *      (Codex resume-r1 HIGH closure 2026-05-03 — the resume token is no
+ *      longer the sole authorization factor; bearing the URL is not enough).
+ *   3. Extracts the token from the path param (string-required).
+ *   4. Calls `getResumeStateMetadata` which returns null on any failure
+ *      mode (bad signature, expired, cross-tenant, wrong actor, wrong
+ *      status, missing).
+ *   5. Maps null → 404 with the canonical "form resume state not found"
  *      message. Per I-025 the response is byte-identical regardless of
  *      which underlying gate tripped.
  */
@@ -68,6 +117,7 @@ export async function getResumeStateHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
+  const ownership = resolveResumeOwnership(req);
 
   const params = req.params as Record<string, unknown>;
   const tokenParam = params['resumeToken'];
@@ -75,7 +125,7 @@ export async function getResumeStateHandler(
     throw req.server.httpErrors.badRequest('Path param `resumeToken` is required.');
   }
 
-  const metadata = await submissionService.getResumeStateMetadata(ctx, tokenParam);
+  const metadata = await submissionService.getResumeStateMetadata(ctx, ownership, tokenParam);
   if (metadata === null) {
     throw req.server.httpErrors.notFound('Form resume state not found.');
   }
