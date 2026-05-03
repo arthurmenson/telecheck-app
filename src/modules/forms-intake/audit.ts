@@ -415,7 +415,114 @@ export async function emitFormsApprovalGovernanceEdited(
 }
 
 // ---------------------------------------------------------------------------
-// Submission lifecycle audit (Category C — operational per Slice PRD §8.5)
+// Submission lifecycle audit (Category C — operational per Slice PRD §8.5
+// + AUDIT_EVENTS v5.2 §Category C action catalog naming intake_paused,
+// intake_resumed, intake_completed, intake_abandoned).
+//
+// SPEC ISSUE: the `intake_*` family isn't enumerated in src/lib/audit.ts
+// AuditAction union (which mirrors AUDIT_EVENTS v5.2 Category C, but the
+// spec catalog lists these by name in PRD §8.5 prose only). We type-cast
+// `'forms_submission_started' as AuditAction` etc. so grep finds
+// unratified action IDs. Engineering Lead amendment pending per
+// EHBG §12 SI/DSI escalation.
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit `forms_submission_started` — patient (or delegate) began an intake.
+ * Category C (operational). target_patient_id is the patient the
+ * submission belongs to; resource_id is the submission_id.
+ */
+export async function emitFormsSubmissionStartedAudit(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    submissionId: FormSubmissionId;
+    deploymentId: FormDeploymentId;
+    patientId: PatientId;
+    delegateId: string | null;
+    variantId: FormVariantId | null;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    {
+      ...buildEnvelope('forms_submission_started' as AuditAction, 'C', {
+        tenant_id: args.tenantId,
+        actor_type: args.delegateId !== null ? 'delegate' : 'patient',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: args.patientId,
+        country_of_care: args.countryOfCare,
+        resource_type: 'forms_submission',
+        resource_id: args.submissionId,
+        detail: {
+          submission_id: args.submissionId,
+          deployment_id: args.deploymentId,
+          patient_id: args.patientId,
+          delegate_id: args.delegateId,
+          variant_id: args.variantId,
+        },
+      }),
+    },
+    tx,
+  );
+}
+
+/**
+ * Emit `forms_submission_completed` — patient finalized the intake.
+ * Category C operational; corresponds to the AUDIT_EVENTS v5.2 §Category C
+ * `intake_completed` action. The corresponding `intake_response.submitted`
+ * domain event is emitted in the same transaction.
+ */
+export async function emitFormsSubmissionCompletedAudit(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    submissionId: FormSubmissionId;
+    deploymentId: FormDeploymentId;
+    patientId: PatientId;
+    delegateId: string | null;
+    submittedAt: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    {
+      ...buildEnvelope('forms_submission_completed' as AuditAction, 'C', {
+        tenant_id: args.tenantId,
+        actor_type: args.delegateId !== null ? 'delegate' : 'patient',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: args.patientId,
+        country_of_care: args.countryOfCare,
+        resource_type: 'forms_submission',
+        resource_id: args.submissionId,
+        detail: {
+          submission_id: args.submissionId,
+          deployment_id: args.deploymentId,
+          patient_id: args.patientId,
+          delegate_id: args.delegateId,
+          submitted_at: args.submittedAt,
+        },
+      }),
+    },
+    tx,
+  );
+}
+
+// Note: per-keystroke auto-save events are intentionally NOT audited here —
+// Category C `intake_paused` (explicit save-and-leave) is covered by the
+// existing `emitFormsResumeStateSaved` emitter; the auto-save path is
+// internal traffic and would explode the audit chain if every keystroke
+// produced an audit row. Slice PRD §8.5 + AUDIT_EVENTS v5.2 §Category C
+// confirm this read of the discipline.
+
+// ---------------------------------------------------------------------------
+// Submission lifecycle audit (legacy — kept for save-and-resume flow only)
 //
 // SPEC ISSUE flagged at file header: AUDIT_EVENTS v5.2 lacks dedicated
 // `forms_submission_*` action IDs. We use `config_change_validated` as the

@@ -288,6 +288,60 @@ export async function retireDeployment(
 }
 
 // ---------------------------------------------------------------------------
+// Submission sentinel error codes
+//
+// Same tenant-blind 400 mapping pattern as the deployment sentinels. Maps
+// to a uniform wire-out 400 envelope per I-025; the structured code
+// preserves observability granularity (NOT_FOUND vs WRONG_STATE).
+// ---------------------------------------------------------------------------
+
+export const SUBMISSION_NOT_FOUND = 'forms.submission.not_found';
+export const SUBMISSION_NOT_IN_PROGRESS = 'forms.submission.not_in_progress';
+
+// ---------------------------------------------------------------------------
+// Submission reads
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a submission by ID under the caller's tenant. Returns null on miss
+ * or cross-tenant (RLS-filtered) — handler maps null to a tenant-blind 404
+ * per I-025. Same canonical pattern as `findTemplateById` / `findDeploymentById`.
+ */
+export async function findSubmissionById(
+  tenantId: TenantId,
+  submissionId: FormSubmissionId,
+  externalTx?: DbClient,
+): Promise<FormSubmission | null> {
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      // Note: forms_submission columns per migration 006 differ from the
+      // FormSubmission TypeScript shape — `started_at` doesn't exist as a
+      // column; the type's `started_at` is mapped from `created_at`. Other
+      // type fields (e.g. `delegate_id`, `submitted_at`) are direct.
+      const result = await client.query<FormSubmission>(
+        `SELECT submission_id,
+                tenant_id,
+                deployment_id,
+                variant_id,
+                patient_id,
+                delegate_id,
+                status,
+                responses,
+                created_at AS started_at,
+                submitted_at
+           FROM forms_submission
+          WHERE submission_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+          LIMIT 1`,
+        [submissionId, tenantId],
+      );
+      return result.rows[0] ?? null;
+    },
+    externalTx,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Submission writes
 // ---------------------------------------------------------------------------
 
@@ -300,42 +354,210 @@ export async function retireDeployment(
  * audit + domain events inside the same transaction so rollback discards
  * everything.
  */
+/**
+ * Insert a new submission row in `in_progress` status + run the caller's
+ * txCallback (which emits audit + domain event) inside the same transaction.
+ *
+ * **Migration 006 conflict (flagged inline 2026-05-03 per EHBG §12 SI/DSI
+ * escalation):** `forms_submission.patient_id` is NOT NULL, but Slice PRD
+ * v2.1 §8.2 calls for a device-anonymous flow where pre-account patients
+ * begin an intake without a resolved patient_id and the binding promotes
+ * post-account-creation. Until the migration is patched (or a placeholder
+ * "anonymous patient" identity is introduced), this repo enforces NOT NULL
+ * at the type level — the service rejects null patientId before reaching
+ * the SQL. The `versionId` and `deviceAnonymousToken` parameters from the
+ * stub are omitted: there is no `version_id` column (template_version is
+ * resolved via deployment_id → forms_template), and the device-anonymous
+ * binding lives on the resume_state table per the slice scaffold.
+ */
 export async function createSubmission(
-  _tenantId: TenantId,
-  _input: {
+  tenantId: TenantId,
+  input: {
     deploymentId: FormDeploymentId;
-    versionId: FormVersionId;
     variantId: FormVariantId | null;
-    patientId: PatientId | null;
-    deviceAnonymousToken: string | null;
+    patientId: PatientId;
+    delegateId: string | null;
   },
-  _txCallback: (tx: DbTransaction, submission: FormSubmission) => Promise<void>,
+  txCallback: (tx: DbTransaction, submission: FormSubmission) => Promise<void>,
+  externalTx?: DbTransaction,
 ): Promise<FormSubmission> {
-  void withTransaction;
-  throw new Error('not implemented');
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    const submissionId = ulid();
+
+    // Cross-table precondition: deployment must exist in this tenant AND
+    // be active (retired_at IS NULL). The composite FK already enforces
+    // tenant binding; the WHERE clause adds the active-deployment guard
+    // atomically with the INSERT (TOCTOU-safe per the createActiveDeployment
+    // pattern). Variant validation is deferred — variants are scaffolded
+    // but the FK is added by ALTER post-table-create and the assignment
+    // logic isn't wired yet.
+    const result = await tx.query<FormSubmission>(
+      `INSERT INTO forms_submission (
+          submission_id, tenant_id, deployment_id, variant_id,
+          patient_id, delegate_id,
+          status, responses, mode_2_eligible,
+          created_at, updated_at
+       )
+       SELECT
+          $1, $2, d.deployment_id, $3,
+          $4, $5,
+          'in_progress', '{}'::jsonb, FALSE,
+          NOW(), NOW()
+         FROM forms_deployment d
+        WHERE d.tenant_id = $2
+          AND d.deployment_id = $6
+          AND d.retired_at IS NULL
+       RETURNING submission_id, tenant_id, deployment_id, variant_id,
+                 patient_id, delegate_id, status, responses,
+                 created_at AS started_at, submitted_at`,
+      [
+        submissionId,
+        tenantId,
+        input.variantId,
+        input.patientId,
+        input.delegateId,
+        input.deploymentId,
+      ],
+    );
+
+    if (result.rows.length === 0) {
+      // Zero rows from RETURNING means the SELECT predicate filtered:
+      // deployment doesn't exist in this tenant, OR is retired.
+      // Maps to a tenant-blind 400 at the handler — the structured code
+      // (DEPLOYMENT_NOT_FOUND) preserves observability granularity.
+      throw new Error(DEPLOYMENT_NOT_FOUND);
+    }
+
+    const submission = result.rows[0]!;
+    await txCallback(tx, submission);
+    return submission;
+  }, externalTx);
 }
 
 /**
- * Persist partial-progress responses. Auto-save (Slice PRD §8.1) calls this
- * on every field blur. Wrapped in a transaction so the response patch +
- * resume-state-touch (last-active timestamp bump) commit atomically.
+ * Persist partial-progress responses (Slice PRD §8.1 auto-save). The
+ * response payload REPLACES the existing `responses` JSONB rather than
+ * patching keys — auto-save sends the full current state, which keeps the
+ * SQL deterministic and avoids JSONB merge edge cases (deleted keys, type
+ * coercion, nested objects). Service-level merging is documented as a
+ * future enhancement under §8.1's "delta" comment.
+ *
+ * I-013 immutability: only `in_progress` submissions accept responses
+ * updates. The WHERE clause includes `status = 'in_progress'`; a
+ * submitted/withdrawn/etc. row gets the SUBMISSION_NOT_IN_PROGRESS
+ * sentinel via a follow-up existence check (same pattern as
+ * `retireDeployment`).
  */
 export async function updateSubmissionResponses(
-  _tenantId: TenantId,
-  _submissionId: FormSubmissionId,
-  _responsePatch: Record<string, unknown>,
-  _txCallback: (tx: DbTransaction) => Promise<void>,
+  tenantId: TenantId,
+  submissionId: FormSubmissionId,
+  responsePatch: Record<string, unknown>,
+  txCallback: (tx: DbTransaction, submission: FormSubmission) => Promise<void>,
+  externalTx?: DbTransaction,
 ): Promise<FormSubmission> {
-  throw new Error('not implemented');
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    const result = await tx.query<FormSubmission>(
+      `UPDATE forms_submission
+          SET responses = $1::jsonb,
+              updated_at = NOW()
+        WHERE submission_id = $2
+          AND tenant_id = $3
+          AND status = 'in_progress'
+          AND deleted_at IS NULL
+       RETURNING submission_id, tenant_id, deployment_id, variant_id,
+                 patient_id, delegate_id, status, responses,
+                 created_at AS started_at, submitted_at`,
+      [JSON.stringify(responsePatch), submissionId, tenantId],
+    );
+
+    if (result.rows.length === 0) {
+      const existence = await tx.query<{ status: string }>(
+        `SELECT status FROM forms_submission
+          WHERE submission_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+        [submissionId, tenantId],
+      );
+      throw new Error(
+        existence.rows.length === 0 ? SUBMISSION_NOT_FOUND : SUBMISSION_NOT_IN_PROGRESS,
+      );
+    }
+
+    const submission = result.rows[0]!;
+    await txCallback(tx, submission);
+    return submission;
+  }, externalTx);
 }
 
+/**
+ * Transition a submission's status. Currently used for `in_progress →
+ * submitted` (final submit). The function clamps allowed transitions at
+ * the SQL level — only `in_progress` rows can transition to `submitted`
+ * via this code path. Other transitions (review → approved, etc.) live
+ * in slices that own those workflows (Async Consult, Pharmacy + Refill).
+ *
+ * **Snapshot capture (DEFERRED — separate slice work):** when status flips
+ * to `submitted`, the submission's rendered form should be captured into
+ * `forms_snapshot` per FORMS_ENGINE v5.2 §Snapshot construction +
+ * Slice PRD v2.1 §4 four-layer model. The snapshot-service.ts file owns
+ * this; it's stubbed today. The status transition + audit + domain event
+ * are committed atomically here; the snapshot capture will hook into the
+ * txCallback once the snapshot-service builds the rendered tree.
+ */
 export async function transitionSubmissionStatus(
-  _tenantId: TenantId,
-  _submissionId: FormSubmissionId,
-  _newStatus: SubmissionStatus,
-  _txCallback: (tx: DbTransaction) => Promise<void>,
+  tenantId: TenantId,
+  submissionId: FormSubmissionId,
+  newStatus: SubmissionStatus,
+  txCallback: (tx: DbTransaction, submission: FormSubmission) => Promise<void>,
+  externalTx?: DbTransaction,
 ): Promise<FormSubmission> {
-  throw new Error('not implemented');
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [tenantId]);
+
+    // For now only the in_progress → submitted transition is supported by
+    // this code path. The migration's CHECK enum allows further states
+    // (under_review, approved, declined, withdrawn) but those belong to
+    // downstream slices.
+    if (newStatus !== 'submitted') {
+      throw new Error(
+        `transitionSubmissionStatus: only 'submitted' is supported at this layer ` +
+          `(received '${newStatus}'). Other lifecycle transitions are owned by ` +
+          `downstream slices (Async Consult, Pharmacy + Refill).`,
+      );
+    }
+
+    const result = await tx.query<FormSubmission>(
+      `UPDATE forms_submission
+          SET status = 'submitted',
+              submitted_at = NOW(),
+              updated_at = NOW()
+        WHERE submission_id = $1
+          AND tenant_id = $2
+          AND status = 'in_progress'
+          AND deleted_at IS NULL
+       RETURNING submission_id, tenant_id, deployment_id, variant_id,
+                 patient_id, delegate_id, status, responses,
+                 created_at AS started_at, submitted_at`,
+      [submissionId, tenantId],
+    );
+
+    if (result.rows.length === 0) {
+      const existence = await tx.query<{ status: string }>(
+        `SELECT status FROM forms_submission
+          WHERE submission_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+        [submissionId, tenantId],
+      );
+      throw new Error(
+        existence.rows.length === 0 ? SUBMISSION_NOT_FOUND : SUBMISSION_NOT_IN_PROGRESS,
+      );
+    }
+
+    const submission = result.rows[0]!;
+    await txCallback(tx, submission);
+    return submission;
+  }, externalTx);
 }
 
 // ---------------------------------------------------------------------------
