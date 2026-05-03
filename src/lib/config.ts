@@ -167,6 +167,17 @@ const ConfigSchema = z.object({
 
   // Research data partnership (per ADR-028) — Stage 2 gate
   RESEARCH_DATA_PARTNERSHIP_ACTIVE: z.enum(['active', 'inactive']).default('inactive'),
+
+  // Resume-token signing secret (Forms/Intake save-and-resume per Slice PRD §8).
+  // The forms-intake module's resume-token.ts derives an HMAC-SHA-256 signature
+  // over (resume_state_id, tenant_id, expires_at_ms) so a leaked token is
+  // (a) tenant-bound (cannot be replayed in another tenant), (b) tamper-evident,
+  // and (c) does not require a separate `resume_token_hash` column on
+  // forms_resume_state (the current migration 006 lacks one).
+  //
+  // **Fail-closed in production** — missing/short secrets at NODE_ENV=production
+  // throw at startup. Dev/test default is deterministic so tests are reproducible.
+  RESUME_TOKEN_SECRET: z.string().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -208,6 +219,26 @@ function loadConfig() {
     );
   }
 
+  // Resume-token secret resolution. Production fail-closed: missing or
+  // <32-char secrets throw at startup. Dev/test get a deterministic default
+  // so the suite is reproducible without env plumbing.
+  let resumeTokenSecret = parsed.RESUME_TOKEN_SECRET ?? '';
+  if (parsed.NODE_ENV === 'production') {
+    if (resumeTokenSecret.length < 32) {
+      throw new Error(
+        'RESUME_TOKEN_SECRET must be set to a value of at least 32 characters in production. ' +
+          'Forms/Intake save-and-resume tokens are HMAC-signed; a missing or weak secret ' +
+          'undermines token integrity per Slice PRD §8.',
+      );
+    }
+  } else if (resumeTokenSecret.length === 0) {
+    // Deterministic dev/test default. Crucially NOT used in production
+    // (the gate above rejects on entry); safe to be deterministic so tests
+    // can re-issue and verify tokens without extra env plumbing.
+    resumeTokenSecret =
+      'dev-resume-token-secret-not-for-production-use-32chars-min-padding-padding';
+  }
+
   return {
     nodeEnv: parsed.NODE_ENV,
     port: parsed.PORT,
@@ -236,6 +267,7 @@ function loadConfig() {
       ENABLE_FULLY_AUTONOMOUS: false as const,
     },
     researchDataPartnershipActive: parsed.RESEARCH_DATA_PARTNERSHIP_ACTIVE === 'active',
+    resumeTokenSecret,
   } as const;
 }
 

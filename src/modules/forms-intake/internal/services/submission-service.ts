@@ -52,7 +52,9 @@ import type {
   UpdateSubmissionResponsesRequest,
 } from '../../schemas.js';
 import * as submissionRepo from '../repositories/submission-repo.js';
-import type { FormSubmission, FormSubmissionId, PatientId } from '../types.js';
+import type { FormSubmission, FormSubmissionId, PatientId, ResumeStateMetadata } from '../types.js';
+
+import { verifyResumeToken } from './resume-token.js';
 
 /**
  * Begin a new submission. Resolves variant assignment via PostHog feature
@@ -410,10 +412,25 @@ export async function submitSubmission(
  * Resume a paused submission. Validates the resume token, expiry, and
  * tenant binding; emits the `forms_resume_state.restored` audit per §8.5.
  *
- * DEFERRED (separate slice handler series): the resume flow lives in
- * dedicated handlers (`POST /v0/forms/resume`, `GET /v0/forms/resume/:t`)
- * with their own ResumeState repo + audit + event work. Stub preserved
- * so existing handler imports compile.
+ * **Still DEFERRED** (the patient-side restoration of partial responses
+ * lives behind several open dependencies):
+ *
+ *   - Migration 006 has no `submission_id` column on `forms_resume_state`,
+ *     so the (resume_state ↔ submission) binding required to surface a
+ *     restored FormSubmission is not yet representable in storage. Either
+ *     migration 007 must add it or the service must reconstruct via
+ *     `(tenant, deployment, patient, status='in_progress')`.
+ *   - The pause/write side that *creates* resume_state rows isn't wired
+ *     yet (`updateResponses` `pause === true` path is still TODO), so
+ *     end-to-end POST /v0/forms/resume cannot be tested without seeding
+ *     rows directly via SQL. Defer until the pause side lands.
+ *   - KMS-decryption of `encrypted_partial_responses` requires the
+ *     `kms.decrypt(tenant, ciphertext)` integration that the v0.1 stub
+ *     gates behind NODE_ENV=test only. Production wiring lands with the
+ *     Identity & Auth slice or its successor.
+ *
+ * The metadata-only read path (`getResumeStateMetadata` below) does NOT
+ * depend on any of the above and IS shipping in this batch.
  */
 export async function resumeSubmission(
   _ctx: TenantContext,
@@ -421,6 +438,73 @@ export async function resumeSubmission(
   _input: ResumeSubmissionRequest,
 ): Promise<FormSubmission> {
   throw new Error('not implemented');
+}
+
+/**
+ * Read the metadata view of a resume_state — what the patient app surfaces
+ * on the dashboard ("[N]% complete · Resume") before the patient clicks.
+ * Metadata only: deployment_id, progress, section, expiry, last_saved_at —
+ * NEVER decrypts `encrypted_partial_responses`.
+ *
+ * Token validation pipeline:
+ *
+ *   1. `verifyResumeToken` checks structure + HMAC signature + token-level
+ *      expiry. Returns null on any failure (constant-time HMAC compare).
+ *   2. The token's tenant_id binding MUST match the request's resolved
+ *      tenant context. A token issued in tenant A presented in tenant B
+ *      surfaces as the same null shape as a missing row (I-025
+ *      tenant-blind).
+ *   3. The repo lookup (`findResumeStateById`) is RLS-guarded. Even if a
+ *      token survived steps 1-2 with cross-tenant identity (it shouldn't,
+ *      but defense-in-depth), RLS rejects the row.
+ *   4. The row's `status` must be `active`. `completed` (already restored)
+ *      and `expired` (cleanup-job processed) both surface as null per
+ *      I-025; we never differentiate "wrong state" from "missing" in the
+ *      patient surface.
+ *   5. The row's `expires_at` must be in the future. The token-level
+ *      expiry from step 1 SHOULD agree with this, but defense-in-depth:
+ *      if a token expiry is somehow ahead of the row expiry, the row
+ *      check still rejects.
+ *
+ * Returns null on every failure mode. Handler maps null to a tenant-blind
+ * 404 envelope per I-025 ERROR_MODEL v5.1.
+ */
+export async function getResumeStateMetadata(
+  ctx: TenantContext,
+  resumeToken: string,
+  externalTx?: DbClient,
+): Promise<ResumeStateMetadata | null> {
+  const verified = verifyResumeToken(resumeToken);
+  if (verified === null) return null;
+
+  // Step 2: token tenant_id binding must match request context. Caller's
+  // tenant is the source of truth; never trust the token's claim alone.
+  if (verified.tenantId !== ctx.tenantId) return null;
+
+  // Step 3: RLS-guarded lookup by primary key.
+  const row = await submissionRepo.findResumeStateById(
+    ctx.tenantId,
+    verified.resumeStateId,
+    externalTx,
+  );
+  if (row === null) return null;
+
+  // Step 4: status gate.
+  if (row.status !== 'active') return null;
+
+  // Step 5: row-level expiry gate (defense-in-depth alongside token-level).
+  if (Date.parse(row.expires_at) <= Date.now()) return null;
+
+  return {
+    resume_state_id: row.resume_state_id,
+    tenant_id: row.tenant_id,
+    deployment_id: row.deployment_id,
+    current_section_index: row.current_section_index,
+    progress_percent: row.progress_percent,
+    status: row.status,
+    expires_at: row.expires_at,
+    last_saved_at: row.last_saved_at,
+  };
 }
 
 /**

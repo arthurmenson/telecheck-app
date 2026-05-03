@@ -140,12 +140,60 @@ export interface FormVariant {
   created_at: string;
 }
 
+/**
+ * forms_resume_state row shape — aligned 1:1 with migration 006.
+ *
+ * **Key migration vs. spec gaps (flagged 2026-05-03):**
+ *
+ *   1. The migration does NOT carry a `submission_id` column — resume_state
+ *      binds to a `(tenant_id, deployment_id, patient_id | device_anonymous_token)`
+ *      tuple, not to a specific submission. Mapping to an in-progress
+ *      `forms_submission` for restoration is a service-layer concern that
+ *      depends on whether the deployment changed since pause (slice §8.3).
+ *
+ *   2. The migration does NOT carry a `resume_token` or `resume_token_hash`
+ *      column. The patient-held "resume token" is materialised at the service
+ *      layer as a self-contained HMAC envelope (see
+ *      `internal/services/resume-token.ts`). Tokens encode the row's primary
+ *      key + tenant + expiry; the row itself is fetched by primary key under
+ *      RLS once the token verifies.
+ *
+ * Both gaps are captured as SPEC ISSUEs per EHBG §12 in the module README;
+ * they are NOT suppressed here. Callers that need the (resume_state ↔ submission)
+ * binding must derive it via `(tenant_id, deployment_id, patient_id, status='in_progress')`
+ * on `forms_submission` once the pause/write side is implemented.
+ */
 export interface ResumeState {
-  id: ResumeStateId;
+  resume_state_id: ResumeStateId;
   tenant_id: TenantId;
-  submission_id: FormSubmissionId;
   patient_id: PatientId | null;
-  resume_token: string; // opaque; encrypted at rest per ADR-024 KMS
+  device_anonymous_token: string | null;
+  deployment_id: FormDeploymentId;
+  variant_id: FormVariantId | null;
+  // Encrypted at rest per ADR-024 KMS; service layer decrypts via lib/kms.ts.
+  // Not surfaced through metadata-only read paths.
+  encrypted_partial_responses: Buffer;
+  current_section_index: number;
+  progress_percent: number;
+  status: 'active' | 'completed' | 'expired';
   expires_at: string;
-  paused_at: string;
+  created_at: string;
+  updated_at: string;
+  last_saved_at: string;
+  resumed_at: string | null;
+}
+
+/**
+ * Patient-app metadata view of a resume_state row — what the dashboard
+ * surfaces ("[N]% complete · Resume") without decrypting partial responses.
+ */
+export interface ResumeStateMetadata {
+  resume_state_id: ResumeStateId;
+  tenant_id: TenantId;
+  deployment_id: FormDeploymentId;
+  current_section_index: number;
+  progress_percent: number;
+  status: 'active' | 'completed' | 'expired';
+  expires_at: string;
+  last_saved_at: string;
 }

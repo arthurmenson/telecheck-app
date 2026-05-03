@@ -666,6 +666,80 @@ export async function promoteVariantToWinner(
 // Resume state repo
 // ---------------------------------------------------------------------------
 
+/**
+ * Read the resume_state row by primary key, scoped to the caller's tenant
+ * via RLS. Returns null on miss OR cross-tenant (RLS rejects) — handler
+ * maps null to a tenant-blind 404 per I-025.
+ *
+ * **Why "by ID" not "by token":** the patient-held token is HMAC-signed
+ * envelope material owned by the service layer (resume-token.ts); the
+ * repo accepts the verified resume_state_id string after token decode +
+ * signature check. Keeping the cryptographic concerns out of the repo
+ * preserves a clean RLS/SQL boundary.
+ *
+ * Renamed from the legacy `findResumeStateByToken` stub on 2026-05-03;
+ * the old signature implied the repo would do hashed-token lookup, but
+ * migration 006 has no `resume_token_hash` column. The HMAC-self-contained
+ * design replaces that storage requirement entirely.
+ */
+export async function findResumeStateById(
+  tenantId: TenantId,
+  resumeStateId: ResumeStateId,
+  externalTx?: DbClient,
+): Promise<ResumeState | null> {
+  return withTenantBoundConnection(
+    tenantId,
+    async (client: DbClient) => {
+      const result = await client.query<ResumeState>(
+        `SELECT resume_state_id,
+                tenant_id,
+                patient_id,
+                device_anonymous_token,
+                deployment_id,
+                variant_id,
+                encrypted_partial_responses,
+                current_section_index,
+                progress_percent,
+                status,
+                expires_at,
+                created_at,
+                updated_at,
+                last_saved_at,
+                resumed_at
+           FROM forms_resume_state
+          WHERE resume_state_id = $1
+            AND tenant_id = $2
+            AND deleted_at IS NULL
+          LIMIT 1`,
+        [resumeStateId, tenantId],
+      );
+      return result.rows[0] ?? null;
+    },
+    externalTx,
+  );
+}
+
+/**
+ * Insert a new resume_state row. Currently NOT YET WIRED — the patient-side
+ * pause path (`updateResponses` with `pause === true`) is still TODO; once
+ * that path is implemented this function will be its repo backing.
+ *
+ * **SPEC ISSUE per EHBG §12** (flagged 2026-05-03):
+ *
+ *   - migration 006 has no `submission_id` column on `forms_resume_state`,
+ *     yet the slice §8 narrative implies a 1:1 binding from a paused
+ *     submission to its resume_state. Either migration 007 must add the
+ *     column, or the service layer must reconstruct the binding via
+ *     `(tenant_id, deployment_id, patient_id, status='in_progress')` on
+ *     `forms_submission`.
+ *
+ *   - `device_anonymous_token` (anonymous-flow path) intersects the broader
+ *     §8.2 device-anonymous flow that today is blocked by
+ *     `forms_submission.patient_id NOT NULL`. Both gaps land together.
+ *
+ * Until the pause path is wired, callers reach this function only through
+ * tests that seed rows directly via SQL.
+ */
 export async function createResumeState(
   _tenantId: TenantId,
   _input: {
@@ -678,16 +752,12 @@ export async function createResumeState(
   throw new Error('not implemented');
 }
 
-export async function findResumeStateByToken(
-  _tenantId: TenantId,
-  _resumeToken: string,
-): Promise<ResumeState | null> {
-  // TODO: SELECT under withTenantBoundConnection. Lookup by hashed token
-  // (the raw token is encrypted at rest per ADR-024 KMS).
-  throw new Error('not implemented');
-}
-
-export async function expireResumeState(
+/**
+ * Mark a resume_state as completed (the patient successfully resumed and
+ * resumed_at was set). NOT YET WIRED — used by the future `restoreSubmission`
+ * service-layer flow. Stub kept for signature stability.
+ */
+export async function markResumeStateCompleted(
   _tenantId: TenantId,
   _resumeStateId: ResumeStateId,
   _txCallback: (tx: DbTransaction) => Promise<void>,
