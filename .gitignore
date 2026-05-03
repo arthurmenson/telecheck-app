@@ -43,6 +43,7 @@ pnpm-debug.log*
 .claude/settings.local.json
 .claude/sessions/
 .claude/transcripts/
+.claude/worktrees/
 
 # Prisma
 prisma/migrations/
