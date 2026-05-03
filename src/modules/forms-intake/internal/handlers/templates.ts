@@ -25,6 +25,7 @@ import {
   PUBLISH_VERSION_NOT_FOUND,
 } from '../repositories/template-repo.js';
 import * as templateService from '../services/template-service.js';
+import { PUBLISH_GATES_NOT_IMPLEMENTED } from '../services/template-service.js';
 
 /**
  * Resolve the acting actor's identity. PLACEHOLDER pending the Identity &
@@ -192,6 +193,17 @@ export async function publishVersionHandler(
       // tooling can distinguish; the wire-out message is uniform.
       throw req.server.httpErrors.badRequest(
         'The requested form version cannot be published in its current state.',
+      );
+    }
+    if (message === PUBLISH_GATES_NOT_IMPLEMENTED) {
+      // 503 Service Unavailable — the publish governance gates haven't
+      // been implemented in this deployment, so publish is fail-closed.
+      // This surfaces to operators as "publishing is not yet enabled in
+      // this environment" rather than a 400 (which would suggest a
+      // client-fixable problem). Codex publishVersion-r1 CRITICAL closure
+      // 2026-05-03.
+      throw req.server.httpErrors.serviceUnavailable(
+        'Form template publishing is not yet enabled in this environment.',
       );
     }
     throw err;

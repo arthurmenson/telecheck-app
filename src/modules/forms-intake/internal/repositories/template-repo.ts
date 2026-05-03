@@ -121,6 +121,13 @@ export async function createDraftTemplate(
     approvalGovernance: unknown;
   },
   txCallback: (tx: DbTransaction, template: FormTemplate) => Promise<void>,
+  /**
+   * Test-only: when supplied, the function runs on the caller's
+   * transaction handle instead of acquiring a fresh pool connection.
+   * Mirrors `lib/db.ts withTransaction`'s externalTx parameter.
+   * Production callers must NOT supply this.
+   */
+  externalTx?: DbTransaction,
 ): Promise<FormTemplate> {
   return withTransaction(async (tx) => {
     // Bind tenant context inside the transaction so RLS policies on
@@ -194,7 +201,7 @@ export async function createDraftTemplate(
     await txCallback(tx, template);
 
     return template;
-  });
+  }, externalTx);
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +259,12 @@ export async function publishVersion(
     published: FormTemplate,
     supersededVersionId: FormVersionId | null,
   ) => Promise<void>,
+  /**
+   * Test-only: see createDraftTemplate's externalTx param. Production
+   * code must NOT supply this — durability is guaranteed by the
+   * BEGIN/COMMIT pool path.
+   */
+  externalTx?: DbTransaction,
 ): Promise<FormTemplate> {
   return withTransaction(async (tx) => {
     await tx.query('SELECT set_tenant_context($1)', [tenantId]);
@@ -348,7 +361,7 @@ export async function publishVersion(
     await txCallback(tx, published, supersededVersionId);
 
     return published;
-  });
+  }, externalTx);
 }
 
 /**

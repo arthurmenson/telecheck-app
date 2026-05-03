@@ -20,6 +20,7 @@
  *   - INVARIANT I-030 (no care-touching dependency on `research_consent_status`)
  */
 
+import type { DbTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import {
   emitFormsDeploymentCreated as emitFormsDeploymentCreatedAudit,
@@ -61,6 +62,7 @@ export async function createDraftTemplate(
   ctx: TenantContext,
   actorId: string,
   input: CreateTemplateRequest,
+  externalTx?: DbTransaction,
 ): Promise<FormTemplate> {
   return templateRepo.createDraftTemplate(
     ctx.tenantId,
@@ -106,8 +108,24 @@ export async function createDraftTemplate(
         actorId,
       });
     },
+    externalTx,
   );
 }
+
+/**
+ * Sentinel error code thrown by `publishVersion` when the four governance
+ * pre-publish gates aren't implemented yet AND the deployment hasn't
+ * explicitly opted into the gate-bypass via the env flag.
+ *
+ * Per Codex publishVersion-r1 CRITICAL closure 2026-05-03: the gates
+ * (I-030 static analysis, MarketingCopy resolution, Mode 2 contract,
+ * L3 dual-control) ARE the safety floor for publishing. Until they're
+ * implemented, the publish path MUST fail closed in production —
+ * shipping the durability + supersession plumbing without the gates
+ * was a "draft becomes published with no governance" hazard. Tests +
+ * local dev opt in via `FORMS_PUBLISH_GATES_BYPASS = 'unsafe-test-only'`.
+ */
+export const PUBLISH_GATES_NOT_IMPLEMENTED = 'forms.publish.gates_not_implemented';
 
 /**
  * Publish a draft version. Pre-publish gates:
@@ -126,13 +144,21 @@ export async function createDraftTemplate(
  * version → published; emits the corresponding governance audit + domain
  * event inside the same transaction.
  *
- * **Pre-publish gate scaffolding (Forms/Intake bootstrap commit):** the
- * four governance gates above arrive with the v1.10 governance work
- * (I-030 static analyzer, MarketingCopy resolver, Mode 2 contract
- * validator, L3 dual-control). At this commit they are TODO stubs noted
- * in comments below; the publish path's durability + supersession +
- * audit-emission pattern is implemented end-to-end so the gates can
- * slot in front without restructuring the write path.
+ * **Pre-publish gate scaffolding (fail-closed at this commit):**
+ * The four governance gates arrive with the v1.10 governance work (I-030
+ * static analyzer, MarketingCopy resolver, Mode 2 contract validator, L3
+ * dual-control). At this commit, the publish path FAILS CLOSED in
+ * production — without the gates, a draft with prohibited
+ * `research_consent_status` dependencies, unapproved marketing copy, or
+ * malformed Mode 2 contract could promote to published. The durability +
+ * supersession + audit-emission pattern is implemented end-to-end so the
+ * gates can slot in front without restructuring the write path.
+ *
+ * Bypass for local dev / integration tests:
+ *   `FORMS_PUBLISH_GATES_BYPASS='unsafe-test-only'`
+ * The literal string is intentionally hostile so production deployments
+ * can't accidentally set it via routine env config (no `'true'` /
+ * `'enabled'` typo path).
  *
  * **Sentinel-throw error contract (mirrors createDeployment):**
  *   - `forms.publish.version_not_found` — version doesn't exist in this
@@ -161,7 +187,23 @@ export async function publishVersion(
   actorId: string,
   versionId: FormTemplateId,
   input: PublishVersionRequest,
+  externalTx?: DbTransaction,
 ): Promise<FormTemplate> {
+  // FAIL-CLOSED gate per Codex publishVersion-r1 CRITICAL closure
+  // (2026-05-03). Until the four governance gates below are implemented,
+  // publishing in production is unsafe — a draft with prohibited
+  // research_consent_status dependencies, unapproved marketing copy, or
+  // malformed Mode 2 contract could promote to published.
+  //
+  // The bypass env value is intentionally a hostile sentinel string
+  // ('unsafe-test-only') so a routine env config typo can't accidentally
+  // open the gate in production. Even with NODE_ENV=test, the bypass
+  // must be explicit.
+  const gateBypass = process.env['FORMS_PUBLISH_GATES_BYPASS'];
+  if (gateBypass !== 'unsafe-test-only') {
+    throw new Error(PUBLISH_GATES_NOT_IMPLEMENTED);
+  }
+
   // TODO (deferred — v1.10 governance work):
   //   1. Run six-category I-030 static analyzer over presentation_content +
   //      branching_logic + eligibility_logic + approval_governance for any
@@ -174,15 +216,21 @@ export async function publishVersion(
   //   4. Verify L3 dual-control: the calling actor MUST NOT be the same
   //      operator who authored any pending eligibility-logic change. Cross-
   //      check against the audit chain.
-  // All four gates SHOULD be invoked here (before delegating to the repo)
-  // so a gate failure aborts before any DB write. The repo's withTransaction
-  // boundary is the durability point; the gates above it are governance.
+  // All four gates land here — before the repo delegate — so a gate
+  // failure aborts before any DB write. When they land, the FAIL-CLOSED
+  // env check above can be removed (the gates themselves become the
+  // safety floor); until then it's the only thing keeping publish from
+  // shipping unsafe drafts.
 
   return templateRepo.publishVersion(
     ctx.tenantId,
     versionId,
     async (tx, published, supersededVersionId) => {
-      await emitFormsTemplateVersionPublishedAudit(
+      // Capture the audit envelope so we can thread its audit_id into the
+      // domain event — without that correlation a subscriber can't prove
+      // the wire-side event corresponds to the immutable Category B audit
+      // record (Codex publishVersion-r1 HIGH closure 2026-05-03).
+      const auditEnvelope = await emitFormsTemplateVersionPublishedAudit(
         {
           tenantId: ctx.tenantId,
           actorId,
@@ -208,8 +256,10 @@ export async function publishVersion(
         priorPublishedVersionId: supersededVersionId,
         actorId,
         changeNotes: input.changeNotes ?? null,
+        auditId: auditEnvelope.audit_id,
       });
     },
+    externalTx,
   );
 }
 

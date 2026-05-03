@@ -121,6 +121,16 @@ export async function emitFormsTemplateVersionPublished(
     priorPublishedVersionId: FormVersionId | null;
     actorId: string;
     changeNotes: string | null;
+    /**
+     * audit_id of the Category B `forms_template_version_published` audit
+     * record emitted in the SAME transaction as this event. Subscribers and
+     * auditors use this to correlate the wire-side event to the immutable
+     * audit row that authorized the lifecycle transition (Codex
+     * publishVersion-r1 HIGH closure 2026-05-03 — without this the event
+     * could be replayed/rerouted with no provable link to the governance
+     * record).
+     */
+    auditId: string;
   },
 ): Promise<void> {
   await emitDomainEvent(tx, {
@@ -137,6 +147,7 @@ export async function emitFormsTemplateVersionPublished(
       prior_published_version_id: args.priorPublishedVersionId,
       actor_id: args.actorId,
       change_notes: args.changeNotes,
+      audit_id: args.auditId,
     },
     occurred_at: new Date().toISOString(),
   });

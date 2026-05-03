@@ -180,8 +180,33 @@ export async function withTenantBoundConnection<T>(
  * Per I-003, audit emission failures inside `fn` MUST cause the transaction
  * to roll back so the upstream business action is reverted — this helper
  * is the mechanism.
+ *
+ * **`externalTx` opt-in (Codex publishVersion-r1 MEDIUM closure 2026-05-03):**
+ * When provided, `fn` runs against the supplied DbTransaction directly
+ * without acquiring a fresh pool connection or issuing BEGIN/COMMIT —
+ * the caller owns the transaction lifecycle. This is what unblocks
+ * integration tests that need a service-level call to share state with
+ * a savepoint-isolated test client.
+ *
+ * Mirror of the `lib/audit.ts emitAudit(input, tx?)` pattern. Production
+ * code must NOT pass externalTx — the durability discipline depends on
+ * the BEGIN/COMMIT happening here. Tests pass `getTestClient()` so the
+ * service's transactional work shares the test outer transaction and
+ * gets rolled back at savepoint end with everything else.
+ *
+ * (Why not gate on NODE_ENV: gating is harder to grep for than the
+ * presence of an explicit parameter at call sites. Reviews of `git grep
+ * 'withTransaction(.*,.*,'` are sufficient to catch any production
+ * code that passes externalTx.)
  */
-export async function withTransaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
+export async function withTransaction<T>(
+  fn: (tx: DbTransaction) => Promise<T>,
+  externalTx?: DbTransaction,
+): Promise<T> {
+  if (externalTx !== undefined) {
+    // Caller owns BEGIN/COMMIT + connection lifecycle. We just run `fn`.
+    return fn(externalTx);
+  }
   const pool = getPool();
   const client = await pool.connect();
   try {
