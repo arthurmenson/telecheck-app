@@ -120,16 +120,23 @@ async function seedActiveDeployment(opts: {
 }
 
 /**
- * Seed an additional published template under the given tenant — used as
- * a `variantTemplateId` for non-Control variant arms (which use a
+ * Seed an additional template under the given tenant — used as a
+ * `variantTemplateId` for non-Control variant arms (which use a
  * separately-authored modified template per Slice PRD §14.1).
+ *
+ * @param opts.status — defaults to 'published' (the only status that
+ *   passes the variant-create publish gate). Tests exercising the
+ *   Codex variants-r1 HIGH-2 closure (publish gate) pass 'draft' /
+ *   'superseded' / 'archived' explicitly to prove rejection.
  */
 async function seedAdditionalTemplate(opts: {
   ctx: TenantContext;
   programId: string;
+  status?: 'draft' | 'published' | 'superseded' | 'archived';
 }): Promise<string> {
   const client = getTestClient();
   const templateId = ulid();
+  const status = opts.status ?? 'published';
   await withTenantContext(opts.ctx.tenantId, async () => {
     await client.query(
       `INSERT INTO forms_template (
@@ -140,18 +147,22 @@ async function seedAdditionalTemplate(opts: {
           published_at, created_at, updated_at
        ) VALUES (
           $1, $2, $3, $4,
-          1, 'published', $5, $6,
+          1, $5, $6, $7,
           '{}'::jsonb, '{}'::jsonb,
           '{}'::jsonb, '{}'::jsonb,
-          NOW(), NOW(), NOW()
+          $8, NOW(), NOW()
        )`,
       [
         templateId,
         opts.ctx.tenantId,
         opts.programId,
         opts.ctx.countryOfCare,
+        status,
         `test-variant-tpl-${templateId.slice(0, 8)}`,
         ulid(),
+        // published_at must be set when status='published' (the migration
+        // doesn't enforce this directly, but other repo paths assume it).
+        status === 'published' ? new Date() : null,
       ],
     );
   });
@@ -345,6 +356,88 @@ describe('forms-intake createVariant — failure modes', () => {
             variantTemplateId: fakeTemplate,
             label: 'control',
             trafficPercent: 100,
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.VARIANT_PRECONDITION_FAILED);
+  });
+
+  // Codex variants-r1 HIGH-2 closure 2026-05-03 — variant_template MUST be
+  // published. A draft / superseded / archived template represents content
+  // that hasn't passed I-013 + I-015 + I-030 publish-time gates; routing
+  // active intake traffic to it is a clinical safety violation.
+  it('rejects a draft variant_template with VARIANT_PRECONDITION_FAILED', async () => {
+    const programId = `prog_var_draft_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const draftTemplateId = await seedAdditionalTemplate({
+      ctx: US_CTX,
+      programId,
+      status: 'draft',
+    });
+
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        templateService.createVariant(
+          US_CTX,
+          'op_variant_draft',
+          {
+            deploymentId,
+            variantTemplateId: draftTemplateId,
+            label: 'A',
+            trafficPercent: 25,
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.VARIANT_PRECONDITION_FAILED);
+  });
+
+  it('rejects a superseded variant_template with VARIANT_PRECONDITION_FAILED', async () => {
+    const programId = `prog_var_super_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const supersededTemplateId = await seedAdditionalTemplate({
+      ctx: US_CTX,
+      programId,
+      status: 'superseded',
+    });
+
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        templateService.createVariant(
+          US_CTX,
+          'op_variant_super',
+          {
+            deploymentId,
+            variantTemplateId: supersededTemplateId,
+            label: 'A',
+            trafficPercent: 25,
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(submissionRepo.VARIANT_PRECONDITION_FAILED);
+  });
+
+  it('rejects an archived variant_template with VARIANT_PRECONDITION_FAILED', async () => {
+    const programId = `prog_var_arch_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const archivedTemplateId = await seedAdditionalTemplate({
+      ctx: US_CTX,
+      programId,
+      status: 'archived',
+    });
+
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        templateService.createVariant(
+          US_CTX,
+          'op_variant_arch',
+          {
+            deploymentId,
+            variantTemplateId: archivedTemplateId,
+            label: 'A',
+            trafficPercent: 25,
           },
           getTestClient(),
         ),

@@ -655,23 +655,41 @@ export const VARIANT_PRECONDITION_FAILED = 'forms.variant.precondition_failed';
 export const VARIANT_LABEL_CONFLICT = 'forms.variant.label_conflict';
 
 /**
- * Create a new A/B variant arm for a deployment. Same INSERT...SELECT
- * concurrency-safe precondition pattern as `createActiveDeployment`:
+ * Create a new A/B variant arm for a deployment.
  *
- *   - The SELECT clause restricts to a deployment that exists in this
- *     tenant AND is not retired AND a variant_template that exists in
- *     this tenant.
- *   - If any of those preconditions fails between the service-layer
- *     pre-check and the INSERT (TOCTOU), the SELECT returns zero rows,
- *     INSERT writes nothing, RETURNING is empty, and the repo throws
- *     `VARIANT_PRECONDITION_FAILED`.
- *   - The composite FK `(tenant_id, variant_template_id) → forms_template`
- *     provides the cross-tenant guarantee independently.
+ * Three concurrent-safety layers (Codex variants-r1 closure 2026-05-03):
  *
- * The unique-label-per-deployment constraint surfaces as a `23505`
- * SQLSTATE; we translate it to `VARIANT_LABEL_CONFLICT` so the service
- * layer can map both preconditions to the same tenant-blind 400 envelope
- * with operator-distinguishable codes.
+ *   1. **Pessimistic row lock on the deployment** via `SELECT ... FOR UPDATE`.
+ *      Closes Codex variants-r1 HIGH-1 (TOCTOU on concurrent retire).
+ *      The prior implementation used a plain INSERT...SELECT predicate
+ *      against `retired_at IS NULL`; under READ COMMITTED a concurrent
+ *      `retireDeployment` UPDATE could interleave: variant-create reads
+ *      pre-retire state, retire UPDATEs and commits, variant-create
+ *      INSERTs an active variant on a now-retired deployment. The
+ *      `FOR UPDATE` on the deployment row blocks the variant-create
+ *      until any in-flight retire commits, then the `retired_at IS NULL`
+ *      predicate re-evaluates against the post-commit state — so a
+ *      concurrent retire deterministically causes the variant-create to
+ *      see 0 rows and throw VARIANT_PRECONDITION_FAILED.
+ *
+ *   2. **Publish-status gate on `variant_template`** via
+ *      `t.status = 'published'`. Closes Codex variants-r1 HIGH-2 (the
+ *      prior implementation only checked tenant alignment, allowing a
+ *      tenant admin to attach a draft / superseded / archived template
+ *      as an active variant arm — bypassing I-013 published-version
+ *      immutability + I-015 dual-control + I-030 research-consent
+ *      static analysis that publishVersion enforces). Same-tenant draft
+ *      content NEVER routes to active intake traffic.
+ *
+ *   3. **Composite FKs** at the DB layer enforce same-tenant alignment
+ *      independently as belt-and-suspenders.
+ *
+ * The unique-label-per-deployment constraint surfaces as `23505`
+ * SQLSTATE; translated to `VARIANT_LABEL_CONFLICT`. Predicate-zero-rows
+ * (any of: deployment missing/retired, template missing/unpublished,
+ * cross-tenant) surfaces as `VARIANT_PRECONDITION_FAILED`. The service
+ * layer maps both to the same tenant-blind 400 envelope per I-025;
+ * operator-facing distinction is preserved through the structured codes.
  */
 export async function createVariant(
   tenantId: TenantId,
@@ -692,13 +710,34 @@ export async function createVariant(
 
     let result;
     try {
-      // INSERT...SELECT: deployment must exist + not be retired, AND
-      // variant_template must exist (both in this tenant). Composite FKs
-      // provide cross-tenant defense; the SELECT predicate provides the
-      // active-deployment + same-tenant template guarantee atomically with
-      // the INSERT.
+      // CTE-based INSERT...SELECT with two locked sub-selects:
+      //   - locked_deployment: SELECT FOR UPDATE so a concurrent
+      //     retireDeployment UPDATE blocks; predicate `retired_at IS NULL`
+      //     re-evaluates after the lock is acquired.
+      //   - eligible_template: predicate `status = 'published'` blocks
+      //     non-published templates from becoming variant arms. We do NOT
+      //     FOR UPDATE here — supersede/archive of a published version is
+      //     not the concurrency hazard the variant-create flow is fighting
+      //     (and would block the publish path unnecessarily). The publish
+      //     transitions are governed by their own state-machine guards
+      //     (I-013 immutability) which are separate from this.
       result = await tx.query<FormVariant>(
-        `INSERT INTO forms_variant (
+        `WITH locked_deployment AS (
+            SELECT deployment_id, tenant_id
+              FROM forms_deployment
+             WHERE tenant_id = $2::varchar
+               AND deployment_id = $6::varchar
+               AND retired_at IS NULL
+             FOR UPDATE
+         ),
+         eligible_template AS (
+            SELECT template_id, tenant_id
+              FROM forms_template
+             WHERE tenant_id = $2::varchar
+               AND template_id = $7::varchar
+               AND status = 'published'
+         )
+         INSERT INTO forms_variant (
             variant_id, tenant_id, deployment_id,
             variant_label, variant_template_id,
             traffic_percent, status, created_by
@@ -707,14 +746,8 @@ export async function createVariant(
             $1::varchar, $2::varchar, d.deployment_id,
             $3::varchar, t.template_id,
             $4::int, 'active', $5::varchar
-           FROM forms_deployment d
-           JOIN forms_template t
-             ON t.tenant_id = d.tenant_id
-           WHERE d.tenant_id = $2::varchar
-             AND d.deployment_id = $6::varchar
-             AND d.retired_at IS NULL
-             AND t.tenant_id = $2::varchar
-             AND t.template_id = $7::varchar
+           FROM locked_deployment d
+          CROSS JOIN eligible_template t
          RETURNING variant_id, tenant_id, deployment_id,
                    variant_label, variant_template_id,
                    traffic_percent, posthog_flag_key,
