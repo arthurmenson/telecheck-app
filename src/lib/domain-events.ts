@@ -26,12 +26,22 @@
  *     `query()`, compatible with both `pg.PoolClient` and Prisma `$transaction`.
  *
  * Open questions for Engineering Lead:
- *   - Migration 004 (`domain_events_outbox` table schema) is not yet authored.
- *     This INSERT will fail until that migration is applied.
  *   - Outbox processor (reads outbox and publishes to event bus) is a separate
  *     concern — deferred to the infrastructure slice.
- *   - `event_id` generation: currently uses `crypto.randomUUID()` as a placeholder.
- *     Spec uses ULID format (`dom_<ULID>`); add `ulid` dependency when available.
+ *   - `event_id` is generated as a UUID v4 via `crypto.randomUUID()` to match
+ *     the migration 004 column type (UUID PRIMARY KEY DEFAULT uuid_generate_v4()).
+ *     When a ULID library is added, this can swap to ULID strings AND the
+ *     migration 004 column type must change to TEXT — the two changes are
+ *     coupled (same pattern as the audit_id change in audit.ts).
+ *
+ * Resolved (foundation wire-up patch v0.2 — 2026-05-02):
+ *   - Migration 004 IS authored. The INSERT below targets the real
+ *     `domain_events_outbox` table created by that migration.
+ *   - `event_id` now uses crypto.randomUUID() to produce a valid UUID v4
+ *     (the prior `dom_${...}` placeholder failed UUID syntax validation).
+ *   - `occurred_at` (business clock) is preserved inside the payload JSONB
+ *     since the migration's column set has only `created_at` (wall clock,
+ *     DEFAULT NOW()). Outbox consumers reading payload see both clocks.
  */
 
 import crypto from 'crypto';
@@ -113,8 +123,9 @@ export async function emitDomainEvent(
     throw new Error('emitDomainEvent: event_type is required');
   }
 
-  // Build the full envelope
-  const eventId = `dom_${crypto.randomUUID().replace(/-/g, '')}`; // STUB: replace with ULID
+  // Build the full envelope. event_id is a UUID v4 to match migration 004's
+  // `event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4()` column type.
+  const eventId = crypto.randomUUID();
   const partitionKey = `${input.tenant_id}:${input.aggregate_id}`;
 
   const envelope: DomainEventEnvelope = {
@@ -123,25 +134,45 @@ export async function emitDomainEvent(
     ...input,
   };
 
-  // Insert into the outbox within the provided transaction.
-  // STUB: migration 004 (`domain_events_outbox` table) not yet authored.
-  //       This query will fail until that migration is applied.
-  await tx.query(
-    `INSERT INTO domain_events_outbox
-       (event_id, tenant_id, aggregate_type, aggregate_id, event_type,
-        payload, partition_key, occurred_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [
-      envelope.event_id,
-      envelope.tenant_id,
-      envelope.aggregate_type,
-      envelope.aggregate_id,
-      envelope.event_type,
-      JSON.stringify(envelope.payload),
-      envelope.partition_key,
-      envelope.occurred_at,
-    ],
-  );
+  // Insert into the outbox within the provided transaction. Migration 004's
+  // table has columns: event_id (UUID), tenant_id, aggregate_type,
+  // aggregate_id, event_type, partition_key, payload (JSONB), published_at,
+  // attempt_count, created_at (wall clock; DEFAULT NOW()). The full envelope
+  // including occurred_at (business clock) is stored in payload so consumers
+  // see both timestamps without needing to join other tables.
+  const payloadWithBusinessClock = {
+    ...envelope.payload,
+    occurred_at: envelope.occurred_at,
+  };
+
+  try {
+    await tx.query(
+      `INSERT INTO domain_events_outbox (
+          event_id, tenant_id, aggregate_type, aggregate_id, event_type,
+          partition_key, payload
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [
+        envelope.event_id,
+        envelope.tenant_id,
+        envelope.aggregate_type,
+        envelope.aggregate_id,
+        envelope.event_type,
+        envelope.partition_key,
+        JSON.stringify(payloadWithBusinessClock),
+      ],
+    );
+  } catch (err) {
+    // Per I-016, domain events are immutable — but the INSERT itself can
+    // legitimately fail (constraint violation, connection drop, etc.). Wrap
+    // the error with context so the caller's transaction aborts cleanly and
+    // upstream debugging is easier.
+    throw new Error(
+      `emitDomainEvent: INSERT failed for event_type "${envelope.event_type}" ` +
+        `(tenant=${envelope.tenant_id}, aggregate=${envelope.aggregate_type}/${envelope.aggregate_id}, ` +
+        `event_id=${envelope.event_id}): ${err instanceof Error ? err.message : String(err)} ` +
+        `— I-016 + same-transaction-outbox semantics require the caller transaction to abort.`,
+    );
+  }
 
   return envelope;
 }

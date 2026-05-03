@@ -320,13 +320,20 @@ export function assertAuditEmittedFor(actionId: string, action: AuditAction): vo
 
 // ---------------------------------------------------------------------------
 // Hash chain helper
-// STUB: queries DB for previous hash; replace with real DB query.
 // ---------------------------------------------------------------------------
 
-function computeGenesisHash(patientId: string): string {
+/**
+ * Compute the genesis hash for a partition. Per AUDIT_EVENTS v5.2 hash-chain
+ * construction, the FIRST record in any partition uses prev_hash =
+ * SHA-256('GENESIS:' || partition_key). The DB-side trigger
+ * (audit_records_hash_insert in migration 002) computes the same value
+ * canonically; this app-side helper exists so the envelope returned by
+ * emitAudit is byte-identical to what the DB stored.
+ */
+function computeGenesisHash(partitionKey: string): string {
   return crypto
     .createHash('sha256')
-    .update(`GENESIS:${patientId}`)
+    .update(`GENESIS:${partitionKey}`)
     .digest('hex');
 }
 
@@ -337,14 +344,71 @@ function computeRecordHash(envelope: Omit<AuditEnvelope, 'hash_chain'>): string 
     .digest('hex');
 }
 
-// STUB: in production, query `SELECT record_hash, sequence_number FROM audit_records
-// WHERE target_patient_id = $1 ORDER BY sequence_number DESC LIMIT 1`
+/**
+ * Look up the most recent record_hash + sequence_number for a partition
+ * (target_patient_id, with 'PLATFORM' sentinel for non-patient events
+ * matching the migration 002 trigger convention).
+ *
+ * When a `tx` is provided, queries the real audit_records table within
+ * the caller's transaction (so the FOR UPDATE row lock serializes
+ * concurrent emissions on the same partition).
+ *
+ * When `tx` is omitted, returns genesis values — used by:
+ *   - NODE_ENV=test paths where unit tests don't carry a DB context
+ *   - The first record in any partition (DB returns no rows; we return
+ *     genesis regardless of whether tx was passed)
+ *
+ * (Patch v0.4 — 2026-05-02: replaces the prior unconditional-genesis stub
+ *  with a real DB lookup when tx is available, closing the foundation-
+ *  layer wire-up gap.)
+ */
 async function getPreviousHashForPartition(
-  _patientId: string,
+  patientId: string,
+  tx?: AuditDbClient,
 ): Promise<{ previousHash: string; sequenceNumber: number }> {
-  // STUB: returns genesis values. Real implementation queries migration 002's
-  // audit_records table.
-  return { previousHash: computeGenesisHash(_patientId), sequenceNumber: 0 };
+  const partitionKey = patientId.length > 0 ? patientId : 'PLATFORM';
+
+  if (tx === undefined) {
+    return {
+      previousHash: computeGenesisHash(partitionKey),
+      sequenceNumber: 0,
+    };
+  }
+
+  const result = await tx.query(
+    `SELECT encode(record_hash, 'hex') AS record_hash_hex, sequence_number
+       FROM audit_records
+      WHERE COALESCE(target_patient_id, 'PLATFORM') = $1
+      ORDER BY sequence_number DESC
+      LIMIT 1
+      FOR UPDATE`,
+    [partitionKey],
+  );
+
+  const rows = result.rows as Array<{
+    record_hash_hex: string;
+    sequence_number: number;
+  }>;
+
+  if (rows.length === 0) {
+    return {
+      previousHash: computeGenesisHash(partitionKey),
+      sequenceNumber: 0,
+    };
+  }
+
+  const row = rows[0];
+  if (row === undefined) {
+    return {
+      previousHash: computeGenesisHash(partitionKey),
+      sequenceNumber: 0,
+    };
+  }
+
+  return {
+    previousHash: row.record_hash_hex,
+    sequenceNumber: row.sequence_number,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -524,9 +588,12 @@ export async function emitAudit(
     );
   }
 
-  // 4. Compute hash chain
+  // 4. Compute hash chain (queries audit_records under tx for FOR UPDATE
+  //    serialization on the same partition; falls back to genesis when no tx
+  //    is provided per the test/unwired path)
   const { previousHash, sequenceNumber } = await getPreviousHashForPartition(
     input.target_patient_id,
+    tx,
   );
 
   // Build the envelope without hash_chain first (needed for record_hash).

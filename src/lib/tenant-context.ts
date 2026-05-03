@@ -49,6 +49,8 @@
 
 import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastify';
 import fp from 'fastify-plugin';
+
+import { withConnection } from './db.js';
 import { type TenantId, asTenantId } from './glossary.js';
 
 // ---------------------------------------------------------------------------
@@ -155,10 +157,83 @@ const SUBDOMAIN_TENANT_MAP: Record<string, SubdomainTenantEntry> = {
   },
 };
 
-function resolveHostToTenant(host: string): SubdomainTenantEntry | null {
+function resolveHostFromMap(host: string): SubdomainTenantEntry | null {
   // Strip port if present (e.g., localhost:3000 → localhost)
   const hostname = host.split(':')[0]?.toLowerCase() ?? '';
   return SUBDOMAIN_TENANT_MAP[hostname] ?? null;
+}
+
+/**
+ * Look up a tenant by `consumer_subdomain` against the migration 001
+ * `tenants` table. Returns a SubdomainTenantEntry on hit, null on miss.
+ *
+ * (Patch v0.2 — 2026-05-02: previously, only the hardcoded SUBDOMAIN_TENANT_MAP
+ *  was consulted, so any tenant created at runtime via `POST /v0/tenants` was
+ *  unresolvable until a code change added it to the map. Now the map is the
+ *  fast-path for the two day-1 tenants + localhost dev; misses fall through
+ *  to a DB query so dynamically-provisioned tenants are first-class.)
+ *
+ * Throws on connection / query failure — fail-closed per I-023; a silent
+ * null return on DB error could let a request through with `unknown` tenant.
+ */
+async function resolveHostFromDb(host: string): Promise<SubdomainTenantEntry | null> {
+  const hostname = host.split(':')[0]?.toLowerCase() ?? '';
+  if (hostname === '') return null;
+
+  return withConnection(async (client) => {
+    const result = await client.query<{
+      id: string;
+      display_name: string;
+      consumer_dba: string;
+      legal_entity: string;
+      consumer_subdomain: string;
+      country_of_care: string;
+      kms_key_alias: string;
+    }>(
+      `SELECT id, display_name, consumer_dba, legal_entity, consumer_subdomain,
+              country_of_care, kms_key_alias
+         FROM tenants
+        WHERE LOWER(consumer_subdomain) = $1
+          AND status = 'active'
+        LIMIT 1`,
+      [hostname],
+    );
+
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    if (row === undefined) return null;
+
+    if (row.country_of_care !== 'US' && row.country_of_care !== 'GH') {
+      // Defensive: the DB CHECK constraint should already enforce this set,
+      // but if the constraint is widened in a future migration without
+      // updating this discriminated union, the request must fail closed.
+      throw new Error(
+        `tenant-context: unsupported country_of_care '${row.country_of_care}' ` +
+          `for tenant '${row.id}'. Update the SubdomainTenantEntry union when ` +
+          `adding new countries.`,
+      );
+    }
+
+    return {
+      tenantId: row.id,
+      displayName: row.display_name,
+      countryOfCare: row.country_of_care,
+      kmsKeyAlias: row.kms_key_alias,
+      consumerDba: row.consumer_dba,
+      legalEntity: row.legal_entity,
+      consumerSubdomain: row.consumer_subdomain,
+    };
+  });
+}
+
+/**
+ * Two-tier resolver: hardcoded map (fast path; covers day-1 tenants +
+ * localhost dev) → DB query (covers dynamically-provisioned tenants).
+ */
+async function resolveHostToTenant(host: string): Promise<SubdomainTenantEntry | null> {
+  const fromMap = resolveHostFromMap(host);
+  if (fromMap !== null) return fromMap;
+  return resolveHostFromDb(host);
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +290,7 @@ const tenantContextPluginImpl: FastifyPluginAsync<TenantContextPluginOptions> = 
       return;
     }
 
-    const entry = resolveHostToTenant(host);
+    const entry = await resolveHostToTenant(host);
     if (!entry) {
       // I-023 fail-closed + I-025 tenant-blind: unknown host = 400.
       // Do NOT return 404 or otherwise confirm tenant existence.

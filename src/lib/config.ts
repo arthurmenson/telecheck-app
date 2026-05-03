@@ -92,6 +92,20 @@ const ConfigSchema = z.object({
     .min(1, 'DATABASE_URL is required')
     .url('DATABASE_URL must be a valid PostgreSQL connection string'),
 
+  // Connection pool sizing — defaults appropriate for a single-process
+  // development run; production should tune per concurrent-request capacity.
+  DB_POOL_MAX: z
+    .string()
+    .default('10')
+    .transform((v) => Number.parseInt(v, 10))
+    .pipe(z.number().int().min(1).max(200)),
+
+  // SSL posture for the DB connection. Production deployments MUST set this
+  // to 'require'. Local dev with Postgres in Docker / native typically uses
+  // 'disable'. There is no 'verify-full' option here — that is a deployment
+  // concern handled via the connection string `sslmode=verify-full`.
+  DATABASE_SSL_MODE: z.enum(['disable', 'require']).default('disable'),
+
   // Redis (idempotency cache + queues)
   REDIS_URL: z.string().min(1, 'REDIS_URL is required').url('REDIS_URL must be a valid Redis connection string'),
 
@@ -167,6 +181,8 @@ function loadConfig() {
     logLevel: parsed.LOG_LEVEL,
     logRedactPaths: parsed.LOG_REDACT_PATHS ?? [],
     databaseUrl: parsed.DATABASE_URL,
+    dbPoolMax: parsed.DB_POOL_MAX,
+    dbSslMode: parsed.DATABASE_SSL_MODE,
     redisUrl: parsed.REDIS_URL,
     tenantKmsLocalDevKey: parsed.TENANT_KMS_LOCAL_DEV_KEY,
     anthropicApiKey: parsed.ANTHROPIC_API_KEY,

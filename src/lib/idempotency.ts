@@ -44,9 +44,16 @@ import crypto from 'crypto';
 import fp from 'fastify-plugin';
 import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 
+import { withConnection } from './db.js';
+
 // ---------------------------------------------------------------------------
-// Idempotency store interface
-// STUB: in-memory Map. Replace with DB-backed store per IDEMPOTENCY v5.1.
+// Idempotency store — DB-backed against migration 005 idempotency_keys table
+//
+// (Patch v0.2 — 2026-05-02: replaces the prior in-memory Map with durable
+//  Postgres-backed lookup + insert. The table's 4-tuple PK
+//  (tenant_id, key, endpoint, actor_id) per CDM SPEC ISSUE P-010 + Codex
+//  foundation HIGH-2 closure means the same key reused on a different
+//  endpoint or by a different actor produces an independent record.)
 // ---------------------------------------------------------------------------
 
 interface CachedResponse {
@@ -56,28 +63,93 @@ interface CachedResponse {
   cachedAt: Date;
 }
 
-type IdempotencyCacheKey = string; // `${tenantId}:${key}:${endpoint}:${actorId}`
-
-// STUB: in-memory store. NOT crash-safe. Replace with DB implementation.
-const _inMemoryStore = new Map<IdempotencyCacheKey, CachedResponse>();
-
-const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours per IDEMPOTENCY v5.1
-
-function buildCacheKey(
-  tenantId: string,
-  idempotencyKey: string,
-  endpoint: string,
-  actorId: string,
-): IdempotencyCacheKey {
-  return `${tenantId}:${idempotencyKey}:${endpoint}:${actorId}`;
-}
-
-function isExpired(entry: CachedResponse): boolean {
-  return Date.now() - entry.cachedAt.getTime() > TTL_MS;
-}
-
 function hashBody(body: string): string {
   return crypto.createHash('sha256').update(body).digest('hex');
+}
+
+/**
+ * Look up a cached response for the given 4-tuple key. Returns null if no
+ * record exists OR the record exists but has expired (the cleanup job
+ * deletes expired rows asynchronously; we treat them as absent here).
+ *
+ * Throws on connection / query failure — per the audit-bare-suppression
+ * discipline, an idempotency lookup that silently returns null on DB error
+ * could let duplicate writes through. Callers must let the error propagate
+ * so the request fails closed.
+ */
+async function lookupIdempotencyRecord(
+  tenantId: string,
+  key: string,
+  endpoint: string,
+  actorId: string,
+): Promise<CachedResponse | null> {
+  return withConnection(async (client) => {
+    const result = await client.query<{
+      response_status: number;
+      response_body: unknown;
+      request_hash_hex: string;
+      created_at: Date;
+    }>(
+      `SELECT response_status,
+              response_body,
+              encode(request_hash, 'hex') AS request_hash_hex,
+              created_at
+         FROM idempotency_keys
+        WHERE tenant_id = $1
+          AND key = $2
+          AND endpoint = $3
+          AND actor_id = $4
+          AND expires_at > NOW()`,
+      [tenantId, key, endpoint, actorId],
+    );
+
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    if (row === undefined) return null;
+
+    return {
+      statusCode: row.response_status,
+      body: row.response_body,
+      bodyHash: row.request_hash_hex,
+      cachedAt: row.created_at,
+    };
+  });
+}
+
+/**
+ * Persist a cached response for the 4-tuple key. ON CONFLICT DO NOTHING
+ * because two concurrent requests with the same key+endpoint+actor would
+ * race the INSERT — the first wins, the second's response is dropped (its
+ * caller still got the response on its own connection, this is just the
+ * cache write losing).
+ */
+async function storeIdempotencyRecord(
+  tenantId: string,
+  key: string,
+  endpoint: string,
+  actorId: string,
+  bodyHash: string,
+  statusCode: number,
+  body: unknown,
+): Promise<void> {
+  await withConnection(async (client) => {
+    await client.query(
+      `INSERT INTO idempotency_keys (
+          tenant_id, key, endpoint, actor_id,
+          request_hash, response_status, response_body, processing_state
+       ) VALUES ($1, $2, $3, $4, decode($5, 'hex'), $6, $7::jsonb, 'completed')
+       ON CONFLICT (tenant_id, key, endpoint, actor_id) DO NOTHING`,
+      [
+        tenantId,
+        key,
+        endpoint,
+        actorId,
+        bodyHash,
+        statusCode,
+        body === null || body === undefined ? null : JSON.stringify(body),
+      ],
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -146,72 +218,97 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
     const actorId = (request.headers['x-actor-id'] as string | undefined) ?? 'anonymous';
     const endpoint = normalizedPath;
 
-    const cacheKey = buildCacheKey(tenantId, idempotencyKey as string, endpoint, actorId);
+    // Look up cache against the migration 005 idempotency_keys table.
+    // The DB query filters by expires_at > NOW() so expired records are
+    // implicitly absent (cleanup job deletes them async).
+    const existing = await lookupIdempotencyRecord(
+      tenantId,
+      idempotencyKey as string,
+      endpoint,
+      actorId,
+    );
 
-    // Look up cache
-    const existing = _inMemoryStore.get(cacheKey);
-    if (existing) {
-      // Evict expired entries
-      if (isExpired(existing)) {
-        _inMemoryStore.delete(cacheKey);
-        // Fall through to process as first request
-      } else {
-        // Entry found and not expired — check body hash
-        const rawBody =
-          typeof request.body === 'string'
-            ? request.body
-            : JSON.stringify(request.body ?? '');
-        const incomingHash = hashBody(rawBody);
-
-        if (incomingHash !== existing.bodyHash) {
-          // Same key, different body → 409 per IDEMPOTENCY v5.1
-          await reply.code(409).send({
-            error: {
-              code: 'internal.idempotency.body_mismatch',
-              message:
-                'Idempotency key already used with a different request body. ' +
-                'Generate a new Idempotency-Key for a different request.',
-              trace_id: request.id,
-              timestamp: new Date().toISOString(),
-            },
-          });
-          return;
-        }
-
-        // Same key, same body → replay cached response
-        await reply.code(existing.statusCode).send(existing.body);
-        return;
-      }
-    }
-
-    // First request — process normally; capture response in onSend hook
-    // We store a sentinel so concurrent duplicate requests are serialized.
     const rawBody =
       typeof request.body === 'string'
         ? request.body
         : JSON.stringify(request.body ?? '');
     const bodyHash = hashBody(rawBody);
 
-    // Attach context to request for onSend hook
+    if (existing !== null) {
+      if (bodyHash !== existing.bodyHash) {
+        // Same 4-tuple key, different body → 409 per IDEMPOTENCY v5.1.
+        await reply.code(409).send({
+          error: {
+            code: 'internal.idempotency.body_mismatch',
+            message:
+              'Idempotency key already used with a different request body. ' +
+              'Generate a new Idempotency-Key for a different request.',
+            trace_id: request.id,
+            timestamp: new Date().toISOString(),
+          },
+        });
+        return;
+      }
+
+      // Same 4-tuple key, same body → replay cached response.
+      await reply.code(existing.statusCode).send(existing.body);
+      return;
+    }
+
+    // First request for this 4-tuple — process normally; capture the response
+    // in the onSend hook below for replay on subsequent identical requests.
+    // Attach context to request for onSend.
     // @ts-expect-error: dynamic property attachment for within-request communication
-    request._idempotencyKey = { cacheKey, bodyHash };
+    request._idempotencyKey = {
+      tenantId,
+      key: idempotencyKey as string,
+      endpoint,
+      actorId,
+      bodyHash,
+    };
   });
 
   fastify.addHook('onSend', async (request: FastifyRequest, reply: FastifyReply, payload: unknown) => {
     // @ts-expect-error: dynamic property from preHandler
     const idempotencyCtx = request._idempotencyKey as
-      | { cacheKey: string; bodyHash: string }
+      | {
+          tenantId: string;
+          key: string;
+          endpoint: string;
+          actorId: string;
+          bodyHash: string;
+        }
       | undefined;
 
     if (!idempotencyCtx) return payload;
 
-    // Cache the response for replay
-    _inMemoryStore.set(idempotencyCtx.cacheKey, {
-      statusCode: reply.statusCode,
-      body: payload,
-      bodyHash: idempotencyCtx.bodyHash,
-      cachedAt: new Date(),
-    });
+    // Persist the response into the durable idempotency_keys table.
+    // ON CONFLICT DO NOTHING handles the race between two concurrent
+    // requests with the same 4-tuple key — first INSERT wins.
+    //
+    // We do NOT throw on a write failure here. The request itself already
+    // succeeded (we are inside onSend); failing at the cache write would
+    // surface a 500 to the client even though the business action
+    // committed. Instead, log and continue. Subsequent duplicate retries
+    // would re-execute the business action, which is the documented
+    // degradation mode for this scenario per IDEMPOTENCY v5.1
+    // crash-semantics.
+    try {
+      await storeIdempotencyRecord(
+        idempotencyCtx.tenantId,
+        idempotencyCtx.key,
+        idempotencyCtx.endpoint,
+        idempotencyCtx.actorId,
+        idempotencyCtx.bodyHash,
+        reply.statusCode,
+        payload,
+      );
+    } catch (err) {
+      request.log.error(
+        { err, idempotencyCtx },
+        'idempotency: cache write failed; subsequent retries will re-execute',
+      );
+    }
 
     return payload;
   });
