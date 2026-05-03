@@ -48,52 +48,48 @@ export type SubmissionStatus =
   | 'declined'
   | 'abandoned';
 
+/**
+ * Domain types — aligned 1:1 with migration 006 column names per Codex
+ * slice-scaffold-verify-r2 MEDIUM finding closure (2026-05-02). The prior
+ * scaffold types used legacy field names (`id`, `version_id`,
+ * `program_catalog_entry_id`, etc.) that did not match the canonical
+ * schema. `client.query<T>` is only a TypeScript assertion — handlers
+ * consuming these types must see the actual DB column shape.
+ */
 export interface FormTemplate {
-  id: FormTemplateId;
+  template_id: FormTemplateId;
   tenant_id: TenantId;
-  program_catalog_entry_id: ProgramCatalogEntryId;
-  name: string;
-  current_version_id: FormVersionId | null;
+  program_id: ProgramCatalogEntryId;       // mirrors forms_template.program_id
+  country_of_care: 'US' | 'GH';            // ISO 3166-1 alpha-2 per CDM §4.1
+  template_version: number;                // monotonic per (tenant, program, country) per Pattern A
+  status: FormLifecycleStatus;
+  // Four FORMS_ENGINE v5.2 functional layers stored as JSONB.
+  presentation_content: unknown;           // L1
+  branching_logic: unknown;                // L2
+  eligibility_logic: unknown;              // L3 — clinical safety
+  approval_governance: unknown;            // L4 — pricing/market gates
   created_at: string;
   updated_at: string;
 }
 
-export interface FormVersion {
-  id: FormVersionId;
-  template_id: FormTemplateId;
-  tenant_id: TenantId;
-  version_number: number;
-  status: FormLifecycleStatus;
-  // The four-layer payload — at this scaffold, opaque JSON. Layer-specific
-  // typing is added when the Admin Backend slice authors the visual builder.
-  layout: unknown; // L1: presentation_content
-  branching_logic: unknown; // L2: branching_logic
-  eligibility_logic: unknown; // L3: eligibility_logic — clinical safety
-  approval_governance: unknown; // L4: approval_governance — pricing/market gates
-  published_at: string | null;
-  created_at: string;
-}
-
 export interface FormDeployment {
-  id: FormDeploymentId;
+  deployment_id: FormDeploymentId;
   tenant_id: TenantId;
-  template_id: FormTemplateId;
-  version_id: FormVersionId;
-  program_market_policy_id: ProgramMarketPolicyId;
-  status: 'active' | 'retired';
+  template_id: FormTemplateId;             // composite FK (tenant_id, template_id) → forms_template
+  program_id: ProgramCatalogEntryId;
   deployed_at: string;
-  retired_at: string | null;
+  retired_at: string | null;               // NULL = currently active (no separate `status` column)
 }
 
 export interface FormSubmission {
-  id: FormSubmissionId;
+  submission_id: FormSubmissionId;
   tenant_id: TenantId;
-  deployment_id: FormDeploymentId;
-  version_id: FormVersionId;
-  variant_id: FormVariantId | null;
-  patient_id: PatientId | null; // null when pre-account device-anonymous
+  deployment_id: FormDeploymentId;         // composite FK (tenant_id, deployment_id) → forms_deployment
+  variant_id: FormVariantId | null;        // triple-composite FK (tenant_id, deployment_id, variant_id) → forms_variant when set
+  patient_id: PatientId | null;            // null when pre-account device-anonymous
+  delegate_id: string | null;              // delegate context per slice PRD §3
   status: SubmissionStatus;
-  responses: Record<string, unknown>;
+  responses: Record<string, unknown>;      // dynamic per template_version; reconstruction via snapshot
   started_at: string;
   submitted_at: string | null;
 }
@@ -102,19 +98,16 @@ export interface FormSubmission {
  * Snapshot — immutable record of EXACTLY what the patient saw at submission
  * time. Per FORMS_ENGINE v5.2 §Form versioning + Slice PRD v2.1 §4 this is
  * the audit-anchor for "what content/branching/copy did the patient interact
- * with". Snapshots are append-only.
+ * with". Snapshots are append-only (REVOKE UPDATE/DELETE FROM PUBLIC + raise-
+ * exception trigger per migration 006).
  */
 export interface FormSnapshot {
-  id: FormSnapshotId;
+  snapshot_id: FormSnapshotId;
   tenant_id: TenantId;
-  submission_id: FormSubmissionId;
-  version_id: FormVersionId;
-  rendered_layout: unknown;
-  rendered_branching: unknown;
-  rendered_eligibility: unknown;
-  rendered_approval_governance: unknown;
-  ccr_resolution_pack: unknown; // CCR keys resolved at render time
-  created_at: string;
+  submission_id: FormSubmissionId;         // composite FK (tenant_id, submission_id) → forms_submission
+  template_id: FormTemplateId;             // composite FK (tenant_id, template_id) → forms_template
+  presented_content: unknown;              // full rendered template + branching + L4 governance + CCR keys + research_consent_text_version per FORMS_ENGINE v5.2
+  captured_at: string;
 }
 
 export interface FormVariant {

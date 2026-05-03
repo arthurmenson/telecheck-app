@@ -23,7 +23,7 @@
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 
 import type { CreateTemplateRequest, PublishVersionRequest } from '../../schemas.js';
-import type { FormTemplate, FormTemplateId, FormVersion, FormVersionId } from '../types.js';
+import type { FormTemplate, FormTemplateId } from '../types.js';
 
 /**
  * Create a draft template under the active tenant context. Returns the
@@ -34,7 +34,7 @@ export async function createDraftTemplate(
   _ctx: TenantContext,
   _actorId: string,
   _input: CreateTemplateRequest,
-): Promise<{ template: FormTemplate; version: FormVersion }> {
+): Promise<FormTemplate> {
   // TODO: validate program_catalog_entry_id resolves to an active
   // ProgramCatalogEntry (per Master PRD v1.10 §10.5 Layer 1) before insert;
   // delegate write to template-repo.createDraftTemplate, threading audit
@@ -62,9 +62,9 @@ export async function createDraftTemplate(
 export async function publishVersion(
   _ctx: TenantContext,
   _actorId: string,
-  _versionId: FormVersionId,
+  _templateId: FormTemplateId,
   _input: PublishVersionRequest,
-): Promise<FormVersion> {
+): Promise<FormTemplate> {
   // TODO: run static-analysis evaluator (six-category I-030 enforcement),
   // marketing-copy resolver, Mode 2 contract validator; on success
   // delegate to template-repo.publishVersion threading audit emission.

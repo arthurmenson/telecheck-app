@@ -800,6 +800,14 @@ CREATE TABLE IF NOT EXISTS forms_variant (
     CONSTRAINT uq_variant_tenant_id
         UNIQUE (tenant_id, variant_id),
 
+    -- Triple-composite UNIQUE that enables forms_submission and
+    -- forms_resume_state to bind variant_id to a SPECIFIC deployment_id
+    -- (not just any variant in the same tenant). Closes the same-tenant
+    -- cross-deployment binding gap per Codex slice-scaffold-verify-r2
+    -- HIGH finding 2026-05-02.
+    CONSTRAINT uq_variant_deployment_tenant
+        UNIQUE (tenant_id, deployment_id, variant_id),
+
     -- -------------------------------------------------------------------------
     -- Composite FKs (v0.2 composite-FK hardening)
     -- Both deployment and variant_template must belong to the same tenant.
@@ -819,13 +827,18 @@ CREATE TABLE IF NOT EXISTS forms_variant (
 -- forms_submission is created before forms_variant (due to the snapshot table
 -- between them), so the FK can only be expressed after forms_variant is created.
 -- v0.2: upgraded to composite (tenant_id, variant_id) → forms_variant
--- (tenant_id, variant_id) to close the cross-tenant binding gap. A NULL
--- variant_id (no A/B test active) is still permitted — the FK only fires
--- when variant_id IS NOT NULL.
+-- (tenant_id, variant_id) to close the cross-tenant binding gap.
+-- v0.3 (2026-05-02 per Codex slice-scaffold-verify-r2 HIGH): upgraded again
+-- to TRIPLE-composite (tenant_id, deployment_id, variant_id) so the variant
+-- MUST belong to the same deployment as the submission. Closes the
+-- same-tenant cross-deployment variant-binding gap. A NULL variant_id (no
+-- A/B test active) is still permitted — Postgres composite FKs only fire
+-- when ALL columns are NOT NULL (MATCH SIMPLE default), so a submission
+-- without a variant assignment skips this FK cleanly.
 ALTER TABLE forms_submission
     ADD CONSTRAINT fk_submission_variant
-        FOREIGN KEY (tenant_id, variant_id)
-        REFERENCES forms_variant (tenant_id, variant_id);
+        FOREIGN KEY (tenant_id, deployment_id, variant_id)
+        REFERENCES forms_variant (tenant_id, deployment_id, variant_id);
 
 -- ---------------------------------------------------------------------------
 -- Indexes for forms_variant
@@ -984,9 +997,12 @@ CREATE TABLE IF NOT EXISTS forms_resume_state (
         FOREIGN KEY (tenant_id, deployment_id)
         REFERENCES forms_deployment (tenant_id, deployment_id),
 
+    -- v0.3 (2026-05-02 per Codex slice-scaffold-verify-r2 HIGH): triple-
+    -- composite FK ensures the variant_id belongs to the SAME deployment
+    -- as deployment_id (not just any variant in the same tenant).
     CONSTRAINT fk_resume_state_variant
-        FOREIGN KEY (tenant_id, variant_id)
-        REFERENCES forms_variant (tenant_id, variant_id)
+        FOREIGN KEY (tenant_id, deployment_id, variant_id)
+        REFERENCES forms_variant (tenant_id, deployment_id, variant_id)
 );
 
 -- ---------------------------------------------------------------------------

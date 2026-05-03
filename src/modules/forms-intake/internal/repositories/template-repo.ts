@@ -35,7 +35,6 @@ import type {
   FormLifecycleStatus,
   FormTemplate,
   FormTemplateId,
-  FormVersion,
   FormVersionId,
 } from '../types.js';
 
@@ -86,7 +85,7 @@ export async function listTemplatesForTenant(
 export async function findVersionById(
   _tenantId: TenantId,
   _versionId: FormVersionId,
-): Promise<FormVersion | null> {
+): Promise<FormTemplate | null> {
   // TODO: SELECT under withTenantBoundConnection following findTemplateById pattern.
   throw new Error('not implemented');
 }
@@ -116,7 +115,7 @@ export async function createDraftTemplate(
     approvalGovernance: unknown;
   },
   _txCallback: (tx: DbTransaction) => Promise<void>,
-): Promise<{ template: FormTemplate; version: FormVersion }> {
+): Promise<FormTemplate> {
   // Canonical pattern (illustrative — body still throws):
   //
   //   return withTransaction(async (tx) => {
@@ -143,7 +142,7 @@ export async function publishVersion(
   _tenantId: TenantId,
   _versionId: FormVersionId,
   _txCallback: (tx: DbTransaction) => Promise<void>,
-): Promise<FormVersion> {
+): Promise<FormTemplate> {
   // Canonical write-path skeleton:
   //
   //   return withTransaction(async (tx) => {
@@ -169,6 +168,6 @@ export async function updateVersionStatus(
   _versionId: FormVersionId,
   _newStatus: FormLifecycleStatus,
   _txCallback: (tx: DbTransaction) => Promise<void>,
-): Promise<FormVersion> {
+): Promise<FormTemplate> {
   throw new Error('not implemented');
 }
