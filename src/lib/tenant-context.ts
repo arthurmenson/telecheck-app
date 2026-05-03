@@ -182,6 +182,76 @@ type DbResolution =
   | { kind: 'unreachable' };
 
 /**
+ * Classify an error from the `pg` library / Node.js socket layer as a
+ * true DB-unreachability event vs a reachable-DB error (SQL syntax,
+ * schema skew, permission denied, etc.). Only the former should trigger
+ * the hardcoded map fallback; the latter MUST fail closed since it
+ * indicates a deployment misconfiguration that should not silently
+ * serve a stale tenant.
+ *
+ * Connection-class signals checked (in order of likelihood):
+ *   - Node.js system errors: `code` ∈ ECONNREFUSED, ECONNRESET, ETIMEDOUT,
+ *     EHOSTUNREACH, ENETUNREACH, ENOTFOUND.
+ *   - PostgreSQL SQLSTATE class 08 (Connection Exception): 08000, 08003,
+ *     08006, 08001, 08004, 08007.
+ *   - PostgreSQL SQLSTATE class 57P01..57P03 (admin shutdown / crash
+ *     shutdown / cannot connect now).
+ *   - pg's "Connection terminated unexpectedly" message string (no error
+ *     code surfaces but the error text is canonical).
+ *
+ * Anything else (42xxx undefined column, 23xxx integrity violation,
+ * 28xxx invalid authorization, etc.) is treated as a reachable-DB error.
+ */
+function isConnectionError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+
+  const e = err as {
+    code?: string | undefined;
+    message?: string | undefined;
+  };
+
+  const code = e.code;
+  if (typeof code === 'string') {
+    const NODE_CONN_CODES = new Set([
+      'ECONNREFUSED',
+      'ECONNRESET',
+      'ETIMEDOUT',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      'ENOTFOUND',
+      'EPIPE',
+    ]);
+    if (NODE_CONN_CODES.has(code)) return true;
+
+    const PG_CONN_SQLSTATES = new Set([
+      '08000', // connection_exception
+      '08003', // connection_does_not_exist
+      '08006', // connection_failure
+      '08001', // sqlclient_unable_to_establish_sqlconnection
+      '08004', // sqlserver_rejected_establishment_of_sqlconnection
+      '08007', // transaction_resolution_unknown
+      '57P01', // admin_shutdown
+      '57P02', // crash_shutdown
+      '57P03', // cannot_connect_now
+    ]);
+    if (PG_CONN_SQLSTATES.has(code)) return true;
+  }
+
+  const message = e.message;
+  if (typeof message === 'string') {
+    if (
+      message.includes('Connection terminated unexpectedly') ||
+      message.includes('Client has encountered a connection error') ||
+      message.includes('timeout exceeded when trying to connect')
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Look up a tenant by `consumer_subdomain` against the migration 001
  * `tenants` table. Returns a tri-state DbResolution.
  *
@@ -223,9 +293,24 @@ async function resolveHostFromDb(host: string): Promise<DbResolution> {
         [hostname],
       );
     });
-  } catch {
-    // DB connection / query failure. Fall back to map at the call site.
-    return { kind: 'unreachable' };
+  } catch (err) {
+    // Discriminate true DB-unreachability (network/connection failure) from
+    // reachable-DB SQL errors (schema skew, revoked permission, undefined
+    // column, etc.). The latter MUST fail closed — they indicate a
+    // misconfigured deployment that should never silently serve a stale
+    // hardcoded tenant.
+    //
+    // (Tightened v0.5 patch 2026-05-02 per Codex foundation-wiring-r3 HIGH
+    //  finding closure: prior catch-all classified every error as
+    //  'unreachable', so a reachable DB with a SQL error could trigger
+    //  the hardcoded-map fallback and serve an inactive day-1 tenant.)
+    if (isConnectionError(err)) {
+      return { kind: 'unreachable' };
+    }
+    // Reachable DB returned a SQL/schema/permission error. Fail closed.
+    // Re-throw so the caller's hook surfaces 500 with a structured log
+    // entry. The pool error handler in db.ts also logs at this layer.
+    throw err;
   }
 
   if (result.rows.length === 0) return { kind: 'inactive_or_unknown' };
@@ -301,8 +386,17 @@ async function resolveHostToTenant(host: string): Promise<SubdomainTenantEntry |
       // Fail closed — DB is authoritative.
       return null;
     case 'unreachable':
-      // Bootstrap fallback only — covers local dev without DB and
-      // brief connection blips during boot.
+      // Bootstrap fallback ONLY in non-production environments (covers
+      // local dev without DB and brief connection blips during dev/test
+      // bootstrap). In production, a 'unreachable' DB MUST fail closed —
+      // serving the hardcoded map could mask a deployment-breaking
+      // outage and let stale tenant config persist.
+      // (Tightened v0.5 patch 2026-05-02 per Codex foundation-wiring-r3
+      //  HIGH finding closure: prior code allowed map fallback in any
+      //  environment, including production.)
+      if (process.env['NODE_ENV'] === 'production') {
+        return null;
+      }
       return resolveHostFromMap(host);
   }
 }
