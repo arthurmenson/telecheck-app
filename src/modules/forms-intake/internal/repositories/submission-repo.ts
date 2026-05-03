@@ -299,6 +299,16 @@ export const SUBMISSION_NOT_FOUND = 'forms.submission.not_found';
 export const SUBMISSION_NOT_IN_PROGRESS = 'forms.submission.not_in_progress';
 
 /**
+ * Sentinel error: at restore time, more than one in_progress submission
+ * matched the (tenant, deployment, patient) tuple — defense-in-depth
+ * against migration 008's unique index being missing or dropped (schema
+ * drift). The service layer maps this to null per I-025 so the patient
+ * surface sees a clean tenant-blind 404 rather than acting on ambiguous
+ * data. Closes Codex resume-restore-r2 HIGH 2026-05-03.
+ */
+export const RESTORE_AMBIGUOUS_SUBMISSION = 'forms.restore.ambiguous_submission';
+
+/**
  * Sentinel error: a patient already has an in_progress submission for the
  * same (tenant, deployment) tuple. Surfaces from migration 008's partial
  * unique index `uq_forms_submission_one_in_progress_per_tuple`. Translated
@@ -1333,6 +1343,18 @@ export async function findInProgressSubmissionForRestore(
   return withTenantBoundConnection(
     tenantId,
     async (client: DbClient) => {
+      // **Defense-in-depth count check (Codex resume-restore-r2 HIGH closure
+      // 2026-05-03):** the partial unique index from migration 008 ensures
+      // at most one matching row, but the application MUST NOT trust an
+      // invariant it doesn't verify. If migration 008 was skipped, dropped
+      // by an operator, or quietly rolled back during an upgrade, restore
+      // would silently corrupt data by writing decrypted paused responses
+      // onto the wrong submission row.
+      //
+      // Fetch up to 2 rows (LIMIT 2) and explicitly check the count. If
+      // more than one matches, throw RESTORE_AMBIGUOUS_SUBMISSION; the
+      // service layer surfaces null per I-025 so the patient sees a clean
+      // tenant-blind 404 rather than an action on ambiguous data.
       const result = await client.query<FormSubmission>(
         `SELECT submission_id,
                 tenant_id,
@@ -1351,10 +1373,15 @@ export async function findInProgressSubmissionForRestore(
             AND status = 'in_progress'
             AND deleted_at IS NULL
           ORDER BY created_at DESC
-          LIMIT 1`,
+          LIMIT 2`,
         [tenantId, deploymentId, patientId],
       );
-      return result.rows[0] ?? null;
+      if (result.rows.length === 0) return null;
+      if (result.rows.length > 1) {
+        // Schema-drift / index-missing scenario. Fail closed.
+        throw new Error(RESTORE_AMBIGUOUS_SUBMISSION);
+      }
+      return result.rows[0]!;
     },
     externalTx,
   );

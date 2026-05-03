@@ -878,12 +878,29 @@ export async function resumeSubmission(
     // means the submission was already finalized (or never existed for
     // this patient/deployment in this tenant); replay-equivalent at
     // the surface layer.
-    const submission = await submissionRepo.findInProgressSubmissionForRestore(
-      ctx.tenantId,
-      row.deployment_id,
-      restorePatientId,
-      tx,
-    );
+    //
+    // **RESTORE_AMBIGUOUS_SUBMISSION (Codex resume-restore-r2 closure
+    // 2026-05-03):** if migration 008's partial unique index is somehow
+    // missing/dropped and the (tenant, deployment, patient) tuple has
+    // multiple in_progress rows, the repo throws this sentinel rather
+    // than silently picking one. We translate to null per I-025 — the
+    // patient sees a tenant-blind 404; the operator sees the sentinel
+    // in the error log channel.
+    let submission: FormSubmission | null;
+    try {
+      submission = await submissionRepo.findInProgressSubmissionForRestore(
+        ctx.tenantId,
+        row.deployment_id,
+        restorePatientId,
+        tx,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message === submissionRepo.RESTORE_AMBIGUOUS_SUBMISSION) {
+        return null;
+      }
+      throw err;
+    }
     if (submission === null) return null;
 
     // Step 8 — merge UPDATE under the outer tx. Repo throws

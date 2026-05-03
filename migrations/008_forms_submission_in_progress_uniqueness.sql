@@ -47,6 +47,45 @@
 -- the predicate composes correctly when it lands).
 -- =============================================================================
 
+-- ---------------------------------------------------------------------------
+-- Preflight check (Codex resume-restore-r2 HIGH closure 2026-05-03):
+--
+-- Refuse to create the unique index if existing rows would already
+-- violate it. CREATE UNIQUE INDEX would otherwise fail with a generic
+-- pg error that buries the affected tuples; the operator-facing
+-- experience would be "migration failed, why?" with no remediation hint.
+--
+-- This DO block runs BEFORE the index creation, counts violators per
+-- tuple, and RAISEs an exception with a clear message + the count. The
+-- operator runs a remediation query (see comment block below the DO)
+-- to resolve duplicates, then re-runs the migration. On greenfield /
+-- empty environments the check passes silently because COUNT(*) = 0.
+-- ---------------------------------------------------------------------------
+
+DO $$
+DECLARE
+    duplicate_tuple_count INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO duplicate_tuple_count
+      FROM (
+        SELECT 1
+          FROM forms_submission
+         WHERE status = 'in_progress'
+           AND deleted_at IS NULL
+         GROUP BY tenant_id, deployment_id, patient_id
+        HAVING COUNT(*) > 1
+      ) AS dup_tuples;
+
+    IF duplicate_tuple_count > 0 THEN
+        RAISE EXCEPTION
+            'Migration 008 cannot create uq_forms_submission_one_in_progress_per_tuple: % distinct (tenant_id, deployment_id, patient_id) tuples already have multiple in_progress forms_submission rows. '
+            'Remediate before re-running this migration. Suggested remediation query: '
+            'SELECT tenant_id, deployment_id, patient_id, COUNT(*), array_agg(submission_id ORDER BY created_at DESC) FROM forms_submission WHERE status = ''in_progress'' AND deleted_at IS NULL GROUP BY tenant_id, deployment_id, patient_id HAVING COUNT(*) > 1; '
+            'Decide which submission_id is canonical for each tuple (typically the most-recent one) and either soft-delete (set deleted_at = NOW()) or transition the others to ''withdrawn'' status. The slice PRD §8 narrative implies 1:1 binding so duplicates are a data defect, not legitimate state.',
+            duplicate_tuple_count;
+    END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_forms_submission_one_in_progress_per_tuple
     ON forms_submission (tenant_id, deployment_id, patient_id)
     WHERE status = 'in_progress' AND deleted_at IS NULL;
