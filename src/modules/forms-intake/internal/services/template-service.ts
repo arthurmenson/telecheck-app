@@ -41,7 +41,13 @@ import type {
 } from '../../schemas.js';
 import * as submissionRepo from '../repositories/submission-repo.js';
 import * as templateRepo from '../repositories/template-repo.js';
-import type { FormDeployment, FormDeploymentId, FormTemplate, FormTemplateId } from '../types.js';
+import type {
+  FormDeployment,
+  FormDeploymentId,
+  FormTemplate,
+  FormTemplateId,
+  FormTemplateSummary,
+} from '../types.js';
 
 /**
  * Create a draft template under the active tenant context. Returns the
@@ -279,14 +285,21 @@ export async function getTemplate(
 }
 
 /**
- * List all templates for the active tenant. Pagination is not implemented
- * at the scaffold layer — service signature reserves room for it.
+ * List a paginated page of templates for the active tenant. Returns
+ * `FormTemplateSummary[]` (no JSONB layer payloads — see types.ts).
+ * Codex forms-admin-r1 MEDIUM closure 2026-05-03: the prior unbounded
+ * list was a tenant-local DoS vector for any tenant that accumulated
+ * many large templates.
+ *
+ * Cursor is the last template_id from the prior page (keyset pagination).
+ * Limit is clamped at the repo layer to LIST_TEMPLATES_MAX_LIMIT.
  */
 export async function listTemplates(
   ctx: TenantContext,
+  opts: { limit: number; cursor?: string | null },
   externalTx?: DbClient,
-): Promise<FormTemplate[]> {
-  return templateRepo.listTemplatesForTenant(ctx.tenantId, externalTx);
+): Promise<FormTemplateSummary[]> {
+  return templateRepo.listTemplatesForTenant(ctx.tenantId, opts, externalTx);
 }
 
 // ---------------------------------------------------------------------------

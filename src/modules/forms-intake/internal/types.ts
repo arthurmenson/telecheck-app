@@ -72,6 +72,25 @@ export interface FormTemplate {
   updated_at: string;
 }
 
+/**
+ * FormTemplate projection without the four JSONB layer payloads. Returned
+ * by `GET /v0/forms/templates` (list) so a tenant with many large templates
+ * can't turn the list endpoint into a DoS vector by forcing every request
+ * to allocate, serialize, and ship megabytes of layer payloads (Codex
+ * forms-admin-r1 MEDIUM closure 2026-05-03). Detail (`GET /v0/forms/
+ * templates/:templateId`) returns the full FormTemplate.
+ */
+export interface FormTemplateSummary {
+  template_id: FormTemplateId;
+  tenant_id: TenantId;
+  program_id: ProgramCatalogEntryId;
+  country_of_care: 'US' | 'GH';
+  template_version: number;
+  status: FormLifecycleStatus;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface FormDeployment {
   deployment_id: FormDeploymentId;
   tenant_id: TenantId;

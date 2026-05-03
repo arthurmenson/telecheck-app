@@ -31,7 +31,23 @@ import {
 } from '../../../../lib/db.js';
 import type { TenantId } from '../../../../lib/glossary.js';
 import { ulid } from '../../../../lib/ulid.js';
-import type { FormLifecycleStatus, FormTemplate, FormTemplateId, FormVersionId } from '../types.js';
+import type {
+  FormLifecycleStatus,
+  FormTemplate,
+  FormTemplateId,
+  FormTemplateSummary,
+  FormVersionId,
+} from '../types.js';
+
+/**
+ * Hard upper bound on a single `listTemplatesForTenant` request size — the
+ * service-level Zod check enforces this too, but the repo also caps the
+ * SQL `LIMIT` so a callsite that bypasses the service contract (e.g., a
+ * future internal admin tool) still can't fan out a giant query that
+ * blows up app/DB memory. (Codex forms-admin-r1 MEDIUM closure 2026-05-03.)
+ */
+export const LIST_TEMPLATES_MAX_LIMIT = 200;
+export const LIST_TEMPLATES_DEFAULT_LIMIT = 50;
 
 // ---------------------------------------------------------------------------
 // Reads
@@ -76,35 +92,67 @@ export async function findTemplateById(
 }
 
 /**
- * List all templates for a tenant ordered by program then version (ascending),
- * latest version last per family. RLS handles tenant isolation; the explicit
- * `tenant_id = $1` filter is belt + suspenders so a missing/expired
- * `set_tenant_context` binding can't accidentally widen the result set.
+ * List a paginated page of summary rows for a tenant. Returns
+ * `FormTemplateSummary[]` (no JSONB layer payloads — keeps the list
+ * endpoint from turning into a DoS vector when a tenant accumulates many
+ * large templates; Codex forms-admin-r1 MEDIUM closure 2026-05-03).
  *
- * Pagination is not implemented at the scaffold layer — the FormTemplate
- * row count per tenant is bounded by the program × version × country grid
- * and is well under any pagination horizon for v1.0. When the visual
- * builder slice ships and templates accumulate per-tenant, add LIMIT +
- * OFFSET (or keyset cursor) here and update the service signature.
+ * Keyset cursor: `cursor` is the last `template_id` from the prior page;
+ * the next page starts strictly after it under the canonical
+ * `(program_id, country_of_care, template_version, template_id)` order.
+ * `template_id` (a ULID) is appended to the order key as the unique
+ * tiebreaker so two templates with the same (program, country, version)
+ * — which the unique constraint forbids today, but the order key still
+ * needs to be total — can't produce duplicate or skipped rows.
+ *
+ * The handler enforces the request-side limit ceiling; this repo also
+ * clamps to LIST_TEMPLATES_MAX_LIMIT as a defence-in-depth guard against
+ * any future callsite that bypasses the service contract.
  */
 export async function listTemplatesForTenant(
   tenantId: TenantId,
+  opts: { limit: number; cursor?: string | null },
   externalTx?: DbClient,
-): Promise<FormTemplate[]> {
+): Promise<FormTemplateSummary[]> {
+  const clampedLimit = Math.min(Math.max(1, opts.limit), LIST_TEMPLATES_MAX_LIMIT);
   return withTenantBoundConnection(
     tenantId,
     async (client: DbClient) => {
-      const result = await client.query<FormTemplate>(
-        `SELECT template_id, tenant_id, program_id, country_of_care,
-                template_version, status,
-                presentation_content, branching_logic,
-                eligibility_logic, approval_governance,
-                created_at, updated_at
-           FROM forms_template
-          WHERE tenant_id = $1
-          ORDER BY program_id ASC, country_of_care ASC, template_version ASC`,
-        [tenantId],
-      );
+      // Keyset pagination: when cursor is provided, return rows whose
+      // ordering key is strictly greater than the cursor's row's key.
+      // We resolve the cursor row's key in a single subquery so the
+      // caller only needs to remember the last template_id.
+      const result = opts.cursor
+        ? await client.query<FormTemplateSummary>(
+            `WITH cursor_row AS (
+                SELECT program_id, country_of_care, template_version, template_id
+                  FROM forms_template
+                 WHERE tenant_id = $1 AND template_id = $2
+                 LIMIT 1
+             )
+             SELECT t.template_id, t.tenant_id, t.program_id, t.country_of_care,
+                    t.template_version, t.status,
+                    t.created_at, t.updated_at
+               FROM forms_template t, cursor_row c
+              WHERE t.tenant_id = $1
+                AND (t.program_id, t.country_of_care, t.template_version, t.template_id)
+                  > (c.program_id, c.country_of_care, c.template_version, c.template_id)
+              ORDER BY t.program_id ASC, t.country_of_care ASC,
+                       t.template_version ASC, t.template_id ASC
+              LIMIT $3`,
+            [tenantId, opts.cursor, clampedLimit],
+          )
+        : await client.query<FormTemplateSummary>(
+            `SELECT template_id, tenant_id, program_id, country_of_care,
+                    template_version, status,
+                    created_at, updated_at
+               FROM forms_template
+              WHERE tenant_id = $1
+              ORDER BY program_id ASC, country_of_care ASC,
+                       template_version ASC, template_id ASC
+              LIMIT $2`,
+            [tenantId, clampedLimit],
+          );
       return result.rows;
     },
     externalTx,

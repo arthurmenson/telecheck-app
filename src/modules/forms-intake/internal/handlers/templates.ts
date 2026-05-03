@@ -105,19 +105,58 @@ export async function createTemplateHandler(
 /**
  * GET /v0/forms/templates — list templates for the active tenant.
  *
- * Pagination is not implemented at the scaffold layer — the row count
- * per tenant is bounded by program × version × country and stays well
- * under any pagination horizon for v1.0. Add LIMIT/OFFSET (or keyset
- * cursor) in this handler + the service signature when the visual
- * builder slice ships and templates accumulate.
+ * Paginated via keyset cursor (Codex forms-admin-r1 MEDIUM closure
+ * 2026-05-03). Query params:
+ *   - `limit` (1..200, default 50) — page size.
+ *   - `cursor` (template_id from prior page) — start strictly after.
+ *
+ * Returns the projection type `FormTemplateSummary` (no JSONB layer
+ * payloads). Detail (full FormTemplate) is fetched via
+ * `GET /v0/forms/templates/:templateId`.
+ *
+ * Response shape: `{ items: FormTemplateSummary[], next_cursor: string | null }`.
+ * `next_cursor` is the last item's template_id when the page hit the
+ * limit (more rows likely available); null when the page came back
+ * shorter than `limit` (caller has reached the end).
  */
+const LIST_TEMPLATES_DEFAULT_LIMIT = 50;
+const LIST_TEMPLATES_MAX_LIMIT = 200;
+
 export async function listTemplatesHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const templates = await templateService.listTemplates(ctx);
-  return reply.code(200).send({ items: templates });
+
+  const query = req.query as Record<string, unknown> | undefined;
+  const rawLimit = query?.['limit'];
+  const rawCursor = query?.['cursor'];
+
+  let limit = LIST_TEMPLATES_DEFAULT_LIMIT;
+  if (rawLimit !== undefined && rawLimit !== '') {
+    const parsed = typeof rawLimit === 'string' ? Number.parseInt(rawLimit, 10) : NaN;
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > LIST_TEMPLATES_MAX_LIMIT) {
+      throw req.server.httpErrors.badRequest(
+        `Query param 'limit' must be an integer in [1, ${LIST_TEMPLATES_MAX_LIMIT}].`,
+      );
+    }
+    limit = parsed;
+  }
+
+  let cursor: string | null = null;
+  if (typeof rawCursor === 'string' && rawCursor.length > 0) {
+    cursor = rawCursor;
+  }
+
+  const items = await templateService.listTemplates(ctx, { limit, cursor });
+  // The page is "exhausted" when the result is shorter than the requested
+  // limit — there's no further page. Otherwise, the last item's id is the
+  // cursor for the next request. (Edge: a page that exactly matches limit
+  // could still be the last page; the next request returns 0 items and a
+  // null cursor — that's fine, just one extra round-trip.)
+  const nextCursor =
+    items.length === limit && items.length > 0 ? items[items.length - 1]!.template_id : null;
+  return reply.code(200).send({ items, next_cursor: nextCursor });
 }
 
 /**
