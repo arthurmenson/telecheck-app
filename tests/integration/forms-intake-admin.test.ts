@@ -231,18 +231,67 @@ describe('forms-intake listTemplates', () => {
     expect(page1Ours[0]!.template_version).toBe(1);
     expect(page1Ours[1]!.template_version).toBe(2);
 
-    // Page 2: cursor = last id from page1 → expect items strictly after.
-    const cursor = page1[page1.length - 1]!.template_id;
+    // Page 2: cursor = ordering tuple of last row from page1 → expect
+    // items strictly after. The cursor is independent of the row's
+    // existence (Codex verify-r1 MEDIUM closure 2026-05-03), so the
+    // service-level call passes the structured tuple directly.
+    const lastPage1 = page1[page1.length - 1]!;
     const page2 = await withTenantContext(TENANT_US, () =>
-      templateService.listTemplates(US_CTX, { limit: 2, cursor }, getTestClient()),
+      templateService.listTemplates(
+        US_CTX,
+        {
+          limit: 2,
+          cursor: {
+            program_id: lastPage1.program_id,
+            country_of_care: lastPage1.country_of_care,
+            template_version: lastPage1.template_version,
+            template_id: lastPage1.template_id,
+          },
+        },
+        getTestClient(),
+      ),
     );
     const page2Ours = page2.filter((t) => t.program_id === programId);
-    // Whether we see v3 here depends on whether cursor was already past it
-    // in the global order. The contract is: every row in page2 has
-    // (program, country, version, id) > cursor's row.
+    // Every row in page2 has (program, country, version, id) > page1's last row.
     for (const row of page2Ours) {
       expect(ids).toContain(row.template_id);
     }
+  });
+
+  it('keeps pagination stable when the cursor row is archived between page fetches', async () => {
+    // Codex verify-r1 MEDIUM regression: with the prior cursor-row CTE
+    // implementation, archiving the cursor's row would silently end
+    // pagination (zero rows returned). The opaque tuple cursor must
+    // resume from the encoded position regardless.
+    const programId = `prog_list_archive_${ulid().slice(0, 8)}`;
+    const v1 = await insertTemplate({ ctx: US_CTX, programId, templateVersion: 1 });
+    const v2 = await insertTemplate({ ctx: US_CTX, programId, templateVersion: 2 });
+    const v3 = await insertTemplate({ ctx: US_CTX, programId, templateVersion: 3 });
+
+    // Build a cursor whose tuple corresponds to v1's row, then archive v1.
+    const cursor = {
+      program_id: programId,
+      country_of_care: 'US',
+      template_version: 1,
+      template_id: v1,
+    };
+    const client = getTestClient();
+    await withTenantContext(TENANT_US, async () => {
+      await client.query(
+        `UPDATE forms_template SET status = 'archived', archived_at = NOW() WHERE template_id = $1`,
+        [v1],
+      );
+    });
+
+    // Continue pagination from v1's tuple — should still return v2 and v3
+    // even though v1 itself is archived.
+    const next = await withTenantContext(TENANT_US, () =>
+      templateService.listTemplates(US_CTX, { limit: 50, cursor }, getTestClient()),
+    );
+    const ours = next.filter((t) => t.program_id === programId);
+    const oursIds = new Set(ours.map((t) => t.template_id));
+    expect(oursIds.has(v2)).toBe(true);
+    expect(oursIds.has(v3)).toBe(true);
   });
 
   it('rejects limit out of bounds at the handler with 400', () => {

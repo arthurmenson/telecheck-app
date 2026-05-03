@@ -49,6 +49,26 @@ import type {
 export const LIST_TEMPLATES_MAX_LIMIT = 200;
 export const LIST_TEMPLATES_DEFAULT_LIMIT = 50;
 
+/**
+ * Keyset-pagination cursor payload. Encodes the full ordering tuple
+ * `(program_id, country_of_care, template_version, template_id)` so the
+ * cursor is independent of whether the cursor's original row still exists
+ * — a deleted/archived row between page fetches doesn't truncate the
+ * stream (Codex forms-admin-r1 verify-r1 MEDIUM closure 2026-05-03; the
+ * prior implementation looked up the cursor row in a CTE and silently
+ * returned an empty page if the row was gone).
+ *
+ * The cursor is conceptually opaque to API callers — the handler
+ * encodes/decodes it as base64url-JSON so callers don't take a
+ * dependency on the field names.
+ */
+export interface ListTemplatesCursor {
+  program_id: string;
+  country_of_care: string;
+  template_version: number;
+  template_id: string;
+}
+
 // ---------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------
@@ -97,50 +117,52 @@ export async function findTemplateById(
  * endpoint from turning into a DoS vector when a tenant accumulates many
  * large templates; Codex forms-admin-r1 MEDIUM closure 2026-05-03).
  *
- * Keyset cursor: `cursor` is the last `template_id` from the prior page;
- * the next page starts strictly after it under the canonical
- * `(program_id, country_of_care, template_version, template_id)` order.
- * `template_id` (a ULID) is appended to the order key as the unique
- * tiebreaker so two templates with the same (program, country, version)
- * — which the unique constraint forbids today, but the order key still
- * needs to be total — can't produce duplicate or skipped rows.
+ * **Keyset cursor (Codex verify-r1 MEDIUM closure 2026-05-03):** the
+ * cursor encodes the FULL ordering tuple
+ * `(program_id, country_of_care, template_version, template_id)`. The
+ * SQL filters on the encoded tuple directly — no dependency on the
+ * cursor's original row still existing. A deleted/archived row between
+ * page fetches doesn't silently truncate the stream; pagination resumes
+ * from the encoded position regardless.
  *
- * The handler enforces the request-side limit ceiling; this repo also
+ * The `template_id` ULID tail is the unique tiebreaker so the ordering
+ * is total. The handler base64url-encodes/decodes the cursor object so
+ * callers see an opaque token; the repo accepts the structured object
+ * directly to keep the SQL clear.
+ *
+ * The handler also enforces the request-side limit ceiling; this repo
  * clamps to LIST_TEMPLATES_MAX_LIMIT as a defence-in-depth guard against
  * any future callsite that bypasses the service contract.
  */
 export async function listTemplatesForTenant(
   tenantId: TenantId,
-  opts: { limit: number; cursor?: string | null },
+  opts: { limit: number; cursor?: ListTemplatesCursor | null },
   externalTx?: DbClient,
 ): Promise<FormTemplateSummary[]> {
   const clampedLimit = Math.min(Math.max(1, opts.limit), LIST_TEMPLATES_MAX_LIMIT);
   return withTenantBoundConnection(
     tenantId,
     async (client: DbClient) => {
-      // Keyset pagination: when cursor is provided, return rows whose
-      // ordering key is strictly greater than the cursor's row's key.
-      // We resolve the cursor row's key in a single subquery so the
-      // caller only needs to remember the last template_id.
       const result = opts.cursor
         ? await client.query<FormTemplateSummary>(
-            `WITH cursor_row AS (
-                SELECT program_id, country_of_care, template_version, template_id
-                  FROM forms_template
-                 WHERE tenant_id = $1 AND template_id = $2
-                 LIMIT 1
-             )
-             SELECT t.template_id, t.tenant_id, t.program_id, t.country_of_care,
-                    t.template_version, t.status,
-                    t.created_at, t.updated_at
-               FROM forms_template t, cursor_row c
-              WHERE t.tenant_id = $1
-                AND (t.program_id, t.country_of_care, t.template_version, t.template_id)
-                  > (c.program_id, c.country_of_care, c.template_version, c.template_id)
-              ORDER BY t.program_id ASC, t.country_of_care ASC,
-                       t.template_version ASC, t.template_id ASC
-              LIMIT $3`,
-            [tenantId, opts.cursor, clampedLimit],
+            `SELECT template_id, tenant_id, program_id, country_of_care,
+                    template_version, status,
+                    created_at, updated_at
+               FROM forms_template
+              WHERE tenant_id = $1
+                AND (program_id, country_of_care, template_version, template_id)
+                  > ($2, $3, $4, $5)
+              ORDER BY program_id ASC, country_of_care ASC,
+                       template_version ASC, template_id ASC
+              LIMIT $6`,
+            [
+              tenantId,
+              opts.cursor.program_id,
+              opts.cursor.country_of_care,
+              opts.cursor.template_version,
+              opts.cursor.template_id,
+              clampedLimit,
+            ],
           )
         : await client.query<FormTemplateSummary>(
             `SELECT template_id, tenant_id, program_id, country_of_care,

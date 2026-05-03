@@ -291,12 +291,18 @@ export async function getTemplate(
  * list was a tenant-local DoS vector for any tenant that accumulated
  * many large templates.
  *
- * Cursor is the last template_id from the prior page (keyset pagination).
+ * `cursor` is the structured ordering tuple from the prior page's last
+ * row (Codex verify-r1 MEDIUM closure 2026-05-03 — the prior
+ * template_id-only cursor would silently truncate pagination if the
+ * cursor row was archived/deleted between page fetches). The handler
+ * base64url-encodes the cursor for callers; the service layer accepts
+ * the decoded object.
+ *
  * Limit is clamped at the repo layer to LIST_TEMPLATES_MAX_LIMIT.
  */
 export async function listTemplates(
   ctx: TenantContext,
-  opts: { limit: number; cursor?: string | null },
+  opts: { limit: number; cursor?: templateRepo.ListTemplatesCursor | null },
   externalTx?: DbClient,
 ): Promise<FormTemplateSummary[]> {
   return templateRepo.listTemplatesForTenant(ctx.tenantId, opts, externalTx);

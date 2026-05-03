@@ -20,6 +20,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateTemplateRequestSchema, PublishVersionRequestSchema } from '../../schemas.js';
+import type { ListTemplatesCursor } from '../repositories/template-repo.js';
 import {
   PUBLISH_VERSION_NOT_DRAFT,
   PUBLISH_VERSION_NOT_FOUND,
@@ -106,21 +107,61 @@ export async function createTemplateHandler(
  * GET /v0/forms/templates — list templates for the active tenant.
  *
  * Paginated via keyset cursor (Codex forms-admin-r1 MEDIUM closure
- * 2026-05-03). Query params:
+ * 2026-05-03; cursor opaque-tuple closure verify-r1 MEDIUM 2026-05-03).
+ * Query params:
  *   - `limit` (1..200, default 50) — page size.
- *   - `cursor` (template_id from prior page) — start strictly after.
+ *   - `cursor` (opaque base64url-encoded JSON tuple from prior page's
+ *     `next_cursor`). Encodes (program_id, country_of_care,
+ *     template_version, template_id). Pagination resumes from this
+ *     position regardless of whether the cursor's original row still
+ *     exists — a delete/archive between page fetches will not silently
+ *     truncate the stream.
  *
  * Returns the projection type `FormTemplateSummary` (no JSONB layer
  * payloads). Detail (full FormTemplate) is fetched via
  * `GET /v0/forms/templates/:templateId`.
  *
  * Response shape: `{ items: FormTemplateSummary[], next_cursor: string | null }`.
- * `next_cursor` is the last item's template_id when the page hit the
- * limit (more rows likely available); null when the page came back
- * shorter than `limit` (caller has reached the end).
+ * `next_cursor` is null when the page came back shorter than `limit`
+ * (caller has reached the end); otherwise it's the encoded tuple for
+ * the next page.
  */
 const LIST_TEMPLATES_DEFAULT_LIMIT = 50;
 const LIST_TEMPLATES_MAX_LIMIT = 200;
+
+function encodeCursor(payload: ListTemplatesCursor): string {
+  return Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
+}
+
+function decodeCursor(raw: string): ListTemplatesCursor | null {
+  try {
+    const json = Buffer.from(raw, 'base64url').toString('utf-8');
+    const obj: unknown = JSON.parse(json);
+    if (
+      typeof obj === 'object' &&
+      obj !== null &&
+      'program_id' in obj &&
+      'country_of_care' in obj &&
+      'template_version' in obj &&
+      'template_id' in obj &&
+      typeof (obj as Record<string, unknown>)['program_id'] === 'string' &&
+      typeof (obj as Record<string, unknown>)['country_of_care'] === 'string' &&
+      typeof (obj as Record<string, unknown>)['template_version'] === 'number' &&
+      typeof (obj as Record<string, unknown>)['template_id'] === 'string'
+    ) {
+      const r = obj as Record<string, unknown>;
+      return {
+        program_id: r['program_id'] as string,
+        country_of_care: r['country_of_care'] as string,
+        template_version: r['template_version'] as number,
+        template_id: r['template_id'] as string,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 export async function listTemplatesHandler(
   req: FastifyRequest,
@@ -143,19 +184,29 @@ export async function listTemplatesHandler(
     limit = parsed;
   }
 
-  let cursor: string | null = null;
+  let cursor: ListTemplatesCursor | null = null;
   if (typeof rawCursor === 'string' && rawCursor.length > 0) {
-    cursor = rawCursor;
+    cursor = decodeCursor(rawCursor);
+    if (cursor === null) {
+      throw req.server.httpErrors.badRequest(
+        "Query param 'cursor' is not a valid pagination token.",
+      );
+    }
   }
 
   const items = await templateService.listTemplates(ctx, { limit, cursor });
   // The page is "exhausted" when the result is shorter than the requested
-  // limit — there's no further page. Otherwise, the last item's id is the
-  // cursor for the next request. (Edge: a page that exactly matches limit
-  // could still be the last page; the next request returns 0 items and a
-  // null cursor — that's fine, just one extra round-trip.)
+  // limit — there's no further page. Otherwise, encode the tuple of the
+  // last item as the cursor for the next request.
   const nextCursor =
-    items.length === limit && items.length > 0 ? items[items.length - 1]!.template_id : null;
+    items.length === limit && items.length > 0
+      ? encodeCursor({
+          program_id: items[items.length - 1]!.program_id,
+          country_of_care: items[items.length - 1]!.country_of_care,
+          template_version: items[items.length - 1]!.template_version,
+          template_id: items[items.length - 1]!.template_id,
+        })
+      : null;
   return reply.code(200).send({ items, next_cursor: nextCursor });
 }
 
