@@ -28,11 +28,12 @@
  *   3. Redaction behavior end-to-end — using the SAME options object
  *      that built the singleton, route a fresh pino instance to a
  *      captured stream and verify each floor path actually redacts.
- *   4. Wildcard depth coverage (root + 1/2/3-deep) — each PHI field is
- *      enumerated at depths 0..3 in `ALWAYS_REDACTED` because pino's
- *      `fast-redact` doesn't support recursive `**` patterns. Tests
- *      verify each documented depth redacts; depth >= 4 is intentionally
- *      out of scope and pinned as such.
+ *   4. UNBOUNDED-DEPTH PHI redaction — PHI fields are removed at any
+ *      nesting depth via the recursive walker `redactPhiRecursive()`
+ *      installed as pino's `formatters.log` hook. Tests exercise
+ *      depths 0..6 + arrays + mixed containers; the walker has no
+ *      depth limit. Direct walker unit tests cover edge cases (Error
+ *      instances not walked, primitives no-op, etc.).
  *   5. createChildLogger — children inherit the parent's redaction
  *      paths (parallel-logger demonstration via pino's `child()`).
  *   6. Bindings — child loggers carry the bound context fields on every
@@ -59,9 +60,11 @@ import { describe, expect, it } from 'vitest';
 import { config } from '../../src/lib/config.ts';
 import {
   ALWAYS_REDACTED,
+  PHI_FIELDS,
   buildPinoOptions,
   createChildLogger,
   logger as singletonLogger,
+  redactPhiRecursive,
 } from '../../src/lib/logger.ts';
 
 // ---------------------------------------------------------------------------
@@ -119,9 +122,13 @@ function lastLogLine(capture: Capture): Record<string, unknown> {
 // 1. ALWAYS_REDACTED contract pin
 // ---------------------------------------------------------------------------
 
-describe('ALWAYS_REDACTED — contract pin (defense-in-depth floor)', () => {
-  it('contains every documented credential path', () => {
-    // Credentials are fixed-depth paths under Fastify's req shape.
+describe('ALWAYS_REDACTED — credential paths contract pin', () => {
+  it('contains every documented credential path (fixed-depth req.* shape)', () => {
+    // Codex logger-r2 closure 2026-05-04: PHI redaction has moved from
+    // wildcard paths in `redact.paths` to a recursive walker via
+    // `formatters.log` (see PHI_FIELDS pin below). ALWAYS_REDACTED now
+    // covers ONLY the 4 credential paths that have stable Fastify-
+    // controlled shapes; recursive PHI walking handles arbitrary nesting.
     const credentialPaths = [
       'req.headers.authorization',
       'req.body.password',
@@ -133,13 +140,26 @@ describe('ALWAYS_REDACTED — contract pin (defense-in-depth floor)', () => {
     }
   });
 
-  it('contains every documented PHI field at depths 0..3 (root + 1-deep + 2-deep + 3-deep)', () => {
-    // Closed 2026-05-04 per Codex logger-r1 HIGH: each PHI field name
-    // expands to a 4-element wildcard set so pino fast-redact catches
-    // the field at root and at any 1/2/3-key nesting under root.
-    // Adding a new field requires adding 4 entries; dropping a depth
-    // for any field is a privacy regression and trips this test.
-    const phiFields = [
+  it('has exactly 4 credential entries (no accidental additions)', () => {
+    // Tighter bound now that PHI moved out — credentials should be
+    // exactly the 4 documented paths. Adding a new credential pattern
+    // requires updating both the constant and this test (deliberate).
+    expect(ALWAYS_REDACTED.length).toBe(4);
+  });
+
+  it('contains no obviously-suspect duplicates (set-equality with itself)', () => {
+    const set = new Set(ALWAYS_REDACTED);
+    expect(set.size).toBe(ALWAYS_REDACTED.length);
+  });
+});
+
+describe('PHI_FIELDS — recursive-walker field set contract pin', () => {
+  it('contains every documented PHI field name', () => {
+    // The set the recursive walker (redactPhiRecursive) deletes at any
+    // depth. Adding a new PHI field requires adding to PHI_FIELDS and
+    // updating this test deliberately; dropping any field is a privacy
+    // regression and trips this test loudly.
+    const requiredFields = [
       'ssn',
       'dob',
       'medical_record_number',
@@ -149,24 +169,17 @@ describe('ALWAYS_REDACTED — contract pin (defense-in-depth floor)', () => {
       'ai_input_text',
       'ai_output_text',
     ];
-    for (const field of phiFields) {
-      expect(ALWAYS_REDACTED).toContain(field); // depth 0 (root)
-      expect(ALWAYS_REDACTED).toContain(`*.${field}`); // depth 1
-      expect(ALWAYS_REDACTED).toContain(`*.*.${field}`); // depth 2
-      expect(ALWAYS_REDACTED).toContain(`*.*.*.${field}`); // depth 3
+    for (const f of requiredFields) {
+      expect(PHI_FIELDS).toContain(f);
     }
   });
 
-  it('has at least 36 entries (4 credential + 8 PHI fields × 4 depths)', () => {
-    // 4 credential paths + (8 PHI fields × 4 depths) = 36 minimum.
-    // Pinning the count separately so an addition that fails to update
-    // the rosters above also trips here.
-    expect(ALWAYS_REDACTED.length).toBeGreaterThanOrEqual(36);
+  it('has exactly 8 entries (current PHI floor count)', () => {
+    expect(PHI_FIELDS.length).toBe(8);
   });
 
-  it('contains no obviously-suspect duplicates (set-equality with itself)', () => {
-    const set = new Set(ALWAYS_REDACTED);
-    expect(set.size).toBe(ALWAYS_REDACTED.length);
+  it('contains no duplicates', () => {
+    expect(new Set(PHI_FIELDS).size).toBe(PHI_FIELDS.length);
   });
 });
 
@@ -306,7 +319,7 @@ describe('logger redaction — behavior (production options + captured destinati
     expect(serialized).not.toContain('jwt-token-here');
   });
 
-  it('redacts every *.<phi-field> wildcard path at depth-1 (one key under root)', () => {
+  it('redacts every PHI field at depth-1 (one key under root) — covers all 8 fields in one fixture', () => {
     const cap = makeCapture();
     const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
     log.info(
@@ -368,21 +381,16 @@ describe('logger redaction — behavior (production options + captured destinati
 });
 
 // ---------------------------------------------------------------------------
-// 4. WILDCARD DEPTH — depths 0..3 covered (Codex r1 HIGH closure)
+// 4. UNBOUNDED-DEPTH PHI redaction (Codex logger-r2 HIGH closure)
 //
-// Pino's `fast-redact` doesn't support recursive `**` wildcards, so
-// each PHI field is enumerated at depths 0..3 in `ALWAYS_REDACTED`.
-// The tests below verify redaction works at every depth in the floor.
-//
-// Depth >= 4 is intentionally OUT OF SCOPE — empirically deeper than
-// any structured-log envelope the platform produces. If a future log
-// emits PHI at depth 4+, that's a code-review-blocking violation
-// regardless of whether redaction would catch it (the discipline is:
-// don't log nested PHI at all; the floor here is defense-in-depth
-// against accidental leaks at sane depths).
+// PHI fields are now redacted at ANY nesting depth via the recursive
+// walker `redactPhiRecursive()` installed as pino's `formatters.log`
+// hook. The tests below exercise depths 0 through 6 to confirm the
+// walker has no fixed-depth limit, plus arrays-of-PHI-bearing-objects
+// to confirm the walker handles array containers.
 // ---------------------------------------------------------------------------
 
-describe('logger redaction — wildcard depth coverage (root + 1/2/3-deep)', () => {
+describe('logger redaction — unbounded PHI depth (recursive walker)', () => {
   it('redacts ssn at depth 0 (bare root key)', () => {
     const cap = makeCapture();
     const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
@@ -447,22 +455,146 @@ describe('logger redaction — wildcard depth coverage (root + 1/2/3-deep)', () 
     expect(JSON.stringify(line)).not.toContain('MRN-DEPTH3-001');
   });
 
-  it('PIN: depth >= 4 is intentionally not covered by the floor', () => {
-    // Pinning the documented depth limit. If a future change adds depth-4
-    // coverage (e.g., bumping pino to a version with recursive `**`),
-    // this test fails — flagging the deliberate scope expansion. If the
-    // test continues to pass, the depth limit holds and the floor is
-    // honest about its boundary.
+  it('redacts ssn at depth 4 (was the r1 leak boundary; now closed)', () => {
     const cap = makeCapture();
     const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
-    const marker = 'depth-4-ssn-leak-marker-not-covered';
-    log.info({ a: { b: { c: { d: { ssn: marker } } } } }, 'depth-4');
+    log.info({ a: { b: { c: { d: { ssn: 'depth-4-ssn-marker' } } } } }, 'depth-4');
     const line = lastLogLine(cap);
-    // Current behavior: depth 4 leaks. The contract says "don't log
-    // PHI that deep"; this test pins the boundary. If a code path
-    // legitimately needs deeper logging in the future, the floor must
-    // be extended explicitly (not by accident).
-    expect(JSON.stringify(line)).toContain(marker);
+    expect(JSON.stringify(line)).not.toContain('depth-4-ssn-marker');
+  });
+
+  it('redacts ssn at depth 5 (proves the walker has no depth limit)', () => {
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    log.info({ a: { b: { c: { d: { e: { ssn: 'depth-5-ssn-marker' } } } } } }, 'depth-5');
+    const line = lastLogLine(cap);
+    expect(JSON.stringify(line)).not.toContain('depth-5-ssn-marker');
+  });
+
+  it('redacts ssn at depth 6 (further confirmation; arbitrary depth)', () => {
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    log.info({ a: { b: { c: { d: { e: { f: { ssn: 'depth-6-ssn-marker' } } } } } } }, 'depth-6');
+    const line = lastLogLine(cap);
+    expect(JSON.stringify(line)).not.toContain('depth-6-ssn-marker');
+  });
+
+  it('redacts medical_record_number at depth 4 (different field; arbitrary depth)', () => {
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    log.info(
+      {
+        a: { b: { c: { d: { medical_record_number: 'MRN-DEPTH4-LEAK-MARKER' } } } },
+      },
+      'depth-4-mrn',
+    );
+    const line = lastLogLine(cap);
+    expect(JSON.stringify(line)).not.toContain('MRN-DEPTH4-LEAK-MARKER');
+  });
+
+  it('redacts PHI inside an ARRAY of objects (walker handles array containers)', () => {
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    log.info(
+      {
+        users: [
+          { name: 'Alice', ssn: 'arr-ssn-1' },
+          { name: 'Bob', ssn: 'arr-ssn-2', medical_record_number: 'arr-mrn-2' },
+        ],
+      },
+      'array-phi',
+    );
+    const line = lastLogLine(cap);
+    const serialized = JSON.stringify(line);
+    expect(serialized).not.toContain('arr-ssn-1');
+    expect(serialized).not.toContain('arr-ssn-2');
+    expect(serialized).not.toContain('arr-mrn-2');
+    // Sanity: non-PHI siblings preserved
+    expect(serialized).toContain('Alice');
+    expect(serialized).toContain('Bob');
+  });
+
+  it('redacts PHI nested inside an array nested inside an object (mixed containers)', () => {
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    log.info(
+      {
+        request: {
+          patients: [{ encounter: { ssn: 'mixed-arr-obj-ssn-leak-marker' } }],
+        },
+      },
+      'mixed-containers',
+    );
+    const line = lastLogLine(cap);
+    expect(JSON.stringify(line)).not.toContain('mixed-arr-obj-ssn-leak-marker');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4b. redactPhiRecursive — direct walker unit tests
+// ---------------------------------------------------------------------------
+
+describe('redactPhiRecursive — direct walker unit tests', () => {
+  it('removes top-level PHI keys', () => {
+    const obj: Record<string, unknown> = { ssn: 'x', name: 'Alice' };
+    redactPhiRecursive(obj);
+    expect(obj).not.toHaveProperty('ssn');
+    expect(obj['name']).toBe('Alice');
+  });
+
+  it('removes nested PHI keys at multiple depths', () => {
+    const obj: Record<string, unknown> = {
+      a: { ssn: 'x', b: { dob: 'y', c: { medical_record_number: 'z' } } },
+    };
+    redactPhiRecursive(obj);
+    const a = obj['a'] as Record<string, unknown>;
+    expect(a).not.toHaveProperty('ssn');
+    const b = a['b'] as Record<string, unknown>;
+    expect(b).not.toHaveProperty('dob');
+    const c = b['c'] as Record<string, unknown>;
+    expect(c).not.toHaveProperty('medical_record_number');
+  });
+
+  it('handles arrays of objects (walks each element)', () => {
+    const obj: Record<string, unknown> = {
+      users: [
+        { ssn: 'a', name: 'Alice' },
+        { ssn: 'b', national_id: 'nid-b' },
+      ],
+    };
+    redactPhiRecursive(obj);
+    const users = obj['users'] as Array<Record<string, unknown>>;
+    expect(users[0]).not.toHaveProperty('ssn');
+    expect(users[0]?.['name']).toBe('Alice');
+    expect(users[1]).not.toHaveProperty('ssn');
+    expect(users[1]).not.toHaveProperty('national_id');
+  });
+
+  it('does NOT walk into class instances (Error/Date — pino has its own serializers for those)', () => {
+    // Plain-object detection: only walk values whose prototype is
+    // Object.prototype (or null). A non-plain Error/Date instance with
+    // a property named `ssn` should be left untouched.
+    const err = new Error('boom');
+    (err as unknown as Record<string, unknown>)['ssn'] = 'should-not-be-walked';
+    const obj: Record<string, unknown> = { err };
+    redactPhiRecursive(obj);
+    // The err's ssn property remains because we don't walk into Error
+    // instances (pino's err serializer handles them).
+    expect((err as unknown as Record<string, unknown>)['ssn']).toBe('should-not-be-walked');
+  });
+
+  it('handles null and primitive leaves without throwing', () => {
+    const obj: Record<string, unknown> = {
+      n: null,
+      s: 'string',
+      i: 42,
+      b: true,
+      arr: [1, 'two', null, undefined],
+    };
+    expect(() => redactPhiRecursive(obj)).not.toThrow();
+    // Sanity: non-PHI fields preserved.
+    expect(obj['s']).toBe('string');
+    expect(obj['i']).toBe(42);
   });
 });
 

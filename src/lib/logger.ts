@@ -50,13 +50,19 @@ import { config } from './config.js';
 // ---------------------------------------------------------------------------
 
 /**
- * PHI fields whose values must NEVER appear in application logs at any
- * realistic nesting depth. Each entry is expanded into multiple
- * wildcard paths below (depths 0–3) because pino's underlying
- * `fast-redact` engine does NOT support recursive `**` matching — it
- * supports wildcards only at single-segment positions, so each depth
- * must be enumerated explicitly. (Closed 2026-05-04 per Codex
- * logger-r1 HIGH — depth-2 PHI was previously leaking.)
+ * PHI fields whose values must NEVER appear in application logs at ANY
+ * nesting depth. The `redactPhiRecursive()` formatter (installed via
+ * pino's `formatters.log` option) walks every log object and removes
+ * any key matching this set, regardless of how deeply nested. This is
+ * the unbounded-depth defense — `redact.paths` covers the fixed-depth
+ * credential paths under `req.*`, but PHI fields can show up under any
+ * structured envelope (request.context.event.patient.*, etc.) so they
+ * need a recursive walker.
+ *
+ * (Codex logger-r2 HIGH closure 2026-05-04 — prior implementation
+ * enumerated depths 0..3 explicitly via wildcard paths but pinned a
+ * known leak at depth >= 4. Switching to a recursive walker via
+ * formatters.log removes the depth limit entirely.)
  */
 const PHI_FIELDS = [
   'ssn',
@@ -70,30 +76,77 @@ const PHI_FIELDS = [
   'ai_output_text',
 ] as const;
 
+const PHI_FIELD_SET: ReadonlySet<string> = new Set(PHI_FIELDS);
+
 /**
- * Expand a PHI field name to a depth-0..3 wildcard set. Depth 0 covers
- * the bare root key (`{ ssn: '…' }`); depths 1–3 cover progressively
- * deeper nesting (`patient.ssn`, `encounter.patient.ssn`,
- * `request.context.encounter.ssn`). Three-level depth is empirically
- * deep enough for the structured-log envelopes the platform produces;
- * deeper PHI in logs is a code-review-blocking violation regardless of
- * whether redaction would catch it.
+ * Recursively walk `value` and DELETE any object key matching a PHI
+ * field name. Mutates in place (pino's `formatters.log` accepts the
+ * mutated/returned object as the merge target for serialization). Walks
+ * arrays + plain objects; scalar leaves and null are no-ops; class
+ * instances (Error, Date, etc.) are NOT walked — they're handled by
+ * pino's built-in serializers and class-instance traversal could mutate
+ * shared library objects.
  */
-function expandPhiPaths(field: string): string[] {
-  return [field, `*.${field}`, `*.*.${field}`, `*.*.*.${field}`];
+function walkAndDeletePhi(value: unknown): void {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) walkAndDeletePhi(item);
+    return;
+  }
+  // Skip non-plain objects (Error, Date, Buffer, etc.). Plain objects
+  // have Object.prototype as their immediate prototype.
+  const proto = Object.getPrototypeOf(value as object);
+  if (proto !== Object.prototype && proto !== null) return;
+
+  const obj = value as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (PHI_FIELD_SET.has(key)) {
+      delete obj[key];
+    } else {
+      walkAndDeletePhi(obj[key]);
+    }
+  }
 }
 
+/**
+ * pino `formatters.log` hook — mutates the merge object before
+ * serialization to remove PHI keys at any depth. Combined with the
+ * fixed-path `redact.paths` config (for credentials under `req.*`),
+ * gives unbounded-depth PHI redaction without enumerating per-depth
+ * wildcards.
+ */
+function redactPhiRecursive(obj: Record<string, unknown>): Record<string, unknown> {
+  walkAndDeletePhi(obj);
+  return obj;
+}
+
+/**
+ * The `ALWAYS_REDACTED` set covers ONLY the fixed-depth credential
+ * paths under Fastify's req shape. PHI field redaction has moved to
+ * the recursive `redactPhiRecursive()` formatter (logger-r2 HIGH
+ * closure 2026-05-04) so PHI is removed at any nesting depth. The
+ * separation:
+ *
+ *   - Credentials (this list)        → fixed `req.*` paths, 4 entries.
+ *     Handled by pino `redact.paths` because the request body shape
+ *     is Fastify-controlled and stable.
+ *
+ *   - PHI fields (PHI_FIELDS above)  → recursive walker via
+ *     `formatters.log`. Handles arbitrary nesting depth, arrays of
+ *     PHI-bearing objects, etc.
+ *
+ * The two mechanisms are independent and additive — both fire on every
+ * log call.
+ */
 export const ALWAYS_REDACTED: readonly string[] = [
-  // Credentials — fixed-depth paths controlled by Fastify's req shape
   'req.headers.authorization',
   'req.body.password',
   'req.body.token',
   'req.body.confirmPassword',
-  // PHI field paths at depth 0–3 (root, 1-deep, 2-deep, 3-deep) for
-  // each field — pino fast-redact requires explicit per-depth
-  // wildcards.
-  ...PHI_FIELDS.flatMap(expandPhiPaths),
 ] as const;
+
+/** Re-export of the recursive PHI walker for direct test coverage. */
+export { redactPhiRecursive, PHI_FIELDS };
 
 // ---------------------------------------------------------------------------
 // Logger factory
@@ -126,6 +179,16 @@ export function buildPinoOptions(): pino.LoggerOptions {
     redact: {
       paths: allRedactPaths,
       remove: true, // remove the field entirely; do not replace with '[Redacted]'
+    },
+    // Recursive PHI walker — removes any PHI field at any nesting depth
+    // before serialization. Combined with `redact.paths` above (which
+    // handles the fixed-depth credential paths under req.*), this gives
+    // unbounded-depth redaction. Closed 2026-05-04 per Codex logger-r2
+    // HIGH (prior implementation enumerated depths 0..3 only and pinned
+    // a known depth-4 leak; the recursive walker removes the depth
+    // limit entirely).
+    formatters: {
+      log: redactPhiRecursive,
     },
     // Serializers: remove any raw error stack in production to avoid
     // leaking internal implementation details per I-025 spirit.
