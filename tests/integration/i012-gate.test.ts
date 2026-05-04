@@ -353,15 +353,53 @@ describe('evaluateI012Gate — envelope sentinels (rejection envelope population
     expect(r.envelope_ai_workload_type).toBe('rejected_invalid_attempt');
   });
 
-  it('uses "rejected_invalid_attempt" sentinel for unknown ai_workload_type', async () => {
-    const r = await evaluateI012Gate(
-      happyCtx({
-        attempted_autonomy_level: 'advisory',
-        attempted_ai_workload_type: 'autonomous_agent', // RESERVED — not yet active
-      }),
-    );
-    expectFail(r);
-    expect(r.envelope_ai_workload_type).toBe('rejected_invalid_attempt');
+  // -----------------------------------------------------------------------
+  // SPEC ISSUE — envelope sentinel asymmetry between dimensions
+  //
+  // i012-gate.ts implements the two envelope-sentinel resolvers asymmetrically:
+  //
+  //   resolveEnvelopeWorkloadType — preserves ONLY the active workload set
+  //     ['conversational_assistant', 'protocol_execution', 'n/a'].
+  //     Reserved-but-known workload types per WORKLOAD_TAXONOMY v5.2
+  //     ('autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent')
+  //     map to the 'rejected_invalid_attempt' sentinel — i.e. the attempted
+  //     value is ERASED from the rejection audit envelope.
+  //
+  //   resolveEnvelopeAutonomyLevel — preserves the active level set AND the
+  //     reserved-but-known set ('action_with_audit_only', 'fully_autonomous').
+  //     Only null / undefined / empty / unknown-future values map to the
+  //     'rejected_invalid_attempt' sentinel.
+  //
+  // The JSDoc on the I012GateResult.envelope_* fields says the sentinel is
+  // used "if attempted value was null/unknown/reserved" for BOTH dimensions —
+  // the implementation matches that wording for workload but contradicts it
+  // for autonomy (where reserved values are preserved). One of the two needs
+  // to move so the rule is symmetric.
+  //
+  // The tests below PIN THE CURRENT BEHAVIOR (so any future fix that
+  // changes either resolver fails loudly here, prompting a deliberate
+  // contract-update conversation rather than a silent drift). A follow-up
+  // SPEC ISSUE filed against AUDIT_EVENTS v5.2 + WORKLOAD_TAXONOMY v5.2
+  // §I-012 reject-unless rejection event is needed to resolve which
+  // direction the symmetry should land.
+  // -----------------------------------------------------------------------
+
+  it('SENTINEL — every reserved-but-known ai_workload_type maps to "rejected_invalid_attempt" (current asymmetric behavior)', async () => {
+    // WORKLOAD_TAXONOMY v5.2 reserved-future workload types per the contract.
+    const reservedWorkloads = ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'];
+    for (const wl of reservedWorkloads) {
+      const r = await evaluateI012Gate(
+        happyCtx({
+          attempted_autonomy_level: 'advisory', // force rejection on clause 1
+          attempted_ai_workload_type: wl,
+        }),
+      );
+      expectFail(r);
+      // Pinning current behavior. If the spec lands on "preserve attempted
+      // for known reserved values" (matching the autonomy-side behavior),
+      // this expectation flips to `expect(...).toBe(wl)`.
+      expect(r.envelope_ai_workload_type).toBe('rejected_invalid_attempt');
+    }
   });
 
   it('preserves active ai_workload_type values (conversational_assistant / protocol_execution / n/a)', async () => {
@@ -375,6 +413,28 @@ describe('evaluateI012Gate — envelope sentinels (rejection envelope population
       expectFail(r);
       expect(r.envelope_ai_workload_type).toBe(wl);
     }
+  });
+
+  it('SENTINEL — unknown future ai_workload_type maps to "rejected_invalid_attempt"', async () => {
+    const r = await evaluateI012Gate(
+      happyCtx({
+        attempted_autonomy_level: 'advisory',
+        attempted_ai_workload_type: 'unknown_future_workload_type_v2030',
+      }),
+    );
+    expectFail(r);
+    expect(r.envelope_ai_workload_type).toBe('rejected_invalid_attempt');
+  });
+
+  it('SENTINEL — empty string ai_workload_type maps to "rejected_invalid_attempt"', async () => {
+    const r = await evaluateI012Gate(
+      happyCtx({
+        attempted_autonomy_level: 'advisory',
+        attempted_ai_workload_type: '',
+      }),
+    );
+    expectFail(r);
+    expect(r.envelope_ai_workload_type).toBe('rejected_invalid_attempt');
   });
 
   it('uses "rejected_invalid_attempt" sentinel for null autonomy_level', async () => {
@@ -414,15 +474,46 @@ describe('evaluateI012Gate — envelope sentinels (rejection envelope population
   });
 
   it('preserves RESERVED autonomy_level values on rejection (action_with_audit_only / fully_autonomous)', async () => {
-    // Reserved levels are KNOWN — the rejection envelope preserves what was
-    // attempted so the audit record shows exactly what the offending caller
-    // tried. The sentinel "rejected_invalid_attempt" is reserved for null /
-    // unknown / future-enum values.
+    // Reserved levels are KNOWN — the resolveEnvelopeAutonomyLevel
+    // implementation preserves what was attempted so the audit record shows
+    // exactly what the offending caller tried. The sentinel
+    // 'rejected_invalid_attempt' is used only for null / undefined / empty /
+    // unknown-future values on this dimension. (Note the asymmetry with the
+    // workload dimension — see SPEC ISSUE comment above; pinning current
+    // behavior here.)
     for (const lvl of ['action_with_audit_only', 'fully_autonomous']) {
       const r = await evaluateI012Gate(happyCtx({ attempted_autonomy_level: lvl }));
       expectFail(r);
       expect(r.envelope_autonomy_level).toBe(lvl);
     }
+  });
+
+  it('SENTINEL — empty string autonomy_level maps to "rejected_invalid_attempt"', async () => {
+    const r = await evaluateI012Gate(happyCtx({ attempted_autonomy_level: '' }));
+    expectFail(r);
+    expect(r.envelope_autonomy_level).toBe('rejected_invalid_attempt');
+  });
+
+  // -----------------------------------------------------------------------
+  // Cross-product: reserved workload + reserved autonomy on the same call.
+  // Verifies the dimensions resolve independently — workload erases to
+  // sentinel while autonomy preserves the attempted reserved value. If
+  // either resolver later drifts to match the other (closing the SPEC ISSUE
+  // documented above), this case fires loudly so the contract change is
+  // explicit rather than silent.
+  // -----------------------------------------------------------------------
+  it('SENTINEL — cross-product reserved-workload + reserved-autonomy preserves only autonomy (current asymmetry)', async () => {
+    const r = await evaluateI012Gate(
+      happyCtx({
+        attempted_autonomy_level: 'fully_autonomous',
+        attempted_ai_workload_type: 'autonomous_agent',
+      }),
+    );
+    expectFail(r);
+    // Workload dimension: reserved → sentinel (current behavior).
+    expect(r.envelope_ai_workload_type).toBe('rejected_invalid_attempt');
+    // Autonomy dimension: reserved → preserved (current behavior).
+    expect(r.envelope_autonomy_level).toBe('fully_autonomous');
   });
 });
 
