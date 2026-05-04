@@ -15,36 +15,156 @@
  *   - INVARIANT I-013 (immutable published versions; analogous floor here)
  */
 
-import type { DbClient } from '../../../../lib/db.js';
+import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import * as snapshotRepo from '../repositories/snapshot-repo.js';
 import * as submissionRepo from '../repositories/submission-repo.js';
+import * as templateRepo from '../repositories/template-repo.js';
 import type {
   FormSnapshot,
   FormSnapshotId,
+  FormSubmission,
   FormSubmissionId,
-  FormVersionId,
   PatientId,
 } from '../types.js';
 
 /**
- * Build and persist a snapshot at submission time. Captures the rendered
- * L1/L2/L3/L4 output AND the CCR resolution pack used at render time so
- * the audit trail can reconstruct EXACTLY what the patient saw and what
- * country-conditional gates applied.
+ * Sentinel error: the snapshot couldn't be built because the submission's
+ * deployment, deployment's template, or one of those preconditions
+ * couldn't be resolved within the caller's tenant context. Service-layer
+ * callers (e.g., `submitSubmission`) re-throw to roll back the encompassing
+ * tx; the handler maps the bubbled-up error to a tenant-blind 400 per I-025.
+ */
+export const SNAPSHOT_BUILD_PRECONDITION_FAILED = 'forms.snapshot.build_precondition_failed';
+
+/**
+ * Build and persist a snapshot at submission time per Slice PRD v2.1 §4.
+ *
+ * Captures the immutable point-in-time view of the form the patient just
+ * submitted: the four template layers (L1 presentation / L2 branching /
+ * L3 eligibility / L4 approval governance), the responses, the
+ * template_version pin, and (when available) the CCR resolution pack and
+ * variant assignment.
+ *
+ * **What's captured at v0.1 vs. what's deferred:** the migration 006
+ * comment for `presented_content` describes a richer shape with rendered
+ * sections, `ccr_resolution_snapshot`, `research_consent_text_version`, and
+ * `l4_approval_governance_snapshot`. Several of those depend on upstream
+ * slices that don't exist yet:
+ *   - Variant rendering — PostHog feature-flag adapter not wired (variant
+ *     assignment in startSubmission is stubbed to null).
+ *   - CCR runtime — country-conditional resolution is its own contract slice.
+ *   - Research consent — landing in the research-data slice (ADR-028).
+ *
+ * For v0.1 the snapshot captures what's deterministically available:
+ *   - The four template-layer JSONB blobs as-is from forms_template
+ *     (so even after later supersede/archive of the template, the rendered
+ *     content the patient saw is reconstructible).
+ *   - The submission's responses at submit time.
+ *   - The template_version pin so audit can join back to the canonical
+ *     template version.
+ *   - `ccr_resolution_snapshot: null` + `variant_id: null` with a SPEC
+ *     ISSUE note inline; both flip to populated values once their
+ *     upstream slices land.
+ *
+ * **Atomicity:** `externalTx` is required (not optional) because this
+ * function is intended to be called from `submitSubmission` inside its
+ * existing transaction so the snapshot INSERT, the submission status flip,
+ * the audit emission, and the domain event all commit together. Calling
+ * outside a tx (when `externalTx` is undefined) opens a fresh tx via
+ * `createSnapshot` — useful for retroactive capture but NOT the canonical
+ * call shape.
  *
  * Append-only — there is intentionally no `updateSnapshot()` exported.
+ * Migration 006 also REVOKEs UPDATE / DELETE on forms_snapshot from
+ * PUBLIC (defense-in-depth at the DB layer).
  */
 export async function buildAndPersistSnapshot(
-  _ctx: TenantContext,
-  _input: {
-    submissionId: FormSubmissionId;
-    versionId: FormVersionId;
+  ctx: TenantContext,
+  input: {
+    submission: FormSubmission;
   },
+  externalTx?: DbTransaction,
 ): Promise<FormSnapshot> {
-  // TODO: render the four-layer output for the submission's variant + CCR
-  // pack; insert via snapshot-repo.createSnapshot under withTransaction.
-  throw new Error('not implemented');
+  // Step 1 — resolve the deployment to learn the template_id. The
+  // submission carries deployment_id directly; we read the deployment row
+  // under RLS via the externalTx (so RLS is consistent with the caller's
+  // tenant scope).
+  const deployment = await submissionRepo.findDeploymentById(
+    ctx.tenantId,
+    input.submission.deployment_id,
+    externalTx,
+  );
+  if (deployment === null) {
+    throw new Error(SNAPSHOT_BUILD_PRECONDITION_FAILED);
+  }
+
+  // Step 2 — resolve the template to get the four JSONB layers + the
+  // template_version pin. Template might have been superseded since the
+  // submission was started; we capture WHAT THE PATIENT SAW per Pattern A
+  // immutability — the snapshot is the durable record. (Supersession of a
+  // template doesn't delete the row from forms_template; the historical
+  // template_version is still readable.)
+  const template = await templateRepo.findTemplateById(
+    ctx.tenantId,
+    deployment.template_id,
+    externalTx,
+  );
+  if (template === null) {
+    throw new Error(SNAPSHOT_BUILD_PRECONDITION_FAILED);
+  }
+
+  // Step 3 — project to the canonical presented_content JSONB shape.
+  // Comment in migration 006 describes the future-rich shape; at v0.1 we
+  // capture what's deterministically available + null-with-SPEC-ISSUE for
+  // the upstream-blocked fields. The shape is forward-compatible: when
+  // CCR runtime lands, ccr_resolution_snapshot flips from null to the
+  // resolved object without changing the JSONB key set.
+  const presentedContent = {
+    template_layers: {
+      presentation_content: template.presentation_content,
+      branching_logic: template.branching_logic,
+      eligibility_logic: template.eligibility_logic,
+      approval_governance: template.approval_governance,
+    },
+    responses: input.submission.responses,
+    captured_at_iso: new Date().toISOString(),
+    // SPEC ISSUE per EHBG §12: ccr_resolution_snapshot is null at v0.1
+    // pending CCR runtime contract slice. Migration 006's presented_content
+    // comment lists this field; it's surfaced here as null so the JSONB
+    // key set is forward-stable and downstream consumers don't see a
+    // missing key when CCR lands.
+    ccr_resolution_snapshot: null,
+    // SPEC ISSUE: variant assignment is stubbed in startSubmission until
+    // PostHog feature-flag adapter lands. The submission's variant_id is
+    // therefore typically null at v0.1; surfaced here so the snapshot
+    // records what variant (if any) the patient was assigned to.
+    variant_id: input.submission.variant_id,
+    // SPEC ISSUE: research_consent_text_version lands with the research-
+    // data slice (ADR-028). Surfaced as null at v0.1.
+    research_consent_text_version: null,
+  };
+
+  return snapshotRepo.createSnapshot(
+    ctx.tenantId,
+    {
+      submissionId: input.submission.submission_id,
+      templateId: template.template_id,
+      templateVersion: template.template_version,
+      presentedContent,
+    },
+    async (_tx, _snapshot) => {
+      // No additional audit/event on the snapshot insert — submitSubmission
+      // already emits the Category C `forms_submission_completed` audit +
+      // `intake_response.submitted` domain event around the snapshot call.
+      // A separate snapshot audit would double-count the same patient
+      // action. The snapshot row itself IS the audit material per Slice
+      // PRD §4.
+      void _tx;
+      void _snapshot;
+    },
+    externalTx,
+  );
 }
 
 // ---------------------------------------------------------------------------

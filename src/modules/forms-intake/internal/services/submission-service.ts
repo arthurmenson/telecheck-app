@@ -67,6 +67,7 @@ import type {
 } from '../types.js';
 
 import { issueResumeToken, verifyResumeToken } from './resume-token.js';
+import * as snapshotService from './snapshot-service.js';
 
 /**
  * Default TTL for new resume_state rows. Matches the migration's
@@ -703,10 +704,18 @@ export async function submitSubmission(
       // TODO Slice PRD §17 subscription handoff:
       //   if responses indicate subscription intent, emit
       //   `intake_subscription_intent` here so Pharmacy + Refill picks it
-      //   up via the outbox.
-      // TODO Slice PRD §4 snapshot layer:
-      //   call snapshotService.buildAndPersistSnapshot(tx, submission)
-      //   so the snapshot row commits with this transaction.
+      //   up via the outbox. Pharmacy+Refill slice not yet started.
+
+      // Slice PRD §4 snapshot layer — capture immutable point-in-time view.
+      // Inside the same outer tx so snapshot + submission status flip +
+      // audit + outbox event commit together (or roll back together).
+      // SPEC ISSUE notes inline at snapshot-service.buildAndPersistSnapshot:
+      // ccr_resolution_snapshot, variant_id, and
+      // research_consent_text_version are null at v0.1 pending their
+      // upstream slices. The forward-stable JSONB key set means the
+      // snapshot's downstream consumers don't have to rev when those
+      // fields populate.
+      await snapshotService.buildAndPersistSnapshot(ctx, { submission }, tx);
 
       void auditEnvelope; // audit_id correlation: see startSubmission note.
     },
