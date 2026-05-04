@@ -103,12 +103,28 @@ export async function createDeploymentHandler(
  *
  * Returns 200 + body on hit. Returns 404 (tenant-blind per I-025) when
  * the deployment doesn't exist in this tenant.
+ *
+ * Requires authenticated actor identity per Codex variants-resume-http-r1
+ * pattern closure 2026-05-03 (extended to deployments by the
+ * deployments-http test pass) — deployment CRUD is a tenant-admin surface
+ * (Slice PRD v2.1 §6.2 deployment workflow), so even read endpoints must
+ * authenticate. The previous implementation only required tenant context,
+ * which let any tenant-network caller hit the endpoint without proving an
+ * admin identity. Auth shim is the same `resolveActorId` (production
+ * fail-closed gated by `ALLOW_ACTOR_HEADER_AUTH`) used by the create +
+ * retire handlers; the Identity & Auth slice replaces the shim with RBAC
+ * role enforcement.
  */
 export async function getDeploymentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
+  // Auth precondition: read endpoints on the admin deployment surface
+  // require an authenticated actor — closes the unauthenticated-admin-read
+  // path (variants-resume-http-r1 pattern, applied here by the
+  // deployments-http test pass).
+  void resolveActorId(req);
 
   const params = req.params as Record<string, unknown>;
   const deploymentIdParam = params['deploymentId'];
