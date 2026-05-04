@@ -63,6 +63,15 @@ jobs:
       # (src/lib/audit.ts emitAudit) so tests that exercise the emitter without a
       # transaction handle don't trip the production-only "I-003 violation" guard.
       NODE_ENV: "test"
+      # Per-tenant KMS dev key. src/lib/kms.ts `deriveTenantKey()` requires a
+      # >= 32-char master string in test env; without it every kms.encrypt /
+      # kms.decrypt call throws (and ANY test that exercises the layer-3
+      # encryption path fails — kms.test.ts directly, plus forms-intake-pause
+      # and forms-intake-restore which encrypt resume_state.encrypted_partial_responses
+      # under the per-tenant key per ADR-024). Production gate (NODE_ENV !== 'test')
+      # in kms.ts ensures this value is NEVER reached in production — it throws
+      # before deriveTenantKey is called. Value mirrors .env.example.
+      TENANT_KMS_LOCAL_DEV_KEY: dev-only-not-for-production-32-chars
       # Force CI mode in tooling (e.g., disables interactive prompts in any future setup script).
       CI: "true"
 
