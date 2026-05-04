@@ -103,14 +103,17 @@ import type {
 // removing this helper (because the spec landed) deletes every placeholder
 // reference at once.
 //
-// Pattern audit (2026-05-04, post legacy-emitter migration):
-//   - All 12 unratified emissions across the module now route through the
+// Pattern audit (2026-05-04, post legacy-emitter migration + r1 cleanup):
+//   - All 11 unratified emissions across the module now route through the
 //     placeholder helper. The legacy `config_change_validated +
 //     detail.intent: '<unratified_id>'` pattern was migrated 2026-05-04 —
-//     `emitFormsResumeStateSaved`, `emitFormsResumeStateRestored`, and
-//     `emitFormsVariantDeployed` now use formsAuditPlaceholder() with the
-//     canonical placeholder action_id and dropped the redundant
-//     detail.intent field. Single-pattern state holds going forward; any
+//     `emitFormsResumeStateSaved` and `emitFormsResumeStateRestored` now
+//     use formsAuditPlaceholder() with the canonical placeholder
+//     action_id and dropped the redundant detail.intent field. The third
+//     legacy emitter on that pattern, `emitFormsVariantDeployed`, was
+//     deleted outright at verify-r1 (zero internal callers, not on the
+//     cross-module surface) — see history note at the file-header SPEC
+//     ISSUE block above. Single-pattern state holds going forward; any
 //     new unratified emission MUST go through the helper, not via
 //     canonical-action + detail-intent encoding.
 //
