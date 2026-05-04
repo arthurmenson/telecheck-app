@@ -47,8 +47,11 @@
  *     tenant-blind 404 — we pin the null-return contract here).
  */
 
+import crypto from 'node:crypto';
+
 import { describe, expect, it } from 'vitest';
 
+import { config } from '../../src/lib/config.ts';
 import { asTenantId, type TenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import {
@@ -226,19 +229,59 @@ describe('verifyResumeToken — structural malformation', () => {
     expect(verifyResumeToken('not-a-valid-token-shape')).toBeNull();
   });
 
-  it('§5g wrong number of payload colon-separators → null', () => {
-    // Construct a token where the payload decodes but has the wrong
-    // number of `:` segments. Easier said than done, since the HMAC
-    // would also need to match. We can't easily do that without the
-    // secret. Instead, we tamper a real token's payload to NOT have
-    // exactly two colons, then re-sign... but we don't have access to
-    // the secret here. The tamper-rejection §4 covers this case via
-    // the signature mismatch — payload-tamper without re-signing is
-    // already rejected at the HMAC step. This test is a placeholder
-    // documenting the intended branch; the actual contract is
-    // covered by §4.
-    const t = issueResumeToken(freshResumeStateId(), T_US, futureIso());
-    expect(verifyResumeToken(t)).not.toBeNull(); // sanity counterpart
+  /**
+   * Sign an arbitrary payload using the SAME HMAC secret as production
+   * `issueResumeToken`. Used by the §5g tests below to exercise the
+   * `payload.split(':').length !== 3` rejection branch which is otherwise
+   * unreachable via composite issue→verify (issueResumeToken always
+   * produces exactly two colons). Codex resume-token-r1 MED closure
+   * 2026-05-04: previous §5g was a placeholder asserting the happy path
+   * instead of the actual malformed-payload rejection.
+   */
+  function signPayload(payload: string): string {
+    function base64UrlEncode(buf: Buffer): string {
+      return buf.toString('base64url');
+    }
+    const sig = crypto.createHmac('sha256', config.resumeTokenSecret).update(payload).digest();
+    return `${base64UrlEncode(Buffer.from(payload, 'utf8'))}.${base64UrlEncode(sig)}`;
+  }
+
+  it('§5g valid HMAC + zero colons in payload → null (split-length=1 branch)', () => {
+    // The HMAC matches (we're using config.resumeTokenSecret) but the
+    // payload is missing colons — the verify path's payload.split(':')
+    // returns length 1, not 3, and the function returns null at the
+    // post-HMAC structural check.
+    const futureMs = Date.now() + 60_000;
+    const token = signPayload(`abcnocolons${futureMs}`);
+    expect(verifyResumeToken(token)).toBeNull();
+  });
+
+  it('§5g valid HMAC + only one colon in payload → null (split-length=2 branch)', () => {
+    const futureMs = Date.now() + 60_000;
+    const token = signPayload(`only:onecolon${futureMs}`);
+    expect(verifyResumeToken(token)).toBeNull();
+  });
+
+  it('§5g valid HMAC + four+ colons in payload → null (split-length>3 branch)', () => {
+    const futureMs = Date.now() + 60_000;
+    const token = signPayload(`a:b:c:d:e:${futureMs}`);
+    expect(verifyResumeToken(token)).toBeNull();
+  });
+
+  it('§5g valid HMAC + empty resume_state_id segment → null', () => {
+    // Three colons but the first segment is empty. The verify check
+    // `if (!resumeStateId || ...)` rejects.
+    const futureMs = Date.now() + 60_000;
+    const token = signPayload(`:tenant:${futureMs}`);
+    expect(verifyResumeToken(token)).toBeNull();
+  });
+
+  it('§5g valid HMAC + non-numeric expiry → null', () => {
+    // The expiry parses via `Number.parseInt(...)`. A non-numeric
+    // expiry returns NaN; the `!Number.isFinite(expiresAtMs)` check
+    // rejects.
+    const token = signPayload('id:tenant:not-a-number');
+    expect(verifyResumeToken(token)).toBeNull();
   });
 });
 

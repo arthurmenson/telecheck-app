@@ -201,9 +201,13 @@ describe('config — NODE_ENV enum', () => {
     for (const env of ['development', 'test', 'production'] as const) {
       applyBaseline();
       vi.stubEnv('NODE_ENV', env);
-      // Production also requires a >=32-char RESUME_TOKEN_SECRET to pass.
+      // Production also requires a >=32-char RESUME_TOKEN_SECRET AND
+      // DATABASE_SSL_MODE=require to pass — both are enforced as
+      // procedural checks at config-load time per the production
+      // fail-closed gates.
       if (env === 'production') {
         vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(40));
+        vi.stubEnv('DATABASE_SSL_MODE', 'require');
       }
       const fresh = await loadFreshConfig();
       expect(fresh.config.nodeEnv).toBe(env);
@@ -286,6 +290,54 @@ describe('config — DATABASE_SSL_MODE enum', () => {
     applyBaseline();
     const fresh = await loadFreshConfig();
     expect(fresh.config.dbSslMode).toBe('disable');
+  });
+
+  // §5e..§5g — production fail-closed gate. Codex config-test-r1 HIGH
+  // closure 2026-05-04: the prior coverage left the production-DB-SSL
+  // boundary unenforced — `DATABASE_SSL_MODE` was a generic enum without
+  // a NODE_ENV cross-field invariant. A production deploy with the env
+  // unset (default 'disable') would start with unencrypted DB transport
+  // and CI would stay green. Now enforced + tested.
+
+  it('§5e production + DATABASE_SSL_MODE unset (defaults disable) → throws', async () => {
+    applyBaseline();
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(40));
+    // Don't stub DATABASE_SSL_MODE — defaults to 'disable'.
+    await expectLoadConfigToThrow(/DATABASE_SSL_MODE.*production/);
+  });
+
+  it('§5f production + DATABASE_SSL_MODE=disable (explicit) → throws', async () => {
+    applyBaseline();
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(40));
+    vi.stubEnv('DATABASE_SSL_MODE', 'disable');
+    await expectLoadConfigToThrow(/DATABASE_SSL_MODE.*production/);
+  });
+
+  it('§5g production + DATABASE_SSL_MODE=require → accepted', async () => {
+    applyBaseline();
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(40));
+    vi.stubEnv('DATABASE_SSL_MODE', 'require');
+    const fresh = await loadFreshConfig();
+    expect(fresh.config.dbSslMode).toBe('require');
+    expect(fresh.config.nodeEnv).toBe('production');
+  });
+
+  it('§5h non-production + DATABASE_SSL_MODE=disable → accepted (dev/test parity)', async () => {
+    // Pin that the production-only enforcement does NOT extend to
+    // dev/test — those environments commonly run against a Postgres
+    // service without TLS termination.
+    for (const env of ['development', 'test'] as const) {
+      applyBaseline();
+      vi.stubEnv('NODE_ENV', env);
+      vi.stubEnv('DATABASE_SSL_MODE', 'disable');
+      const fresh = await loadFreshConfig();
+      expect(fresh.config.dbSslMode).toBe('disable');
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
   });
 });
 
@@ -444,13 +496,19 @@ describe('config — RESUME_TOKEN_SECRET production gate', () => {
   it('§10a production + missing secret → throws', async () => {
     applyBaseline();
     vi.stubEnv('NODE_ENV', 'production');
-    // Don't set RESUME_TOKEN_SECRET. (The applyBaseline doesn't.)
+    vi.stubEnv('DATABASE_SSL_MODE', 'require');
+    // EXPLICITLY delete RESUME_TOKEN_SECRET from process.env. CI doesn't
+    // set it, but a developer shell or future CI might inject it; without
+    // deleteEnv this test would pass for ambient reasons rather than for
+    // product behavior. Codex config-test-r1 MED closure 2026-05-04.
+    deleteEnv('RESUME_TOKEN_SECRET');
     await expectLoadConfigToThrow(/RESUME_TOKEN_SECRET/);
   });
 
   it('§10b production + 31-char secret → throws (boundary)', async () => {
     applyBaseline();
     vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('DATABASE_SSL_MODE', 'require');
     vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(31));
     await expectLoadConfigToThrow(/RESUME_TOKEN_SECRET.*at least 32/);
   });
@@ -458,6 +516,7 @@ describe('config — RESUME_TOKEN_SECRET production gate', () => {
   it('§10c production + 32-char secret → accepted (boundary)', async () => {
     applyBaseline();
     vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('DATABASE_SSL_MODE', 'require');
     vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(32));
     const fresh = await loadFreshConfig();
     expect(fresh.config.resumeTokenSecret).toBe('a'.repeat(32));
@@ -466,6 +525,7 @@ describe('config — RESUME_TOKEN_SECRET production gate', () => {
   it('§10d production + long secret → accepted, value preserved', async () => {
     applyBaseline();
     vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('DATABASE_SSL_MODE', 'require');
     vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(64));
     const fresh = await loadFreshConfig();
     expect(fresh.config.resumeTokenSecret.length).toBe(64);
@@ -480,6 +540,10 @@ describe('config — RESUME_TOKEN_SECRET dev/test default', () => {
   it('§11a development + missing secret → deterministic default applied', async () => {
     applyBaseline();
     vi.stubEnv('NODE_ENV', 'development');
+    // Same deleteEnv discipline as §10a — the default-applied branch must
+    // be entered ONLY when the env genuinely lacks the secret, not because
+    // CI happens not to set it.
+    deleteEnv('RESUME_TOKEN_SECRET');
     const fresh = await loadFreshConfig();
     // The default is documented in config.ts; pin the exact value so a
     // future change requires explicit acknowledgement (the dev/test
@@ -491,6 +555,7 @@ describe('config — RESUME_TOKEN_SECRET dev/test default', () => {
 
   it('§11b test + missing secret → deterministic default applied', async () => {
     applyBaseline(); // NODE_ENV=test
+    deleteEnv('RESUME_TOKEN_SECRET');
     const fresh = await loadFreshConfig();
     expect(fresh.config.resumeTokenSecret.length).toBeGreaterThanOrEqual(32);
   });

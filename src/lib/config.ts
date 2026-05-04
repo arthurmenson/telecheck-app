@@ -219,6 +219,29 @@ function loadConfig() {
     );
   }
 
+  // Production DB SSL fail-closed gate. Production deployments MUST set
+  // DATABASE_SSL_MODE=require; the prior version of this file documented
+  // the requirement in a comment but never enforced it, so a production
+  // deploy with the env unset (default 'disable') would start with
+  // unencrypted DB transport. Codex config-test-r1 closure 2026-05-04
+  // (HIGH finding): the documented contract is now enforced.
+  //
+  // Why the gate is here, not in the Zod enum: the enum lists the two
+  // valid SSL modes ('disable' / 'require') without cross-field
+  // dependencies. The NODE_ENV-conditional rejection is a cross-field
+  // invariant that's clearer expressed as a procedural check at the
+  // point of resolution. Same pattern as the RESUME_TOKEN_SECRET gate
+  // immediately below.
+  if (parsed.NODE_ENV === 'production' && parsed.DATABASE_SSL_MODE !== 'require') {
+    throw new Error(
+      'DATABASE_SSL_MODE must be "require" in production. ' +
+        `Got "${parsed.DATABASE_SSL_MODE}" — production deployments MUST encrypt DB transport ` +
+        'per ADR-022 cloud-posture + I-023 cross-tenant data integrity. ' +
+        'Local dev / test environments may use "disable" against a Postgres ' +
+        'service without TLS termination.',
+    );
+  }
+
   // Resume-token secret resolution. Production fail-closed: missing or
   // <32-char secrets throw at startup. Dev/test get a deterministic default
   // so the suite is reproducible without env plumbing.

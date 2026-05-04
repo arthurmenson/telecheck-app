@@ -40,7 +40,7 @@
  *      across many calls (statistical sanity — empty diversity check)
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ulid } from './ulid.ts';
 
@@ -180,25 +180,50 @@ describe('ulid() — timestamp prefix decodes to current time (Date.now())', () 
 // ---------------------------------------------------------------------------
 
 describe('ulid() — same-millisecond pair: prefix shared, suffix differs', () => {
-  it('§6a two ULIDs generated back-to-back share the 10-char timestamp prefix', () => {
-    // Generate two IDs in tight succession so they almost certainly
-    // share the same Date.now() value.
-    let a = ulid();
-    let b = ulid();
-    // Try a few times to catch the same-ms case — modern CPUs can
-    // straddle a ms boundary if very unlucky. After 10 attempts the
-    // probability of always crossing a boundary is < 0.01% on any
-    // reasonable hardware.
-    for (let i = 0; i < 10 && a.slice(0, 10) !== b.slice(0, 10); i++) {
-      a = ulid();
-      b = ulid();
-    }
+  // Restore the real Date.now() after each test in this section so the
+  // mock doesn't leak into subsequent timestamp-dependent tests.
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('§6a two ULIDs generated at the SAME ms (mocked Date.now) share the 10-char prefix and differ on suffix', () => {
+    // Codex ulid-test-r1 MED closure 2026-05-04: the prior version
+    // relied on real-clock cooperation across two back-to-back ulid()
+    // calls — a 10-iteration retry loop, but on slow / instrumented /
+    // heavily-loaded CI the retries could still all straddle a ms
+    // boundary, leading to a flaky failure even when the generator is
+    // correct. Mocking Date.now to a fixed value makes the test
+    // deterministic: both calls see the SAME ms by construction, so
+    // any failure points unambiguously at the random-suffix
+    // disambiguation property.
+    const FIXED_MS = 1_780_000_000_000; // arbitrary fixed timestamp
+    vi.spyOn(Date, 'now').mockReturnValue(FIXED_MS);
+
+    const a = ulid();
+    const b = ulid();
+
     expect(a.slice(0, 10)).toBe(b.slice(0, 10));
     // Suffix must differ — the property test-helpers like
     // `prog_${ulid().slice(-8)}` rely on (CI surfaced two
     // uq_template_version dup-keys before this property was relied on
     // explicitly).
     expect(a.slice(10)).not.toBe(b.slice(10));
+  });
+
+  it('§6b 100 ULIDs generated at the SAME ms (mocked Date.now) all share the prefix; all 100 suffixes are distinct', () => {
+    const FIXED_MS = 1_780_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(FIXED_MS);
+
+    const ids = Array.from({ length: 100 }, () => ulid());
+    const prefixes = new Set(ids.map((id) => id.slice(0, 10)));
+    const suffixes = new Set(ids.map((id) => id.slice(10)));
+
+    // All 100 IDs share the SAME timestamp prefix.
+    expect(prefixes.size).toBe(1);
+    // All 100 random suffixes are distinct (collision-resistance under
+    // forced same-ms — the entire collision-prevention burden falls on
+    // randomBytes here).
+    expect(suffixes.size).toBe(100);
   });
 });
 
