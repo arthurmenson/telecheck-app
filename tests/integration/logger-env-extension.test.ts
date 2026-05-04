@@ -280,16 +280,18 @@ describe('LOG_REDACT_PATHS env-extension — singleton wiring observed', () => {
     // Pino's d.ts uses `export = pino`; vi.importActual returns the
     // module's namespace object, which under esModuleInterop is
     // sometimes the callable function and sometimes an object with
-    // .default. Cast to `any` for the wrapper internals — the
-    // contract under test is the recorded options, not pino's API.
+    // .default. We type the wrapper as a generic factory accepting
+    // unknown args and returning unknown — the contract under test is
+    // the recorded options, not pino's API surface.
     const recordedOptions: unknown[] = [];
+    type PinoFactory = (opts?: unknown, dest?: unknown) => unknown;
     vi.doMock('pino', async () => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const actualMod = (await vi.importActual('pino')) as any;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const actualPino: (...args: any[]) => any =
-        typeof actualMod === 'function' ? actualMod : actualMod.default;
-      const wrapped = (opts?: unknown, dest?: unknown): unknown => {
+      const actualMod: unknown = await vi.importActual('pino');
+      const actualPino: PinoFactory =
+        typeof actualMod === 'function'
+          ? (actualMod as PinoFactory)
+          : (actualMod as { default: PinoFactory }).default;
+      const wrapped: PinoFactory = (opts, dest) => {
         recordedOptions.push(opts);
         if (dest === undefined) return actualPino(opts);
         return actualPino(opts, dest);
@@ -338,13 +340,14 @@ describe('LOG_REDACT_PATHS env-extension — singleton wiring observed', () => {
     // returns — i.e., the documented wiring `logger = pino(buildPinoOptions())`
     // holds.
     const recordedOptions: unknown[] = [];
+    type PinoFactory = (opts?: unknown, dest?: unknown) => unknown;
     vi.doMock('pino', async () => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const actualMod = (await vi.importActual('pino')) as any;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const actualPino: (...args: any[]) => any =
-        typeof actualMod === 'function' ? actualMod : actualMod.default;
-      const wrapped = (opts?: unknown, dest?: unknown): unknown => {
+      const actualMod: unknown = await vi.importActual('pino');
+      const actualPino: PinoFactory =
+        typeof actualMod === 'function'
+          ? (actualMod as PinoFactory)
+          : (actualMod as { default: PinoFactory }).default;
+      const wrapped: PinoFactory = (opts, dest) => {
         recordedOptions.push(opts);
         if (dest === undefined) return actualPino(opts);
         return actualPino(opts, dest);

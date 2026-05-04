@@ -215,7 +215,7 @@ export function composeCleanupErrors(
   fnError: unknown,
   cleanupErrors: readonly unknown[],
   verificationError: Error | null,
-): unknown | null {
+): unknown {
   const allErrors: unknown[] = [];
   if (fnError !== undefined) allErrors.push(fnError);
   for (const e of cleanupErrors) allErrors.push(e);
@@ -249,8 +249,14 @@ export function composeCleanupErrors(
  */
 async function checkCleanupState(): Promise<Error | null> {
   const client = getTestClient();
+  // `triggerEnabled` is true when verified enabled, false when verified
+  // disabled, and 'unknown' when the verification query itself errored.
+  // `sessionUser` is the verified session user string, or 'unknown' on
+  // verify-query error. The literal 'unknown' is a sentinel value
+  // distinguishable from a real session_user (which is always a
+  // PostgreSQL role name).
   let triggerEnabled: boolean | 'unknown' = 'unknown';
-  let sessionUser: string | 'unknown' = 'unknown';
+  let sessionUser = 'unknown';
   const verifyErrors: unknown[] = [];
 
   try {

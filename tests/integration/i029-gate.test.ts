@@ -629,8 +629,11 @@ describe('evaluateI029Gate — documented edge cases', () => {
     // (e.g. `in [active, provisional]`) trips the test.
     const r = await evaluateI029Gate(
       happyCtx({
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        dsa_status_at_export: 'unknown_status_v2030' as any,
+        // Cast through unknown to feign a future DSA status not yet in
+        // the documented union — the gate's strict !== 'active' equality
+        // is what we're testing.
+        dsa_status_at_export:
+          'unknown_status_v2030' as unknown as I029ExportContext['dsa_status_at_export'],
       }),
     );
     expectFail(r);

@@ -97,10 +97,11 @@ const PHI_FIELD_SET: ReadonlySet<string> = new Set(PHI_FIELDS);
  */
 function walkAndDeletePhi(value: unknown, seen: WeakSet<object>): void {
   if (value === null || typeof value !== 'object') return;
-  // Cycle short-circuit. Add BEFORE recursing so a self-reference
-  // detected during the walk doesn't infinite-loop.
-  if (seen.has(value as object)) return;
-  seen.add(value as object);
+  // After the typeof+null guard, TS narrows value to `object`. Cycle
+  // short-circuit. Add BEFORE recursing so a self-reference detected
+  // during the walk doesn't infinite-loop.
+  if (seen.has(value)) return;
+  seen.add(value);
 
   if (Array.isArray(value)) {
     for (const item of value) walkAndDeletePhi(item, seen);
@@ -109,7 +110,10 @@ function walkAndDeletePhi(value: unknown, seen: WeakSet<object>): void {
   // Skip non-plain objects (Error, Date, Buffer, etc.). Plain objects
   // have Object.prototype as their immediate prototype, OR null
   // (Object.create(null) instances are still "plain" by intent).
-  const proto = Object.getPrototypeOf(value as object);
+  // Object.getPrototypeOf returns `any` per its TS typings; annotate
+  // explicitly as `unknown` to satisfy no-unsafe-assignment without
+  // weakening the type-equality checks below.
+  const proto: unknown = Object.getPrototypeOf(value);
   if (proto !== Object.prototype && proto !== null) return;
 
   const obj = value as Record<string, unknown>;
