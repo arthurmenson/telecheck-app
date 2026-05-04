@@ -112,9 +112,16 @@ async function adminAuthHeaders(): Promise<Record<string, string>> {
 }
 
 function createTemplatePayload(): Record<string, unknown> {
+  // Use .slice(-8) (random portion of the ULID) instead of .slice(0, 8)
+  // (timestamp portion). Two ULIDs generated within the same millisecond
+  // share the first 10 chars; tests that call createTemplatePayload()
+  // twice in fast succession (e.g., the 4-tuple-PK actor independence
+  // test) would generate identical programCatalogEntryId values and
+  // collide on `uq_template_version`. Codex idem-http-r0 closure
+  // 2026-05-04 — same fix pattern as resume-http seedPausedSubmission.
   return {
-    programCatalogEntryId: `prog_idem_${ulid().slice(0, 8)}`,
-    name: `idem template ${ulid().slice(0, 8)}`,
+    programCatalogEntryId: `prog_idem_${ulid().slice(-8)}`,
+    name: `idem template ${ulid().slice(-8)}`,
     layout: {},
     branchingLogic: {},
     eligibilityLogic: {},
