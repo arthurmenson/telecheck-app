@@ -383,8 +383,28 @@ async function resolveHostToTenant(host: string): Promise<SubdomainTenantEntry |
     case 'found':
       return dbResult.entry;
     case 'inactive_or_unknown':
-      // Fail closed — DB is authoritative.
-      return null;
+      // Production: fail closed — the DB is authoritative, and a host that
+      // doesn't appear in `tenants.consumer_subdomain` (with status='active')
+      // MUST NOT silently resolve via the hardcoded bootstrap map. This
+      // preserves the Codex foundation-wiring-r2 HIGH closure: a
+      // deactivated production tenant cannot be re-activated by the map.
+      //
+      // Non-production (test / development): the SUBDOMAIN_TENANT_MAP
+      // intentionally contains DEV-ONLY aliases (e.g., 'localhost', the
+      // www-prefix variant) that are NOT real production subdomains and
+      // therefore are NOT seeded into `tenants.consumer_subdomain`. Falling
+      // back to the map here lets HTTP test fixtures using `host: 'localhost'`
+      // resolve to Telecheck-US without forcing every test to use the
+      // production-hostname `heroshealth.com`. This is bounded: the map
+      // is a fixed compile-time set of aliases; it cannot be widened by
+      // a misconfigured deployment, and the production branch above
+      // guarantees this fallback NEVER fires in production. (Codex
+      // tenant-mapping-r0 closure 2026-05-04 — restores test ergonomics
+      // without weakening production fail-closed.)
+      if (process.env['NODE_ENV'] === 'production') {
+        return null;
+      }
+      return resolveHostFromMap(host);
     case 'unreachable':
       // Bootstrap fallback ONLY in non-production environments (covers
       // local dev without DB and brief connection blips during dev/test

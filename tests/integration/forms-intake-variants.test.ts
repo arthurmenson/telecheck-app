@@ -147,11 +147,21 @@ async function seedAdditionalTemplate(opts: {
           published_at, created_at, updated_at
        ) VALUES (
           $1, $2, $3, $4,
-          1, $5, $6, $7,
+          2, $5, $6, $7,
           '{}'::jsonb, '{}'::jsonb,
           '{}'::jsonb, '{}'::jsonb,
           $8, NOW(), NOW()
        )`,
+      // template_version=2 here, NOT 1 — the test seeds an ADDITIONAL
+      // template under the same (tenant_id, program_id, country_of_care)
+      // family as `seedActiveDeployment` (which uses version=1).
+      // `uq_template_version` (tenant, program, country, version) rejects
+      // collision; bumping the version side-steps the constraint while
+      // preserving the "two templates in the same program family" intent
+      // (Pattern A — multiple versions per family, one published at a
+      // time per FORMS_ENGINE v5.2). Codex tenant-mapping-r0 closure
+      // 2026-05-04: prior version=1 collided whenever both seeds were
+      // called with the same programId in a single test.
       [
         templateId,
         opts.ctx.tenantId,

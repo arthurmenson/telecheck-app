@@ -215,11 +215,17 @@ async function seedAdditionalTemplate(opts: {
           published_at, created_at, updated_at
        ) VALUES (
           $1, $2, $3, $4,
-          1, $5, $6, $7,
+          2, $5, $6, $7,
           '{}'::jsonb, '{}'::jsonb,
           '{}'::jsonb, '{}'::jsonb,
           $8, NOW(), NOW()
        )`,
+      // template_version=2 — see forms-intake-variants.test.ts for the same
+      // fix. `uq_template_version` rejects (tenant, program, country, version)
+      // collision; this seeds an ADDITIONAL template under the same program
+      // family as `seedActiveDeployment` (which uses version=1). Bumping
+      // here to version=2 is the canonical fix per Codex tenant-mapping-r0
+      // closure 2026-05-04.
       [
         templateId,
         opts.ctx.tenantId,
