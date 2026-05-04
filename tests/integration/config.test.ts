@@ -104,8 +104,38 @@ async function expectLoadConfigToThrow(pattern: RegExp): Promise<void> {
   await expect(import('../../src/lib/config.ts')).rejects.toThrow(pattern);
 }
 
+/**
+ * `vi.stubEnv(key, undefined)` does NOT actually unset a process.env
+ * key in Vitest 2.x — it leaves the underlying env intact. CI ships
+ * NODE_ENV=test, DATABASE_URL=..., REDIS_URL=..., etc. as concrete
+ * values, so a "missing var" test must DELETE the key from
+ * process.env directly. This helper records the original value and
+ * the afterEach handler restores it.
+ *
+ * (Codex config-test-r0 closure 2026-05-04 — initial test version
+ * relied on `vi.unstubAllEnvs()` which restores the original CI env;
+ * "missing DATABASE_URL" tests passed validation against the real
+ * CI value and the load-throws assertions resolved instead of
+ * rejecting.)
+ */
+const _envSnapshots = new Map<string, string | undefined>();
+function deleteEnv(key: string): void {
+  if (!_envSnapshots.has(key)) {
+    _envSnapshots.set(key, process.env[key]);
+  }
+  delete process.env[key];
+}
+
 afterEach(() => {
   vi.unstubAllEnvs();
+  for (const [key, value] of _envSnapshots) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  _envSnapshots.clear();
   vi.resetModules();
 });
 
@@ -115,25 +145,22 @@ afterEach(() => {
 
 describe('config — required vars', () => {
   it('§1a throws when DATABASE_URL is missing', async () => {
-    vi.stubEnv('NODE_ENV', 'test');
-    vi.stubEnv('REDIS_URL', 'redis://localhost:6379');
-    // Explicitly clear DATABASE_URL — vi.stubEnv with empty string is
-    // a stub of "" not "undefined", so we use the unset form.
-    vi.unstubAllEnvs();
+    deleteEnv('DATABASE_URL');
     vi.stubEnv('NODE_ENV', 'test');
     vi.stubEnv('REDIS_URL', 'redis://localhost:6379');
     await expectLoadConfigToThrow(/DATABASE_URL/);
   });
 
   it('§1b throws when REDIS_URL is missing', async () => {
-    vi.unstubAllEnvs();
+    deleteEnv('REDIS_URL');
     vi.stubEnv('NODE_ENV', 'test');
     vi.stubEnv('DATABASE_URL', 'postgres://x:y@localhost:5432/z');
     await expectLoadConfigToThrow(/REDIS_URL/);
   });
 
   it('§1c throws with both DATABASE_URL and REDIS_URL absent (multi-error path)', async () => {
-    vi.unstubAllEnvs();
+    deleteEnv('DATABASE_URL');
+    deleteEnv('REDIS_URL');
     vi.stubEnv('NODE_ENV', 'test');
     // Aggregate Zod error contains both field names.
     await expectLoadConfigToThrow(/Configuration validation failed/);
@@ -192,7 +219,7 @@ describe('config — NODE_ENV enum', () => {
   });
 
   it('§3c defaults NODE_ENV to "development" when unset', async () => {
-    vi.unstubAllEnvs();
+    deleteEnv('NODE_ENV');
     vi.stubEnv('DATABASE_URL', 'postgres://x:y@localhost:5432/z');
     vi.stubEnv('REDIS_URL', 'redis://localhost:6379');
     const fresh = await loadFreshConfig();
