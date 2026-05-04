@@ -490,6 +490,9 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       url: `/v0/forms/variants/${variantId}`,
       headers: {
         host: 'localhost',
+        // Admin endpoints (incl. reads) require an authenticated actor —
+        // Codex variants-resume-http-r1 closure 2026-05-03.
+        'x-actor-id': 'op_get',
       },
     });
 
@@ -503,6 +506,33 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
     // matches the active tenant rather than asserting absence (see the
     // surface classification note at the top of the file).
     expect(body.tenant_id).toBe(TENANT_US);
+  });
+
+  it('returns 401 when no actor identity is supplied (admin-read auth gate)', async () => {
+    // Codex variants-resume-http-r1 closure 2026-05-03 — variants are
+    // tenant-admin operations per Slice PRD §14; even read endpoints
+    // require authenticated actor identity. Without `x-actor-id` the
+    // handler's `resolveActorId` shim 401s before any DB access runs.
+    const programId = `prog_var_http_get401_${ulid().slice(0, 8)}`;
+    const { templateId, deploymentId } = await seedActiveDeployment({
+      ctx: US_CTX,
+      programId,
+    });
+    const variantId = await seedControlVariant({
+      ctx: US_CTX,
+      deploymentId,
+      variantTemplateId: templateId,
+    });
+
+    const response = await app!.inject({
+      method: 'GET',
+      url: `/v0/forms/variants/${variantId}`,
+      headers: {
+        host: 'localhost',
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
   });
 
   it('returns 404 (tenant-blind) when a different tenant attempts the read', async () => {
@@ -526,6 +556,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       url: `/v0/forms/variants/${usVariantId}`,
       headers: {
         host: 'ghana.heroshealth.com',
+        'x-actor-id': 'op_xt',
       },
     });
 
@@ -540,6 +571,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       url: `/v0/forms/variants/${ulid()}`,
       headers: {
         host: 'localhost',
+        'x-actor-id': 'op_missing',
       },
     });
 

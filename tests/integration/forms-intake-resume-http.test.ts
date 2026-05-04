@@ -234,6 +234,54 @@ function assertNoTenantIdLeakage(response: { body: string; json: <T>() => T }): 
   expect(findKeyAtAnyDepth(parsed, 'tenant_id')).toBe(false);
 }
 
+/**
+ * Same byte-clean guarantee as `assertNoTenantIdLeakage` but tolerant of
+ * empty / non-JSON bodies (some 401/4xx come back as empty strings).
+ * Applied to every negative response in this suite per Codex
+ * variants-resume-http-r1 closure 2026-05-03 — error envelopes are a
+ * real PHI leak surface.
+ */
+function assertNoTenantIdLeakageInError(response: { body: string }): void {
+  expect(response.body).not.toContain('tenant_id');
+  expect(response.body).not.toContain(TENANT_US);
+  if (response.body.trim().length === 0) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(response.body);
+  } catch {
+    return;
+  }
+  expect(findKeyAtAnyDepth(parsed, 'tenant_id')).toBe(false);
+}
+
+/**
+ * Strip volatile fields (request_id, timestamps) from an error envelope
+ * so cross-test envelope shape can be compared. Codex variants-resume-
+ * http-r1 closure 2026-05-03 specifically calls for "compare normalized
+ * error envelopes for cross-patient, tampered, missing/completed-replay
+ * cases after removing request_id so the tests actually pin tenant-blind
+ * behavior."
+ *
+ * The expected normalized shape for the resume tenant-blind paths:
+ *   { error: { code: <static-string>, message: <static-string> } }
+ * Anything else (a leaked detail, a stack frame, a tenant-context field)
+ * would diverge from this shape and fail the equality assertion.
+ */
+function normalizeErrorEnvelope(response: { body: string }): unknown {
+  if (response.body.trim().length === 0) return null;
+  let parsed: { error?: Record<string, unknown> };
+  try {
+    parsed = JSON.parse(response.body) as { error?: Record<string, unknown> };
+  } catch {
+    return null;
+  }
+  if (parsed.error === undefined) return null;
+  const error = parsed.error;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { request_id: _reqId, statusCode: _sc, ...stable } = error;
+  return { error: stable };
+}
+
 // ---------------------------------------------------------------------------
 // HTTP-level resume-metadata read path
 // ---------------------------------------------------------------------------
@@ -285,7 +333,10 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     expect(response.statusCode).toBe(404);
     // I-025 tenant-blind: shape doesn't differentiate "doesn't exist" from
     // "exists but cross-patient". The error envelope plugin's canonical
-    // shape applies; we only assert the envelope is present.
+    // shape applies; we assert the envelope is present + tenant-blind
+    // (no tenant_id leak via key OR value substring at any depth) per
+    // Codex variants-resume-http-r1 closure 2026-05-03.
+    assertNoTenantIdLeakageInError(response);
     const body = response.json<{ error?: { code?: string } }>();
     expect(body.error?.code).toBeDefined();
   });
@@ -312,6 +363,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     });
 
     expect(response.statusCode).toBe(404);
+    assertNoTenantIdLeakageInError(response);
     const body = response.json<{ error?: { code?: string } }>();
     expect(body.error?.code).toBeDefined();
   });
@@ -328,6 +380,43 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     });
 
     expect(response.statusCode).toBe(401);
+    assertNoTenantIdLeakageInError(response);
+  });
+
+  // Codex variants-resume-http-r1 closure 2026-05-03 — normalized envelope
+  // equality across the three tenant-blind 404 paths (cross-patient,
+  // tampered, replay-completed). All three should produce the EXACT same
+  // envelope shape after stripping volatile fields like request_id; any
+  // divergence would betray which underlying gate tripped, weakening
+  // I-025 tenant-blindness.
+  it('produces the same normalized error envelope shape for cross-patient and tampered-token 404s', async () => {
+    const { resumeToken } = await seedPausedSubmission();
+
+    // Cross-patient 404
+    const crossPatient = await app!.inject({
+      method: 'GET',
+      url: `/v0/forms/resume/${resumeToken}`,
+      headers: { host: 'localhost', 'x-patient-id': ulid() },
+    });
+
+    // Tampered-signature 404
+    const dotIdx = resumeToken.lastIndexOf('.');
+    const sig = resumeToken.slice(dotIdx + 1);
+    const flipped = sig[0] === 'A' ? 'B' : 'A';
+    const tampered = resumeToken.slice(0, dotIdx + 1) + flipped + sig.slice(1);
+    const { patientId: tamperedPatient } = await seedPausedSubmission();
+    const tamperedResp = await app!.inject({
+      method: 'GET',
+      url: `/v0/forms/resume/${tampered}`,
+      headers: { host: 'localhost', 'x-patient-id': tamperedPatient },
+    });
+
+    expect(crossPatient.statusCode).toBe(404);
+    expect(tamperedResp.statusCode).toBe(404);
+
+    const aNorm = normalizeErrorEnvelope(crossPatient);
+    const bNorm = normalizeErrorEnvelope(tamperedResp);
+    expect(aNorm).toEqual(bNorm);
   });
 });
 
@@ -387,6 +476,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     });
 
     expect(response.statusCode).toBe(404);
+    assertNoTenantIdLeakageInError(response);
     const body = response.json<{ error?: { code?: string } }>();
     expect(body.error?.code).toBeDefined();
   });
@@ -425,6 +515,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
       payload: { resumeToken },
     });
     expect(second.statusCode).toBe(404);
+    assertNoTenantIdLeakageInError(second);
     const body = second.json<{ error?: { code?: string } }>();
     expect(body.error?.code).toBeDefined();
   });
@@ -450,6 +541,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     });
 
     expect(response.statusCode).toBe(401);
+    assertNoTenantIdLeakageInError(response);
   });
 
   it('returns 400 when the body is missing the resumeToken field', async () => {
@@ -469,5 +561,58 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     });
 
     expect(response.statusCode).toBe(400);
+    assertNoTenantIdLeakageInError(response);
+  });
+
+  // Codex variants-resume-http-r1 normalized-envelope check on the
+  // POST tenant-blind 404 paths: cross-patient + replay must produce
+  // the same envelope shape after stripping volatile fields.
+  it('produces the same normalized error envelope shape for cross-patient and replay 404s', async () => {
+    // Cross-patient
+    const seedA = await seedPausedSubmission();
+    const crossPatient = await app!.inject({
+      method: 'POST',
+      url: `/v0/forms/resume`,
+      headers: {
+        host: 'localhost',
+        'x-patient-id': ulid(),
+        'x-actor-id': 'op_norm_xpat',
+        'content-type': 'application/json',
+      },
+      payload: { resumeToken: seedA.resumeToken },
+    });
+
+    // Replay (paused -> restored once, then restored again)
+    const seedB = await seedPausedSubmission();
+    const firstRestore = await app!.inject({
+      method: 'POST',
+      url: `/v0/forms/resume`,
+      headers: {
+        host: 'localhost',
+        'x-patient-id': seedB.patientId,
+        'x-actor-id': 'op_norm_replay_first',
+        'content-type': 'application/json',
+      },
+      payload: { resumeToken: seedB.resumeToken },
+    });
+    expect(firstRestore.statusCode).toBe(200);
+    const replay = await app!.inject({
+      method: 'POST',
+      url: `/v0/forms/resume`,
+      headers: {
+        host: 'localhost',
+        'x-patient-id': seedB.patientId,
+        'x-actor-id': 'op_norm_replay_second',
+        'content-type': 'application/json',
+      },
+      payload: { resumeToken: seedB.resumeToken },
+    });
+
+    expect(crossPatient.statusCode).toBe(404);
+    expect(replay.statusCode).toBe(404);
+
+    const aNorm = normalizeErrorEnvelope(crossPatient);
+    const bNorm = normalizeErrorEnvelope(replay);
+    expect(aNorm).toEqual(bNorm);
   });
 });

@@ -98,6 +98,16 @@ export async function createVariantHandler(
 /**
  * GET /v0/forms/variants/:variantId — read variant state + traffic split.
  *
+ * Requires authenticated actor identity per Codex variants-resume-http-r1
+ * closure 2026-05-03 — variants are a tenant-admin surface (Slice PRD
+ * §14), so even read endpoints must authenticate. The previous
+ * implementation only required tenant context, which let any
+ * tenant-network caller hit the endpoint without proving an admin
+ * identity. Auth shim is the same `resolveActorId` (production
+ * fail-closed gated by `ALLOW_ACTOR_HEADER_AUTH`) used by the create +
+ * promote handlers; the Identity & Auth slice replaces the shim with
+ * RBAC role enforcement.
+ *
  * 200 hit / 404 tenant-blind miss per I-025 (cross-tenant resolves to the
  * same envelope as missing).
  */
@@ -106,6 +116,10 @@ export async function getVariantHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
+  // Auth precondition: read endpoints on the admin variant surface
+  // require an authenticated actor — closes the unauthenticated-admin-read
+  // path Codex flagged on the HTTP-test pass.
+  void resolveActorId(req);
 
   const params = req.params as Record<string, unknown>;
   const variantIdParam = params['variantId'];
