@@ -474,71 +474,255 @@ describe('evaluateI029Gate — single-reason discipline (no multi-reason payload
     expect(new Set(observed)).toEqual(new Set(allReasons));
   });
 
-  it('CONDITION ORDER PIN — condition 1 wins over condition 2 wins over condition 3 wins over 4 wins over 5 wins over 6', async () => {
-    // Compose four pairs. Each pair establishes that the EARLIER condition
-    // beats the LATER one when both fail simultaneously. Together they pin
-    // the documented evaluation order.
+  // -----------------------------------------------------------------------
+  // CONDITION ORDER PIN (TABLE-DRIVEN, every-suffix-failing)
+  //
+  // Codex r0 finding: a pair-wise adjacency table only proves N beats N+1.
+  // A buggy reorder that moved condition 6 ahead of conditions 1, 2, 3, or 4
+  // could pass adjacency tests because (e.g.) "2 beats 6" was never asserted.
+  //
+  // Replacement: for every condition N in 1..6, sabotage condition N AND
+  // every later condition simultaneously, then assert the gate returns N's
+  // canonical reason. Six rows cover all 15 N-vs-later pairings (1>2, 1>3,
+  // …, 5>6) plus the implicit "all-fail" stress on condition 1.
+  //
+  // sabotage(N) returns the partial context overrides that break ONLY
+  // condition N (independently of others). Reusing it lets us OR them
+  // together for the suffix-failure cases.
+  // -----------------------------------------------------------------------
 
-    // 1 beats 2
+  const longAgoIso = new Date(0).toISOString();
+
+  function sabotageCondition1(): Partial<I029ExportContext> {
+    return { dsa_status_at_export: 'expired' };
+  }
+  function sabotageCondition2(): Partial<I029ExportContext> {
+    return { k_threshold_actual: 1, k_min_required: 11 };
+  }
+  function sabotageCondition3(): Partial<I029ExportContext> {
+    return {
+      permitted_data_domains_at_export: ['ncd_surveillance'],
+      permitted_data_domains_at_initiation: ['chronic_disease_longitudinal'],
+    };
+  }
+  function sabotageCondition4(): Partial<I029ExportContext> {
+    return {
+      consent_cohort_snapshot_hash_initiated: 'X',
+      consent_cohort_snapshot_hash_completed: 'Y',
+    };
+  }
+  function sabotageCondition6(): Partial<I029ExportContext> {
+    return {
+      grant_artifact_validity_to: longAgoIso,
+      grant_signer_chain_attestation_hash_at_initiation: 'A',
+      grant_signer_chain_attestation_hash_at_completion: 'B',
+    };
+  }
+
+  const orderTable: Array<{
+    name: string;
+    setupOverride5: I029GateResult | null;
+    overrides: Partial<I029ExportContext>;
+    expectedReason: I029InvalidationReason;
+  }> = [
     {
-      const r = await evaluateI029Gate(
-        happyCtx({
-          dsa_status_at_export: 'expired',
-          k_threshold_actual: 1,
-          k_min_required: 11,
-        }),
-      );
-      expectFail(r);
-      expect(r.reason).toBe<I029InvalidationReason>('dsa_inactive');
-    }
-    // 2 beats 3
+      // Sabotage 1 + 2 + 3 + 4 + 5 + 6 → reason MUST be condition 1's
+      name: 'condition 1 sabotaged + ALL later conditions sabotaged → reason=dsa_inactive',
+      setupOverride5: { pass: false, reason: 'consent_revocation_mid_export' },
+      overrides: {
+        ...sabotageCondition1(),
+        ...sabotageCondition2(),
+        ...sabotageCondition3(),
+        ...sabotageCondition4(),
+        ...sabotageCondition6(),
+      },
+      expectedReason: 'dsa_inactive',
+    },
     {
-      const r = await evaluateI029Gate(
-        happyCtx({
-          k_threshold_actual: 1,
-          k_min_required: 11,
-          permitted_data_domains_at_export: ['ncd_surveillance'],
-          permitted_data_domains_at_initiation: ['chronic_disease_longitudinal'],
-        }),
-      );
-      expectFail(r);
-      expect(r.reason).toBe<I029InvalidationReason>('k_anonymity_violation');
-    }
-    // 3 beats 4
+      // Sabotage 2 + 3 + 4 + 5 + 6 → reason MUST be condition 2's
+      name: 'condition 2 sabotaged + 3+4+5+6 sabotaged → reason=k_anonymity_violation',
+      setupOverride5: { pass: false, reason: 'consent_revocation_mid_export' },
+      overrides: {
+        ...sabotageCondition2(),
+        ...sabotageCondition3(),
+        ...sabotageCondition4(),
+        ...sabotageCondition6(),
+      },
+      expectedReason: 'k_anonymity_violation',
+    },
     {
-      const r = await evaluateI029Gate(
-        happyCtx({
-          permitted_data_domains_at_export: ['ncd_surveillance'],
-          permitted_data_domains_at_initiation: ['chronic_disease_longitudinal'],
-          consent_cohort_snapshot_hash_initiated: 'X',
-          consent_cohort_snapshot_hash_completed: 'Y',
-        }),
-      );
-      expectFail(r);
-      expect(r.reason).toBe<I029InvalidationReason>('permitted_domain_drift');
-    }
-    // 4 beats 5
+      // Sabotage 3 + 4 + 5 + 6 → reason MUST be condition 3's
+      name: 'condition 3 sabotaged + 4+5+6 sabotaged → reason=permitted_domain_drift',
+      setupOverride5: { pass: false, reason: 'consent_revocation_mid_export' },
+      overrides: {
+        ...sabotageCondition3(),
+        ...sabotageCondition4(),
+        ...sabotageCondition6(),
+      },
+      expectedReason: 'permitted_domain_drift',
+    },
     {
-      _testSetCondition5Override({ pass: false, reason: 'consent_revocation_mid_export' });
-      const r = await evaluateI029Gate(
-        happyCtx({
-          consent_cohort_snapshot_hash_initiated: 'X',
-          consent_cohort_snapshot_hash_completed: 'Y',
-        }),
-      );
-      expectFail(r);
-      expect(r.reason).toBe<I029InvalidationReason>('consent_cohort_change');
-    }
-    // 5 beats 6
+      // Sabotage 4 + 5 + 6 → reason MUST be condition 4's
+      name: 'condition 4 sabotaged + 5+6 sabotaged → reason=consent_cohort_change',
+      setupOverride5: { pass: false, reason: 'consent_revocation_mid_export' },
+      overrides: {
+        ...sabotageCondition4(),
+        ...sabotageCondition6(),
+      },
+      expectedReason: 'consent_cohort_change',
+    },
     {
-      _testSetCondition5Override({ pass: false, reason: 'consent_revocation_mid_export' });
-      const r = await evaluateI029Gate(
-        happyCtx({
-          grant_artifact_validity_to: new Date(0).toISOString(),
-        }),
-      );
+      // Sabotage 5 + 6 → reason MUST be condition 5's
+      name: 'condition 5 sabotaged + 6 sabotaged → reason=consent_revocation_mid_export',
+      setupOverride5: { pass: false, reason: 'consent_revocation_mid_export' },
+      overrides: { ...sabotageCondition6() },
+      expectedReason: 'consent_revocation_mid_export',
+    },
+    {
+      // Sabotage 6 alone → reason MUST be condition 6's
+      name: 'condition 6 sabotaged alone → reason=grant_artifact_invalidated',
+      setupOverride5: null,
+      overrides: { ...sabotageCondition6() },
+      expectedReason: 'grant_artifact_invalidated',
+    },
+  ];
+
+  for (const row of orderTable) {
+    it(`CONDITION ORDER PIN — ${row.name}`, async () => {
+      _testSetCondition5Override(row.setupOverride5);
+      const r = await evaluateI029Gate(happyCtx(row.overrides));
       expectFail(r);
-      expect(r.reason).toBe<I029InvalidationReason>('consent_revocation_mid_export');
-    }
+      expect(r.reason).toBe<I029InvalidationReason>(row.expectedReason);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 9. Edge cases — k=0, unknown DSA status, reserved/unknown domain enum value
+//    (Codex r0 finding: documented edge cases were not exercised)
+// ---------------------------------------------------------------------------
+
+describe('evaluateI029Gate — documented edge cases', () => {
+  it('k_threshold_actual=0 (degenerate but legal input) rejects with k_anonymity_violation', async () => {
+    // Zero is a legal Number, not undefined. A buggy gate that treated 0
+    // as "unset → pass" would let a fully-deidentified-by-cohort-collapse
+    // export through. Pin the rejection.
+    const r = await evaluateI029Gate(happyCtx({ k_threshold_actual: 0, k_min_required: 11 }));
+    expectFail(r);
+    expect(r.reason).toBe<I029InvalidationReason>('k_anonymity_violation');
+  });
+
+  it('k_threshold_actual=0 AND k_min_required=0 (degenerate equality) passes — gate only checks <', async () => {
+    // 0 >= 0 is true. This pins gate semantics: it does NOT impose a floor on
+    // k_min_required itself. The platform default of 11 (Master PRD §15.3) is
+    // an UPSTREAM concern (CCR), not gate logic. If we ever want this gate
+    // to enforce a minimum on k_min itself, this expectation flips.
+    const r = await evaluateI029Gate(happyCtx({ k_threshold_actual: 0, k_min_required: 0 }));
+    expect(r).toEqual({ pass: true });
+  });
+
+  it('unknown DSA status string (cast through any) rejects with dsa_inactive', async () => {
+    // A future DB record migration drift could surface a status outside the
+    // documented active|suspended|expired|retired union. The gate uses
+    // strict !== 'active' equality, so any value other than the literal
+    // 'active' string rejects — pin this so a future "membership" rewrite
+    // (e.g. `in [active, provisional]`) trips the test.
+    const r = await evaluateI029Gate(
+      happyCtx({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        dsa_status_at_export: 'unknown_status_v2030' as any,
+      }),
+    );
+    expectFail(r);
+    expect(r.reason).toBe<I029InvalidationReason>('dsa_inactive');
+  });
+
+  it('reserved/unknown permitted_data_domain string on one side only rejects with permitted_domain_drift', async () => {
+    // Documented enum: chronic_disease_longitudinal | ncd_surveillance |
+    // pharmacovigilance_signal | population_health_aggregate. A future
+    // reserved domain that landed only on one snapshot side must trip the
+    // drift check — even if the gate had a docs-aware allowlist, set
+    // equality between the two snapshots is what the gate enforces.
+    const r = await evaluateI029Gate(
+      happyCtx({
+        permitted_data_domains_at_export: [
+          'chronic_disease_longitudinal',
+          'reserved_future_domain_v2030',
+        ],
+        permitted_data_domains_at_initiation: ['chronic_disease_longitudinal'],
+      }),
+    );
+    expectFail(r);
+    expect(r.reason).toBe<I029InvalidationReason>('permitted_domain_drift');
+  });
+
+  it('reserved/unknown permitted_data_domain string on BOTH sides (matched) passes — set-equality is the only check', async () => {
+    // Pinning that the gate does NOT independently validate the enum
+    // membership. Upstream CCR validation (research_permitted_data_domains
+    // closed enum) is responsible for that. This test guards against a
+    // future change that adds enum-membership validation to the gate
+    // without also flagging a SPEC ISSUE — if the gate gains enum
+    // checking, this expectation flips and we want explicit conversation.
+    const r = await evaluateI029Gate(
+      happyCtx({
+        permitted_data_domains_at_export: [
+          'chronic_disease_longitudinal',
+          'reserved_future_domain_v2030',
+        ],
+        permitted_data_domains_at_initiation: [
+          'chronic_disease_longitudinal',
+          'reserved_future_domain_v2030',
+        ],
+      }),
+    );
+    expect(r).toEqual({ pass: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. Test-stub trust contract — condition 5 override pass-through
+//
+// Codex r0 finding: the single-reason discipline test only observes the six
+// canonical failures THIS test drives. It never makes the condition-5
+// override return a non-canonical string. The TypeScript generic on
+// `toBe<I029InvalidationReason>` is compile-time only — it would not catch
+// a runtime free-form string leaking through.
+//
+// Pinning the current contract: the test-mode override is TRUSTED — whatever
+// the test sets, the gate returns. This is INTENTIONAL for a stub injection
+// point: tests need to drive any reason value, including future-added
+// reasons not yet in the canonical enum, to verify caller emit-paths.
+// Production callers don't see this surface (the production stub THROWS).
+//
+// SPEC ISSUE candidate: if research-data-partnership slice lands a non-stub
+// implementation of condition 5, the gate should narrow the override
+// contract OR introduce a runtime enum check before returning. Until then,
+// these tests pin the TRUST contract so any future tightening is explicit.
+// ---------------------------------------------------------------------------
+
+describe('evaluateI029Gate — condition 5 override pass-through (test-stub trust contract)', () => {
+  it('returns a free-form reason string verbatim from the override (current trust contract)', async () => {
+    // Cast through unknown to feign a future reason value not yet in the
+    // canonical enum. The gate currently passes it through unmodified.
+    const futureReason = 'future_reason_added_in_2030' as unknown as I029InvalidationReason;
+    _testSetCondition5Override({ pass: false, reason: futureReason });
+    const r = await evaluateI029Gate(happyCtx());
+    expectFail(r);
+    // Pinning current behavior. If a future commit adds runtime enum
+    // validation in evaluateI029Gate, this assertion flips.
+    expect(r.reason).toBe(futureReason);
+  });
+
+  it('failure object shape is exactly { pass: false, reason: <string> } — no extra keys leaked', async () => {
+    _testSetCondition5Override({ pass: false, reason: 'consent_revocation_mid_export' });
+    const r = await evaluateI029Gate(happyCtx());
+    expectFail(r);
+    // Only the two documented keys must be present.
+    expect(Object.keys(r).sort()).toEqual(['pass', 'reason'].sort());
+  });
+
+  it('pass result shape is exactly { pass: true } — no extra keys leaked', async () => {
+    const r = await evaluateI029Gate(happyCtx());
+    expect(Object.keys(r).sort()).toEqual(['pass'].sort());
   });
 });
