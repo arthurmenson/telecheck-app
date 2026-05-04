@@ -118,52 +118,65 @@ export async function withTenantContext<T>(
     result = undefined as unknown as T;
   }
 
-  // RESTORE phase. The asymmetry is critical:
+  // RESTORE phase. Both branches are fail-closed (Codex rls-r3 HIGH closure):
   //
-  //   previous !== null → restore failure is FATAL. Outer-scope code is
-  //     about to continue executing queries on this connection; if the
-  //     binding is stuck on the inner tenant, those queries silently
-  //     run under the wrong tenant — a cross-tenant context mismatch
-  //     that's WORSE than fail-closed (because the caller doesn't know
-  //     it's happened). We MUST throw so the outer scope cannot continue.
+  //   previous !== null (nested call):
+  //     Restore failure is FATAL. Outer-scope code is about to continue
+  //     executing queries on this connection; if the binding is stuck on
+  //     the inner tenant, those queries silently run under the wrong
+  //     tenant — a cross-tenant context mismatch that's WORSE than
+  //     fail-closed because the caller doesn't know it happened.
   //
-  //   previous === null → clear failure can be swallowed. There's no
-  //     outer scope to leak into (we're the outermost call). The worst
-  //     case is a stale binding on the connection until the migration-003
-  //     5-min TTL cleans it up; if the connection returns to the pool,
-  //     the next caller's withTenantContext will read it as `previous`
-  //     and restore over it.
+  //   previous === null (outermost call):
+  //     Clear failure is ALSO FATAL. The connection is about to return
+  //     to the pool. If the inner tenant binding is still active, the
+  //     next caller's withTenantContext will (a) read the stale tenant
+  //     as `previous`, (b) install its own tenant for its callback,
+  //     (c) on exit "restore" the stale tenant — perpetuating the leak
+  //     forever. Worse: any code path that touches the connection without
+  //     first calling withTenantContext runs under the stale binding.
+  //     Fail closed: throw so the pool/caller can discard the connection.
+  //     The migration-003 5-minute TTL is a safety net only against
+  //     crashes, not against silent cleanup failures.
   //
-  // Closed 2026-05-03 per Codex rls-r2 HIGH (verify-r3).
-  let restoreError: unknown;
+  // Closed 2026-05-03 per Codex rls-r2 HIGH (verify-r3) + rls-r3 HIGH
+  // (verify-r4) which extended the fix to the outermost-clear branch.
+  let cleanupError: unknown;
   if (previous !== null) {
     try {
       await client.query('SELECT set_tenant_context($1)', [previous]);
     } catch (err) {
-      restoreError = err;
+      cleanupError = err;
     }
   } else {
-    await client.query('SELECT clear_tenant_context()', []).catch(() => {
-      // Intentional swallow — outermost-exit, no outer scope to leak into.
-    });
+    try {
+      await client.query('SELECT clear_tenant_context()', []);
+    } catch (err) {
+      cleanupError = err;
+    }
   }
 
-  if (restoreError !== undefined) {
-    // I-023 safety: outer-scope queries cannot be allowed to run under the
-    // stale inner tenant. Fail closed. If the callback ALSO errored, wrap
-    // both errors via AggregateError so the original failure isn't masked.
-    const restoreMsg = restoreError instanceof Error ? restoreError.message : String(restoreError);
+  if (cleanupError !== undefined) {
+    // I-023 safety: queries cannot be allowed to run under a stale
+    // tenant binding on this connection. Fail closed. If the callback
+    // ALSO errored, wrap both errors via AggregateError so the original
+    // failure isn't masked. The thrown error signals to the caller
+    // (and to db.ts withTenantBoundConnection) that this connection's
+    // tenant-context state is unsafe and the connection should be
+    // discarded from the pool, not returned to it.
+    const cleanupMsg = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+    const cleanupKind = previous !== null ? 'restore' : 'clear';
     if (cbError !== undefined) {
       throw new AggregateError(
-        [cbError, restoreError],
-        `I-023 violation: tenant-context restore failed (${restoreMsg}); ` +
-          `outer-scope queries cannot continue under the stale inner tenant. ` +
+        [cbError, cleanupError],
+        `I-023 violation: tenant-context ${cleanupKind} failed (${cleanupMsg}); ` +
+          `connection has a stale tenant binding and must be discarded from the pool. ` +
           `Original callback error preserved at AggregateError.errors[0].`,
       );
     }
     throw new Error(
-      `I-023 violation: tenant-context restore failed (${restoreMsg}). ` +
-        `Outer-scope queries cannot continue under the stale inner tenant.`,
+      `I-023 violation: tenant-context ${cleanupKind} failed (${cleanupMsg}). ` +
+        `Connection has a stale tenant binding and must be discarded from the pool.`,
     );
   }
 

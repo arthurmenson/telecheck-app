@@ -20,12 +20,15 @@
  *   2. withTenantContext restores prior context AFTER the callback (success
  *      path) — or clears if there was no prior context
  *   3. withTenantContext restores/clears context even when the callback THROWS
- *      (the original error must propagate; restore/clear failure must not
- *      mask it)
+ *      (the original error must propagate; cleanup-success path)
  *   4. set_tenant_context() failure surfaces immediately (migration 003 not
  *      applied → throws BEFORE the callback runs)
- *   5. clear_tenant_context() / restore-set failure is intentionally
- *      swallowed (monitoring concern; original callback error wins)
+ *   5. CLEANUP FAILURE FAIL-CLOSED (Codex rls-r2 + rls-r3 closure): both
+ *      branches now throw I-023 violations. previous!==null + restore fails →
+ *      throws (cannot let outer continue under inner). previous===null +
+ *      clear fails → throws (cannot return stale binding to pool, would
+ *      perpetuate across pool checkouts). When callback ALSO threw,
+ *      AggregateError preserves both at .errors[0/1].
  *   6. callback receives the SAME client passed in (not a new connection)
  *   7. assertRlsActive throws when no context is set
  *   8. assertRlsActive succeeds when context is set
@@ -171,49 +174,21 @@ describe('withTenantContext — error path lifecycle', () => {
     // Clear must still have happened so a pooled connection isn't poisoned.
     expect(client.calls.some((c) => c.sql.includes('clear_tenant_context'))).toBe(true);
   });
-
-  it('clear_tenant_context failure is SWALLOWED (callback success result still returns)', async () => {
-    const client = makeMockClient();
-    client.throwOn = /clear_tenant_context/;
-    // The callback succeeds; the clear fails. The wrapper should NOT
-    // propagate the clear failure — that would mask perfectly fine
-    // application work and turn ops noise into a 500.
-    const result = await withTenantContext(client, TENANT_US, async () => 'ok');
-    expect(result).toBe('ok');
-  });
-
-  it('clear_tenant_context failure does NOT mask the callback error (callback error wins)', async () => {
-    // If both the callback AND the clear fail, the original callback error
-    // is what surfaces — the clear-failure is monitoring-only.
-    const client = makeMockClient();
-    client.throwOn = /clear_tenant_context/;
-    const cbError = new Error('callback fatal');
-    let caught: unknown;
-    try {
-      await withTenantContext(client, TENANT_US, async () => {
-        throw cbError;
-      });
-    } catch (err) {
-      caught = err;
-    }
-    expect(caught).toBe(cbError);
-  });
 });
 
 // ---------------------------------------------------------------------------
-// 3.5 Restore-failure handling (Codex rls-r2 HIGH closure)
+// 3.5 Cleanup-failure handling — BOTH branches are fail-closed
+// (Codex rls-r2 HIGH closed at verify-r3; rls-r3 HIGH closed at verify-r4)
 //
-// Asymmetric contract:
-//   - previous !== null → restore failure is FATAL. Throws to prevent
-//     outer-scope queries from running under the stale inner tenant.
-//     If the callback ALSO errored, AggregateError preserves both.
-//   - previous === null → clear failure is SWALLOWED. Outermost-exit;
-//     no outer scope to leak into; the migration-003 5-min TTL is the
-//     safety net.
+// Symmetric contract: ANY tenant-context cleanup failure throws an I-023
+// violation so the caller (and pool wrapper in db.ts) can discard the
+// connection. Silently swallowing leaves a stale binding on a pooled
+// connection — either bleeding into outer scope (nested case) or
+// perpetuating across pool checkouts (outermost case).
 // ---------------------------------------------------------------------------
 
-describe('withTenantContext — restore-failure handling (I-023 cross-tenant leak prevention)', () => {
-  it('previous=US + restore set_tenant_context FAILS → throws (cannot let outer continue under inner)', async () => {
+describe('withTenantContext — cleanup-failure handling (I-023 cross-tenant leak prevention)', () => {
+  it('NESTED — previous=US + restore set_tenant_context FAILS → throws (cannot let outer continue under inner)', async () => {
     const client = makeMockClient();
     // Mock prior context = TENANT_US (so previous !== null).
     client.rowsForCurrentTenantId = [{ tid: TENANT_US }];
@@ -232,7 +207,7 @@ describe('withTenantContext — restore-failure handling (I-023 cross-tenant lea
     ).rejects.toThrow(/I-023 violation: tenant-context restore failed/);
   });
 
-  it('previous=US + restore FAILS + callback ALSO threw → AggregateError preserves both', async () => {
+  it('NESTED — previous=US + restore FAILS + callback ALSO threw → AggregateError preserves both', async () => {
     const client = makeMockClient();
     client.rowsForCurrentTenantId = [{ tid: TENANT_US }];
     client.throwIf = (call, before) => {
@@ -256,16 +231,20 @@ describe('withTenantContext — restore-failure handling (I-023 cross-tenant lea
     );
   });
 
-  it('previous=null + clear FAILS → SWALLOWED (callback success result still returns)', async () => {
-    // No prior context (rowsForCurrentTenantId default = null). Clear fails.
-    // No outer scope to leak into → swallow + return callback result.
+  it('OUTERMOST — previous=null + clear_tenant_context FAILS → throws (cannot return stale binding to pool)', async () => {
+    // No prior context. Clear fails. With the rls-r4 fix, this MUST throw
+    // so the caller / pool wrapper can discard the connection — silently
+    // returning a connection to the pool with a stale tenant binding
+    // would let the next caller's withTenantContext "restore" the stale
+    // tenant on its own exit, perpetuating the leak across pool checkouts.
     const client = makeMockClient();
     client.throwOn = /clear_tenant_context/;
-    const result = await withTenantContext(client, TENANT_US, async () => 'callback-ok');
-    expect(result).toBe('callback-ok');
+    await expect(withTenantContext(client, TENANT_US, async () => 'callback-ok')).rejects.toThrow(
+      /I-023 violation: tenant-context clear failed/,
+    );
   });
 
-  it('previous=null + clear FAILS + callback ALSO threw → callback error wins (clear swallowed)', async () => {
+  it('OUTERMOST — previous=null + clear FAILS + callback ALSO threw → AggregateError preserves both', async () => {
     const client = makeMockClient();
     client.throwOn = /clear_tenant_context/;
     const cbError = new Error('callback boom');
@@ -277,7 +256,40 @@ describe('withTenantContext — restore-failure handling (I-023 cross-tenant lea
     } catch (err) {
       caught = err;
     }
-    expect(caught).toBe(cbError);
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors[0]).toBe(cbError);
+    expect((caught as AggregateError).message).toMatch(
+      /I-023 violation: tenant-context clear failed/,
+    );
+  });
+
+  it('REGRESSION GUARD — clear failure followed by another withTenantContext call on same client surfaces (does NOT silently restore stale tenant)', async () => {
+    // The exact regression Codex called out: a silently-swallowed clear
+    // failure leaves the binding on the client; the next withTenantContext
+    // call would read it as `previous` and "restore" the stale tenant on
+    // exit. With rls-r4 fail-closed-on-cleanup, the caller saw the error
+    // from the first call and (in production) the pool would discard the
+    // connection. Here we simulate "caller catches and tries again on the
+    // same client" as a defensive integration check: the FIRST call must
+    // throw; the SECOND call (with simulated clean state) must operate
+    // independently of the first call's stale state.
+    const client = makeMockClient();
+    client.throwOn = /clear_tenant_context/;
+    // First call: throws on clear.
+    await expect(withTenantContext(client, TENANT_GHANA, async () => 'first-ok')).rejects.toThrow(
+      /I-023 violation/,
+    );
+    // Production would discard the client here. Our mock proceeds to a
+    // second call; we reset the mock's failure mode to simulate a fresh
+    // pool checkout. The contract: even if a caller WERE to reuse the
+    // mock client, the second call surfaces its own state, not the first
+    // call's stale binding.
+    // (delete vs `= undefined` because exactOptionalPropertyTypes blocks
+    //  the assignment form for optional fields.)
+    delete client.throwOn;
+    client.rowsForCurrentTenantId = [{ tid: null }];
+    const result = await withTenantContext(client, TENANT_US, async () => 'second-ok');
+    expect(result).toBe('second-ok');
   });
 });
 
