@@ -369,15 +369,20 @@ describe('withTenantContext — real DB round-trip via shared client', () => {
     expect(observed).toBe(TENANT_US);
   });
 
-  it('clears the context after the callback so current_tenant_id() returns null afterwards', async () => {
+  it('clears the context after the callback so current_tenant_id() raises tenant_context_not_set afterwards', async () => {
+    // Per migration 003, current_tenant_id() RAISES `tenant_context_not_set`
+    // when no binding exists — this is fail-closed-by-design so RLS USING
+    // expressions reject queries that ran outside any withTenantContext.
+    // Test assertion updated 2026-05-04 (Codex rls-test-r0): the prior
+    // version expected `null` which never matches reality — current_tenant_id()
+    // never returns NULL.
     const client = getTestClient() as unknown as DbClient;
     await withTenantContext(client, TENANT_US, async () => {
       // empty
     });
-    const result = (await client.query('SELECT current_tenant_id() AS tid')) as {
-      rows: Array<{ tid: string | null }>;
-    };
-    expect(result.rows[0]?.tid ?? null).toBeNull();
+    await expect(client.query('SELECT current_tenant_id() AS tid')).rejects.toThrow(
+      /tenant_context_not_set/,
+    );
   });
 
   it('NESTED RESTORE — inner Ghana context exits and outer US context is RESTORED (I-023 safety)', async () => {
@@ -413,17 +418,19 @@ describe('withTenantContext — real DB round-trip via shared client', () => {
     // After BOTH the inner and outer withTenantContext exit, there should be
     // no tenant context set (the outermost call started with no prior
     // binding, so save/restore correctly returns to "no binding" at the
-    // outermost exit).
+    // outermost exit). With migration 003's fail-closed semantics
+    // current_tenant_id() RAISES `tenant_context_not_set` instead of
+    // returning NULL — the regression-guard assertion is "raises"
+    // (Codex rls-test-r0 closure 2026-05-04).
     const client = getTestClient() as unknown as DbClient;
     await withTenantContext(client, TENANT_US, async (cOuter) => {
       await withTenantContext(cOuter, TENANT_GHANA, async () => {
         // empty
       });
     });
-    const result = (await client.query('SELECT current_tenant_id() AS tid')) as {
-      rows: Array<{ tid: string | null }>;
-    };
-    expect(result.rows[0]?.tid ?? null).toBeNull();
+    await expect(client.query('SELECT current_tenant_id() AS tid')).rejects.toThrow(
+      /tenant_context_not_set/,
+    );
   });
 
   it('NESTED RESTORE — error in inner scope still restores outer binding', async () => {

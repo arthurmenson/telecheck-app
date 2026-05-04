@@ -630,12 +630,22 @@ export async function pauseSubmission(
     // Codex pause-r1 MEDIUM closure). Type system enforces this — the
     // PauseSubmissionResult.submission field is PatientFormSubmissionView,
     // not FormSubmission.
+    // Normalize expires_at to ISO 8601 string. The pg driver returns
+    // TIMESTAMPTZ columns as JS Date objects; the API contract (and
+    // test assertions per Codex pause-r1 typeof check) expect string.
+    // The repo's TS shape says `expires_at: string` but the runtime
+    // value is a Date (the type narrows to `string` at compile time
+    // but the cast is wrong) — coerce here defensively.
+    // Codex pause-typeof-r0 closure 2026-05-04.
+    const rawExpiresAt: unknown = resumeState.expires_at;
+    const expiresAtIso =
+      rawExpiresAt instanceof Date ? rawExpiresAt.toISOString() : String(rawExpiresAt);
     return {
       submission: toPatientView(merged),
       resumeState: {
         resumeStateId: resumeState.resume_state_id,
         resumeToken,
-        expiresAt: resumeState.expires_at,
+        expiresAt: expiresAtIso,
       },
     };
   }, externalTx);
