@@ -115,12 +115,18 @@ describe('otp-repo §1 createOtp', () => {
 describe('otp-repo §2 findLatestActiveOtp', () => {
   it('§2a returns most-recent active OTP for (tenant, phone, purpose)', async () => {
     const phone = uniquePhone();
+    const firstId = asOtpId(ulid());
 
-    // First OTP
-    await withTenantContext(T_US, () =>
-      createOtp(
+    // First OTP — manually backdate created_at by 60s so the ORDER BY
+    // created_at DESC ordering is unambiguous. (Within a savepoint-
+    // wrapped test transaction, NOW() returns the same value for both
+    // inserts; the repo's INSERT uses NOW() so both rows would tie.
+    // Backdating the first row to NOW() - 60s makes the second row
+    // unambiguously newer.)
+    await withTenantContext(T_US, async () => {
+      await createOtp(
         {
-          otp_id: asOtpId(ulid()),
+          otp_id: firstId,
           tenant_id: T_US,
           phone_e164: phone,
           purpose: 'login',
@@ -129,12 +135,14 @@ describe('otp-repo §2 findLatestActiveOtp', () => {
         },
         async () => {},
         getTestClient(),
-      ),
-    );
+      );
+      await getTestClient().query(
+        "UPDATE otp_challenges SET created_at = NOW() - INTERVAL '60 seconds' WHERE otp_id = $1",
+        [firstId],
+      );
+    });
 
-    await new Promise((r) => setTimeout(r, 5));
-
-    // Second OTP (more recent)
+    // Second OTP — uses default created_at = NOW() (newer than first)
     const secondId = asOtpId(ulid());
     await withTenantContext(T_US, () =>
       createOtp(
