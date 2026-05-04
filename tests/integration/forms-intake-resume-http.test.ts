@@ -255,17 +255,23 @@ function assertNoTenantIdLeakageInError(response: { body: string }): void {
 }
 
 /**
- * Strip volatile fields (request_id, timestamps) from an error envelope
- * so cross-test envelope shape can be compared. Codex variants-resume-
- * http-r1 closure 2026-05-03 specifically calls for "compare normalized
- * error envelopes for cross-patient, tampered, missing/completed-replay
- * cases after removing request_id so the tests actually pin tenant-blind
- * behavior."
+ * Strip volatile fields from an error envelope so cross-test envelope
+ * shape can be compared.
+ *
+ * **Codex variants-resume-http-r2 closure 2026-05-03:** the volatile
+ * fields the platform error envelope (`src/lib/error-envelope.ts`) emits
+ * are `trace_id` (per-request unique) and `timestamp` (now()), NOT
+ * `request_id`. Two separate `app.inject` calls would otherwise produce
+ * different normalized objects even when the tenant-blind code/message
+ * are identical. The previous version of this normalizer stripped the
+ * wrong fields and would have made the equality tests timing-dependent
+ * (passing only if timestamps happened to match at millisecond
+ * resolution).
  *
  * The expected normalized shape for the resume tenant-blind paths:
  *   { error: { code: <static-string>, message: <static-string> } }
- * Anything else (a leaked detail, a stack frame, a tenant-context field)
- * would diverge from this shape and fail the equality assertion.
+ * Anything else (a leaked detail field, a tenant-context entry) would
+ * diverge from this shape and fail the equality assertion.
  */
 function normalizeErrorEnvelope(response: { body: string }): unknown {
   if (response.body.trim().length === 0) return null;
@@ -277,8 +283,15 @@ function normalizeErrorEnvelope(response: { body: string }): unknown {
   }
   if (parsed.error === undefined) return null;
   const error = parsed.error;
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { request_id: _reqId, statusCode: _sc, ...stable } = error;
+  /* eslint-disable @typescript-eslint/no-unused-vars */
+  const {
+    trace_id: _trace,
+    timestamp: _ts,
+    request_id: _reqId,
+    statusCode: _sc,
+    ...stable
+  } = error;
+  /* eslint-enable @typescript-eslint/no-unused-vars */
   return { error: stable };
 }
 
