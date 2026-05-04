@@ -169,21 +169,63 @@ export async function withTenantBoundConnection<T>(
     // Caller owns binding + connection lifecycle. We just run `fn`.
     return fn(externalTx);
   }
-  return withConnection(async (client) => {
-    await client.query('SELECT set_tenant_context($1)', [tenantId]);
-    try {
-      return await fn(client);
-    } finally {
-      // Clear the binding before the connection returns to the pool so the
-      // next caller doesn't inherit it. The TTL on the binding (5 min per
-      // migration 003) is the primary safeguard, but explicit cleanup
-      // shortens the leak window.
-      await client.query('SELECT clear_tenant_context()').catch(() => {
-        // Swallow cleanup error — the original `fn` result is more important
-        // to surface; if the connection itself died, the pool will discard it.
-      });
+  // Manage the pool client lifecycle here (rather than via withConnection)
+  // so we can call `client.release(error)` to DISCARD the connection from
+  // the pool on cleanup failure. This is the I-023 floor enforcement at
+  // the pool layer: a clear failure means the binding is still active on
+  // this backend; returning that connection to the pool would let the
+  // next caller inherit the stale binding.
+  // (Closed 2026-05-03 per Codex rls-r4 HIGH (verify-r5) — companion to
+  //  the rls.ts fix; both layers must fail closed for the I-023 floor to
+  //  hold across pool checkouts.)
+  const pool = getPool();
+  const client = await pool.connect();
+  await client.query('SELECT set_tenant_context($1)', [tenantId]);
+
+  let result: T;
+  let cbError: unknown;
+  try {
+    result = await fn(client);
+  } catch (err) {
+    cbError = err;
+    result = undefined as unknown as T;
+  }
+
+  let cleanupError: unknown;
+  try {
+    await client.query('SELECT clear_tenant_context()');
+  } catch (err) {
+    cleanupError = err;
+  }
+
+  if (cleanupError !== undefined) {
+    // Discard the connection from the pool — passing a truthy argument to
+    // pg.PoolClient.release() destroys the underlying connection rather
+    // than returning it to the pool. The next caller gets a fresh
+    // backend with no binding.
+    client.release(true);
+    const cleanupMsg = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+    if (cbError !== undefined) {
+      throw new AggregateError(
+        [cbError, cleanupError],
+        `I-023 violation: tenant-context clear failed in withTenantBoundConnection (${cleanupMsg}); ` +
+          `connection has been discarded from the pool. ` +
+          `Original callback error preserved at AggregateError.errors[0].`,
+      );
     }
-  });
+    throw new Error(
+      `I-023 violation: tenant-context clear failed in withTenantBoundConnection (${cleanupMsg}). ` +
+        `Connection has been discarded from the pool.`,
+    );
+  }
+
+  // Healthy cleanup; return the connection to the pool normally.
+  client.release();
+
+  if (cbError !== undefined) {
+    throw cbError;
+  }
+  return result;
 }
 
 /**
