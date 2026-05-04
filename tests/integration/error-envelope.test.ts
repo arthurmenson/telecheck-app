@@ -21,10 +21,12 @@
  *      IDENTICAL response shape to non-existent resource (no 403, no detail).
  *   3. Response body schema validation: only { error: { code, message, request_id } }.
  *
- * NOTE: These tests exercise the HTTP layer via Fastify's buildApp(). The
- * error-envelope middleware is written by the appsec-expert agent in
- * src/lib/error-envelope.ts. Until that module exists, tests use it.todo()
- * at the HTTP boundary and verify the envelope shape assertion helpers.
+ * NOTE: This file holds the unit-style SHAPE assertions against
+ * `assertI025TenantBlindEnvelope` + `makeEnvelope` from
+ * src/lib/error-envelope.ts. The HTTP-level EMISSION tests (formerly
+ * left as it.todo() pending middleware) are now closed in
+ * tests/integration/error-envelope-http.test.ts via buildApp + Fastify
+ * inject. Look there for end-to-end coverage of the plugin behavior.
  *
  * DEPENDS ON:
  *   - src/app.ts (buildApp — available at bootstrap)
@@ -71,15 +73,11 @@ function makeEnvelope(code: string, message: string, requestId: string): ErrorEn
 // ---------------------------------------------------------------------------
 
 describe('error envelope — non-existent resource (I-025)', () => {
-  // TODO: Replace this stub with a real Fastify inject() call once
-  //   src/lib/error-envelope.ts is written by the appsec-expert agent.
-  //   The test will then issue GET /patients/pat_does_not_exist with
-  //   a valid Tenant-A session header and assert the response.
-
-  it.todo(
-    'should return 404 with tenant-blind envelope for a non-existent resource ID ' +
-      '(HTTP layer — depends on src/lib/error-envelope.ts)',
-  );
+  // The HTTP-layer assertion previously held here as it.todo() is now
+  // covered by tests/integration/error-envelope-http.test.ts (which
+  // exercises the actual errorEnvelopePlugin end-to-end via buildApp +
+  // Fastify inject). This unit-style file retains the SHAPE assertions
+  // against the helper; the EMISSION assertions live in the http file.
 
   it('should validate the error envelope schema shape', () => {
     // Unit-style assertion against the helper — runnable without a real server.
@@ -108,11 +106,10 @@ describe('error envelope — non-existent resource (I-025)', () => {
 // ---------------------------------------------------------------------------
 
 describe('error envelope — cross-tenant existence leak prevention (I-025)', () => {
-  it.todo(
-    'should return the IDENTICAL 404 envelope shape whether the resource does not exist ' +
-      'or exists in another tenant (HTTP layer — depends on src/lib/error-envelope.ts + ' +
-      'routing middleware with tenant context)',
-  );
+  // HTTP-level identical-shape assertion (missing vs cross-tenant
+  // resource) is covered end-to-end in error-envelope-http.test.ts
+  // via buildApp + Fastify inject through the actual route handlers.
+  // This file retains the shape-validator unit checks below.
 
   it('should detect a 403-revealing envelope as an I-025 violation', () => {
     // A 403 that reveals the resource exists in another tenant is forbidden.
@@ -196,11 +193,9 @@ describe('error envelope — schema conformance (I-025)', () => {
     expect(missingResource.error.code).toBe(crossTenantResource.error.code);
   });
 
-  it.todo(
-    'should assert via HTTP inject that Tenant A authenticated request for Tenant B resource ' +
-      'returns HTTP 404 (not 403) with the canonical error envelope — ' +
-      'blocked on src/lib/error-envelope.ts + auth middleware (appsec-expert agent)',
-  );
+  // HTTP-inject assertion (Tenant A request for Tenant B resource → 404 with
+  // canonical envelope) is closed by error-envelope-http.test.ts. The .todo()
+  // that lived here historically was removed 2026-05-04 once that file landed.
 });
 
 // Cross-invariant assertion: test that the envelope helpers are consistent with
