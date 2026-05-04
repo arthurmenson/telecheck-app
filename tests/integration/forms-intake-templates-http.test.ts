@@ -29,7 +29,7 @@
  *   - Master PRD v1.10 §17 patient-surface rule (DOES NOT apply to admin)
  */
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
@@ -357,11 +357,40 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
 // the publish service expects.
 // ---------------------------------------------------------------------------
 
+/**
+ * Run an `app.inject` call with FORMS_PUBLISH_GATES_BYPASS set to the
+ * 'unsafe-test-only' sentinel. Mirrors the helper in
+ * tests/integration/forms-intake-publish.test.ts — the gate is
+ * hostile-named so a routine env-config typo can't accidentally open
+ * publish in production. We save/restore around every publish-path
+ * HTTP test.
+ *
+ * **Codex templates-http-r1 closure 2026-05-03:** the prior version of
+ * this suite ran publish-path tests without setting the bypass. Every
+ * publish call (including draft / already-published / missing) hit the
+ * fail-closed sentinel first and returned 503 instead of the intended
+ * 200/400 response — so the assertions were either red in CI or
+ * masked by a process-wide bypass set elsewhere.
+ */
+async function injectWithPublishBypass(injectArgs: InjectOptions): Promise<LightMyRequestResponse> {
+  const prior = process.env['FORMS_PUBLISH_GATES_BYPASS'];
+  process.env['FORMS_PUBLISH_GATES_BYPASS'] = 'unsafe-test-only';
+  try {
+    return await app!.inject(injectArgs);
+  } finally {
+    if (prior === undefined) {
+      delete process.env['FORMS_PUBLISH_GATES_BYPASS'];
+    } else {
+      process.env['FORMS_PUBLISH_GATES_BYPASS'] = prior;
+    }
+  }
+}
+
 describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — HTTP-level', () => {
-  it('returns 200 + body when publishing a draft template', async () => {
+  it('returns 200 + body when publishing a draft template (bypass set)', async () => {
     const { templateId } = await seedTemplate({ status: 'draft' });
 
-    const response = await app!.inject({
+    const response = await injectWithPublishBypass({
       method: 'POST',
       url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
       headers: {
@@ -372,9 +401,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       payload: {},
     });
 
-    // Publish flow may return 200 on success. Status check is lax to
-    // tolerate the handler returning 204 or similar on the empty-body
-    // case while still asserting no error.
+    // Publish flow may return 200 on success. Lax 2xx check to tolerate
+    // 204 or similar on the empty-body case.
     expect(response.statusCode).toBeGreaterThanOrEqual(200);
     expect(response.statusCode).toBeLessThan(300);
   });
@@ -383,7 +411,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
     // Pattern A immutability: a published version cannot be re-published.
     const { templateId } = await seedTemplate({ status: 'published' });
 
-    const response = await app!.inject({
+    const response = await injectWithPublishBypass({
       method: 'POST',
       url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
       headers: {
@@ -399,7 +427,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
   });
 
   it('returns 400 (tenant-blind) for a non-existent template_id', async () => {
-    const response = await app!.inject({
+    const response = await injectWithPublishBypass({
       method: 'POST',
       url: `/v0/forms/templates/${ulid()}/versions/${ulid()}/publish`,
       headers: {
@@ -416,6 +444,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
   it('returns 401 when no actor identity is supplied', async () => {
     const { templateId } = await seedTemplate({ status: 'draft' });
 
+    // No bypass needed — the actor-id 401 fires before the publish-gate
+    // sentinel. This test covers the auth-gate-first ordering.
     const response = await app!.inject({
       method: 'POST',
       url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
@@ -426,6 +456,39 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       payload: {},
     });
     expect(response.statusCode).toBe(401);
+    assertNoTenantIdLeakageInError(response);
+  });
+
+  // Codex templates-http-r1 closure 2026-05-03: assert the fail-closed
+  // invariant explicitly. With the bypass absent (default production
+  // posture), the publish endpoint MUST return 503 — preserves the
+  // safety floor that publish-time governance gates aren't yet
+  // implemented and won't accidentally pass through.
+  it('returns 503 when FORMS_PUBLISH_GATES_BYPASS is absent (fail-closed invariant)', async () => {
+    const { templateId } = await seedTemplate({ status: 'draft' });
+
+    // Save the env state, ensure bypass is unset for THIS test only,
+    // restore after.
+    const prior = process.env['FORMS_PUBLISH_GATES_BYPASS'];
+    delete process.env['FORMS_PUBLISH_GATES_BYPASS'];
+    let response;
+    try {
+      response = await app!.inject({
+        method: 'POST',
+        url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
+        headers: {
+          host: US_HOST,
+          'x-actor-id': 'op_pub_failclose',
+          'content-type': 'application/json',
+        },
+        payload: {},
+      });
+    } finally {
+      if (prior !== undefined) {
+        process.env['FORMS_PUBLISH_GATES_BYPASS'] = prior;
+      }
+    }
+    expect(response.statusCode).toBe(503);
     assertNoTenantIdLeakageInError(response);
   });
 });
