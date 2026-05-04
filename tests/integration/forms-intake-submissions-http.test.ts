@@ -90,6 +90,62 @@ function assertNoTenantIdLeakage(response: { body: string; json: <T>() => T }): 
   expect(findKeyAtAnyDepth(parsed, 'tenant_id')).toBe(false);
 }
 
+/**
+ * Same byte-clean guarantee as `assertNoTenantIdLeakage` but tolerant of
+ * empty / non-JSON bodies (some 401 / 4xx responses come back as empty
+ * strings depending on Fastify's default error serializer). Applied to
+ * EVERY negative HTTP response per Codex submissions-http-r1 closure
+ * 2026-05-03 — error envelopes are a real PHI leak surface and must
+ * carry the same no-tenant_id-leak guarantee as success responses.
+ */
+function assertNoTenantIdLeakageInError(response: { body: string }): void {
+  // Raw-string check is unconditional — it catches both the key string
+  // and the tenant value substring regardless of whether the body is
+  // valid JSON.
+  expect(response.body).not.toContain('tenant_id');
+  expect(response.body).not.toContain(TENANT_US);
+  // Recursive parsed scan only when the body is non-empty AND parses as
+  // JSON. Some 4xx responses (e.g., Fastify's default 400 on parse error)
+  // come back with a non-JSON body or an empty string.
+  if (response.body.trim().length === 0) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(response.body);
+  } catch {
+    return;
+  }
+  expect(findKeyAtAnyDepth(parsed, 'tenant_id')).toBe(false);
+}
+
+/**
+ * Assert the response is a tenant-blind error envelope per I-025 +
+ * ERROR_MODEL v5.1. The canonical shape:
+ *   { error: { code: string, message: string, request_id?: string } }
+ *
+ * Combined with `assertNoTenantIdLeakageInError` this guarantees that
+ * cross-patient / missing-resource / state-violation errors expose
+ * neither the operating-tenant identifier nor any structural hint that
+ * a row exists in another tenant.
+ */
+function assertTenantBlindErrorEnvelope(response: { body: string; statusCode: number }): void {
+  assertNoTenantIdLeakageInError(response);
+  // Empty body (e.g., raw 401 from Fastify before our plugin renders) is
+  // treated as a pass — there's nothing to leak. Covered separately by
+  // the substring check above.
+  if (response.body.trim().length === 0) return;
+  let parsed: { error?: { code?: string; message?: string } };
+  try {
+    parsed = JSON.parse(response.body) as { error?: { code?: string; message?: string } };
+  } catch {
+    // Non-JSON 4xx — no envelope to assert. The substring check has
+    // already verified no tenant leak.
+    return;
+  }
+  // When the body IS JSON, expect the canonical envelope shape.
+  expect(parsed.error).toBeDefined();
+  expect(parsed.error?.code).toBeDefined();
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -187,8 +243,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
     });
 
     expect(response.statusCode).toBe(400);
-    const body = response.json<{ error?: { code?: string } }>();
-    expect(body.error?.code).toBeDefined();
+    assertTenantBlindErrorEnvelope(response);
   });
 
   it('returns 400 when starting a duplicate in_progress submission for the same tuple', async () => {
@@ -221,6 +276,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       payload: { deploymentId },
     });
     expect(second.statusCode).toBe(400);
+    assertTenantBlindErrorEnvelope(second);
   });
 
   it('returns 401 when no patient identity header is supplied', async () => {
@@ -237,6 +293,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       payload: { deploymentId },
     });
     expect(response.statusCode).toBe(401);
+    assertNoTenantIdLeakageInError(response);
   });
 
   it('returns 400 on missing body', async () => {
@@ -252,6 +309,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       payload: {},
     });
     expect(response.statusCode).toBe(400);
+    assertNoTenantIdLeakageInError(response);
   });
 });
 
@@ -327,6 +385,7 @@ describe('GET /v0/forms/submissions/:submissionId — HTTP-level', () => {
       },
     });
     expect(response.statusCode).toBe(404);
+    assertTenantBlindErrorEnvelope(response);
   });
 
   it('returns 404 for a missing submission_id', async () => {
@@ -339,6 +398,7 @@ describe('GET /v0/forms/submissions/:submissionId — HTTP-level', () => {
       },
     });
     expect(response.statusCode).toBe(404);
+    assertTenantBlindErrorEnvelope(response);
   });
 });
 
@@ -425,6 +485,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
     // with a structured error code (not the generic 4xx) so the patient
     // surface can branch to the crisis-resources path.
     expect(response.statusCode).toBe(409);
+    assertTenantBlindErrorEnvelope(response);
   });
 
   it('returns 404 cross-patient on update', async () => {
@@ -463,6 +524,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
     // SUBMISSION_NOT_FOUND on ownership mismatch -> tenant-blind 400 per
     // I-025 (unified envelope for the "in invalid state" sentinels).
     expect(response.statusCode).toBe(400);
+    assertTenantBlindErrorEnvelope(response);
   });
 
   it('returns 401 when no patient identity is supplied', async () => {
@@ -497,6 +559,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       payload: { responses: { f: 'v' } },
     });
     expect(response.statusCode).toBe(401);
+    assertNoTenantIdLeakageInError(response);
   });
 });
 
@@ -650,6 +713,7 @@ describe('POST /v0/forms/submissions/:submissionId/submit — HTTP-level', () =>
       payload: {},
     });
     expect(response.statusCode).toBe(400);
+    assertTenantBlindErrorEnvelope(response);
   });
 
   it('returns 401 when no patient identity is supplied', async () => {
@@ -684,5 +748,6 @@ describe('POST /v0/forms/submissions/:submissionId/submit — HTTP-level', () =>
       payload: {},
     });
     expect(response.statusCode).toBe(401);
+    assertNoTenantIdLeakageInError(response);
   });
 });
