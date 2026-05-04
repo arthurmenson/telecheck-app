@@ -71,13 +71,24 @@ interface MockClient extends DbClient {
   throwWith?: Error;
   /** If set, query() returns this value (used for assertRlsActive tests). */
   rowsForCurrentTenantId?: Array<{ tid: string | null }>;
+  /**
+   * Optional predicate: if provided AND the predicate returns true for the
+   * current call, throw. Used for tests that need to throw on the SECOND
+   * occurrence of a matching SQL (e.g., restore-set after initial-set).
+   */
+  throwIf?: (call: RecordedCall, callsBeforeThis: RecordedCall[]) => boolean;
 }
 
 function makeMockClient(): MockClient {
   const m: MockClient = {
     calls: [],
     query: async (sql: string, params?: readonly unknown[]) => {
-      m.calls.push({ sql, params });
+      const call: RecordedCall = { sql, params };
+      const callsBefore = m.calls.slice();
+      m.calls.push(call);
+      if (m.throwIf !== undefined && m.throwIf(call, callsBefore)) {
+        throw m.throwWith ?? new Error(`mock: throwIf matched on ${sql}`);
+      }
       if (m.throwOn !== undefined && m.throwOn.test(sql)) {
         throw m.throwWith ?? new Error(`mock: throwing on sql matching ${m.throwOn}`);
       }
@@ -177,6 +188,87 @@ describe('withTenantContext — error path lifecycle', () => {
     const client = makeMockClient();
     client.throwOn = /clear_tenant_context/;
     const cbError = new Error('callback fatal');
+    let caught: unknown;
+    try {
+      await withTenantContext(client, TENANT_US, async () => {
+        throw cbError;
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBe(cbError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3.5 Restore-failure handling (Codex rls-r2 HIGH closure)
+//
+// Asymmetric contract:
+//   - previous !== null → restore failure is FATAL. Throws to prevent
+//     outer-scope queries from running under the stale inner tenant.
+//     If the callback ALSO errored, AggregateError preserves both.
+//   - previous === null → clear failure is SWALLOWED. Outermost-exit;
+//     no outer scope to leak into; the migration-003 5-min TTL is the
+//     safety net.
+// ---------------------------------------------------------------------------
+
+describe('withTenantContext — restore-failure handling (I-023 cross-tenant leak prevention)', () => {
+  it('previous=US + restore set_tenant_context FAILS → throws (cannot let outer continue under inner)', async () => {
+    const client = makeMockClient();
+    // Mock prior context = TENANT_US (so previous !== null).
+    client.rowsForCurrentTenantId = [{ tid: TENANT_US }];
+    // Throw on the SECOND set_tenant_context call (the restore-set);
+    // the FIRST set_tenant_context call (initial set to TENANT_GHANA)
+    // must succeed so we exercise the restore branch.
+    client.throwIf = (call, before) => {
+      const isSet = call.sql.includes('set_tenant_context');
+      const priorSetCount = before.filter((c) => c.sql.includes('set_tenant_context')).length;
+      return isSet && priorSetCount >= 1;
+    };
+    await expect(
+      withTenantContext(client, TENANT_GHANA, async () => {
+        return 'callback-ok';
+      }),
+    ).rejects.toThrow(/I-023 violation: tenant-context restore failed/);
+  });
+
+  it('previous=US + restore FAILS + callback ALSO threw → AggregateError preserves both', async () => {
+    const client = makeMockClient();
+    client.rowsForCurrentTenantId = [{ tid: TENANT_US }];
+    client.throwIf = (call, before) => {
+      const isSet = call.sql.includes('set_tenant_context');
+      const priorSetCount = before.filter((c) => c.sql.includes('set_tenant_context')).length;
+      return isSet && priorSetCount >= 1;
+    };
+    const cbError = new Error('callback boom');
+    let caught: unknown;
+    try {
+      await withTenantContext(client, TENANT_GHANA, async () => {
+        throw cbError;
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors[0]).toBe(cbError);
+    expect((caught as AggregateError).message).toMatch(
+      /I-023 violation: tenant-context restore failed/,
+    );
+  });
+
+  it('previous=null + clear FAILS → SWALLOWED (callback success result still returns)', async () => {
+    // No prior context (rowsForCurrentTenantId default = null). Clear fails.
+    // No outer scope to leak into → swallow + return callback result.
+    const client = makeMockClient();
+    client.throwOn = /clear_tenant_context/;
+    const result = await withTenantContext(client, TENANT_US, async () => 'callback-ok');
+    expect(result).toBe('callback-ok');
+  });
+
+  it('previous=null + clear FAILS + callback ALSO threw → callback error wins (clear swallowed)', async () => {
+    const client = makeMockClient();
+    client.throwOn = /clear_tenant_context/;
+    const cbError = new Error('callback boom');
     let caught: unknown;
     try {
       await withTenantContext(client, TENANT_US, async () => {
