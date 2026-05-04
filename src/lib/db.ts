@@ -180,52 +180,97 @@ export async function withTenantBoundConnection<T>(
   //  hold across pool checkouts.)
   const pool = getPool();
   const client = await pool.connect();
-  await client.query('SELECT set_tenant_context($1)', [tenantId]);
 
-  let result: T;
-  let cbError: unknown;
+  // Everything from this point onward MUST be in a controlled lifecycle
+  // that releases the client on every exit. A failure between pool.connect()
+  // and the cleanup phase (e.g., set_tenant_context throws because
+  // migration 003 isn't applied, or the connection drops mid-query) would
+  // otherwise leak the client back to the JS heap without ever returning
+  // it to the pool — repeated failures exhaust the pool and turn an
+  // auth/RLS setup failure into a broader availability incident.
+  // (Closed 2026-05-03 per Codex db-r5 HIGH (verify-r6).)
+  let releaseHandled = false;
   try {
-    result = await fn(client);
-  } catch (err) {
-    cbError = err;
-    result = undefined as unknown as T;
-  }
-
-  let cleanupError: unknown;
-  try {
-    await client.query('SELECT clear_tenant_context()');
-  } catch (err) {
-    cleanupError = err;
-  }
-
-  if (cleanupError !== undefined) {
-    // Discard the connection from the pool — passing a truthy argument to
-    // pg.PoolClient.release() destroys the underlying connection rather
-    // than returning it to the pool. The next caller gets a fresh
-    // backend with no binding.
-    client.release(true);
-    const cleanupMsg = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-    if (cbError !== undefined) {
-      throw new AggregateError(
-        [cbError, cleanupError],
-        `I-023 violation: tenant-context clear failed in withTenantBoundConnection (${cleanupMsg}); ` +
-          `connection has been discarded from the pool. ` +
-          `Original callback error preserved at AggregateError.errors[0].`,
+    // Phase A: install tenant binding. If this fails, the connection
+    // state is uncertain — discard rather than risk reusing a half-bound
+    // backend.
+    try {
+      await client.query('SELECT set_tenant_context($1)', [tenantId]);
+    } catch (setErr) {
+      client.release(true);
+      releaseHandled = true;
+      const setMsg = setErr instanceof Error ? setErr.message : String(setErr);
+      throw new Error(
+        `withTenantBoundConnection: set_tenant_context failed (${setMsg}). ` +
+          `Connection discarded from the pool. ` +
+          `Common causes: migration 003 not applied; connection dropped mid-query; ` +
+          `unknown tenantId.`,
       );
     }
-    throw new Error(
-      `I-023 violation: tenant-context clear failed in withTenantBoundConnection (${cleanupMsg}). ` +
-        `Connection has been discarded from the pool.`,
-    );
-  }
 
-  // Healthy cleanup; return the connection to the pool normally.
-  client.release();
+    // Phase B: callback + cleanup, with the asymmetric I-023 fail-closed
+    // contract for cleanup failures.
+    let result: T;
+    let cbError: unknown;
+    try {
+      result = await fn(client);
+    } catch (err) {
+      cbError = err;
+      result = undefined as unknown as T;
+    }
 
-  if (cbError !== undefined) {
-    throw cbError;
+    let cleanupError: unknown;
+    try {
+      await client.query('SELECT clear_tenant_context()');
+    } catch (err) {
+      cleanupError = err;
+    }
+
+    if (cleanupError !== undefined) {
+      // Discard the connection — passing a truthy argument to
+      // pg.PoolClient.release() destroys the underlying connection rather
+      // than returning it to the pool. The next caller gets a fresh
+      // backend with no binding.
+      client.release(true);
+      releaseHandled = true;
+      const cleanupMsg =
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      if (cbError !== undefined) {
+        throw new AggregateError(
+          [cbError, cleanupError],
+          `I-023 violation: tenant-context clear failed in withTenantBoundConnection (${cleanupMsg}); ` +
+            `connection has been discarded from the pool. ` +
+            `Original callback error preserved at AggregateError.errors[0].`,
+        );
+      }
+      throw new Error(
+        `I-023 violation: tenant-context clear failed in withTenantBoundConnection (${cleanupMsg}). ` +
+          `Connection has been discarded from the pool.`,
+      );
+    }
+
+    // Healthy cleanup; return the connection to the pool normally.
+    client.release();
+    releaseHandled = true;
+
+    if (cbError !== undefined) {
+      throw cbError;
+    }
+    return result;
+  } catch (err) {
+    // Catch-all leak guard. Every controlled exit above sets
+    // releaseHandled = true; if we got here without it set, an
+    // unexpected error escaped before any release/discard ran. Discard
+    // the connection now to prevent pool exhaustion.
+    if (!releaseHandled) {
+      try {
+        client.release(true);
+      } catch {
+        // Ignore — original error is what matters.
+      }
+    }
+    throw err;
   }
-  return result;
 }
 
 /**
