@@ -16,6 +16,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateVariantRequestSchema, PromoteVariantRequestSchema } from '../../schemas.js';
 import {
@@ -71,6 +72,7 @@ export async function createVariantHandler(
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
+  requireAdminRole(req);
 
   const parsed = CreateVariantRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -120,6 +122,7 @@ export async function getVariantHandler(
   // require an authenticated actor — closes the unauthenticated-admin-read
   // path Codex flagged on the HTTP-test pass.
   void resolveActorId(req);
+  requireAdminRole(req);
 
   const params = req.params as Record<string, unknown>;
   const variantIdParam = params['variantId'];
@@ -152,6 +155,7 @@ export async function promoteVariantHandler(
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
+  requireAdminRole(req);
 
   const params = req.params as Record<string, unknown>;
   const variantIdParam = params['variantId'];

@@ -291,6 +291,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_create',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {
         deploymentId,
@@ -325,6 +327,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_retired',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {
         deploymentId,
@@ -355,6 +359,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dup_first',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {
         deploymentId,
@@ -373,6 +379,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dup_second',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {
         deploymentId,
@@ -409,6 +417,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_draft',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {
         deploymentId,
@@ -430,6 +440,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_nobody',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {},
     });
@@ -466,6 +478,35 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
 
     expect(response.statusCode).toBe(401);
   });
+
+  // Codex deployments-http-r1 closure 2026-05-03 — admin endpoints assert
+  // BOTH identity AND admin-role authorization. With actor-id present
+  // but no admin role, the handler returns 403 (not 401, not 201).
+  it('returns 403 when actor identity is present but no admin role is supplied', async () => {
+    const programId = `prog_var_http_noadmin_${ulid().slice(0, 8)}`;
+    const { templateId, deploymentId } = await seedActiveDeployment({
+      ctx: US_CTX,
+      programId,
+    });
+
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/forms/variants',
+      headers: {
+        host: 'localhost',
+        'x-actor-id': 'op_no_admin_role',
+        // Non-admin role.
+        'x-actor-roles': 'patient',
+      },
+      payload: {
+        deploymentId,
+        variantTemplateId: templateId,
+        label: 'control',
+        trafficPercent: 100,
+      },
+    });
+    expect(response.statusCode).toBe(403);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -493,6 +534,8 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
         // Admin endpoints (incl. reads) require an authenticated actor —
         // Codex variants-resume-http-r1 closure 2026-05-03.
         'x-actor-id': 'op_get',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -557,6 +600,8 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       headers: {
         host: 'ghana.heroshealth.com',
         'x-actor-id': 'op_xt',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -572,6 +617,8 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_missing',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -620,6 +667,8 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_promote',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {
         rationale: 'Arm A converted 12% better; p < 0.01 over n=2000 sessions.',
@@ -656,6 +705,8 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_promote_first',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {
         rationale: 'first',
@@ -672,6 +723,8 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_promote_second',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {
         rationale: 'second',

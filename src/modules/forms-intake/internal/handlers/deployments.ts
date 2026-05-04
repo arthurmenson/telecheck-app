@@ -13,6 +13,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateDeploymentRequestSchema } from '../../schemas.js';
 import {
@@ -70,6 +71,7 @@ export async function createDeploymentHandler(
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
+  requireAdminRole(req);
 
   const parsed = CreateDeploymentRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -125,6 +127,7 @@ export async function getDeploymentHandler(
   // path (variants-resume-http-r1 pattern, applied here by the
   // deployments-http test pass).
   void resolveActorId(req);
+  requireAdminRole(req);
 
   const params = req.params as Record<string, unknown>;
   const deploymentIdParam = params['deploymentId'];
@@ -159,6 +162,7 @@ export async function retireDeploymentHandler(
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
+  requireAdminRole(req);
 
   const params = req.params as Record<string, unknown>;
   const deploymentIdParam = params['deploymentId'];

@@ -160,6 +160,8 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_create_tpl',
+
+        'x-actor-roles': 'tenant_admin',
         'content-type': 'application/json',
       },
       payload: {
@@ -185,6 +187,8 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_no_body',
+
+        'x-actor-roles': 'tenant_admin',
         'content-type': 'application/json',
       },
       payload: {},
@@ -213,6 +217,35 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
     expect(response.statusCode).toBe(401);
     assertNoTenantIdLeakageInError(response);
   });
+
+  // Codex deployments-http-r1 closure 2026-05-03 — admin endpoints must
+  // assert AUTHORIZATION (admin role) on top of IDENTITY (actor-id).
+  // Identity present without admin role MUST return 403, not 401 and not
+  // 200. Without this the handler would let any authenticated tenant
+  // actor (incl. patient/clinician roles) write admin data.
+  it('returns 403 when actor identity is present but no admin role is supplied', async () => {
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/forms/templates',
+      headers: {
+        host: US_HOST,
+        'x-actor-id': 'op_no_admin_role',
+        // Deliberately a non-admin role.
+        'x-actor-roles': 'patient',
+        'content-type': 'application/json',
+      },
+      payload: {
+        programCatalogEntryId: `prog_${ulid().slice(0, 8)}`,
+        name: 'name',
+        layout: {},
+        branchingLogic: {},
+        eligibilityLogic: {},
+        approvalGovernance: {},
+      },
+    });
+    expect(response.statusCode).toBe(403);
+    assertNoTenantIdLeakageInError(response);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -229,6 +262,8 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_list',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -245,6 +280,8 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_list_bad',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
     expect(response.statusCode).toBe(400);
@@ -258,6 +295,8 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_list_cur',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
     expect(response.statusCode).toBe(400);
@@ -293,6 +332,8 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_get',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -312,6 +353,8 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
       headers: {
         host: 'ghana.heroshealth.com',
         'x-actor-id': 'op_xt',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -326,6 +369,8 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_missing',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
     expect(response.statusCode).toBe(404);
@@ -396,6 +441,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_publish',
+
+        'x-actor-roles': 'tenant_admin',
         'content-type': 'application/json',
       },
       payload: {},
@@ -417,6 +464,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_double_publish',
+
+        'x-actor-roles': 'tenant_admin',
         'content-type': 'application/json',
       },
       payload: {},
@@ -433,6 +482,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       headers: {
         host: US_HOST,
         'x-actor-id': 'op_pub_missing',
+
+        'x-actor-roles': 'tenant_admin',
         'content-type': 'application/json',
       },
       payload: {},
@@ -479,6 +530,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
         headers: {
           host: US_HOST,
           'x-actor-id': 'op_pub_failclose',
+
+          'x-actor-roles': 'tenant_admin',
           'content-type': 'application/json',
         },
         payload: {},

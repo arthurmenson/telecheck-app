@@ -258,6 +258,8 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_create',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId },
     });
@@ -293,6 +295,8 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_draft',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId: draftTemplateId },
     });
@@ -314,6 +318,8 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_missing',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId: ulid() },
     });
@@ -345,6 +351,29 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
     assertNoTenantIdLeakageInError(response);
   });
 
+  // Codex deployments-http-r1 closure 2026-05-03 — admin endpoints assert
+  // BOTH identity AND admin-role authorization. With actor-id present
+  // but no admin role, the handler returns 403 (not 401, not 200).
+  it('returns 403 when actor identity is present but no admin role is supplied', async () => {
+    const programId = `prog_dep_http_noadmin_${ulid().slice(0, 8)}`;
+    const templateId = await seedTemplate({ ctx: US_CTX, programId });
+
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/forms/deployments',
+      headers: {
+        host: 'localhost',
+        'x-actor-id': 'op_no_admin_role',
+        // Non-admin role.
+        'x-actor-roles': 'patient',
+      },
+      payload: { templateId },
+    });
+
+    expect(response.statusCode).toBe(403);
+    assertNoTenantIdLeakageInError(response);
+  });
+
   it('returns 400 when the request body is empty (missing templateId)', async () => {
     // CreateDeploymentRequestSchema requires `templateId: z.string().min(1)`;
     // an empty payload fails Zod validation before the service runs.
@@ -354,6 +383,8 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_emptybody',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: {},
     });
@@ -382,6 +413,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_get_create',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId },
     });
@@ -399,6 +432,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
         // the same commit adds `void resolveActorId(req)` to
         // getDeploymentHandler.
         'x-actor-id': 'op_http_dep_get',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -429,6 +464,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_get401_create',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId },
     });
@@ -461,6 +498,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_xt_create',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId },
     });
@@ -473,6 +512,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       headers: {
         host: 'ghana.heroshealth.com',
         'x-actor-id': 'op_http_dep_xt_read',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -489,6 +530,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_missing_get',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -514,6 +557,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_retire_create',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId },
     });
@@ -526,6 +571,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_retire',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -553,6 +600,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_dup_create',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId },
     });
@@ -565,6 +614,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_dup_first',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
     expect(first.statusCode).toBe(200);
@@ -575,6 +626,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_dup_second',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -597,6 +650,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_retire_missing',
+
+        'x-actor-roles': 'tenant_admin',
       },
     });
 
@@ -619,6 +674,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       headers: {
         host: 'localhost',
         'x-actor-id': 'op_http_dep_retire_noactor_create',
+
+        'x-actor-roles': 'tenant_admin',
       },
       payload: { templateId },
     });

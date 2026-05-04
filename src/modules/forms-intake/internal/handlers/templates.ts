@@ -18,6 +18,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateTemplateRequestSchema, PublishVersionRequestSchema } from '../../schemas.js';
 import type { ListTemplatesCursor } from '../repositories/template-repo.js';
@@ -88,6 +89,7 @@ export async function createTemplateHandler(
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
+  requireAdminRole(req);
 
   const parsed = CreateTemplateRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -174,6 +176,7 @@ export async function listTemplatesHandler(
   // actor identity. Without `x-actor-id` the shim returns 401 before
   // any DB access runs.
   void resolveActorId(req);
+  requireAdminRole(req);
 
   const query = req.query as Record<string, unknown> | undefined;
   const rawLimit = query?.['limit'];
@@ -232,6 +235,7 @@ export async function getTemplateHandler(
   // Admin-read auth gate (Codex variants-resume-http-r1 closure pattern
   // applied preemptively to templates 2026-05-03).
   void resolveActorId(req);
+  requireAdminRole(req);
 
   const params = req.params as Record<string, unknown>;
   const templateIdParam = params['templateId'];
@@ -276,6 +280,7 @@ export async function publishVersionHandler(
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
+  requireAdminRole(req);
 
   const params = req.params as Record<string, unknown>;
   const templateIdParam = params['templateId'];
