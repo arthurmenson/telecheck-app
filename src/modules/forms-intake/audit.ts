@@ -29,32 +29,35 @@
  *   `formsAuditPlaceholder()` helper — typed-cast helper with a closed
  *   union of placeholder IDs (`FormsAuditActionPlaceholder`). The single
  *   sanctioned `as AuditAction` cast lives inside the helper. Used by all
- *   12 unratified emitters across the module:
- *     template (2) + deployment (2) + submission (4) + variant (4)
+ *   11 unratified emitters across the module:
+ *     template (2) + deployment (2) + submission (4) + variant (3)
  *   Inventory: `git grep "formsAuditPlaceholder("`.
  *
  * (History note 2026-05-04: prior to the legacy-emitter-migration batch,
  * 3 emitters (`emitFormsResumeStateSaved`, `emitFormsResumeStateRestored`,
  * `emitFormsVariantDeployed`) used a different pattern — canonical action
- * `config_change_validated` + `detail.intent: '<unratified_id>'`. They've
- * been migrated to the helper; tests now assert against the new action_id
- * directly instead of the (action, detail.intent) tuple.)
+ * `config_change_validated` + `detail.intent: '<unratified_id>'`. The
+ * resume-state emitters were migrated to the helper; the deprecated
+ * `emitFormsVariantDeployed` was deleted outright since it had zero
+ * internal callers and was not on the cross-module surface. Tests now
+ * assert against the new action_id directly instead of the (action,
+ * detail.intent) tuple.)
  *
- * Engineering Lead + Contracts Pack owner must ratify ALL TWELVE action
+ * Engineering Lead + Contracts Pack owner must ratify ALL ELEVEN action
  * IDs enumerated in the `FormsAuditActionPlaceholder` union (template
  * lifecycle: `forms_template_created`, `forms_template_version_published`;
  * deployment lifecycle: `forms_deployment_created`,
  * `forms_deployment_retired`; submission lifecycle:
  * `forms_submission_started`, `forms_submission_paused`,
  * `forms_submission_resumed`, `forms_submission_completed`; variant
- * lifecycle: `forms_variant_created`, `forms_variant_deployed`,
- * `forms_variant_winner_promoted`, `forms_variant_retired`) in a future
- * AUDIT_EVENTS amendment per EHBG §12 SI/DSI escalation. Partial
- * ratification (e.g. only the template/deployment subset) would leave
- * the unratified subset stranded if the helper is deleted; the migration
- * MUST be all-or-nothing or staged through a smaller union. When the
- * full amendment lands, deleting `formsAuditPlaceholder()` and migrating
- * its callers is a 3-step grep documented at the helper definition.
+ * lifecycle: `forms_variant_created`, `forms_variant_winner_promoted`,
+ * `forms_variant_retired`) in a future AUDIT_EVENTS amendment per
+ * EHBG §12 SI/DSI escalation. Partial ratification (e.g. only the
+ * template/deployment subset) would leave the unratified subset
+ * stranded if the helper is deleted; the migration MUST be all-or-
+ * nothing or staged through a smaller union. When the full amendment
+ * lands, deleting `formsAuditPlaceholder()` and migrating its callers
+ * is a 3-step grep documented at the helper definition.
  *
  * Hard rule per I-003: every emitter below MUST throw on emission failure
  * (the underlying `emitAudit()` already does); callers MUST NOT swallow
@@ -140,7 +143,6 @@ type FormsAuditActionPlaceholder =
   | 'forms_submission_completed'
   // Variant lifecycle (A/B)
   | 'forms_variant_created'
-  | 'forms_variant_deployed'
   | 'forms_variant_winner_promoted'
   | 'forms_variant_retired';
 
@@ -161,11 +163,11 @@ type FormsAuditActionPlaceholder =
  *
  * **Migration trigger (when AUDIT_EVENTS v5.2 amendment lands):**
  *   The amendment MUST ratify every member of the
- *   `FormsAuditActionPlaceholder` union — currently 9 IDs spanning
+ *   `FormsAuditActionPlaceholder` union — currently 11 IDs spanning
  *   template, deployment, submission, and variant lifecycle. Partial
  *   ratification strands the unratified subset; the union itself is
  *   the authoritative migration checklist (read its definition above).
- *   Once all 9 are in the canonical `AuditAction` enum:
+ *   Once all 11 are in the canonical `AuditAction` enum:
  *     1. Add the new actions to `AuditAction` in lib/audit.ts.
  *     2. Delete this function and the union in this file.
  *     3. Replace every `formsAuditPlaceholder('<id>')` call with the
@@ -868,55 +870,22 @@ export async function emitFormsVariantCreated(
   );
 }
 
-/**
- * Legacy emitter retained for backward compatibility with any external
- * callers that still reference it. No internal callers exist as of
- * 2026-05-04 (search: `git grep emitFormsVariantDeployed src tests`);
- * new code should call `emitFormsVariantCreated` directly. The emitter
- * is kept (rather than deleted) because module-public exports are part
- * of the slice's stable surface; removal is a separate breaking-change
- * batch.
- *
- * Routed through `formsAuditPlaceholder('forms_variant_deployed')` per
- * the legacy-emitter-migration batch 2026-05-04.
- *
- * @deprecated Use `emitFormsVariantCreated`.
- */
-export async function emitFormsVariantDeployed(
-  args: {
-    tenantId: TenantId;
-    actorId: string;
-    actorTenantId: string;
-    countryOfCare: string;
-    variantId: FormVariantId;
-    parentVersionId: FormVersionId;
-    targetPatientId: PatientId;
-    label: string;
-    trafficSplitPercent: number;
-  },
-  tx?: AuditDbClient,
-): Promise<AuditEnvelope> {
-  return emitAudit(
-    buildEnvelope(formsAuditPlaceholder('forms_variant_deployed'), 'B', {
-      tenant_id: args.tenantId,
-      actor_type: 'operator',
-      actor_id: args.actorId,
-      actor_tenant_id: args.actorTenantId,
-      target_patient_id: args.targetPatientId,
-      country_of_care: args.countryOfCare,
-      resource_type: 'form_variant',
-      resource_id: args.variantId,
-      detail: {
-        // Redundant `intent` field dropped per migration 2026-05-04.
-        variant_id: args.variantId,
-        parent_version_id: args.parentVersionId,
-        label: args.label,
-        traffic_split_percent: args.trafficSplitPercent,
-      },
-    }),
-    tx,
-  );
-}
+// `emitFormsVariantDeployed` was deleted 2026-05-04 (legacy-emitter-migration
+// verify-r1 closure). It was historically marked @deprecated and had ZERO
+// internal callers across the entire codebase (`git grep` at deletion time
+// returned only its own definition + 2 self-referential JSDoc comments). It
+// was NOT exported through this module's `index.ts` (cross-module surface),
+// so its removal is internal-implementation-only and breaks no external
+// contract. Callers needing variant-creation audit emit through
+// `emitFormsVariantCreated` directly.
+//
+// (Codex legacy-emitter-migration r0 MEDIUM closure — the emitter was
+//  inadvertently changed from `config_change_validated + detail.intent` to
+//  `forms_variant_deployed` action_id during r0, which would have broken
+//  the externally-observable wire shape this emitter's @deprecated comment
+//  was meant to preserve. Confirmation that no external callers exist made
+//  outright deletion the cleanest fix; the placeholder union is also
+//  trimmed back from 12 to 11 entries to match.)
 
 /**
  * Emit a `forms_variant_winner_promoted` audit when a tenant admin promotes
