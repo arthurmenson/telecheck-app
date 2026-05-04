@@ -10,15 +10,15 @@
  *   2. Merges the responses into the submission row (auto-save path).
  *   3. Encrypts the merged responses under per-tenant KMS (ADR-024).
  *   4. INSERTs a forms_resume_state row in 'active' status.
- *   5. Emits the Category B `forms_submission_paused` audit (typed
+ *   5. Emits the Category C `forms_submission_paused` audit (typed
  *      placeholder action_id via formsAuditPlaceholder() per the SPEC
  *      ISSUE flagged in audit.ts; post legacy-emitter-migration the
  *      discriminator is the action_id directly, not detail.intent).
- *      Note: slice PRD §8.5 calls this Category C operational; the
- *      emitter currently uses Category B carried over from the
- *      pre-migration `config_change_validated` placeholder. Reconciling
- *      that drift is a separate Engineering Lead decision (flagged in
- *      audit.ts SPEC ISSUE inline comment).
+ *      Category C aligned with slice PRD §8.5 line 327 ("audited per
+ *      AUDIT-EVENTS Category C (operational)") on 2026-05-04 — the
+ *      pre-migration emitter inherited Category B from the legacy
+ *      `config_change_validated` placeholder; the dedicated action_id
+ *      now carries the spec-correct Category C.
  *   6. Emits the `forms_resume_state.saved` domain event.
  *   7. Issues an HMAC-self-contained resume token (resume-token.ts).
  *
@@ -216,11 +216,18 @@ describe('forms-intake pauseSubmission — happy path', () => {
     // `action='config_change_validated'` with `detail.intent='forms_submission_paused'`;
     // the migration moved the discriminator into the action_id and dropped
     // the redundant detail.intent field.
+    //
+    // Category C alignment (2026-05-04 follow-up): the emitter category
+    // was migrated B → C to align with slice PRD §8.5 line 327 ("audited
+    // per AUDIT-EVENTS Category C (operational)"). Pinning the category
+    // here prevents a future regression back to the pre-alignment
+    // Category B.
     await withTenantContext(TENANT_US, () =>
       assertAuditRecordExists(
         TENANT_US,
         (rec) =>
           rec.action === ('forms_submission_paused' as typeof rec.action) &&
+          rec.category === 'C' &&
           rec.detail['resume_state_id'] === result.resumeState.resumeStateId &&
           rec.target_patient_id === patientId,
       ),

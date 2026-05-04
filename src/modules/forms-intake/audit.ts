@@ -717,24 +717,20 @@ export async function emitFormsSubmissionCompletedAudit(
 // confirm this read of the discipline.
 
 // ---------------------------------------------------------------------------
-// Submission save-and-resume audit (paused / resumed)
+// Submission save-and-resume audit (paused / resumed) — Category C operational
 //
 // Migrated 2026-05-04 from the legacy `config_change_validated +
 // detail.intent` pattern to the typed `formsAuditPlaceholder()` helper.
 // The action IDs are unratified (SPEC ISSUE flagged at file header) but
 // follow the same single-pattern discipline as the rest of the module.
 //
-// SPEC ISSUE — Category B vs Category C drift on these emitters
-//   Slice PRD v2.1 §8.5 describes save-and-resume audit as Category C
-//   operational. The current emitters use Category B (carried over from
-//   the legacy `config_change_validated` placeholder, which IS Category B
-//   in AUDIT_EVENTS v5.2). The migration to a dedicated
-//   `forms_submission_paused` / `forms_submission_resumed` action ID
-//   PRESERVES the current Category B classification so the migration is
-//   audit-shape-neutral; reconciling the category against §8.5 is a
-//   separate Engineering Lead decision (likely paired with the canonical
-//   action-ID amendment). Pinning current Category B until then so the
-//   audit-chain partition behavior is unchanged.
+// Category alignment 2026-05-04 (closed during legacy-emitter migration
+// follow-up): slice PRD v2.1 §8.5 line 327 explicitly states "audited
+// per AUDIT-EVENTS Category C (operational)". The pre-migration emitters
+// inherited Category B from the legacy `config_change_validated`
+// placeholder; the dedicated action_id migration now uses Category C in
+// alignment with §8.5. Tests under tests/integration/forms-intake-{pause,
+// restore}.test.ts have been updated to assert Category C accordingly.
 // ---------------------------------------------------------------------------
 
 /**
@@ -742,7 +738,8 @@ export async function emitFormsSubmissionCompletedAudit(
  *
  * Routed through `formsAuditPlaceholder('forms_submission_paused')` —
  * the action ID is not yet canonical in AUDIT_EVENTS v5.2 (see file-header
- * SPEC ISSUE for the full migration list).
+ * SPEC ISSUE for the full migration list). Category C operational per
+ * Slice PRD v2.1 §8.5.
  */
 export async function emitFormsResumeStateSaved(
   args: {
@@ -759,7 +756,7 @@ export async function emitFormsResumeStateSaved(
   tx?: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope(formsAuditPlaceholder('forms_submission_paused'), 'B', {
+    buildEnvelope(formsAuditPlaceholder('forms_submission_paused'), 'C', {
       tenant_id: args.tenantId,
       actor_type: 'patient',
       actor_id: args.actorId,
@@ -787,7 +784,8 @@ export async function emitFormsResumeStateSaved(
  * Emit an audit when a previously-paused submission is resumed.
  *
  * Routed through `formsAuditPlaceholder('forms_submission_resumed')` —
- * same migration treatment as the paused emitter above.
+ * same migration treatment as the paused emitter above. Category C
+ * operational per Slice PRD v2.1 §8.5.
  */
 export async function emitFormsResumeStateRestored(
   args: {
@@ -803,7 +801,7 @@ export async function emitFormsResumeStateRestored(
   tx?: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope(formsAuditPlaceholder('forms_submission_resumed'), 'B', {
+    buildEnvelope(formsAuditPlaceholder('forms_submission_resumed'), 'C', {
       tenant_id: args.tenantId,
       actor_type: 'patient',
       actor_id: args.actorId,

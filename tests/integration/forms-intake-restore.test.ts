@@ -5,14 +5,14 @@
  * `submissionService.resumeSubmission` validates the patient-held HMAC
  * resume token, decrypts the partial responses, merges them back onto
  * the in-progress forms_submission row, flips the resume_state row to
- * `status='completed'`, and emits the Category B `forms_submission_resumed`
+ * `status='completed'`, and emits the Category C `forms_submission_resumed`
  * audit (typed placeholder action_id via formsAuditPlaceholder() per the
  * SPEC ISSUE flagged in audit.ts; post legacy-emitter-migration the
  * discriminator is the action_id directly, not detail.intent).
- * Note: slice PRD §8.5 calls this Category C; the emitter currently uses
- * Category B carried over from the pre-migration `config_change_validated`
- * placeholder. Reconciling that drift is a separate Engineering Lead
- * decision (flagged in audit.ts SPEC ISSUE inline comment).
+ * Category C aligned with slice PRD §8.5 line 327 ("audited per
+ * AUDIT-EVENTS Category C (operational)") on 2026-05-04 — the
+ * pre-migration emitter inherited Category B from the legacy
+ * `config_change_validated` placeholder.
  *
  * Atomic orchestration in ONE outer transaction (I-016 same-tx outbox):
  * a failure anywhere in the merge UPDATE / status flip / audit emission
@@ -261,11 +261,18 @@ describe('forms-intake resumeSubmission — happy path', () => {
     // `action='config_change_validated'` with `detail.intent='forms_submission_resumed'`;
     // the migration moved the discriminator into the action_id and dropped
     // the redundant detail.intent field.
+    //
+    // Category C alignment (2026-05-04 follow-up): the emitter category
+    // was migrated B → C to align with slice PRD §8.5 line 327 ("audited
+    // per AUDIT-EVENTS Category C (operational)"). Pinning the category
+    // here prevents a future regression back to the pre-alignment
+    // Category B.
     await withTenantContext(TENANT_US, () =>
       assertAuditRecordExists(
         TENANT_US,
         (rec) =>
           rec.action === ('forms_submission_resumed' as typeof rec.action) &&
+          rec.category === 'C' &&
           rec.detail['resume_state_id'] === setup.resumeStateId &&
           rec.detail['submission_id'] === setup.submissionId &&
           rec.target_patient_id === setup.patientId,
