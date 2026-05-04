@@ -617,7 +617,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
 
         'x-actor-roles': 'tenant_admin',
 
-        'x-actor-admin-tenant': TENANT_US,
+        'x-actor-admin-tenant': 'Telecheck-Ghana',
       },
     });
 

@@ -531,7 +531,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
 
         'x-actor-roles': 'tenant_admin',
 
-        'x-actor-admin-tenant': TENANT_US,
+        'x-actor-admin-tenant': 'Telecheck-Ghana',
       },
     });
 
