@@ -69,17 +69,30 @@ export type MedicationRequestId = Brand<string, 'MedicationRequestId'>;
 /**
  * Canonical MedicationRequestId pattern: `mrx_` prefix + 26-char Crockford
  * base32 ULID (per src/lib/ulid.ts canonical alphabet 0-9A-HJKMNPQRSTVWXYZ
- * with I/L/O/U excluded).
+ * with I/L/O/U excluded), with the additional ULID-specific constraint that
+ * the FIRST character of the ULID body is 0-7.
  *
- * Tightened 2026-05-03 per Codex glossary-r0 HIGH (verify-r1): prior
- * implementation only checked the prefix, which let `mrx_` (empty
- * suffix), `mrx_not-a-ulid`, and arbitrary trailing payloads brand
- * successfully. Full validation is appropriate at the type-construction
- * boundary because invalid IDs should never cross into persistence/API
- * layers regardless of whether RLS or schema constraints would later
- * catch them.
+ * Why the first-character constraint: a ULID encodes a 48-bit millisecond
+ * timestamp in its first 10 base32 chars. Each base32 char represents 5
+ * bits (10*5 = 50 bits), so the highest character carries the top 3 bits
+ * of the 48-bit timestamp. 3 bits = values 0-7. Anything with first char
+ * value >= 8 represents a timestamp > 2^48-1, which is impossible.
+ * Crockford base32 maps positions 0-7 to '0'-'7', positions 8-9 to '8'-'9',
+ * so the regex constrains the first body char to [0-7].
+ *
+ * Tightened 2026-05-03 per Codex glossary-r1 HIGH (verify-r2):
+ *   r0 (verify-r1) already moved from prefix-only to full Crockford-26
+ *   validation, but Codex correctly observed that 26-char Crockford
+ *   strings include impossible ULID encodings (e.g. mrx_ZZZZ...). The
+ *   r1 (verify-r2) tightening adds the first-character timestamp-range
+ *   constraint so the regex matches only structurally-valid ULIDs.
+ *
+ * Future possible tightening: if/when ulid.ts exports a `parseUlid()`
+ * helper that decodes and validates the timestamp-+-randomness split,
+ * use that instead of duplicating the encoding rule here. The regex
+ * stays as a fast-path even then so the validator doesn't allocate.
  */
-const MEDICATION_REQUEST_ID_PATTERN = /^mrx_[0-9A-HJKMNPQRSTVWXYZ]{26}$/;
+const MEDICATION_REQUEST_ID_PATTERN = /^mrx_[0-7][0-9A-HJKMNPQRSTVWXYZ]{25}$/;
 
 /** Type constructor — validates the full mrx_<ULID> shape. */
 export function asMedicationRequestId(raw: string): MedicationRequestId {
@@ -88,6 +101,7 @@ export function asMedicationRequestId(raw: string): MedicationRequestId {
       raw,
       'MedicationRequestId must match the canonical mrx_<26-char Crockford-base32 ULID> ' +
         'shape (TYPES v5.2 + ulid.ts canonical alphabet 0-9A-HJKMNPQRSTVWXYZ excluding I/L/O/U). ' +
+        'First ULID body character must be 0-7 (48-bit timestamp range constraint). ' +
         'Bare "mrx_" prefix is not sufficient.',
     );
   }

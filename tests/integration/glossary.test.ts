@@ -53,10 +53,11 @@ import {
 // ---------------------------------------------------------------------------
 
 describe('asMedicationRequestId — mrx_ + full ULID validation (TYPES v5.2)', () => {
-  // Sample valid ULIDs use the Crockford base32 alphabet
-  // (0-9A-HJKMNPQRSTVWXYZ, 26 chars; I/L/O/U excluded).
-  const VALID_ULID_1 = '01HXYZABCDEFGHJKMNPQRSTVWX'; // 26 chars
-  const VALID_ULID_2 = '01J0123456789ABCDEFGHJKMNP'; // 26 chars
+  // Sample valid ULIDs: 26 chars in Crockford base32
+  // (alphabet 0-9A-HJKMNPQRSTVWXYZ; I/L/O/U excluded). First character
+  // MUST be 0-7 (48-bit timestamp range constraint per ULID spec).
+  const VALID_ULID_1 = '01HXYZABCDEFGHJKMNPQRSTVWX'; // 26 chars, leading '0'
+  const VALID_ULID_2 = '7HJKMNPQRSTVWXYZ0123456789'; // 26 chars, leading '7'
 
   it('accepts a well-formed mrx_-prefixed 26-char Crockford ULID', () => {
     const id = asMedicationRequestId(`mrx_${VALID_ULID_1}`);
@@ -117,11 +118,49 @@ describe('asMedicationRequestId — mrx_ + full ULID validation (TYPES v5.2)', (
     // Crockford base32 EXCLUDES I, L, O, U for human readability. ULIDs
     // emitted by ulid.ts never contain them. A full-validation guard must
     // reject IDs that contain these characters even if 26 chars total.
+    // Pick a NON-leading position so the test isolates the alphabet check
+    // from the leading-char-range constraint.
     const forbiddenChars = ['I', 'L', 'O', 'U'];
     for (const ch of forbiddenChars) {
-      // Replace position 0 of a valid ULID with the forbidden char.
-      const bad = ch + VALID_ULID_1.slice(1);
+      // Replace position 1 of a valid ULID with the forbidden char.
+      const bad = VALID_ULID_1[0]! + ch + VALID_ULID_1.slice(2);
       expect(() => asMedicationRequestId(`mrx_${bad}`)).toThrow(GlossaryViolationError);
+    }
+  });
+
+  it('REJECTS mrx_ + ULID with leading character 8 or 9 (48-bit timestamp overflow)', () => {
+    // Timestamp range constraint: leading char 0-7 only. A ULID body
+    // starting with 8 or 9 represents a timestamp > 2^48-1 which is
+    // structurally impossible. Pin the rejection so a future relaxation
+    // back to the broader Crockford-26 regex (the r0 verify-r1 attempt)
+    // fails this test loudly.
+    // Closure 2026-05-03 per Codex glossary-r1 HIGH (verify-r2).
+    expect(() => asMedicationRequestId(`mrx_8${VALID_ULID_1.slice(1)}`)).toThrow(
+      GlossaryViolationError,
+    );
+    expect(() => asMedicationRequestId(`mrx_9${VALID_ULID_1.slice(1)}`)).toThrow(
+      GlossaryViolationError,
+    );
+  });
+
+  it('REJECTS mrx_ + ULID with leading alphabetic character (A through Z)', () => {
+    // All alphabetic Crockford chars (A-H, J-N, P-Z minus I/L/O/U) at the
+    // leading position represent values >= 10, well above the 0-7 range.
+    // Spot-check the boundary (A) and a high value (Z).
+    expect(() => asMedicationRequestId(`mrx_A${VALID_ULID_1.slice(1)}`)).toThrow(
+      GlossaryViolationError,
+    );
+    expect(() => asMedicationRequestId(`mrx_Z${VALID_ULID_1.slice(1)}`)).toThrow(
+      GlossaryViolationError,
+    );
+  });
+
+  it('ACCEPTS leading digits 0..7 (every valid timestamp prefix)', () => {
+    // Drive every valid leading character to prove the regex doesn't
+    // accidentally narrow further than the spec requires.
+    for (const lead of '01234567') {
+      const id = `mrx_${lead}${VALID_ULID_1.slice(1)}`;
+      expect(asMedicationRequestId(id)).toBe(id);
     }
   });
 
