@@ -47,6 +47,18 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     genReqId: () => crypto.randomUUID(),
     // Reject invalid Content-Type early.
     bodyLimit: 1_048_576, // 1 MiB; per-route overrides where needed
+    // Fastify's default `maxParamLength` (100) is too small for resume
+    // tokens carried in `:resumeToken` path params. Resume tokens are
+    // HMAC-signed `<base64url(payload)>.<base64url(signature)>` strings
+    // — typical length 115+ chars. With the default 100-char ceiling,
+    // any URL like `/v0/forms/resume/<long-token>` silently 404s before
+    // reaching the handler, surfacing as `internal.resource.not_found`
+    // from setNotFoundHandler. Raise to 512 — comfortably accommodates
+    // the resume token plus any future signed-URL params per
+    // forms-intake-resume-r0 closure 2026-05-04 (forensically isolated
+    // via local Fastify reproduction: token at 100 chars matches, 101+
+    // 404s).
+    routerOptions: { maxParamLength: 512 },
   });
 
   // Security headers

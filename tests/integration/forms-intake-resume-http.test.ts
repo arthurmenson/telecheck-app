@@ -340,13 +340,6 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
       },
     });
 
-    if (response.statusCode !== 200) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[DIAG resume-http 200-happy] status=${response.statusCode} body=${response.body} url=/v0/forms/resume/${resumeToken} tokenLen=${resumeToken.length} tokenSample=${resumeToken.slice(0, 30)}... resumeStateId=${resumeStateId} patientId=${patientId} deploymentId=${deploymentId}`,
-      );
-    }
-
     expect(response.statusCode).toBe(200);
 
     // No-tenant_id-leak guarantee at every layer (any-depth nested key,
@@ -426,13 +419,6 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
         host: 'localhost',
       },
     });
-
-    if (response.statusCode !== 401) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[DIAG resume-http 401-noauth] status=${response.statusCode} body=${response.body}`,
-      );
-    }
 
     expect(response.statusCode).toBe(401);
     assertNoTenantIdLeakageInError(response);

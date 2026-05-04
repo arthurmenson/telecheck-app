@@ -305,10 +305,6 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
       headers: { ...headersA, 'idempotency-key': idempotencyKey },
       payload: payloadA,
     });
-    if (first.statusCode !== 201) {
-      // eslint-disable-next-line no-console
-      console.log(`[DIAG idem-actor-first] status=${first.statusCode} body=${first.body}`);
-    }
     expect(first.statusCode).toBe(201);
     const firstBody = first.json<Record<string, unknown>>();
 
@@ -323,10 +319,6 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
       headers: { ...headersB, 'idempotency-key': idempotencyKey },
       payload: payloadB,
     });
-    if (second.statusCode !== 201) {
-      // eslint-disable-next-line no-console
-      console.log(`[DIAG idem-actor-second] status=${second.statusCode} body=${second.body}`);
-    }
     expect(second.statusCode).toBe(201);
     const secondBody = second.json<Record<string, unknown>>();
 
