@@ -151,19 +151,118 @@ describe('withTransaction — real DB lifecycle', () => {
     expect(firstTxid).toBe(secondTxid);
   });
 
-  it('re-throws fn errors and ROLLBACKs the transaction', async () => {
-    // We assert two things: (a) the error propagates verbatim,
-    // (b) ROLLBACK was issued. The latter is hard to observe from outside
-    // the connection — the easiest signal is that the connection is
-    // returned to a usable state for the next call (which we already
-    // probe in the no-leak test below). The direct assertion here is
-    // that the original error surfaces unchanged.
+  it('re-throws fn errors verbatim', async () => {
     const cbError = new Error('rollback me');
     await expect(
       withTransaction(async () => {
         throw cbError;
       }),
     ).rejects.toBe(cbError);
+  });
+
+  // -----------------------------------------------------------------------
+  // MUTATION-BASED ROLLBACK PROOF (Codex db-transaction-r0 HIGH closure)
+  //
+  // Closes Codex r0 finding: prior tests only proved fn errors propagated,
+  // not that real mutations were undone. A broken implementation that
+  // catches the callback error, issues COMMIT, releases the client, and
+  // rethrows would have passed every prior assertion while committing
+  // business writes whose paired audit/event emission failed (a direct
+  // I-003 violation).
+  //
+  // The test pattern:
+  //   1. Generate a unique tenant id satisfying tenant_id_format CHECK
+  //      (`^Telecheck-[A-Z][A-Za-z]+$`).
+  //   2. Inside withTransaction(fn), INSERT the tenant row, sanity-check
+  //      it's visible to a same-tx SELECT, then throw.
+  //   3. After withTransaction rejects, verify from the SHARED test
+  //      client (a separate pg connection — won't see uncommitted
+  //      state) that the row is absent. If absent → ROLLBACK ran. If
+  //      present → COMMIT ran instead, I-003 violation.
+  //   4. Inverse: same INSERT + return success → row visible from
+  //      shared client. Cleanup via a second withTransaction DELETE.
+  // -----------------------------------------------------------------------
+
+  function uniqueTenantId(): string {
+    // tenant_id_format CHECK: `^Telecheck-[A-Z][A-Za-z]+$`. Use 'Tx' +
+    // 4 random uppercase letters (alphabet only). 26^4 = 456,976
+    // combinations — collision-free for any reasonable test run.
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let suffix = '';
+    for (let i = 0; i < 4; i += 1) {
+      suffix += chars[Math.floor(Math.random() * chars.length)];
+    }
+    return `Telecheck-Tx${suffix}`;
+  }
+
+  async function insertTestTenant(tx: DbTransaction, id: string): Promise<void> {
+    const lower = id.slice('Telecheck-'.length).toLowerCase();
+    await tx.query(
+      `INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain,
+                            country_of_care, kms_key_alias, status, activated_at)
+       VALUES ($1, $1, $2, 'Test Inc.', $3,
+               'US', 'alias/test', 'active', NOW())`,
+      [id, `Heros Health Test ${lower}`, `test-${lower}.heroshealth.com`],
+    );
+  }
+
+  it('MUTATION ROLLBACK PROOF — INSERT inside fn that throws is GONE after rejection', async () => {
+    const id = uniqueTenantId();
+    const cbError = new Error('forced rollback');
+
+    await expect(
+      withTransaction(async (tx) => {
+        await insertTestTenant(tx, id);
+        // Sanity: visible inside the tx (proves the INSERT actually ran;
+        // distinguishes "rollback worked" from "INSERT silently skipped").
+        const inside = await tx.query<{ n: string }>(
+          `SELECT COUNT(*)::text AS n FROM tenants WHERE id = $1`,
+          [id],
+        );
+        expect(Number(inside.rows[0]!.n)).toBe(1);
+        throw cbError;
+      }),
+    ).rejects.toBe(cbError);
+
+    // After rejection, query via the SHARED test client (a separate pg
+    // connection). If ROLLBACK ran, the row is absent. If a broken
+    // implementation issued COMMIT instead, the row is present and this
+    // assertion catches the I-003 violation loud.
+    const sharedClient = getTestClient();
+    const after = await sharedClient.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM tenants WHERE id = $1`,
+      [id],
+    );
+    expect(Number(after.rows[0]!.n)).toBe(0);
+  });
+
+  it('MUTATION COMMIT PROOF — INSERT inside fn that returns successfully is PRESENT after', async () => {
+    const id = uniqueTenantId();
+
+    await withTransaction(async (tx) => {
+      await insertTestTenant(tx, id);
+    });
+
+    // The COMMIT path persisted the row to the shared visible state.
+    const sharedClient = getTestClient();
+    const after = await sharedClient.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM tenants WHERE id = $1`,
+      [id],
+    );
+    expect(Number(after.rows[0]!.n)).toBe(1);
+
+    // Cleanup: the row was committed via withTransaction's own pool
+    // connection so the shared client's SAVEPOINT won't undo it. Manual
+    // delete via a second withTransaction (this commit too — but DELETE
+    // of a row we created is the standard cleanup pattern).
+    await withTransaction(async (tx) => {
+      await tx.query(`DELETE FROM tenants WHERE id = $1`, [id]);
+    });
+    const afterCleanup = await sharedClient.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM tenants WHERE id = $1`,
+      [id],
+    );
+    expect(Number(afterCleanup.rows[0]!.n)).toBe(0);
   });
 
   it('does NOT leak connections under repeated fn-error calls (5x rejection cycle)', async () => {
