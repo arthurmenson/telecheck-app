@@ -70,7 +70,23 @@ export const ALWAYS_REDACTED: readonly string[] = [
 // Logger factory
 // ---------------------------------------------------------------------------
 
-function buildPinoOptions(): pino.LoggerOptions {
+/**
+ * Construct the pino options that the singleton logger uses. Exported so
+ * tests can directly assert the production wiring: that `redact.paths`
+ * is the full union of `ALWAYS_REDACTED` + `config.logRedactPaths`, that
+ * `redact.remove === true` (no '[Redacted]' sentinel leaking field
+ * presence), and that the dev-only pino-pretty transport is gated on
+ * `config.nodeEnv === 'development'`.
+ *
+ * Black-box-testing the singleton's destination directly is not feasible
+ * (pino caches its destination at construction time), so this exported
+ * options-builder is the proxy the test suite uses to assert what was
+ * passed into pino at startup. The singleton itself is constructed via
+ * `pino(buildPinoOptions())` immediately below; any future change that
+ * paths logger construction through a different options object MUST
+ * also keep this exported function in sync.
+ */
+export function buildPinoOptions(): pino.LoggerOptions {
   const additionalPaths = config.logRedactPaths;
 
   // Merge always-redacted with env-configured paths, deduplicated
