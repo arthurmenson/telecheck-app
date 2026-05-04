@@ -21,14 +21,30 @@
  *     I-027 (every record carries tenant_id).
  *
  * SPEC ISSUE: AUDIT_EVENTS v5.2 does not enumerate canonical action IDs for
- * forms-engine submission lifecycle (start, pause, resume, abandon, complete)
- * or for variant deploy/retire/promote. The slice PRD §14.6 and §8.5 say
- * these MUST be audited but does not pin exact action identifiers. This
- * scaffold uses the existing `forms_*` actions for governance edits and
- * routes lifecycle events through the closest existing operational actions
- * (`config_change_validated`) plus rich `detail` payloads. Engineering Lead
- * + Contracts Pack owner should add canonical `forms_submission_*` and
- * `forms_variant_*` action IDs in a future AUDIT_EVENTS amendment.
+ * forms-engine template / deployment / submission / variant lifecycle. The
+ * slice PRD §8.5, §14.5, §14.6 say these MUST be audited but doesn't pin
+ * exact action identifiers. This module emits them under DESCRIPTIVE-but-
+ * unratified IDs through TWO patterns:
+ *
+ *   1. `formsAuditPlaceholder()` helper — typed-cast helper with a closed
+ *      union of placeholder IDs (`FormsAuditActionPlaceholder`). The
+ *      single sanctioned `as AuditAction` cast lives inside the helper.
+ *      Used by 9 emitters: template + deployment + submission + variant
+ *      lifecycle. Inventory:
+ *        git grep "formsAuditPlaceholder("
+ *
+ *   2. Canonical-action + `detail.intent` pattern — used by 3 legacy
+ *      emitters (`emitFormsResumeStateSaved`, `emitFormsResumeStateRestored`,
+ *      `emitFormsVariantDeployed`) that route through canonical
+ *      `config_change_validated` and encode the unratified semantic in
+ *      `detail.intent`. Migrating those to pattern (1) is a separate
+ *      batch — flagged at the helper above for follow-up.
+ *
+ * Engineering Lead + Contracts Pack owner should add canonical
+ * `forms_submission_*` and `forms_variant_*` action IDs in a future
+ * AUDIT_EVENTS amendment per EHBG §12 SI/DSI escalation. When that lands,
+ * deleting `formsAuditPlaceholder()` and migrating its callers is a
+ * 3-step grep documented at the helper definition.
  *
  * Hard rule per I-003: every emitter below MUST throw on emission failure
  * (the underlying `emitAudit()` already does); callers MUST NOT swallow
@@ -53,6 +69,91 @@ import type {
   PatientId,
   ResumeStateId,
 } from './internal/types.js';
+
+// ---------------------------------------------------------------------------
+// SPEC ISSUE — unratified Forms/Intake audit action IDs (placeholder helper)
+//
+// AUDIT_EVENTS v5.2 enumerates `forms_eligibility_logic_edited` and
+// `forms_approval_governance_edited` as canonical Category B governance
+// actions for the forms engine, but does NOT canonicalize action IDs for
+// template/deployment/submission/variant lifecycle. Slice PRD v2.1 §8.5,
+// §14.5, §14.6 require these events to be audited (per I-027 + I-003), so
+// this module emits them under DESCRIPTIVE-but-not-yet-ratified action IDs
+// pending an EHBG §12 SI/DSI escalation that adds them to the canonical
+// AuditAction enum in `lib/audit.ts`.
+//
+// Until that ratification lands, the placeholder IDs are typed via a single
+// sanctioned cast helper (`formsAuditPlaceholder()` below) so every
+// unratified emission flows through ONE grep-able call site. The
+// `FormsAuditActionPlaceholder` union enumerates exactly the placeholder
+// strings — typos at call sites become compile errors, and a future commit
+// removing this helper (because the spec landed) deletes every placeholder
+// reference at once.
+//
+// Pattern audit (2026-05-04):
+//   - 9 emitters use the placeholder helper (template/deployment/submission/
+//     variant lifecycle).
+//   - 3 legacy emitters (`emitFormsResumeStateSaved`,
+//     `emitFormsResumeStateRestored`, `emitFormsVariantDeployed`) use a
+//     DIFFERENT pattern: canonical action `config_change_validated` +
+//     `detail.intent: '<unratified_id>'`. That pattern is honest (uses a
+//     real canonical action) but loses the structured action-ID typing.
+//     Migrating those is a separate batch — flagged here for follow-up.
+//
+// When the spec amendment lands, the migration is a 3-step grep:
+//   1. Add the new actions to `AuditAction` in lib/audit.ts.
+//   2. Delete `formsAuditPlaceholder()` and its union here.
+//   3. Replace every `formsAuditPlaceholder('<id>')` call with bare
+//      `'<id>' satisfies AuditAction` (or just the literal — TS infers).
+// ---------------------------------------------------------------------------
+
+/**
+ * Closed union of unratified action IDs used by the Forms/Intake module.
+ *
+ * Each entry MUST have an open EHBG §12 spec issue requesting its
+ * ratification. Adding a new placeholder here is the explicit price of
+ * shipping unratified audit semantics — code review can grep this union
+ * to inventory what the spec owes us.
+ */
+type FormsAuditActionPlaceholder =
+  // Template lifecycle
+  | 'forms_template_created'
+  | 'forms_template_version_published'
+  // Deployment lifecycle
+  | 'forms_deployment_created'
+  | 'forms_deployment_retired'
+  // Submission lifecycle (patient-facing)
+  | 'forms_submission_started'
+  | 'forms_submission_completed'
+  // Variant lifecycle (A/B)
+  | 'forms_variant_created'
+  | 'forms_variant_winner_promoted'
+  | 'forms_variant_retired';
+
+/**
+ * formsAuditPlaceholder — single sanctioned `as AuditAction` cast site.
+ *
+ * Returns the placeholder string typed as `AuditAction` so it can flow
+ * into `emitAudit()` without a per-call-site cast. The cast is contained
+ * in this one function so reviewers can grep for the source of every
+ * unratified emission across the module:
+ *
+ *   git grep "formsAuditPlaceholder("
+ *
+ * That single grep also gives the migration list when the spec
+ * amendment ratifies these IDs and the helper can be removed.
+ *
+ * The compile-time `FormsAuditActionPlaceholder` union prevents typos.
+ *
+ * @param id  Placeholder action ID drawn from the closed union.
+ * @returns   The same string typed as `AuditAction` (single sanctioned cast).
+ */
+export function formsAuditPlaceholder(id: FormsAuditActionPlaceholder): AuditAction {
+  // The cast is intentional and contained here. Removing this function
+  // when AUDIT_EVENTS v5.2 ratifies these IDs is the migration trigger;
+  // do NOT replicate this cast pattern at call sites.
+  return id as AuditAction;
+}
 
 // ---------------------------------------------------------------------------
 // Common envelope-builder for forms-engine audit emissions.
@@ -161,7 +262,7 @@ export async function emitFormsTemplateCreated(
 ): Promise<AuditEnvelope> {
   return emitAudit(
     {
-      ...buildEnvelope('forms_template_created' as AuditAction, 'B', {
+      ...buildEnvelope(formsAuditPlaceholder('forms_template_created'), 'B', {
         tenant_id: args.tenantId,
         actor_type: 'operator',
         actor_id: args.actorId,
@@ -189,11 +290,11 @@ export async function emitFormsTemplateCreated(
  * Category B (governance / config).
  *
  * Same SPEC ISSUE caveat as emitFormsTemplateCreated: AUDIT_EVENTS v5.2
- * doesn't enumerate `forms_template_version_published`; the closest
- * Engineering-Lead-ratified action is `config_change_validated`. Using the
- * descriptive action ID here (typed via `as AuditAction`) preserves the
- * SPEC-ISSUE flag — grep for `as AuditAction` to find unratified action
- * IDs awaiting Engineering Lead amendment per EHBG §12.
+ * doesn't enumerate `forms_template_version_published`. The action ID
+ * routes through `formsAuditPlaceholder()` (the single sanctioned-cast
+ * helper documented at the top of this file) — grep
+ * `formsAuditPlaceholder(` to inventory every unratified emission across
+ * the module pending Engineering Lead amendment per EHBG §12.
  *
  * `priorPublishedVersionId` is null when this publish is the first
  * published version for the family (no prior to supersede). When non-null,
@@ -218,7 +319,7 @@ export async function emitFormsTemplateVersionPublished(
 ): Promise<AuditEnvelope> {
   return emitAudit(
     {
-      ...buildEnvelope('forms_template_version_published' as AuditAction, 'B', {
+      ...buildEnvelope(formsAuditPlaceholder('forms_template_version_published'), 'B', {
         tenant_id: args.tenantId,
         actor_type: 'operator',
         actor_id: args.actorId,
@@ -263,7 +364,7 @@ export async function emitFormsDeploymentCreated(
 ): Promise<AuditEnvelope> {
   return emitAudit(
     {
-      ...buildEnvelope('forms_deployment_created' as AuditAction, 'B', {
+      ...buildEnvelope(formsAuditPlaceholder('forms_deployment_created'), 'B', {
         tenant_id: args.tenantId,
         actor_type: 'operator',
         actor_id: args.actorId,
@@ -290,9 +391,10 @@ export async function emitFormsDeploymentCreated(
  * Same SPEC ISSUE caveat as the createTemplate / versionPublished family:
  * AUDIT_EVENTS v5.2 doesn't enumerate `forms_deployment_retired` and
  * neither State Machines v1.1 nor the slice PRD canonicalize the
- * deployment lifecycle (active → retired). The action ID is type-cast
- * via `as AuditAction` so grep finds unratified action IDs awaiting
- * Engineering Lead amendment per EHBG §12 SI/DSI escalation.
+ * deployment lifecycle (active → retired). Routed through
+ * `formsAuditPlaceholder()` so the `FormsAuditActionPlaceholder` union
+ * tracks the unratified IDs in one grep-able place pending Engineering
+ * Lead amendment per EHBG §12 SI/DSI escalation.
  *
  * Per Slice PRD §14.5 supersession discipline + Pattern A immutability,
  * retiring a deployment does NOT halt in-progress submissions assigned
@@ -315,7 +417,7 @@ export async function emitFormsDeploymentRetired(
 ): Promise<AuditEnvelope> {
   return emitAudit(
     {
-      ...buildEnvelope('forms_deployment_retired' as AuditAction, 'B', {
+      ...buildEnvelope(formsAuditPlaceholder('forms_deployment_retired'), 'B', {
         tenant_id: args.tenantId,
         actor_type: 'operator',
         actor_id: args.actorId,
@@ -421,10 +523,11 @@ export async function emitFormsApprovalGovernanceEdited(
 //
 // SPEC ISSUE: the `intake_*` family isn't enumerated in src/lib/audit.ts
 // AuditAction union (which mirrors AUDIT_EVENTS v5.2 Category C, but the
-// spec catalog lists these by name in PRD §8.5 prose only). We type-cast
-// `'forms_submission_started' as AuditAction` etc. so grep finds
-// unratified action IDs. Engineering Lead amendment pending per
-// EHBG §12 SI/DSI escalation.
+// spec catalog lists these by name in PRD §8.5 prose only). The
+// `forms_submission_*` placeholder action IDs route through
+// `formsAuditPlaceholder()` so unratified emissions are inventoried via
+// `git grep "formsAuditPlaceholder("` pending Engineering Lead amendment
+// per EHBG §12 SI/DSI escalation.
 // ---------------------------------------------------------------------------
 
 /**
@@ -448,7 +551,7 @@ export async function emitFormsSubmissionStartedAudit(
 ): Promise<AuditEnvelope> {
   return emitAudit(
     {
-      ...buildEnvelope('forms_submission_started' as AuditAction, 'C', {
+      ...buildEnvelope(formsAuditPlaceholder('forms_submission_started'), 'C', {
         tenant_id: args.tenantId,
         actor_type: args.delegateId !== null ? 'delegate' : 'patient',
         actor_id: args.actorId,
@@ -502,7 +605,12 @@ export async function emitCrisisDetectionTrigger(
 ): Promise<AuditEnvelope> {
   return emitAudit(
     {
-      ...buildEnvelope('crisis_detection_trigger' as AuditAction, 'A', {
+      // crisis_detection_trigger IS canonical in AUDIT_EVENTS v5.2 §Category A
+      // (see lib/audit.ts CategoryAAction). The historical `as AuditAction` cast
+      // here was a copy-paste artifact from the placeholder pattern; removed
+      // 2026-05-04 with the placeholder-helper refactor — TS infers the literal
+      // type and the bare string assigns cleanly to AuditAction.
+      ...buildEnvelope('crisis_detection_trigger', 'A', {
         tenant_id: args.tenantId,
         actor_type: 'patient',
         actor_id: args.actorId,
@@ -548,7 +656,7 @@ export async function emitFormsSubmissionCompletedAudit(
 ): Promise<AuditEnvelope> {
   return emitAudit(
     {
-      ...buildEnvelope('forms_submission_completed' as AuditAction, 'C', {
+      ...buildEnvelope(formsAuditPlaceholder('forms_submission_completed'), 'C', {
         tenant_id: args.tenantId,
         actor_type: args.delegateId !== null ? 'delegate' : 'patient',
         actor_id: args.actorId,
@@ -684,9 +792,9 @@ export async function emitFormsResumeStateRestored(
  * `target_patient_id: null`.
  *
  * SPEC ISSUE per EHBG §12: AUDIT_EVENTS v5.2 doesn't canonicalize
- * `forms_variant_created` — flagged with `as AuditAction` cast pending
- * Engineering Lead ratification. Same pattern as `forms_template_created`
- * et al. that this slice has been using throughout.
+ * `forms_variant_created`. Routed through `formsAuditPlaceholder()` —
+ * same pattern as `forms_template_created` et al. across this module
+ * pending Engineering Lead ratification.
  */
 export async function emitFormsVariantCreated(
   args: {
@@ -703,7 +811,7 @@ export async function emitFormsVariantCreated(
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope('forms_variant_created' as AuditAction, 'B', {
+    buildEnvelope(formsAuditPlaceholder('forms_variant_created'), 'B', {
       tenant_id: args.tenantId,
       actor_type: 'operator',
       actor_id: args.actorId,
@@ -775,8 +883,8 @@ export async function emitFormsVariantDeployed(
  * other admin emitters).
  *
  * SPEC ISSUE per EHBG §12: action ID `forms_variant_winner_promoted` is
- * not canonical in AUDIT_EVENTS v5.2 — flagged with `as AuditAction`
- * cast pending Engineering Lead ratification.
+ * not canonical in AUDIT_EVENTS v5.2. Routed through
+ * `formsAuditPlaceholder()` pending Engineering Lead ratification.
  */
 export async function emitFormsVariantWinnerPromoted(
   args: {
@@ -794,7 +902,7 @@ export async function emitFormsVariantWinnerPromoted(
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope('forms_variant_winner_promoted' as AuditAction, 'B', {
+    buildEnvelope(formsAuditPlaceholder('forms_variant_winner_promoted'), 'B', {
       tenant_id: args.tenantId,
       actor_type: 'operator',
       actor_id: args.actorId,
@@ -838,7 +946,7 @@ export async function emitFormsVariantRetired(
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope('forms_variant_retired' as AuditAction, 'B', {
+    buildEnvelope(formsAuditPlaceholder('forms_variant_retired'), 'B', {
       tenant_id: args.tenantId,
       actor_type: 'operator',
       actor_id: args.actorId,
