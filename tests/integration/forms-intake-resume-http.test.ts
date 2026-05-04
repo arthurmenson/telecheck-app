@@ -31,7 +31,7 @@
  *     sole bearer of authorization; identity header is required
  */
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
@@ -60,6 +60,25 @@ afterAll(async () => {
     await app.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Idempotency-Key wrapper — every state-changing HTTP request must carry an
+// `Idempotency-Key` header per IDEMPOTENCY v5.1 (the platform plugin in
+// `src/lib/idempotency.ts` returns 400 with code
+// `internal.idempotency.missing_key` otherwise). Tests use this wrapper
+// so a fresh ULID is auto-injected on every state-changing method.
+// Tests that need to exercise the missing-key path call `injectWithIdempotency(...)`
+// directly.
+// ---------------------------------------------------------------------------
+
+async function injectWithIdempotency(args: InjectOptions): Promise<LightMyRequestResponse> {
+  const headers = { ...(args.headers ?? {}) } as Record<string, string>;
+  const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && !('idempotency-key' in headers)) {
+    headers['idempotency-key'] = ulid();
+  }
+  return app!.inject({ ...args, headers });
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures (mirror forms-intake-restore.test.ts's `pauseHelper` pipeline,
@@ -303,7 +322,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
   it('returns 200 + patient-safe metadata (no tenant_id) for the owning patient', async () => {
     const { resumeToken, resumeStateId, deploymentId, patientId } = await seedPausedSubmission();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/resume/${resumeToken}`,
       headers: {
@@ -334,7 +353,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     const { resumeToken } = await seedPausedSubmission();
     const wrongPatientId = ulid();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/resume/${resumeToken}`,
       headers: {
@@ -366,7 +385,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     const flipped = sig[0] === 'A' ? 'B' : 'A';
     const tampered = resumeToken.slice(0, dotIdx + 1) + flipped + sig.slice(1);
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/resume/${tampered}`,
       headers: {
@@ -384,7 +403,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
   it('returns 401 when neither x-patient-id nor x-device-anonymous-token is supplied', async () => {
     const { resumeToken } = await seedPausedSubmission();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/resume/${resumeToken}`,
       headers: {
@@ -406,7 +425,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     const { resumeToken } = await seedPausedSubmission();
 
     // Cross-patient 404
-    const crossPatient = await app!.inject({
+    const crossPatient = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/resume/${resumeToken}`,
       headers: { host: 'localhost', 'x-patient-id': ulid() },
@@ -418,7 +437,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     const flipped = sig[0] === 'A' ? 'B' : 'A';
     const tampered = resumeToken.slice(0, dotIdx + 1) + flipped + sig.slice(1);
     const { patientId: tamperedPatient } = await seedPausedSubmission();
-    const tamperedResp = await app!.inject({
+    const tamperedResp = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/resume/${tampered}`,
       headers: { host: 'localhost', 'x-patient-id': tamperedPatient },
@@ -441,7 +460,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
   it('returns 200 + patient-safe submission view (no tenant_id) for the owning patient', async () => {
     const { resumeToken, submissionId, deploymentId, patientId } = await seedPausedSubmission();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
@@ -476,7 +495,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     const { resumeToken } = await seedPausedSubmission();
     const wrongPatientId = ulid();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
@@ -498,7 +517,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     const { resumeToken, patientId } = await seedPausedSubmission();
 
     // First restore — must succeed.
-    const first = await app!.inject({
+    const first = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
@@ -516,7 +535,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     // tx. Repo's markResumeStateCompleted predicate trips the
     // RESUME_STATE_NOT_RESTORABLE sentinel; service maps to null;
     // handler maps null to a tenant-blind 404 per I-025.
-    const second = await app!.inject({
+    const second = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
@@ -543,7 +562,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     // what this case asserts. (The GET handler does NOT require an
     // actor-id, so the GET-side 401 case above is a clean
     // ownership-shim 401.)
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
@@ -561,7 +580,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     // Don't seed — the body validation runs before the service does any
     // lookup, so a paused submission isn't required to exercise this path.
     const patientId = ulid();
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
@@ -583,7 +602,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
   it('produces the same normalized error envelope shape for cross-patient and replay 404s', async () => {
     // Cross-patient
     const seedA = await seedPausedSubmission();
-    const crossPatient = await app!.inject({
+    const crossPatient = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
@@ -597,7 +616,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
 
     // Replay (paused -> restored once, then restored again)
     const seedB = await seedPausedSubmission();
-    const firstRestore = await app!.inject({
+    const firstRestore = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
@@ -609,7 +628,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
       payload: { resumeToken: seedB.resumeToken },
     });
     expect(firstRestore.statusCode).toBe(200);
-    const replay = await app!.inject({
+    const replay = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {

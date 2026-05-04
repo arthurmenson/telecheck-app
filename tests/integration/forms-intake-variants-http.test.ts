@@ -53,7 +53,7 @@
  *   - ERROR_MODEL v5.1 (canonical error envelope shape).
  */
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
@@ -84,6 +84,25 @@ afterAll(async () => {
     await app.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Idempotency-Key wrapper — every state-changing HTTP request must carry an
+// `Idempotency-Key` header per IDEMPOTENCY v5.1 (the platform plugin in
+// `src/lib/idempotency.ts` returns 400 with code
+// `internal.idempotency.missing_key` otherwise). Tests use this wrapper
+// so a fresh ULID is auto-injected on every state-changing method.
+// Tests that need to exercise the missing-key path call `injectWithIdempotency(...)`
+// directly.
+// ---------------------------------------------------------------------------
+
+async function injectWithIdempotency(args: InjectOptions): Promise<LightMyRequestResponse> {
+  const headers = { ...(args.headers ?? {}) } as Record<string, string>;
+  const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && !('idempotency-key' in headers)) {
+    headers['idempotency-key'] = ulid();
+  }
+  return app!.inject({ ...args, headers });
+}
 
 // ---------------------------------------------------------------------------
 // Tenant contexts (mirrored from forms-intake-variants.test.ts; duplicated
@@ -285,7 +304,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       programId,
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/variants',
       headers: {
@@ -323,7 +342,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       retired: true,
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/variants',
       headers: {
@@ -357,7 +376,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
     });
 
     // First create — succeeds.
-    const first = await app!.inject({
+    const first = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/variants',
       headers: {
@@ -379,7 +398,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
 
     // Second create with same label — must conflict (VARIANT_LABEL_CONFLICT
     // → 400 tenant-blind).
-    const second = await app!.inject({
+    const second = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/variants',
       headers: {
@@ -419,7 +438,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       status: 'draft',
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/variants',
       headers: {
@@ -444,7 +463,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
   });
 
   it('returns 400 when the request body is missing required fields', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/variants',
       headers: {
@@ -474,7 +493,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       programId,
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/variants',
       headers: {
@@ -501,7 +520,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       programId,
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/variants',
       headers: {
@@ -538,7 +557,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       variantTemplateId: templateId,
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/variants/${variantId}`,
       headers: {
@@ -581,7 +600,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       variantTemplateId: templateId,
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/variants/${variantId}`,
       headers: {
@@ -608,7 +627,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       variantTemplateId: templateId,
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/variants/${usVariantId}`,
       headers: {
@@ -627,7 +646,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
   });
 
   it('returns 404 (tenant-blind) for a non-existent variant_id', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/variants/${ulid()}`,
       headers: {
@@ -679,7 +698,7 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
     });
 
     // Promote arm A.
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/variants/${armAId}/promote`,
       headers: {
@@ -719,7 +738,7 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
     });
 
     // First promote — succeeds.
-    const first = await app!.inject({
+    const first = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/variants/${variantId}/promote`,
       headers: {
@@ -739,7 +758,7 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
     expect(first.statusCode).toBe(200);
 
     // Second promote — must reject (variant is now `winner`, not `active`).
-    const second = await app!.inject({
+    const second = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/variants/${variantId}/promote`,
       headers: {
@@ -775,7 +794,7 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
       variantTemplateId: templateId,
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/variants/${variantId}/promote`,
       headers: {

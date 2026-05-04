@@ -62,7 +62,7 @@
  *     deployment binds (tenant, template, version, ProgramMarketPolicy)).
  */
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
@@ -92,6 +92,25 @@ afterAll(async () => {
     await app.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Idempotency-Key wrapper — every state-changing HTTP request must carry an
+// `Idempotency-Key` header per IDEMPOTENCY v5.1 (the platform plugin in
+// `src/lib/idempotency.ts` returns 400 with code
+// `internal.idempotency.missing_key` otherwise). Tests use this wrapper
+// so a fresh ULID is auto-injected on every state-changing method.
+// Tests that need to exercise the missing-key path call `injectWithIdempotency(...)`
+// directly.
+// ---------------------------------------------------------------------------
+
+async function injectWithIdempotency(args: InjectOptions): Promise<LightMyRequestResponse> {
+  const headers = { ...(args.headers ?? {}) } as Record<string, string>;
+  const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && !('idempotency-key' in headers)) {
+    headers['idempotency-key'] = ulid();
+  }
+  return app!.inject({ ...args, headers });
+}
 
 // ---------------------------------------------------------------------------
 // Tenant contexts (mirrored from forms-intake-variants-http.test.ts)
@@ -252,7 +271,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
     const programId = `prog_dep_http_ok_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -291,7 +310,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       status: 'draft',
     });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -316,7 +335,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
     // template; handler maps to 400. Same envelope shape as the draft path
     // per I-025 — observability code preserved internally, wire body
     // doesn't betray which underlying reason tripped.
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -344,7 +363,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
     const programId = `prog_dep_http_noactor_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -364,7 +383,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
     const programId = `prog_dep_http_noadmin_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -383,7 +402,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
   it('returns 400 when the request body is empty (missing templateId)', async () => {
     // CreateDeploymentRequestSchema requires `templateId: z.string().min(1)`;
     // an empty payload fails Zod validation before the service runs.
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -415,7 +434,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
     const programId = `prog_dep_http_getok_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const createResp = await app!.inject({
+    const createResp = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -431,7 +450,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
     expect(createResp.statusCode).toBe(201);
     const created = createResp.json<DeploymentResponseBody>();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/deployments/${created.deployment_id}`,
       headers: {
@@ -470,7 +489,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
     const programId = `prog_dep_http_get401_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const createResp = await app!.inject({
+    const createResp = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -486,7 +505,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
     expect(createResp.statusCode).toBe(201);
     const { deployment_id } = createResp.json<DeploymentResponseBody>();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/deployments/${deployment_id}`,
       headers: {
@@ -506,7 +525,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
     const programId = `prog_dep_http_xt_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const createResp = await app!.inject({
+    const createResp = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -522,7 +541,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
     expect(createResp.statusCode).toBe(201);
     const { deployment_id: usDeploymentId } = createResp.json<DeploymentResponseBody>();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/deployments/${usDeploymentId}`,
       headers: {
@@ -542,7 +561,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
   });
 
   it('returns 404 (tenant-blind) for a non-existent deployment_id', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/deployments/${ulid()}`,
       headers: {
@@ -571,7 +590,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
     const programId = `prog_dep_http_retire_ok_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const createResp = await app!.inject({
+    const createResp = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -587,7 +606,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
     expect(createResp.statusCode).toBe(201);
     const { deployment_id } = createResp.json<DeploymentResponseBody>();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/deployments/${deployment_id}/retire`,
       headers: {
@@ -618,7 +637,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
     const programId = `prog_dep_http_retire_dup_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const createResp = await app!.inject({
+    const createResp = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -634,7 +653,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
     expect(createResp.statusCode).toBe(201);
     const { deployment_id } = createResp.json<DeploymentResponseBody>();
 
-    const first = await app!.inject({
+    const first = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/deployments/${deployment_id}/retire`,
       headers: {
@@ -648,7 +667,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
     });
     expect(first.statusCode).toBe(200);
 
-    const second = await app!.inject({
+    const second = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/deployments/${deployment_id}/retire`,
       headers: {
@@ -674,7 +693,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
     // tenant-blindness per I-025 + the handler's documented contract —
     // a 404 here would let an attacker enumerate deployment_ids by
     // probing for "exists" vs "doesn't exist" responses (404 vs 400).
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/deployments/${ulid()}/retire`,
       headers: {
@@ -700,7 +719,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
     const programId = `prog_dep_http_retire_noactor_${ulid().slice(0, 8)}`;
     const templateId = await seedTemplate({ ctx: US_CTX, programId });
 
-    const createResp = await app!.inject({
+    const createResp = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/deployments',
       headers: {
@@ -716,7 +735,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
     expect(createResp.statusCode).toBe(201);
     const { deployment_id } = createResp.json<DeploymentResponseBody>();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/deployments/${deployment_id}/retire`,
       headers: {

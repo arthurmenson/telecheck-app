@@ -56,6 +56,25 @@ afterAll(async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Idempotency-Key wrapper — every state-changing HTTP request must carry an
+// `Idempotency-Key` header per IDEMPOTENCY v5.1 (the platform plugin in
+// `src/lib/idempotency.ts` returns 400 with code
+// `internal.idempotency.missing_key` otherwise). Tests use this wrapper
+// so a fresh ULID is auto-injected on every state-changing method.
+// Tests that need to exercise the missing-key path call `injectWithIdempotency(...)`
+// directly.
+// ---------------------------------------------------------------------------
+
+async function injectWithIdempotency(args: InjectOptions): Promise<LightMyRequestResponse> {
+  const headers = { ...(args.headers ?? {}) } as Record<string, string>;
+  const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && !('idempotency-key' in headers)) {
+    headers['idempotency-key'] = ulid();
+  }
+  return app!.inject({ ...args, headers });
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers (mirror the snapshot/submissions/variants/resume HTTP tests)
 // ---------------------------------------------------------------------------
 
@@ -154,7 +173,7 @@ const US_HOST = 'localhost';
 describe('POST /v0/forms/templates — HTTP-level', () => {
   it('returns 201 + admin body for a valid create', async () => {
     const programId = `prog_create_${ulid().slice(0, 8)}`;
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: {
@@ -183,7 +202,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
   });
 
   it('returns 400 on missing body', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: {
@@ -202,7 +221,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
   });
 
   it('returns 401 when no actor identity is supplied', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: {
@@ -227,7 +246,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
   // even with a valid actor identity + admin role + actor-admin-tenant
   // header pointing at A. The shim's tenant-scope check refuses.
   it('returns 403 when tenant_admin role is scoped to a different tenant', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: {
@@ -256,7 +275,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
   // authorized in any tenant context regardless of admin-tenant binding.
   it('returns 201 when platform_admin role is supplied (global scope, no admin-tenant header needed)', async () => {
     const programId = `prog_platadmin_${ulid().slice(0, 8)}`;
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: {
@@ -285,7 +304,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
   // 200. Without this the handler would let any authenticated tenant
   // actor (incl. patient/clinician roles) write admin data.
   it('returns 403 when actor identity is present but no admin role is supplied', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: {
@@ -317,7 +336,7 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
   it('returns 200 + items array for an authenticated admin', async () => {
     await seedTemplate({});
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: '/v0/forms/templates?limit=5',
       headers: {
@@ -337,7 +356,7 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
   });
 
   it('returns 400 on an invalid limit', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: '/v0/forms/templates?limit=abc',
       headers: {
@@ -354,7 +373,7 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
   });
 
   it('returns 400 on an invalid pagination cursor', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: '/v0/forms/templates?cursor=not-a-real-cursor',
       headers: {
@@ -373,7 +392,7 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
   it('returns 401 when no actor identity is supplied (admin-read auth gate)', async () => {
     // Codex variants-resume-http-r1 pattern: list endpoint is admin
     // surface; even reads require authenticated actor identity.
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: '/v0/forms/templates',
       headers: {
@@ -393,7 +412,7 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
   it('returns 200 + admin body for a same-tenant lookup', async () => {
     const { templateId } = await seedTemplate({});
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/templates/${templateId}`,
       headers: {
@@ -416,7 +435,7 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
   it('returns 404 (tenant-blind) when a Ghana request reads a US-seeded template', async () => {
     const { templateId } = await seedTemplate({});
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/templates/${templateId}`,
       headers: {
@@ -434,7 +453,7 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
   });
 
   it('returns 404 (tenant-blind) for a non-existent template_id', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/templates/${ulid()}`,
       headers: {
@@ -452,7 +471,7 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
 
   it('returns 401 when no actor identity is supplied', async () => {
     const { templateId } = await seedTemplate({});
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/templates/${templateId}`,
       headers: {
@@ -494,7 +513,7 @@ async function injectWithPublishBypass(injectArgs: InjectOptions): Promise<Light
   const prior = process.env['FORMS_PUBLISH_GATES_BYPASS'];
   process.env['FORMS_PUBLISH_GATES_BYPASS'] = 'unsafe-test-only';
   try {
-    return await app!.inject(injectArgs);
+    return await injectWithIdempotency(injectArgs);
   } finally {
     if (prior === undefined) {
       delete process.env['FORMS_PUBLISH_GATES_BYPASS'];
@@ -576,7 +595,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
 
     // No bypass needed — the actor-id 401 fires before the publish-gate
     // sentinel. This test covers the auth-gate-first ordering.
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
       headers: {
@@ -603,7 +622,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
     delete process.env['FORMS_PUBLISH_GATES_BYPASS'];
     let response;
     try {
-      response = await app!.inject({
+      response = await injectWithIdempotency({
         method: 'POST',
         url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
         headers: {

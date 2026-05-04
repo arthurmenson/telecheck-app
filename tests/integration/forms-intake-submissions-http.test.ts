@@ -21,7 +21,7 @@
  *     NOT render the operating-tenant identifier
  */
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
@@ -47,6 +47,25 @@ afterAll(async () => {
     await app.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Idempotency-Key wrapper — every state-changing HTTP request must carry an
+// `Idempotency-Key` header per IDEMPOTENCY v5.1 (the platform plugin in
+// `src/lib/idempotency.ts` returns 400 with code
+// `internal.idempotency.missing_key` otherwise). Tests use this wrapper
+// so a fresh ULID is auto-injected on every state-changing method.
+// Tests that need to exercise the missing-key path call `injectWithIdempotency(...)`
+// directly.
+// ---------------------------------------------------------------------------
+
+async function injectWithIdempotency(args: InjectOptions): Promise<LightMyRequestResponse> {
+  const headers = { ...(args.headers ?? {}) } as Record<string, string>;
+  const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && !('idempotency-key' in headers)) {
+    headers['idempotency-key'] = ulid();
+  }
+  return app!.inject({ ...args, headers });
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers (mirror the snapshot HTTP test for consistency)
@@ -205,7 +224,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
     const { deploymentId } = await seedActiveDeployment();
     const patientId = ulid();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/submissions',
       headers: {
@@ -230,7 +249,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
     const patientId = ulid();
     const fakeDeploymentId = ulid();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/submissions',
       headers: {
@@ -251,7 +270,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
     const { deploymentId } = await seedActiveDeployment();
     const patientId = ulid();
 
-    const first = await app!.inject({
+    const first = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/submissions',
       headers: {
@@ -264,7 +283,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
     });
     expect(first.statusCode).toBe(201);
 
-    const second = await app!.inject({
+    const second = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/submissions',
       headers: {
@@ -282,7 +301,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
   it('returns 401 when no patient identity header is supplied', async () => {
     const { deploymentId } = await seedActiveDeployment();
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/submissions',
       headers: {
@@ -297,7 +316,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
   });
 
   it('returns 400 on missing body', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/submissions',
       headers: {
@@ -339,7 +358,7 @@ describe('GET /v0/forms/submissions/:submissionId — HTTP-level', () => {
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/submissions/${submission.submission_id}`,
       headers: {
@@ -376,7 +395,7 @@ describe('GET /v0/forms/submissions/:submissionId — HTTP-level', () => {
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/submissions/${submission.submission_id}`,
       headers: {
@@ -389,7 +408,7 @@ describe('GET /v0/forms/submissions/:submissionId — HTTP-level', () => {
   });
 
   it('returns 404 for a missing submission_id', async () => {
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/submissions/${ulid()}`,
       headers: {
@@ -429,7 +448,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'PATCH',
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
@@ -468,7 +487,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'PATCH',
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
@@ -510,7 +529,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'PATCH',
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
@@ -548,7 +567,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'PATCH',
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
@@ -589,7 +608,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (pa
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'PATCH',
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
@@ -644,7 +663,7 @@ describe('POST /v0/forms/submissions/:submissionId/submit — HTTP-level', () =>
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/submissions/${submission.submission_id}/submit`,
       headers: {
@@ -701,7 +720,7 @@ describe('POST /v0/forms/submissions/:submissionId/submit — HTTP-level', () =>
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/submissions/${submission.submission_id}/submit`,
       headers: {
@@ -737,7 +756,7 @@ describe('POST /v0/forms/submissions/:submissionId/submit — HTTP-level', () =>
       ),
     );
 
-    const response = await app!.inject({
+    const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/submissions/${submission.submission_id}/submit`,
       headers: {
