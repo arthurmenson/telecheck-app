@@ -145,6 +145,60 @@ async function seedSubmittedSubmission(): Promise<SeededFixture> {
   };
 }
 
+/**
+ * Recursively scan a parsed JSON value for a key matching `targetKey`
+ * (case-sensitive). Used to catch nested `tenant_id` leaks that a
+ * top-level `not.toHaveProperty` check misses.
+ *
+ * Codex snapshot-http-r1 closure 2026-05-03: the prior tests checked
+ * only the top-level body for `tenant_id` and only the raw body string
+ * for the tenant ID VALUE. A nested object with `{ tenant_id: 'X' }`
+ * inside `presented_content` (or anywhere else) would slip through.
+ */
+function findKeyAtAnyDepth(value: unknown, targetKey: string): boolean {
+  type Frame = unknown;
+  const stack: Frame[] = [value];
+  while (stack.length > 0) {
+    const next = stack.pop();
+    if (Array.isArray(next)) {
+      for (const item of next) {
+        stack.push(item);
+      }
+      continue;
+    }
+    if (next !== null && typeof next === 'object') {
+      const obj = next as Record<string, unknown>;
+      for (const key of Object.keys(obj)) {
+        if (key === targetKey) {
+          return true;
+        }
+        stack.push(obj[key]);
+      }
+    }
+    // primitives — no key surface
+  }
+  return false;
+}
+
+/**
+ * Assert that an HTTP response body is byte-clean of operating-tenant
+ * identity at BOTH the JSON-key level (any depth) AND the raw-string
+ * level (any nesting / serialization shape). Per Codex snapshot-http-r1
+ * recommendation: "Assert against the actual serialized surface."
+ */
+function assertNoTenantIdLeakage(response: { body: string; json: <T>() => T }): void {
+  // Raw-string: catch key OR value anywhere in the wire body, including
+  // accidental nesting under presented_content or any future field.
+  expect(response.body).not.toContain('tenant_id');
+  expect(response.body).not.toContain(TENANT_US);
+  // Parsed: defense-in-depth for cases where the key happens to appear
+  // inside an unrelated free-text field (the raw-string check would
+  // false-positive there). The recursive scan catches a deliberate
+  // nested object key.
+  const parsed = response.json<unknown>();
+  expect(findKeyAtAnyDepth(parsed, 'tenant_id')).toBe(false);
+}
+
 // ---------------------------------------------------------------------------
 // HTTP-level snapshot read path
 // ---------------------------------------------------------------------------
@@ -164,21 +218,18 @@ describe('GET /v0/forms/submissions/:submissionId/snapshot — HTTP-level', () =
 
     expect(response.statusCode).toBe(200);
 
-    // Parse the response body as JSON. The snapshot is the patient-safe
-    // projection, so tenant_id MUST NOT appear at the top level.
-    const body = response.json<Record<string, unknown>>();
-    expect(body).not.toHaveProperty('tenant_id');
+    // No-tenant_id-leak guarantee at every layer (top-level key,
+    // any-depth nested key, raw-body string, tenantId value).
+    assertNoTenantIdLeakage(response);
+
     // Spot-check kept fields.
+    const body = response.json<Record<string, unknown>>();
     expect(body['submission_id']).toBe(submissionId);
     expect(body).toHaveProperty('snapshot_id');
     expect(body).toHaveProperty('template_id');
     expect(body).toHaveProperty('template_version');
     expect(body).toHaveProperty('presented_content');
     expect(body).toHaveProperty('created_at');
-
-    // Defense-in-depth: the raw response body string must not contain the
-    // operating-tenant identifier anywhere (catches accidental nesting).
-    expect(response.body).not.toContain('Telecheck-US');
   });
 
   it('returns 404 when a different patient presents a valid submission_id', async () => {
@@ -241,8 +292,11 @@ describe('GET /v0/forms/snapshots/:snapshotId — HTTP-level', () => {
       },
     });
     expect(byIdResp.statusCode).toBe(200);
+
+    // Same byte-clean guarantee as the by-submission route.
+    assertNoTenantIdLeakage(byIdResp);
+
     const body = byIdResp.json<Record<string, unknown>>();
-    expect(body).not.toHaveProperty('tenant_id');
     expect(body['snapshot_id']).toBe(snapshotId);
   });
 
