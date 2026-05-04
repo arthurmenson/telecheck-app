@@ -173,7 +173,21 @@ describe('idempotency plugin HTTP — replay (same 4-tuple + same body)', () => 
   it('returns the cached response on second call with identical key + body', async () => {
     const idempotencyKey = ulid();
     const headers = await adminAuthHeaders();
-    const payload = createTemplatePayload();
+    // Discriminate via the request payload, NOT the returned template_id.
+    // Codex idempotency-http-r1 closure 2026-05-03: a broken idempotency
+    // layer could re-run the handler on the second request, create a
+    // SECOND forms_template row with a NEW template_id, and still return
+    // the cached first response. A COUNT(*) WHERE template_id = first.id
+    // would pass that bug; we need a query that captures BOTH rows if a
+    // duplicate exists.
+    //
+    // Strategy: tag the payload with a unique programCatalogEntryId for
+    // this test invocation; after the second call, count ALL forms_template
+    // rows in this tenant with that program_id and require exactly one.
+    // Any duplicate handler-run would write a second row with the same
+    // program_id (the payload uniquely identifies the request shape).
+    const uniqueProgramId = `prog_idem_replay_${ulid()}`;
+    const payload = { ...createTemplatePayload(), programCatalogEntryId: uniqueProgramId };
 
     // First call: real handler runs, template created.
     const first = await inject({
@@ -196,17 +210,18 @@ describe('idempotency plugin HTTP — replay (same 4-tuple + same body)', () => 
     });
     expect(second.statusCode).toBe(201);
     const secondBody = second.json<Record<string, unknown>>();
-    // The replayed body MUST equal the first body (proves no second-handler
-    // run created a different row).
     expect(secondBody['template_id']).toBe(firstBody['template_id']);
 
-    // Side-effect verification: only ONE template row was created.
+    // Side-effect verification by REQUEST-DERIVED discriminator: count ALL
+    // forms_template rows in this tenant with the unique program_id.
+    // Exactly one row proves the handler ran exactly once. A duplicate-run
+    // bug would surface here even if the cached response replayed cleanly.
     const client = getTestClient();
     const count = await withTenantContext(TENANT_US, async () => {
       const r = await client.query<{ c: string }>(
         `SELECT COUNT(*)::text AS c FROM forms_template
-           WHERE tenant_id = $1 AND template_id = $2`,
-        [TENANT_US, firstBody['template_id']],
+           WHERE tenant_id = $1 AND program_id = $2`,
+        [TENANT_US, uniqueProgramId],
       );
       return Number.parseInt(r.rows[0]!.c, 10);
     });
