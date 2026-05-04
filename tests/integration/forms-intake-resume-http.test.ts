@@ -343,7 +343,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     if (response.statusCode !== 200) {
       // eslint-disable-next-line no-console
       console.log(
-        `[DIAG resume-http 200-happy] status=${response.statusCode} body=${response.body} resumeStateId=${resumeStateId} patientId=${patientId} deploymentId=${deploymentId}`,
+        `[DIAG resume-http 200-happy] status=${response.statusCode} body=${response.body} url=/v0/forms/resume/${resumeToken} tokenLen=${resumeToken.length} tokenSample=${resumeToken.slice(0, 30)}... resumeStateId=${resumeStateId} patientId=${patientId} deploymentId=${deploymentId}`,
       );
     }
 
