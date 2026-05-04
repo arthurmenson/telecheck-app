@@ -78,6 +78,28 @@ async function safeFindSnapshotBySubmission(
 export const SNAPSHOT_BUILD_PRECONDITION_FAILED = 'forms.snapshot.build_precondition_failed';
 
 /**
+ * Patient-safe projection of a FormSnapshot. Strips the operating-tenant
+ * identifier (`tenant_id`) per Master PRD v1.10 §17 + Glossary v5.2 C3
+ * brand-structure rule (same discipline as PatientFormSubmissionView in
+ * submission-service.ts and ResumeStateMetadata projection landed at
+ * resume-r1).
+ *
+ * Type-level enforcement: the patient handler returns this projection;
+ * a refactor that returns the un-projected FormSnapshot fails tsc.
+ */
+export type PatientFormSnapshotView = Omit<FormSnapshot, 'tenant_id'>;
+
+/**
+ * Project a full FormSnapshot to the patient-safe view. Drops `tenant_id`
+ * by destructuring; never copy the field by mistake.
+ */
+export function snapshotToPatientView(snapshot: FormSnapshot): PatientFormSnapshotView {
+  const { tenant_id: _stripped, ...patientView } = snapshot;
+  void _stripped;
+  return patientView;
+}
+
+/**
  * Build and persist a snapshot at submission time per Slice PRD v2.1 §4.
  *
  * Captures the immutable point-in-time view of the form the patient just

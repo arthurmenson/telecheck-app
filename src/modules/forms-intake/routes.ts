@@ -25,6 +25,10 @@ import {
 } from './internal/handlers/deployments.js';
 import { getResumeStateHandler, resumeSubmissionHandler } from './internal/handlers/resume.js';
 import {
+  getSnapshotByIdHandler,
+  getSnapshotForSubmissionHandler,
+} from './internal/handlers/snapshots.js';
+import {
   getSubmissionHandler,
   startSubmissionHandler,
   submitSubmissionHandler,
@@ -65,6 +69,10 @@ export const registerFormsIntakeRoutes: FastifyPluginAsync = async (
   app.get('/submissions/:submissionId', getSubmissionHandler);
   app.patch('/submissions/:submissionId/responses', updateSubmissionResponsesHandler);
   app.post('/submissions/:submissionId/submit', submitSubmissionHandler);
+
+  // ---- Snapshots (patient-facing reads of immutable submission view) ----
+  app.get('/submissions/:submissionId/snapshot', getSnapshotForSubmissionHandler);
+  app.get('/snapshots/:snapshotId', getSnapshotByIdHandler);
 
   // ---- Variants (A/B test administration) ----
   app.post('/variants', createVariantHandler);

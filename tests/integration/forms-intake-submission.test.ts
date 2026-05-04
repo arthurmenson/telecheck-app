@@ -795,6 +795,57 @@ describe('forms-intake submitSubmission — snapshot capture (Slice PRD §4)', (
     ).rejects.toThrow(snapshotRepo.SNAPSHOT_ALREADY_EXISTS);
   });
 
+  // Codex pause-r1 MEDIUM closure pattern applied to snapshot reads:
+  // PatientFormSnapshotView strips tenant_id; the handler projects via
+  // snapshotToPatientView before reply.send. Regression guard ensures
+  // tenant_id never appears on the patient surface.
+  it('PatientFormSnapshotView projection strips tenant_id', async () => {
+    const programId = `prog_snap_dto_${ulid().slice(0, 8)}`;
+    const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
+    const patientId = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_dto', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+    await withTenantContext(TENANT_US, () =>
+      submissionService.submitSubmission(
+        US_CTX,
+        { actorId: 'op_dto', patientId, delegateId: null },
+        submission.submission_id,
+        {},
+        getTestClient(),
+      ),
+    );
+
+    const snapshot = await withTenantContext(TENANT_US, () =>
+      snapshotService.getSnapshotForSubmissionAsPatient(
+        US_CTX,
+        patientId,
+        submission.submission_id,
+        getTestClient(),
+      ),
+    );
+    expect(snapshot).not.toBeNull();
+
+    // Project via the public helper that the handler uses.
+    const patientView = snapshotService.snapshotToPatientView(snapshot!);
+
+    // Type-level: PatientFormSnapshotView is Omit<FormSnapshot, 'tenant_id'>.
+    // Runtime-level: ensure no key named tenant_id leaks via a wider type.
+    expect(Object.keys(patientView)).not.toContain('tenant_id');
+    // Spot-check the kept fields.
+    expect(patientView.snapshot_id).toBe(snapshot!.snapshot_id);
+    expect(patientView.submission_id).toBe(snapshot!.submission_id);
+    expect(patientView.template_id).toBe(snapshot!.template_id);
+    expect(patientView.template_version).toBe(snapshot!.template_version);
+    expect(patientView.presented_content).toEqual(snapshot!.presented_content);
+  });
+
   it('rejects cross-patient snapshot read via the patient-facing API', async () => {
     const programId = `prog_snap_xpat_${ulid().slice(0, 8)}`;
     const { deploymentId } = await seedActiveDeployment({ ctx: US_CTX, programId });
