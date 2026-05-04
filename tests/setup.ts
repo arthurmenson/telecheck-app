@@ -288,13 +288,56 @@ beforeEach(async () => {
   _savepointCounter += 1;
   _currentSavepoint = `sp_${_savepointCounter}`;
   await client.query(`SAVEPOINT ${_currentSavepoint}`);
+
+  // Defensive tx-health probe: if the outer transaction is in an aborted
+  // state (e.g., a prior test's afterEach didn't fully recover, or a fork
+  // entered the file with a leftover-aborted state from buildApp init),
+  // every subsequent statement except SAVEPOINT/ROLLBACK fails with
+  // `current transaction is aborted`. The savepoint we just created is
+  // still in place; rolling back to it recovers the aborted state. We
+  // probe with a noop SELECT 1; if that fails, recover via ROLLBACK TO
+  // SAVEPOINT (which is allowed in aborted txns) and re-establish the
+  // savepoint.
+  //
+  // Closes the rls.test.ts §6 "real DB round-trip" cascade where the FIRST
+  // §6 test's beforeEach left the outer tx aborted and tests 2-5 all
+  // failed with `current transaction is aborted`. (Codex setup-r0
+  // 2026-05-04.)
+  try {
+    await client.query('SELECT 1');
+  } catch {
+    // Outer tx is aborted. Recover via ROLLBACK TO SAVEPOINT and
+    // re-establish the per-test savepoint so this test starts fresh.
+    await client.query(`ROLLBACK TO SAVEPOINT ${_currentSavepoint}`);
+    // The savepoint still exists post-rollback (Postgres docs:
+    // "A savepoint that has been rolled back to is still considered
+    // active") — but a fresh test should start with a fresh savepoint
+    // name to avoid name collision in afterEach. Release and re-create.
+    await client.query(`RELEASE SAVEPOINT ${_currentSavepoint}`);
+    _savepointCounter += 1;
+    _currentSavepoint = `sp_${_savepointCounter}`;
+    await client.query(`SAVEPOINT ${_currentSavepoint}`);
+  }
 });
 
 afterEach(async () => {
   if (_currentSavepoint !== null) {
     const client = getTestClient();
-    await client.query(`ROLLBACK TO SAVEPOINT ${_currentSavepoint}`);
-    await client.query(`RELEASE SAVEPOINT ${_currentSavepoint}`);
+    // ROLLBACK TO SAVEPOINT works on aborted txns; RELEASE SAVEPOINT
+    // works on the post-rollback (non-aborted) savepoint. Both must run
+    // to keep the outer tx healthy for the next test. Errors here are
+    // logged but swallowed so a single test's cleanup failure doesn't
+    // abort the entire test run.
+    try {
+      await client.query(`ROLLBACK TO SAVEPOINT ${_currentSavepoint}`);
+    } catch {
+      // Swallow — beforeEach probe will recover.
+    }
+    try {
+      await client.query(`RELEASE SAVEPOINT ${_currentSavepoint}`);
+    } catch {
+      // Swallow — beforeEach probe will recover.
+    }
     _currentSavepoint = null;
   }
 });

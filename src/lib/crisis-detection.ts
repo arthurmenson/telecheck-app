@@ -207,12 +207,21 @@ export class CrisisDetector {
 
   private classifyCrisisType(text: string): CrisisType {
     const lower = text.toLowerCase();
+    // Keep classifier alternates in PARITY with the corresponding
+    // CRISIS_PATTERNS alternates above. A pattern that detects but isn't
+    // classified falls through to 'general_crisis' — the failure mode CI
+    // surfaced 2026-05-04 (e.g., "I have thoughts of death" detected via
+    // CRISIS_PATTERNS but classified as general_crisis because the
+    // classifier was missing `thoughts?\s+of\s+death`). Codex
+    // crisis-classify-r0 closure 2026-05-04.
     if (
-      /suicid|kill\s+myself|end\s+my\s+life|want\s+to\s+die|don'?t\s+want\s+to\s+live/.test(lower)
+      /suicid|kill\s+myself|end\s+my\s+life|want\s+to\s+die|don'?t\s+want\s+to\s+live|thoughts?\s+of\s+death/.test(
+        lower,
+      )
     ) {
       return 'suicidal_ideation';
     }
-    if (/self[\s-]?harm|cutting|hurt\s+myself|burning\s+myself/.test(lower)) {
+    if (/self[\s-]?harm|cutting|hurt\s+myself|burning\s+myself|hurting\s+myself/.test(lower)) {
       return 'self_harm';
     }
     if (/abused|hurting\s+me|domestic\s+violence|sexual\s+abuse|physical\s+abuse/.test(lower)) {
