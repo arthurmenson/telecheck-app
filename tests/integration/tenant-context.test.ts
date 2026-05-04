@@ -20,15 +20,22 @@
  *      bypass at runtime. Currently exercised only INDIRECTLY through
  *      every handler test that reads `ctx.tenantId`.
  *
- *   §2 Missing-Host-header path — the plugin's `if (!host)` branch
- *      (line 462-472 of tenant-context.ts) is NOT directly tested.
- *      Existing tests cover UNKNOWN-host but not MISSING-host. These
- *      are different code paths (different error code:
- *      `internal.request.missing_host_header` vs
- *      `internal.request.unresolvable_tenant`) and the regression
- *      mode would manifest as wrong-error-code on a malformed client
- *      request. Pin both code values so a refactor that collapses the
- *      branches is caught.
+ *   §2 Unknown-host envelope tenant-blindness (I-025) — the existing
+ *      `tenant-context-http.test.ts` asserts only that an error code
+ *      is present on the unknown-host 400; it does NOT assert the
+ *      response body is free of tenant-identifier substrings. A
+ *      regression that swapped to a more verbose error message
+ *      ("Tenant Telecheck-US is not active") could pass the existing
+ *      assertions but would be an I-025 violation. Pin via explicit
+ *      not-contains assertions on `Telecheck-*` and `heros`.
+ *
+ *      (Note: the missing-Host-header branch — `if (!host)` in the
+ *      plugin — is NOT covered here; lightMyRequest auto-fills `host`
+ *      to `localhost` when an empty string is passed via inject(),
+ *      so the branch can't be reached through the integration entry
+ *      point. Direct coverage would require constructing a raw
+ *      FastifyRequest stub against the hook function — out of scope
+ *      for this commit.)
  *
  *   §3 Case-insensitive Host matching — `resolveHostFromMap` does
  *      `host.split(':')[0]?.toLowerCase()`. A refactor that drops
@@ -153,60 +160,39 @@ describe('requireTenantContext — pure-function guard', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §2 — Missing Host header → distinct internal code
+// §2 — Unknown-host fail-closed envelope tenant-blindness
 // ---------------------------------------------------------------------------
+//
+// Note: the missing-Host-header branch (`if (!host)` in the plugin) is
+// genuinely difficult to exercise via Fastify's `inject()` — lightMyRequest
+// auto-fills the host header to `localhost` if the caller passes an empty
+// string. Direct missing-host coverage would require a lower-level test
+// against `request.headers` in isolation; out of scope for this file. The
+// existing `tenant-context-http.test.ts` covers the unknown-host path; this
+// section adds a tighter check on the I-025 tenant-blindness of that
+// envelope (the existing test only asserts code presence, not content).
 
-describe('tenantContextPlugin — missing Host header (distinct from unknown-host)', () => {
-  it('§2a returns 400 with code "internal.request.missing_host_header" when Host is empty string', async () => {
-    // lightMyRequest may auto-add a default host on inject(); explicitly
-    // set the host header to an empty string to force the `if (!host)`
-    // branch. The plugin's check is `if (!host)` so '' (falsy) trips it.
+describe('tenantContextPlugin — unknown-host envelope is tenant-blind', () => {
+  it('§2a unknown-host envelope carries no tenant identifier substring (I-025)', async () => {
+    // I-025: the wire envelope must not leak any signal of which
+    // operating tenant exists. The existing `tenant-context-http.test.ts`
+    // asserts only that an error code is present; this test pins that
+    // the response BODY does not contain `Telecheck-`, the consumer
+    // DBA names, or related leak vectors.
     const response = await app!.inject({
-      method: 'GET',
-      url: '/v0/forms/templates',
-      headers: {
-        host: '',
-        'x-patient-id': 'pat_unused_for_this_test',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-    const body = response.json<ErrorEnvelope>();
-    expect(body.error?.code).toBe('internal.request.missing_host_header');
-    expect(body.error?.message).toContain('Host header');
-  });
-
-  it('§2b distinct code from "unresolvable_tenant" — missing-host vs unknown-host are SEPARATE branches', async () => {
-    // Sanity counterpart: an UNKNOWN host emits a different code. Pin
-    // the diff so a refactor that collapses the two branches into one
-    // generic "tenant resolution failed" code is caught.
-    const missingHost = await app!.inject({
-      method: 'GET',
-      url: '/v0/forms/templates',
-      headers: { host: '', 'x-patient-id': 'p' },
-    });
-    const unknownHost = await app!.inject({
       method: 'GET',
       url: '/v0/forms/templates',
       headers: { host: 'unknown-host.example.com', 'x-patient-id': 'p' },
     });
-    const missingCode = missingHost.json<ErrorEnvelope>().error?.code;
-    const unknownCode = unknownHost.json<ErrorEnvelope>().error?.code;
-    expect(missingCode).toBe('internal.request.missing_host_header');
-    expect(unknownCode).toBe('internal.request.unresolvable_tenant');
-    expect(missingCode).not.toBe(unknownCode);
-  });
-
-  it('§2c error envelope is tenant-blind — neither code mentions any tenant identifier', async () => {
-    // I-025: the wire envelope must not leak tenant existence info.
-    const response = await app!.inject({
-      method: 'GET',
-      url: '/v0/forms/templates',
-      headers: { host: '', 'x-patient-id': 'p' },
-    });
+    expect(response.statusCode).toBe(400);
     const bodyText = response.body;
     expect(bodyText).not.toContain('Telecheck-US');
     expect(bodyText).not.toContain('Telecheck-Ghana');
     expect(bodyText.toLowerCase()).not.toContain('heros');
+    // Code itself is allowed to be specific (`unresolvable_tenant`); the
+    // PROHIBITED leakage is rendering the actual tenant identifier.
+    const body = response.json<ErrorEnvelope>();
+    expect(body.error?.code).toBe('internal.request.unresolvable_tenant');
   });
 });
 
