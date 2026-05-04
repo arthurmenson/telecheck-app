@@ -104,19 +104,92 @@ export function setTestPool(client: DbClient): void {
   // app code paths only call `connect()` and the connection's `query` /
   // `release`. Anything else (idleTimeout, on('error'), end()) is noop'd
   // here — the harness owns the real client.
+  //
+  // CRITICAL — transaction-command translation:
+  //
+  //   The app's `withTransaction` runs literal `BEGIN` / `COMMIT` / `ROLLBACK`
+  //   on the connection it gets from `pool.connect()`. If those statements
+  //   ran on the shared test client unmodified, the app would commit/rollback
+  //   the OUTER test transaction managed by tests/setup.ts (the one that
+  //   wraps every test in a SAVEPOINT). After that COMMIT, subsequent
+  //   `SAVEPOINT sp_N` calls fail with "SAVEPOINT can only be used in
+  //   transaction blocks" — which is exactly the cascade that surfaced on
+  //   CI run 25325909032 (commit 1ea8965): 75 × SAVEPOINT + 82 × ROLLBACK
+  //   TO SAVEPOINT errors when the test-pool override was naive.
+  //
+  //   Fix: intercept the three transaction commands per-connection and
+  //   translate them to nested-savepoint operations against a connection-
+  //   local savepoint name. The app sees normal transaction semantics
+  //   (begin → work → commit, rollback discards mid-flight work) while the
+  //   shared test client's outer-transaction state is preserved for the
+  //   harness's per-test SAVEPOINT/ROLLBACK TO SAVEPOINT cycle.
+  //
+  //     app `BEGIN`     → SAVEPOINT app_tx_N
+  //     app `COMMIT`    → RELEASE SAVEPOINT app_tx_N
+  //     app `ROLLBACK`  → ROLLBACK TO SAVEPOINT app_tx_N + RELEASE
+  //
+  //   The savepoint counter is module-scope so re-entrant withTransaction
+  //   calls (rare but possible) get distinct names.
+  let _appTxCounter = 0;
+  const connect = async () => {
+    let activeAppTxSavepoint: string | null = null;
+
+    const interceptedQuery = async (text: string, values?: ReadonlyArray<unknown>) => {
+      // Only the leading keyword matters — strip surrounding whitespace and
+      // check the first token, case-insensitive. We don't need to match
+      // exact `BEGIN ISOLATION LEVEL ...` variants (the app doesn't use
+      // them) but we lowercase to be robust against future stylistic drift.
+      const trimmed = text.trim().toUpperCase();
+      if (trimmed === 'BEGIN' || trimmed.startsWith('BEGIN ')) {
+        if (activeAppTxSavepoint !== null) {
+          // Re-entrant BEGIN on the same fake connection — preserve the
+          // first one's name; nested transactions on the same connection
+          // are not supported by withTransaction's contract anyway.
+          return { rows: [], rowCount: null };
+        }
+        _appTxCounter += 1;
+        activeAppTxSavepoint = `app_tx_${_appTxCounter}`;
+        return client.query(`SAVEPOINT ${activeAppTxSavepoint}`);
+      }
+      if (trimmed === 'COMMIT' || trimmed.startsWith('COMMIT ')) {
+        if (activeAppTxSavepoint !== null) {
+          const sp = activeAppTxSavepoint;
+          activeAppTxSavepoint = null;
+          return client.query(`RELEASE SAVEPOINT ${sp}`);
+        }
+        // No active app savepoint — silently no-op so app code that does
+        // a defensive COMMIT outside withTransaction doesn't error.
+        return { rows: [], rowCount: null };
+      }
+      if (trimmed === 'ROLLBACK' || trimmed.startsWith('ROLLBACK ')) {
+        if (activeAppTxSavepoint !== null) {
+          const sp = activeAppTxSavepoint;
+          activeAppTxSavepoint = null;
+          await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+          return client.query(`RELEASE SAVEPOINT ${sp}`);
+        }
+        return { rows: [], rowCount: null };
+      }
+      // Pass through every other query unchanged.
+      return values === undefined ? client.query(text) : client.query(text, values);
+    };
+
+    const decorated = {
+      query: interceptedQuery,
+      release: (_err?: boolean | Error) => {
+        // No-op: the harness owns the client lifecycle. If there's an
+        // active app-level savepoint that was never committed/rolled back
+        // (e.g., the app threw between BEGIN and COMMIT and never reached
+        // either ROLLBACK or finally), we leave the savepoint dangling —
+        // the harness's per-test ROLLBACK TO SAVEPOINT discards it
+        // along with everything else.
+      },
+    };
+    return decorated;
+  };
+
   const wrapper = {
-    connect: async () => {
-      // Decorate the shared test client with a release() no-op so the app's
-      // withTenantBoundConnection / withConnection / withTransaction code
-      // paths work unchanged.
-      const decorated = {
-        query: client.query.bind(client),
-        release: (_err?: boolean | Error) => {
-          // No-op: the harness owns the client lifecycle.
-        },
-      };
-      return decorated;
-    },
+    connect,
     end: async () => {
       // No-op: the harness owns the client lifecycle.
     },
