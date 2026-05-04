@@ -35,6 +35,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
 // Test app lifecycle
@@ -119,64 +121,116 @@ describe('tenant context HTTP — fail-closed on tenant-scoped routes', () => {
 // Host → tenant mapping observed via downstream handler behavior
 // ---------------------------------------------------------------------------
 
-describe('tenant context HTTP — host → tenant mapping', () => {
-  // The downstream handler receives the resolved tenant context via
-  // `req.tenantContext`. We can't introspect that decorator from outside
-  // the request, so we verify the mapping INDIRECTLY by hitting the
-  // GET /v0/forms/submissions/:id endpoint with a known submissionId
-  // that doesn't exist — the handler returns a tenant-blind 404 if
-  // tenant resolution succeeded (proves the host mapped to a real
-  // tenant context). A failed tenant resolve would have surfaced 400
-  // before the handler ran.
+describe('tenant context HTTP — host → tenant mapping (tenant-discriminating)', () => {
+  // **Codex tenant-context-http-r1 closure 2026-05-03:** the prior version
+  // of these tests just asserted 404 on a fresh ULID, which would pass
+  // even if a regression mapped `ghana.heroshealth.com` to Telecheck-US
+  // (or vice versa) — handler reaches a 404 either way for an unseeded
+  // ULID. Replaced with tenant-discriminating tests: seed a submission
+  // in tenant A; assert that host A returns 200 (the seed) AND host B
+  // returns 404 (cross-tenant invisible). Any host-mapping regression
+  // surfaces as either a wrong-200 or wrong-404.
 
-  it('localhost host resolves to a valid tenant context (handler runs, returns 404)', async () => {
-    const response = await app!.inject({
-      method: 'GET',
-      url: `/v0/forms/submissions/${ulid()}`,
-      headers: {
-        host: 'localhost',
-        'x-patient-id': ulid(),
-      },
+  // Seed a US-tenant submission once for the suite; reuse across
+  // host-mapping cases. Tests that mutate would need their own seed.
+  let usSeed: { submissionId: string; patientId: string } | null = null;
+
+  beforeAll(async () => {
+    const client = getTestClient();
+    const programId = `prog_tx_http_${ulid().slice(0, 8)}`;
+    const templateId = ulid();
+    const deploymentId = ulid();
+    const submissionId = ulid();
+    const patientId = ulid();
+    await withTenantContext(TENANT_US, async () => {
+      await client.query(
+        `INSERT INTO forms_template (
+            template_id, tenant_id, program_id, country_of_care,
+            template_version, status, name, created_by,
+            presentation_content, branching_logic,
+            eligibility_logic, approval_governance,
+            published_at, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, 1, 'published', $5, $6,
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{}'::jsonb, '{}'::jsonb,
+                    NOW(), NOW(), NOW())`,
+        [templateId, TENANT_US, programId, 'US', `tx-${templateId.slice(0, 8)}`, ulid()],
+      );
+      await client.query(
+        `INSERT INTO forms_deployment (
+            deployment_id, tenant_id, template_id, program_id,
+            deployed_by, deployed_at, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), NOW())`,
+        [deploymentId, TENANT_US, templateId, programId, ulid()],
+      );
+      await client.query(
+        `INSERT INTO forms_submission (
+            submission_id, tenant_id, deployment_id, variant_id,
+            patient_id, delegate_id,
+            status, responses, mode_2_eligible,
+            created_at, updated_at
+         ) VALUES ($1, $2, $3, NULL, $4, NULL,
+                    'in_progress', '{}'::jsonb, FALSE,
+                    NOW(), NOW())`,
+        [submissionId, TENANT_US, deploymentId, patientId],
+      );
     });
-    expect(response.statusCode).toBe(404);
+    usSeed = { submissionId, patientId };
   });
 
-  it('heroshealth.com host resolves to Telecheck-US tenant context', async () => {
+  it('localhost host resolves to Telecheck-US (200 hit on US-seeded submission)', async () => {
+    expect(usSeed).not.toBeNull();
     const response = await app!.inject({
       method: 'GET',
-      url: `/v0/forms/submissions/${ulid()}`,
-      headers: {
-        host: 'heroshealth.com',
-        'x-patient-id': ulid(),
-      },
+      url: `/v0/forms/submissions/${usSeed!.submissionId}`,
+      headers: { host: 'localhost', 'x-patient-id': usSeed!.patientId },
     });
-    // 404 = tenant resolved (request reached the handler), submission
-    // doesn't exist. 400 would mean tenant resolution failed at the plugin.
-    expect(response.statusCode).toBe(404);
+    expect(response.statusCode).toBe(200);
   });
 
-  it('www.heroshealth.com host also resolves to Telecheck-US', async () => {
+  it('heroshealth.com host resolves to Telecheck-US (200 hit on US-seeded submission)', async () => {
+    expect(usSeed).not.toBeNull();
     const response = await app!.inject({
       method: 'GET',
-      url: `/v0/forms/submissions/${ulid()}`,
-      headers: {
-        host: 'www.heroshealth.com',
-        'x-patient-id': ulid(),
-      },
+      url: `/v0/forms/submissions/${usSeed!.submissionId}`,
+      headers: { host: 'heroshealth.com', 'x-patient-id': usSeed!.patientId },
     });
-    expect(response.statusCode).toBe(404);
+    expect(response.statusCode).toBe(200);
   });
 
-  it('ghana.heroshealth.com host resolves to Telecheck-Ghana tenant context', async () => {
+  it('www.heroshealth.com host also resolves to Telecheck-US (200 hit on US-seeded submission)', async () => {
+    expect(usSeed).not.toBeNull();
     const response = await app!.inject({
       method: 'GET',
-      url: `/v0/forms/submissions/${ulid()}`,
-      headers: {
-        host: 'ghana.heroshealth.com',
-        'x-patient-id': ulid(),
-      },
+      url: `/v0/forms/submissions/${usSeed!.submissionId}`,
+      headers: { host: 'www.heroshealth.com', 'x-patient-id': usSeed!.patientId },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('ghana.heroshealth.com host resolves to Telecheck-Ghana (404 on US-seeded submission per tenant isolation)', async () => {
+    expect(usSeed).not.toBeNull();
+    // Same submission_id + same patient_id, but different host → different
+    // tenant context → RLS hides the row → tenant-blind 404 per I-025.
+    // This is the tenant-DISCRIMINATING assertion: if Ghana host
+    // accidentally mapped to Telecheck-US, this test would return 200
+    // instead of 404.
+    const response = await app!.inject({
+      method: 'GET',
+      url: `/v0/forms/submissions/${usSeed!.submissionId}`,
+      headers: { host: 'ghana.heroshealth.com', 'x-patient-id': usSeed!.patientId },
     });
     expect(response.statusCode).toBe(404);
+    // Sanity: ensure the response is the canonical tenant-blind 404,
+    // not e.g. a 500 because the Ghana mapping is broken.
+    const body = response.json<{ error?: { code?: string } }>();
+    expect(body.error?.code).toBeDefined();
+  });
+
+  // Asserting TENANT_GHANA constant is used so the imports aren't pruned —
+  // documents the intent that the cross-tenant case proves the Ghana map.
+  it('TENANT_GHANA constant exists (sentinel for the Ghana cross-tenant guard above)', () => {
+    expect(TENANT_GHANA).toBe('Telecheck-Ghana');
   });
 });
 
