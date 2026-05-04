@@ -28,9 +28,11 @@
  *   3. Redaction behavior end-to-end — using the SAME options object
  *      that built the singleton, route a fresh pino instance to a
  *      captured stream and verify each floor path actually redacts.
- *   4. Wildcard depth pin — pino's `*.field` is depth-1 only (SPEC
- *      ISSUE flagged inline; if the floor needs deeper coverage, the
- *      list must use `**.field` or each depth explicitly).
+ *   4. Wildcard depth coverage (root + 1/2/3-deep) — each PHI field is
+ *      enumerated at depths 0..3 in `ALWAYS_REDACTED` because pino's
+ *      `fast-redact` doesn't support recursive `**` patterns. Tests
+ *      verify each documented depth redacts; depth >= 4 is intentionally
+ *      out of scope and pinned as such.
  *   5. createChildLogger — children inherit the parent's redaction
  *      paths (parallel-logger demonstration via pino's `child()`).
  *   6. Bindings — child loggers carry the bound context fields on every
@@ -118,31 +120,48 @@ function lastLogLine(capture: Capture): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 
 describe('ALWAYS_REDACTED — contract pin (defense-in-depth floor)', () => {
-  it('contains every documented PHI / credential path', () => {
-    // This roster MIRRORS the documented floor paths. Any commit that drops
-    // an entry from ALWAYS_REDACTED must update this test deliberately —
-    // silent removals trip a CI failure here.
-    const requiredPaths = [
+  it('contains every documented credential path', () => {
+    // Credentials are fixed-depth paths under Fastify's req shape.
+    const credentialPaths = [
       'req.headers.authorization',
       'req.body.password',
       'req.body.token',
       'req.body.confirmPassword',
-      '*.ssn',
-      '*.dob',
-      '*.medical_record_number',
-      '*.date_of_birth',
-      '*.social_security_number',
-      '*.national_id',
-      '*.ai_input_text',
-      '*.ai_output_text',
     ];
-    for (const p of requiredPaths) {
+    for (const p of credentialPaths) {
       expect(ALWAYS_REDACTED).toContain(p);
     }
   });
 
-  it('has at least 12 entries (current floor count)', () => {
-    expect(ALWAYS_REDACTED.length).toBeGreaterThanOrEqual(12);
+  it('contains every documented PHI field at depths 0..3 (root + 1-deep + 2-deep + 3-deep)', () => {
+    // Closed 2026-05-04 per Codex logger-r1 HIGH: each PHI field name
+    // expands to a 4-element wildcard set so pino fast-redact catches
+    // the field at root and at any 1/2/3-key nesting under root.
+    // Adding a new field requires adding 4 entries; dropping a depth
+    // for any field is a privacy regression and trips this test.
+    const phiFields = [
+      'ssn',
+      'dob',
+      'medical_record_number',
+      'date_of_birth',
+      'social_security_number',
+      'national_id',
+      'ai_input_text',
+      'ai_output_text',
+    ];
+    for (const field of phiFields) {
+      expect(ALWAYS_REDACTED).toContain(field); // depth 0 (root)
+      expect(ALWAYS_REDACTED).toContain(`*.${field}`); // depth 1
+      expect(ALWAYS_REDACTED).toContain(`*.*.${field}`); // depth 2
+      expect(ALWAYS_REDACTED).toContain(`*.*.*.${field}`); // depth 3
+    }
+  });
+
+  it('has at least 36 entries (4 credential + 8 PHI fields × 4 depths)', () => {
+    // 4 credential paths + (8 PHI fields × 4 depths) = 36 minimum.
+    // Pinning the count separately so an addition that fails to update
+    // the rosters above also trips here.
+    expect(ALWAYS_REDACTED.length).toBeGreaterThanOrEqual(36);
   });
 
   it('contains no obviously-suspect duplicates (set-equality with itself)', () => {
@@ -349,30 +368,31 @@ describe('logger redaction — behavior (production options + captured destinati
 });
 
 // ---------------------------------------------------------------------------
-// 4. WILDCARD DEPTH — SPEC ISSUE pin (Codex r0 MED closure)
+// 4. WILDCARD DEPTH — depths 0..3 covered (Codex r1 HIGH closure)
 //
-// Pino's `*.field` syntax matches a SINGLE depth-1 key ("any direct
-// child of root with key `field`"). It does NOT redact `field` at
-// deeper nesting (e.g. `patient.profile.ssn` is NOT covered by `*.ssn`).
+// Pino's `fast-redact` doesn't support recursive `**` wildcards, so
+// each PHI field is enumerated at depths 0..3 in `ALWAYS_REDACTED`.
+// The tests below verify redaction works at every depth in the floor.
 //
-// The `ALWAYS_REDACTED` floor as currently authored only covers
-// depth-1. If a future code path logs a deeply-nested PHI envelope
-// (e.g. `{ encounter: { patient: { ssn: '…' } } }`), the value WILL
-// leak. SPEC ISSUE flagged here pending Engineering Lead decision:
-//   - Option A: extend each `*.<field>` to also include the literal
-//     deeper paths actually used (`encounter.patient.ssn` etc.).
-//   - Option B: bump pino + use `**.field` (recursive wildcard, newer
-//     pino versions only).
-//   - Option C: rely on a structured-logger discipline that PHI is
-//     never logged below depth 1 — but that's a process control, not
-//     a technical guarantee.
-//
-// The tests below PIN THE CURRENT BEHAVIOR (depth-1 only) so any future
-// fix or regression triggers a deliberate test update.
+// Depth >= 4 is intentionally OUT OF SCOPE — empirically deeper than
+// any structured-log envelope the platform produces. If a future log
+// emits PHI at depth 4+, that's a code-review-blocking violation
+// regardless of whether redaction would catch it (the discipline is:
+// don't log nested PHI at all; the floor here is defense-in-depth
+// against accidental leaks at sane depths).
 // ---------------------------------------------------------------------------
 
-describe('logger redaction — wildcard depth pin (SPEC ISSUE)', () => {
-  it('redacts depth-1 wildcards (sanity counterpart for the depth-2 pin below)', () => {
+describe('logger redaction — wildcard depth coverage (root + 1/2/3-deep)', () => {
+  it('redacts ssn at depth 0 (bare root key)', () => {
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    log.info({ ssn: '000-11-2222' }, 'depth-0');
+    const line = lastLogLine(cap);
+    expect(line).not.toHaveProperty('ssn');
+    expect(JSON.stringify(line)).not.toContain('000-11-2222');
+  });
+
+  it('redacts ssn at depth 1 (one key under root)', () => {
     const cap = makeCapture();
     const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
     log.info({ user: { ssn: '111-22-3333' } }, 'depth-1');
@@ -382,26 +402,30 @@ describe('logger redaction — wildcard depth pin (SPEC ISSUE)', () => {
     expect(JSON.stringify(line)).not.toContain('111-22-3333');
   });
 
-  it('DOES NOT redact ssn at depth-2 (pino *.ssn matches single-key only — SPEC ISSUE)', () => {
-    // Pinning current behavior. If this test starts FAILING, redaction
-    // has expanded to deeper paths (good news; flag as deliberate change).
-    // If the test still passes, the depth-1 limitation is still in
-    // place and PHI nested deeper is at risk.
+  it('redacts ssn at depth 2 (encounter.patient.ssn)', () => {
     const cap = makeCapture();
     const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
     log.info({ encounter: { patient: { ssn: 'depth-2-ssn-value' } } }, 'depth-2');
     const line = lastLogLine(cap);
-    // The current behavior: ssn at depth 2 IS leaked. Pinning the leak
-    // explicitly so it's grep-able.
     const encounter = line['encounter'] as Record<string, unknown>;
     const patient = encounter['patient'] as Record<string, unknown>;
-    expect(patient).toHaveProperty('ssn');
-    expect(patient['ssn']).toBe('depth-2-ssn-value');
-    // The serialized line DOES contain the ssn value at depth 2.
-    expect(JSON.stringify(line)).toContain('depth-2-ssn-value');
+    expect(patient).not.toHaveProperty('ssn');
+    expect(JSON.stringify(line)).not.toContain('depth-2-ssn-value');
   });
 
-  it('DOES NOT redact ai_input_text at depth-2 — second example to confirm the pin is general, not field-specific', () => {
+  it('redacts ssn at depth 3 (request.context.encounter.ssn)', () => {
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    log.info({ request: { context: { encounter: { ssn: 'depth-3-ssn-value' } } } }, 'depth-3');
+    const line = lastLogLine(cap);
+    const request = line['request'] as Record<string, unknown>;
+    const context = request['context'] as Record<string, unknown>;
+    const encounter = context['encounter'] as Record<string, unknown>;
+    expect(encounter).not.toHaveProperty('ssn');
+    expect(JSON.stringify(line)).not.toContain('depth-3-ssn-value');
+  });
+
+  it('redacts ai_input_text at depth 2 (general — not ssn-specific)', () => {
     const cap = makeCapture();
     const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
     log.info(
@@ -409,7 +433,36 @@ describe('logger redaction — wildcard depth pin (SPEC ISSUE)', () => {
       'depth-2-ai',
     );
     const line = lastLogLine(cap);
-    expect(JSON.stringify(line)).toContain('depth-2-ai-input-leak-marker');
+    expect(JSON.stringify(line)).not.toContain('depth-2-ai-input-leak-marker');
+  });
+
+  it('redacts medical_record_number at depth 3 (general — not ssn-specific)', () => {
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    log.info(
+      { event: { ctx: { patient: { medical_record_number: 'MRN-DEPTH3-001' } } } },
+      'depth-3-mrn',
+    );
+    const line = lastLogLine(cap);
+    expect(JSON.stringify(line)).not.toContain('MRN-DEPTH3-001');
+  });
+
+  it('PIN: depth >= 4 is intentionally not covered by the floor', () => {
+    // Pinning the documented depth limit. If a future change adds depth-4
+    // coverage (e.g., bumping pino to a version with recursive `**`),
+    // this test fails — flagging the deliberate scope expansion. If the
+    // test continues to pass, the depth limit holds and the floor is
+    // honest about its boundary.
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    const marker = 'depth-4-ssn-leak-marker-not-covered';
+    log.info({ a: { b: { c: { d: { ssn: marker } } } } }, 'depth-4');
+    const line = lastLogLine(cap);
+    // Current behavior: depth 4 leaks. The contract says "don't log
+    // PHI that deep"; this test pins the boundary. If a code path
+    // legitimately needs deeper logging in the future, the floor must
+    // be extended explicitly (not by accident).
+    expect(JSON.stringify(line)).toContain(marker);
   });
 });
 

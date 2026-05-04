@@ -49,21 +49,50 @@ import { config } from './config.js';
 // once at logger-construction time.
 // ---------------------------------------------------------------------------
 
+/**
+ * PHI fields whose values must NEVER appear in application logs at any
+ * realistic nesting depth. Each entry is expanded into multiple
+ * wildcard paths below (depths 0–3) because pino's underlying
+ * `fast-redact` engine does NOT support recursive `**` matching — it
+ * supports wildcards only at single-segment positions, so each depth
+ * must be enumerated explicitly. (Closed 2026-05-04 per Codex
+ * logger-r1 HIGH — depth-2 PHI was previously leaking.)
+ */
+const PHI_FIELDS = [
+  'ssn',
+  'dob',
+  'medical_record_number',
+  'date_of_birth',
+  'social_security_number',
+  'national_id',
+  // AI inference inputs/outputs that may contain patient text
+  'ai_input_text',
+  'ai_output_text',
+] as const;
+
+/**
+ * Expand a PHI field name to a depth-0..3 wildcard set. Depth 0 covers
+ * the bare root key (`{ ssn: '…' }`); depths 1–3 cover progressively
+ * deeper nesting (`patient.ssn`, `encounter.patient.ssn`,
+ * `request.context.encounter.ssn`). Three-level depth is empirically
+ * deep enough for the structured-log envelopes the platform produces;
+ * deeper PHI in logs is a code-review-blocking violation regardless of
+ * whether redaction would catch it.
+ */
+function expandPhiPaths(field: string): string[] {
+  return [field, `*.${field}`, `*.*.${field}`, `*.*.*.${field}`];
+}
+
 export const ALWAYS_REDACTED: readonly string[] = [
+  // Credentials — fixed-depth paths controlled by Fastify's req shape
   'req.headers.authorization',
   'req.body.password',
   'req.body.token',
   'req.body.confirmPassword',
-  // PHI field paths — applied wherever they appear in any log object
-  '*.ssn',
-  '*.dob',
-  '*.medical_record_number',
-  '*.date_of_birth',
-  '*.social_security_number',
-  '*.national_id',
-  // AI inference inputs/outputs that may contain patient text
-  '*.ai_input_text',
-  '*.ai_output_text',
+  // PHI field paths at depth 0–3 (root, 1-deep, 2-deep, 3-deep) for
+  // each field — pino fast-redact requires explicit per-depth
+  // wildcards.
+  ...PHI_FIELDS.flatMap(expandPhiPaths),
 ] as const;
 
 // ---------------------------------------------------------------------------
