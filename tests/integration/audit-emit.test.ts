@@ -62,6 +62,8 @@
  *     trigger that recomputes hash chain under pg_advisory_xact_lock)
  */
 
+import crypto from 'node:crypto';
+
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
@@ -73,6 +75,23 @@ import {
 import { asTenantId, type TenantId } from '../../src/lib/glossary.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+/**
+ * Compute the canonical genesis hash for a partition. Mirrors the
+ * `computeGenesisHash` helper in audit.ts and the DB trigger's seed
+ * (migration 002 audit_records_hash_insert): SHA-256 of
+ * `'GENESIS:' || partition_key`. Used by the genesis-equality tests to
+ * assert the actual emitted hex matches the canonical derivation —
+ * a bare hex-shape check would pass for any 64-char hex digest.
+ *
+ * (Codex r0 MED closure 2026-05-04: the prior genesis test only
+ * asserted /^[0-9a-f]{64}$/ shape; a trigger regression that used the
+ * wrong seed, omitted tenant from the partition, or produced any hex
+ * digest at all would have passed silently.)
+ */
+function computeGenesisHashHex(partitionKey: string): string {
+  return crypto.createHash('sha256').update(`GENESIS:${partitionKey}`).digest('hex');
+}
 
 // `TENANT_US` / `TENANT_GHANA` come from tenant-fixtures.ts as plain
 // strings; the `AuditEnvelopeInput.tenant_id` field is the branded
@@ -213,6 +232,69 @@ describe('emitAudit — Zod required-field validation', () => {
     } catch (err) {
       expect((err as Error).message).toMatch(/I-003 forbids suppression/);
     }
+  });
+
+  it('throws when timestamp is empty', async () => {
+    await expect(emitAudit(baseInput({ timestamp: '' }))).rejects.toThrow(/timestamp/);
+  });
+
+  it('throws when detail is not an object (Zod z.record)', async () => {
+    await expect(
+      emitAudit(
+        baseInput({
+          detail: 'not-an-object' as unknown as Record<string, unknown>,
+        }),
+      ),
+    ).rejects.toThrow(/detail/);
+  });
+
+  // -----------------------------------------------------------------------
+  // SPEC ISSUE — schema-not-validated fields (Codex r0 HIGH closure)
+  //
+  // The Zod schema in audit.ts currently validates 12 fields. The
+  // remaining envelope fields (timestamp format beyond non-empty,
+  // linked_events array shape, compliance_flags array shape, ai context
+  // bundle, engine_versions, signals, override, break_glass) are
+  // TypeScript-typed but NOT runtime-validated. A regression upstream
+  // that produces e.g. `linked_events: 'malformed'` would silently
+  // pass Zod and reach the DB INSERT, where it'd either fail at JSON
+  // serialization or land malformed in the row.
+  //
+  // Tests below PIN current schema-permissive behavior — when the
+  // schema is tightened (Engineering Lead amendment), each test flips
+  // from permissive to strict. The test names start with "SPEC ISSUE:"
+  // so they're grep-able.
+  // -----------------------------------------------------------------------
+
+  it('SPEC ISSUE: malformed timestamp (non-ISO) currently PASSES Zod (only min(1) checked)', async () => {
+    // The schema validates `timestamp: z.string().min(1)` — a
+    // non-empty string passes, even if it isn't a valid ISO 8601
+    // timestamp. Pinning so a future tightening of the schema (e.g.
+    // `z.string().datetime()`) is a deliberate change.
+    const env = await emitAudit(baseInput({ timestamp: 'not-iso-format' }));
+    expect(env.timestamp).toBe('not-iso-format');
+  });
+
+  it('SPEC ISSUE: linked_events as a non-array currently PASSES Zod (field not in schema)', async () => {
+    // linked_events is TypeScript-typed as AuditLinkedEvent[] but the
+    // Zod schema doesn't include it. A buggy producer of `linked_events:
+    // 'oops'` would slip through. Pinning so the gap is grep-able.
+    // Cast through unknown to bypass TS — the runtime is what we're testing.
+    const env = await emitAudit(
+      baseInput({
+        linked_events: 'not-an-array' as unknown as AuditEnvelopeInput['linked_events'],
+      }),
+    );
+    expect(env).toBeDefined();
+  });
+
+  it('SPEC ISSUE: compliance_flags as a non-array currently PASSES Zod (field not in schema)', async () => {
+    const env = await emitAudit(
+      baseInput({
+        compliance_flags: 'not-an-array' as unknown as AuditEnvelopeInput['compliance_flags'],
+      }),
+    );
+    expect(env).toBeDefined();
   });
 });
 
@@ -436,6 +518,50 @@ describe('emitAudit — reserved workload / autonomy types', () => {
     );
     expect(env.autonomy_level).toBe('fully_autonomous');
   });
+
+  // -----------------------------------------------------------------------
+  // ASYMMETRY PIN — reserved workload values are STILL rejected on
+  // *.execution_rejected (Codex r0 HIGH closure)
+  //
+  // The reserved-value carve-out for execution_rejected applies ONLY to
+  // autonomy levels (the implementation has `&& !isExecutionRejected` on
+  // the autonomy check, but NOT on the workload check). The asymmetry is
+  // documented in i012-gate.ts `resolveEnvelopeWorkloadType` /
+  // `resolveEnvelopeAutonomyLevel`:
+  //
+  //   - resolveEnvelopeWorkloadType ERASES reserved workload values to
+  //     the `rejected_invalid_attempt` sentinel before audit emission.
+  //   - resolveEnvelopeAutonomyLevel PRESERVES reserved autonomy values.
+  //
+  // So the canonical pattern for *.execution_rejected with a reserved
+  // attempted workload is: workload='rejected_invalid_attempt' (sentinel)
+  // + autonomy=<attempted reserved value>. The tests below pin BOTH
+  // sides of this contract (tested already on autonomy above; tested
+  // here for workload).
+  // -----------------------------------------------------------------------
+
+  for (const wl of ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'] as const) {
+    it(`STILL throws when reserved workload "${wl}" appears on *.execution_rejected (asymmetry pin — workload is erased, autonomy is preserved)`, async () => {
+      // The validation gate doesn't make a carve-out for workload on
+      // execution_rejected; reserved workload values must arrive as the
+      // sentinel `rejected_invalid_attempt` instead. If a future change
+      // adds the same `&& !isExecutionRejected` carve-out to workload,
+      // this test fails and the asymmetry change is deliberate.
+      await expect(
+        emitAudit(
+          baseInput({
+            action: 'prescribing.execution_rejected',
+            category: 'A',
+            actor_type: 'clinician',
+            ai_workload_type: wl,
+            autonomy_level: 'rejected_invalid_attempt',
+          }),
+        ),
+      ).rejects.toThrow(
+        new RegExp(`Reserved ai_workload_type "${wl}" cannot appear on audit records at v1\\.0`),
+      );
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -530,8 +656,14 @@ describe('emitAudit — production durability gate (I-003)', () => {
 // ---------------------------------------------------------------------------
 
 describe('emitAudit — hash chain envelope construction', () => {
-  it('first record in a partition gets sequence_number=1 + genesis previous_hash', async () => {
+  it('first record in a partition gets sequence_number=1 + EXACT genesis previous_hash', async () => {
+    // Codex r0 MED closure: assert the EXACT SHA-256 derivation, not
+    // just hex-shape. Previously a trigger regression using the wrong
+    // seed (or omitting tenant from the partition) would have produced
+    // a different hex digest and silently passed.
     const uniquePatient = `pat_genesis_${Math.random().toString(36).slice(2, 10)}`;
+    const partitionKey = `${TENANT_US}:${uniquePatient}`;
+    const expectedGenesis = computeGenesisHashHex(partitionKey);
     await withTenantContext(TENANT_US, async () => {
       const env = await emitAudit(
         baseInput({
@@ -541,12 +673,29 @@ describe('emitAudit — hash chain envelope construction', () => {
         getTx(),
       );
       expect(env.hash_chain.sequence_number).toBe(1);
-      // Genesis previous_hash is SHA-256("GENESIS:<partition_key>"),
-      // which is a 64-char hex string. We don't assert the exact value
-      // (computed server-side by the trigger); just that it's a hex
-      // SHA-256 and that subsequent records will reference it.
-      expect(env.hash_chain.previous_hash).toMatch(/^[0-9a-f]{64}$/);
-      expect(env.hash_chain.partition).toBe(`${TENANT_US}:${uniquePatient}`);
+      expect(env.hash_chain.previous_hash).toBe(expectedGenesis);
+      expect(env.hash_chain.partition).toBe(partitionKey);
+    });
+  });
+
+  it('platform-scope genesis: SHA-256("GENESIS:<tenant>:PLATFORM")', async () => {
+    // Same exact-derivation pin for the PLATFORM partition.
+    const expectedGenesis = computeGenesisHashHex(`${TENANT_US}:PLATFORM`);
+    const uniqueResource = `cfg_genesis_${Math.random().toString(36).slice(2, 12)}`;
+    await withTenantContext(TENANT_US, async () => {
+      const env = await emitAudit(
+        baseInput({
+          target_patient_id: null,
+          action: 'config_change_validated',
+          resource_type: 'config',
+          resource_id: uniqueResource,
+          category: 'B',
+        }),
+        getTx(),
+      );
+      expect(env.hash_chain.sequence_number).toBe(1);
+      expect(env.hash_chain.previous_hash).toBe(expectedGenesis);
+      expect(env.hash_chain.partition).toBe(`${TENANT_US}:PLATFORM`);
     });
   });
 
@@ -618,6 +767,19 @@ describe('emitAudit — hash chain envelope construction', () => {
     expect(usEnv.hash_chain.partition).toBe(`${TENANT_US}:${sharedPatient}`);
     expect(ghanaEnv.hash_chain.partition).toBe(`${TENANT_GHANA}:${sharedPatient}`);
     expect(usEnv.hash_chain.partition).not.toBe(ghanaEnv.hash_chain.partition);
+    // Genesis hashes derive from the partition key, so cross-tenant
+    // genesis values are different deterministic SHA-256 digests.
+    // Asserting the exact pair pins the tenant-scoped seed: a
+    // tenant-blind seed (e.g. just `GENESIS:<patient_id>`) would
+    // produce IDENTICAL genesis values for both tenants and silently
+    // collapse the chain isolation.
+    expect(usEnv.hash_chain.previous_hash).toBe(
+      computeGenesisHashHex(`${TENANT_US}:${sharedPatient}`),
+    );
+    expect(ghanaEnv.hash_chain.previous_hash).toBe(
+      computeGenesisHashHex(`${TENANT_GHANA}:${sharedPatient}`),
+    );
+    expect(usEnv.hash_chain.previous_hash).not.toBe(ghanaEnv.hash_chain.previous_hash);
   });
 });
 
