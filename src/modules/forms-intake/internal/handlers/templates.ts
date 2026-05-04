@@ -168,6 +168,12 @@ export async function listTemplatesHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
+  // Admin-read auth gate (Codex variants-resume-http-r1 closure pattern
+  // applied preemptively to templates 2026-05-03). Templates list is a
+  // tenant-admin surface; even read endpoints require authenticated
+  // actor identity. Without `x-actor-id` the shim returns 401 before
+  // any DB access runs.
+  void resolveActorId(req);
 
   const query = req.query as Record<string, unknown> | undefined;
   const rawLimit = query?.['limit'];
@@ -223,6 +229,9 @@ export async function getTemplateHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
+  // Admin-read auth gate (Codex variants-resume-http-r1 closure pattern
+  // applied preemptively to templates 2026-05-03).
+  void resolveActorId(req);
 
   const params = req.params as Record<string, unknown>;
   const templateIdParam = params['templateId'];
