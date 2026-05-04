@@ -194,12 +194,42 @@ export async function withTenantContext<T>(
  * compared to the alternative of failing the whole `withTenantContext` call).
  */
 async function readCurrentTenantId(client: DbClient): Promise<string | null> {
+  // current_tenant_id() RAISES EXCEPTION `tenant_context_not_set` (migration
+  // 003) when no binding exists for this backend. Inside an outer transaction
+  // (the test harness wraps every test in a SAVEPOINT, and the production
+  // code path also runs inside withTransaction), that exception aborts the
+  // current savepoint/subtransaction — every subsequent statement fails with
+  // `current transaction is aborted` until a ROLLBACK fires. The legacy
+  // `try { SELECT } catch { return null }` swallowed the JS error but did
+  // NOT recover the savepoint state, so the very next query (e.g.,
+  // `set_tenant_context($1)` on rls.ts:109) cascaded into the aborted-tx
+  // failure mode that surfaced as the rls.test.ts §6 5-test cascade in CI.
+  //
+  // Fix (Codex rls-readcurrent-r0 closure 2026-05-04): wrap the probe in a
+  // sub-savepoint so the EXCEPTION aborts only the sub-savepoint, and
+  // ROLLBACK TO that sub-savepoint to recover the outer state. The
+  // sub-savepoint name uses a high-entropy suffix to avoid collisions
+  // with the harness's per-test `sp_N` names.
+  const probeSavepoint = `rls_probe_${Math.random().toString(36).slice(2, 10)}`;
+  await client.query(`SAVEPOINT ${probeSavepoint}`);
   try {
     const result = (await client.query('SELECT current_tenant_id() AS tid', [])) as {
       rows: Array<{ tid: string | null }>;
     };
+    await client.query(`RELEASE SAVEPOINT ${probeSavepoint}`);
     return result.rows[0]?.tid ?? null;
   } catch {
+    // tenant_context_not_set (or any other exception). Roll back the
+    // sub-savepoint to recover outer-savepoint state, then signal "no
+    // current binding" via null.
+    try {
+      await client.query(`ROLLBACK TO SAVEPOINT ${probeSavepoint}`);
+      await client.query(`RELEASE SAVEPOINT ${probeSavepoint}`);
+    } catch {
+      // The recovery itself failed (extremely unlikely — ROLLBACK TO
+      // SAVEPOINT works in aborted txns). Caller's set_tenant_context
+      // call will surface a clearer error if so.
+    }
     return null;
   }
 }
