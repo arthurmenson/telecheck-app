@@ -290,30 +290,34 @@ beforeEach(async () => {
   await client.query(`SAVEPOINT ${_currentSavepoint}`);
 
   // Defensive tx-health probe: if the outer transaction is in an aborted
-  // state (e.g., a prior test's afterEach didn't fully recover, or a fork
-  // entered the file with a leftover-aborted state from buildApp init),
-  // every subsequent statement except SAVEPOINT/ROLLBACK fails with
-  // `current transaction is aborted`. The savepoint we just created is
-  // still in place; rolling back to it recovers the aborted state. We
-  // probe with a noop SELECT 1; if that fails, recover via ROLLBACK TO
-  // SAVEPOINT (which is allowed in aborted txns) and re-establish the
-  // savepoint.
+  // state, every subsequent statement except ROLLBACK/SAVEPOINT/RELEASE
+  // fails with `current transaction is aborted, commands ignored ...`.
+  // The savepoint we just created is INSIDE the aborted region, so
+  // ROLLBACK TO SAVEPOINT to it doesn't recover state — we need a full
+  // ROLLBACK + BEGIN to restart the outer tx from clean. Cross-test
+  // seeded data (file beforeAll INSERTs that ran in autocommit BEFORE
+  // any BEGIN) is unaffected by ROLLBACK; in-savepoint inserts from
+  // prior tests have already been rolled back at afterEach.
   //
-  // Closes the rls.test.ts §6 "real DB round-trip" cascade where the FIRST
-  // §6 test's beforeEach left the outer tx aborted and tests 2-5 all
-  // failed with `current transaction is aborted`. (Codex setup-r0
-  // 2026-05-04.)
+  // Closes the rls.test.ts §6 "real DB round-trip" cascade where the
+  // FIRST §6 test's beforeEach left the outer tx aborted and tests 2-5
+  // all failed with `current transaction is aborted`. (Codex setup-r1
+  // 2026-05-04 — first attempt used ROLLBACK TO SAVEPOINT which doesn't
+  // recover an aborted-before-savepoint state; this version uses a
+  // full ROLLBACK + BEGIN.)
   try {
     await client.query('SELECT 1');
   } catch {
-    // Outer tx is aborted. Recover via ROLLBACK TO SAVEPOINT and
-    // re-establish the per-test savepoint so this test starts fresh.
-    await client.query(`ROLLBACK TO SAVEPOINT ${_currentSavepoint}`);
-    // The savepoint still exists post-rollback (Postgres docs:
-    // "A savepoint that has been rolled back to is still considered
-    // active") — but a fresh test should start with a fresh savepoint
-    // name to avoid name collision in afterEach. Release and re-create.
-    await client.query(`RELEASE SAVEPOINT ${_currentSavepoint}`);
+    // Outer tx is aborted at savepoint creation time. Discard the bad
+    // savepoint, reset the outer tx fully, and start fresh.
+    try {
+      await client.query(`RELEASE SAVEPOINT ${_currentSavepoint}`);
+    } catch {
+      // RELEASE may fail in some edge cases — swallow; the next ROLLBACK
+      // resets everything.
+    }
+    await client.query('ROLLBACK');
+    await client.query('BEGIN');
     _savepointCounter += 1;
     _currentSavepoint = `sp_${_savepointCounter}`;
     await client.query(`SAVEPOINT ${_currentSavepoint}`);

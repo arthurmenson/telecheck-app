@@ -110,8 +110,17 @@ export interface PauseSubmissionResult {
 /**
  * Project a full FormSubmission to the patient-safe view. Drops `tenant_id`
  * by destructuring; never copy the field by mistake.
+ *
+ * Exported so route handlers serving patient surfaces can strip the
+ * operating-tenant identifier from response bodies before reply.send().
+ * Per Master PRD v1.10 §17 + Glossary v5.2 C3 brand-structure rules,
+ * patient-facing surfaces MUST NOT render `tenant_id`. (Codex
+ * patient-surface-r0 closure 2026-05-04 — CI surfaced 4 ×
+ * `not to contain 'tenant_id'` failures on POST/GET/PATCH/SUBMIT
+ * /v0/forms/submissions/* because the service returned the full
+ * FormSubmission and handlers replied with it unfiltered.)
  */
-function toPatientView(submission: FormSubmission): PatientFormSubmissionView {
+export function toPatientView(submission: FormSubmission): PatientFormSubmissionView {
   const { tenant_id: _stripped, ...patientView } = submission;
   void _stripped;
   return patientView;

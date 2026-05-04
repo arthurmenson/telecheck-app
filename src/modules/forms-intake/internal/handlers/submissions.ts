@@ -32,7 +32,11 @@ import {
   SUBMISSION_NOT_FOUND,
   SUBMISSION_NOT_IN_PROGRESS,
 } from '../repositories/submission-repo.js';
-import { CRISIS_DETECTED, RESPONSE_PAYLOAD_TOO_LARGE } from '../services/submission-service.js';
+import {
+  CRISIS_DETECTED,
+  RESPONSE_PAYLOAD_TOO_LARGE,
+  toPatientView,
+} from '../services/submission-service.js';
 import * as submissionService from '../services/submission-service.js';
 import type { PatientId } from '../types.js';
 
@@ -138,7 +142,9 @@ export async function startSubmissionHandler(
       { actorId, patientId, delegateId },
       parsed.data,
     );
-    return reply.code(201).send(submission);
+    // Patient surface — strip tenant_id per Master PRD v1.10 §17 +
+    // Glossary v5.2 C3 (Codex patient-surface-r0 closure 2026-05-04).
+    return reply.code(201).send(toPatientView(submission));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isHandledSentinel(message)) {
@@ -186,7 +192,8 @@ export async function getSubmissionHandler(
   if (submission === null) {
     throw req.server.httpErrors.notFound('Form submission not found.');
   }
-  return reply.code(200).send(submission);
+  // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
+  return reply.code(200).send(toPatientView(submission));
 }
 
 /**
@@ -269,7 +276,8 @@ export async function updateSubmissionResponsesHandler(
       submissionIdParam,
       parsed.data,
     );
-    return reply.code(200).send(submission);
+    // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
+    return reply.code(200).send(toPatientView(submission));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message === CRISIS_DETECTED) {
@@ -351,7 +359,8 @@ export async function submitSubmissionHandler(
       submissionIdParam,
       parsed.data,
     );
-    return reply.code(200).send(submission);
+    // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
+    return reply.code(200).send(toPatientView(submission));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isHandledSentinel(message)) {
