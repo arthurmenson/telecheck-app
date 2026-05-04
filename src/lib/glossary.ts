@@ -66,12 +66,29 @@ export type MedicationRequestId = Brand<string, 'MedicationRequestId'>;
 // There is intentionally no `PrescriptionId` export. Any code that tries to
 // import `PrescriptionId` will get a compile-time error directing to this file.
 
-/** Type constructor — use only after source has been validated as a mrx_ ULID. */
+/**
+ * Canonical MedicationRequestId pattern: `mrx_` prefix + 26-char Crockford
+ * base32 ULID (per src/lib/ulid.ts canonical alphabet 0-9A-HJKMNPQRSTVWXYZ
+ * with I/L/O/U excluded).
+ *
+ * Tightened 2026-05-03 per Codex glossary-r0 HIGH (verify-r1): prior
+ * implementation only checked the prefix, which let `mrx_` (empty
+ * suffix), `mrx_not-a-ulid`, and arbitrary trailing payloads brand
+ * successfully. Full validation is appropriate at the type-construction
+ * boundary because invalid IDs should never cross into persistence/API
+ * layers regardless of whether RLS or schema constraints would later
+ * catch them.
+ */
+const MEDICATION_REQUEST_ID_PATTERN = /^mrx_[0-9A-HJKMNPQRSTVWXYZ]{26}$/;
+
+/** Type constructor — validates the full mrx_<ULID> shape. */
 export function asMedicationRequestId(raw: string): MedicationRequestId {
-  if (!raw.startsWith('mrx_')) {
+  if (!MEDICATION_REQUEST_ID_PATTERN.test(raw)) {
     throw new GlossaryViolationError(
       raw,
-      'MedicationRequestId must begin with the canonical "mrx_" prefix (TYPES v5.2)',
+      'MedicationRequestId must match the canonical mrx_<26-char Crockford-base32 ULID> ' +
+        'shape (TYPES v5.2 + ulid.ts canonical alphabet 0-9A-HJKMNPQRSTVWXYZ excluding I/L/O/U). ' +
+        'Bare "mrx_" prefix is not sufficient.',
     );
   }
   return raw as MedicationRequestId;
@@ -165,6 +182,23 @@ export type ForbiddenAlias<T extends string> = T extends ForbiddenAliases ? neve
 // Runtime assertCanonicalTerm — for dynamic strings types cannot validate
 // ---------------------------------------------------------------------------
 
+// Runtime forbidden-alias set. Every entry must also have a coverage row
+// in tests/integration/glossary.test.ts so a future addition trips the
+// test suite if anyone forgets to extend the matching test inventory.
+//
+// Tightened 2026-05-03 per Codex glossary-r0 MED (verify-r1):
+//   - Added `heros-ghana` — bare "Heros" + country-suffix forms are
+//     documented as forbidden in the asTenantId JSDoc above; the runtime
+//     alias check should mirror the docstring.
+//
+// SPEC ISSUE candidate: Codex r0 also flagged that the canonical glossary
+// in the spec corpus lists additional forbidden aliases (renewal /
+// reorder / re-prescription on the medication-action axis;
+// auto-approved / automated-prescription / AI-prescribed on the
+// AI-vs-clinician axis). Those need verification against the
+// authoritative `Telecheck_Contracts_Pack_v5_00_GLOSSARY.md` text in
+// the spec corpus before adding here — pinned for follow-up; the test
+// suite documents the gap.
 const FORBIDDEN_RUNTIME_ALIASES: ReadonlySet<string> = new Set([
   'prescription',
   'prescriptionid',
@@ -172,6 +206,7 @@ const FORBIDDEN_RUNTIME_ALIASES: ReadonlySet<string> = new Set([
   'customer',
   'heros', // bare Heros (case-insensitive check below)
   'heros-health',
+  'heros-ghana', // bare "Heros-Ghana" — operating-tenant slot must use Telecheck-Ghana
   'ai_mode_1', // deprecated actor_type alias — new code MUST use actor_type=ai_workload
   'ai_mode_2', // deprecated actor_type alias — new code MUST use actor_type=ai_workload
 ]);

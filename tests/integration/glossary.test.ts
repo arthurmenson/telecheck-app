@@ -52,29 +52,80 @@ import {
 // 1. asMedicationRequestId
 // ---------------------------------------------------------------------------
 
-describe('asMedicationRequestId — mrx_ prefix enforcement (TYPES v5.2)', () => {
-  it('accepts a well-formed mrx_-prefixed ULID', () => {
-    const id = asMedicationRequestId('mrx_01HXY12345ABCDEFG');
-    expect(id).toBe('mrx_01HXY12345ABCDEFG');
+describe('asMedicationRequestId — mrx_ + full ULID validation (TYPES v5.2)', () => {
+  // Sample valid ULIDs use the Crockford base32 alphabet
+  // (0-9A-HJKMNPQRSTVWXYZ, 26 chars; I/L/O/U excluded).
+  const VALID_ULID_1 = '01HXYZABCDEFGHJKMNPQRSTVWX'; // 26 chars
+  const VALID_ULID_2 = '01J0123456789ABCDEFGHJKMNP'; // 26 chars
+
+  it('accepts a well-formed mrx_-prefixed 26-char Crockford ULID', () => {
+    const id = asMedicationRequestId(`mrx_${VALID_ULID_1}`);
+    expect(id).toBe(`mrx_${VALID_ULID_1}`);
+  });
+
+  it('accepts another well-formed mrx_-prefixed ULID (different ULID body)', () => {
+    expect(asMedicationRequestId(`mrx_${VALID_ULID_2}`)).toBe(`mrx_${VALID_ULID_2}`);
   });
 
   it('rejects bare ULID without prefix', () => {
-    expect(() => asMedicationRequestId('01HXY12345ABCDEFG')).toThrow(GlossaryViolationError);
+    expect(() => asMedicationRequestId(VALID_ULID_1)).toThrow(GlossaryViolationError);
   });
 
   it('rejects rx_-prefixed ID (close-but-wrong prefix)', () => {
-    expect(() => asMedicationRequestId('rx_01HXY12345ABCDEFG')).toThrow(GlossaryViolationError);
+    expect(() => asMedicationRequestId(`rx_${VALID_ULID_1}`)).toThrow(GlossaryViolationError);
   });
 
   it('rejects prescription_-prefixed ID (forbidden alias prefix)', () => {
-    expect(() => asMedicationRequestId('prescription_01HXY12345')).toThrow(GlossaryViolationError);
+    expect(() => asMedicationRequestId(`prescription_${VALID_ULID_1}`)).toThrow(
+      GlossaryViolationError,
+    );
   });
 
   it('rejects empty string', () => {
     expect(() => asMedicationRequestId('')).toThrow(GlossaryViolationError);
   });
 
-  it('error message cites TYPES v5.2 + the offending value', () => {
+  // Tightened 2026-05-03 per Codex glossary-r0 HIGH closure: full
+  // mrx_<26-char-ULID> validation, NOT just prefix.
+  it('REJECTS bare "mrx_" prefix with empty suffix (prefix-only is not sufficient)', () => {
+    expect(() => asMedicationRequestId('mrx_')).toThrow(GlossaryViolationError);
+  });
+
+  it('REJECTS mrx_ + non-ULID payload (e.g., "mrx_not-a-ulid")', () => {
+    expect(() => asMedicationRequestId('mrx_not-a-ulid')).toThrow(GlossaryViolationError);
+  });
+
+  it('REJECTS mrx_ + arbitrary trailing payload (whitespace / control chars / hyphens)', () => {
+    expect(() => asMedicationRequestId('mrx_   ')).toThrow(GlossaryViolationError);
+    expect(() => asMedicationRequestId('mrx_\t\n')).toThrow(GlossaryViolationError);
+    expect(() => asMedicationRequestId('mrx_anything-with-hyphens-here')).toThrow(
+      GlossaryViolationError,
+    );
+  });
+
+  it('REJECTS mrx_ + 25-char (one too short)', () => {
+    expect(() => asMedicationRequestId('mrx_01HXYZABCDEFGHJKMNPQRSTV')).toThrow(
+      GlossaryViolationError,
+    );
+  });
+
+  it('REJECTS mrx_ + 27-char (one too long)', () => {
+    expect(() => asMedicationRequestId(`mrx_${VALID_ULID_1}A`)).toThrow(GlossaryViolationError);
+  });
+
+  it('REJECTS mrx_ + ULID containing forbidden alphabet characters (I / L / O / U)', () => {
+    // Crockford base32 EXCLUDES I, L, O, U for human readability. ULIDs
+    // emitted by ulid.ts never contain them. A full-validation guard must
+    // reject IDs that contain these characters even if 26 chars total.
+    const forbiddenChars = ['I', 'L', 'O', 'U'];
+    for (const ch of forbiddenChars) {
+      // Replace position 0 of a valid ULID with the forbidden char.
+      const bad = ch + VALID_ULID_1.slice(1);
+      expect(() => asMedicationRequestId(`mrx_${bad}`)).toThrow(GlossaryViolationError);
+    }
+  });
+
+  it('error message cites TYPES v5.2 + Crockford alphabet + the offending value', () => {
     try {
       asMedicationRequestId('rx_invalid');
       expect.fail('expected throw');
@@ -83,16 +134,23 @@ describe('asMedicationRequestId — mrx_ prefix enforcement (TYPES v5.2)', () =>
       const e = err as GlossaryViolationError;
       expect(e.message).toMatch(/TYPES v5\.2/);
       expect(e.message).toMatch(/mrx_/);
+      expect(e.message).toMatch(/Crockford/);
       // Original value appears in the error message for grep-ability
       expect(e.message).toMatch(/rx_invalid/);
     }
   });
 
-  it('case-sensitivity — MRX_ uppercase is NOT accepted (canonical prefix is lowercase)', () => {
-    // Pinning current strict-prefix behavior. If a future change adds
-    // case-insensitive prefix matching, this test fails and the change
-    // is deliberate.
-    expect(() => asMedicationRequestId('MRX_01HXY12345ABCDEFG')).toThrow(GlossaryViolationError);
+  it('case-sensitivity — MRX_ uppercase prefix is NOT accepted (canonical prefix is lowercase)', () => {
+    expect(() => asMedicationRequestId(`MRX_${VALID_ULID_1}`)).toThrow(GlossaryViolationError);
+  });
+
+  it('case-sensitivity — lowercase ULID body is NOT accepted (Crockford alphabet is uppercase)', () => {
+    // Pin current strict-uppercase behavior. ulid.ts emits uppercase only;
+    // accepting lowercase would be a silent normalization that masks
+    // upstream bugs.
+    expect(() => asMedicationRequestId('mrx_01hxyzabcdefghjkmnpqrstvwx')).toThrow(
+      GlossaryViolationError,
+    );
   });
 });
 
@@ -176,7 +234,11 @@ describe('asTenantId — Telecheck-{Country} format + forbidden-alias enforcemen
 // ---------------------------------------------------------------------------
 
 describe('assertCanonicalTerm — case-insensitive forbidden-alias detection', () => {
-  it('throws on canonical forbidden aliases (every documented value)', () => {
+  it('throws on canonical forbidden aliases (every value in FORBIDDEN_RUNTIME_ALIASES)', () => {
+    // This roster MUST mirror the FORBIDDEN_RUNTIME_ALIASES set in
+    // src/lib/glossary.ts. If a future change adds an entry there, this
+    // test fails until the test inventory is extended too. (Codex
+    // glossary-r0 MED closure 2026-05-03 added 'heros-ghana' to both.)
     const forbidden = [
       'prescription',
       'prescriptionid',
@@ -184,6 +246,7 @@ describe('assertCanonicalTerm — case-insensitive forbidden-alias detection', (
       'customer',
       'heros',
       'heros-health',
+      'heros-ghana',
       'ai_mode_1',
       'ai_mode_2',
     ];
@@ -191,6 +254,35 @@ describe('assertCanonicalTerm — case-insensitive forbidden-alias detection', (
       expect(() => assertCanonicalTerm(term)).toThrow(GlossaryViolationError);
     }
   });
+
+  // SPEC ISSUE — broader forbidden-alias inventory verification needed
+  //
+  // Codex glossary-r0 MED flagged that the canonical Contracts Pack v5.2
+  // GLOSSARY in the spec corpus likely lists additional forbidden aliases
+  // beyond the FORBIDDEN_RUNTIME_ALIASES set:
+  //
+  //   - medication-action axis: renewal / reorder / re-prescription
+  //   - AI-vs-clinician axis:   auto-approved / automated-prescription /
+  //                             AI-prescribed
+  //
+  // These need verification against the authoritative
+  // `Telecheck_Contracts_Pack_v5_00_GLOSSARY.md` text in the spec corpus
+  // before adding to the runtime set. Without verification, asserting
+  // them in the test would either (a) make assertions on aliases that
+  // aren't actually canonical (false claims), or (b) require speculatively
+  // adding them to FORBIDDEN_RUNTIME_ALIASES (premature contract change).
+  //
+  // The failing test below documents the gap in a way that surfaces in
+  // CI without breaking existing assertions. When the spec corpus is
+  // consulted and the canonical list is confirmed, this test gets
+  // converted to assertions against `assertCanonicalTerm` AND the
+  // matching aliases get added to glossary.ts.
+  it.todo(
+    'TODO: verify renewal/reorder/re-prescription against Contracts Pack v5.2 GLOSSARY canonical text',
+  );
+  it.todo(
+    'TODO: verify auto-approved/automated-prescription/AI-prescribed against Contracts Pack v5.2 GLOSSARY canonical text',
+  );
 
   it('case-insensitivity — UPPERCASE / Mixed forms also throw', () => {
     const forbiddenVariants = [
@@ -201,6 +293,8 @@ describe('assertCanonicalTerm — case-insensitive forbidden-alias detection', (
       'CUSTOMER',
       'HEROS',
       'Heros',
+      'HEROS-GHANA',
+      'Heros-Ghana',
       'AI_MODE_1',
       'AI_MODE_2',
     ];
