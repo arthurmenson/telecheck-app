@@ -105,7 +105,16 @@ interface PausedFixture {
  */
 async function seedPausedSubmission(): Promise<PausedFixture> {
   const client = getTestClient();
-  const programId = `prog_resume_http_${ulid().slice(0, 8)}`;
+  // Use the LAST 8 chars (random portion) of the ULID, not the first 8.
+  // ULIDs are 10-char-timestamp + 16-char-random; two ULIDs generated in
+  // the same millisecond share the first 10 chars. `.slice(0, 8)` would
+  // return identical prefixes for back-to-back calls and collide on the
+  // forms_template `uq_template_version` UNIQUE constraint when a single
+  // test calls seedPausedSubmission() twice (the cross-patient-vs-
+  // tampered-token envelope-shape tests do exactly that). Codex
+  // resume-http-r0 closure 2026-05-04. The random portion is unique
+  // per ULID call so .slice(-8) is collision-safe.
+  const programId = `prog_resume_http_${ulid().slice(-8)}`;
   const templateId = ulid();
   const deploymentId = ulid();
   const patientId = ulid();
