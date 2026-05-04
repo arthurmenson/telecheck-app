@@ -293,6 +293,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
         'x-actor-id': 'op_http_create',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {
         deploymentId,
@@ -329,6 +331,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
         'x-actor-id': 'op_http_retired',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {
         deploymentId,
@@ -361,6 +365,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
         'x-actor-id': 'op_http_dup_first',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {
         deploymentId,
@@ -381,6 +387,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
         'x-actor-id': 'op_http_dup_second',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {
         deploymentId,
@@ -419,6 +427,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
         'x-actor-id': 'op_http_draft',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {
         deploymentId,
@@ -442,6 +452,8 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
         'x-actor-id': 'op_http_nobody',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {},
     });
@@ -536,6 +548,8 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
         'x-actor-id': 'op_get',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -602,6 +616,8 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
         'x-actor-id': 'op_xt',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -619,6 +635,8 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
         'x-actor-id': 'op_missing',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -669,6 +687,8 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
         'x-actor-id': 'op_http_promote',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {
         rationale: 'Arm A converted 12% better; p < 0.01 over n=2000 sessions.',
@@ -707,6 +727,8 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
         'x-actor-id': 'op_http_promote_first',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {
         rationale: 'first',
@@ -725,6 +747,8 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
         'x-actor-id': 'op_http_promote_second',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {
         rationale: 'second',

@@ -162,6 +162,8 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
         'x-actor-id': 'op_create_tpl',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
         'content-type': 'application/json',
       },
       payload: {
@@ -189,6 +191,8 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
         'x-actor-id': 'op_no_body',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
         'content-type': 'application/json',
       },
       payload: {},
@@ -216,6 +220,63 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
     });
     expect(response.statusCode).toBe(401);
     assertNoTenantIdLeakageInError(response);
+  });
+
+  // Codex admin-auth-r1 closure 2026-05-03 — tenant_admin scope is
+  // tenant-bound. A tenant_admin for tenant A cannot administer tenant B
+  // even with a valid actor identity + admin role + actor-admin-tenant
+  // header pointing at A. The shim's tenant-scope check refuses.
+  it('returns 403 when tenant_admin role is scoped to a different tenant', async () => {
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/forms/templates',
+      headers: {
+        host: US_HOST,
+        'x-actor-id': 'op_xt_admin',
+        'x-actor-roles': 'tenant_admin',
+        // Role binding points to a DIFFERENT tenant than the request's
+        // resolved context (which is Telecheck-US per host=localhost).
+        'x-actor-admin-tenant': 'Telecheck-Ghana',
+        'content-type': 'application/json',
+      },
+      payload: {
+        programCatalogEntryId: `prog_${ulid().slice(0, 8)}`,
+        name: 'cross-tenant attempt',
+        layout: {},
+        branchingLogic: {},
+        eligibilityLogic: {},
+        approvalGovernance: {},
+      },
+    });
+    expect(response.statusCode).toBe(403);
+    assertNoTenantIdLeakageInError(response);
+  });
+
+  // Codex admin-auth-r1 closure 2026-05-03 — platform_admin is global,
+  // authorized in any tenant context regardless of admin-tenant binding.
+  it('returns 201 when platform_admin role is supplied (global scope, no admin-tenant header needed)', async () => {
+    const programId = `prog_platadmin_${ulid().slice(0, 8)}`;
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/forms/templates',
+      headers: {
+        host: US_HOST,
+        'x-actor-id': 'op_platform_admin',
+        'x-actor-roles': 'platform_admin',
+        // Deliberately NO x-actor-admin-tenant header — platform_admin
+        // is global per RBAC v1.1.
+        'content-type': 'application/json',
+      },
+      payload: {
+        programCatalogEntryId: programId,
+        name: 'platform admin create',
+        layout: {},
+        branchingLogic: {},
+        eligibilityLogic: {},
+        approvalGovernance: {},
+      },
+    });
+    expect(response.statusCode).toBe(201);
   });
 
   // Codex deployments-http-r1 closure 2026-05-03 — admin endpoints must
@@ -264,6 +325,8 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
         'x-actor-id': 'op_list',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -282,6 +345,8 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
         'x-actor-id': 'op_list_bad',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
     expect(response.statusCode).toBe(400);
@@ -297,6 +362,8 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
         'x-actor-id': 'op_list_cur',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
     expect(response.statusCode).toBe(400);
@@ -334,6 +401,8 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
         'x-actor-id': 'op_get',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -355,6 +424,8 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
         'x-actor-id': 'op_xt',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -371,6 +442,8 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
         'x-actor-id': 'op_missing',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
     expect(response.statusCode).toBe(404);
@@ -443,6 +516,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
         'x-actor-id': 'op_publish',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
         'content-type': 'application/json',
       },
       payload: {},
@@ -466,6 +541,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
         'x-actor-id': 'op_double_publish',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
         'content-type': 'application/json',
       },
       payload: {},
@@ -484,6 +561,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
         'x-actor-id': 'op_pub_missing',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
         'content-type': 'application/json',
       },
       payload: {},
@@ -532,6 +611,8 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
           'x-actor-id': 'op_pub_failclose',
 
           'x-actor-roles': 'tenant_admin',
+
+          'x-actor-admin-tenant': TENANT_US,
           'content-type': 'application/json',
         },
         payload: {},

@@ -260,6 +260,8 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_create',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId },
     });
@@ -297,6 +299,8 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_draft',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId: draftTemplateId },
     });
@@ -320,6 +324,8 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_missing',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId: ulid() },
     });
@@ -385,6 +391,8 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_emptybody',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: {},
     });
@@ -415,6 +423,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_get_create',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId },
     });
@@ -434,6 +444,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_get',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -466,6 +478,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_get401_create',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId },
     });
@@ -500,6 +514,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_xt_create',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId },
     });
@@ -514,6 +530,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_xt_read',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -532,6 +550,8 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
         'x-actor-id': 'op_http_dep_missing_get',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -559,6 +579,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
         'x-actor-id': 'op_http_dep_retire_create',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId },
     });
@@ -573,6 +595,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
         'x-actor-id': 'op_http_dep_retire',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -602,6 +626,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
         'x-actor-id': 'op_http_dep_dup_create',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId },
     });
@@ -616,6 +642,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
         'x-actor-id': 'op_http_dep_dup_first',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
     expect(first.statusCode).toBe(200);
@@ -628,6 +656,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
         'x-actor-id': 'op_http_dep_dup_second',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -652,6 +682,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
         'x-actor-id': 'op_http_dep_retire_missing',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
     });
 
@@ -676,6 +708,8 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
         'x-actor-id': 'op_http_dep_retire_noactor_create',
 
         'x-actor-roles': 'tenant_admin',
+
+        'x-actor-admin-tenant': TENANT_US,
       },
       payload: { templateId },
     });
