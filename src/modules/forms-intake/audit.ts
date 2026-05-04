@@ -40,11 +40,19 @@
  *      `detail.intent`. Migrating those to pattern (1) is a separate
  *      batch — flagged at the helper above for follow-up.
  *
- * Engineering Lead + Contracts Pack owner should add canonical
- * `forms_submission_*` and `forms_variant_*` action IDs in a future
- * AUDIT_EVENTS amendment per EHBG §12 SI/DSI escalation. When that lands,
- * deleting `formsAuditPlaceholder()` and migrating its callers is a
- * 3-step grep documented at the helper definition.
+ * Engineering Lead + Contracts Pack owner must ratify ALL NINE action IDs
+ * enumerated in the `FormsAuditActionPlaceholder` union (template lifecycle:
+ * `forms_template_created`, `forms_template_version_published`; deployment
+ * lifecycle: `forms_deployment_created`, `forms_deployment_retired`;
+ * submission lifecycle: `forms_submission_started`,
+ * `forms_submission_completed`; variant lifecycle: `forms_variant_created`,
+ * `forms_variant_winner_promoted`, `forms_variant_retired`) in a future
+ * AUDIT_EVENTS amendment per EHBG §12 SI/DSI escalation. Partial
+ * ratification (e.g. only submission + variant) would leave the unratified
+ * subset stranded if the helper is deleted; the migration MUST be all-or-
+ * nothing or staged through a smaller union. When the full amendment
+ * lands, deleting `formsAuditPlaceholder()` and migrating its callers
+ * is a 3-step grep documented at the helper definition.
  *
  * Hard rule per I-003: every emitter below MUST throw on emission failure
  * (the underlying `emitAudit()` already does); callers MUST NOT swallow
@@ -144,6 +152,18 @@ type FormsAuditActionPlaceholder =
  * amendment ratifies these IDs and the helper can be removed.
  *
  * The compile-time `FormsAuditActionPlaceholder` union prevents typos.
+ *
+ * **Migration trigger (when AUDIT_EVENTS v5.2 amendment lands):**
+ *   The amendment MUST ratify every member of the
+ *   `FormsAuditActionPlaceholder` union — currently 9 IDs spanning
+ *   template, deployment, submission, and variant lifecycle. Partial
+ *   ratification strands the unratified subset; the union itself is
+ *   the authoritative migration checklist (read its definition above).
+ *   Once all 9 are in the canonical `AuditAction` enum:
+ *     1. Add the new actions to `AuditAction` in lib/audit.ts.
+ *     2. Delete this function and the union in this file.
+ *     3. Replace every `formsAuditPlaceholder('<id>')` call with the
+ *        bare literal — TS infers the AuditAction type.
  *
  * @param id  Placeholder action ID drawn from the closed union.
  * @returns   The same string typed as `AuditAction` (single sanctioned cast).
