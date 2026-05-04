@@ -199,6 +199,10 @@ describe('idempotency plugin HTTP — replay (same 4-tuple + same body)', () => 
       headers: { ...headers, 'idempotency-key': idempotencyKey },
       payload,
     });
+    if (first.statusCode !== 201) {
+      // eslint-disable-next-line no-console
+      console.log(`[DIAG idem-replay] first.status=${first.statusCode} body=${first.body}`);
+    }
     expect(first.statusCode).toBe(201);
     const firstBody = first.json<Record<string, unknown>>();
     expect(firstBody['template_id']).toBeDefined();
