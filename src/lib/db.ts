@@ -189,7 +189,35 @@ export async function withTenantBoundConnection<T>(
   // it to the pool — repeated failures exhaust the pool and turn an
   // auth/RLS setup failure into a broader availability incident.
   // (Closed 2026-05-03 per Codex db-r5 HIGH (verify-r6).)
+  // Helper: discard the client from the pool. ALWAYS marks releaseHandled
+  // and ALWAYS swallows release errors — the caller's primary error
+  // (set/clear/callback failure) is what should surface, not a synchronous
+  // throw from pg's release path. Idempotent if called twice.
+  // Closure over `releaseHandled`; declared before use.
   let releaseHandled = false;
+  function discardClient(): void {
+    if (releaseHandled) return;
+    releaseHandled = true;
+    try {
+      client.release(true);
+    } catch {
+      // Swallow — release errors during fault paths must not mask the
+      // primary diagnostic. The connection is in an unknown state but
+      // the JS-side reference is now decoupled from the pool.
+    }
+  }
+  function returnClient(): void {
+    if (releaseHandled) return;
+    releaseHandled = true;
+    try {
+      client.release();
+    } catch {
+      // Same swallow rationale as discardClient — happy-path release
+      // errors are extraordinarily rare and the callback already
+      // succeeded.
+    }
+  }
+
   try {
     // Phase A: install tenant binding. If this fails, the connection
     // state is uncertain — discard rather than risk reusing a half-bound
@@ -197,8 +225,7 @@ export async function withTenantBoundConnection<T>(
     try {
       await client.query('SELECT set_tenant_context($1)', [tenantId]);
     } catch (setErr) {
-      client.release(true);
-      releaseHandled = true;
+      discardClient();
       const setMsg = setErr instanceof Error ? setErr.message : String(setErr);
       throw new Error(
         `withTenantBoundConnection: set_tenant_context failed (${setMsg}). ` +
@@ -227,12 +254,10 @@ export async function withTenantBoundConnection<T>(
     }
 
     if (cleanupError !== undefined) {
-      // Discard the connection — passing a truthy argument to
-      // pg.PoolClient.release() destroys the underlying connection rather
-      // than returning it to the pool. The next caller gets a fresh
-      // backend with no binding.
-      client.release(true);
-      releaseHandled = true;
+      // Discard the connection. discardClient() marks releaseHandled and
+      // swallows any release-side throw so the AggregateError contract
+      // below remains the authoritative diagnostic.
+      discardClient();
       const cleanupMsg =
         cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
       if (cbError !== undefined) {
@@ -250,25 +275,20 @@ export async function withTenantBoundConnection<T>(
     }
 
     // Healthy cleanup; return the connection to the pool normally.
-    client.release();
-    releaseHandled = true;
+    returnClient();
 
     if (cbError !== undefined) {
       throw cbError;
     }
     return result;
   } catch (err) {
-    // Catch-all leak guard. Every controlled exit above sets
-    // releaseHandled = true; if we got here without it set, an
-    // unexpected error escaped before any release/discard ran. Discard
-    // the connection now to prevent pool exhaustion.
-    if (!releaseHandled) {
-      try {
-        client.release(true);
-      } catch {
-        // Ignore — original error is what matters.
-      }
-    }
+    // Catch-all leak guard. Every controlled exit above already called
+    // discardClient() or returnClient(). If we got here without
+    // releaseHandled set, an unexpected error escaped before any
+    // release/discard ran (e.g., a JS-level error in the test path).
+    // Discard now to prevent pool exhaustion. discardClient() is a no-op
+    // when already handled, so calling it unconditionally here is safe.
+    discardClient();
     throw err;
   }
 }
