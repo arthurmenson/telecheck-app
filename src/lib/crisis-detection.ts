@@ -58,10 +58,19 @@
 // A false positive (unnecessary escalation) is safer than a false negative.
 
 const CRISIS_PATTERNS: ReadonlyArray<RegExp> = [
-  // Suicidal ideation
-  /\b(suicid|kill\s+myself|end\s+my\s+life|want\s+to\s+die|don'?t\s+want\s+to\s+live|thoughts?\s+of\s+death)\b/i,
-  // Self-harm
-  /\b(self[\s-]?harm|cutting\s+myself|hurt\s+myself|burning\s+myself|hurting\s+myself)\b/i,
+  // Suicidal ideation. Stem-prefix matchers (`suicid`, `harm`) DO NOT use a
+  // trailing `\b` so they catch declined / inflected forms like "suicide",
+  // "suicidal", "suicidality", "self-harming". The prior version used
+  // `\b(suicid|...)\b` which failed to match "suicide" because the `e` after
+  // `suicid` is a word character — no \b boundary fired. Per I-019 (crisis
+  // detection is platform-floor) and the explicit comment above ("a false
+  // positive is safer than a false negative"), high-recall stem matching is
+  // the correct posture. Codex crisis-detect-r0 closure 2026-05-04.
+  /\b(suicid\w*|kill\s+myself|end\s+my\s+life|want\s+to\s+die|don'?t\s+want\s+to\s+live|thoughts?\s+of\s+death)/i,
+  // Self-harm — stem-prefix `self[\s-]?harm` allows "self-harming",
+  // "self-harms". Multi-word phrases retain the trailing `\b` since they
+  // already include word characters at the end that don't need to inflect.
+  /\b(self[\s-]?harm\w*|cutting\s+myself|hurt\s+myself|burning\s+myself|hurting\s+myself)/i,
   // Abuse disclosure
   /\b(being\s+abused|someone\s+is\s+hurting\s+me|domestic\s+violence|sexual\s+abuse|physical\s+abuse)\b/i,
   // Medical emergency indicators
@@ -209,7 +218,11 @@ export class CrisisDetector {
     if (/abused|hurting\s+me|domestic\s+violence|sexual\s+abuse|physical\s+abuse/.test(lower)) {
       return 'abuse_disclosure';
     }
-    if (/chest\s+pain|can'?t\s+breathe|stroke|seizure|unconscious|overdose/.test(lower)) {
+    if (
+      /chest\s+pain|can'?t\s+breathe|difficulty\s+breathing|stroke|seizure|unconscious|overdose/.test(
+        lower,
+      )
+    ) {
       return 'medical_emergency';
     }
     return 'general_crisis';

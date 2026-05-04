@@ -199,10 +199,6 @@ describe('idempotency plugin HTTP — replay (same 4-tuple + same body)', () => 
       headers: { ...headers, 'idempotency-key': idempotencyKey },
       payload,
     });
-    if (first.statusCode !== 201) {
-      // eslint-disable-next-line no-console
-      console.log(`[DIAG idem-replay] first.status=${first.statusCode} body=${first.body}`);
-    }
     expect(first.statusCode).toBe(201);
     const firstBody = first.json<Record<string, unknown>>();
     expect(firstBody['template_id']).toBeDefined();
@@ -279,7 +275,20 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
   it('treats same key with different actor as independent (no replay across actors)', async () => {
     const idempotencyKey = ulid();
     const baseHeaders = await adminAuthHeaders();
-    const payload = createTemplatePayload();
+
+    // Actor A and Actor B each get a DISTINCT payload (different
+    // programCatalogEntryId) so each can succeed at the DB layer —
+    // forms_template has a UNIQUE constraint on
+    // (tenant_id, program_id, country_of_care, template_version)
+    // per FORMS_ENGINE Pattern A. If both actors used the same
+    // programCatalogEntryId, the second INSERT would fail with
+    // uq_template_version even when the idempotency layer correctly
+    // routes through to the handler (the bug we're testing for).
+    // Distinct payloads isolate the test to "did the handler run
+    // again?" without entangling the DB unique-constraint behavior.
+    // Codex idempotency-http-r1 closure 2026-05-04.
+    const payloadA = createTemplatePayload();
+    const payloadB = createTemplatePayload();
 
     // Actor A creates with the key.
     const headersA = { ...baseHeaders, 'x-actor-id': 'op_idem_actorA' };
@@ -287,21 +296,21 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
       method: 'POST',
       url: '/v0/forms/templates',
       headers: { ...headersA, 'idempotency-key': idempotencyKey },
-      payload,
+      payload: payloadA,
     });
     expect(first.statusCode).toBe(201);
     const firstBody = first.json<Record<string, unknown>>();
 
-    // Actor B uses the SAME key + SAME body. With a single-actor cache
-    // this would replay; with the 4-tuple PK (tenant, key, endpoint,
-    // actor) it's an independent record so the handler runs again and
-    // creates a SECOND template.
+    // Actor B uses the SAME key + DIFFERENT body. With a single-actor
+    // cache this would 409 (body mismatch); with the 4-tuple PK
+    // (tenant, key, endpoint, actor) it's an independent record so
+    // the handler runs again and creates a SECOND template.
     const headersB = { ...baseHeaders, 'x-actor-id': 'op_idem_actorB' };
     const second = await inject({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: { ...headersB, 'idempotency-key': idempotencyKey },
-      payload,
+      payload: payloadB,
     });
     expect(second.statusCode).toBe(201);
     const secondBody = second.json<Record<string, unknown>>();
