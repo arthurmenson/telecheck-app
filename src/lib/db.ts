@@ -67,7 +67,82 @@ export type DbTransaction = DbClient;
 
 let _pool: pg.Pool | null = null;
 
+/**
+ * Test-mode pool override. When set (via `setTestPool()` from tests/setup.ts),
+ * `getPool()` returns this wrapper instead of constructing a real pg.Pool.
+ *
+ * Why: integration tests share a SINGLE pg.Client across all queries (so per-
+ * test SAVEPOINT rollback isolates state). When the app instead uses a real
+ * pg.Pool, every `pool.connect()` returns a DIFFERENT physical connection that
+ * cannot see the test client's open-transaction writes. The test seeds
+ * a row inside the savepoint, the HTTP request opens a fresh pool connection
+ * to query it, and the row is invisible — the request 404s / 500s and
+ * upstream tests fail with `expected 201 to be 400`-shaped mismatches.
+ *
+ * The fix is to make the app's pool a thin wrapper that returns the same
+ * test client on every `connect()` call, with `release()` and `release(true)`
+ * as no-ops (the test harness owns the client lifecycle). This is gated to
+ * test mode only — production keeps the real pg.Pool.
+ *
+ * (Closed 2026-05-04 per CI 25325596109 forensic — the diagnostic
+ * console.log in commit 37db5b3 surfaced `forms.deployment.template_not_found`
+ * on a freshly-seeded template, isolating the failure mode to test-client
+ * vs pool-client transaction-visibility split.)
+ */
+let _testPoolOverride: pg.Pool | null = null;
+
+/**
+ * Test-only: install a wrapper pool that returns the supplied client on
+ * every `connect()` and treats `release` as a no-op. Called by
+ * tests/setup.ts beforeAll once the shared test client is connected.
+ *
+ * Production code MUST NOT call this — there is no mode where a real
+ * deployment wants pool.connect() to return a single fixed connection.
+ */
+export function setTestPool(client: DbClient): void {
+  // Build a structural-typed pool wrapper. We cast to pg.Pool because the
+  // app code paths only call `connect()` and the connection's `query` /
+  // `release`. Anything else (idleTimeout, on('error'), end()) is noop'd
+  // here — the harness owns the real client.
+  const wrapper = {
+    connect: async () => {
+      // Decorate the shared test client with a release() no-op so the app's
+      // withTenantBoundConnection / withConnection / withTransaction code
+      // paths work unchanged.
+      const decorated = {
+        query: client.query.bind(client),
+        release: (_err?: boolean | Error) => {
+          // No-op: the harness owns the client lifecycle.
+        },
+      };
+      return decorated;
+    },
+    end: async () => {
+      // No-op: the harness owns the client lifecycle.
+    },
+    on: () => {
+      // No-op: error handling is on the real client in the harness.
+    },
+  } as unknown as pg.Pool;
+  _testPoolOverride = wrapper;
+  // Reset _pool so getPool() picks up the override on next call.
+  _pool = null;
+}
+
+/**
+ * Test-only: clear the test-pool override. Called by tests/setup.ts in
+ * afterAll for cleanliness, though typically not strictly needed because
+ * each test fork has its own module-scope state.
+ */
+export function clearTestPool(): void {
+  _testPoolOverride = null;
+  _pool = null;
+}
+
 export function getPool(): pg.Pool {
+  if (_testPoolOverride !== null) {
+    return _testPoolOverride;
+  }
   if (_pool === null) {
     _pool = new Pool({
       connectionString: config.databaseUrl,

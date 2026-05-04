@@ -55,6 +55,8 @@ import { join, resolve } from 'node:path';
 import { Client, type ClientConfig } from 'pg';
 import { afterEach, beforeAll, beforeEach } from 'vitest';
 
+import { setTestPool, type DbClient } from '../src/lib/db.ts';
+
 // ---------------------------------------------------------------------------
 // Re-export the shared client reference so helpers can import it.
 // Tests MUST NOT create their own pg.Client — always use the shared client
@@ -236,6 +238,17 @@ beforeAll(async () => {
   // every BEGIN/COMMIT cycle on this connection.
   await installTestAppRole(_client);
   await _client.query(`SET SESSION AUTHORIZATION ${TEST_APP_ROLE}`);
+
+  // Install the test-pool override so any code path that calls
+  // `getPool()` (withConnection / withTenantBoundConnection / withTransaction
+  // in src/lib/db.ts) gets back a wrapper that returns THIS shared client
+  // on every connect(). Without this, integration tests that seed via the
+  // test client (inside the savepoint-wrapped outer transaction) would
+  // have their data invisible to HTTP requests routed through the app's
+  // pool — DIFFERENT physical connection, can't see uncommitted writes.
+  // The CI run on commit 37db5b3 surfaced this as
+  // `forms.deployment.template_not_found` on a freshly-seeded template.
+  setTestPool(_client as unknown as DbClient);
 });
 
 // ---------------------------------------------------------------------------
