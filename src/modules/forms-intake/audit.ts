@@ -3,14 +3,35 @@
  *
  * Wraps `lib/audit.ts emitAudit()` with the action IDs and envelope shape
  * the Forms/Intake Engine emits per Forms/Intake Engine Slice PRD v2.1
- * §8.5 (save/resume/abandon are Category C), §14.6 (variant lifecycle is
- * Category B), and Contracts Pack v5.2 AUDIT_EVENTS (governance edits
- * `forms_eligibility_logic_edited`, `forms_approval_governance_edited`).
+ * §8.5 (save/resume are Category C — abandon NOT YET COVERED, see SPEC
+ * ISSUE below), §14.6 (variant lifecycle is Category B), and Contracts
+ * Pack v5.2 AUDIT_EVENTS (governance edits `forms_eligibility_logic_edited`,
+ * `forms_approval_governance_edited`).
+ *
+ * SPEC ISSUE — abandonment audit not yet wired
+ *   Slice PRD §8.5 line 327 says "Every save, every resume, EVERY EXPIRY
+ *   is audited per AUDIT-EVENTS Category C (operational)." The save and
+ *   resume legs are covered by `emitFormsResumeStateSaved` and
+ *   `emitFormsResumeStateRestored` (both Category C as of 2026-05-04
+ *   alignment). The expiry/abandonment leg is NOT — there's no audit
+ *   emitter for it, no service-layer wiring of the §16.1 30-day
+ *   abandonment lifecycle, and no scheduled job scanning for expired
+ *   resume_state rows. The domain-event side has a single emitter
+ *   (`emitFormsSubmissionAbandoned` in events.ts) but ZERO callers.
+ *   When §16.1 lifecycle wiring lands, an `emitFormsSubmissionAbandoned`
+ *   AUDIT emitter should be added here using
+ *   `formsAuditPlaceholder('forms_submission_abandoned')` (the
+ *   placeholder ID would extend the closed union; same pattern as the
+ *   other 11 unratified emitters). Engineering Lead per EHBG §12.
  *
  * Spec references:
- *   - Slice PRD v2.1 §8.5 — save-and-resume audit (Category C operational)
+ *   - Slice PRD v2.1 §8.5 — save-and-resume audit (Category C operational;
+ *     save/resume legs covered, abandon leg pending §16.1 lifecycle wiring
+ *     per the SPEC ISSUE above)
  *   - Slice PRD v2.1 §14.6 — variant audit (Category B governance)
- *   - Slice PRD v2.1 §16.6 — abandonment recovery audit
+ *   - Slice PRD v2.1 §16.6 — abandonment recovery audit (NOT YET WIRED;
+ *     the recovery-flow emitter would land here when the lifecycle is
+ *     implemented; flagged inline at the file-header SPEC ISSUE)
  *   - Slice PRD v2.1 §25.3 — research consent block audit linkage
  *     (`research.consent_granted` / `research.consent_revoked` — emitted from
  *     the consent module, not here; this file only handles forms-engine-
