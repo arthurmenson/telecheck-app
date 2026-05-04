@@ -371,6 +371,7 @@ export async function createDeployment(
       ctx.tenantId,
       {
         templateId: input.templateId,
+        deployedBy: actorId,
       },
       async (tx, deployment) => {
         await emitFormsDeploymentCreatedAudit(

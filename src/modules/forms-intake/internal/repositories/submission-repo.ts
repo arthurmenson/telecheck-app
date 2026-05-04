@@ -141,6 +141,15 @@ export async function createActiveDeployment(
   tenantId: TenantId,
   input: {
     templateId: FormDeploymentId;
+    /**
+     * Tenant-user identifier for the deployment author. Required to satisfy
+     * `forms_deployment.deployed_by NOT NULL` (migration 006). Codex
+     * deployment-not-null-r0 closure 2026-05-04 — the prior INSERT omitted
+     * this column, which CI surfaced as `null value in column "deployed_by"
+     * ... violates not-null constraint` once the test-pool override
+     * (commit 4fb39b7) made the actual INSERT path observable end-to-end.
+     */
+    deployedBy: string;
   },
   txCallback: (tx: DbTransaction, deployment: FormDeployment) => Promise<void>,
 ): Promise<FormDeployment> {
@@ -167,18 +176,18 @@ export async function createActiveDeployment(
     const result = await tx.query<FormDeployment>(
       `INSERT INTO forms_deployment (
           deployment_id, tenant_id, template_id, program_id,
-          deployed_at, retired_at
+          deployed_by, deployed_at, retired_at
        )
        SELECT
           $1, t.tenant_id, t.template_id, t.program_id,
-          NOW(), NULL
+          $4, NOW(), NULL
          FROM forms_template t
         WHERE t.tenant_id = $2
           AND t.template_id = $3
           AND t.status = 'published'
        RETURNING deployment_id, tenant_id, template_id, program_id,
                  deployed_at, retired_at`,
-      [deploymentId, tenantId, input.templateId],
+      [deploymentId, tenantId, input.templateId, input.deployedBy],
     );
 
     if (result.rows.length === 0) {
