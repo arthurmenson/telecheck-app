@@ -186,7 +186,10 @@ describe('idempotency plugin HTTP — replay (same 4-tuple + same body)', () => 
     // rows in this tenant with that program_id and require exactly one.
     // Any duplicate handler-run would write a second row with the same
     // program_id (the payload uniquely identifies the request shape).
-    const uniqueProgramId = `prog_idem_replay_${ulid()}`;
+    // Codex idempotency-http-r2 closure 2026-05-03: forms_template.program_id
+    // is VARCHAR(26); a longer value would fail the INSERT before the
+    // replay logic ran. ULID is 26 chars, so prefix+slice keeps total <= 26.
+    const uniqueProgramId = `idem_${ulid().slice(0, 21)}`;
     const payload = { ...createTemplatePayload(), programCatalogEntryId: uniqueProgramId };
 
     // First call: real handler runs, template created.
