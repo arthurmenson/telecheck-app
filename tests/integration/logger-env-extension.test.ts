@@ -75,10 +75,12 @@ async function loadFreshLogger(): Promise<FreshLoggerModule> {
 // ---------------------------------------------------------------------------
 
 afterEach(() => {
-  // Always restore env + reset modules so subsequent tests (in any
-  // file) see an unstubbed environment and the canonical singleton.
+  // Always restore env + reset modules + clear mocks so subsequent
+  // tests (in any file) see an unstubbed environment, the canonical
+  // singleton, and the unmocked pino default export.
   vi.unstubAllEnvs();
   vi.resetModules();
+  vi.doUnmock('pino');
 });
 
 // ---------------------------------------------------------------------------
@@ -245,5 +247,126 @@ describe('LOG_REDACT_PATHS env-extension — end-to-end redaction', () => {
       .filter((s) => s.length > 0);
     const last = JSON.parse(lines[lines.length - 1]!) as Record<string, unknown>;
     expect(JSON.stringify(last)).not.toContain('Bearer floor-still-redacts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. Singleton wiring — observe options the EXPORTED logger was built with
+//    (Codex r0 MED closure 2026-05-04)
+//
+// The §3 end-to-end tests above build a SEPARATE pino instance from
+// fresh.buildPinoOptions(). That proves the options-builder is wired
+// correctly but does NOT prove the EXPORTED singleton (`logger` from
+// logger.ts) was actually constructed with those same options. A
+// future regression where logger.ts changes the singleton construction
+// path (calls pino with different args, or builds the singleton before
+// config is reloaded) would silently let production logs emit
+// unredacted env-extension fields while these §3 tests still passed.
+//
+// To close that gap we vi.doMock('pino') with a wrapper that records
+// every call to pino's default export, then dynamically import
+// logger.ts so its `export const logger = pino(buildPinoOptions())`
+// goes through the wrapper. The recorded options ARE what the
+// singleton was constructed with, so we can assert they include both
+// env-extended paths AND the canonical floor.
+// ---------------------------------------------------------------------------
+
+describe('LOG_REDACT_PATHS env-extension — singleton wiring observed', () => {
+  it('singleton was constructed with options.redact.paths containing BOTH env paths and ALWAYS_REDACTED', async () => {
+    // Mock pino BEFORE the dynamic import so logger.ts's
+    // `pino(buildPinoOptions())` call goes through the wrapper.
+    // Records the (options) arg and delegates to actual pino so the
+    // singleton is still functional.
+    // Pino's d.ts uses `export = pino`; vi.importActual returns the
+    // module's namespace object, which under esModuleInterop is
+    // sometimes the callable function and sometimes an object with
+    // .default. Cast to `any` for the wrapper internals — the
+    // contract under test is the recorded options, not pino's API.
+    const recordedOptions: unknown[] = [];
+    vi.doMock('pino', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const actualMod = (await vi.importActual('pino')) as any;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const actualPino: (...args: any[]) => any =
+        typeof actualMod === 'function' ? actualMod : actualMod.default;
+      const wrapped = (opts?: unknown, dest?: unknown): unknown => {
+        recordedOptions.push(opts);
+        if (dest === undefined) return actualPino(opts);
+        return actualPino(opts, dest);
+      };
+      return { default: wrapped };
+    });
+
+    vi.stubEnv('LOG_REDACT_PATHS', 'ctx.singleton_secret,deep.nested_credential');
+
+    // Dynamic import → triggers `export const logger = pino(buildPinoOptions())`
+    // inside logger.ts → goes through our mocked pino wrapper.
+    const fresh = await loadFreshLogger();
+
+    // pino was called at least once during module evaluation (the
+    // singleton construction). We assert the FIRST recorded call
+    // received options whose redact.paths include both extension
+    // paths and the canonical floor.
+    expect(recordedOptions.length).toBeGreaterThan(0);
+    const firstCallOpts = recordedOptions[0] as {
+      redact?: { paths?: string[]; remove?: boolean };
+    };
+    expect(firstCallOpts.redact).toBeDefined();
+    const paths = firstCallOpts.redact!.paths!;
+
+    // Env-extended paths present.
+    expect(paths).toContain('ctx.singleton_secret');
+    expect(paths).toContain('deep.nested_credential');
+
+    // EVERY canonical floor entry present (the regression-guard
+    // assertion: a REPLACEMENT-not-extension regression would drop
+    // these and pass the previous assertion).
+    for (const floorPath of fresh.ALWAYS_REDACTED) {
+      expect(paths).toContain(floorPath);
+    }
+
+    // remove: true preserved on the singleton's actual options object.
+    expect(firstCallOpts.redact!.remove).toBe(true);
+  });
+
+  it('singleton-construction options match the buildPinoOptions() output verbatim (no divergence)', async () => {
+    // A future regression where logger.ts builds the singleton via a
+    // different code path than buildPinoOptions() would silently mean
+    // the §1/§2 tests on buildPinoOptions() prove nothing about the
+    // exported singleton. Pin that the call to pino() during module
+    // evaluation receives the SAME options object that buildPinoOptions
+    // returns — i.e., the documented wiring `logger = pino(buildPinoOptions())`
+    // holds.
+    const recordedOptions: unknown[] = [];
+    vi.doMock('pino', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const actualMod = (await vi.importActual('pino')) as any;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const actualPino: (...args: any[]) => any =
+        typeof actualMod === 'function' ? actualMod : actualMod.default;
+      const wrapped = (opts?: unknown, dest?: unknown): unknown => {
+        recordedOptions.push(opts);
+        if (dest === undefined) return actualPino(opts);
+        return actualPino(opts, dest);
+      };
+      return { default: wrapped };
+    });
+
+    vi.stubEnv('LOG_REDACT_PATHS', 'ctx.divergence_check');
+    const fresh = await loadFreshLogger();
+
+    // Build a control-options object via the exported builder and
+    // compare its redact.paths set to what the singleton actually
+    // received. They MUST be the same set (order-insensitive — pino
+    // doesn't depend on path order) since the documented wiring is
+    // pino(buildPinoOptions()).
+    const controlOpts = fresh.buildPinoOptions();
+    const controlPaths = new Set((controlOpts.redact as { paths: string[] }).paths);
+
+    expect(recordedOptions.length).toBeGreaterThan(0);
+    const singletonOpts = recordedOptions[0] as { redact: { paths: string[] } };
+    const singletonPaths = new Set(singletonOpts.redact.paths);
+
+    expect(singletonPaths).toEqual(controlPaths);
   });
 });
