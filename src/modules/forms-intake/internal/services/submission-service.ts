@@ -38,6 +38,7 @@ import crypto from 'crypto';
 import { crisisDetector } from '../../../../lib/crisis-detection.js';
 import { type DbClient, type DbTransaction, withTransaction } from '../../../../lib/db.js';
 import { kms } from '../../../../lib/kms.js';
+import { logger } from '../../../../lib/logger.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import {
   emitCrisisDetectionTrigger,
@@ -880,12 +881,20 @@ export async function resumeSubmission(
     // the surface layer.
     //
     // **RESTORE_AMBIGUOUS_SUBMISSION (Codex resume-restore-r2 closure
-    // 2026-05-03):** if migration 008's partial unique index is somehow
-    // missing/dropped and the (tenant, deployment, patient) tuple has
-    // multiple in_progress rows, the repo throws this sentinel rather
-    // than silently picking one. We translate to null per I-025 — the
-    // patient sees a tenant-blind 404; the operator sees the sentinel
-    // in the error log channel.
+    // 2026-05-03 + r3 observability addendum 2026-05-03):** if migration
+    // 008's partial unique index is somehow missing/dropped and the
+    // (tenant, deployment, patient) tuple has multiple in_progress rows,
+    // the repo throws this sentinel rather than silently picking one.
+    //
+    // We translate to null per I-025 — the patient surface stays
+    // tenant-blind. BEFORE returning null we MUST emit a structured
+    // operator-facing log so schema drift / data-corruption is visible
+    // rather than silently turning into 404s. Otherwise repeated restore
+    // failures would persist undetected until a patient reports them.
+    //
+    // The log carries non-PHI identifiers only: tenant_id, deployment_id,
+    // resume_state_id. Patient_id is intentionally omitted — it IS PHI
+    // and the logger's redact list might not catch it on every code path.
     let submission: FormSubmission | null;
     try {
       submission = await submissionRepo.findInProgressSubmissionForRestore(
@@ -897,6 +906,23 @@ export async function resumeSubmission(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (message === submissionRepo.RESTORE_AMBIGUOUS_SUBMISSION) {
+        logger.error(
+          {
+            event: 'forms_intake.restore.ambiguous_submission',
+            sentinel: submissionRepo.RESTORE_AMBIGUOUS_SUBMISSION,
+            tenant_id: ctx.tenantId,
+            deployment_id: row.deployment_id,
+            resume_state_id: row.resume_state_id,
+            // Operator action: investigate forms_submission for duplicate
+            // in_progress rows on this (tenant, deployment) and verify
+            // migration 008's uq_forms_submission_one_in_progress_per_tuple
+            // index is present. See migration 008 header for remediation
+            // query.
+          },
+          'Save-and-resume restore detected multiple in_progress submissions for one tuple. ' +
+            'This indicates schema drift (the partial unique index from migration 008 is missing/dropped) ' +
+            'or data corruption. Patient request returns tenant-blind 404; operator must remediate.',
+        );
         return null;
       }
       throw err;
