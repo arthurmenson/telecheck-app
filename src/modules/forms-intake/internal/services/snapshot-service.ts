@@ -16,6 +16,7 @@
  */
 
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
+import { logger } from '../../../../lib/logger.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import * as snapshotRepo from '../repositories/snapshot-repo.js';
 import * as submissionRepo from '../repositories/submission-repo.js';
@@ -27,6 +28,45 @@ import type {
   FormSubmissionId,
   PatientId,
 } from '../types.js';
+
+/**
+ * Internal helper — wrap `findSnapshotBySubmissionId` so the
+ * SNAPSHOT_AMBIGUOUS_FOR_SUBMISSION sentinel is translated to null
+ * with an operator-visible structured log. Mirrors the
+ * resume-restore-r3 pattern used in submission-service.resumeSubmission.
+ *
+ * Codex snapshot-write-r1 HIGH closure (defense-in-depth on schema drift).
+ */
+async function safeFindSnapshotBySubmission(
+  ctx: TenantContext,
+  submissionId: FormSubmissionId,
+  externalTx?: DbClient,
+): Promise<FormSnapshot | null> {
+  try {
+    return await snapshotRepo.findSnapshotBySubmissionId(ctx.tenantId, submissionId, externalTx);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === snapshotRepo.SNAPSHOT_AMBIGUOUS_FOR_SUBMISSION) {
+      logger.error(
+        {
+          event: 'forms_intake.snapshot.ambiguous_for_submission',
+          sentinel: snapshotRepo.SNAPSHOT_AMBIGUOUS_FOR_SUBMISSION,
+          tenant_id: ctx.tenantId,
+          submission_id: submissionId,
+          // Operator action: investigate forms_snapshot for duplicate
+          // rows on (tenant_id, submission_id) and verify migration 009's
+          // uq_forms_snapshot_one_per_submission index is present. See
+          // migration 009 header for remediation query.
+        },
+        'Snapshot read detected multiple snapshots for one submission. ' +
+          'This indicates schema drift (the unique index from migration 009 is missing/dropped) ' +
+          'or an out-of-band INSERT bypassed createSnapshot. Read returns tenant-blind 404; operator must remediate.',
+      );
+      return null;
+    }
+    throw err;
+  }
+}
 
 /**
  * Sentinel error: the snapshot couldn't be built because the submission's
@@ -215,11 +255,7 @@ export async function getSnapshotForSubmissionAsPatient(
   submissionId: FormSubmissionId,
   externalTx?: DbClient,
 ): Promise<FormSnapshot | null> {
-  const snapshot = await snapshotRepo.findSnapshotBySubmissionId(
-    ctx.tenantId,
-    submissionId,
-    externalTx,
-  );
+  const snapshot = await safeFindSnapshotBySubmission(ctx, submissionId, externalTx);
   if (snapshot === null) return null;
 
   const submission = await submissionRepo.findSubmissionById(
@@ -251,7 +287,7 @@ export async function getSnapshotForSubmissionAsClinician(
   submissionId: FormSubmissionId,
   externalTx?: DbClient,
 ): Promise<FormSnapshot | null> {
-  return snapshotRepo.findSnapshotBySubmissionId(ctx.tenantId, submissionId, externalTx);
+  return safeFindSnapshotBySubmission(ctx, submissionId, externalTx);
 }
 
 /**

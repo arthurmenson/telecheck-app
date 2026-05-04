@@ -36,8 +36,31 @@ import type { FormSnapshot, FormSnapshotId, FormSubmissionId, FormTemplateId } f
 // ---------------------------------------------------------------------------
 
 /**
+ * Sentinel error: at read time, more than one snapshot matched the
+ * (tenant_id, submission_id) tuple. Defense-in-depth against migration
+ * 009's unique index being missing or dropped (schema drift), mirroring
+ * the same posture as RESTORE_AMBIGUOUS_SUBMISSION on the resume side.
+ * Service-layer callers translate to null per I-025 and emit a structured
+ * operator-visible log so schema drift is detectable.
+ */
+export const SNAPSHOT_AMBIGUOUS_FOR_SUBMISSION = 'forms.snapshot.ambiguous_for_submission';
+
+/**
  * Fetch the snapshot for a submission. Used by clinicians during review
  * (Slice PRD §3 — clinician consumes intake data read-only).
+ *
+ * **Defense-in-depth count check (Codex snapshot-write-r1 HIGH closure
+ * 2026-05-03):** migration 009 added a UNIQUE constraint on
+ * `(tenant_id, submission_id)` so at most one snapshot exists per
+ * submission. The repo MUST NOT trust an invariant it doesn't verify;
+ * if migration 009 was somehow skipped, dropped, or relaxed during
+ * upgrade, a LIMIT 1 read would return an arbitrary one of the
+ * duplicates and undermine the immutability invariant the snapshot
+ * exists to provide.
+ *
+ * Selects up to 2 rows; throws SNAPSHOT_AMBIGUOUS_FOR_SUBMISSION when
+ * multiple match. The service layer surfaces null per I-025 + emits a
+ * structured operator log mirroring the resume-r3 pattern.
  */
 export async function findSnapshotBySubmissionId(
   tenantId: TenantId,
@@ -47,21 +70,20 @@ export async function findSnapshotBySubmissionId(
   return withTenantBoundConnection(
     tenantId,
     async (client: DbClient) => {
-      // Aligned to migration 006 column set (Codex slice-scaffold-r1
-      // MEDIUM finding closure 2026-05-02): singular table name
-      // `forms_snapshot`, primary key `snapshot_id`, references
-      // `template_id` (no version_id; the template_version is captured
-      // inside presented_content per FORMS_ENGINE v5.2 + the canonical
-      // §4.1 seed).
       const result = await client.query<FormSnapshot>(
         `SELECT snapshot_id, tenant_id, submission_id, template_id,
                 template_version, presented_content, created_at
-         FROM forms_snapshot
-        WHERE submission_id = $1 AND tenant_id = $2
-        LIMIT 1`,
+           FROM forms_snapshot
+          WHERE submission_id = $1 AND tenant_id = $2
+          LIMIT 2`,
         [submissionId, tenantId],
       );
-      return result.rows[0] ?? null;
+      if (result.rows.length === 0) return null;
+      if (result.rows.length > 1) {
+        // Schema-drift / migration-009-missing scenario. Fail closed.
+        throw new Error(SNAPSHOT_AMBIGUOUS_FOR_SUBMISSION);
+      }
+      return result.rows[0]!;
     },
     externalTx,
   );

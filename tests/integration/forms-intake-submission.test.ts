@@ -27,6 +27,7 @@ import { describe, expect, it } from 'vitest';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import * as snapshotRepo from '../../src/modules/forms-intake/internal/repositories/snapshot-repo.ts';
 import * as submissionRepo from '../../src/modules/forms-intake/internal/repositories/submission-repo.ts';
 import * as snapshotService from '../../src/modules/forms-intake/internal/services/snapshot-service.ts';
 import * as submissionService from '../../src/modules/forms-intake/internal/services/submission-service.ts';
@@ -716,6 +717,82 @@ describe('forms-intake submitSubmission — snapshot capture (Slice PRD §4)', (
     );
     expect(fetched).not.toBeNull();
     expect(fetched!.submission_id).toBe(submission.submission_id);
+  });
+
+  // Codex snapshot-write-r1 HIGH closure 2026-05-03 — at most one snapshot
+  // per submission. The application's createSnapshot was generating a
+  // fresh ULID per call without checking for an existing row; without
+  // migration 009's UNIQUE constraint, a buggy retry could persist
+  // multiple immutable rows for one submission and clinician reads would
+  // become ambiguous.
+  it('rejects a second snapshot for the same submission with SNAPSHOT_ALREADY_EXISTS', async () => {
+    const programId = `prog_snap_dup_${ulid().slice(0, 8)}`;
+    const { deploymentId, templateId } = await seedActiveDeployment({
+      ctx: US_CTX,
+      programId,
+    });
+    const patientId = ulid();
+
+    const submission = await withTenantContext(TENANT_US, () =>
+      submissionService.startSubmission(
+        US_CTX,
+        { actorId: 'op_dup_snap', patientId, delegateId: null },
+        { deploymentId },
+        getTestClient(),
+      ),
+    );
+
+    // First snapshot — happy path. Calls the repo directly to avoid
+    // routing through submitSubmission (which already wraps it).
+    await withTenantContext(TENANT_US, () =>
+      submissionRepo.findSubmissionById(US_CTX.tenantId, submission.submission_id, getTestClient()),
+    );
+    const presentedContent = {
+      template_layers: {},
+      responses: { field: 'value' },
+      captured_at_iso: new Date().toISOString(),
+      ccr_resolution_snapshot: null,
+      variant_id: null,
+      research_consent_text_version: null,
+    };
+    await withTenantContext(TENANT_US, () =>
+      snapshotRepo.createSnapshot(
+        US_CTX.tenantId,
+        {
+          submissionId: submission.submission_id,
+          templateId,
+          templateVersion: 1,
+          presentedContent,
+        },
+        async (_tx, _row) => {
+          void _tx;
+          void _row;
+        },
+        getTestClient(),
+      ),
+    );
+
+    // Second snapshot for the same submission — must reject with the
+    // SNAPSHOT_ALREADY_EXISTS sentinel (translated from the 23505
+    // unique violation on uq_forms_snapshot_one_per_submission).
+    await expect(
+      withTenantContext(TENANT_US, () =>
+        snapshotRepo.createSnapshot(
+          US_CTX.tenantId,
+          {
+            submissionId: submission.submission_id,
+            templateId,
+            templateVersion: 1,
+            presentedContent,
+          },
+          async (_tx, _row) => {
+            void _tx;
+            void _row;
+          },
+          getTestClient(),
+        ),
+      ),
+    ).rejects.toThrow(snapshotRepo.SNAPSHOT_ALREADY_EXISTS);
   });
 
   it('rejects cross-patient snapshot read via the patient-facing API', async () => {
