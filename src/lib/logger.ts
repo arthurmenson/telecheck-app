@@ -40,9 +40,16 @@ import { config } from './config.js';
 
 // ---------------------------------------------------------------------------
 // Always-redacted PHI paths (non-overridable floor)
+//
+// Exported so test suites can pin the contract (every path in this list MUST
+// continue to redact) and so any future code that needs to add a defense-in-
+// depth log redaction can extend the same canonical list rather than
+// duplicating it in a parallel constant. The list is intentionally `readonly`
+// at the type level so callers can't mutate it post-import; pino consumes it
+// once at logger-construction time.
 // ---------------------------------------------------------------------------
 
-const ALWAYS_REDACTED: readonly string[] = [
+export const ALWAYS_REDACTED: readonly string[] = [
   'req.headers.authorization',
   'req.body.password',
   'req.body.token',
