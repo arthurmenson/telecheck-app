@@ -198,10 +198,17 @@ describe('emitFormsTemplateVersionPublished', () => {
     expect(row!.payload['template_version']).toBe(2);
     expect(row!.payload['prior_published_version_id']).toBe(priorVersionId);
     expect(row!.payload['change_notes']).toBe(changeNotes);
-    // audit_id correlates the wire event to the Category B governance
-    // record per the publishVersion-r1 HIGH closure pattern (events.ts
-    // §emitFormsTemplateVersionPublished JSDoc). Pin presence so a
-    // regression that drops the field gets caught.
+    // SPEC NOTE (Codex r0 MED — 2026-05-04): audit_id correlates the
+    // wire event to the Category B governance record per the
+    // publishVersion-r1 HIGH closure pattern. Today it lives in
+    // `payload.audit_id`; the open governance question is whether
+    // governance correlation should move to an envelope-level field
+    // (DOMAIN_EVENTS v5.2 doesn't currently spec a correlation slot
+    // outside the payload). This assertion pins the CURRENT location
+    // so a regression that silently drops the field gets caught; if
+    // the correlation slot moves, this assertion gets updated as part
+    // of the migration, not silently. Engineering Lead to ratify the
+    // canonical correlation location.
     expect(row!.payload['audit_id']).toBe(auditId);
   });
 
@@ -267,10 +274,17 @@ describe('emitFormsDeploymentCreated', () => {
 
 describe('emitFormsDeploymentRetired', () => {
   it('emits forms_deployment.retired with audit_id correlation + template/program linkage', async () => {
-    // Note: events.ts retire emitter does NOT carry a `retiredAt`
-    // payload field — the occurred_at on the envelope IS the retire
-    // timestamp; payload-side retired_at would duplicate. Pinned here
-    // so a regression that adds a separate retired_at gets caught.
+    // Spec note (Codex r0 MED — 2026-05-04): the retire emitter does
+    // NOT carry a `retiredAt` payload field today — the only timestamp
+    // available is `occurred_at` (set by the emitter, copied into the
+    // payload by emitDomainEvent because the outbox column set has no
+    // dedicated occurred_at column). That is the CURRENT canonical
+    // retire-time signal. If/when the spec ratifies a domain-specific
+    // `retired_at` (distinct from the emitter clock), this assertion
+    // gets revised. We pin presence of `occurred_at` (positive) rather
+    // than absence of `retired_at` (negative) so a future enhancement
+    // that adds `retired_at` doesn't trigger a false-positive test
+    // failure.
     const tenantId = T_US;
     const deploymentId = ulid();
     const templateId = ulid();
@@ -301,9 +315,11 @@ describe('emitFormsDeploymentRetired', () => {
     expect(row!.payload['country_of_care']).toBe('US');
     expect(row!.payload['actor_id']).toBe(actorId);
     expect(row!.payload['audit_id']).toBe(auditId);
-    // Defensive: payload should NOT carry retired_at (envelope's
-    // occurred_at is canonical).
-    expect(row!.payload).not.toHaveProperty('retired_at');
+    // Positive assertion on the canonical retire-time signal (the
+    // emitter clock copied into payload). ISO 8601 string per
+    // emitDomainEvent's `occurred_at: new Date().toISOString()`.
+    expect(typeof row!.payload['occurred_at']).toBe('string');
+    expect(row!.payload['occurred_at'] as string).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
   });
 });
 
