@@ -131,15 +131,28 @@ export class CrisisDetector {
   /**
    * Construct a CrisisDetector instance.
    *
-   * @param _disabledByConfig  Must never be true. Throws I-019 violation if true.
-   *   This parameter exists only so callers who attempt to gate crisis detection
-   *   on a feature flag get a compile-time parameter they must explicitly pass,
-   *   making the I-019 violation visible in code review.
+   * @param _disabledByConfig  Must never be passed at all. Throws I-019
+   *   violation if the constructor is called with ANY argument — including
+   *   explicit `undefined`, `undefined` from a defaulted/optional parameter,
+   *   or a value spread from `[undefined]`. The `never` type above is the
+   *   compile-time block; the `arguments.length > 0` runtime check is the
+   *   physical fail-closed gate.
+   *
+   * Tightened 2026-05-03 per Codex crisis-detection-r1 HIGH (verify-r2):
+   *   Prior implementation used `_disabledByConfig !== undefined`, which
+   *   accepted explicit `undefined` (and spread `[undefined]`) silently.
+   *   That left a bypass surface for any future config plumb that
+   *   normalized a disable flag to undefined. The argument-count check
+   *   closes the bypass: passing anything — INCLUDING undefined — fails
+   *   closed. The only documented usage is `new CrisisDetector()` with NO
+   *   argument (used by the platform singleton at the bottom of this file).
    */
   constructor(_disabledByConfig?: never) {
-    // I-019: this guard throws if anyone passes a truthy disable flag.
-    // The `never` type above is a compile-time block; this is the runtime block.
-    if (_disabledByConfig !== undefined) {
+    // I-019: argument-count gate. ANY supplied argument trips this — including
+    // explicit `undefined`, defaulted `undefined`, or a spread `[undefined]`.
+    // This is the fail-closed posture per the always-on contract: the only
+    // permitted call site is `new CrisisDetector()` with zero arguments.
+    if (arguments.length > 0) {
       throw new DisabledCrisisDetectionError('constructor called with disabledByConfig argument');
     }
   }

@@ -64,14 +64,12 @@ import {
 // ---------------------------------------------------------------------------
 
 describe('CrisisDetector — always-on contract (I-019)', () => {
-  it('constructor throws DisabledCrisisDetectionError when any non-undefined value is passed (truthy or falsy)', () => {
+  it('constructor throws DisabledCrisisDetectionError for ANY supplied argument value (truthy or falsy)', () => {
     // The `never`-typed parameter is a compile-time block; we cast through
-    // unknown to test the runtime guard. The current runtime check is
-    // `_disabledByConfig !== undefined`, so any passed value other than the
-    // sentinel `undefined` trips it — including the falsy values false / 0 / ''.
-    // Pinning the falsy cases is critical: a future change from `!== undefined`
-    // to e.g. `Boolean(_disabledByConfig)` or `=== true` would silently accept
-    // false/0/'' as "not disabling" and weaken I-019.
+    // unknown to test the runtime guard. As of crisis-detection-r2 the runtime
+    // check is `arguments.length > 0`, so EVERY supplied value trips it —
+    // including the falsy values false / 0 / '' which a `Boolean()`-based
+    // check would have silently accepted.
     for (const v of [true, false, 0, 1, '', 'disabled-by-flag', null]) {
       expect(() => new CrisisDetector(v as unknown as never)).toThrow(DisabledCrisisDetectionError);
     }
@@ -81,34 +79,29 @@ describe('CrisisDetector — always-on contract (I-019)', () => {
     expect(() => new CrisisDetector()).not.toThrow();
   });
 
-  // SPEC ISSUE — undefined-equivalent bypass of the always-on guard
-  //
-  // The current runtime check is `_disabledByConfig !== undefined`, so
-  // `new CrisisDetector(undefined)` is treated identically to the no-arg
-  // form: both succeed. This is fine for direct callers but is a known
-  // bypass surface IF the constructor is ever rewritten to use an
-  // optional/defaulted parameter — at which point an explicit
-  // `undefined`-coerced disable flag from a config plumb would silently
-  // weaken the I-019 floor.
-  //
-  // The test below PINS the current "explicit undefined succeeds" behavior
-  // so any tightening (e.g. checking `arguments.length > 0`) requires a
-  // deliberate test update rather than landing as a silent regression.
-  // Engineering Lead candidate-fix: switch to argument-count detection so
-  // ANY parameter passed — including explicit undefined — fails closed.
-  it('constructor with explicit `undefined` argument SUCCEEDS (current `!== undefined` semantic — see SPEC ISSUE comment)', () => {
-    // PINNING current behavior. If this test starts failing, a fix has
-    // landed and the SPEC ISSUE above can be closed; please also update
-    // the next test (spread-undefined) accordingly.
-    expect(() => new CrisisDetector(undefined as unknown as never)).not.toThrow();
+  // SPEC ISSUE CLOSED 2026-05-03 (Codex crisis-detection HIGH r1 → r2):
+  // Prior implementation used `_disabledByConfig !== undefined`, which
+  // silently accepted explicit `undefined` (and spread `[undefined]`) — a
+  // bypass surface for any future config plumb that normalized a disable
+  // flag to undefined. The runtime check is now `arguments.length > 0`,
+  // so ANY supplied parameter — including undefined — fails closed.
+  it('constructor with explicit `undefined` argument THROWS (closed bypass; argument-count gate)', () => {
+    // ENFORCING the always-on invariant. Failure means the runtime guard
+    // has been weakened back to value-equality — fix the implementation,
+    // do not soften this test.
+    expect(() => new CrisisDetector(undefined as unknown as never)).toThrow(
+      DisabledCrisisDetectionError,
+    );
   });
 
-  it('constructor with spread `[undefined]` argument SUCCEEDS (same `!== undefined` semantic — paired with above)', () => {
-    // The spread form proves the bypass behaves the same way as a literal
-    // undefined: arguments.length === 1 but value is undefined → silent pass.
-    // Paired with the test above, both expectations flip together when the
-    // SPEC ISSUE is resolved.
-    expect(() => new CrisisDetector(...([undefined] as unknown as [never]))).not.toThrow();
+  it('constructor with spread `[undefined]` argument THROWS (paired with above; same argument-count gate)', () => {
+    // The spread form proves the gate is argument-count, not value-equality:
+    // `arguments.length === 1` here even though the value is undefined.
+    // Paired with the test above, both expectations enforce the closed
+    // bypass through every plumb path.
+    expect(() => new CrisisDetector(...([undefined] as unknown as [never]))).toThrow(
+      DisabledCrisisDetectionError,
+    );
   });
 
   it('DisabledCrisisDetectionError message cites I-019 + the offending reason', () => {
