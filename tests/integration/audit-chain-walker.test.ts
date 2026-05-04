@@ -125,7 +125,25 @@ const TEST_APP_ROLE = 'telecheck_test_app';
 /**
  * Run `fn` with the BEFORE INSERT hash trigger temporarily disabled, so
  * tampered rows can be inserted with arbitrary prev_hash / record_hash
- * / sequence_number values. ALWAYS restores the trigger via try/finally.
+ * / sequence_number values.
+ *
+ * Cleanup safety (Codex chain-walker-r0 HIGH closure 2026-05-04):
+ *   The shared test client is a single long-lived connection that
+ *   subsequent tests reuse. A cleanup failure here can leave:
+ *     (a) the hash trigger disabled — subsequent inserts skip the hash
+ *         chain entirely, silently corrupting integration-test results.
+ *     (b) the session authorized as the underlying superuser — RLS
+ *         and authorization-gate tests would silently bypass.
+ *
+ *   Each cleanup step runs in its own guarded try/catch so a failure
+ *   in one doesn't skip the others. After all cleanup runs, we VERIFY
+ *   the post-cleanup state (trigger enabled + session_user is the test
+ *   role); any verification failure throws loud and kills the test
+ *   process so contamination can't reach later tests.
+ *
+ *   Errors during cleanup are PRESERVED (concatenated into a single
+ *   error) — the original `fn` error (if any) is re-thrown via
+ *   AggregateError to preserve diagnostics for both failure modes.
  *
  * Requires the underlying connection role to own audit_records (the
  * test harness runs migrations as a superuser and then SETs the test
@@ -135,12 +153,100 @@ async function withInsertTriggerDisabled<T>(fn: () => Promise<T>): Promise<T> {
   const client = getTestClient();
   await client.query('RESET SESSION AUTHORIZATION');
   await client.query('ALTER TABLE audit_records DISABLE TRIGGER audit_records_before_insert');
+
+  let fnError: unknown;
+  let result: T;
   try {
-    return await fn();
-  } finally {
-    // Re-enable the trigger and restore the test role even on test failure.
+    result = await fn();
+  } catch (err) {
+    fnError = err;
+    result = undefined as unknown as T;
+  }
+
+  // Each cleanup step in its own try/catch — a failure in one MUST NOT
+  // skip the others. Collect cleanup errors for a single AggregateError.
+  const cleanupErrors: unknown[] = [];
+
+  try {
     await client.query('ALTER TABLE audit_records ENABLE TRIGGER audit_records_before_insert');
+  } catch (err) {
+    cleanupErrors.push(err);
+  }
+  try {
     await client.query(`SET SESSION AUTHORIZATION ${TEST_APP_ROLE}`);
+  } catch (err) {
+    cleanupErrors.push(err);
+  }
+
+  // Verify the post-cleanup state. If verification fails, the shared
+  // client is in an unsafe state and subsequent tests would be
+  // contaminated. Throw LOUD to terminate the test process at this
+  // boundary rather than letting the contamination propagate.
+  await verifyCleanCleanupState(cleanupErrors);
+
+  if (cleanupErrors.length > 0) {
+    if (fnError !== undefined) {
+      throw new AggregateError(
+        [fnError, ...cleanupErrors],
+        'withInsertTriggerDisabled: callback errored AND cleanup errored. ' +
+          'Original callback error preserved at AggregateError.errors[0]; ' +
+          'cleanup errors at .errors[1..].',
+      );
+    }
+    throw new AggregateError(
+      cleanupErrors,
+      'withInsertTriggerDisabled: cleanup errored. The post-cleanup ' +
+        'verification passed, so the shared session state is safe; the ' +
+        'test surface is just signaling that cleanup is degraded.',
+    );
+  }
+
+  if (fnError !== undefined) throw fnError;
+  return result;
+}
+
+/**
+ * Verify that after cleanup:
+ *   - audit_records_before_insert trigger is enabled
+ *   - session_user is the test app role (not the underlying superuser)
+ *
+ * Throws loudly on mismatch — contamination of subsequent tests is a
+ * test-process-level failure, not a per-test failure.
+ */
+async function verifyCleanCleanupState(cleanupErrors: unknown[]): Promise<void> {
+  const client = getTestClient();
+  let triggerEnabled: boolean | 'unknown' = 'unknown';
+  let sessionUser: string | 'unknown' = 'unknown';
+
+  try {
+    const r = await client.query<{ tgenabled: string }>(
+      `SELECT tgenabled FROM pg_trigger
+        WHERE tgname = 'audit_records_before_insert'
+          AND tgrelid = 'audit_records'::regclass`,
+    );
+    // tgenabled = 'O' means trigger is enabled (origin/local mode).
+    // 'D' means disabled. Other values: 'R' replica only, 'A' always.
+    triggerEnabled = r.rows[0]?.tgenabled === 'O';
+  } catch (err) {
+    // Verification query itself failed — record + treat as unsafe.
+    cleanupErrors.push(err);
+  }
+
+  try {
+    const r = await client.query<{ session_user: string }>(`SELECT session_user`);
+    sessionUser = r.rows[0]?.session_user ?? 'unknown';
+  } catch (err) {
+    cleanupErrors.push(err);
+  }
+
+  if (triggerEnabled !== true || sessionUser !== TEST_APP_ROLE) {
+    throw new Error(
+      `withInsertTriggerDisabled: post-cleanup verification FAILED. ` +
+        `audit_records_before_insert trigger enabled=${String(triggerEnabled)} ` +
+        `(expected true); session_user='${sessionUser}' (expected '${TEST_APP_ROLE}'). ` +
+        `The shared test client is in an UNSAFE state — subsequent tests would ` +
+        `be contaminated. Aborting to prevent silent corruption.`,
+    );
   }
 }
 
@@ -150,26 +256,55 @@ function sha256Hex(s: string): string {
 }
 
 afterEach(async () => {
-  // Defensive cleanup: if a test crashed BEFORE the try/finally in
-  // withInsertTriggerDisabled could re-enable the trigger AND restore
-  // the test role, this hook ensures the next test starts in a clean
-  // state. The savepoint at tests/setup.ts also rolls back any inserted
-  // rows; this hook is purely about session-level role + trigger state.
+  // Defensive: if `withInsertTriggerDisabled` itself ran cleanly the
+  // session is already in a clean state (test app role + trigger
+  // enabled). This hook's job is to verify that, and to recover from
+  // any prior crash that escaped the inner cleanup.
+  //
+  // Cleanup safety (Codex r0 HIGH closure 2026-05-04): the shared
+  // client persists across tests, so leaked privilege escalation or
+  // a disabled trigger silently corrupts every subsequent test. Each
+  // step is independently guarded, post-state is verified, and any
+  // verification failure throws loudly to abort the suite at this
+  // boundary rather than propagate.
   const client = getTestClient();
+
+  // Step 1: try to RESET to the underlying superuser so we can
+  // execute ALTER TRIGGER. If this fails because we're already at
+  // the underlying role (no SET in effect), pg returns silently —
+  // RESET is a no-op when no SESSION AUTHORIZATION is in effect.
+  // The wrapper still runs ENABLE next so the trigger state is
+  // re-asserted regardless.
   try {
-    // RESET first (harmless if already reset), then ENABLE (idempotent
-    // — if the trigger was already enabled, ENABLE is a no-op).
     await client.query('RESET SESSION AUTHORIZATION');
+  } catch {
+    // Permission error → we're not in a position to ALTER. Verify
+    // step below catches an actually-disabled trigger.
+  }
+
+  // Step 2: re-enable the trigger if disabled. If we don't have
+  // privilege (because RESET failed or the connection's underlying
+  // role isn't the table owner), this fails — verify will then
+  // throw. ENABLE on an already-enabled trigger is a no-op.
+  try {
     await client.query('ALTER TABLE audit_records ENABLE TRIGGER audit_records_before_insert');
   } catch {
-    // Privilege errors here mean we're already as the test role and
-    // the trigger is enabled — fine.
+    // Verify step catches a still-disabled trigger.
   }
+
+  // Step 3: switch back to the test app role. If we're already there,
+  // SET SESSION AUTHORIZATION to the same role is a no-op.
   try {
     await client.query(`SET SESSION AUTHORIZATION ${TEST_APP_ROLE}`);
   } catch {
-    // Already in the test role.
+    // Verify step catches an unexpected session_user.
   }
+
+  // Verify post-cleanup state. Throw LOUD on mismatch — silent
+  // corruption is the failure mode this whole batch was designed
+  // around. Re-uses the helper from withInsertTriggerDisabled so
+  // both cleanup paths share verification logic.
+  await verifyCleanCleanupState([]);
 });
 
 // ---------------------------------------------------------------------------
