@@ -186,32 +186,50 @@ async function withInsertTriggerDisabled<T>(fn: () => Promise<T>): Promise<T> {
   // (Codex r1 MED closure 2026-05-04).
   const verificationError = await checkCleanupState();
 
-  // Compose the final throw, preserving every cause:
-  //   - fnError (if the callback threw)
-  //   - cleanupErrors (if any cleanup step threw)
-  //   - verificationError (if post-cleanup state is unsafe)
-  // When more than one is present, AggregateError carries them all.
-  // When only one is present, throw it directly to keep the stack
-  // clean for the common single-error case.
+  const composed = composeCleanupErrors(fnError, cleanupErrors, verificationError);
+  if (composed !== null) {
+    throw composed;
+  }
+
+  return result;
+}
+
+/**
+ * Pure error-composition helper. Returns the single error (or
+ * AggregateError) that should be thrown given:
+ *   - `fnError` — callback failure if any (undefined = no error)
+ *   - `cleanupErrors` — each cleanup step's error (empty array OK)
+ *   - `verificationError` — post-cleanup state mismatch if any
+ *
+ * Behavior:
+ *   - 0 causes → returns null (caller returns result)
+ *   - 1 cause  → returns that error verbatim (clean stack for the
+ *                common case)
+ *   - 2+ causes → returns AggregateError with all causes preserved
+ *
+ * Extracted as a pure function (Codex r2 MED closure 2026-05-04) so
+ * the multi-cause composition path can be unit-tested directly
+ * without DB-level fault injection.
+ */
+export function composeCleanupErrors(
+  fnError: unknown,
+  cleanupErrors: readonly unknown[],
+  verificationError: Error | null,
+): unknown | null {
   const allErrors: unknown[] = [];
   if (fnError !== undefined) allErrors.push(fnError);
   for (const e of cleanupErrors) allErrors.push(e);
   if (verificationError !== null) allErrors.push(verificationError);
 
-  if (allErrors.length === 1) {
-    throw allErrors[0];
-  }
-  if (allErrors.length > 1) {
-    throw new AggregateError(
-      allErrors,
-      'withInsertTriggerDisabled: multiple errors during execution + cleanup. ' +
-        'Inspect AggregateError.errors[] in order: callback error (if any), ' +
-        'cleanup errors (if any), then post-cleanup verification error (if state ' +
-        'verification failed). All causes preserved for diagnostics.',
-    );
-  }
-
-  return result;
+  if (allErrors.length === 0) return null;
+  if (allErrors.length === 1) return allErrors[0];
+  return new AggregateError(
+    allErrors,
+    'withInsertTriggerDisabled: multiple errors during execution + cleanup. ' +
+      'Inspect AggregateError.errors[] in order: callback error (if any), ' +
+      'cleanup errors (if any), then post-cleanup verification error (if state ' +
+      'verification failed). All causes preserved for diagnostics.',
+  );
 }
 
 /**
@@ -336,53 +354,115 @@ afterEach(async () => {
 });
 
 // ---------------------------------------------------------------------------
-// §0 — Cleanup-helper preservation regression (Codex r1 MED closure)
+// §0 — composeCleanupErrors: pure-function unit tests
+//     (Codex r2 MED closure 2026-05-04)
 //
-// Sanity-checks the failure-composition contract of
-// withInsertTriggerDisabled. When the callback errors AND a cleanup
-// step also errors, the original callback error MUST be preserved at
-// AggregateError.errors[0]. Without this regression test, a future
-// refactor that re-throws verification errors directly (the bug r1
-// fixed) would silently lose the root cause again.
+// The error-composition contract was extracted from the body of
+// withInsertTriggerDisabled into a pure function that can be exercised
+// for every branch directly, without needing DB-level fault injection.
+// These tests pin the contract: 0 causes → null; 1 cause → verbatim;
+// 2+ causes → AggregateError preserving every cause in order
+// (callback first, cleanup steps next, verification last).
 // ---------------------------------------------------------------------------
 
-describe('withInsertTriggerDisabled — error preservation contract', () => {
-  it('callback error alone is rethrown verbatim (single-cause path)', async () => {
-    const cbErr = new Error('callback boom — single cause');
-    let caught: unknown;
-    try {
-      await withInsertTriggerDisabled(async () => {
-        throw cbErr;
-      });
-    } catch (err) {
-      caught = err;
-    }
-    // Single error → thrown verbatim, NOT wrapped in AggregateError.
-    expect(caught).toBe(cbErr);
+describe('composeCleanupErrors — error preservation contract', () => {
+  it('returns null when no errors occurred (success path)', () => {
+    expect(composeCleanupErrors(undefined, [], null)).toBeNull();
   });
 
-  it('multiple causes are wrapped in AggregateError with original callback error preserved', async () => {
-    // Synthetic regression: the callback throws AND we ALSO throw a
-    // synthetic cleanup error by stubbing the client query for a step
-    // that runs during cleanup. We can't easily force a real cleanup
-    // failure here without DB-level fault injection, so this test
-    // proves the composition logic via fnError alone — but the
-    // commit message documents the intent that reaching the
-    // multi-cause branch DOES preserve causes (verified by code review
-    // + the §4/§5/§6 tampering tests that exercise the production
-    // path under real conditions).
-    //
-    // For a true multi-cause test, see commit history rationale:
-    // we're explicit that "production correctness verified by
-    // §4/§5/§6 + cleanup-state verification + AggregateError shape
-    // assertion below".
+  it('returns the callback error verbatim when only fn errored (single-cause path)', () => {
+    const cb = new Error('cb boom');
+    expect(composeCleanupErrors(cb, [], null)).toBe(cb);
+  });
 
-    // Sanity-only: reuse the single-cause path under conditions where
-    // the cleanup is going to succeed (the helper has nothing to do
-    // because we don't actually invoke a tampering insert). Confirms
-    // the composition WIRING (allErrors length=1 vs >1 branch) is
-    // intact.
-    const cbErr = new Error('callback boom — composition test');
+  it('returns the single cleanup error verbatim when only one cleanup step failed', () => {
+    const c1 = new Error('cleanup-step-1 boom');
+    expect(composeCleanupErrors(undefined, [c1], null)).toBe(c1);
+  });
+
+  it('returns the verification error verbatim when only post-state was bad', () => {
+    const v = new Error('verification mismatch');
+    expect(composeCleanupErrors(undefined, [], v)).toBe(v);
+  });
+
+  it('returns AggregateError preserving fnError + cleanupError(s) in order', () => {
+    const cb = new Error('cb boom');
+    const c1 = new Error('cleanup-1');
+    const c2 = new Error('cleanup-2');
+    const result = composeCleanupErrors(cb, [c1, c2], null);
+    expect(result).toBeInstanceOf(AggregateError);
+    const agg = result as AggregateError;
+    expect(agg.errors).toHaveLength(3);
+    expect(agg.errors[0]).toBe(cb);
+    expect(agg.errors[1]).toBe(c1);
+    expect(agg.errors[2]).toBe(c2);
+  });
+
+  it('returns AggregateError preserving fnError + verificationError', () => {
+    const cb = new Error('cb boom');
+    const v = new Error('verification mismatch');
+    const result = composeCleanupErrors(cb, [], v);
+    expect(result).toBeInstanceOf(AggregateError);
+    const agg = result as AggregateError;
+    expect(agg.errors).toHaveLength(2);
+    expect(agg.errors[0]).toBe(cb);
+    expect(agg.errors[1]).toBe(v);
+  });
+
+  it('returns AggregateError preserving cleanupError + verificationError (no callback)', () => {
+    const c1 = new Error('cleanup-1');
+    const v = new Error('verification mismatch');
+    const result = composeCleanupErrors(undefined, [c1], v);
+    expect(result).toBeInstanceOf(AggregateError);
+    const agg = result as AggregateError;
+    expect(agg.errors).toHaveLength(2);
+    expect(agg.errors[0]).toBe(c1);
+    expect(agg.errors[1]).toBe(v);
+  });
+
+  it('returns AggregateError preserving ALL three causes in order (the original Codex r2 case)', () => {
+    // The exact multi-cause regression Codex r2 flagged: callback
+    // errored, cleanup errored, AND verification failed. All three
+    // causes MUST be preserved at AggregateError.errors[0..2] in
+    // (callback, cleanup, verification) order so operators reading
+    // CI logs see the root cause first.
+    const cb = new Error('cb boom — root cause');
+    const c1 = new Error('cleanup-step-1 also boomed');
+    const v = new Error('verification: trigger still disabled');
+    const result = composeCleanupErrors(cb, [c1], v);
+    expect(result).toBeInstanceOf(AggregateError);
+    const agg = result as AggregateError;
+    expect(agg.errors).toHaveLength(3);
+    expect(agg.errors[0]).toBe(cb); // root cause first
+    expect(agg.errors[1]).toBe(c1); // cleanup next
+    expect(agg.errors[2]).toBe(v); // verification last
+    // Aggregate message documents the order so callers can grep CI
+    // logs without parsing AggregateError shape.
+    expect(agg.message).toMatch(/All causes preserved for diagnostics/);
+  });
+
+  it('does NOT wrap a single cause in AggregateError (clean stack for common case)', () => {
+    // Regression guard: a future change that "always wraps" would
+    // produce noisy stack traces. The contract is verbatim throw on
+    // single cause.
+    const cb = new Error('only one error');
+    const result = composeCleanupErrors(cb, [], null);
+    expect(result).not.toBeInstanceOf(AggregateError);
+    expect(result).toBe(cb);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §0b — Integration smoke: withInsertTriggerDisabled does NOT lose the
+//       callback error in the single-cause production path
+// ---------------------------------------------------------------------------
+
+describe('withInsertTriggerDisabled — single-cause production path', () => {
+  it('callback error alone is rethrown verbatim (clean cleanup case)', async () => {
+    // The integration-side smoke: in the realistic case where cleanup
+    // succeeds, the callback error reaches the test verbatim. Pairs
+    // with the unit tests above to cover both ends of the contract.
+    const cbErr = new Error('callback boom — production smoke');
     let caught: unknown;
     try {
       await withInsertTriggerDisabled(async () => {
@@ -391,11 +471,8 @@ describe('withInsertTriggerDisabled — error preservation contract', () => {
     } catch (err) {
       caught = err;
     }
-    // With clean cleanup, only the callback error is in allErrors,
-    // so it's thrown verbatim.
     expect(caught).toBe(cbErr);
-    // After this test the helper's cleanup ran cleanly — the afterEach
-    // verifyCleanCleanupState() will assert post-state for us.
+    // afterEach's checkCleanupState() asserts post-state is clean.
   });
 });
 
