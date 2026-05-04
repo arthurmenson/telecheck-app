@@ -5,10 +5,14 @@
  * `submissionService.resumeSubmission` validates the patient-held HMAC
  * resume token, decrypts the partial responses, merges them back onto
  * the in-progress forms_submission row, flips the resume_state row to
- * `status='completed'`, and emits the Category C
- * `forms_resume_state.restored` audit (placeholder action_id
- * `config_change_validated` per the SPEC ISSUE flagged in audit.ts;
- * identified by `detail.intent='forms_submission_resumed'`).
+ * `status='completed'`, and emits the Category B `forms_submission_resumed`
+ * audit (typed placeholder action_id via formsAuditPlaceholder() per the
+ * SPEC ISSUE flagged in audit.ts; post legacy-emitter-migration the
+ * discriminator is the action_id directly, not detail.intent).
+ * Note: slice PRD §8.5 calls this Category C; the emitter currently uses
+ * Category B carried over from the pre-migration `config_change_validated`
+ * placeholder. Reconciling that drift is a separate Engineering Lead
+ * decision (flagged in audit.ts SPEC ISSUE inline comment).
  *
  * Atomic orchestration in ONE outer transaction (I-016 same-tx outbox):
  * a failure anywhere in the merge UPDATE / status flip / audit emission
@@ -251,14 +255,17 @@ describe('forms-intake resumeSubmission — happy path', () => {
     expect(subRow).toBeDefined();
     expect(subRow!.responses).toEqual(responses);
 
-    // Category C audit emitted (placeholder action_id — see SPEC ISSUE in
-    // audit.ts emitFormsResumeStateRestored). Identified by detail.intent.
+    // Audit emitted with the typed-placeholder action_id (post legacy-
+    // emitter-migration 2026-05-04 — see SPEC ISSUE in audit.ts
+    // formsAuditPlaceholder helper). Prior to the migration this row used
+    // `action='config_change_validated'` with `detail.intent='forms_submission_resumed'`;
+    // the migration moved the discriminator into the action_id and dropped
+    // the redundant detail.intent field.
     await withTenantContext(TENANT_US, () =>
       assertAuditRecordExists(
         TENANT_US,
         (rec) =>
-          rec.action === ('config_change_validated' as typeof rec.action) &&
-          rec.detail['intent'] === 'forms_submission_resumed' &&
+          rec.action === ('forms_submission_resumed' as typeof rec.action) &&
           rec.detail['resume_state_id'] === setup.resumeStateId &&
           rec.detail['submission_id'] === setup.submissionId &&
           rec.target_patient_id === setup.patientId,

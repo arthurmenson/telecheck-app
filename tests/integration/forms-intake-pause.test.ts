@@ -10,9 +10,15 @@
  *   2. Merges the responses into the submission row (auto-save path).
  *   3. Encrypts the merged responses under per-tenant KMS (ADR-024).
  *   4. INSERTs a forms_resume_state row in 'active' status.
- *   5. Emits the Category C `forms_submission_paused` audit (placeholder
- *      action_id `config_change_validated` per the SPEC ISSUE flagged in
- *      audit.ts; identified by detail.intent='forms_submission_paused').
+ *   5. Emits the Category B `forms_submission_paused` audit (typed
+ *      placeholder action_id via formsAuditPlaceholder() per the SPEC
+ *      ISSUE flagged in audit.ts; post legacy-emitter-migration the
+ *      discriminator is the action_id directly, not detail.intent).
+ *      Note: slice PRD §8.5 calls this Category C operational; the
+ *      emitter currently uses Category B carried over from the
+ *      pre-migration `config_change_validated` placeholder. Reconciling
+ *      that drift is a separate Engineering Lead decision (flagged in
+ *      audit.ts SPEC ISSUE inline comment).
  *   6. Emits the `forms_resume_state.saved` domain event.
  *   7. Issues an HMAC-self-contained resume token (resume-token.ts).
  *
@@ -35,10 +41,11 @@
  *     anonymous-flow (§8.2 device-anonymous) end-to-end; tests cover the
  *     known-patient happy path. Anonymous-flow lands when both the
  *     migration patch + audit-emitter signature change land together.
- *   - Audit action_id is `config_change_validated` placeholder pending
- *     AUDIT_EVENTS amendment for `forms_submission_paused`; tests assert
- *     against the placeholder + `detail.intent` so the SPEC ISSUE flag
- *     stays grep-able alongside the existing emitter SPEC ISSUE comment.
+ *   - Audit action_id is `forms_submission_paused`, a typed placeholder
+ *     in `FormsAuditActionPlaceholder` pending AUDIT_EVENTS amendment.
+ *     Tests assert against the action_id directly post legacy-emitter
+ *     migration 2026-05-04. The SPEC ISSUE flag is inventoried via
+ *     `git grep "formsAuditPlaceholder("` in src/modules/forms-intake/.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -203,14 +210,17 @@ describe('forms-intake pauseSubmission — happy path', () => {
     expect(row!.device_anonymous_token).toBeNull();
     expect(row!.deployment_id).toBe(deploymentId);
 
-    // Category C audit emitted (placeholder action_id — see SPEC ISSUE in
-    // audit.ts emitFormsResumeStateSaved). Identified by detail.intent.
+    // Audit emitted with the typed-placeholder action_id (post legacy-
+    // emitter-migration 2026-05-04 — see SPEC ISSUE in audit.ts
+    // formsAuditPlaceholder helper). Prior to the migration this row used
+    // `action='config_change_validated'` with `detail.intent='forms_submission_paused'`;
+    // the migration moved the discriminator into the action_id and dropped
+    // the redundant detail.intent field.
     await withTenantContext(TENANT_US, () =>
       assertAuditRecordExists(
         TENANT_US,
         (rec) =>
-          rec.action === ('config_change_validated' as typeof rec.action) &&
-          rec.detail['intent'] === 'forms_submission_paused' &&
+          rec.action === ('forms_submission_paused' as typeof rec.action) &&
           rec.detail['resume_state_id'] === result.resumeState.resumeStateId &&
           rec.target_patient_id === patientId,
       ),

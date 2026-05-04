@@ -24,35 +24,37 @@
  * forms-engine template / deployment / submission / variant lifecycle. The
  * slice PRD §8.5, §14.5, §14.6 say these MUST be audited but doesn't pin
  * exact action identifiers. This module emits them under DESCRIPTIVE-but-
- * unratified IDs through TWO patterns:
+ * unratified IDs through a SINGLE pattern:
  *
- *   1. `formsAuditPlaceholder()` helper — typed-cast helper with a closed
- *      union of placeholder IDs (`FormsAuditActionPlaceholder`). The
- *      single sanctioned `as AuditAction` cast lives inside the helper.
- *      Used by 9 emitters: template + deployment + submission + variant
- *      lifecycle. Inventory:
- *        git grep "formsAuditPlaceholder("
+ *   `formsAuditPlaceholder()` helper — typed-cast helper with a closed
+ *   union of placeholder IDs (`FormsAuditActionPlaceholder`). The single
+ *   sanctioned `as AuditAction` cast lives inside the helper. Used by all
+ *   12 unratified emitters across the module:
+ *     template (2) + deployment (2) + submission (4) + variant (4)
+ *   Inventory: `git grep "formsAuditPlaceholder("`.
  *
- *   2. Canonical-action + `detail.intent` pattern — used by 3 legacy
- *      emitters (`emitFormsResumeStateSaved`, `emitFormsResumeStateRestored`,
- *      `emitFormsVariantDeployed`) that route through canonical
- *      `config_change_validated` and encode the unratified semantic in
- *      `detail.intent`. Migrating those to pattern (1) is a separate
- *      batch — flagged at the helper above for follow-up.
+ * (History note 2026-05-04: prior to the legacy-emitter-migration batch,
+ * 3 emitters (`emitFormsResumeStateSaved`, `emitFormsResumeStateRestored`,
+ * `emitFormsVariantDeployed`) used a different pattern — canonical action
+ * `config_change_validated` + `detail.intent: '<unratified_id>'`. They've
+ * been migrated to the helper; tests now assert against the new action_id
+ * directly instead of the (action, detail.intent) tuple.)
  *
- * Engineering Lead + Contracts Pack owner must ratify ALL NINE action IDs
- * enumerated in the `FormsAuditActionPlaceholder` union (template lifecycle:
- * `forms_template_created`, `forms_template_version_published`; deployment
- * lifecycle: `forms_deployment_created`, `forms_deployment_retired`;
- * submission lifecycle: `forms_submission_started`,
- * `forms_submission_completed`; variant lifecycle: `forms_variant_created`,
+ * Engineering Lead + Contracts Pack owner must ratify ALL TWELVE action
+ * IDs enumerated in the `FormsAuditActionPlaceholder` union (template
+ * lifecycle: `forms_template_created`, `forms_template_version_published`;
+ * deployment lifecycle: `forms_deployment_created`,
+ * `forms_deployment_retired`; submission lifecycle:
+ * `forms_submission_started`, `forms_submission_paused`,
+ * `forms_submission_resumed`, `forms_submission_completed`; variant
+ * lifecycle: `forms_variant_created`, `forms_variant_deployed`,
  * `forms_variant_winner_promoted`, `forms_variant_retired`) in a future
  * AUDIT_EVENTS amendment per EHBG §12 SI/DSI escalation. Partial
- * ratification (e.g. only submission + variant) would leave the unratified
- * subset stranded if the helper is deleted; the migration MUST be all-or-
- * nothing or staged through a smaller union. When the full amendment
- * lands, deleting `formsAuditPlaceholder()` and migrating its callers
- * is a 3-step grep documented at the helper definition.
+ * ratification (e.g. only the template/deployment subset) would leave
+ * the unratified subset stranded if the helper is deleted; the migration
+ * MUST be all-or-nothing or staged through a smaller union. When the
+ * full amendment lands, deleting `formsAuditPlaceholder()` and migrating
+ * its callers is a 3-step grep documented at the helper definition.
  *
  * Hard rule per I-003: every emitter below MUST throw on emission failure
  * (the underlying `emitAudit()` already does); callers MUST NOT swallow
@@ -98,15 +100,16 @@ import type {
 // removing this helper (because the spec landed) deletes every placeholder
 // reference at once.
 //
-// Pattern audit (2026-05-04):
-//   - 9 emitters use the placeholder helper (template/deployment/submission/
-//     variant lifecycle).
-//   - 3 legacy emitters (`emitFormsResumeStateSaved`,
-//     `emitFormsResumeStateRestored`, `emitFormsVariantDeployed`) use a
-//     DIFFERENT pattern: canonical action `config_change_validated` +
-//     `detail.intent: '<unratified_id>'`. That pattern is honest (uses a
-//     real canonical action) but loses the structured action-ID typing.
-//     Migrating those is a separate batch — flagged here for follow-up.
+// Pattern audit (2026-05-04, post legacy-emitter migration):
+//   - All 12 unratified emissions across the module now route through the
+//     placeholder helper. The legacy `config_change_validated +
+//     detail.intent: '<unratified_id>'` pattern was migrated 2026-05-04 —
+//     `emitFormsResumeStateSaved`, `emitFormsResumeStateRestored`, and
+//     `emitFormsVariantDeployed` now use formsAuditPlaceholder() with the
+//     canonical placeholder action_id and dropped the redundant
+//     detail.intent field. Single-pattern state holds going forward; any
+//     new unratified emission MUST go through the helper, not via
+//     canonical-action + detail-intent encoding.
 //
 // When the spec amendment lands, the migration is a 3-step grep:
 //   1. Add the new actions to `AuditAction` in lib/audit.ts.
@@ -132,9 +135,12 @@ type FormsAuditActionPlaceholder =
   | 'forms_deployment_retired'
   // Submission lifecycle (patient-facing)
   | 'forms_submission_started'
+  | 'forms_submission_paused'
+  | 'forms_submission_resumed'
   | 'forms_submission_completed'
   // Variant lifecycle (A/B)
   | 'forms_variant_created'
+  | 'forms_variant_deployed'
   | 'forms_variant_winner_promoted'
   | 'forms_variant_retired';
 
@@ -706,21 +712,32 @@ export async function emitFormsSubmissionCompletedAudit(
 // confirm this read of the discipline.
 
 // ---------------------------------------------------------------------------
-// Submission lifecycle audit (legacy — kept for save-and-resume flow only)
+// Submission save-and-resume audit (paused / resumed)
 //
-// SPEC ISSUE flagged at file header: AUDIT_EVENTS v5.2 lacks dedicated
-// `forms_submission_*` action IDs. We use `config_change_validated` as the
-// closest available Category B action for variant lifecycle and retain
-// rich `detail` payloads for traceability until the spec adds canonical IDs.
+// Migrated 2026-05-04 from the legacy `config_change_validated +
+// detail.intent` pattern to the typed `formsAuditPlaceholder()` helper.
+// The action IDs are unratified (SPEC ISSUE flagged at file header) but
+// follow the same single-pattern discipline as the rest of the module.
+//
+// SPEC ISSUE — Category B vs Category C drift on these emitters
+//   Slice PRD v2.1 §8.5 describes save-and-resume audit as Category C
+//   operational. The current emitters use Category B (carried over from
+//   the legacy `config_change_validated` placeholder, which IS Category B
+//   in AUDIT_EVENTS v5.2). The migration to a dedicated
+//   `forms_submission_paused` / `forms_submission_resumed` action ID
+//   PRESERVES the current Category B classification so the migration is
+//   audit-shape-neutral; reconciling the category against §8.5 is a
+//   separate Engineering Lead decision (likely paired with the canonical
+//   action-ID amendment). Pinning current Category B until then so the
+//   audit-chain partition behavior is unchanged.
 // ---------------------------------------------------------------------------
 
 /**
  * Emit a paused-submission audit (save-and-leave per Slice PRD §8.2).
  *
- * SPEC ISSUE: no canonical `forms_submission_paused` action exists in
- * AUDIT_EVENTS v5.2. Until that lands, we use `config_change_validated`
- * as a placeholder Category B action — Engineering Lead must replace this
- * via an AUDIT_EVENTS amendment. TODO once spec lands.
+ * Routed through `formsAuditPlaceholder('forms_submission_paused')` —
+ * the action ID is not yet canonical in AUDIT_EVENTS v5.2 (see file-header
+ * SPEC ISSUE for the full migration list).
  */
 export async function emitFormsResumeStateSaved(
   args: {
@@ -736,12 +753,8 @@ export async function emitFormsResumeStateSaved(
   },
   tx?: AuditDbClient,
 ): Promise<AuditEnvelope> {
-  // SPEC ISSUE: action 'forms_submission_paused' is not canonical in
-  // AUDIT_EVENTS v5.2. Using 'config_change_validated' as the closest
-  // available Category B action; the rich detail block preserves the
-  // intended semantics until the spec adds a dedicated action ID.
   return emitAudit(
-    buildEnvelope('config_change_validated', 'B', {
+    buildEnvelope(formsAuditPlaceholder('forms_submission_paused'), 'B', {
       tenant_id: args.tenantId,
       actor_type: 'patient',
       actor_id: args.actorId,
@@ -751,7 +764,10 @@ export async function emitFormsResumeStateSaved(
       resource_type: 'form_submission',
       resource_id: args.submissionId,
       detail: {
-        intent: 'forms_submission_paused',
+        // The redundant `intent: 'forms_submission_paused'` field that the
+        // legacy pattern carried has been dropped — the action_id itself
+        // is now the discriminator. Tests assert against `action ===
+        // 'forms_submission_paused'` directly.
         submission_id: args.submissionId,
         resume_state_id: args.resumeStateId,
         section_index: args.sectionIndex,
@@ -765,8 +781,8 @@ export async function emitFormsResumeStateSaved(
 /**
  * Emit an audit when a previously-paused submission is resumed.
  *
- * SPEC ISSUE: action 'forms_submission_resumed' is not canonical in
- * AUDIT_EVENTS v5.2. Same placeholder + detail block treatment as above.
+ * Routed through `formsAuditPlaceholder('forms_submission_resumed')` —
+ * same migration treatment as the paused emitter above.
  */
 export async function emitFormsResumeStateRestored(
   args: {
@@ -782,7 +798,7 @@ export async function emitFormsResumeStateRestored(
   tx?: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope('config_change_validated', 'B', {
+    buildEnvelope(formsAuditPlaceholder('forms_submission_resumed'), 'B', {
       tenant_id: args.tenantId,
       actor_type: 'patient',
       actor_id: args.actorId,
@@ -792,7 +808,7 @@ export async function emitFormsResumeStateRestored(
       resource_type: 'form_submission',
       resource_id: args.submissionId,
       detail: {
-        intent: 'forms_submission_resumed',
+        // Redundant `intent` field dropped per migration 2026-05-04.
         submission_id: args.submissionId,
         resume_state_id: args.resumeStateId,
         time_paused_ms: args.timePausedMs,
@@ -853,9 +869,16 @@ export async function emitFormsVariantCreated(
 }
 
 /**
- * Legacy emitter retained as a thin wrapper around the canonical
- * `emitFormsVariantCreated` so existing call sites keep compiling. New
- * code should call `emitFormsVariantCreated` directly.
+ * Legacy emitter retained for backward compatibility with any external
+ * callers that still reference it. No internal callers exist as of
+ * 2026-05-04 (search: `git grep emitFormsVariantDeployed src tests`);
+ * new code should call `emitFormsVariantCreated` directly. The emitter
+ * is kept (rather than deleted) because module-public exports are part
+ * of the slice's stable surface; removal is a separate breaking-change
+ * batch.
+ *
+ * Routed through `formsAuditPlaceholder('forms_variant_deployed')` per
+ * the legacy-emitter-migration batch 2026-05-04.
  *
  * @deprecated Use `emitFormsVariantCreated`.
  */
@@ -874,7 +897,7 @@ export async function emitFormsVariantDeployed(
   tx?: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope('config_change_validated', 'B', {
+    buildEnvelope(formsAuditPlaceholder('forms_variant_deployed'), 'B', {
       tenant_id: args.tenantId,
       actor_type: 'operator',
       actor_id: args.actorId,
@@ -884,7 +907,7 @@ export async function emitFormsVariantDeployed(
       resource_type: 'form_variant',
       resource_id: args.variantId,
       detail: {
-        intent: 'forms_variant_deployed',
+        // Redundant `intent` field dropped per migration 2026-05-04.
         variant_id: args.variantId,
         parent_version_id: args.parentVersionId,
         label: args.label,
