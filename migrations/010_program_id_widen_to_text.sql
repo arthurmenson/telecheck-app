@@ -1,0 +1,73 @@
+-- ===========================================================================
+-- File:    migrations/010_program_id_widen_to_text.sql
+-- Purpose: Widen `program_id` from VARCHAR(26) to TEXT on every forms-intake
+--          table that references it.
+--
+-- Why this is a real production fix (not a test-only workaround):
+--   The original migration 006 declared `program_id VARCHAR(26)` with the
+--   inline comment "VARCHAR(26) ULID per CDM convention." That comment was
+--   wrong post-v1.10. Master PRD v1.10 §10.5 promoted the program catalog
+--   architecture and TYPES v5.2 §ProgramCatalogEntry now requires the
+--   `pce_`-prefixed identifier convention (`pce_<ULID>`, 4 + 26 = 30 chars).
+--   The VARCHAR(26) ceiling forbids the canonical post-v1.10 identifier
+--   from ever landing in this column — every production INSERT carrying a
+--   real `pce_…` value would fail with the exact error the test suite is
+--   surfacing today: `value too long for type character varying(26)`.
+--
+--   The column inconsistency was masked at v1.0 because pre-v1.10 tests
+--   used short ad-hoc strings, but post-v1.10 admin HTTP fixtures
+--   legitimately need program identifiers like
+--   `prog_dep_http_retire_noactor_<ulid-slice>` (30+ chars) to keep tests
+--   readable AND realistic against the post-v1.10 identifier convention.
+--
+-- Spec references:
+--   - Master PRD v1.10 §10.5 (program catalog architecture; ProgramCatalogEntry
+--     pce_-prefixed identifier).
+--   - Contracts Pack v5.2 TYPES (§ProgramCatalogEntry id format).
+--   - CDM v1.2 §2 — the "VARCHAR(26) ULID" convention applies to ULID-only
+--     identifiers; `program_id` is NOT a bare ULID, it's a typed identifier.
+--   - INVARIANTS v5.2 (no production-data integrity rule mandates a 26-char
+--     ceiling on program_id; the ceiling was an inadvertent CDM-convention
+--     overreach).
+--
+-- Tables affected:
+--   - forms_template.program_id      VARCHAR(26) → TEXT
+--   - forms_deployment.program_id    VARCHAR(26) → TEXT
+--
+-- Related columns NOT touched in this migration (out of scope):
+--   - forms_template.tenant_id (FK to tenants(id) which is itself VARCHAR(26)
+--     per the Telecheck-{country} format — that's the canonical operating-
+--     tenant identifier shape and IS bounded; widening tenant_id would
+--     decouple the FK semantics).
+--   - forms_template.template_id, forms_deployment.deployment_id (these ARE
+--     ULID-typed primary keys; the 26-char ceiling is correct for them).
+--   - created_by, deployed_by, approved_by (tenant_user_id ULIDs; ceiling
+--     correct).
+--   - patient_id (patient ULID; ceiling correct).
+--
+-- Idempotency:
+--   ALTER TABLE … ALTER COLUMN … TYPE TEXT is a no-op if the column is
+--   already TEXT (Postgres doesn't fail on idempotent type changes when the
+--   target type is wider). Safe to re-run via the test setup's auto-discovery.
+--
+-- Rollback: see migrations/rollback/010_program_id_widen_to_text_rollback.sql
+--   (narrows back to VARCHAR(26); will fail at runtime if any row has a
+--   program_id longer than 26 chars — which is the new realistic state, so
+--   rollback is dev-only).
+-- ===========================================================================
+
+ALTER TABLE forms_template
+    ALTER COLUMN program_id TYPE TEXT;
+
+ALTER TABLE forms_deployment
+    ALTER COLUMN program_id TYPE TEXT;
+
+-- ---------------------------------------------------------------------------
+-- Re-validate the constraints + indexes that reference program_id, in case
+-- the type change invalidated any plan-cached identifier:
+--   - uq_template_version covers (tenant_id, program_id, country_of_care,
+--     template_version). Postgres re-validates UNIQUE constraints
+--     automatically on ALTER COLUMN TYPE; no manual REINDEX needed.
+--   - Composite FK on forms_deployment(tenant_id, template_id) → forms_template
+--     does NOT involve program_id, so no FK invalidation risk.
+-- ---------------------------------------------------------------------------

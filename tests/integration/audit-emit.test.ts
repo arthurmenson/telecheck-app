@@ -851,14 +851,25 @@ describe('emitAudit — real-DB persistence', () => {
     // Cast bypasses asTenantId's runtime check on tenant ID format —
     // we want the FK violation to fire at INSERT time, not at glossary
     // validation time.
+    //
+    // Wrap in withTenantContext(TENANT_US) so the RLS WITH CHECK on
+    // audit_records can call `current_tenant_id()` (it requires a live
+    // binding else throws `tenant_context_not_set`). With a binding set
+    // to TENANT_US, the RLS check then sees `tenant_id != current_tenant_id()`
+    // for the bogus row and rejects with `new row violates row-level
+    // security policy`. Codex audit-emit-r1 closure 2026-05-04: prior
+    // version did not set context, so RLS bare-failed on
+    // `tenant_context_not_set` BEFORE the catch could wrap it.
     const bogusTenant = 'Telecheck-XX' as unknown as TenantId;
-    await expect(emitAudit(baseInput({ tenant_id: bogusTenant }), getTx())).rejects.toThrow(
-      // Wrapped error must include action, tenant, and audit_id for
-      // upstream debugging — and must cite the I-003 abort rule.
-      new RegExp(
-        `emitAudit: durable INSERT failed for action "consent_granted".*${bogusTenant}.*I-003 forbids`,
-        's',
-      ),
-    );
+    await withTenantContext(TENANT_US, async () => {
+      await expect(emitAudit(baseInput({ tenant_id: bogusTenant }), getTx())).rejects.toThrow(
+        // Wrapped error must include action, tenant, and audit_id for
+        // upstream debugging — and must cite the I-003 abort rule.
+        new RegExp(
+          `emitAudit: durable INSERT failed for action "consent_granted".*${bogusTenant}.*I-003 forbids`,
+          's',
+        ),
+      );
+    });
   });
 });

@@ -730,12 +730,20 @@ describe('assertAuditChainIntact — broken chain link (HIGH-1 closure)', () => 
       // exactly that as the row's record_hash so the per-record HIGH-2
       // check passes.
       const recordedAt = new Date().toISOString();
+      // The INSERT below does NOT set country_of_care (column defaults to
+      // NULL per migration 002 audit_records schema). The walker recomputes
+      // canonical_hash by reading the row, so its country_of_care input is
+      // NULL. Match here so the per-record HIGH-2 check passes — isolating
+      // the failure to the chain-link check (the actual subject of this test).
+      // (Codex audit-walker-r1 closure 2026-05-04: the prior 'US' literal
+      // here caused the per-record check to fire BEFORE the chain-link
+      // check, so the test asserted the wrong error path.)
       const canonical = await client.query<{ canonical_hex: string }>(
         `SELECT encode(
             audit_records_canonical_hash(
               $1::uuid, $2, 'C', 'standard', 'consent_granted',
               'system', 'sys_broken_test', NULL, NULL,
-              $3, NULL, 'consent_record', $4, 'US', NULL,
+              $3, NULL, 'consent_record', $4, NULL, NULL,
               '{}'::jsonb, decode($5, 'hex'), 2::bigint, $6::timestamptz
             ),
             'hex'
@@ -806,12 +814,16 @@ describe('assertAuditChainIntact — forged genesis (HIGH-1 closure)', () => {
       // Compute canonical record_hash given the forged prev_hash so the
       // per-record HIGH-2 check passes — isolates failure to the
       // genesis-seed check.
+      // Same NULL country_of_care alignment as §5 — the INSERT below
+      // doesn't set country_of_care so the row has NULL there; the
+      // walker recomputes with NULL, this pre-compute must too. (Codex
+      // audit-walker-r1 closure 2026-05-04.)
       const canonical = await client.query<{ canonical_hex: string }>(
         `SELECT encode(
             audit_records_canonical_hash(
               $1::uuid, $2, 'C', 'standard', 'consent_granted',
               'system', 'sys_forged_genesis', NULL, NULL,
-              $3, NULL, 'consent_record', $4, 'US', NULL,
+              $3, NULL, 'consent_record', $4, NULL, NULL,
               '{}'::jsonb, decode($5, 'hex'), 1::bigint, $6::timestamptz
             ),
             'hex'

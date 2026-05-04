@@ -720,15 +720,19 @@ describe('logger singleton — sanity', () => {
   // Diagnostic-only — pino's internal symbol layout is not part of its
   // stable API. Demoted from a contract assertion (which it was in r0)
   // because the production-options assertions above (§2) are the
-  // authoritative proof. Kept as a low-cost smoke check that the
-  // singleton has SOME redact-related plumbing installed.
-  it('DIAGNOSTIC: singleton has at least one redact-related internal symbol', () => {
+  // authoritative proof.
+  //
+  // Skipped 2026-05-04 (Codex CI-r1 closure): pino 9.x stopped exposing a
+  // 'redact'-named symbol on the logger instance — the redaction plumbing
+  // moved to a different internal location that is not stable across pino
+  // versions. The comment above ALREADY instructed "demote to .skip"
+  // when this happens; honoring that contract here. The §2
+  // `buildPinoOptions()` assertions remain the authoritative proof that
+  // redact is wired correctly.
+  it.skip('DIAGNOSTIC: singleton has at least one redact-related internal symbol', () => {
     const redactSymbols = Object.getOwnPropertySymbols(singletonLogger).filter((s) =>
       s.toString().toLowerCase().includes('redact'),
     );
-    // At least one redact-related symbol present. If pino renames its
-    // internals and this fails, demote to .skip — the §2 buildPinoOptions
-    // assertions are the contract.
     expect(redactSymbols.length).toBeGreaterThan(0);
   });
 });
