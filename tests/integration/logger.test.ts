@@ -596,6 +596,71 @@ describe('redactPhiRecursive — direct walker unit tests', () => {
     expect(obj['s']).toBe('string');
     expect(obj['i']).toBe(42);
   });
+
+  // -----------------------------------------------------------------------
+  // Cycle safety (Codex logger-r3 HIGH closure)
+  //
+  // Cyclic payloads must not crash the walker with stack overflow.
+  // Per-call WeakSet tracks visited objects/arrays; re-visited refs
+  // short-circuit. PHI on first-visit paths is still removed.
+  // -----------------------------------------------------------------------
+
+  it('does not throw on a self-cyclic object (obj.self = obj)', () => {
+    const obj: Record<string, unknown> = { ssn: 'should-be-deleted', name: 'Alice' };
+    // Create cycle.
+    obj['self'] = obj;
+    expect(() => redactPhiRecursive(obj)).not.toThrow();
+    // PHI was removed on first visit (before recursing into the cycle).
+    expect(obj).not.toHaveProperty('ssn');
+    expect(obj['name']).toBe('Alice');
+    // Self-reference is preserved (we don't break it; we just don't
+    // recurse into it twice).
+    expect(obj['self']).toBe(obj);
+  });
+
+  it('does not throw on a self-cyclic array', () => {
+    const arr: unknown[] = [];
+    arr.push(arr); // self-reference
+    arr.push({ ssn: 'arr-cycle-ssn' });
+    const obj: Record<string, unknown> = { items: arr };
+    expect(() => redactPhiRecursive(obj)).not.toThrow();
+    // PHI inside the array element was removed.
+    expect(arr[1] as Record<string, unknown>).not.toHaveProperty('ssn');
+  });
+
+  it('does not throw on a cross-reference cycle (a.b = c, c.back = a)', () => {
+    const a: Record<string, unknown> = { ssn: 'a-ssn', label: 'A' };
+    const c: Record<string, unknown> = { ssn: 'c-ssn', label: 'C' };
+    a['b'] = c;
+    c['back'] = a;
+    const root: Record<string, unknown> = { a, c };
+    expect(() => redactPhiRecursive(root)).not.toThrow();
+    // Both PHI fields removed despite the cycle.
+    expect(a).not.toHaveProperty('ssn');
+    expect(c).not.toHaveProperty('ssn');
+    expect(a['label']).toBe('A');
+    expect(c['label']).toBe('C');
+  });
+
+  it('end-to-end via pino: cyclic payload does not crash logging', () => {
+    // Most important assertion: cyclic payload through the actual
+    // pino pipeline doesn't throw. This is the failure mode Codex
+    // r3 surfaced — a logged cyclic object would have crashed the
+    // formatter and dropped the entire log event.
+    const cap = makeCapture();
+    const log = buildLoggerWithProductionOptionsButCapturedDest(cap);
+    const cyclic: Record<string, unknown> = { ssn: 'cyclic-ssn-marker', name: 'Cyclic Ed' };
+    cyclic['self'] = cyclic;
+    expect(() => log.info({ payload: cyclic }, 'cyclic-payload')).not.toThrow();
+    // Pino's own JSON.stringify also handles cycles via its internal
+    // safe-stable-stringify, but we should still verify our walker
+    // didn't leave PHI in place. The cycle reference will appear in
+    // the serialized output as some marker (pino's choice); the SSN
+    // value must NOT.
+    expect(cap.buf.length).toBeGreaterThan(0);
+    const allOutput = cap.buf.join('');
+    expect(allOutput).not.toContain('cyclic-ssn-marker');
+  });
 });
 
 // ---------------------------------------------------------------------------

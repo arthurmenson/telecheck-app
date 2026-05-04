@@ -86,15 +86,29 @@ const PHI_FIELD_SET: ReadonlySet<string> = new Set(PHI_FIELDS);
  * instances (Error, Date, etc.) are NOT walked — they're handled by
  * pino's built-in serializers and class-instance traversal could mutate
  * shared library objects.
+ *
+ * Cycle-safe: tracks visited objects/arrays in a per-call `WeakSet`
+ * so cyclic payloads (`{ self: ... }; obj.self = obj`) don't trigger
+ * stack overflow during the recursion. PHI on first-visit paths is
+ * still removed; revisited references short-circuit. (Closed
+ * 2026-05-04 per Codex logger-r3 HIGH — prior implementation would
+ * `RangeError: Maximum call stack size exceeded` on cyclic log
+ * payloads, dropping the entire log line at serialization time.)
  */
-function walkAndDeletePhi(value: unknown): void {
+function walkAndDeletePhi(value: unknown, seen: WeakSet<object>): void {
   if (value === null || typeof value !== 'object') return;
+  // Cycle short-circuit. Add BEFORE recursing so a self-reference
+  // detected during the walk doesn't infinite-loop.
+  if (seen.has(value as object)) return;
+  seen.add(value as object);
+
   if (Array.isArray(value)) {
-    for (const item of value) walkAndDeletePhi(item);
+    for (const item of value) walkAndDeletePhi(item, seen);
     return;
   }
   // Skip non-plain objects (Error, Date, Buffer, etc.). Plain objects
-  // have Object.prototype as their immediate prototype.
+  // have Object.prototype as their immediate prototype, OR null
+  // (Object.create(null) instances are still "plain" by intent).
   const proto = Object.getPrototypeOf(value as object);
   if (proto !== Object.prototype && proto !== null) return;
 
@@ -103,7 +117,7 @@ function walkAndDeletePhi(value: unknown): void {
     if (PHI_FIELD_SET.has(key)) {
       delete obj[key];
     } else {
-      walkAndDeletePhi(obj[key]);
+      walkAndDeletePhi(obj[key], seen);
     }
   }
 }
@@ -113,10 +127,10 @@ function walkAndDeletePhi(value: unknown): void {
  * serialization to remove PHI keys at any depth. Combined with the
  * fixed-path `redact.paths` config (for credentials under `req.*`),
  * gives unbounded-depth PHI redaction without enumerating per-depth
- * wildcards.
+ * wildcards. Cycle-safe via per-call WeakSet (see walkAndDeletePhi).
  */
 function redactPhiRecursive(obj: Record<string, unknown>): Record<string, unknown> {
-  walkAndDeletePhi(obj);
+  walkAndDeletePhi(obj, new WeakSet<object>());
   return obj;
 }
 
