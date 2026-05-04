@@ -285,6 +285,12 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       payload: { templateId },
     });
 
+    // CI diagnostic: surface the actual 500 body. Remove once green.
+    if (response.statusCode !== 201) {
+      // eslint-disable-next-line no-console
+      console.log(`[DIAG dep-http happy v2] status=${response.statusCode} body=${response.body}`);
+    }
+
     expect(response.statusCode).toBe(201);
     const body = response.json<DeploymentResponseBody>();
     expect(body.deployment_id).toBeDefined();
