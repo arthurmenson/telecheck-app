@@ -17,18 +17,23 @@
  *
  * Coverage in this file:
  *   1. withTenantContext sets context BEFORE calling the callback
- *   2. withTenantContext clears context AFTER the callback (success path)
- *   3. withTenantContext clears context even when the callback THROWS
- *      (the original error must propagate; clear-failure must not mask it)
+ *   2. withTenantContext restores prior context AFTER the callback (success
+ *      path) — or clears if there was no prior context
+ *   3. withTenantContext restores/clears context even when the callback THROWS
+ *      (the original error must propagate; restore/clear failure must not
+ *      mask it)
  *   4. set_tenant_context() failure surfaces immediately (migration 003 not
  *      applied → throws BEFORE the callback runs)
- *   5. clear_tenant_context() failure is intentionally swallowed (monitoring
- *      concern; original callback error wins)
+ *   5. clear_tenant_context() / restore-set failure is intentionally
+ *      swallowed (monitoring concern; original callback error wins)
  *   6. callback receives the SAME client passed in (not a new connection)
  *   7. assertRlsActive throws when no context is set
  *   8. assertRlsActive succeeds when context is set
  *   9. Real-DB integration: full round-trip via getTestClient — set / read
  *      back via current_tenant_id() / clear / read again should be null
+ *  10. NESTED RESTORE (Codex rls-r1 HIGH closure): inner withTenantContext
+ *      exits and outer binding is RESTORED; outermost exit clears; inner
+ *      error still restores outer binding before propagating
  *
  * Spec references:
  *   - I-023 (three-layer tenant isolation; this is the DB layer)
@@ -271,15 +276,17 @@ describe('withTenantContext — real DB round-trip via shared client', () => {
     expect(result.rows[0]?.tid ?? null).toBeNull();
   });
 
-  it('switches context atomically — Ghana context inside a US-context callback is fully replaced', async () => {
+  it('NESTED RESTORE — inner Ghana context exits and outer US context is RESTORED (I-023 safety)', async () => {
+    // Closed 2026-05-03 per Codex rls-r1 HIGH (verify-r2): the prior version
+    // of this test pinned a BUG — that the inner clear unconditionally
+    // cleared the outer binding. That left outer-scope queries running
+    // with no RLS context, a direct I-023 floor violation. The fix is
+    // save/restore: read the current binding before set, and on exit either
+    // restore it (if there was one) or clear (if there wasn't).
     const client = getTestClient() as unknown as DbClient;
     let observedInner: string | null = null;
     let observedAfterInner: string | null = null;
     await withTenantContext(client, TENANT_US, async (cOuter) => {
-      // Nested withTenantContext for Ghana — the inner clear MUST clear the
-      // outer's binding too because clear is unconditional. Pinning this
-      // behavior so anyone tempted to "preserve outer context on inner clear"
-      // breaks the test (the contract is: clear ALWAYS clears).
       await withTenantContext(cOuter, TENANT_GHANA, async (cInner) => {
         const r = (await cInner.query('SELECT current_tenant_id() AS tid')) as {
           rows: Array<{ tid: string | null }>;
@@ -292,11 +299,50 @@ describe('withTenantContext — real DB round-trip via shared client', () => {
       observedAfterInner = r2.rows[0]?.tid ?? null;
     });
     expect(observedInner).toBe(TENANT_GHANA);
-    // Pinning current behavior: after the inner withTenantContext exits,
-    // current_tenant_id() is null (the outer's set was overwritten by the
-    // inner's set, and the inner's clear cleared it). Anyone wanting nested
-    // tenant contexts to behave like a stack must implement that explicitly.
-    expect(observedAfterInner).toBeNull();
+    // Outer context MUST be restored after inner exit. Anything else
+    // (null OR Ghana) is an I-023 violation — outer-scope queries would
+    // run unfiltered.
+    expect(observedAfterInner).toBe(TENANT_US);
+  });
+
+  it('NESTED RESTORE — outer scope final clear leaves no binding (return to no-context after both exits)', async () => {
+    // After BOTH the inner and outer withTenantContext exit, there should be
+    // no tenant context set (the outermost call started with no prior
+    // binding, so save/restore correctly returns to "no binding" at the
+    // outermost exit).
+    const client = getTestClient() as unknown as DbClient;
+    await withTenantContext(client, TENANT_US, async (cOuter) => {
+      await withTenantContext(cOuter, TENANT_GHANA, async () => {
+        // empty
+      });
+    });
+    const result = (await client.query('SELECT current_tenant_id() AS tid')) as {
+      rows: Array<{ tid: string | null }>;
+    };
+    expect(result.rows[0]?.tid ?? null).toBeNull();
+  });
+
+  it('NESTED RESTORE — error in inner scope still restores outer binding', async () => {
+    // Belt-and-suspenders for the finally branch: an inner-scope error
+    // must NOT leave the connection without the outer binding. The outer
+    // try/catch can keep doing PHI-safe work after it observes/handles
+    // the inner failure.
+    const client = getTestClient() as unknown as DbClient;
+    let observedAfterError: string | null = null;
+    await withTenantContext(client, TENANT_US, async (cOuter) => {
+      try {
+        await withTenantContext(cOuter, TENANT_GHANA, async () => {
+          throw new Error('inner boom');
+        });
+      } catch {
+        // outer scope handles inner error
+      }
+      const r = (await cOuter.query('SELECT current_tenant_id() AS tid')) as {
+        rows: Array<{ tid: string | null }>;
+      };
+      observedAfterError = r.rows[0]?.tid ?? null;
+    });
+    expect(observedAfterError).toBe(TENANT_US);
   });
 });
 

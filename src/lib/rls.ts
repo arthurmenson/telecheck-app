@@ -86,6 +86,20 @@ export async function withTenantContext<T>(
   tenantId: string,
   fn: (client: DbClient) => Promise<T>,
 ): Promise<T> {
+  // SAVE the current binding (if any) so nested calls restore correctly on
+  // exit. Without this save/restore step, an inner withTenantContext exit
+  // would unconditionally clear the outer binding — leaving any subsequent
+  // queries in the outer scope running with NO RLS context. That is a
+  // direct I-023 floor violation: an outer-scope SELECT after an inner
+  // operation would either fail closed (if RLS denies tenant_id NULL) or
+  // worse, run unfiltered if the test/dev RLS posture differs from prod.
+  //
+  // Closed 2026-05-03 per Codex rls-r1 HIGH (verify-r2). Prior implementation
+  // unconditionally cleared on exit; the new save/restore preserves outer-
+  // scope RLS context across nested withTenantContext calls on the same
+  // client.
+  const previous = await readCurrentTenantId(client);
+
   // Establish the tenant context binding via migration 003's
   // set_tenant_context() SECURITY DEFINER function. The binding is keyed
   // on pg_backend_pid() and stored in the private _session_tenant_context
@@ -98,19 +112,45 @@ export async function withTenantContext<T>(
   try {
     result = await fn(client);
   } finally {
-    // Always clear the binding after the callback, even on error. Prevents
-    // cross-request tenant leakage on pooled connections. Belt-and-suspenders:
-    // the binding has a 5-minute TTL on the DB side, but explicit cleanup
-    // shortens the leak window for crashes.
-    // Fire-and-forget — if cleanup fails, log and continue (the original
-    // error from `fn` is more important to surface).
-    await client.query('SELECT clear_tenant_context()', []).catch(() => {
-      // Intentional: swallow clear-error to avoid masking the original error.
-      // Monitoring should alert on repeated clear failures as a pool-leak signal.
-    });
+    // RESTORE the prior binding so a wrapping outer scope keeps its RLS
+    // context. If there was no prior binding, clear instead. Belt-and-
+    // suspenders against pool-leak: the binding has a 5-minute TTL on the
+    // DB side, but explicit restore/clear shortens the leak window for
+    // crashes AND keeps outer-scope queries correct.
+    //
+    // Fire-and-forget — if restore/clear fails, swallow so the original
+    // error from `fn` still surfaces. Monitoring should alert on repeated
+    // failures as a pool-leak signal.
+    if (previous !== null) {
+      await client.query('SELECT set_tenant_context($1)', [previous]).catch(() => {
+        // Intentional swallow.
+      });
+    } else {
+      await client.query('SELECT clear_tenant_context()', []).catch(() => {
+        // Intentional swallow.
+      });
+    }
   }
 
   return result;
+}
+
+/**
+ * Read the current tenant binding (if any) for save/restore in withTenantContext.
+ * Returns null if no binding is set OR if the SELECT fails (treats failure as
+ * "no prior binding to restore" — the subsequent set will install our binding
+ * either way; the only loss is outer-scope nested context, which is acceptable
+ * compared to the alternative of failing the whole `withTenantContext` call).
+ */
+async function readCurrentTenantId(client: DbClient): Promise<string | null> {
+  try {
+    const result = (await client.query('SELECT current_tenant_id() AS tid', [])) as {
+      rows: Array<{ tid: string | null }>;
+    };
+    return result.rows[0]?.tid ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
