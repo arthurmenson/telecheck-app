@@ -256,10 +256,22 @@ CREATE POLICY tenant_isolation ON accounts
 -- Keeps updated_at honest without requiring every UPDATE to set it explicitly.
 -- ---------------------------------------------------------------------------
 
+-- Use clock_timestamp() rather than NOW()/transaction_timestamp() so the
+-- column advances on EVERY update, even when a transaction issues
+-- INSERT then UPDATE on the same row (NOW() returns the transaction-
+-- start timestamp; clock_timestamp() returns wall-clock time at call).
+-- This matters for:
+--   1. Test environments using savepoint-wrapped transactions where
+--      INSERT and UPDATE share a transaction.
+--   2. Service-layer code that mutates a freshly-inserted row inside
+--      the same business transaction (e.g., status flip + audit emit).
+-- The DEFAULT NOW() on the column itself is preserved so created_at ==
+-- updated_at on a fresh INSERT (both fire from the same transaction
+-- timestamp); the asymmetry is intentional.
 CREATE OR REPLACE FUNCTION accounts_set_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
-    NEW.updated_at := NOW();
+    NEW.updated_at := clock_timestamp();
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
