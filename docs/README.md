@@ -54,12 +54,27 @@ Anything that becomes canonical guidance gets promoted **to the spec repo** via 
 
 ```
 docs/
-├── README.md            # this file
-├── build-sequence.md    # (filled in by Plan agent) concrete sprint-to-task mapping
-├── onboarding.md        # (added when first slice begins) local dev setup
-└── adr-local/           # (optional) repo-local ADRs covering pure-implementation decisions
-                         # that don't rise to platform-architecture level
+├── README.md                                  # this file
+├── IDENTITY_SLICE_STATUS_2026-05-05.md        # Slice 2 (Identity + JWT) handoff
+├── CONSENT_SLICE_STATUS_2026-05-05.md         # Slice 3 (Consent + Delegation) handoff
+├── SI-001-MedicationRequest-Schema-Gap.md     # Open Spec Issue blocking Slice 4
+├── build-sequence.md                          # (filled in by Plan agent) concrete sprint-to-task mapping
+├── onboarding.md                              # (added when first slice begins) local dev setup
+└── adr-local/                                 # (optional) repo-local ADRs covering pure-implementation
+                                               # decisions that don't rise to platform-architecture level
 ```
+
+## Implementation status (post-Consent-slice landing)
+
+| Slice (per EHBG §10b)            | Status                     | Pointer                                                         |
+| -------------------------------- | -------------------------- | --------------------------------------------------------------- |
+| Slice 1 — Forms-Intake v2.1      | ✅ Implementation-complete | (status doc not authored — see git log + tests/forms-intake-\*) |
+| Slice 2 — Identity & Auth + JWT  | ✅ Implementation-complete | `IDENTITY_SLICE_STATUS_2026-05-05.md`                           |
+| Slice 3 — Consent + Delegation   | ✅ Implementation-complete | `CONSENT_SLICE_STATUS_2026-05-05.md`                            |
+| Slice 4 — Pharmacy + Refill v2.1 | ⛔ Blocked on **SI-001**   | `SI-001-MedicationRequest-Schema-Gap.md`                        |
+| Slices 5-17                      | Not started                | per EHBG §10b sprint plan                                       |
+
+**Cross-cutting hardening landed alongside Slice 3:** cross-tenant isolation tests for consent + delegation services (I-023 / I-024 / I-025); I-025 tenant-blindness regression for HTTP error envelopes; full HTTP coverage of all 12 routes mounted under `/v0/consent`; service-layer direct integration tests for both consent-service and delegation-service.
 
 ## When in doubt
 
