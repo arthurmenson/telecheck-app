@@ -147,6 +147,13 @@ const ConfigSchema = z.object({
   // KMS — dev-only local key; prod uses AWS KMS via `kmsKeyAlias` from tenants table
   TENANT_KMS_LOCAL_DEV_KEY: z.string().optional(),
 
+  // JWT signing key for Identity slice access tokens (HMAC-SHA256 at v1.0;
+  // RSA/ECDSA upgrade lands when key rotation infrastructure is wired).
+  // Required in production; tests/dev fall back to a deterministic stub.
+  // The signing key is platform-wide (not per-tenant) — JWT issuance + verify
+  // happens at the platform plane; tenant_id is a CLAIM inside the JWT body.
+  JWT_SIGNING_KEY: z.string().optional(),
+
   // AI providers (per ADR-020 multi-provider abstraction)
   ANTHROPIC_API_KEY: z.string().optional(),
   ANTHROPIC_MODEL: z.string().default('claude-opus-4-5-20250929'),
@@ -262,6 +269,25 @@ function loadConfig() {
       'dev-resume-token-secret-not-for-production-use-32chars-min-padding-padding';
   }
 
+  // JWT signing key resolution. Mirror of the resume-token pattern:
+  // production fail-closed on missing/short keys; dev/test get a
+  // deterministic default. Identity Spec v1.0 §3.3: access tokens are
+  // JWTs; signing key strength directly bounds session security.
+  let jwtSigningKey = parsed.JWT_SIGNING_KEY ?? '';
+  if (parsed.NODE_ENV === 'production') {
+    if (jwtSigningKey.length < 32) {
+      throw new Error(
+        'JWT_SIGNING_KEY must be set to a value of at least 32 characters in production. ' +
+          'Identity slice access tokens are HMAC-signed JWTs per Identity Spec §3.3; ' +
+          'a missing or weak signing key undermines session integrity. ' +
+          'Generate with: openssl rand -base64 48',
+      );
+    }
+  } else if (jwtSigningKey.length === 0) {
+    // Deterministic dev/test default.
+    jwtSigningKey = 'dev-jwt-signing-key-not-for-production-use-32chars-min-padding-padding';
+  }
+
   return {
     nodeEnv: parsed.NODE_ENV,
     port: parsed.PORT,
@@ -272,6 +298,7 @@ function loadConfig() {
     dbSslMode: parsed.DATABASE_SSL_MODE,
     redisUrl: parsed.REDIS_URL,
     tenantKmsLocalDevKey: parsed.TENANT_KMS_LOCAL_DEV_KEY,
+    jwtSigningKey,
     anthropicApiKey: parsed.ANTHROPIC_API_KEY,
     anthropicModel: parsed.ANTHROPIC_MODEL,
     aws: {
