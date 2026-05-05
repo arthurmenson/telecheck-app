@@ -104,7 +104,7 @@ async function findOutboxEvent(
     `SELECT event_type, aggregate_type, aggregate_id, tenant_id, payload, partition_key
        FROM domain_events_outbox
       WHERE tenant_id = $1 AND event_type = $2 AND aggregate_id = $3
-      ORDER BY emitted_at DESC LIMIT 1`,
+      ORDER BY created_at DESC LIMIT 1`,
     [tenantId, eventType, aggregateId],
   );
   return r.rows[0] ?? null;
