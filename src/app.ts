@@ -22,6 +22,7 @@ import fastifySensible from '@fastify/sensible';
 import Fastify, { type FastifyInstance } from 'fastify';
 
 import { aiContextPlugin } from './lib/ai-context.js';
+import { authContextPlugin } from './lib/auth-context.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
@@ -107,10 +108,18 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     ],
   });
 
-  // 5. Idempotency — tenant-scoped per IDEMPOTENCY v5.1
+  // 5. Auth context — JWT verification populates req.actorContext when
+  //    a valid Bearer token is present. Fail-soft: missing / invalid
+  //    token leaves actorContext undefined (handlers that require auth
+  //    use requireActorContext() to enforce). Replaces the pre-auth
+  //    x-actor-id / x-patient-id header stubs gated by
+  //    ALLOW_ACTOR_HEADER_AUTH.
+  await app.register(authContextPlugin);
+
+  // 6. Idempotency — tenant-scoped per IDEMPOTENCY v5.1
   await app.register(idempotencyPlugin);
 
-  // 6. AI context decorator — opt-in per route handler
+  // 7. AI context decorator — opt-in per route handler
   await app.register(aiContextPlugin);
 
   // ----------------------------------------------------------
