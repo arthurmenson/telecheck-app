@@ -14,6 +14,7 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { getMyAccountHandler } from './internal/handlers/accounts.js';
 import {
   listDevicesHandler,
   registerDeviceHandler,
@@ -91,4 +92,15 @@ export const registerIdentityRoutes: FastifyPluginAsync = async (
   app.post('/devices', registerDeviceHandler);
   app.get('/devices', listDevicesHandler);
   app.delete('/devices/:deviceId', revokeDeviceHandler);
+
+  /**
+   * Account self-read — returns the calling patient's own account.
+   *
+   *   GET /accounts/me
+   *     Headers: x-account-id (stub at v1.0; replaced by JWT)
+   *
+   * Tenant-blind 404 if account doesn't exist or is in another tenant
+   * (I-025).
+   */
+  app.get('/accounts/me', getMyAccountHandler);
 };
