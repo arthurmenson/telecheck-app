@@ -31,6 +31,7 @@ import { formsIntakePlugin } from './modules/forms-intake/index.js';
 import { identityPlugin } from './modules/identity/plugin.js';
 import { medInteractionPlugin } from './modules/med-interaction/index.js';
 import { pharmacyPlugin } from './modules/pharmacy/plugin.js';
+import { subscriptionPlugin } from './modules/subscription/index.js';
 import { tenantConfigPlugin } from './modules/tenant-config/plugin.js';
 
 export interface AppOptions {
@@ -115,6 +116,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/pharmacy/ready',
       '/v0/med-interaction/health',
       '/v0/med-interaction/ready',
+      '/v0/subscription/health',
+      '/v0/subscription/ready',
       '/v0/admin/ready',
     ],
   });
@@ -180,6 +183,14 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // Platform-floor hard rule: the interaction engine runs BEFORE clinician
   // commits a prescription (Master PRD v1.10 §7).
   await app.register(medInteractionPlugin);
+
+  // Subscription — routes mounted under /v0/subscription.
+  // SKELETON ONLY at v0.1: only /health (200) + /ready (503) are mounted;
+  // full implementation (POST /subscriptions, PATCH .../pause|resume|cancel|switch
+  // + state machine + Pharmacy + Payment adapter wiring) is BLOCKED on
+  // SI-001 (MedicationRequest schema gap — Subscription binds via
+  // medication_request_id). See src/modules/subscription/README.md.
+  await app.register(subscriptionPlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
