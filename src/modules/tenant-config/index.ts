@@ -28,6 +28,11 @@ export type {
 
 export { asCountryCode, asCcrConfigId } from './internal/types.js';
 
+// Canonical CCR key constants per Contracts Pack v5.2 CCR_RUNTIME.
+// Use these instead of hardcoded literals to avoid typos that silently
+// return null from the resolver.
+export { CCR_KEYS, type CcrKey } from './internal/ccr-keys.js';
+
 // CCR resolver — canonical CCR key lookup
 export {
   resolveCcrKey,
