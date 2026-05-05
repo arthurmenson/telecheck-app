@@ -229,4 +229,121 @@ describe('consent slice — §1 domain-event emission', () => {
     expect(event!.payload['delegation_id']).toBe(invited.delegation_id);
     expect(event!.payload['grantor_account_id']).toBe(grantor);
   });
+
+  it('§1e declineDelegation emits delegation.declined in outbox', async () => {
+    const grantor = await seedAccount();
+    const delegate = await seedAccount();
+    const invited = await withTenantContext(T_US, () =>
+      delegationService.inviteDelegate(
+        US_CTX,
+        { actorId: 'op_evt_1e' },
+        {
+          grantor_account_id: grantor,
+          delegate_account_id: delegate,
+          relationship_type: 'spouse_partner',
+        },
+        getTestClient(),
+      ),
+    );
+    await withTenantContext(T_US, () =>
+      delegationService.declineDelegation(
+        US_CTX,
+        { actorId: 'op_evt_1e' },
+        invited.delegation_id,
+        getTestClient(),
+      ),
+    );
+
+    const event = await findOutboxEvent(T_US, 'delegation.declined', invited.delegation_id);
+    expect(event).not.toBeNull();
+    expect(event!.payload['delegation_id']).toBe(invited.delegation_id);
+  });
+
+  it('§1f revokeDelegation emits delegation.revoked in outbox', async () => {
+    const grantor = await seedAccount();
+    const delegate = await seedAccount();
+    const invited = await withTenantContext(T_US, () =>
+      delegationService.inviteDelegate(
+        US_CTX,
+        { actorId: 'op_evt_1f' },
+        {
+          grantor_account_id: grantor,
+          delegate_account_id: delegate,
+          relationship_type: 'spouse_partner',
+        },
+        getTestClient(),
+      ),
+    );
+    await withTenantContext(T_US, () =>
+      delegationService.acceptDelegation(
+        US_CTX,
+        { actorId: 'op_evt_1f' },
+        invited.delegation_id,
+        getTestClient(),
+      ),
+    );
+    await withTenantContext(T_US, () =>
+      delegationService.revokeDelegation(
+        US_CTX,
+        { actorId: 'op_evt_1f' },
+        invited.delegation_id,
+        'patient_initiated',
+        getTestClient(),
+      ),
+    );
+
+    const event = await findOutboxEvent(T_US, 'delegation.revoked', invited.delegation_id);
+    expect(event).not.toBeNull();
+    expect(event!.payload['revoked_reason']).toBe('patient_initiated');
+  });
+
+  it('§1g grantScope + revokeScope emit delegation.scope_granted + scope_revoked', async () => {
+    const grantor = await seedAccount();
+    const delegate = await seedAccount();
+    const invited = await withTenantContext(T_US, () =>
+      delegationService.inviteDelegate(
+        US_CTX,
+        { actorId: 'op_evt_1g' },
+        {
+          grantor_account_id: grantor,
+          delegate_account_id: delegate,
+          relationship_type: 'spouse_partner',
+        },
+        getTestClient(),
+      ),
+    );
+    const granted = await withTenantContext(T_US, () =>
+      delegationService.grantScope(
+        US_CTX,
+        { actorId: 'op_evt_1g', grantorAccountId: grantor },
+        { delegation_id: invited.delegation_id, scope: 'view_records' },
+        getTestClient(),
+      ),
+    );
+
+    const grantedEv = await findOutboxEvent(
+      T_US,
+      'delegation.scope_granted',
+      granted.delegation_scope_id,
+    );
+    expect(grantedEv).not.toBeNull();
+    expect(grantedEv!.aggregate_type).toBe('delegation_scope');
+    expect(grantedEv!.payload['scope']).toBe('view_records');
+
+    await withTenantContext(T_US, () =>
+      delegationService.revokeScope(
+        US_CTX,
+        { actorId: 'op_evt_1g', grantorAccountId: grantor },
+        granted.delegation_scope_id,
+        getTestClient(),
+      ),
+    );
+    const revokedEv = await findOutboxEvent(
+      T_US,
+      'delegation.scope_revoked',
+      granted.delegation_scope_id,
+    );
+    expect(revokedEv).not.toBeNull();
+    expect(revokedEv!.payload['scope']).toBe('view_records');
+  });
 });
