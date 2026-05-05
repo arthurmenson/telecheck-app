@@ -249,13 +249,16 @@ describe('I-023 RLS policy coverage lockdown — §3 platform-level tables stay 
           WHERE relname = $1`,
         [tableName],
       );
-      // The table must exist (skip if migrations haven't applied yet)
-      if (r.rows.length === 0) {
-        // Don't soft-fail in production — this should be a hard skip
-        // condition only on a fresh DB before migrations run, which
-        // shouldn't happen in CI but might happen in local dev.
-        return;
-      }
+      // Platform-level tables MUST exist in any post-migration DB state
+      // (they're created by migrations 001 + later). If absent, the
+      // migration environment is broken — fail HARD rather than soft-skip.
+      // Codex rls-policy-r1 MEDIUM closure 2026-05-05: prior version
+      // returned early on `r.rows.length === 0`, which would silently
+      // pass §3 against any catalog-backed contract failure where the
+      // lookup table wasn't created. A "schema drift / migrations not
+      // applied" CI path would have reported false-green on the whole
+      // platform-level exclusion section.
+      expect(r.rows.length).toBe(1);
       // Platform-level tables MUST NOT have RLS enabled. If a future
       // migration accidentally turns it on, this test fires.
       expect(r.rows[0]?.relrowsecurity).toBe(false);
