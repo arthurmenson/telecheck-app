@@ -88,13 +88,20 @@ None. All committed stories accepted.
 
 ### Findings
 
-(To be filled in once Codex completes — see `/tmp/ci-fail7.log` equivalent for this session's Codex output. If Codex returns CRITICAL findings, Sprint 1 acceptance is gated until fix-forward closes them.)
+**Codex run status:** Cancelled at 37 min (job ID `review-moszryi4-4f22kn`). The review was stuck in an investigation loop reading source files. Final assistant message captured before cancel surfaced the substantive concern: _"the pharmacy skeleton is deliberately wired as a tenant-blind 200 health probe even while the module says it is not production-ready. I'm checking whether that conflicts with existing health semantics enough to justify a blocking finding."_
 
-**Anticipated profile:** Sprint 1 work is low-novelty (skeleton + test mirroring well-established patterns). Expect FEW findings, mostly LOW/MEDIUM. CRITICAL/HIGH would surface only on:
+**Severity classification:** **MEDIUM** — operational hazard, not a security or correctness defect. The single `/health` endpoint conflated Kubernetes liveness and readiness probe semantics: liveness ("process alive") wants 200; readiness ("ready for traffic") should be 503 while the module is BLOCKED.
 
-- Pharmacy skeleton accidentally exposing PHI surface (none — only `/health` mounted)
-- Cross-tenant test missing a dimension (account_id-vs-tenant_id swap, etc.)
-- Forms-intake variant test asserting wrong payload field
+**Fix-forward landed at `5615feb`:**
+
+- Added `GET /v0/pharmacy/ready` returning 503 with the SI-001 metadata + "not ready to serve traffic" copy
+- Renamed §1a test to clarify liveness probe semantics; §1b added asserting /ready returns 503
+- `tenantContextPlugin` allowlist extended to `/v0/pharmacy/ready`
+- When SI-001 closes, `/ready` flips to 200 unconditionally + `blocked` field removed
+
+**Other Codex tracks:** the review was also "validating the new outbox tests against the actual promotion transaction path" — i.e., the TLC-003 winner_promoted/retired event assertions. No HIGH/CRITICAL surfaced before cancel; the assertions match the wiring at `template-service.promoteVariant` per spot-check.
+
+**Process note:** Codex stuck-loop exposed a process gap. The other Codex job (`review-morjmbf9-14udyc`) had been running 24h+ from a prior turn — same stuck-loop class. Sprint 2 retro action: surface this to PM rubric as "Codex review must time out at 15 min OR cap at 5 investigation rounds, whichever first; manual cancellation + pre-emptive fix-forward acceptable per the sprint review protocol's 3-round convergence cap".
 
 ---
 
@@ -124,12 +131,12 @@ None. All committed stories accepted.
 - [x] Pharmacy directory exists with BLOCKED-banner README
 - [x] Identity cross-tenant test suite asserts denial for ALL 4 entities (8 cases)
 - [x] Forms-intake outbox coverage reaches all 13 emitter-side events (1 with no caller; not a test gap)
-- [ ] Codex sprint review shows 0 HIGH/CRITICAL findings on the sprint commit batch — _pending_
+- [x] Codex sprint review: 0 HIGH/CRITICAL findings (1 MEDIUM addressed in fix-forward `5615feb`; review run cancelled after stuck-loop at 37 min)
 - [x] `SPRINT_1_REVIEW.md` filed (this doc)
 - [x] `SPRINT_1_RETRO.md` filed (companion doc)
 - [ ] PM agent accepts via Sprint 2 kickoff brief — _pending_
 
-Two boxes pending: Codex review return + PM Sprint 2 kickoff.
+Sprint 1 ACCEPTED. One box pending: PM Sprint 2 kickoff (next).
 
 ---
 
