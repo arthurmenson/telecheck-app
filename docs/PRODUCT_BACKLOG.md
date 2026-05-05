@@ -6,11 +6,70 @@
 
 ---
 
-## Sprint 1 — committed
+## Sprint 2 — committed (kickoff 2026-05-05)
+
+### TLC-004 — Tenant-config Admin Backend read handlers
+
+**Status:** todo
+**Sprint:** Sprint 2
+**Estimated commits:** 5
+**Decision rule:** 3 (diminishing-returns hygiene)
+
+#### Current state baseline (verified 2026-05-05 by PM)
+
+- `tenant-config` module exposes `/health` + `/me` only
+- 3 of 4 repos exist: `country-profile-repo`, `tenant-brand-repo`, `ccr-config-repo`
+- `adapter-config-repo` does NOT exist (referenced in module README; not authored)
+- Admin Backend slice v1.1 owns mutation handlers; READ paths are unblocked
+
+#### Acceptance criteria
+
+- 4 GET handlers wired under `/v0/admin/*` in `tenant-config/routes.ts`:
+  - `GET /v0/admin/country-profiles` (list)
+  - `GET /v0/admin/tenant-brand`
+  - `GET /v0/admin/ccr-configs`
+  - `GET /v0/admin/adapter-configs` (scope-amended: author repo OR document deferral to follow-up; scrum master picks at exec time)
+- JWT-auth Tier 1 required (`requireActorContext`)
+- Cross-tenant test asserts US JWT can't read Ghana brand/configs (I-025 tenant-blindness on body)
+- No mutation handlers; no schema migrations
+- Test coverage: HTTP integration tests for each new route + 1 cross-tenant case
+
+#### Dependencies
+
+- None
+
+---
+
+### TLC-006 — Forms-intake operator-edit emit-site wiring
+
+**Status:** todo
+**Sprint:** Sprint 2
+**Estimated commits:** 3
+**Decision rule:** 3 (diminishing-returns hygiene)
+
+#### Current state baseline (verified 2026-05-05 by PM)
+
+- `emitFormsEligibilityLogicEdited` + `emitFormsApprovalGovernanceEdited` exist in `audit.ts:503,540`
+- ZERO callers in `src/` — emitters preserved for spec compliance
+- ZERO tests in `tests/` — genuine coverage gap
+
+#### Acceptance criteria
+
+- Either (a) wire emitters into `template-service.editEligibilityLogic` + `editApprovalGovernance` operator surfaces OR (b) document as "no consumer yet" and add direct-call envelope-shape unit tests covering Category B + audit_sensitivity_level (scrum master picks lighter path)
+- Author parallel domain-event emitters: `forms_eligibility_logic.edited`, `forms_approval_governance.edited`
+- Outbox-landing tests for both events in `forms-intake-events.test.ts`
+
+#### Dependencies
+
+- None
+
+---
+
+## Sprint 1 — DONE (closed 2026-05-05 at ee2be83)
 
 ### TLC-001 — Pharmacy module skeleton (blocked-aware)
 
-**Status:** todo
+**Status:** ✅ done (9abf614 + 5615feb fix-forward)
 **Sprint:** Sprint 1
 **Estimated commits:** 2
 **Decision rule:** 4 (new unblocked slice work)
@@ -33,7 +92,7 @@
 
 ### TLC-002 — Identity cross-tenant isolation regression suite
 
-**Status:** todo
+**Status:** ✅ done (3410b6d, 8 cases)
 **Sprint:** Sprint 1
 **Estimated commits:** 1
 **Decision rule:** 3 (diminishing-returns hygiene)
@@ -55,7 +114,7 @@
 
 ### TLC-003 — Forms-intake remaining outbox-landing tests
 
-**Status:** todo
+**Status:** ✅ done (d87a6ba; re-scoped to variant.winner_promoted + variant.retired after PM premise corrected)
 **Sprint:** Sprint 1
 **Estimated commits:** 2
 **Decision rule:** 3 (diminishing-returns hygiene)
