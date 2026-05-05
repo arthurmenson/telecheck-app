@@ -15,6 +15,11 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import {
+  listDevicesHandler,
+  registerDeviceHandler,
+  revokeDeviceHandler,
+} from './internal/handlers/devices.js';
+import {
   loginStartHandler,
   loginVerifyHandler,
   sessionLogoutHandler,
@@ -72,4 +77,18 @@ export const registerIdentityRoutes: FastifyPluginAsync = async (
   app.post('/login/verify', loginVerifyHandler);
   app.post('/sessions/refresh', sessionRefreshHandler);
   app.post('/sessions/logout', sessionLogoutHandler);
+
+  /**
+   * Device management per Identity Spec v1.0 §3.1 (biometric unlock) +
+   * §3.4 (multi-device cap).
+   *
+   *   POST   /devices                  — register a new device for an
+   *                                      account (auto-evicts oldest
+   *                                      when account is at the 3-cap)
+   *   GET    /devices?account_id=<id>  — list active devices
+   *   DELETE /devices/:deviceId        — revoke (patient_unregistered)
+   */
+  app.post('/devices', registerDeviceHandler);
+  app.get('/devices', listDevicesHandler);
+  app.delete('/devices/:deviceId', revokeDeviceHandler);
 };
