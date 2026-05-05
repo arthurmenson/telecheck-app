@@ -59,6 +59,7 @@ docs/
 ├── IDENTITY_SLICE_STATUS_2026-05-05.md        # Slice 2 (Identity + JWT) handoff
 ├── CONSENT_SLICE_STATUS_2026-05-05.md         # Slice 3 (Consent + Delegation) handoff
 ├── SI-001-MedicationRequest-Schema-Gap.md     # Open Spec Issue blocking Slice 4
+├── SI-002-AUDIT_EVENTS-Placeholder-Ratification.md  # Open SI — 31 placeholder action IDs
 ├── build-sequence.md                          # (filled in by Plan agent) concrete sprint-to-task mapping
 ├── onboarding.md                              # (added when first slice begins) local dev setup
 └── adr-local/                                 # (optional) repo-local ADRs covering pure-implementation
