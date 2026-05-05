@@ -41,7 +41,7 @@ afterAll(async () => {
 });
 
 describe('pharmacy slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/pharmacy/health returns BLOCKED state with SI-001 reference', async () => {
+  it('§1a GET /v0/pharmacy/health returns 200 (liveness — module alive) with SI-001 metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/pharmacy/health',
@@ -57,8 +57,26 @@ describe('pharmacy slice — §1 plugin wiring', () => {
     expect(body.status).toBe('ok');
     expect(body.module).toBe('pharmacy');
     expect(body.blocked).toBe('SI-001');
-    // The blocked_message points operator monitoring at the SI doc.
     expect(body.blocked_message).toContain('SI-001');
     expect(body.blocked_message).toContain('MedicationRequest');
+  });
+
+  it('§1b GET /v0/pharmacy/ready returns 503 (not ready for traffic) while SI-001 open', async () => {
+    const r = await app!.inject({
+      method: 'GET',
+      url: '/v0/pharmacy/ready',
+      headers: { host: 'localhost' },
+    });
+    expect(r.statusCode).toBe(503);
+    const body = r.json<{
+      status: string;
+      module: string;
+      blocked: string;
+      blocked_message: string;
+    }>();
+    expect(body.status).toBe('not_ready');
+    expect(body.module).toBe('pharmacy');
+    expect(body.blocked).toBe('SI-001');
+    expect(body.blocked_message).toContain('not ready to serve traffic');
   });
 });

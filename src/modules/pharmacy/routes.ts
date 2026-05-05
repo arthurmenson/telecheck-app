@@ -16,10 +16,9 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 export const registerPharmacyRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
-  // Health probe — allowlisted in tenantContextPlugin so it works
-  // without tenant binding. Returns the BLOCKED state explicitly so
-  // operator monitoring distinguishes "module up" (200) from "module
-  // ready for production" (which it is NOT until SI-001 closes).
+  // Liveness probe — process is alive. Returns 200 always (module is
+  // running), with `blocked: 'SI-001'` carried as informational metadata
+  // for operator monitoring. Allowlisted in tenantContextPlugin.
   app.get('/health', async () => ({
     status: 'ok',
     module: 'pharmacy',
@@ -28,6 +27,26 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
       'MedicationRequest schema not yet ratified in CDM v1.2 §4. ' +
       'See docs/SI-001-MedicationRequest-Schema-Gap.md.',
   }));
+
+  // Readiness probe — module is READY to serve traffic. Returns 503
+  // while SI-001 is open: the module is intentionally not production-
+  // ready, so a Kubernetes/load-balancer readiness probe will keep
+  // traffic away from this module's real routes (which don't exist
+  // yet). Distinguishes liveness ("process up") from readiness
+  // ("traffic-acceptable") per the canonical k8s pattern.
+  //
+  // When SI-001 closes and the real handler surface lands, this returns
+  // 200 unconditionally + the blocked field is removed.
+  app.get('/ready', async (_req, reply) => {
+    return reply.code(503).send({
+      status: 'not_ready',
+      module: 'pharmacy',
+      blocked: 'SI-001',
+      blocked_message:
+        'Module is not ready to serve traffic — MedicationRequest schema ' +
+        'not yet ratified in CDM v1.2 §4. See docs/SI-001-MedicationRequest-Schema-Gap.md.',
+    });
+  });
 
   // Real routes (POST /prescriptions, POST /refills, etc.) land when
   // SI-001 closes and the schema migrations are authored. The handler

@@ -111,6 +111,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/consent/health',
       '/v0/tenant-config/health',
       '/v0/pharmacy/health',
+      '/v0/pharmacy/ready',
     ],
   });
 
