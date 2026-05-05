@@ -58,6 +58,7 @@ docs/
 ├── FORMS_INTAKE_SLICE_STATUS_2026-05-05.md    # Slice 1 (Forms-Intake + JWT-migration) handoff
 ├── IDENTITY_SLICE_STATUS_2026-05-05.md        # Slice 2 (Identity + JWT) handoff
 ├── CONSENT_SLICE_STATUS_2026-05-05.md         # Slice 3 (Consent + Delegation) handoff
+├── TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md  # Tenant-config foundation (CDM §4.2-§4.6)
 ├── SI-001-MedicationRequest-Schema-Gap.md     # Open Spec Issue blocking Slice 4
 ├── SI-002-AUDIT_EVENTS-Placeholder-Ratification.md  # Open SI — 31 placeholder action IDs
 ├── build-sequence.md                          # (filled in by Plan agent) concrete sprint-to-task mapping
@@ -68,15 +69,18 @@ docs/
 
 ## Implementation status (post-Consent-slice landing)
 
-| Slice (per EHBG §10b)            | Status                     | Pointer                                   |
-| -------------------------------- | -------------------------- | ----------------------------------------- |
-| Slice 1 — Forms-Intake v2.1      | ✅ Implementation-complete | `FORMS_INTAKE_SLICE_STATUS_2026-05-05.md` |
-| Slice 2 — Identity & Auth + JWT  | ✅ Implementation-complete | `IDENTITY_SLICE_STATUS_2026-05-05.md`     |
-| Slice 3 — Consent + Delegation   | ✅ Implementation-complete | `CONSENT_SLICE_STATUS_2026-05-05.md`      |
-| Slice 4 — Pharmacy + Refill v2.1 | ⛔ Blocked on **SI-001**   | `SI-001-MedicationRequest-Schema-Gap.md`  |
-| Slices 5-17                      | Not started                | per EHBG §10b sprint plan                 |
+| Slice (per EHBG §10b)            | Status                     | Pointer                                         |
+| -------------------------------- | -------------------------- | ----------------------------------------------- |
+| Slice 1 — Forms-Intake v2.1      | ✅ Implementation-complete | `FORMS_INTAKE_SLICE_STATUS_2026-05-05.md`       |
+| Slice 2 — Identity & Auth + JWT  | ✅ Implementation-complete | `IDENTITY_SLICE_STATUS_2026-05-05.md`           |
+| Slice 3 — Consent + Delegation   | ✅ Implementation-complete | `CONSENT_SLICE_STATUS_2026-05-05.md`            |
+| Slice 4 — Pharmacy + Refill v2.1 | ⛔ Blocked on **SI-001**   | `SI-001-MedicationRequest-Schema-Gap.md`        |
+| Slices 5-17                      | Not started                | per EHBG §10b sprint plan                       |
+| **Foundation: tenant-config**    | ✅ Implementation-complete | `TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md` |
 
-**Cross-cutting hardening landed alongside Slice 3:** cross-tenant isolation tests for consent + delegation services (I-023 / I-024 / I-025); I-025 tenant-blindness regression for HTTP error envelopes; full HTTP coverage of all 12 routes mounted under `/v0/consent`; service-layer direct integration tests for both consent-service and delegation-service.
+**Foundation note:** the tenant-config layer (CDM §4.2-§4.6) is NOT a slice from the EHBG sprint plan — it's foundational utility infrastructure that every CCR-driven downstream slice depends on. It was unblocked alongside Slice 3 because none of its entities reference `medication_requests`. Schema, repos, CCR resolver service, and a patient-app `GET /v0/tenant-config/me` bootstrap endpoint are live. AdapterConfig + TenantUser service layers are scaffolded at the schema level but their service/HTTP wiring belongs with Admin Backend slice v1.1 (encryption-at-rest + operator auth).
+
+**Cross-cutting hardening landed alongside Slice 3:** cross-tenant isolation tests for consent + delegation services (I-023 / I-024 / I-025); I-025 tenant-blindness regression for HTTP error envelopes; full HTTP coverage of all 12 routes mounted under `/v0/consent`; service-layer direct integration tests for both consent-service and delegation-service; idempotency replay regression for consent endpoints; I-003 audit-chain regression for the 8 Slice 3 lifecycle events.
 
 ## When in doubt
 
