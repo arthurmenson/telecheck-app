@@ -15,6 +15,12 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import {
+  loginStartHandler,
+  loginVerifyHandler,
+  sessionLogoutHandler,
+  sessionRefreshHandler,
+} from './internal/handlers/login.js';
+import {
   registrationStartHandler,
   registrationVerifyHandler,
 } from './internal/handlers/registration.js';
@@ -49,4 +55,21 @@ export const registerIdentityRoutes: FastifyPluginAsync = async (
    */
   app.post('/registration/start', registrationStartHandler);
   app.post('/registration/verify', registrationVerifyHandler);
+
+  /**
+   * Login flow per Identity Spec v1.0 §3.
+   *
+   *   POST /login/start    — issue OTP for an existing account by phone
+   *   POST /login/verify   — verify code; on success issue a session
+   *                          (returns refresh-token plaintext + session
+   *                          + PatientAccountView)
+   *   POST /sessions/refresh — exchange refresh token for an extended
+   *                            session (no-op rotation at v1.0)
+   *   POST /sessions/logout  — revoke session by refresh token
+   *                            (idempotent, tenant-blind 204)
+   */
+  app.post('/login/start', loginStartHandler);
+  app.post('/login/verify', loginVerifyHandler);
+  app.post('/sessions/refresh', sessionRefreshHandler);
+  app.post('/sessions/logout', sessionLogoutHandler);
 };
