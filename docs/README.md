@@ -55,6 +55,7 @@ Anything that becomes canonical guidance gets promoted **to the spec repo** via 
 ```
 docs/
 ├── README.md                                  # this file
+├── AUTONOMOUS_TURN_SUMMARY_2026-05-05.md      # Cumulative summary of the multi-day autonomous turn
 ├── FORMS_INTAKE_SLICE_STATUS_2026-05-05.md    # Slice 1 (Forms-Intake + JWT-migration) handoff
 ├── IDENTITY_SLICE_STATUS_2026-05-05.md        # Slice 2 (Identity + JWT) handoff
 ├── CONSENT_SLICE_STATUS_2026-05-05.md         # Slice 3 (Consent + Delegation) handoff
