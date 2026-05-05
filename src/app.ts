@@ -26,6 +26,7 @@ import { authContextPlugin } from './lib/auth-context.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
+import { asyncConsultPlugin } from './modules/async-consult/index.js';
 import { consentPlugin } from './modules/consent/plugin.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
 import { identityPlugin } from './modules/identity/plugin.js';
@@ -118,6 +119,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/med-interaction/ready',
       '/v0/subscription/health',
       '/v0/subscription/ready',
+      '/v0/async-consult/health',
+      '/v0/async-consult/ready',
       '/v0/admin/ready',
     ],
   });
@@ -191,6 +194,14 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // SI-001 (MedicationRequest schema gap — Subscription binds via
   // medication_request_id). See src/modules/subscription/README.md.
   await app.register(subscriptionPlugin);
+
+  // Async Consult — routes mounted under /v0/async-consult.
+  // SKELETON at v0.1 (Sprint 8 / TLC-020): only /health (200) + /ready (503)
+  // are mounted. Sprint 1 of 3 for this slice — Sprint 9 adds repos /
+  // service layer / state machine + initial HTTP handlers; Sprint 10 adds
+  // full integration + audit + domain event emitters. See
+  // src/modules/async-consult/README.md for the multi-sprint sequencing.
+  await app.register(asyncConsultPlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
