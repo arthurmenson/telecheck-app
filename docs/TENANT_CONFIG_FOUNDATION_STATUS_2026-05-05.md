@@ -2,8 +2,8 @@
 
 **Date:** 2026-05-05
 **Author:** Autonomous turn (Claude Sonnet 4.5)
-**Final commit:** `9740e7b` (HTTP layer; data-layer at `25e6026`; migrations at `eacafeb` + `11fd332`)
-**CI status:** ✅ Green at `9740e7b`
+**Final commit:** `c378dd7` (resolveQuietHours tests; resolver+CCR_KEYS at `fb13a90`+`37a7205`; cross-tenant tests at `ecf0f4a`; HTTP layer at `9740e7b`; data layer at `25e6026`; migrations at `eacafeb`+`11fd332`)
+**CI status:** ✅ Green at `c378dd7`
 
 ---
 
@@ -59,9 +59,13 @@ import {
   resolvePaymentProcessor, // override → country profile fallback (string)
   resolveCurrencyCode, // jurisdictional, no per-tenant override
   resolveEmergencyNumber, // jurisdictional, used by crisis-detection surface
+  resolveQuietHours, // override → country profile fallback (QuietHours object)
   findTenantBrand, // tenant brand snapshot
   findCountryProfile, // platform-level read
   listCountryProfiles, // admin market-rollout UI
+  CCR_KEYS, // canonical CCR key constants — use instead of hardcoded literals
+  type CcrKey, // string-literal union of CCR_KEYS values
+  type QuietHours, // {start, end, timezone_anchor}
   tenantConfigPlugin,
   // + branded types
 } from 'src/modules/tenant-config';
@@ -80,13 +84,14 @@ The `/me` endpoint requires NO auth because brand info (logo, colors, support co
 
 ## Test coverage
 
-| Test file                                      | Cases  | Layer            |
-| ---------------------------------------------- | ------ | ---------------- |
-| tenant-config-migration.test.ts                | 12     | Schema (mig 018) |
-| adapter-configs-tenant-users-migration.test.ts | 12     | Schema (mig 019) |
-| tenant-config-resolver.test.ts                 | 9      | Service / repo   |
-| tenant-config-http.test.ts                     | 5      | HTTP integration |
-| **Total tenant-config foundation**             | **38** | —                |
+| Test file                                      | Cases  | Layer                                       |
+| ---------------------------------------------- | ------ | ------------------------------------------- |
+| tenant-config-migration.test.ts                | 12     | Schema (mig 018)                            |
+| adapter-configs-tenant-users-migration.test.ts | 12     | Schema (mig 019)                            |
+| tenant-config-resolver.test.ts                 | 12     | Service / repo (9 baseline + 3 quiet-hours) |
+| tenant-config-http.test.ts                     | 5      | HTTP integration                            |
+| tenant-config-cross-tenant-isolation.test.ts   | 4      | Cross-tenant                                |
+| **Total tenant-config foundation**             | **45** | —                                           |
 
 Sections:
 
@@ -137,6 +142,11 @@ Sections:
 ## Resumed-turn commit log (chronological)
 
 ```
+c378dd7 test: 3 new resolveQuietHours cases (default + override + malformed)
+fb13a90 feat(tenant-config): resolveQuietHours typed resolver + QuietHours type
+37a7205 feat(tenant-config): canonical CCR key constants per CCR_RUNTIME v5.2
+ecf0f4a test: tenant-config CCR resolver cross-tenant isolation (4 cases)
+9e94e38 docs(tenant-config): foundation status doc + README implementation table update
 9740e7b feat(tenant-config): plugin + GET /v0/tenant-config/{health,me}
 25e6026 feat(tenant-config): module data layer + CCR resolver service
 11fd332 fix(test): wrap tenant_users inserts in withTenantContext
@@ -146,7 +156,7 @@ eacafeb fix(test): tenant-config §1c uses 7-char non-hex value
 58f6cb5 docs(spec-issue): SI-002 — AUDIT_EVENTS v5.2 placeholder action IDs
 ```
 
-(7 commits across the foundation layer; preceded by Slices 1-3 hardening + SI-001 + the consent-repo ULID-tiebreaker fix earlier in the same resumed turn.)
+(12 commits across the foundation layer; preceded by Slices 1-3 hardening + SI-001 + the consent-repo ULID-tiebreaker fix earlier in the same resumed turn.)
 
 ---
 
