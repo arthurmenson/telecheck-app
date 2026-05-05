@@ -82,6 +82,10 @@ function resolveResumeOwnership(req: FastifyRequest): {
  * signature change).
  */
 function resolveActorId(req: FastifyRequest): string {
+  // Tier 1 JWT (preferred via authContextPlugin); Tier 2 header shim.
+  if (req.actorContext !== undefined) {
+    return req.actorContext.accountId;
+  }
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
   if (isProd && !optIn) {

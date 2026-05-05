@@ -29,6 +29,12 @@ import * as templateService from '../services/template-service.js';
  * Identity & Auth slice lands).
  */
 function resolveActorId(req: FastifyRequest): string {
+  // Tier 1: JWT-resolved actor (preferred via authContextPlugin;
+  // landed 2d45f98). Tier 2: x-actor-id header shim (production
+  // fail-closed unless ALLOW_ACTOR_HEADER_AUTH=true).
+  if (req.actorContext !== undefined) {
+    return req.actorContext.accountId;
+  }
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
   if (isProd && !optIn) {

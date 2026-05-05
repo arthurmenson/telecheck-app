@@ -49,9 +49,16 @@ import { PUBLISH_GATES_NOT_IMPLEMENTED } from '../services/template-service.js';
  * Identity slice's authoring.
  */
 function resolveActorId(req: FastifyRequest): string {
-  // Production fail-closed: refuse to use the header shim in production
-  // unless the deployment explicitly opts in. This prevents an inadvertent
-  // production rollout from silently accepting forged audit actors.
+  // Tier 1: req.actorContext (JWT-resolved via authContextPlugin;
+  // landed 2d45f98). Real auth — preferred path going forward.
+  if (req.actorContext !== undefined) {
+    return req.actorContext.accountId;
+  }
+
+  // Tier 2: header shim. Production fail-closed: refuse the shim in
+  // production unless the deployment explicitly opts in. This prevents
+  // an inadvertent production rollout from silently accepting forged
+  // audit actors.
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
   if (isProd && !optIn) {

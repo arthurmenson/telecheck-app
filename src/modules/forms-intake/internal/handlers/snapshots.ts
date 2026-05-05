@@ -39,6 +39,11 @@ import type { PatientId } from '../types.js';
  * delegate completed the form, the snapshot belongs to the patient_id.
  */
 function resolvePatientId(req: FastifyRequest): PatientId {
+  // Tier 1: JWT actor (preferred). Patient's account_id IS the
+  // patient_id at v1.0 (Account = Patient per CDM §3.2).
+  if (req.actorContext !== undefined) {
+    return req.actorContext.accountId;
+  }
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
   if (isProd && !optIn) {
