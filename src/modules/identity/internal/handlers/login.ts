@@ -219,7 +219,7 @@ export async function loginVerifyHandler(
     const ua = req.headers['user-agent'];
     const userAgent = typeof ua === 'string' ? ua : null;
 
-    const { session, refreshTokenPlaintext } = await sessionService.issueSession(
+    const { session, refreshTokenPlaintext, accessToken } = await sessionService.issueSession(
       ctx,
       { actorId: 'system' },
       {
@@ -235,6 +235,7 @@ export async function loginVerifyHandler(
       account: accountService.toPatientAccountView(account),
       session: sessionService.toPatientSessionView(session),
       refresh_token: refreshTokenPlaintext,
+      access_token: accessToken,
     });
   });
 }

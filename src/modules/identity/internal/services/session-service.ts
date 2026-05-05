@@ -13,7 +13,9 @@
 
 import crypto from 'node:crypto';
 
+import { config } from '../../../../lib/config.js';
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
+import { issueAccessToken } from '../../../../lib/jwt.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { emitSessionIssuedAudit, emitSessionRevokedAudit } from '../../audit.js';
 import * as sessionRepo from '../repositories/session-repo.js';
@@ -79,15 +81,27 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 /**
  * Issue a new session for an account. Generates a fresh refresh token,
  * hashes it, persists the session row with same-transaction audit
- * emission, and returns the persisted Session PLUS the plaintext refresh
- * token (which the caller MUST return to the client and forget).
+ * emission, and returns:
+ *   - the persisted Session
+ *   - the plaintext refresh token (returned to client ONCE; never
+ *     persisted server-side beyond the SHA-256 hash)
+ *   - a fresh JWT access token (15-min TTL per Identity Spec §3.2;
+ *     stateless verification via verifyAccessToken)
+ *
+ * The access token's session_id claim binds it to the persisted
+ * session row, so the auth hook can verify session liveness against
+ * the DB on every request (revocation propagates immediately).
  */
 export async function issueSession(
   ctx: TenantContext,
   actor: { actorId: string },
   input: IssueSessionInput,
   externalTx?: DbTransaction,
-): Promise<{ session: Session; refreshTokenPlaintext: string }> {
+): Promise<{
+  session: Session;
+  refreshTokenPlaintext: string;
+  accessToken: string;
+}> {
   const { plaintext, hash } = generateRefreshToken();
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * MS_PER_DAY).toISOString();
 
@@ -121,7 +135,21 @@ export async function issueSession(
     externalTx,
   );
 
-  return { session, refreshTokenPlaintext: plaintext };
+  // Issue the JWT access token using the persisted session_id. The
+  // signing key is platform-wide (production fail-closed gated in
+  // config.ts) — same key signs across all tenants; tenant_id is a
+  // claim INSIDE the JWT, not part of the signing input.
+  const accessToken = issueAccessToken(
+    {
+      account_id: session.account_id,
+      tenant_id: session.tenant_id,
+      session_id: session.session_id,
+      country_of_care: ctx.countryOfCare,
+    },
+    config.jwtSigningKey,
+  );
+
+  return { session, refreshTokenPlaintext: plaintext, accessToken };
 }
 
 // ---------------------------------------------------------------------------
