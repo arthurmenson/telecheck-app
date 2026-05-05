@@ -15,10 +15,13 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 
-import { registerTenantConfigRoutes } from './routes.js';
+import { registerTenantConfigAdminRoutes, registerTenantConfigRoutes } from './routes.js';
 
 const tenantConfigPluginImpl: FastifyPluginAsync = async (app: FastifyInstance): Promise<void> => {
   await app.register(registerTenantConfigRoutes, { prefix: '/v0/tenant-config' });
+  // Admin read paths under /v0/admin/* — JWT-auth Tier 1 enforced
+  // per-handler via requireActorContext. Sprint 2 / TLC-004.
+  await app.register(registerTenantConfigAdminRoutes, { prefix: '/v0/admin' });
 };
 
 export const tenantConfigPlugin = fp(tenantConfigPluginImpl, {
