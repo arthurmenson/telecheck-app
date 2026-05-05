@@ -109,9 +109,10 @@ module.exports = {
       },
     },
     {
-      // vitest.config.ts is a tooling config; lint it with typeless rules
-      // (it isn't included in tsconfig.json's project, so type-aware rules fail).
-      files: ['vitest.config.ts'],
+      // vitest.config.ts + vitest.bench.config.ts are tooling configs; lint
+      // with typeless rules (not included in tsconfig.json's project, so
+      // type-aware rules fail).
+      files: ['vitest.config.ts', 'vitest.bench.config.ts'],
       parserOptions: {
         project: null,
       },
@@ -129,10 +130,12 @@ module.exports = {
     '*.cjs',
     '.eslintrc.cjs',
     '.tsbuildinfo',
-    // vitest.config.ts is not in tsconfig.json's `include` (intentionally —
-    // it's a tooling config, not source) so type-aware lint rules can't parse
-    // it. Vitest itself validates the file at test time, so we don't lose
-    // coverage by excluding it from ESLint.
+    // vitest.config.ts + vitest.bench.config.ts (Sprint 7 / TLC-018) are
+    // not in tsconfig.json's `include` (intentionally — tooling configs,
+    // not source) so type-aware lint rules can't parse them. Vitest
+    // validates them at test/bench time, so we don't lose coverage by
+    // excluding them from ESLint.
     'vitest.config.ts',
+    'vitest.bench.config.ts',
   ],
 };

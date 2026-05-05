@@ -143,5 +143,36 @@ export default defineConfig({
      * Print a newline before each test file name for readability in CI logs.
      */
     logHeapUsage: false,
+
+    // Benchmark configuration (Sprint 7 / TLC-018).
+    //
+    // Vitest bench mode is invoked via `vitest bench` (mapped to
+    // `npm run bench`). It is independent from `vitest run` (mapped to
+    // `npm test`) — bench files use `bench()` instead of `it()` and
+    // are NOT executed by the standard test runner.
+    //
+    // Bench is SIGNAL, not GATE at v0.1 — CI does not block on bench
+    // results. See tests/perf/README.md for the operating model and
+    // Sprint 11 promotion path (per ORT v1.5 OR-218).
+    //
+    // include: only *.bench.ts files under tests/perf/. The standard
+    //   test runner's bench-file glob exclusion is implicit because
+    //   the standard `include` only matches *.test.ts.
+    // exclude: standard exclusions; tests/setup.ts is intentionally
+    //   omitted from benches (no DB needed for the v0.1 bench corpus
+    //   — pure-function targets only).
+    //
+    // NOTE: glob literals are kept out of any JSDoc above this block
+    // because esbuild's block-comment scanner treats the `*/` inside
+    // `**/*` as a comment terminator (same constraint as line 48).
+    // Benchmarks are configured in a separate file (vitest.bench.config.ts)
+    // because the test runner's setupFiles requires an ephemeral
+    // Postgres which isn't appropriate for the v0.1 pure-function
+    // bench corpus. Per-mode setupFiles override under a `benchmark:`
+    // key inside this config doesn't apply in Vitest 2; using a
+    // dedicated config file is the clean separation.
+    //
+    // Run with: `npm run bench` (which maps to
+    // `vitest bench --run -c vitest.bench.config.ts`).
   },
 });
