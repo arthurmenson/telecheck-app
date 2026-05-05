@@ -279,11 +279,16 @@ describe('forms-intake resumeSubmission — happy path', () => {
       ),
     );
 
-    // No `forms_resume_state.restored` domain event is emitted on restore
-    // at v0.1 (DOMAIN_EVENTS v5.2 doesn't enumerate it; SPEC ISSUE flagged
-    // inline in submission-service.ts). The lack of an event here is part
-    // of the contract — this assertion guards against accidental drift
-    // where someone wires an event without the spec amendment.
+    // `forms_resume_state.restored` domain event IS now emitted on restore
+    // (wired at ba2bc41 alongside SI-003 raising the parallel
+    // DOMAIN_EVENTS v5.2 placeholder gap). The earlier "expect 0" guard
+    // pre-dated the consent + identity domain-event scaffolding pattern;
+    // forms-intake adopts the same same-tx outbox pattern at this commit.
+    // The event-type string `forms_resume_state.restored` is one of the
+    // 28 placeholder strings tracked by SI-003 — pinning the assertion
+    // here ensures any rename when SI-003 closes surfaces as a test
+    // failure that gets paired with the matching events.ts emitter
+    // rename in lockstep.
     const evCount = await withTenantContext(TENANT_US, async () => {
       const r = await client.query<{ count: string }>(
         `SELECT COUNT(*)::text AS count
@@ -295,7 +300,7 @@ describe('forms-intake resumeSubmission — happy path', () => {
       );
       return r.rows[0]!.count;
     });
-    expect(evCount).toBe('0');
+    expect(evCount).toBe('1');
   });
 
   it('preserves prior submission keys when restoring (merge semantics)', async () => {
