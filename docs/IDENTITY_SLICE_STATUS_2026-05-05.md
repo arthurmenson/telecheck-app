@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-05
 **Author:** Autonomous turn (Claude Sonnet 4.5)
-**Final commit:** `692206e`
+**Final commit:** `4fa12b3` (domain events + 5-case test; events wiring at `aec04ce` + `663c8fb`; original slice landing at `692206e`)
 **CI status:** ✅ Green
 
 ---
@@ -104,6 +104,30 @@ Every PHI-touching path through the slice now passes through:
 - **Master PRD v1.10 §17 + Glossary v5.2 C3** — `tenant_id` stripped from every patient-surface response (`toPatientAccountView`, `toPatientSessionView`, device-view inline strip)
 - **ADR-022** native-first / minimal deps — JWT module is hand-rolled HMAC-SHA256, zero new runtime deps
 - **Identity Spec §3.2 / §3.3** — 15-min access JWT, 30-day refresh-hash, max 3 devices per account (oldest auto-evicted on 4th register)
+
+---
+
+## Domain-event emission (added 2026-05-05)
+
+All 9 lifecycle audit emissions now have parallel `identity.*` domain
+events emitted INSIDE the same transaction:
+
+- `identity.account.created` / `identity.account.activated`
+- `identity.session.issued` / `identity.session.revoked`
+- `identity.otp.issued` / `identity.otp.consumed` / `identity.otp.lockout_triggered`
+- `identity.device.registered` / `identity.device.revoked`
+
+Wired across all 4 services (account-service / session-service /
+otp-service / auth-device-service) at commits `aec04ce` (account
+events) + `663c8fb` (session/otp/device events). Outbox-landing test
+at `tests/integration/identity-domain-events.test.ts` (5 cases —
+account.created, account.activated, session.issued, otp.issued,
+device.registered) at commit `4fa12b3`.
+
+The `identity.*` event-type strings are NOT yet ratified in
+DOMAIN_EVENTS v5.2 — same gap as the audit-side SI-002 placeholder
+pattern. A parallel DOMAIN_EVENTS SI lands when consumers need
+precise contracts.
 
 ---
 
