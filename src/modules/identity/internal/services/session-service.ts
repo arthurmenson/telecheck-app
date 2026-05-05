@@ -18,6 +18,7 @@ import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import { issueAccessToken } from '../../../../lib/jwt.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { emitSessionIssuedAudit, emitSessionRevokedAudit } from '../../audit.js';
+import { emitSessionIssuedDomainEvent, emitSessionRevokedDomainEvent } from '../../events.js';
 import * as sessionRepo from '../repositories/session-repo.js';
 import type { AccountId, DeviceId, Session, SessionId, SessionRevocationReason } from '../types.js';
 
@@ -131,6 +132,12 @@ export async function issueSession(
         },
         tx,
       );
+      await emitSessionIssuedDomainEvent(tx, {
+        tenantId: ctx.tenantId,
+        accountId: persisted.account_id,
+        sessionId: persisted.session_id,
+        occurredAt: persisted.created_at,
+      });
     },
     externalTx,
   );
@@ -186,6 +193,13 @@ export async function revokeSession(
         },
         tx,
       );
+      await emitSessionRevokedDomainEvent(tx, {
+        tenantId: ctx.tenantId,
+        accountId: revoked.account_id,
+        sessionId: revoked.session_id,
+        revokedReason: reason,
+        occurredAt: revoked.revoked_at ?? revoked.created_at,
+      });
       return revoked;
     });
   }
@@ -203,6 +217,13 @@ export async function revokeSession(
     },
     externalTx,
   );
+  await emitSessionRevokedDomainEvent(externalTx, {
+    tenantId: ctx.tenantId,
+    accountId: revoked.account_id,
+    sessionId: revoked.session_id,
+    revokedReason: reason,
+    occurredAt: revoked.revoked_at ?? revoked.created_at,
+  });
   return revoked;
 }
 

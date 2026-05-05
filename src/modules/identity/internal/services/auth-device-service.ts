@@ -11,6 +11,7 @@ import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import { withTenantBoundConnection } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { emitDeviceRegisteredAudit, emitDeviceRevokedAudit } from '../../audit.js';
+import { emitDeviceRegisteredDomainEvent, emitDeviceRevokedDomainEvent } from '../../events.js';
 import * as deviceRepo from '../repositories/auth-device-repo.js';
 import type {
   AccountId,
@@ -85,6 +86,13 @@ export async function registerDevice(
             },
             tx,
           );
+          await emitDeviceRevokedDomainEvent(tx, {
+            tenantId: ctx.tenantId,
+            accountId: evicted.account_id,
+            deviceId: evicted.device_id,
+            revokedReason: 'max_devices_evicted',
+            occurredAt: evicted.revoked_at ?? evicted.created_at,
+          });
         }
       }
     }
@@ -116,6 +124,13 @@ export async function registerDevice(
           },
           innerTx,
         );
+        await emitDeviceRegisteredDomainEvent(innerTx, {
+          tenantId: ctx.tenantId,
+          accountId: persisted.account_id,
+          deviceId: persisted.device_id,
+          platform: persisted.platform,
+          occurredAt: persisted.created_at,
+        });
       },
       tx,
     );
@@ -152,6 +167,13 @@ export async function revokeDevice(
       },
       tx,
     );
+    await emitDeviceRevokedDomainEvent(tx, {
+      tenantId: ctx.tenantId,
+      accountId: revoked.account_id,
+      deviceId: revoked.device_id,
+      revokedReason: reason,
+      occurredAt: revoked.revoked_at ?? revoked.created_at,
+    });
     return revoked;
   };
 

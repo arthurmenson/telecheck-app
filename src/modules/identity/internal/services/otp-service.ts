@@ -19,6 +19,11 @@ import {
   emitOtpIssuedAudit,
   emitOtpLockoutTriggeredAudit,
 } from '../../audit.js';
+import {
+  emitOtpConsumedDomainEvent,
+  emitOtpIssuedDomainEvent,
+  emitOtpLockoutTriggeredDomainEvent,
+} from '../../events.js';
 import * as otpRepo from '../repositories/otp-repo.js';
 import type { AccountId, OtpChallenge, OtpId, OtpPurpose } from '../types.js';
 
@@ -132,6 +137,18 @@ export async function issueOtp(
         },
         tx,
       );
+      // Domain event emission alongside audit (same tx).
+      // Skip when account_id is null (pre-registration OTPs); the event
+      // shape requires accountId. The audit row still captures the issuance.
+      if (persisted.account_id !== null) {
+        await emitOtpIssuedDomainEvent(tx, {
+          tenantId: ctx.tenantId,
+          otpId: persisted.otp_id,
+          accountId: persisted.account_id,
+          purpose: persisted.purpose,
+          occurredAt: persisted.created_at,
+        });
+      }
     },
     externalTx,
   );
@@ -205,6 +222,14 @@ export async function verifyOtp(
             },
             tx,
           );
+          if (consumed.account_id !== null) {
+            await emitOtpConsumedDomainEvent(tx, {
+              tenantId: ctx.tenantId,
+              otpId: consumed.otp_id,
+              accountId: consumed.account_id,
+              occurredAt: consumed.consumed_at ?? consumed.created_at,
+            });
+          }
         }
         return {
           ok: consumed !== null,
@@ -227,6 +252,14 @@ export async function verifyOtp(
         },
         externalTx,
       );
+      if (consumed.account_id !== null) {
+        await emitOtpConsumedDomainEvent(externalTx, {
+          tenantId: ctx.tenantId,
+          otpId: consumed.otp_id,
+          accountId: consumed.account_id,
+          occurredAt: consumed.consumed_at ?? consumed.created_at,
+        });
+      }
     }
     return {
       ok: consumed !== null,
@@ -274,6 +307,14 @@ async function decrementWithAudit(
       },
       tx,
     );
+    if (after.account_id !== null) {
+      await emitOtpLockoutTriggeredDomainEvent(tx, {
+        tenantId: ctx.tenantId,
+        otpId: after.otp_id,
+        accountId: after.account_id,
+        occurredAt: after.locked_until ?? after.created_at,
+      });
+    }
     return {
       ok: false,
       consumedOtp: null,
