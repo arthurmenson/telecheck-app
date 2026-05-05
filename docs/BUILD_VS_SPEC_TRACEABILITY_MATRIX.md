@@ -3,9 +3,15 @@
 **Living artifact** — amend in place when re-run; bump revision-line below.
 
 **Revision history:**
-- **r1 (2026-05-05, Sprint 6 / TLC-017):** initial consolidation. Maps each implemented invariant / slice / module / state-machine to the test files covering it. Cross-links existing per-slice status docs (does NOT duplicate them; references them as the source-of-truth for per-slice deferred-work tables).
+- **r1 (2026-05-05, Sprint 6 / TLC-017):** initial consolidation. Maps each implemented invariant / slice / module / state-machine to the test files covering it. Cross-links existing per-slice status docs.
+- **r2 (2026-05-05, Sprint 7):** absorbs **TLC-019 descope** — adds OR-208 back-link as the canonical closure path for "Data-level filtering implementation choice" (this matrix's §1 I-023 row + §2 lib rows already document ADR-023's 3-layer enforcement decision). Also documents **TLC-018 perf scaffold landing** (`tests/perf/`) per OR-218 — but OR-218 itself remains **OPEN** because non-blocking bench harness without enforceable thresholds cannot serve as the launch-blocking gate the ORT row demands (Codex `perf-bench-r1` HIGH closure 2026-05-05).
 
-**Closes:** ORT row OR-216 ("Build vs spec traceability matrix"; verified at `Telecheck_Operational_Readiness_Todo_v1_5.md:127`).
+**Closes:**
+- ORT row **OR-216** ("Build vs spec traceability matrix"; verified at `Telecheck_Operational_Readiness_Todo_v1_5.md:127`)
+- ORT row **OR-208** ("Data-level filtering implementation choice (RLS vs view vs app-layer)"; verified at `Telecheck_Operational_Readiness_Todo_v1_5.md:119`) — **absorbed via this matrix; TLC-019 descoped at Sprint 7 PM kickoff** because §1 I-023 row + §2 `tenant-context.ts` / `rls.ts` / `kms.ts` rows already document ADR-023's 3-layer enforcement decision rationale + the test surface that proves it.
+
+**Scaffolds (NOT closes):**
+- ORT row **OR-218** ("Performance and load test plan"; `Telecheck_Operational_Readiness_Todo_v1_5.md:129`) — **OPEN**. Sprint 7 / TLC-018 scaffolded `tests/perf/` infra with 1 example bench (`tests/perf/audit/crisis-detect.bench.ts` + `tests/perf/README.md`). Closure path per Sprint 7 retro: Sprint 11 hardening adds (1) explicit p95 thresholds per bench, (2) wires `npm run bench` into CI as required gate, (3) baseline comparison output for regression detection. Until those three conditions hold, OR-218 stays OPEN in the ORT.
 
 **Author:** Scrum Master (Claude Code main turn)
 **Source-of-truth pointers:**
@@ -143,7 +149,7 @@ Per Sprint 5 TLC-015 ORT audit + Sprint 6 author analysis:
 
 ## §6 — Cumulative metrics
 
-**As of Sprint 6 close (`75640ef` + Codex `2dece96` fix-forward):**
+**As of Sprint 7 close (`d677fd3` TLC-018 + `d879a79` Codex HIGH fix-forward + r2 amend):**
 
 - **Slices (implementation-complete):** 3 (Forms-Intake, Identity, Consent + Delegation)
 - **Foundation modules:** 2 (tenant-config: 4 admin reads + 5 admin-write 503 stubs + readiness probe; pharmacy skeleton — but pharmacy is technically a BLOCKED-aware skeleton)
@@ -153,10 +159,12 @@ Per Sprint 5 TLC-015 ORT audit + Sprint 6 author analysis:
 - **Rollback migrations:** 18 (matched-pair coverage)
 - **Domain events wired with explicit outbox tests:** 31 of 31
 - **Active platform invariants:** 25 (I-001 base + 3 added v1.10 cycle as I-029/030/031); 13 fully covered, 4 partially covered (I-024 / I-029 / I-030 / I-031 — blocked on slice activations), 8+ not yet active in this repo (slice-dependent)
-- **Test files (rough count):** ~106 (added rls-policy-coverage-lockdown.test.ts in Sprint 6)
-- **Test cases (rough count):** ~1470+ (added 46 from TLC-016)
-- **Codex findings closed across all sprints:** 3 (1 Sprint 1 MEDIUM, 1 Sprint 5 HIGH, 1 Sprint 6 MEDIUM); each closed in-sprint via fix-forward; each surfaced a real bug class the SM had not caught
-- **Audit / coverage docs (living artifacts):** 3 (CRISIS_DETECTION_COVERAGE_AUDIT.md, ORT_V1_5_TESTABLE_ITEMS_AUDIT.md, BUILD_VS_SPEC_TRACEABILITY_MATRIX.md — this doc)
+- **Test files (rough count):** ~107 (added rls-policy-coverage-lockdown.test.ts in Sprint 6 + tests/perf/audit/crisis-detect.bench.ts in Sprint 7)
+- **Test cases (rough count):** ~1470+ (Sprint 6 added 46 from TLC-016; Sprint 7 added bench scenarios that count separately as 4 bench cases, not test cases)
+- **Bench scenarios (Sprint 7 TLC-018):** 4 (§1-§4 in `tests/perf/audit/crisis-detect.bench.ts`)
+- **Codex findings closed across all sprints:** 4 (1 Sprint 1 MEDIUM `pharmacy-blocked-handler` / 1 Sprint 5 HIGH `idempotency-r5` / 1 Sprint 6 MEDIUM `rls-policy-r1` / 1 Sprint 7 HIGH `perf-bench-r1`); each closed in-sprint via fix-forward; each surfaced a real bug class the SM had not caught
+- **Audit / coverage docs (living artifacts):** 3 (CRISIS_DETECTION_COVERAGE_AUDIT.md, ORT_V1_5_TESTABLE_ITEMS_AUDIT.md, BUILD_VS_SPEC_TRACEABILITY_MATRIX.md — this doc; r2 at Sprint 7)
+- **PM-brief verification gate runs:** 2 inaugural runs (Sprint 6 + Sprint 7); both ALL PASS — the Sprint 3 + Sprint 5 hallucination class has not recurred since the gate was instituted at `804c294` (Evans 2026-05-05 oversight directive)
 
 ---
 
