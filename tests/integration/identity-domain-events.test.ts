@@ -179,4 +179,117 @@ describe('identity slice — §1 domain-event emission', () => {
     expect(event!.payload['account_id']).toBe(accountId);
     expect(event!.payload['platform']).toBe('ios');
   });
+
+  it('§1f revokeSession emits identity.session.revoked in outbox', async () => {
+    const { accountId } = await seedAccount();
+    const sessionId = asSessionId(ulid());
+    await withTenantContext(T_US, () =>
+      sessionService.issueSession(
+        US_CTX,
+        { actorId: 'op_session_rev' },
+        { session_id: sessionId, account_id: accountId },
+        getTestClient(),
+      ),
+    );
+    await withTenantContext(T_US, () =>
+      sessionService.revokeSession(
+        US_CTX,
+        { actorId: 'op_session_rev' },
+        sessionId,
+        'patient_logout',
+        getTestClient(),
+      ),
+    );
+
+    const event = await findOutboxEvent(T_US, 'identity.session.revoked', sessionId);
+    expect(event).not.toBeNull();
+    expect(event!.payload['revoked_reason']).toBe('patient_logout');
+    expect(event!.payload['session_id']).toBe(sessionId);
+  });
+
+  it('§1g verifyOtp success emits identity.otp.consumed in outbox', async () => {
+    const { accountId, phone } = await seedAccount();
+    const otpId = asOtpId(ulid());
+    const { codePlaintext } = await withTenantContext(T_US, () =>
+      otpService.issueOtp(
+        US_CTX,
+        { actorId: 'op_otp_consume' },
+        { otp_id: otpId, account_id: accountId, phone_e164: phone, purpose: 'login' },
+        getTestClient(),
+      ),
+    );
+    const result = await withTenantContext(T_US, () =>
+      otpService.verifyOtp(
+        US_CTX,
+        { actorId: 'op_otp_consume' },
+        { phone_e164: phone, purpose: 'login', code: codePlaintext },
+        getTestClient(),
+      ),
+    );
+    expect(result.ok).toBe(true);
+
+    const event = await findOutboxEvent(T_US, 'identity.otp.consumed', otpId);
+    expect(event).not.toBeNull();
+    expect(event!.payload['account_id']).toBe(accountId);
+  });
+
+  it('§1h verifyOtp lockout emits identity.otp.lockout_triggered in outbox', async () => {
+    const { accountId, phone } = await seedAccount();
+    const otpId = asOtpId(ulid());
+    await withTenantContext(T_US, () =>
+      otpService.issueOtp(
+        US_CTX,
+        { actorId: 'op_otp_lock' },
+        { otp_id: otpId, account_id: accountId, phone_e164: phone, purpose: 'login' },
+        getTestClient(),
+      ),
+    );
+    // 3 wrong attempts triggers lockout
+    for (let i = 0; i < 3; i++) {
+      await withTenantContext(T_US, () =>
+        otpService.verifyOtp(
+          US_CTX,
+          { actorId: 'op_otp_lock' },
+          { phone_e164: phone, purpose: 'login', code: '000000' },
+          getTestClient(),
+        ),
+      );
+    }
+
+    const event = await findOutboxEvent(T_US, 'identity.otp.lockout_triggered', otpId);
+    expect(event).not.toBeNull();
+    expect(event!.payload['account_id']).toBe(accountId);
+  });
+
+  it('§1i revokeDevice emits identity.device.revoked in outbox', async () => {
+    const { accountId } = await seedAccount();
+    const deviceId = asDeviceId(ulid());
+    await withTenantContext(T_US, () =>
+      authDeviceService.registerDevice(
+        US_CTX,
+        { actorId: 'op_dev_rev' },
+        {
+          device_id: deviceId,
+          account_id: accountId,
+          platform: 'ios',
+          device_public_key: 'pubkey-test',
+        },
+        getTestClient(),
+      ),
+    );
+    await withTenantContext(T_US, () =>
+      authDeviceService.revokeDevice(
+        US_CTX,
+        { actorId: 'op_dev_rev' },
+        deviceId,
+        'patient_unregistered',
+        getTestClient(),
+      ),
+    );
+
+    const event = await findOutboxEvent(T_US, 'identity.device.revoked', deviceId);
+    expect(event).not.toBeNull();
+    expect(event!.payload['revoked_reason']).toBe('patient_unregistered');
+    expect(event!.payload['device_id']).toBe(deviceId);
+  });
 });
