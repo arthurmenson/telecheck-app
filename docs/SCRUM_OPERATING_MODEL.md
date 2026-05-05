@@ -37,6 +37,7 @@ When the user reviews progress at the end of the week, they see N completed spri
 ```
 ┌─ Sprint kickoff ─────────────────────────────────────────────┐
 │ 1. PM call: confirm/update sprint goal + commit backlog     │
+│ 1.5. SM PM-brief verification gate (mechanical) — see below │
 │ 2. Scrum Master writes SPRINT_<N>_PLAN.md                   │
 └─ ↓                                                           │
 ┌─ Iteration loop (4-8 per sprint) ─────────────────────────────┐
@@ -56,6 +57,33 @@ When the user reviews progress at the end of the week, they see N completed spri
 │ 11. Loop to next sprint kickoff                              │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+### PM-brief verification gate (Sprint 5 retro deliverable; Evans 2026-05-05 oversight directive)
+
+After PM brief returns and BEFORE the Scrum Master writes SPRINT_<N>_PLAN.md, the SM runs a mechanical verification pass on every cited identifier. This is non-negotiable:
+
+| Identifier class cited in brief | Verification step | Source-of-truth file |
+| --- | --- | --- |
+| Error code (`internal.X.Y`) | Grep `src/lib/error-envelope.ts` + `src/**/*.ts` for the literal string | ERROR_MODEL v5.1 |
+| Audit `event_type` | Grep canonical-glossary lookups + `src/lib/audit.ts` | AUDIT_EVENTS v5.2 |
+| Domain `event_type` | Grep `src/**/*events*.ts` for the literal string | DOMAIN_EVENTS v5.2 |
+| State machine value | Grep `src/**/*state-machine*.ts` or the relevant slice's state defs | State Machines v1.1 |
+| ORT row ID (`OR-NNN`) | Grep `Telecheck_Operational_Readiness_Todo_v1_5.md` for `^\| OR-NNN ` | ORT v1.5 |
+| ADR number (`ADR-NNN`) | Grep `Telecheck_ADR_Set_v1_0.md` + addenda | ADR Set + addenda |
+| Promotion Ledger entry (`P-NNN`) | Grep `Telecheck_Promotion_Ledger.md` | Promotion Ledger |
+| Slice PRD section (`§N.M`) | Read the cited slice PRD and verify the section exists | Per-slice PRD |
+| Invariant ID (`I-NNN`) | Grep `Telecheck_Contracts_Pack_v5_00_INVARIANTS.md` | INVARIANTS v5.2 |
+| File path | `Read` or `Glob` to confirm the file exists at the cited path | filesystem |
+
+**Verification outcomes:**
+
+- All identifiers verify → SM proceeds to write SPRINT_<N>_PLAN.md and execute the brief
+- Some identifiers fail → SM has TWO options:
+  - **(a) Bounce back to PM** with the specific failures and re-prompt (preferred when the brief's whole structure is sound but individual identifiers are wrong; PM gets a chance to self-correct)
+  - **(b) SM-correct inline** by reading the source-of-truth file directly, surfacing real identifiers, and updating the brief in the SPRINT_<N>_PLAN.md (preferred when SM has the context to fix it deterministically and PM-bounce would just round-trip)
+- Either way: the Sprint review doc records the verification gate findings under §"PM-brief verification gate" so the pattern is visible to subsequent retros
+
+**Why this gate exists:** PM hallucination has been a recurring failure class (Sprint 3 invented `internal.module.blocked`; Sprint 5 invented OR-253/244/255). PM rubric updates have been reactive — each one closes the specific class that already burned the sprint. This gate makes verification mechanical and deterministic instead of relying on PM self-discipline.
 
 **Sprint duration:** 1 week of autonomous wall-clock. Within a 24-hr autonomous-turn window, expect 2-4 iterations + 1 review + 1 retro for short sprints; longer features may consume the full week.
 

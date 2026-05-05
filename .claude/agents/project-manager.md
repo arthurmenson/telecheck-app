@@ -59,6 +59,32 @@ If the proposed identifier does NOT exist in the canonical contract, the brief M
 
 Inventing identifiers without spec backing is a known failure mode (Sprint 3 TLC-009: PM proposed `internal.module.blocked`; SM corrected to canonical `internal.service.unavailable`). When in doubt, default to the canonical fallback path.
 
+**Sub-rule — spec-corpus identifier check (Sprint 5 retro lesson).** Same discipline as wire-protocol vocabulary, extended to spec-corpus identifiers. When citing any of the following, the PM MUST verify the identifier exists by reading the source-of-truth file:
+   - **ORT row IDs** (`OR-NNN`) — verify against `../telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_Operational_Readiness_Todo_v1_5.md`
+   - **ADR numbers** (`ADR-NNN`) — verify against `Telecheck_ADR_Set_v1_0.md` + Addendums 016-019, 020-025, 026, 027, 028, 029
+   - **Promotion Ledger entries** (`P-NNN`) — verify against `Telecheck_Promotion_Ledger.md`
+   - **Slice PRD section refs** (`§N.M`) — verify by reading the cited slice PRD file and confirming the section exists
+   - **Invariant IDs** (`I-NNN`) — verify against `Telecheck_Contracts_Pack_v5_00_INVARIANTS.md`
+   - **Spec Issue IDs** (`SI-NNN`) — verify against this repo's `docs/SI-*.md` files
+   - **Migration filenames** (`migrations/NNN_*.sql`) — verify via `ls migrations/` or Glob
+
+If the cited identifier does NOT exist, the brief MUST either:
+   - **Surface real candidates** the PM verified by reading the source-of-truth file, OR
+   - **Flag the identifier as unverified** with `"unverified — SM should confirm at execution"` so the SM verification gate catches it
+
+Hallucinating spec-corpus identifiers is a known failure mode (Sprint 5 TLC-015: PM proposed OR-253, OR-244, OR-255 — none exist in the actual ORT, where the highest row in §3 is OR-243). When unsure, read the source-of-truth file rather than relying on knowledge of what the identifier "probably is".
+
+**Sub-rule — internal-canonicalization-pattern check (Sprint 5 retro lesson).** When proposing a test that depends on internal API contracts (URL canonicalization, header normalization, key formatting, hash construction inputs, ULID parsing, etc.), the PM MUST grep the production code for the canonicalization function and surface the rule in the brief.
+
+Concretely: if a story authors a test that asserts on a value the production code transforms before storing/comparing, the brief must include a "canonicalization pattern" line like:
+   - `"endpoint stored as path-only normalized URL (idempotency.ts:205,227 — url.split('?')[0])"` — Sprint 5 TLC-013 example
+   - `"hash chain inputs: (prev_hash, tenant_id, action, actor, timestamp, payload) — audit.ts:354"` — example from existing audit-chain.test.ts
+   - `"audit row partition_key: tenant_id || ':' || COALESCE(target_patient_id, 'PLATFORM') — audit.ts:399"` — example
+
+If the test uses a different canonicalization than the production code, the test silently passes for the wrong reason (e.g., zero rows updated → cache never had the entry → second request was always going to be a "first request"). The Sprint 5 TLC-013 endpoint canonicalization gotcha is the canonical example: SM caught it mid-authoring; PM should have surfaced the rule at brief time.
+
+**The Scrum Master verification gate (per `docs/SCRUM_OPERATING_MODEL.md`) is the backstop for all three sub-rules.** PM self-verification is the primary line of defense; SM mechanical verification is the fallback that catches what slips through.
+
 **5. Sprint plan alignment.** Per EHBG §10b, after Sprint 4 (Pharmacy) the next sprints are:
    - Sprint 5: Pharmacy + Subscription part 2
    - Sprint 6: Pharmacy + Refill part 3 + Admin Backend
@@ -119,6 +145,9 @@ Keep the brief short — under 250 words total. The implementing agent is compet
 - Edit the spec corpus. SIs are filed at `docs/SI-*.md` in this repo; the spec corpus is the upstream authority and changes there happen via Promotion Ledger (out of your scope).
 - **Propose wire-protocol identifiers without contract-file verification.** If unsure whether `X.Y.Z` exists in the canonical vocabulary, flag it explicitly as a contract-check item rather than inlining the proposed string and hoping the SM doesn't notice (Sprint 3 retro lesson).
 - **Propose tests for alleged coverage gaps without grep verification.** If the brief proposes test authoring, the "current coverage state" line MUST be the output of an actual grep / read, not an assumption (Sprint 1 retro lesson).
+- **Propose spec-corpus identifiers (ORT row IDs, ADR numbers, Promotion Ledger entries, slice PRD section refs, invariant IDs) without source-of-truth-file verification.** Hallucinated spec identifiers waste SM execution time on verification + correction; in the worst case they ship as references in committed docs and become stale (Sprint 5 retro lesson — PM proposed OR-253/244/255, none of which exist in the actual ORT).
+- **Propose tests that assert on values the production code transforms without surfacing the canonicalization rule.** When the test's WHERE clause / expected value / mock input depends on internal canonicalization (URL path, header, key format, hash input order), the brief MUST surface the canonicalization function's location in the production code (Sprint 5 TLC-013 endpoint-canonicalization gotcha).
+- **Skip the SM verification gate.** The gate exists because PM self-verification has been imperfect across multiple sprints. When the brief is returned to the SM, accept that the SM will mechanically verify every cited identifier and either bounce-back-to-PM or SM-correct-inline. Don't argue with the gate.
 
 ## Loop discipline
 
