@@ -33,7 +33,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { withTenantBoundConnection, withTransaction } from '../../../../lib/db.js';
+import { withTenantBoundConnection } from '../../../../lib/db.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import * as accountService from '../services/account-service.js';
@@ -115,15 +115,20 @@ export async function registrationStartHandler(
   }
 
   // Issue OTP. issueOtp throws OTP_LOCKOUT_ACTIVE on cooldown.
+  // Use withTenantBoundConnection so set_tenant_context() is called on
+  // the connection BEFORE the INSERT — the otp_challenges RLS policy's
+  // WITH CHECK clause requires current_tenant_id() to match the row's
+  // tenant_id, which only works when the tenant context is bound.
   try {
-    const { otp } = await withTransaction((tx) =>
+    const phone = body.phone_e164;
+    const { otp } = await withTenantBoundConnection(ctx.tenantId, (tx) =>
       otpService.issueOtp(
         ctx,
         { actorId: 'system' },
         {
           otp_id: asOtpId(ulid()),
           account_id: null, // registration: no account yet
-          phone_e164: body.phone_e164!,
+          phone_e164: phone,
           purpose: 'registration',
         },
         tx,
