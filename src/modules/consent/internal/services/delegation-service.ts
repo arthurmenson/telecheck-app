@@ -25,6 +25,14 @@ import {
   emitDelegationScopeGrantedAudit,
   emitDelegationScopeRevokedAudit,
 } from '../../audit.js';
+import {
+  emitDelegationAcceptedDomainEvent,
+  emitDelegationDeclinedDomainEvent,
+  emitDelegationInvitedDomainEvent,
+  emitDelegationRevokedDomainEvent,
+  emitDelegationScopeGrantedDomainEvent,
+  emitDelegationScopeRevokedDomainEvent,
+} from '../../events.js';
 import * as delegationRepo from '../repositories/delegation-repo.js';
 import {
   asDelegationId,
@@ -122,6 +130,14 @@ export async function inviteDelegate(
           },
           innerTx,
         );
+        await emitDelegationInvitedDomainEvent(innerTx, {
+          tenantId: ctx.tenantId,
+          delegationId: delegation.delegation_id,
+          grantorAccountId: delegation.grantor_account_id,
+          delegateAccountId: delegation.delegate_account_id,
+          relationshipType: delegation.relationship_type,
+          occurredAt: delegation.created_at,
+        });
       },
       tx,
     );
@@ -155,6 +171,13 @@ export async function acceptDelegation(
       },
       tx,
     );
+    await emitDelegationAcceptedDomainEvent(tx, {
+      tenantId: ctx.tenantId,
+      delegationId: accepted.delegation_id,
+      grantorAccountId: accepted.grantor_account_id,
+      delegateAccountId: accepted.delegate_account_id,
+      occurredAt: accepted.accepted_at ?? accepted.created_at,
+    });
     return accepted;
   };
   if (externalTx !== undefined) return runFn(externalTx);
@@ -181,6 +204,13 @@ export async function declineDelegation(
       },
       tx,
     );
+    await emitDelegationDeclinedDomainEvent(tx, {
+      tenantId: ctx.tenantId,
+      delegationId: declined.delegation_id,
+      grantorAccountId: declined.grantor_account_id,
+      delegateAccountId: declined.delegate_account_id,
+      occurredAt: declined.declined_at ?? declined.created_at,
+    });
     return declined;
   };
   if (externalTx !== undefined) return runFn(externalTx);
@@ -208,6 +238,13 @@ export async function revokeDelegation(
       },
       tx,
     );
+    await emitDelegationRevokedDomainEvent(tx, {
+      tenantId: ctx.tenantId,
+      delegationId: revoked.delegation_id,
+      grantorAccountId: revoked.grantor_account_id,
+      reason,
+      occurredAt: revoked.revoked_at ?? revoked.created_at,
+    });
     return revoked;
   };
   if (externalTx !== undefined) return runFn(externalTx);
@@ -254,6 +291,13 @@ export async function grantScope(
       },
       tx,
     );
+    await emitDelegationScopeGrantedDomainEvent(tx, {
+      tenantId: ctx.tenantId,
+      delegationScopeId: created.delegation_scope_id,
+      delegationId: created.delegation_id,
+      scope: created.scope,
+      occurredAt: created.granted_at,
+    });
     return created;
   };
   if (externalTx !== undefined) return runFn(externalTx);
@@ -281,6 +325,13 @@ export async function revokeScope(
       },
       tx,
     );
+    await emitDelegationScopeRevokedDomainEvent(tx, {
+      tenantId: ctx.tenantId,
+      delegationScopeId: revoked.delegation_scope_id,
+      delegationId: revoked.delegation_id,
+      scope: revoked.scope,
+      occurredAt: revoked.revoked_at ?? revoked.granted_at,
+    });
     return revoked;
   };
   if (externalTx !== undefined) return runFn(externalTx);

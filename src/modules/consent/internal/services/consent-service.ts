@@ -21,6 +21,7 @@ import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import type { AccountId } from '../../../identity/internal/types.js';
 import { emitConsentGrantedAudit, emitConsentRevokedAudit } from '../../audit.js';
+import { emitConsentGrantedDomainEvent, emitConsentRevokedDomainEvent } from '../../events.js';
 import * as consentRepo from '../repositories/consent-repo.js';
 import {
   asConsentId,
@@ -86,6 +87,16 @@ export async function grantConsent(
         },
         tx,
       );
+      // Domain event emission alongside audit (same tx; rollback together).
+      await emitConsentGrantedDomainEvent(tx, {
+        tenantId: ctx.tenantId,
+        consentId: consent.consent_id,
+        accountId: consent.account_id,
+        consentType: consent.consent_type,
+        scopeId: consent.scope_id,
+        consentVersionId: consent.consent_version_id,
+        occurredAt: consent.created_at,
+      });
     },
     externalTx,
   );
@@ -169,6 +180,16 @@ export async function revokeConsent(
         },
         tx,
       );
+      // Domain event emission alongside audit (same tx; rollback together).
+      await emitConsentRevokedDomainEvent(tx, {
+        tenantId: ctx.tenantId,
+        consentId: consent.consent_id,
+        accountId: consent.account_id,
+        consentType: consent.consent_type,
+        scopeId: consent.scope_id,
+        revocationReason: input.reason,
+        occurredAt: consent.created_at,
+      });
     },
     externalTx,
   );
