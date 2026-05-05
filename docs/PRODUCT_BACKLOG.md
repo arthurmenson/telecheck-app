@@ -1,7 +1,7 @@
 # Product Backlog — Telecheck-app
 
 **Owner:** project-manager agent
-**Last reviewed:** 2026-05-05 (Sprint 6 close → Sprint 7 kickoff prep)
+**Last reviewed:** 2026-05-05 (Sprint 7 close → Sprint 8 kickoff prep — **PRE-PAVE RUNWAY EXHAUSTED**)
 **Story format:** `TLC-NNN — title`
 
 ---
@@ -296,42 +296,72 @@ Consolidates existing per-slice status docs into a single traceability matrix ma
 
 ---
 
-## Sprint 7 — proposed (PM confirms at Sprint 7 kickoff; verification gate runs)
+## Sprint 7 — DONE (closed 2026-05-05 at ba2c7be; review/retro pending commit)
 
-### TLC-018 — Foundation-layer perf budget tests (OR-218)
+### TLC-018 — Perf budget infra scaffold (SCAFFOLDS OR-218; does NOT close)
 
-**Status:** todo (candidate; lower priority)
+**Status:** ✅ done (d677fd3 + d879a79 Codex HIGH fix-forward; re-verify APPROVE)
 **Sprint:** Sprint 7
-**Estimated commits:** 2-3
+**Actual commits:** 2 (story + fix-forward)
 **Decision rule:** 6 (UAT / launch-readiness)
 
-Per-foundation-layer perf assertions (idempotency lookup, audit emit, RLS query) under representative load. PM verify-before-authoring at Sprint 7 kickoff: check what perf measurement infra exists today; if none, story is larger than 2-3 commits and needs to be re-scoped.
+Vitest bench mode scaffolding (separate `vitest.bench.config.ts` because per-mode setupFiles override doesn't apply in Vitest 2). 1 example bench at `tests/perf/audit/crisis-detect.bench.ts` with 4 scenarios. `npm run bench` script wired. Bench is signal-not-gate at v0.1; OR-218 stays OPEN until Sprint 11 hardening adds (1) p95 thresholds, (2) CI gate wiring, (3) baseline comparison output. Codex perf-bench-r1 HIGH closed via reframe ("scaffolds OR-218 infra; closure deferred to Sprint 11").
 
-### TLC-019 — Data-filtering implementation status doc (OR-208)
+### TLC-019 — Data-filtering implementation status doc
 
-**Status:** todo (candidate; lowest priority)
-**Sprint:** Sprint 7 (filler)
-**Estimated commits:** 1
-**Decision rule:** 6
+**Status:** ❌ DESCOPED at Sprint 7 PM kickoff
+**Reason:** PM verified BUILD_VS_SPEC_TRACEABILITY_MATRIX.md §1 I-023 row + §2 lib rows already document ADR-023's 3-layer enforcement. Authoring duplicate would violate "verify before authoring". Absorbed into matrix r2 with OR-208 back-link.
 
-Status doc capturing ADR-023's 3-layer enforcement decision rationale + the test surface that proves it. ADR-023 implicit closure already exists; this doc makes it explicit. Sprint 7 PM may descope on grounds that the BUILD_VS_SPEC_TRACEABILITY_MATRIX (TLC-017) §1 + §2 already documents the I-023 enforcement layers + test coverage.
+### Matrix r2 amend (TLC-019 absorption + OR-218 status correction)
 
-### Pre-pave runway flag (Sprint 6 retro signal)
+**Status:** ✅ done (ba2c7be)
+**Sprint:** Sprint 7
+**Actual commits:** 1
+**Decision rule:** Sprint 7 retro process change
 
-After Sprint 7 closes TLC-018/019, the testable-without-upstream-blockers backlog is exhausted. Sprint 8+ work pivots to either:
-- (a) Slice 4 schema authoring (if SI-001 closes upstream — PM checks Promotion Ledger for P-011)
-- (b) Authoring an Async Consult slice if the slice PRD exists in the spec corpus (Sprint 8 PM grep)
-- (c) Surface to Evans: "no further pre-pave; awaiting upstream SI closures + emergency-access vendor integration"
-
-### Process item for Sprint 7 PM kickoff
-
-Severity-gating sub-rule extension (Sprint 6 retro deliverable): "MEDIUM findings on contract-lockdown surfaces (`tests/contracts/`) where the fix is trivial (≤5 LOC) AND the finding hits the test's core value proposition = fix-forward in-sprint." General MEDIUM-deferral rule remains for all other surfaces.
-
-Also: SM execution checklist addition (Sprint 6 retro): for any new contract-lockdown test, audit each early-`return` / soft-skip for "does this hide a real failure from CI?" Apply before commit, not after Codex.
+Living-doc amend in place (4th amend across the 3 living docs). Closes OR-208 (matrix is canonical closure path); flags OR-218 as scaffolded-not-closed; updates §6 cumulative metrics with Sprint 7 deltas.
 
 ---
 
-## Sprint 8+ — proposed (sequenced through EHBG §10b)
+## Sprint 8 — proposed (PM confirms at Sprint 8 kickoff; PRE-PAVE EXHAUSTED — pivot decision required)
+
+**Status flag at Sprint 7 close:** the testable-without-upstream-blockers backlog is depleted. Sprint 8+ MUST pivot. Three pivot paths:
+
+### Path (a) — Slice 4 schema authoring (if SI-001 closes upstream)
+
+PM checks Promotion Ledger for P-011 entry. If it lands between Sprint 7 close and Sprint 8 kickoff, Slice 4 schema authoring becomes the priority path.
+
+### Path (b) — Async Consult slice authoring (RECOMMENDED if SI-001 still open)
+
+**Status:** todo (candidate; PM verifies PRD section refs at Sprint 8 kickoff)
+**Sprint:** Sprint 8 (estimated Sprint A; full slice spans Sprint 8-10)
+**Estimated commits:** 5-10 per sprint × ~3 sprints = 15-30 total
+**Decision rule:** 4 (new unblocked slice work)
+
+PRD verified to exist at `Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_Async_Consult_Slice_PRD_v1_0.md` (Sprint 7 PM brief §5; SM verification gate confirmed). Sprint sequencing per Forms-Intake / Identity / Consent precedent:
+- **Sprint 8 (TLC-020):** Module skeleton + state machine + branded ID types + plugin smoke test
+- **Sprint 9 (TLC-021):** Repos + service layer + initial HTTP handlers
+- **Sprint 10 (TLC-022):** Full HTTP integration tests + audit + domain event emitters + cross-tenant isolation tests + Codex FIRE per iteration
+
+PM-brief verification gate at Sprint 8 kickoff MUST verify the Async Consult PRD section refs the SM cites (per Sprint 5 retro spec-corpus identifier sub-rule extended to slice PRD section refs).
+
+### Path (c) — Surface emergency-access blockers to Evans
+
+If neither (a) nor (b) is viable (e.g., Async Consult PRD turns out to depend on un-authored upstream slice contracts), surface to Evans the remaining work that requires his emergency-only involvement:
+- Vendor account credentials (LiveKit, Anthropic API, AWS Bedrock, Twilio/Hubtel, etc.)
+- AWS deploy access for production cutover
+- Counsel work (DPIA, threat model, etc.) that's out-of-repo
+
+### Process items for Sprint 8 PM kickoff
+
+- Verification gate runs again per `SCRUM_OPERATING_MODEL.md`
+- Sprint 7 retro process change: SM closure-language audit before commit (don't ship "closes <X>" if the doc itself says "non-blocking" + X is launch-blocking)
+- Sprint 7 retro process change: pre-commit local-run for new infra (lint+typecheck alone insufficient for test runners / build configs / scripts)
+- Sprint 7 retro process change: vitest config block addition checklist (audit existing comments for `*/` glob-comment-terminator constraint pattern)
+
+---
+
+## Sprint 9+ — proposed (sequenced through EHBG §10b)
 
 | Sprint | EHBG mapping                                                     | Indicative stories                                                                                                                                                                                                        |
 | ------ | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -362,6 +392,12 @@ PM may resequence based on SI closures + emergent priorities.
 
 ## Done (rolling archive — last 3 sprints visible)
 
+### Sprint 7 — closed 2026-05-05
+
+- TLC-018 — Perf budget infra scaffold (d677fd3 + d879a79 fix-forward; Codex HIGH closed; re-verify APPROVE; SCAFFOLDS OR-218 — does NOT close)
+- TLC-019 — DESCOPED at PM kickoff (matrix already covers)
+- Matrix r2 amend (ba2c7be; closes OR-208 via absorption; flags OR-218 status correction)
+
 ### Sprint 6 — closed 2026-05-05
 
 - TLC-016 — RLS policy coverage lockdown (75640ef + 2dece96 fix-forward; Codex MEDIUM closed; re-verify APPROVE; 46 cases across 21 tenant-scoped tables)
@@ -371,8 +407,3 @@ PM may resequence based on SI closures + emergent priorities.
 
 - TLC-013 — Idempotency invariant lockdown (3e37433 + 0f4a757 fix-forward; Codex HIGH closed; re-verify APPROVE)
 - TLC-015 — ORT v1.5 testable items audit (1eab1a6; 4 verified-real Sprint 6+ candidates surfaced)
-
-### Sprint 4 — closed 2026-05-05
-
-- TLC-010 — Subscription module skeleton (da597c6; 3rd skeleton-recipe application + 2 wiring tests)
-- TLC-012-rescoped — Crisis-detection (I-019) coverage audit + lockdown (be6a2dc; coverage audit doc + 9-case static-analysis lockdown)
