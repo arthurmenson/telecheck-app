@@ -547,3 +547,76 @@ export async function emitFormsResumeStateRestored(
     occurred_at: new Date().toISOString(),
   });
 }
+
+// ---------------------------------------------------------------------------
+// Operator-edit governance events (Sprint 2 / TLC-006)
+//
+// Audit-side emitters exist in audit.ts but currently have ZERO callers
+// (the operator-side mutation surface for editing eligibility logic +
+// approval governance hasn't been authored yet at v0.1). These domain
+// events ship parallel to the audit emitters so when the operator
+// surface lands (Admin Backend slice or a future template-service mutation
+// path), wiring is one-line — both audit + event emit alongside the
+// state change.
+//
+// SPEC ISSUE per EHBG §12: DOMAIN_EVENTS v5.2 doesn't enumerate
+// `forms_eligibility_logic.edited` / `forms_approval_governance.edited`.
+// SI-003 covers this same placeholder-string ratification gap.
+// ---------------------------------------------------------------------------
+
+const FORMS_VERSION_AGGREGATE = 'forms_version';
+
+/**
+ * Emit `forms_eligibility_logic.edited` — operator edited the Layer 3
+ * eligibility-logic on a form version per FORMS_ENGINE v5.2 §Layer 3.
+ * Category B governance event. Pairs with the parallel audit emit at
+ * `audit.ts emitFormsEligibilityLogicEdited`.
+ */
+export async function emitFormsEligibilityLogicEdited(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    versionId: FormVersionId;
+    changes: ReadonlyArray<Record<string, unknown>>;
+    clinicalImpactAssessment: string;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_VERSION_AGGREGATE,
+    aggregate_id: args.versionId,
+    event_type: 'forms_eligibility_logic.edited',
+    payload: {
+      form_version_id: args.versionId,
+      changes: args.changes,
+      clinical_impact_assessment: args.clinicalImpactAssessment,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Emit `forms_approval_governance.edited` — operator edited the Layer 4
+ * approval-governance (pricing / market / launch gating) on a form
+ * version per FORMS_ENGINE v5.2 §Layer 4. Category B governance event.
+ */
+export async function emitFormsApprovalGovernanceEdited(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    versionId: FormVersionId;
+    changes: ReadonlyArray<Record<string, unknown>>;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_VERSION_AGGREGATE,
+    aggregate_id: args.versionId,
+    event_type: 'forms_approval_governance.edited',
+    payload: {
+      form_version_id: args.versionId,
+      changes: args.changes,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
