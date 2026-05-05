@@ -207,22 +207,32 @@ describe('consent slice — §1 idempotency replay', () => {
     // Side-effect probe: exactly ONE consent row for this account+version.
     // The consent table is append-only (Slice PRD §7.1) — a duplicate
     // handler-run would write a SECOND `granted` row with a different
-    // consent_id, which this query would catch.
-    const consentCount = await getTestClient().query<{ c: string }>(
-      `SELECT COUNT(*)::text AS c FROM consent
-         WHERE tenant_id = $1 AND account_id = $2 AND consent_version_id = $3`,
-      [T_US, accountId, versionId],
-    );
-    expect(Number.parseInt(consentCount.rows[0]!.c, 10)).toBe(1);
+    // consent_id, which this query would catch. Wrapped in withTenantContext
+    // because the test client's tenant binding from earlier
+    // withTenantContext calls in loginAndGetToken may have been rolled back
+    // or expired before reaching this assertion (the binding is stored in
+    // a tx-scoped row in _session_tenant_context per migration 003).
+    const consentCount = await withTenantContext(T_US, async () => {
+      const r = await getTestClient().query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c FROM consent
+           WHERE tenant_id = $1 AND account_id = $2 AND consent_version_id = $3`,
+        [T_US, accountId, versionId],
+      );
+      return Number.parseInt(r.rows[0]!.c, 10);
+    });
+    expect(consentCount).toBe(1);
 
     // Parallel audit-side probe: exactly ONE consent_granted audit for
     // this consent_id. A re-run handler would emit a second audit row.
-    const auditCount = await getTestClient().query<{ c: string }>(
-      `SELECT COUNT(*)::text AS c FROM audit_records
-         WHERE tenant_id = $1 AND action = 'consent_granted' AND resource_id = $2`,
-      [T_US, firstBody.consent_id],
-    );
-    expect(Number.parseInt(auditCount.rows[0]!.c, 10)).toBe(1);
+    const auditCount = await withTenantContext(T_US, async () => {
+      const r = await getTestClient().query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c FROM audit_records
+           WHERE tenant_id = $1 AND action = 'consent_granted' AND resource_id = $2`,
+        [T_US, firstBody.consent_id],
+      );
+      return Number.parseInt(r.rows[0]!.c, 10);
+    });
+    expect(auditCount).toBe(1);
   });
 
   it('§1b POST /consents same key + different body returns 409 tenant-blind', async () => {
@@ -308,11 +318,14 @@ describe('consent slice — §1 idempotency replay', () => {
 
     // Exactly ONE delegation row for the (grantor, delegate) tuple. A
     // duplicate handler-run would write a second pending_acceptance row.
-    const count = await getTestClient().query<{ c: string }>(
-      `SELECT COUNT(*)::text AS c FROM delegations
-         WHERE tenant_id = $1 AND delegate_account_id = $2`,
-      [T_US, delegateId],
-    );
-    expect(Number.parseInt(count.rows[0]!.c, 10)).toBe(1);
+    const count = await withTenantContext(T_US, async () => {
+      const r = await getTestClient().query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c FROM delegations
+           WHERE tenant_id = $1 AND delegate_account_id = $2`,
+        [T_US, delegateId],
+      );
+      return Number.parseInt(r.rows[0]!.c, 10);
+    });
+    expect(count).toBe(1);
   });
 });
