@@ -59,11 +59,13 @@ const GH_CTX: TenantContext = {
   consumerSubdomain: 'ghana.heroshealth.com',
 };
 
+// Per-process monotonic counter for collision-proof phone uniqueness; see
+// the parallel comment in delegation-service.test.ts for the failure mode
+// the prior ULID-slice helper had.
+let _phoneCounter = 0;
 function uniquePhone(prefix: string): string {
-  const digits = ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0')
-    .padEnd(9, '0');
+  _phoneCounter += 1;
+  const digits = String(Date.now() * 1000 + (_phoneCounter % 1000)).slice(-9);
   return `${prefix}${digits}`;
 }
 
@@ -208,6 +210,7 @@ describe('cross-tenant isolation §2 delegation-service', () => {
           delegate_account_id: delegate,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
 
@@ -217,6 +220,7 @@ describe('cross-tenant isolation §2 delegation-service', () => {
         US_CTX,
         { actorId: 'op_us_attacker' },
         invited.delegation_id,
+        getTestClient(),
       ),
     );
     expect(result).toBeNull();
@@ -253,6 +257,7 @@ describe('cross-tenant isolation §2 delegation-service', () => {
           delegate_account_id: delegate,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
     await withTenantContext(T_GH, () =>
@@ -260,6 +265,7 @@ describe('cross-tenant isolation §2 delegation-service', () => {
         GH_CTX,
         { actorId: 'op_gh_accept_2b' },
         invited.delegation_id,
+        getTestClient(),
       ),
     );
 
@@ -270,6 +276,7 @@ describe('cross-tenant isolation §2 delegation-service', () => {
         { actorId: 'op_us_attacker' },
         invited.delegation_id,
         'patient_initiated',
+        getTestClient(),
       ),
     );
     expect(result).toBeNull();

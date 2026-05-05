@@ -14,6 +14,14 @@
  *   - Consent Slice PRD v1.0 §6
  *   - I-003 (audit append-only; bare suppression forbidden — but null no-op
  *     correctly emits no audit because nothing transitioned)
+ *
+ * NOTE on externalTx: every delegationService.* call passes getTestClient()
+ * as the externalTx parameter so the call uses the test's savepoint-bound
+ * connection (which already has app.current_tenant_id set by withTenantContext).
+ * Without externalTx, the service falls back to withTenantBoundConnection()
+ * which acquires a fresh pool connection that does NOT inherit the test's
+ * GUC state — surfacing as `tenant_context_not_set` errors. (CI fix
+ * 2026-05-05; first authored at f4dee93 missed this; corrected here.)
  */
 
 import { describe, expect, it } from 'vitest';
@@ -40,11 +48,15 @@ const US_CTX: TenantContext = {
   consumerSubdomain: 'heroshealth.com',
 };
 
+// Per-process monotonic counter; combined with Date.now() in uniquePhone()
+// to guarantee 9-digit phone uniqueness within a test run. The earlier
+// ULID-slice helper had a degenerate case where many non-digit base32 chars
+// collapsed to '0', producing collisions like '+10000000000' across two
+// seedAccount() calls in the same test.
+let _phoneCounter = 0;
 function uniquePhone(): string {
-  const digits = ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0')
-    .padEnd(9, '0');
+  _phoneCounter += 1;
+  const digits = String(Date.now() * 1000 + (_phoneCounter % 1000)).slice(-9);
   return `+1${digits}`;
 }
 
@@ -88,6 +100,7 @@ describe('delegation-service §1 inviteDelegate', () => {
           delegate_account_id: delegate,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
     expect(delegation.status).toBe('pending_acceptance');
@@ -117,6 +130,7 @@ describe('delegation-service §1 inviteDelegate', () => {
             delegate_account_id: me,
             relationship_type: 'spouse_partner',
           },
+          getTestClient(),
         ),
       ),
     ).rejects.toThrow(delegationService.DELEGATION_SELF_FORBIDDEN);
@@ -139,6 +153,7 @@ describe('delegation-service §1 inviteDelegate', () => {
           delegate_account_id: b,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
     // B accepts -> now active delegate of A
@@ -147,6 +162,7 @@ describe('delegation-service §1 inviteDelegate', () => {
         US_CTX,
         { actorId: 'op_test_1c_setup' },
         delegation.delegation_id,
+        getTestClient(),
       ),
     );
 
@@ -161,6 +177,7 @@ describe('delegation-service §1 inviteDelegate', () => {
             delegate_account_id: c,
             relationship_type: 'spouse_partner',
           },
+          getTestClient(),
         ),
       ),
     ).rejects.toThrow(delegationService.DELEGATION_CHAIN_FORBIDDEN);
@@ -185,11 +202,17 @@ describe('delegation-service §2 state transitions', () => {
           delegate_account_id: delegate,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
 
     const accepted = await withTenantContext(T_US, () =>
-      delegationService.acceptDelegation(US_CTX, { actorId: 'op_test_2a' }, invited.delegation_id),
+      delegationService.acceptDelegation(
+        US_CTX,
+        { actorId: 'op_test_2a' },
+        invited.delegation_id,
+        getTestClient(),
+      ),
     );
     expect(accepted).not.toBeNull();
     expect(accepted!.status).toBe('active');
@@ -204,7 +227,12 @@ describe('delegation-service §2 state transitions', () => {
 
     // Idempotent re-call returns null and emits no spurious audit.
     const second = await withTenantContext(T_US, () =>
-      delegationService.acceptDelegation(US_CTX, { actorId: 'op_test_2a' }, invited.delegation_id),
+      delegationService.acceptDelegation(
+        US_CTX,
+        { actorId: 'op_test_2a' },
+        invited.delegation_id,
+        getTestClient(),
+      ),
     );
     expect(second).toBeNull();
   });
@@ -222,11 +250,17 @@ describe('delegation-service §2 state transitions', () => {
           delegate_account_id: delegate,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
 
     const declined = await withTenantContext(T_US, () =>
-      delegationService.declineDelegation(US_CTX, { actorId: 'op_test_2b' }, invited.delegation_id),
+      delegationService.declineDelegation(
+        US_CTX,
+        { actorId: 'op_test_2b' },
+        invited.delegation_id,
+        getTestClient(),
+      ),
     );
     expect(declined).not.toBeNull();
     expect(declined!.status).toBe('declined');
@@ -245,6 +279,7 @@ describe('delegation-service §2 state transitions', () => {
         US_CTX,
         { actorId: 'op_test_2b' },
         asDelegationId(ulid()),
+        getTestClient(),
       ),
     );
     expect(ghost).toBeNull();
@@ -263,10 +298,16 @@ describe('delegation-service §2 state transitions', () => {
           delegate_account_id: delegate,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
     await withTenantContext(T_US, () =>
-      delegationService.acceptDelegation(US_CTX, { actorId: 'op_test_2c' }, invited.delegation_id),
+      delegationService.acceptDelegation(
+        US_CTX,
+        { actorId: 'op_test_2c' },
+        invited.delegation_id,
+        getTestClient(),
+      ),
     );
 
     const revoked = await withTenantContext(T_US, () =>
@@ -275,6 +316,7 @@ describe('delegation-service §2 state transitions', () => {
         { actorId: 'op_test_2c' },
         invited.delegation_id,
         'patient_initiated',
+        getTestClient(),
       ),
     );
     expect(revoked).not.toBeNull();
@@ -297,6 +339,7 @@ describe('delegation-service §2 state transitions', () => {
         { actorId: 'op_test_2c' },
         invited.delegation_id,
         'patient_initiated',
+        getTestClient(),
       ),
     );
     expect(second).toBeNull();
@@ -320,6 +363,7 @@ describe('delegation-service §3 scope CRUD', () => {
           delegate_account_id: delegate,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
 
@@ -331,6 +375,7 @@ describe('delegation-service §3 scope CRUD', () => {
           delegation_id: invited.delegation_id,
           scope: 'view_records',
         },
+        getTestClient(),
       ),
     );
     expect(scope.scope).toBe('view_records');
@@ -359,6 +404,7 @@ describe('delegation-service §3 scope CRUD', () => {
           delegate_account_id: delegate,
           relationship_type: 'spouse_partner',
         },
+        getTestClient(),
       ),
     );
     const granted = await withTenantContext(T_US, () =>
@@ -369,6 +415,7 @@ describe('delegation-service §3 scope CRUD', () => {
           delegation_id: invited.delegation_id,
           scope: 'view_records',
         },
+        getTestClient(),
       ),
     );
 
@@ -377,6 +424,7 @@ describe('delegation-service §3 scope CRUD', () => {
         US_CTX,
         { actorId: 'op_test_3b', grantorAccountId: grantor },
         granted.delegation_scope_id,
+        getTestClient(),
       ),
     );
     expect(revoked).not.toBeNull();
@@ -399,6 +447,7 @@ describe('delegation-service §3 scope CRUD', () => {
         US_CTX,
         { actorId: 'op_test_3c', grantorAccountId: grantor },
         asDelegationScopeId(ulid()),
+        getTestClient(),
       ),
     );
     expect(result).toBeNull();
