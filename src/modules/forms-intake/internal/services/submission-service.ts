@@ -48,6 +48,7 @@ import {
   emitFormsSubmissionStartedAudit,
 } from '../../audit.js';
 import {
+  emitFormsResumeStateRestored as emitFormsResumeStateRestoredEvent,
   emitFormsResumeStateSaved as emitFormsResumeStateSavedEvent,
   emitFormsSubmissionCompleted as emitFormsSubmissionCompletedEvent,
   emitFormsSubmissionStarted as emitFormsSubmissionStartedEvent,
@@ -1013,6 +1014,13 @@ export async function resumeSubmission(
             },
             innerTx,
           );
+          // Domain event emission alongside audit (same tx).
+          await emitFormsResumeStateRestoredEvent(innerTx, {
+            tenantId: ctx.tenantId,
+            submissionId: updatedSubmission.submission_id,
+            resumeStateId: row.resume_state_id,
+            patientId: restorePatientId,
+          });
         },
         tx,
       );

@@ -33,6 +33,7 @@ import type {
   FormDeploymentId,
   FormSubmissionId,
   FormTemplateId,
+  FormVariantId,
   FormVersionId,
   PatientId,
   ResumeStateId,
@@ -46,6 +47,7 @@ const INTAKE_RESPONSE_AGGREGATE = 'intake_response';
 const RESUME_STATE_AGGREGATE = 'forms_resume_state';
 const FORMS_TEMPLATE_AGGREGATE = 'forms_template';
 const FORMS_DEPLOYMENT_AGGREGATE = 'forms_deployment';
+const FORMS_VARIANT_AGGREGATE = 'forms_variant';
 
 // ---------------------------------------------------------------------------
 // Template lifecycle event emitters
@@ -401,6 +403,146 @@ export async function emitIntakeSubscriptionIntent(
       products: args.products,
       payment_method_preference: args.paymentMethodPreference,
       shipping_preference: args.shippingPreference,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Variant lifecycle events (forms_variant aggregate)
+//
+// SPEC ISSUE per EHBG §12: DOMAIN_EVENTS v5.2 doesn't enumerate the
+// `forms_variant` aggregate or its lifecycle events. Same gap as the
+// `forms_template` aggregate above. Pattern follows the established
+// audit-side placeholder approach (see audit.ts emitFormsVariantCreated).
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit `forms_variant.created` — operator created a new A/B variant arm
+ * via the visual-builder workflow per Slice PRD §6 + §14.5.
+ */
+export async function emitFormsVariantCreated(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    variantId: FormVariantId;
+    deploymentId: FormDeploymentId;
+    variantTemplateId: FormTemplateId;
+    label: string;
+    trafficPercent: number;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_VARIANT_AGGREGATE,
+    aggregate_id: args.variantId,
+    event_type: 'forms_variant.created',
+    payload: {
+      variant_id: args.variantId,
+      deployment_id: args.deploymentId,
+      variant_template_id: args.variantTemplateId,
+      label: args.label,
+      traffic_percent: args.trafficPercent,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Emit `forms_variant.winner_promoted` — operator promoted a statistically-
+ * significant winner variant to new Control per Slice PRD §14.5/§14.6.
+ * Captures sample size, p-value, and rationale to track the experimentation
+ * decision in the audit chain alongside the structured event.
+ */
+export async function emitFormsVariantWinnerPromoted(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    variantId: FormVariantId;
+    deploymentId: FormDeploymentId;
+    sampleSize: number;
+    pValue: number;
+    rationale: string;
+    retiredLoserIds: FormVariantId[];
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_VARIANT_AGGREGATE,
+    aggregate_id: args.variantId,
+    event_type: 'forms_variant.winner_promoted',
+    payload: {
+      variant_id: args.variantId,
+      deployment_id: args.deploymentId,
+      sample_size: args.sampleSize,
+      p_value: args.pValue,
+      rationale: args.rationale,
+      retired_loser_ids: args.retiredLoserIds,
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Emit `forms_variant.retired` — sibling variant retired as part of a
+ * winner-promotion event per Slice PRD §14.5. One event per retired loser
+ * so each retirement is independently attributable.
+ */
+export async function emitFormsVariantRetired(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    variantId: FormVariantId;
+    deploymentId: FormDeploymentId;
+    rationale: string;
+    promotedWinnerId: FormVariantId;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: FORMS_VARIANT_AGGREGATE,
+    aggregate_id: args.variantId,
+    event_type: 'forms_variant.retired',
+    payload: {
+      variant_id: args.variantId,
+      deployment_id: args.deploymentId,
+      rationale: args.rationale,
+      promoted_winner_id: args.promotedWinnerId,
+      retired_as_part_of: 'winner_promotion',
+    },
+    occurred_at: new Date().toISOString(),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Resume-state restored event
+//
+// Pairs with emitFormsResumeStateSaved above. Per Slice PRD §8.2 patient
+// "Resume" surface successful redemption.
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit `forms_resume_state.restored` — patient redeemed a resume token and
+ * re-attached the in-progress submission per Slice PRD §8.2.
+ */
+export async function emitFormsResumeStateRestored(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    submissionId: FormSubmissionId;
+    resumeStateId: ResumeStateId;
+    patientId: PatientId | null;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: RESUME_STATE_AGGREGATE,
+    aggregate_id: args.resumeStateId,
+    event_type: 'forms_resume_state.restored',
+    payload: {
+      submission_id: args.submissionId,
+      resume_state_id: args.resumeStateId,
+      patient_id: args.patientId,
     },
     occurred_at: new Date().toISOString(),
   });

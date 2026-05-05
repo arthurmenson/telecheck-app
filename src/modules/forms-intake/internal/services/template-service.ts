@@ -36,6 +36,9 @@ import {
   emitFormsDeploymentRetired as emitFormsDeploymentRetiredEvent,
   emitFormsTemplateCreated as emitFormsTemplateCreatedEvent,
   emitFormsTemplateVersionPublished as emitFormsTemplateVersionPublishedEvent,
+  emitFormsVariantCreated as emitFormsVariantCreatedEvent,
+  emitFormsVariantRetired as emitFormsVariantRetiredEvent,
+  emitFormsVariantWinnerPromoted as emitFormsVariantWinnerPromotedEvent,
 } from '../../events.js';
 import type {
   CreateDeploymentRequest,
@@ -548,6 +551,15 @@ export async function createVariant(
       );
       // audit_id retained for future domain-event correlation (see header).
       void auditEnvelope;
+      // Domain event emission alongside audit (same tx).
+      await emitFormsVariantCreatedEvent(tx, {
+        tenantId: ctx.tenantId,
+        variantId: variant.variant_id,
+        deploymentId: variant.deployment_id,
+        variantTemplateId: variant.variant_template_id,
+        label: variant.variant_label,
+        trafficPercent: variant.traffic_percent,
+      });
     },
     externalTx,
   );
@@ -620,8 +632,18 @@ export async function promoteVariant(
         },
         tx,
       );
-      // One retire audit per loser so each retirement is independently
-      // attributable in the audit chain.
+      // Domain event for the winner promotion (same tx).
+      await emitFormsVariantWinnerPromotedEvent(tx, {
+        tenantId: ctx.tenantId,
+        variantId: promoted.variant_id,
+        deploymentId: promoted.deployment_id,
+        sampleSize: input.sampleSize,
+        pValue: input.pValue,
+        rationale: input.rationale,
+        retiredLoserIds,
+      });
+      // One retire audit + event per loser so each retirement is
+      // independently attributable in the audit chain + outbox.
       for (const loserId of retiredLoserIds) {
         await emitFormsVariantRetiredAudit(
           {
@@ -636,6 +658,13 @@ export async function promoteVariant(
           },
           tx,
         );
+        await emitFormsVariantRetiredEvent(tx, {
+          tenantId: ctx.tenantId,
+          variantId: loserId,
+          deploymentId: promoted.deployment_id,
+          rationale: input.rationale,
+          promotedWinnerId: promoted.variant_id,
+        });
       }
     },
     externalTx,
