@@ -46,3 +46,6 @@ export {
   findCountryProfile,
   listCountryProfiles,
 } from './internal/repositories/country-profile-repo.js';
+
+// Fastify plugin for app.ts wiring
+export { tenantConfigPlugin } from './plugin.js';

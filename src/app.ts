@@ -29,6 +29,7 @@ import { tenantContextPlugin } from './lib/tenant-context.js';
 import { consentPlugin } from './modules/consent/plugin.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
 import { identityPlugin } from './modules/identity/plugin.js';
+import { tenantConfigPlugin } from './modules/tenant-config/plugin.js';
 
 export interface AppOptions {
   /**
@@ -107,6 +108,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       // /health is automatically allowlisted by the plugin.
       '/v0/identity/health',
       '/v0/consent/health',
+      '/v0/tenant-config/health',
     ],
   });
 
@@ -148,6 +150,13 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // Full consent grant/revoke + delegation invite/accept/revoke + scope
   // routes land in subsequent commits.
   await app.register(consentPlugin);
+
+  // Tenant Config — routes mounted under /v0/tenant-config.
+  // Provides /me endpoint for patient-app bootstrap (brand + country
+  // profile snapshot). The CCR resolver service is the canonical CCR-key
+  // lookup surface for cross-module consumers — see
+  // src/modules/tenant-config/index.ts.
+  await app.register(tenantConfigPlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
