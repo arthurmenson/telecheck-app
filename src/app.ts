@@ -26,6 +26,7 @@ import { authContextPlugin } from './lib/auth-context.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
+import { consentPlugin } from './modules/consent/plugin.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
 import { identityPlugin } from './modules/identity/plugin.js';
 
@@ -105,6 +106,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       // Extend here when new tenant-blind routes are added.
       // /health is automatically allowlisted by the plugin.
       '/v0/identity/health',
+      '/v0/consent/health',
     ],
   });
 
@@ -140,6 +142,12 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // Full registration / login / session / device routes land in
   // subsequent commits.
   await app.register(identityPlugin);
+
+  // Consent & Delegated Access Slice — routes mounted under /v0/consent.
+  // Currently registers only a module health probe (/v0/consent/health).
+  // Full consent grant/revoke + delegation invite/accept/revoke + scope
+  // routes land in subsequent commits.
+  await app.register(consentPlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
