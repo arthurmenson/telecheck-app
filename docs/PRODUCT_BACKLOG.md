@@ -1,7 +1,7 @@
 # Product Backlog — Telecheck-app
 
 **Owner:** project-manager agent
-**Last reviewed:** 2026-05-05 (Sprint 2 close → Sprint 3 kickoff prep)
+**Last reviewed:** 2026-05-05 (Sprint 3 close → Sprint 4 kickoff prep)
 **Story format:** `TLC-NNN — title`
 
 ---
@@ -191,38 +191,68 @@ The audit emitters EXIST in `src/modules/forms-intake/audit.ts` but no service c
 
 ---
 
-## Sprint 3 — proposed (PM confirms at Sprint 3 kickoff)
+## Sprint 3 — DONE (closed 2026-05-05 at ad711fb; review/retro pending commit)
 
 ### TLC-007 — Med Interaction signals contract scaffolding
 
-**Status:** todo (candidate)
-**Sprint:** Sprint 3 (if SI-001 still open)
+**Status:** ✅ done (2f89661; module skeleton + plugin smoke test)
+**Sprint:** Sprint 3
 **Estimated commits:** 2
-**Decision rule:** 3 (diminishing-returns hygiene) / 4 (new unblocked slice prep)
+**Actual commits:** 1
+**Decision rule:** 4 (new unblocked slice prep)
 
-Pure types module — no schema, no migrations. Authors `src/modules/med-interaction/internal/types.ts` with branded ID types (`InteractionSignalId`, `InteractionOverrideId`) + signal-shape interfaces matching the future Med Interaction Engine slice contract. Mirrors pharmacy skeleton pattern. Plugin shell + `/health` BLOCKED probe (BLOCKED on Med Interaction slice ratification).
+Branded IDs: `InteractionSignalId`, `InteractionOverrideId`, `InteractionRulesetId`. Plugin under `/v0/med-interaction` with `/health` (200) + `/ready` (503) — Sprint 1 Codex MEDIUM finding applied a-priori. 2-case wiring test mirroring pharmacy skeleton.
 
 ### TLC-008 — Forms-intake remaining audit-emitter coverage gaps
 
-**Status:** todo (candidate; PM verifies at kickoff per Sprint 1 retro lesson "verify before authoring")
-**Sprint:** Sprint 3
-**Estimated commits:** 1-2
-**Decision rule:** 3 (diminishing-returns hygiene)
+**Status:** ❌ DESCOPED at Sprint 3 kickoff
+**Reason:** PM verify-before-authoring research showed non-governance forms-intake emitters have transitive integration coverage via service-layer tests; not a genuine gap.
 
-PM research step at kickoff: grep `emitForms*` callers vs. existing test files; surface ONLY the genuine coverage gaps. Acceptance criteria: each newly-tested emitter has an envelope-shape assertion covering `audit_sensitivity_level` + Category. If grep shows zero gaps, story is descoped at kickoff.
+### TLC-009 — Tenant-config admin-write 503 surface skeleton
 
-### TLC-009 — Tenant-config admin-write skeleton (BLOCKED-aware)
-
-**Status:** todo (candidate)
+**Status:** ✅ done (ad711fb; 5 mutation stubs + readiness probe + 7 tests)
 **Sprint:** Sprint 3
 **Estimated commits:** 2
+**Actual commits:** 1
 **Decision rule:** 4 (new slice prep) / partially-blocked
 
-Mirrors pharmacy skeleton pattern. Authors `src/modules/tenant-config/internal/handlers/admin-write.ts` with route stubs returning 503 for all PATCH/POST/DELETE under `/v0/admin/*`. Documents BLOCKED status on Admin Backend slice v1.1 (which owns operator auth + ADR-024 encryption-at-rest). Adds `/v0/admin/ready` returning 503 (matches pharmacy pattern). Zero schema migrations.
+503 stubs for PATCH/POST/DELETE under `/v0/admin/*` using canonical `internal.service.unavailable` envelope (NOT a new error code class — chose canonical pattern over PM's proposed `internal.module.blocked`). JWT auth fires BEFORE 503 (no enumeration attack). Mutation-surface readiness probe at `/v0/admin/ready`. ADR-024 redaction discipline applied a-priori on the 503 path.
 
 ---
 
-## Sprint 4+ — proposed (sequenced through EHBG §10b)
+## Sprint 4 — proposed (PM confirms at Sprint 4 kickoff)
+
+### TLC-010 — Subscription module skeleton (BLOCKED-aware)
+
+**Status:** todo (candidate)
+**Sprint:** Sprint 4 (if SI-001 still open)
+**Estimated commits:** 1
+**Decision rule:** 4 (new slice prep)
+
+Reproducible blocked-aware skeleton recipe (3rd application after pharmacy + med-interaction): index.ts re-exports + plugin.ts shell + routes.ts /health 200 + /ready 503 + internal/types.ts branded `SubscriptionId` + README.md BLOCKED banner + 2-case plugin smoke test. Subscription depends on MedicationRequest schema for refill cadence — branded ID ships now; row shapes await SI-001.
+
+### TLC-011 — Audit-chain hash-chain integrity regression test (I-003)
+
+**Status:** todo (candidate)
+**Sprint:** Sprint 4
+**Estimated commits:** 1-2
+**Decision rule:** 3 (diminishing-returns hygiene) / invariant-coverage
+
+Pure test work — no production code. Asserts I-003 hash-chain integrity holds across the existing audit row inventory: each row's `prev_hash` matches the previous row's `hash` (within tenant_id partition); each row's `hash` is correctly derived from `(prev_hash, tenant_id, action, actor, timestamp, payload)`; no orphaned rows. Catches future regressions where someone "optimizes" the hash construction or batches an audit insert. Higher novelty than skeleton stories — Codex eligible.
+
+### TLC-012 — Crisis-detection (I-019) coverage research
+
+**Status:** todo (candidate)
+**Sprint:** Sprint 4
+**Estimated commits:** 1 (research output) + variable (fix scope determined by research)
+
+PM grep at kickoff verifies which chat / community / forms paths actually invoke `crisisDetector` vs. assume it. Output is either:
+(a) clean bill of health → story descopes at kickoff with documented finding, OR
+(b) genuine coverage gap → story expands to add `crisisDetector` calls + per-path tests in subsequent commits.
+
+---
+
+## Sprint 5+ — proposed (sequenced through EHBG §10b)
 
 | Sprint | EHBG mapping                                                     | Indicative stories                                                                                                                                                                                                        |
 | ------ | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -252,6 +282,11 @@ PM may resequence based on SI closures + emergent priorities.
 ---
 
 ## Done (rolling archive — last 3 sprints visible)
+
+### Sprint 3 — closed 2026-05-05
+
+- TLC-007 — Med Interaction module skeleton (2f89661; 3 branded IDs + plugin shell + 2 wiring tests)
+- TLC-009 — Tenant-config admin-write 503 surface (ad711fb; 5 mutation stubs + readiness probe + 7 tests)
 
 ### Sprint 2 — closed 2026-05-05
 
