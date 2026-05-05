@@ -29,6 +29,7 @@ import { tenantContextPlugin } from './lib/tenant-context.js';
 import { consentPlugin } from './modules/consent/plugin.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
 import { identityPlugin } from './modules/identity/plugin.js';
+import { medInteractionPlugin } from './modules/med-interaction/index.js';
 import { pharmacyPlugin } from './modules/pharmacy/plugin.js';
 import { tenantConfigPlugin } from './modules/tenant-config/plugin.js';
 
@@ -112,6 +113,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/tenant-config/health',
       '/v0/pharmacy/health',
       '/v0/pharmacy/ready',
+      '/v0/med-interaction/health',
+      '/v0/med-interaction/ready',
     ],
   });
 
@@ -167,6 +170,15 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // (MedicationRequest schema gap in CDM v1.2). See
   // docs/SI-001-MedicationRequest-Schema-Gap.md for the resume path.
   await app.register(pharmacyPlugin);
+
+  // Med Interaction Engine — routes mounted under /v0/med-interaction.
+  // SKELETON ONLY at v0.1: only /health (200) + /ready (503) are mounted;
+  // full implementation (POST /signals/check, override workflow, ruleset
+  // resolver, vendor adapter abstraction) is BLOCKED on Med Interaction
+  // Engine slice PRD ratification. See src/modules/med-interaction/README.md.
+  // Platform-floor hard rule: the interaction engine runs BEFORE clinician
+  // commits a prescription (Master PRD v1.10 §7).
+  await app.register(medInteractionPlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
