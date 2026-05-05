@@ -1,7 +1,7 @@
 # Product Backlog — Telecheck-app
 
 **Owner:** project-manager agent
-**Last reviewed:** 2026-05-05 (Sprint 3 close → Sprint 4 kickoff prep)
+**Last reviewed:** 2026-05-05 (Sprint 4 close → Sprint 5 kickoff prep)
 **Story format:** `TLC-NNN — title`
 
 ---
@@ -220,39 +220,69 @@ Branded IDs: `InteractionSignalId`, `InteractionOverrideId`, `InteractionRuleset
 
 ---
 
-## Sprint 4 — proposed (PM confirms at Sprint 4 kickoff)
+## Sprint 4 — DONE (closed 2026-05-05 at be6a2dc; review/retro pending commit)
 
 ### TLC-010 — Subscription module skeleton (BLOCKED-aware)
 
-**Status:** todo (candidate)
-**Sprint:** Sprint 4 (if SI-001 still open)
+**Status:** ✅ done (da597c6; 3 branded IDs + plugin shell + 2 wiring tests)
+**Sprint:** Sprint 4
 **Estimated commits:** 1
+**Actual commits:** 1
 **Decision rule:** 4 (new slice prep)
 
-Reproducible blocked-aware skeleton recipe (3rd application after pharmacy + med-interaction): index.ts re-exports + plugin.ts shell + routes.ts /health 200 + /ready 503 + internal/types.ts branded `SubscriptionId` + README.md BLOCKED banner + 2-case plugin smoke test. Subscription depends on MedicationRequest schema for refill cadence — branded ID ships now; row shapes await SI-001.
+3rd application of the BLOCKED-aware skeleton recipe (pharmacy → med-interaction → subscription). Recipe is now fixed and reproducible.
 
 ### TLC-011 — Audit-chain hash-chain integrity regression test (I-003)
 
-**Status:** todo (candidate)
+**Status:** ❌ DESCOPED at Sprint 4 kickoff
+**Reason:** PM verify-before-authoring research showed existing `audit-chain.test.ts` (330 LOC, 6 describe blocks) + `audit-chain-walker.test.ts` (869 LOC, 8 describe blocks) already cover hash-chain integrity comprehensively (HIGH-1 broken-link, HIGH-1 forged-genesis, HIGH-2 record-hash tampering all asserted). Authoring would have duplicated existing coverage.
+
+### TLC-012 — Crisis-detection (I-019) coverage RESCOPED
+
+**Status:** ✅ done (be6a2dc; coverage audit doc + 9-case static-analysis lockdown test)
 **Sprint:** Sprint 4
-**Estimated commits:** 1-2
+**Estimated commits:** 1
+**Actual commits:** 1
 **Decision rule:** 3 (diminishing-returns hygiene) / invariant-coverage
 
-Pure test work — no production code. Asserts I-003 hash-chain integrity holds across the existing audit row inventory: each row's `prev_hash` matches the previous row's `hash` (within tenant_id partition); each row's `hash` is correctly derived from `(prev_hash, tenant_id, action, actor, timestamp, payload)`; no orphaned rows. Catches future regressions where someone "optimizes" the hash construction or batches an audit insert. Higher novelty than skeleton stories — Codex eligible.
-
-### TLC-012 — Crisis-detection (I-019) coverage research
-
-**Status:** todo (candidate)
-**Sprint:** Sprint 4
-**Estimated commits:** 1 (research output) + variable (fix scope determined by research)
-
-PM grep at kickoff verifies which chat / community / forms paths actually invoke `crisisDetector` vs. assume it. Output is either:
-(a) clean bill of health → story descopes at kickoff with documented finding, OR
-(b) genuine coverage gap → story expands to add `crisisDetector` calls + per-path tests in subsequent commits.
+PM grep at kickoff: clean bill of health for current modules (only `submission-service:289` invokes `crisisDetector`). Story rescoped from "fix gap" to "documentation + lockdown regression test" because no genuine gap exists. Static-analysis lockdown pattern (sibling to `canonical-glossary.test.ts`) — runs without DB; catches source-level regressions.
 
 ---
 
-## Sprint 5+ — proposed (sequenced through EHBG §10b)
+## Sprint 5 — proposed (PM confirms at Sprint 5 kickoff)
+
+### TLC-013 — Idempotency invariant (I-016) regression test
+
+**Status:** todo (candidate; PM verifies coverage at kickoff)
+**Sprint:** Sprint 5
+**Estimated commits:** 1-2
+**Decision rule:** 3 (diminishing-returns hygiene)
+
+PM verify-before-authoring at kickoff: grep `tests/integration/idempotency*.test.ts` for existing coverage of I-016 invariants (tenant-scoped key namespacing per IDEMPOTENCY v5.1; replay returns identical response; idempotency-key TTL enforced). Author only the genuine gaps; descope if covered.
+
+### TLC-014 — Tenant-isolation regression for tenant-config admin reads
+
+**Status:** todo (candidate; PM verifies at kickoff)
+**Sprint:** Sprint 5
+**Estimated commits:** 0-1
+
+PM verify-before-authoring: check whether `tests/integration/tenant-config-admin-http.test.ts` §4b cross-tenant case + the existing 9 cases sufficiently cover the admin GET surface. Likely descope candidate.
+
+### TLC-015 — ORT v1.5 launch-readiness items audit (research)
+
+**Status:** todo (candidate)
+**Sprint:** Sprint 5
+**Estimated commits:** 1 (research) + variable (Sprint 6+ depends on findings)
+
+PM reads `Telecheck_Operational_Readiness_Tracker_v1_5.md` and surfaces which items are testable in this repo (e.g., "rate limiting configured", "idempotency keys tenant-scoped", "audit-chain genesis hash documented"). Output document determines Sprint 6+ work. Research-shaped first; execution scope determined by audit output.
+
+### Process item for Sprint 5 PM kickoff
+
+PM should propose convention for coverage-audit doc filenames: rename to non-dated single living doc OR establish `docs/audits/` folder with dated artifacts. Currently `docs/CRISIS_DETECTION_COVERAGE_AUDIT_2026-05-05.md` is date-stamped but it's intended as a living artifact.
+
+---
+
+## Sprint 6+ — proposed (sequenced through EHBG §10b)
 
 | Sprint | EHBG mapping                                                     | Indicative stories                                                                                                                                                                                                        |
 | ------ | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -283,6 +313,11 @@ PM may resequence based on SI closures + emergent priorities.
 
 ## Done (rolling archive — last 3 sprints visible)
 
+### Sprint 4 — closed 2026-05-05
+
+- TLC-010 — Subscription module skeleton (da597c6; 3rd skeleton-recipe application + 2 wiring tests)
+- TLC-012-rescoped — Crisis-detection (I-019) coverage audit + lockdown (be6a2dc; coverage audit doc + 9-case static-analysis lockdown)
+
 ### Sprint 3 — closed 2026-05-05
 
 - TLC-007 — Med Interaction module skeleton (2f89661; 3 branded IDs + plugin shell + 2 wiring tests)
@@ -292,9 +327,3 @@ PM may resequence based on SI closures + emergent priorities.
 
 - TLC-004 — Tenant-config Admin Backend read handlers (f12a142; 4 GET routes + 9 tests + adapter-config-repo + ADR-024 redaction view)
 - TLC-006 — Forms-intake operator-edit emit-site wiring (8a0956a; 2 parallel domain-event emitters + 4 envelope-shape tests; chose option (b) lighter path)
-
-### Sprint 1 — closed 2026-05-05
-
-- TLC-001 — Pharmacy module skeleton (9abf614 + 5615feb fix-forward)
-- TLC-002 — Identity cross-tenant isolation regression suite (3410b6d)
-- TLC-003 — Forms-intake remaining outbox-landing tests (d87a6ba; re-scoped)
