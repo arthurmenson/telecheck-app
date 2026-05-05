@@ -26,6 +26,7 @@ import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
+import { identityPlugin } from './modules/identity/plugin.js';
 
 export interface AppOptions {
   /**
@@ -102,6 +103,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     allowlistedPaths: [
       // Extend here when new tenant-blind routes are added.
       // /health is automatically allowlisted by the plugin.
+      '/v0/identity/health',
     ],
   });
 
@@ -123,6 +125,12 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
 
   // Forms / Intake Engine Slice PRD v2.1 — routes mounted under /v0/forms.
   await app.register(formsIntakePlugin);
+
+  // Identity & Auth Slice — routes mounted under /v0/identity.
+  // Currently registers only a module health probe (/v0/identity/health).
+  // Full registration / login / session / device routes land in
+  // subsequent commits.
+  await app.register(identityPlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
