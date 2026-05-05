@@ -115,6 +115,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/pharmacy/ready',
       '/v0/med-interaction/health',
       '/v0/med-interaction/ready',
+      '/v0/admin/ready',
     ],
   });
 
