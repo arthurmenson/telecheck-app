@@ -221,7 +221,7 @@ describe('auth-device-service §1 registerDevice', () => {
       (r) =>
         r.action === 'identity_device_revoked' &&
         r.resource_id === oldest &&
-        (r.detail as Record<string, unknown>)['revoked_reason'] === 'max_devices_evicted',
+        r.detail['revoked_reason'] === 'max_devices_evicted',
     );
   });
 });
