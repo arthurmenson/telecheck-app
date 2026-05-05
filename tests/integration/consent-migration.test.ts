@@ -23,18 +23,11 @@ import { ulid } from '../../src/lib/ulid.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 const T_US = TENANT_US as TenantId;
 const T_GH = TENANT_GHANA as TenantId;
-
-function uniquePhone(prefix: '+1' | '+233' = '+1'): string {
-  const digits = ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0')
-    .padEnd(9, '0');
-  return `${prefix}${digits}`;
-}
 
 async function seedAccount(tenant: TenantId, country: 'US' | 'GH' = 'US'): Promise<AccountId> {
   const accountId = asAccountId(ulid());

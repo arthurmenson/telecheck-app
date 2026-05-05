@@ -90,6 +90,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ulid } from '../../src/lib/ulid.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone as uniqueE164 } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
@@ -151,20 +152,6 @@ async function insertAccount(input: InsertAccountInput): Promise<string> {
     ],
   );
   return accountId;
-}
-
-/**
- * Generate a phone in E.164 format unique to this test. Uses the last 9
- * digits of a ULID to avoid cross-test collisions (the test suite uses
- * savepoint isolation, but the UNIQUE constraint is index-level so
- * within-test uniqueness still matters when the test runs multiple
- * inserts).
- */
-function uniqueE164(prefix: '+1' | '+233' = '+1'): string {
-  const digits = ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0');
-  return `${prefix}${digits.padEnd(9, '0')}`;
 }
 
 // ---------------------------------------------------------------------------

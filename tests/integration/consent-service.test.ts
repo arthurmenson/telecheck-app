@@ -26,6 +26,7 @@ import { createAccount } from '../../src/modules/identity/internal/repositories/
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { assertAuditRecordExists } from '../helpers/audit-assertions.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 const T_US = asTenantId(TENANT_US);
@@ -38,14 +39,6 @@ const US_CTX: TenantContext = {
   legalEntity: 'Telecheck Health LLC',
   consumerSubdomain: 'heroshealth.com',
 };
-
-function uniquePhone(): string {
-  const digits = ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0')
-    .padEnd(9, '0');
-  return `+1${digits}`;
-}
 
 async function seedAccount(): Promise<AccountId> {
   const accountId = asAccountId(ulid());

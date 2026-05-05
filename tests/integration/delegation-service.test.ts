@@ -35,6 +35,7 @@ import { createAccount } from '../../src/modules/identity/internal/repositories/
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { assertAuditRecordExists } from '../helpers/audit-assertions.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 const T_US = asTenantId(TENANT_US);
@@ -47,18 +48,6 @@ const US_CTX: TenantContext = {
   legalEntity: 'Telecheck Health LLC',
   consumerSubdomain: 'heroshealth.com',
 };
-
-// Per-process monotonic counter; combined with Date.now() in uniquePhone()
-// to guarantee 9-digit phone uniqueness within a test run. The earlier
-// ULID-slice helper had a degenerate case where many non-digit base32 chars
-// collapsed to '0', producing collisions like '+10000000000' across two
-// seedAccount() calls in the same test.
-let _phoneCounter = 0;
-function uniquePhone(): string {
-  _phoneCounter += 1;
-  const digits = String(Date.now() * 1000 + (_phoneCounter % 1000)).slice(-9);
-  return `+1${digits}`;
-}
 
 async function seedAccount(): Promise<AccountId> {
   const accountId = asAccountId(ulid());

@@ -21,22 +21,11 @@ import { ulid } from '../../src/lib/ulid.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 const T_US = TENANT_US as TenantId;
 const T_GH = TENANT_GHANA as TenantId;
-
-// Per-process monotonic counter for collision-proof phone uniqueness.
-// (CI fix 2026-05-05): the earlier ULID-slice helper had a degenerate case
-// where ULID slices with many non-digit base32 chars collapsed to '0',
-// producing collisions like '+10000000000' across two seedAccount() calls.
-// The counter+Date.now() approach guarantees uniqueness within a test run.
-let _phoneCounter = 0;
-function uniquePhone(prefix: '+1' | '+233' = '+1'): string {
-  _phoneCounter += 1;
-  const digits = String(Date.now() * 1000 + (_phoneCounter % 1000)).slice(-9);
-  return `${prefix}${digits}`;
-}
 
 async function seedAccount(tenant: TenantId, country: 'US' | 'GH' = 'US'): Promise<AccountId> {
   const accountId = asAccountId(ulid());

@@ -27,6 +27,7 @@ import * as accountService from '../../src/modules/identity/internal/services/ac
 import * as otpService from '../../src/modules/identity/internal/services/otp-service.ts';
 import { asAccountId, asOtpId } from '../../src/modules/identity/internal/types.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 const T_US = TENANT_US as TenantId;
@@ -53,14 +54,6 @@ afterAll(async () => {
     await app.close();
   }
 });
-
-function uniquePhone(): string {
-  const digits = ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0')
-    .padEnd(9, '0');
-  return `+1${digits}`;
-}
 
 async function createPatientAndLogin(): Promise<{ accessToken: string; accountId: string }> {
   const phone = uniquePhone();

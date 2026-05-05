@@ -24,6 +24,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ulid } from '../../src/lib/ulid.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
@@ -33,10 +34,7 @@ import { getTestClient } from '../setup.ts';
 async function seedAccount(tenantId: string, country: 'US' | 'GH' = 'US'): Promise<string> {
   const client = getTestClient();
   const accountId = ulid();
-  const phone = `+${country === 'US' ? '1' : '233'}${ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0')
-    .padEnd(9, '0')}`;
+  const phone = uniquePhone(country === 'US' ? '+1' : '+233');
   await client.query(
     `INSERT INTO accounts (
         account_id, tenant_id, phone_e164,

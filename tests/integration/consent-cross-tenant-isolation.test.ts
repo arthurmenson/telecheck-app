@@ -35,6 +35,7 @@ import {
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 const T_US = asTenantId(TENANT_US);
@@ -58,16 +59,6 @@ const GH_CTX: TenantContext = {
   legalEntity: 'Telecheck-Ghana Ltd.',
   consumerSubdomain: 'ghana.heroshealth.com',
 };
-
-// Per-process monotonic counter for collision-proof phone uniqueness; see
-// the parallel comment in delegation-service.test.ts for the failure mode
-// the prior ULID-slice helper had.
-let _phoneCounter = 0;
-function uniquePhone(prefix: string): string {
-  _phoneCounter += 1;
-  const digits = String(Date.now() * 1000 + (_phoneCounter % 1000)).slice(-9);
-  return `${prefix}${digits}`;
-}
 
 async function seedAccountIn(tenantCtx: TenantContext, phonePrefix: string): Promise<AccountId> {
   const accountId = asAccountId(ulid());
