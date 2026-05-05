@@ -14,6 +14,11 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import {
+  registrationStartHandler,
+  registrationVerifyHandler,
+} from './internal/handlers/registration.js';
+
 export const registerIdentityRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
@@ -28,4 +33,20 @@ export const registerIdentityRoutes: FastifyPluginAsync = async (
   app.get('/health', async (_request, reply) => {
     await reply.code(200).send({ status: 'ok', module: 'identity' });
   });
+
+  /**
+   * Registration flow per Identity Spec v1.0 §2.
+   *
+   *   POST /registration/start  — issue OTP for an unregistered phone
+   *   POST /registration/verify — verify code + create+activate account
+   *
+   * Both routes are tenant-scoped (require tenantContext via Host header
+   * resolution). Idempotency is enforced at the OTP layer (same phone
+   * within cooldown returns OTP_LOCKOUT_ACTIVE) so these don't need
+   * Idempotency-Key for the v1.0 surface — the foundation idempotency
+   * plugin's exempt-paths set may need to allow these later if a tenant
+   * client treats them as retryable.
+   */
+  app.post('/registration/start', registrationStartHandler);
+  app.post('/registration/verify', registrationVerifyHandler);
 };
