@@ -36,7 +36,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
 import { ulid } from '../../src/lib/ulid.ts';
-import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
@@ -361,6 +361,155 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
       );
     } else {
       expect(second.statusCode).toBe(400);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Sprint 5 / TLC-013 — closes 2 verified IDEMPOTENCY v5.1 invariant gaps
+  // surfaced at PM kickoff:
+  //   1. Same key + different TENANT → independent (4-tuple PK tenant case)
+  //   2. TTL expiry → treated as first request
+  //
+  // Prior comment at line 274–278 explicitly deferred the cross-tenant case
+  // ("covered indirectly"); this story closes it directly via host-header
+  // tenant routing. The TTL case had ZERO test coverage prior; relied on
+  // SQL `expires_at > NOW()` behavior implicitly. This locks both surfaces
+  // against future regression.
+  // -------------------------------------------------------------------------
+
+  it('§NEW (TLC-013) treats same key with different tenant as independent (no replay across tenants — I-023 + 4-tuple PK)', async () => {
+    const idempotencyKey = ulid();
+
+    // Each tenant gets a DISTINCT payload (different programCatalogEntryId)
+    // so each can succeed at the DB layer — forms_template has a UNIQUE
+    // constraint on (tenant_id, program_id, country_of_care, template_version)
+    // per FORMS_ENGINE Pattern A. Distinct payloads isolate the test to
+    // "did the handler run again?" without entangling the DB unique-
+    // constraint behavior. Mirror of the 4-tuple-PK actor independence
+    // test pattern (Codex idempotency-http-r1 closure 2026-05-04).
+    const payloadUS = createTemplatePayload();
+    const payloadGH = createTemplatePayload();
+
+    // Tenant US: POST with the key. Host header `heroshealth.com` resolves
+    // to TENANT_US per src/lib/tenant-context.ts hostname mapping.
+    const headersUS = {
+      ...(await adminAuthHeaders()),
+      host: 'heroshealth.com',
+      'x-actor-admin-tenant': TENANT_US,
+    };
+    const first = await inject({
+      method: 'POST',
+      url: '/v0/forms/templates',
+      headers: { ...headersUS, 'idempotency-key': idempotencyKey },
+      payload: payloadUS,
+    });
+    expect(first.statusCode).toBe(201);
+    const firstBody = first.json<Record<string, unknown>>();
+    expect(firstBody['template_id']).toBeDefined();
+
+    // Tenant Ghana: SAME key + DIFFERENT body via DIFFERENT host header
+    // → resolves to TENANT_GHANA. With a single-tenant cache this would
+    // 409 (body mismatch); with the 4-tuple PK (tenant, key, endpoint,
+    // actor) it's an independent record so the handler runs again and
+    // creates a SECOND template.
+    const headersGH = {
+      ...(await adminAuthHeaders()),
+      host: 'ghana.heroshealth.com',
+      'x-actor-admin-tenant': TENANT_GHANA,
+    };
+    const second = await inject({
+      method: 'POST',
+      url: '/v0/forms/templates',
+      headers: { ...headersGH, 'idempotency-key': idempotencyKey },
+      payload: payloadGH,
+    });
+    expect(second.statusCode).toBe(201);
+    const secondBody = second.json<Record<string, unknown>>();
+    expect(secondBody['template_id']).toBeDefined();
+
+    // Two distinct template_ids prove the handler ran twice (no replay).
+    // The 4-tuple PK kept the tenants' records independent at the cache
+    // layer; RLS at the data layer kept their template rows independent.
+    expect(secondBody['template_id']).not.toBe(firstBody['template_id']);
+  });
+
+  it('§NEW (TLC-013) treats expired idempotency key as first request (TTL expiry)', async () => {
+    const idempotencyKey = ulid();
+    const headers = await adminAuthHeaders();
+    const payload = createTemplatePayload();
+
+    // Step 1: First call creates the cache row + the template row.
+    const first = await inject({
+      method: 'POST',
+      url: '/v0/forms/templates',
+      headers: { ...headers, 'idempotency-key': idempotencyKey },
+      payload,
+    });
+    expect(first.statusCode).toBe(201);
+    const firstBody = first.json<Record<string, unknown>>();
+    expect(firstBody['template_id']).toBeDefined();
+
+    // Step 2: Backdate the cache row's expires_at to 1 hour AGO so the
+    // SQL guard `expires_at > NOW()` filters it out on the next lookup.
+    // This simulates the 24-hour TTL elapsing without waiting 24 hours.
+    const client = getTestClient();
+    const updated = await withTenantContext(TENANT_US, async () => {
+      const r = await client.query<{ c: string }>(
+        `UPDATE idempotency_keys
+            SET expires_at = NOW() - INTERVAL '1 hour'
+          WHERE tenant_id = $1
+            AND key = $2
+            AND endpoint = $3
+          RETURNING (1)::text AS c`,
+        // The plugin canonicalizes endpoint as the path-only normalized URL
+        // (idempotency.ts:205,227 — `url.split('?')[0]`). Method is NOT
+        // included in the endpoint column. The UPDATE here MUST use the
+        // same canonicalization or the WHERE will silently match zero rows
+        // (which would let the test pass for the wrong reason).
+        [TENANT_US, idempotencyKey, '/v0/forms/templates'],
+      );
+      return r.rowCount ?? 0;
+    });
+    // Sanity: the UPDATE must hit exactly one row. If the endpoint string
+    // doesn't match what the plugin canonicalizes, the test would silently
+    // pass the assertion below for the wrong reason (no row updated → cache
+    // never had the entry → second request was always going to be a "first
+    // request"). Bail loudly if the seed didn't take.
+    expect(updated).toBe(1);
+
+    // Step 3: Second call with the SAME key + SAME body. The expired cache
+    // row should be filtered out by `expires_at > NOW()`; the plugin treats
+    // this as a first request and re-runs the handler, creating a SECOND
+    // forms_template row.
+    const secondPayload = { ...payload };
+    const second = await inject({
+      method: 'POST',
+      url: '/v0/forms/templates',
+      headers: { ...headers, 'idempotency-key': idempotencyKey },
+      payload: secondPayload,
+    });
+
+    // Two acceptable outcomes prove TTL expiry works:
+    //   (a) 201 with a NEW template_id (re-ran cleanly), OR
+    //   (b) 4xx from the DB unique-constraint guard (the handler re-ran
+    //       and the INSERT collided with the first row's
+    //       (tenant_id, program_id, country_of_care, template_version)
+    //       unique key — proves the handler ran past the idempotency
+    //       cache layer).
+    //
+    // The forbidden outcome is a 201 with the SAME template_id as the
+    // first call (that would be a replay from the supposedly-expired
+    // cache row).
+    if (second.statusCode === 201) {
+      const secondBody = second.json<Record<string, unknown>>();
+      expect(secondBody['template_id']).toBeDefined();
+      expect(secondBody['template_id']).not.toBe(firstBody['template_id']);
+    } else {
+      // Handler re-ran past the idempotency layer and hit the DB
+      // unique-constraint guard — also proves TTL expiry worked.
+      expect(second.statusCode).toBeGreaterThanOrEqual(400);
+      expect(second.statusCode).toBeLessThan(500);
+      assertNoTenantIdLeakageInError(second);
     }
   });
 });
