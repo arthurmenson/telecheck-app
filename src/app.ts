@@ -29,6 +29,7 @@ import { tenantContextPlugin } from './lib/tenant-context.js';
 import { consentPlugin } from './modules/consent/plugin.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
 import { identityPlugin } from './modules/identity/plugin.js';
+import { pharmacyPlugin } from './modules/pharmacy/plugin.js';
 import { tenantConfigPlugin } from './modules/tenant-config/plugin.js';
 
 export interface AppOptions {
@@ -109,6 +110,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/identity/health',
       '/v0/consent/health',
       '/v0/tenant-config/health',
+      '/v0/pharmacy/health',
     ],
   });
 
@@ -157,6 +159,13 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // lookup surface for cross-module consumers — see
   // src/modules/tenant-config/index.ts.
   await app.register(tenantConfigPlugin);
+
+  // Pharmacy + Refill Slice — routes mounted under /v0/pharmacy.
+  // SKELETON ONLY at v0.1: only /health is mounted; full implementation
+  // (POST /prescriptions, POST /refills, etc.) is BLOCKED on SI-001
+  // (MedicationRequest schema gap in CDM v1.2). See
+  // docs/SI-001-MedicationRequest-Schema-Gap.md for the resume path.
+  await app.register(pharmacyPlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
