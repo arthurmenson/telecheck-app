@@ -137,3 +137,44 @@ export async function resolveEmergencyNumber(
   if (profile === null) return null;
   return profile.emergency_number;
 }
+
+/**
+ * QuietHours config — the {start, end, timezone_anchor} shape stored in
+ * country_profiles.default_quiet_hours and ccr_configs override JSONB.
+ */
+export interface QuietHours {
+  start: string;
+  end: string;
+  timezone_anchor: string;
+}
+
+function isQuietHoursShape(v: unknown): v is QuietHours {
+  if (typeof v !== 'object' || v === null) return false;
+  const obj = v as Record<string, unknown>;
+  return (
+    typeof obj['start'] === 'string' &&
+    typeof obj['end'] === 'string' &&
+    typeof obj['timezone_anchor'] === 'string'
+  );
+}
+
+/**
+ * Resolve quiet-hours configuration for a tenant: per-tenant override
+ * (CCR key `notification.quiet_hours_override`) OR
+ * country_profiles.default_quiet_hours. Used by Notifications slice
+ * to gate non-urgent SMS / email / push during patient quiet hours.
+ *
+ * Returns null when the override exists but is malformed (defensive —
+ * caller falls back to design-system defaults rather than crashing).
+ */
+export async function resolveQuietHours(
+  ctx: TenantContext,
+  externalTx?: DbClient,
+): Promise<QuietHours | null> {
+  const override = await resolveCcrKey(ctx, 'notification.quiet_hours_override', externalTx);
+  if (isQuietHoursShape(override)) return override;
+  const profile = await getTenantCountryProfile(ctx, externalTx);
+  if (profile === null) return null;
+  if (isQuietHoursShape(profile.default_quiet_hours)) return profile.default_quiet_hours;
+  return null;
+}

@@ -41,6 +41,8 @@ export {
   resolvePaymentProcessor,
   resolveCurrencyCode,
   resolveEmergencyNumber,
+  resolveQuietHours,
+  type QuietHours,
 } from './internal/services/ccr-resolver.js';
 
 // Tenant brand fetch (used by patient/clinician UI)
