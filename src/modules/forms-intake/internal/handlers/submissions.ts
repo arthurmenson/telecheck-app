@@ -41,12 +41,23 @@ import * as submissionService from '../services/submission-service.js';
 import type { PatientId } from '../types.js';
 
 /**
- * Resolve the acting actor's identity. Same shim + production-fail-closed
- * gate as templates.ts (kept duplicated rather than extracted to keep each
- * handler-file's auth boundary obvious; centralization happens when the
- * Identity & Auth slice lands).
+ * Resolve the acting actor's identity. Two-tier resolution:
+ *   1. PREFERRED: req.actorContext populated by authContextPlugin
+ *      (Identity slice JWT verification — landed 2d45f98)
+ *   2. FALLBACK: x-actor-id header (gated by ALLOW_ACTOR_HEADER_AUTH;
+ *      production fail-closed unless the env opt-in is set)
+ *
+ * The fallback exists for the transition period where some handlers
+ * have been migrated to JWT and some haven't. Once every handler has
+ * migrated, the fallback path will be retired.
  */
 function resolveActorId(req: FastifyRequest): string {
+  // Tier 1: real auth via req.actorContext
+  if (req.actorContext !== undefined) {
+    return req.actorContext.accountId;
+  }
+
+  // Tier 2: header shim (test/dev convenience)
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
   if (isProd && !optIn) {
@@ -63,20 +74,25 @@ function resolveActorId(req: FastifyRequest): string {
 }
 
 /**
- * Resolve the patient identity for a submission request. Production
- * fail-closed gated by the same `ALLOW_ACTOR_HEADER_AUTH` env opt-in.
+ * Resolve the patient identity for a submission request. Two-tier
+ * resolution mirroring resolveActorId.
  *
- * **Slice PRD §8.2 device-anonymous flow (DEFERRED):** the spec PRD calls
- * for a pre-account flow where patient_id is null and a
- * `deviceAnonymousToken` carries identity until the account creates.
- * Migration 006 declares `forms_submission.patient_id` NOT NULL, so this
- * shim refuses null patient_id today. Once the migration is patched
- * (or a placeholder "anonymous patient" identity lands), the shim relaxes.
- *
- * Optional `x-delegate-id` header; null when absent (the patient is
- * completing their own form, the normal case).
+ * **Slice PRD §8.2 device-anonymous flow (DEFERRED):** see the prior
+ * comment — migration 006 declares forms_submission.patient_id NOT NULL,
+ * so the shim refuses null patient_id today.
  */
 function resolvePatient(req: FastifyRequest): { patientId: PatientId; delegateId: string | null } {
+  // Tier 1: req.actorContext (JWT-resolved). The patient's account_id
+  // IS the patient_id at v1.0 (Account = Patient per CDM §3.2;
+  // separate Patient entity is deferred per Identity Spec §1.X).
+  if (req.actorContext !== undefined) {
+    return {
+      patientId: req.actorContext.accountId,
+      delegateId: req.actorContext.delegateId,
+    };
+  }
+
+  // Tier 2: header shim
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
   if (isProd && !optIn) {
