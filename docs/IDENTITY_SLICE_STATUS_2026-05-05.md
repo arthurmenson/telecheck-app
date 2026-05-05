@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-05
 **Author:** Autonomous turn (Claude Sonnet 4.5)
-**Final commit:** `4fa12b3` (domain events + 5-case test; events wiring at `aec04ce` + `663c8fb`; original slice landing at `692206e`)
+**Final commit:** `fcd25f4` (9-case domain-events outbox-landing test; 5-case original test at `4fa12b3`; events wiring at `aec04ce` + `663c8fb`; original slice landing at `692206e`)
 **CI status:** ✅ Green
 
 ---
@@ -120,9 +120,11 @@ events emitted INSIDE the same transaction:
 Wired across all 4 services (account-service / session-service /
 otp-service / auth-device-service) at commits `aec04ce` (account
 events) + `663c8fb` (session/otp/device events). Outbox-landing test
-at `tests/integration/identity-domain-events.test.ts` (5 cases —
-account.created, account.activated, session.issued, otp.issued,
-device.registered) at commit `4fa12b3`.
+at `tests/integration/identity-domain-events.test.ts` covers ALL 9
+lifecycle events (5 baseline cases at `4fa12b3` — account.created,
+account.activated, session.issued, otp.issued, device.registered;
++4 extension cases at `fcd25f4` — session.revoked, otp.consumed,
+otp.lockout_triggered, device.revoked).
 
 The `identity.*` event-type strings are NOT yet ratified in
 DOMAIN_EVENTS v5.2 — same gap as the audit-side SI-002 placeholder

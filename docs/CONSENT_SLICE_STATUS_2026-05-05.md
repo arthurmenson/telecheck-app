@@ -1,7 +1,7 @@
 # Consent & Delegated Access Slice — Implementation Status
 
 **Date:** 2026-05-05
-**Final commit:** `f3c759f` (domain-event emission + 4 outbox-landing tests; service wiring at `fcfbc3a`; delegation-service direct integration tests at `f4dee93`; consent-service tests at `972a3aa`; HTTP tests at `3f93e6e` / `59292ab`; service+handler scaffold complete at `b7223df`)
+**Final commit:** `e3bc5fb` (8-case domain-events outbox-landing test; 4-case baseline at `f3c759f`; service wiring at `fcfbc3a`; delegation-service direct integration tests at `f4dee93`; consent-service tests at `972a3aa`; HTTP tests at `3f93e6e` / `59292ab`; service+handler scaffold complete at `b7223df`)
 **CI status:** ✅ Green
 
 ---
@@ -97,15 +97,15 @@ import {
 
 ## Known limitations / deferred work
 
-| Item                                                                   | Status                                                                                                                                                                                          |
-| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| HTTP integration tests for consent + delegation flows                  | ✅ Delivered (`tests/integration/consent-http.test.ts` 7 cases at `59292ab`; `tests/integration/delegation-http.test.ts` 8 cases at `3f93e6e`)                                                  |
-| Service-layer direct integration tests                                 | ✅ Delivered (`tests/integration/consent-service.test.ts` 9 cases at `972a3aa`; `tests/integration/delegation-service.test.ts` 9 cases at `f4dee93`)                                            |
-| Episode consent (Slice PRD §5.6)                                       | Schema supports it; UI/runtime deferred until Care Delivery slice                                                                                                                               |
-| Healthcare-proxy legal documentation upload (`legal_documentation_id`) | Schema supports nullable FK; document storage lands with Documents slice                                                                                                                        |
-| Per-jurisdiction consent requirements (Market Rollout Cockpit)         | Schema-only at v1.0; runtime resolution deferred                                                                                                                                                |
-| AUDIT_EVENTS v5.2 ratification of Consent action IDs                   | Open SPEC ISSUE; placeholder pattern retained                                                                                                                                                   |
-| Domain-event emission alongside audit                                  | ✅ Delivered (`src/modules/consent/events.ts` 8 emitters wired into both services at `fcfbc3a`; outbox-landing tests in `tests/integration/consent-domain-events.test.ts` 4 cases at `f3c759f`) |
+| Item                                                                   | Status                                                                                                                                                                                                                                                 |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| HTTP integration tests for consent + delegation flows                  | ✅ Delivered (`tests/integration/consent-http.test.ts` 7 cases at `59292ab`; `tests/integration/delegation-http.test.ts` 8 cases at `3f93e6e`)                                                                                                         |
+| Service-layer direct integration tests                                 | ✅ Delivered (`tests/integration/consent-service.test.ts` 9 cases at `972a3aa`; `tests/integration/delegation-service.test.ts` 9 cases at `f4dee93`)                                                                                                   |
+| Episode consent (Slice PRD §5.6)                                       | Schema supports it; UI/runtime deferred until Care Delivery slice                                                                                                                                                                                      |
+| Healthcare-proxy legal documentation upload (`legal_documentation_id`) | Schema supports nullable FK; document storage lands with Documents slice                                                                                                                                                                               |
+| Per-jurisdiction consent requirements (Market Rollout Cockpit)         | Schema-only at v1.0; runtime resolution deferred                                                                                                                                                                                                       |
+| AUDIT_EVENTS v5.2 ratification of Consent action IDs                   | Open SPEC ISSUE; placeholder pattern retained                                                                                                                                                                                                          |
+| Domain-event emission alongside audit                                  | ✅ Delivered (`src/modules/consent/events.ts` 8 emitters wired into both services at `fcfbc3a`; ALL 8 lifecycle events asserted in `tests/integration/consent-domain-events.test.ts` — 4 baseline cases at `f3c759f` + 4 extension cases at `e3bc5fb`) |
 
 ---
 
