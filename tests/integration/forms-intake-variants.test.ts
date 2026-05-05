@@ -222,6 +222,28 @@ describe('forms-intake createVariant — happy path', () => {
           rec.target_patient_id === null,
       ),
     );
+
+    // Domain event 'forms_variant.created' lands in outbox same-tx
+    // (wired at ba2bc41 alongside SI-003).
+    const evRow = await withTenantContext(TENANT_US, async () => {
+      const r = await getTestClient().query<{
+        event_type: string;
+        aggregate_type: string;
+        payload: Record<string, unknown>;
+      }>(
+        `SELECT event_type, aggregate_type, payload
+           FROM domain_events_outbox
+          WHERE tenant_id = $1
+            AND aggregate_id = $2
+            AND event_type = 'forms_variant.created'`,
+        [TENANT_US, variant.variant_id],
+      );
+      return r.rows[0] ?? null;
+    });
+    expect(evRow).not.toBeNull();
+    expect(evRow!.aggregate_type).toBe('forms_variant');
+    expect(evRow!.payload['label']).toBe('control');
+    expect(evRow!.payload['traffic_percent']).toBe(50);
   });
 
   it('supports a non-Control arm pointing at a separately-authored template', async () => {
