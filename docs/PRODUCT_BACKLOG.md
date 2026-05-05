@@ -1,18 +1,19 @@
 # Product Backlog — Telecheck-app
 
 **Owner:** project-manager agent
-**Last reviewed:** 2026-05-05 (Sprint 1 kickoff)
+**Last reviewed:** 2026-05-05 (Sprint 2 close → Sprint 3 kickoff prep)
 **Story format:** `TLC-NNN — title`
 
 ---
 
-## Sprint 2 — committed (kickoff 2026-05-05)
+## Sprint 2 — DONE (closed 2026-05-05 at 8a0956a; review/retro pending commit)
 
 ### TLC-004 — Tenant-config Admin Backend read handlers
 
-**Status:** todo
+**Status:** ✅ done (f12a142)
 **Sprint:** Sprint 2
 **Estimated commits:** 5
+**Actual commits:** 1
 **Decision rule:** 3 (diminishing-returns hygiene)
 
 #### Current state baseline (verified 2026-05-05 by PM)
@@ -42,9 +43,10 @@
 
 ### TLC-006 — Forms-intake operator-edit emit-site wiring
 
-**Status:** todo
+**Status:** ✅ done (8a0956a; chose option b — direct-call tests + parallel domain-event emitters)
 **Sprint:** Sprint 2
 **Estimated commits:** 3
+**Actual commits:** 1
 **Decision rule:** 3 (diminishing-returns hygiene)
 
 #### Current state baseline (verified 2026-05-05 by PM)
@@ -53,11 +55,12 @@
 - ZERO callers in `src/` — emitters preserved for spec compliance
 - ZERO tests in `tests/` — genuine coverage gap
 
-#### Acceptance criteria
+#### Acceptance criteria (final state)
 
-- Either (a) wire emitters into `template-service.editEligibilityLogic` + `editApprovalGovernance` operator surfaces OR (b) document as "no consumer yet" and add direct-call envelope-shape unit tests covering Category B + audit_sensitivity_level (scrum master picks lighter path)
-- Author parallel domain-event emitters: `forms_eligibility_logic.edited`, `forms_approval_governance.edited`
-- Outbox-landing tests for both events in `forms-intake-events.test.ts`
+- ✅ Chose option (b) — "no consumer yet" rationale documented inline in `events.ts` header
+- ✅ Parallel domain-event emitters authored: `forms_eligibility_logic.edited`, `forms_approval_governance.edited`
+- ✅ 4-case test file `forms-intake-governance-emit.test.ts` covering envelope shape (Category B) + outbox-landing for both events
+- ✅ `FORMS_VERSION_AGGREGATE` constant added to events.ts
 
 #### Dependencies
 
@@ -188,19 +191,49 @@ The audit emitters EXIST in `src/modules/forms-intake/audit.ts` but no service c
 
 ---
 
-## Sprint 3+ — proposed (sequenced through EHBG §10b)
+## Sprint 3 — proposed (PM confirms at Sprint 3 kickoff)
+
+### TLC-007 — Med Interaction signals contract scaffolding
+
+**Status:** todo (candidate)
+**Sprint:** Sprint 3 (if SI-001 still open)
+**Estimated commits:** 2
+**Decision rule:** 3 (diminishing-returns hygiene) / 4 (new unblocked slice prep)
+
+Pure types module — no schema, no migrations. Authors `src/modules/med-interaction/internal/types.ts` with branded ID types (`InteractionSignalId`, `InteractionOverrideId`) + signal-shape interfaces matching the future Med Interaction Engine slice contract. Mirrors pharmacy skeleton pattern. Plugin shell + `/health` BLOCKED probe (BLOCKED on Med Interaction slice ratification).
+
+### TLC-008 — Forms-intake remaining audit-emitter coverage gaps
+
+**Status:** todo (candidate; PM verifies at kickoff per Sprint 1 retro lesson "verify before authoring")
+**Sprint:** Sprint 3
+**Estimated commits:** 1-2
+**Decision rule:** 3 (diminishing-returns hygiene)
+
+PM research step at kickoff: grep `emitForms*` callers vs. existing test files; surface ONLY the genuine coverage gaps. Acceptance criteria: each newly-tested emitter has an envelope-shape assertion covering `audit_sensitivity_level` + Category. If grep shows zero gaps, story is descoped at kickoff.
+
+### TLC-009 — Tenant-config admin-write skeleton (BLOCKED-aware)
+
+**Status:** todo (candidate)
+**Sprint:** Sprint 3
+**Estimated commits:** 2
+**Decision rule:** 4 (new slice prep) / partially-blocked
+
+Mirrors pharmacy skeleton pattern. Authors `src/modules/tenant-config/internal/handlers/admin-write.ts` with route stubs returning 503 for all PATCH/POST/DELETE under `/v0/admin/*`. Documents BLOCKED status on Admin Backend slice v1.1 (which owns operator auth + ADR-024 encryption-at-rest). Adds `/v0/admin/ready` returning 503 (matches pharmacy pattern). Zero schema migrations.
+
+---
+
+## Sprint 4+ — proposed (sequenced through EHBG §10b)
 
 | Sprint | EHBG mapping                                                     | Indicative stories                                                                                                                                                                                                        |
 | ------ | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 3      | (Pharmacy if SI-001 closes) OR Med Interaction Engine slice prep | TLC-007 Med Interaction signals contract; TLC-008 InteractionOverride entity scaffold                                                                                                                                     |
-| 4      | Pharmacy + Refill v2.X part 1                                    | TLC-009 Refill state machine; TLC-010 Pharmacy adapter framework + first US adapter                                                                                                                                       |
-| 5      | Pharmacy + Refill part 2 + Subscription                          | TLC-011 Subscription model + state machine; TLC-012 ProductCatalog scaffold                                                                                                                                               |
-| 6      | Pharmacy + Refill part 3 + Admin Backend part 1                  | TLC-013 Pause/resume/switch/cancel flows; TLC-014 Admin Backend Platform Admin tenant management UI                                                                                                                       |
-| 7      | Async Consult + Admin Backend part 2                             | TLC-015 Async consult workflow; TLC-016 Admin Backend Tenant Admin subscription/refill management                                                                                                                         |
-| 8      | Sync Video Consult + Admin Backend part 3                        | TLC-017 LiveKit integration; TLC-018 AI Scribe; TLC-019 Admin Backend catalog/pricing/discount                                                                                                                            |
-| 9      | Labs + Admin Backend part 4                                      | TLC-020 Labs upload + AWS Textract; TLC-021 Admin Backend affiliate MVP                                                                                                                                                   |
-| 10     | Adverse Event + RPM/CCM                                          | TLC-022 Adverse event detection; TLC-023 RPM/CCM model + alerts                                                                                                                                                           |
-| 11     | Hardening + Launch prep                                          | TLC-024 Performance optimization; TLC-025 Security hardening; TLC-026 Accessibility audit; TLC-027 Telecheck-Ghana launch readiness; TLC-028 Telecheck-US (Heros Health DBA) launch readiness; TLC-029 Runbooks finalized |
+| 4      | Pharmacy + Refill v2.X part 1 (if SI-001 closes)                 | TLC-010 MedicationRequest schema + state machine; TLC-011 Refill state machine + repo                                                                                                                                     |
+| 5      | Pharmacy + Refill part 2 + Subscription                          | TLC-012 Pharmacy adapter framework + first US adapter; TLC-013 Subscription model + state machine                                                                                                                         |
+| 6      | Pharmacy + Refill part 3 + Admin Backend part 1                  | TLC-014 Pause/resume/switch/cancel flows; TLC-015 ProductCatalog scaffold; TLC-016 Admin Backend Platform Admin tenant management UI                                                                                      |
+| 7      | Async Consult + Admin Backend part 2                             | TLC-017 Async consult workflow; TLC-018 Admin Backend Tenant Admin subscription/refill management                                                                                                                         |
+| 8      | Sync Video Consult + Admin Backend part 3                        | TLC-019 LiveKit integration; TLC-020 AI Scribe; TLC-021 Admin Backend catalog/pricing/discount                                                                                                                            |
+| 9      | Labs + Admin Backend part 4                                      | TLC-022 Labs upload + AWS Textract; TLC-023 Admin Backend affiliate MVP                                                                                                                                                   |
+| 10     | Adverse Event + RPM/CCM                                          | TLC-024 Adverse event detection; TLC-025 RPM/CCM model + alerts                                                                                                                                                           |
+| 11     | Hardening + Launch prep                                          | TLC-026 Performance optimization; TLC-027 Security hardening; TLC-028 Accessibility audit; TLC-029 Telecheck-Ghana launch readiness; TLC-030 Telecheck-US (Heros Health DBA) launch readiness; TLC-031 Runbooks finalized |
 
 PM may resequence based on SI closures + emergent priorities.
 
@@ -220,4 +253,13 @@ PM may resequence based on SI closures + emergent priorities.
 
 ## Done (rolling archive — last 3 sprints visible)
 
-(empty until first sprint review)
+### Sprint 2 — closed 2026-05-05
+
+- TLC-004 — Tenant-config Admin Backend read handlers (f12a142; 4 GET routes + 9 tests + adapter-config-repo + ADR-024 redaction view)
+- TLC-006 — Forms-intake operator-edit emit-site wiring (8a0956a; 2 parallel domain-event emitters + 4 envelope-shape tests; chose option (b) lighter path)
+
+### Sprint 1 — closed 2026-05-05
+
+- TLC-001 — Pharmacy module skeleton (9abf614 + 5615feb fix-forward)
+- TLC-002 — Identity cross-tenant isolation regression suite (3410b6d)
+- TLC-003 — Forms-intake remaining outbox-landing tests (d87a6ba; re-scoped)
