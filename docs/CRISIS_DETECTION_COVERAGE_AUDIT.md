@@ -1,9 +1,14 @@
-# Crisis-Detection (I-019) Coverage Audit — 2026-05-05
+# Crisis-Detection (I-019) Coverage Audit
 
-**Sprint:** 4 / TLC-012-rescoped
+**Living artifact** — amend in place when re-run; bump revision-line below.
+
+**Revision history:**
+- **r1 (2026-05-05, Sprint 4 / TLC-012-rescoped):** initial audit — clean bill of health; lockdown regression test authored. Originally filed as `CRISIS_DETECTION_COVERAGE_AUDIT_2026-05-05.md`.
+- **r1.1 (2026-05-05, Sprint 5 kickoff):** renamed to non-dated form per Sprint 5 PM convention decision; lockdown test reference updated to match new path. No content changes.
+
 **Author:** Scrum Master (Claude Code main turn)
 **PM verification grep:** `grep -rn "crisisDetector\." src/`
-**Result:** Clean bill of health for current modules; lockdown regression test authored.
+**Result (current):** Clean bill of health for current modules; lockdown regression test authored.
 
 ---
 

@@ -2,7 +2,7 @@
  * Crisis-detection (I-019) coverage lockdown — static analysis test.
  *
  * Sprint 4 / TLC-012-rescoped. Pairs with the audit doc at
- * `docs/CRISIS_DETECTION_COVERAGE_AUDIT_2026-05-05.md`.
+ * `docs/CRISIS_DETECTION_COVERAGE_AUDIT.md`.
  *
  * Contract under test: I-019 (Crisis detection is platform-floor — every
  * free-text patient-input field MUST scan with `crisisDetector` BEFORE
@@ -60,7 +60,7 @@
  *   - I-019 (Contracts Pack v5.2 INVARIANTS)
  *   - CLAUDE.md (project root + telecheck-app) — "Crisis detection is
  *     platform-floor" hard rule
- *   - docs/CRISIS_DETECTION_COVERAGE_AUDIT_2026-05-05.md
+ *   - docs/CRISIS_DETECTION_COVERAGE_AUDIT.md
  *   - Codex submissions-r1 CRITICAL-1 closure 2026-05-03
  */
 
@@ -155,12 +155,12 @@ describe('I-019 crisis-detection coverage lockdown — §3 future-module gating 
   // future-module engineers lose the I-019 onramp).
 
   it('§3a coverage audit doc exists at the canonical path', () => {
-    const doc = readSource('docs/CRISIS_DETECTION_COVERAGE_AUDIT_2026-05-05.md');
+    const doc = readSource('docs/CRISIS_DETECTION_COVERAGE_AUDIT.md');
     expect(doc.length).toBeGreaterThan(0);
   });
 
   it('§3b coverage audit doc declares the gating principle for future modules', () => {
-    const doc = readSource('docs/CRISIS_DETECTION_COVERAGE_AUDIT_2026-05-05.md');
+    const doc = readSource('docs/CRISIS_DETECTION_COVERAGE_AUDIT.md');
     // The exact phrase from the doc; if someone edits the doc to remove
     // this gating principle, the test fires.
     expect(doc).toContain(
@@ -169,7 +169,7 @@ describe('I-019 crisis-detection coverage lockdown — §3 future-module gating 
   });
 
   it('§3c coverage audit doc lists chat / community / voice as future scope', () => {
-    const doc = readSource('docs/CRISIS_DETECTION_COVERAGE_AUDIT_2026-05-05.md');
+    const doc = readSource('docs/CRISIS_DETECTION_COVERAGE_AUDIT.md');
     // These are the modules I-019 will need to cover when authored.
     // Locking the doc's mention of them prevents quietly losing the future scope.
     expect(doc.toLowerCase()).toContain('chat module');
