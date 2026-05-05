@@ -68,10 +68,13 @@ describe('migrations/018 — §1 tenant_brands', () => {
   });
 
   it('§1c primary_color hex CHECK rejects non-hex', async () => {
+    // primary_color is VARCHAR(7) — value must be exactly 7 chars to test
+    // the regex CHECK rather than the length limit. '#GGGGGG' is 7 chars
+    // but contains non-hex letters (G is outside [0-9A-Fa-f]).
     await expect(
       withTenantContext(T_US, () =>
         getTestClient().query(
-          `UPDATE tenant_brands SET primary_color = 'not-a-color' WHERE tenant_id = $1`,
+          `UPDATE tenant_brands SET primary_color = '#GGGGGG' WHERE tenant_id = $1`,
           [T_US],
         ),
       ),
