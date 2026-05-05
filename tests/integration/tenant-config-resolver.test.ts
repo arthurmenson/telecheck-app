@@ -29,6 +29,7 @@ import {
   resolveCurrencyCode,
   resolveEmergencyNumber,
   resolvePaymentProcessor,
+  resolveQuietHours,
   resolveSmsProvider,
 } from '../../src/modules/tenant-config/index.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
@@ -120,6 +121,50 @@ describe('tenant-config §2 ccr-resolver', () => {
       resolvePaymentProcessor(GH_CTX, getTestClient()),
     );
     expect(result).toBe('paystack');
+  });
+
+  it('§2d2 resolveQuietHours falls back to country profile default', async () => {
+    // No override seeded — falls back to country_profiles.default_quiet_hours
+    // which the migration seeds as { start: '21:00', end: '07:00',
+    // timezone_anchor: 'patient_local' } for both US and GH.
+    const result = await withTenantContext(T_US, () => resolveQuietHours(US_CTX, getTestClient()));
+    expect(result).not.toBeNull();
+    expect(result!.start).toBe('21:00');
+    expect(result!.end).toBe('07:00');
+    expect(result!.timezone_anchor).toBe('patient_local');
+  });
+
+  it('§2d3 resolveQuietHours uses per-tenant override when shape is valid', async () => {
+    await withTenantContext(T_US, () =>
+      getTestClient().query(
+        `INSERT INTO ccr_configs (id, tenant_id, config_key, config_value)
+         VALUES ($1, $2, $3, $4::jsonb)`,
+        [
+          ulid(),
+          T_US,
+          'notification.quiet_hours_override',
+          JSON.stringify({ start: '22:00', end: '06:00', timezone_anchor: 'tenant_local' }),
+        ],
+      ),
+    );
+    const result = await withTenantContext(T_US, () => resolveQuietHours(US_CTX, getTestClient()));
+    expect(result).not.toBeNull();
+    expect(result!.start).toBe('22:00');
+    expect(result!.timezone_anchor).toBe('tenant_local');
+  });
+
+  it('§2d4 resolveQuietHours rejects malformed override and falls through', async () => {
+    // Insert a malformed override (missing timezone_anchor)
+    await withTenantContext(T_US, () =>
+      getTestClient().query(
+        `INSERT INTO ccr_configs (id, tenant_id, config_key, config_value)
+         VALUES ($1, $2, $3, $4::jsonb)`,
+        [ulid(), T_US, 'notification.quiet_hours_override', JSON.stringify({ start: '23:00' })],
+      ),
+    );
+    const result = await withTenantContext(T_US, () => resolveQuietHours(US_CTX, getTestClient()));
+    // Defensive: malformed override → falls through to country profile default
+    expect(result!.start).toBe('21:00');
   });
 
   it('§2d resolveCurrencyCode + resolveEmergencyNumber are jurisdictional', async () => {
