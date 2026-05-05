@@ -722,6 +722,56 @@ describe('forms-intake promoteVariant — winner promotion', () => {
           rec.target_patient_id === null,
       ),
     );
+
+    // Domain events lands in outbox same-tx with the audit emissions
+    // (Sprint 1 / TLC-003 — closes the last forms-intake outbox-landing
+    // gaps). One winner_promoted event + one retired event per loser.
+    const winnerEv = await withTenantContext(TENANT_US, async () => {
+      const r = await getTestClient().query<{
+        event_type: string;
+        aggregate_type: string;
+        payload: Record<string, unknown>;
+      }>(
+        `SELECT event_type, aggregate_type, payload
+           FROM domain_events_outbox
+          WHERE tenant_id = $1
+            AND aggregate_id = $2
+            AND event_type = 'forms_variant.winner_promoted'`,
+        [TENANT_US, armA.variant_id],
+      );
+      return r.rows[0] ?? null;
+    });
+    expect(winnerEv).not.toBeNull();
+    expect(winnerEv!.aggregate_type).toBe('forms_variant');
+    expect(winnerEv!.payload['rationale']).toBeDefined();
+
+    // Retired event for control.
+    const controlRetiredEv = await withTenantContext(TENANT_US, async () => {
+      const r = await getTestClient().query<{ payload: Record<string, unknown> }>(
+        `SELECT payload FROM domain_events_outbox
+          WHERE tenant_id = $1
+            AND aggregate_id = $2
+            AND event_type = 'forms_variant.retired'`,
+        [TENANT_US, control.variant_id],
+      );
+      return r.rows[0] ?? null;
+    });
+    expect(controlRetiredEv).not.toBeNull();
+    expect(controlRetiredEv!.payload['promoted_winner_id']).toBe(armA.variant_id);
+
+    // Retired event for armB.
+    const armBRetiredEv = await withTenantContext(TENANT_US, async () => {
+      const r = await getTestClient().query<{ payload: Record<string, unknown> }>(
+        `SELECT payload FROM domain_events_outbox
+          WHERE tenant_id = $1
+            AND aggregate_id = $2
+            AND event_type = 'forms_variant.retired'`,
+        [TENANT_US, armB.variant_id],
+      );
+      return r.rows[0] ?? null;
+    });
+    expect(armBRetiredEv).not.toBeNull();
+    expect(armBRetiredEv!.payload['promoted_winner_id']).toBe(armA.variant_id);
   });
 });
 
