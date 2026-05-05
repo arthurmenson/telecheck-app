@@ -13,6 +13,12 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import {
+  getMyConsentHistoryHandler,
+  grantConsentHandler,
+  revokeConsentHandler,
+} from './internal/handlers/consents.js';
+
 export const registerConsentRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
@@ -23,4 +29,12 @@ export const registerConsentRoutes: FastifyPluginAsync = async (
   app.get('/health', async (_request, reply) => {
     await reply.code(200).send({ status: 'ok', module: 'consent' });
   });
+
+  /**
+   * Consent grant / revoke / history per Slice PRD §5-§9.
+   * All require Bearer JWT auth (req.actorContext).
+   */
+  app.post('/consents', grantConsentHandler);
+  app.post('/consents/revoke', revokeConsentHandler);
+  app.get('/consents/me', getMyConsentHistoryHandler);
 };
