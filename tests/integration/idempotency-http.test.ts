@@ -436,14 +436,25 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
   it('§NEW (TLC-013) treats expired idempotency key as first request (TTL expiry)', async () => {
     const idempotencyKey = ulid();
     const headers = await adminAuthHeaders();
-    const payload = createTemplatePayload();
+
+    // Per Codex idempotency-r5 HIGH finding 2026-05-05: the second request
+    // MUST use a DISTINCT payload from the first so the post-TTL retry can
+    // succeed cleanly (201 with a new template_id) without colliding with
+    // the first row's (tenant_id, program_id, country_of_care,
+    // template_version) UNIQUE constraint. The original test accepted any
+    // 4xx as "proof TTL works", which would silently pass on unrelated
+    // handler-side failures (auth, validation, etc.). With distinct
+    // payloads the test has exactly ONE expected outcome — 201 with a
+    // different template_id — and can no longer pass for the wrong reason.
+    const firstPayload = createTemplatePayload();
+    const secondPayload = createTemplatePayload();
 
     // Step 1: First call creates the cache row + the template row.
     const first = await inject({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: { ...headers, 'idempotency-key': idempotencyKey },
-      payload,
+      payload: firstPayload,
     });
     expect(first.statusCode).toBe(201);
     const firstBody = first.json<Record<string, unknown>>();
@@ -477,11 +488,18 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
     // request"). Bail loudly if the seed didn't take.
     expect(updated).toBe(1);
 
-    // Step 3: Second call with the SAME key + SAME body. The expired cache
-    // row should be filtered out by `expires_at > NOW()`; the plugin treats
-    // this as a first request and re-runs the handler, creating a SECOND
-    // forms_template row.
-    const secondPayload = { ...payload };
+    // Step 3: Second call with the SAME key + DISTINCT payload. The expired
+    // cache row should be filtered out by `expires_at > NOW()`; the plugin
+    // treats this as a first request and re-runs the handler, creating a
+    // SECOND forms_template row.
+    //
+    // Note on body-mismatch: with the SAME key and a DIFFERENT body, an
+    // UNEXPIRED cache row would 409 with internal.idempotency.body_mismatch.
+    // We are exploiting that here in our favor: if the cache row had NOT
+    // expired, this request would 409 (not 201) — proving the test depends
+    // on TTL expiry actually filtering the row. So 201 on the second call
+    // is exactly the post-TTL "first request" semantics; 409 would be a
+    // failed test (TTL expiry didn't filter).
     const second = await inject({
       method: 'POST',
       url: '/v0/forms/templates',
@@ -489,27 +507,11 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
       payload: secondPayload,
     });
 
-    // Two acceptable outcomes prove TTL expiry works:
-    //   (a) 201 with a NEW template_id (re-ran cleanly), OR
-    //   (b) 4xx from the DB unique-constraint guard (the handler re-ran
-    //       and the INSERT collided with the first row's
-    //       (tenant_id, program_id, country_of_care, template_version)
-    //       unique key — proves the handler ran past the idempotency
-    //       cache layer).
-    //
-    // The forbidden outcome is a 201 with the SAME template_id as the
-    // first call (that would be a replay from the supposedly-expired
-    // cache row).
-    if (second.statusCode === 201) {
-      const secondBody = second.json<Record<string, unknown>>();
-      expect(secondBody['template_id']).toBeDefined();
-      expect(secondBody['template_id']).not.toBe(firstBody['template_id']);
-    } else {
-      // Handler re-ran past the idempotency layer and hit the DB
-      // unique-constraint guard — also proves TTL expiry worked.
-      expect(second.statusCode).toBeGreaterThanOrEqual(400);
-      expect(second.statusCode).toBeLessThan(500);
-      assertNoTenantIdLeakageInError(second);
-    }
+    // Exactly one expected outcome: 201 with a NEW template_id. Codex
+    // idempotency-r5 HIGH closure 2026-05-05.
+    expect(second.statusCode).toBe(201);
+    const secondBody = second.json<Record<string, unknown>>();
+    expect(secondBody['template_id']).toBeDefined();
+    expect(secondBody['template_id']).not.toBe(firstBody['template_id']);
   });
 });
