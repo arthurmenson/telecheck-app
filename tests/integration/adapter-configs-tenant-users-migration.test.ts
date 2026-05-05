@@ -169,14 +169,24 @@ describe('migrations/019 — §2 tenant_users', () => {
   it('§2a INSERT platform_admin (tenant_id NULL)', async () => {
     const id = ulid();
     const email = `platform.admin+${id}@telecheck.health`;
-    await getTestClient().query(
-      `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
-       VALUES ($1, NULL, $2, $3, 'platform_admin', 'active', NOW())`,
-      [id, email, 'Platform Admin Test'],
+    // Wrap in withTenantContext so the RLS policy can evaluate
+    // current_tenant_id() without raising — the function is STABLE and
+    // may be evaluated by the planner even when the OR-clause would
+    // short-circuit `tenant_id IS NULL` to TRUE first. The platform_admin
+    // row itself has tenant_id=NULL regardless of which tenant context
+    // is bound at insert time.
+    await withTenantContext(T_US, () =>
+      getTestClient().query(
+        `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
+         VALUES ($1, NULL, $2, $3, 'platform_admin', 'active', NOW())`,
+        [id, email, 'Platform Admin Test'],
+      ),
     );
-    const r = await getTestClient().query<{ tenant_id: string | null; role: string }>(
-      `SELECT tenant_id, role FROM tenant_users WHERE id = $1`,
-      [id],
+    const r = await withTenantContext(T_US, () =>
+      getTestClient().query<{ tenant_id: string | null; role: string }>(
+        `SELECT tenant_id, role FROM tenant_users WHERE id = $1`,
+        [id],
+      ),
     );
     expect(r.rows[0]!.tenant_id).toBeNull();
     expect(r.rows[0]!.role).toBe('platform_admin');
@@ -216,26 +226,32 @@ describe('migrations/019 — §2 tenant_users', () => {
 
   it('§2d role-scope CHECK rejects tenant_admin with tenant_id NULL', async () => {
     await expect(
-      getTestClient().query(
-        `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
-         VALUES ($1, NULL, $2, $3, 'tenant_admin', 'active', NOW())`,
-        [ulid(), `bad+${ulid()}@x.com`, 'Bad Tenant Admin'],
+      withTenantContext(T_US, () =>
+        getTestClient().query(
+          `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
+           VALUES ($1, NULL, $2, $3, 'tenant_admin', 'active', NOW())`,
+          [ulid(), `bad+${ulid()}@x.com`, 'Bad Tenant Admin'],
+        ),
       ),
     ).rejects.toThrow(/tenant_user_role_scope_consistent|check constraint/i);
   });
 
   it('§2e UNIQUE email rejected on second insert', async () => {
     const email = `unique+${ulid()}@telecheck.health`;
-    await getTestClient().query(
-      `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
-       VALUES ($1, NULL, $2, $3, 'platform_admin', 'active', NOW())`,
-      [ulid(), email, 'First'],
-    );
-    await expect(
+    await withTenantContext(T_US, () =>
       getTestClient().query(
         `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
          VALUES ($1, NULL, $2, $3, 'platform_admin', 'active', NOW())`,
-        [ulid(), email, 'Second'],
+        [ulid(), email, 'First'],
+      ),
+    );
+    await expect(
+      withTenantContext(T_US, () =>
+        getTestClient().query(
+          `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
+           VALUES ($1, NULL, $2, $3, 'platform_admin', 'active', NOW())`,
+          [ulid(), email, 'Second'],
+        ),
       ),
     ).rejects.toThrow(/duplicate key|unique/i);
   });
@@ -244,10 +260,12 @@ describe('migrations/019 — §2 tenant_users', () => {
     // Seed a platform admin (tenant_id NULL) + a US tenant admin
     const platformId = ulid();
     const usAdminId = ulid();
-    await getTestClient().query(
-      `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
-       VALUES ($1, NULL, $2, $3, 'platform_admin', 'active', NOW())`,
-      [platformId, `pa+${platformId}@x.com`, 'PA'],
+    await withTenantContext(T_US, () =>
+      getTestClient().query(
+        `INSERT INTO tenant_users (id, tenant_id, email, display_name, role, status, activated_at)
+         VALUES ($1, NULL, $2, $3, 'platform_admin', 'active', NOW())`,
+        [platformId, `pa+${platformId}@x.com`, 'PA'],
+      ),
     );
     await withTenantContext(T_US, () =>
       getTestClient().query(
