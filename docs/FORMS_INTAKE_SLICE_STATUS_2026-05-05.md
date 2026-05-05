@@ -2,8 +2,8 @@
 
 **Date:** 2026-05-05
 **Author:** Autonomous turn (Claude Sonnet 4.5)
-**Final commit:** `86b7844` (Slice 1 itself stable since pre-`d2b6ea9`; cross-cutting hardening + JWT migration extends through `692206e`)
-**CI status:** ✅ Green at `86b7844` (per the autonomous-turn record; not re-verified at this doc's authoring because `gh` is not authenticated in this session)
+**Final commit:** `4ab2663` (forms-intake variant + resume_restored domain events wired at `ba2bc41`; SI-003 raised at `f2a16f3`; test-side flip at `4ab2663`; original Slice 1 stable since pre-`d2b6ea9`; JWT migration through `692206e`; status doc landed at `39a0ede`)
+**CI status:** ✅ Green at `4ab2663`
 
 ---
 
@@ -144,15 +144,15 @@ The migration touched: `templates.ts`, `deployments.ts`, `variants.ts`, `resume.
 
 ## Known limitations / deferred work
 
-| Item                                                                     | Status                                                                                                                                                                                           |
-| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Domain-event emission alongside audit (forms-intake outbox)              | Scaffolded in `events.ts`; outbox table exists (`migrations/004`); end-to-end emission deferred — pattern consumed by Slice 3 (consent) status doc                                               |
-| Forms-intake header-shim Tier 2 retirement                               | Deferred — pending migration of every forms-intake test to JWT-bearing requests                                                                                                                  |
-| AUDIT_EVENTS v5.2 ratification of forms-intake action IDs                | Open SPEC ISSUE — emitted via `formsIntakeAuditPlaceholder()` pattern; same approach inherited by Identity (`identityAuditPlaceholder`) and Consent (`consentAuditPlaceholder`)                  |
-| Crisis-detection escalation routing (operator alert → on-call clinician) | Deferred — `crisis_detection.trigger` audit is emitted; the consumer (alerting + on-call routing) lands with the Admin Backend slice and the on-call rotation infra                              |
-| Multi-language template support                                          | Schema supports a `locale` column; runtime resolution + UX deferred until per-jurisdiction Market Rollout Cockpit work                                                                           |
-| Variant traffic-split runtime evaluation                                 | `forms_variant.assignment_rule_jsonb` accepts the rule shape; runtime variant-evaluator lands with the Acquisition & Engagement slice (PostHog A/B integration per EHBG §10b Sprint 3 detail)    |
-| Codex review §1c rest-spread "false-confidence" finding                  | Deferred indefinitely — current FormSnapshot / FormSubmission fields are all patient-safe; the rest-spread pattern is preserved for future-safety but the explicit allowlist refactor is on hold |
+| Item                                                                     | Status                                                                                                                                                                                                                                                                                  |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Domain-event emission alongside audit (forms-intake outbox)              | ✅ Delivered (12 lifecycle events in `events.ts` wired across template-service + submission-service same-tx outbox; SI-003 raised at `f2a16f3` for the placeholder event-type strings; `forms_resume_state.restored` round-trip asserted at forms-intake-restore.test.ts §"happy path") |
+| Forms-intake header-shim Tier 2 retirement                               | Deferred — pending migration of every forms-intake test to JWT-bearing requests                                                                                                                                                                                                         |
+| AUDIT_EVENTS v5.2 ratification of forms-intake action IDs                | Open SPEC ISSUE — emitted via `formsIntakeAuditPlaceholder()` pattern; same approach inherited by Identity (`identityAuditPlaceholder`) and Consent (`consentAuditPlaceholder`)                                                                                                         |
+| Crisis-detection escalation routing (operator alert → on-call clinician) | Deferred — `crisis_detection.trigger` audit is emitted; the consumer (alerting + on-call routing) lands with the Admin Backend slice and the on-call rotation infra                                                                                                                     |
+| Multi-language template support                                          | Schema supports a `locale` column; runtime resolution + UX deferred until per-jurisdiction Market Rollout Cockpit work                                                                                                                                                                  |
+| Variant traffic-split runtime evaluation                                 | `forms_variant.assignment_rule_jsonb` accepts the rule shape; runtime variant-evaluator lands with the Acquisition & Engagement slice (PostHog A/B integration per EHBG §10b Sprint 3 detail)                                                                                           |
+| Codex review §1c rest-spread "false-confidence" finding                  | Deferred indefinitely — current FormSnapshot / FormSubmission fields are all patient-safe; the rest-spread pattern is preserved for future-safety but the explicit allowlist refactor is on hold                                                                                        |
 
 ---
 
