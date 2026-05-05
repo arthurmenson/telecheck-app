@@ -261,6 +261,20 @@ export async function createConsent(
  *   1. latest row exists, AND
  *   2. latest row.status === 'granted'
  *   3. (optionally) latest row.expires_at > now
+ *
+ * Tie-breaker rationale (CI fix 2026-05-05):
+ *   `created_at DEFAULT NOW()` returns the top-level transaction-start
+ *   timestamp, NOT the per-statement clock. Inside savepoint-wrapped
+ *   integration tests (the canonical pattern at tests/setup.ts), a grant
+ *   and a subsequent revoke land in the same outer transaction and
+ *   therefore share the same `created_at`. ORDER BY created_at DESC
+ *   alone is then non-deterministic. The `consent_id DESC` secondary
+ *   sort key resolves the tie because consent_id is a ULID — the first
+ *   48 bits are millisecond-precision timestamp and the lower bits are
+ *   monotonically increasing within the same millisecond, so a later-
+ *   generated ULID strictly compares greater than an earlier one. This
+ *   matches the same fix-pattern used by migration 012's `updated_at`
+ *   trigger that switched from NOW() to clock_timestamp().
  */
 export async function findLatestConsent(
   tenantId: TenantId,
@@ -281,7 +295,7 @@ export async function findLatestConsent(
           AND account_id = $2
           AND consent_type = $3
           AND ${scopeId === null ? 'scope_id IS NULL' : 'scope_id = $4'}
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, consent_id DESC
         LIMIT 1`,
       scopeId === null
         ? [tenantId, accountId, consentType]
@@ -312,7 +326,7 @@ export async function listConsentHistory(
          FROM consent
         WHERE tenant_id = $1
           AND account_id = $2
-        ORDER BY created_at DESC`,
+        ORDER BY created_at DESC, consent_id DESC`,
       [tenantId, accountId],
     );
     return result.rows.map(rowToConsent);
