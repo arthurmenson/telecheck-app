@@ -1,7 +1,7 @@
 # Product Backlog — Telecheck-app
 
 **Owner:** project-manager agent
-**Last reviewed:** 2026-05-05 (Sprint 7 close → Sprint 8 kickoff prep — **PRE-PAVE RUNWAY EXHAUSTED**)
+**Last reviewed:** 2026-05-05 (Sprint 8 close → Sprint 9 kickoff prep — **Async Consult slice authoring underway**)
 **Story format:** `TLC-NNN — title`
 
 ---
@@ -323,9 +323,60 @@ Living-doc amend in place (4th amend across the 3 living docs). Closes OR-208 (m
 
 ---
 
-## Sprint 8 — proposed (PM confirms at Sprint 8 kickoff; PRE-PAVE EXHAUSTED — pivot decision required)
+## Sprint 8 — DONE (closed 2026-05-05 at 2a44164; review/retro pending commit)
 
-**Status flag at Sprint 7 close:** the testable-without-upstream-blockers backlog is depleted. Sprint 8+ MUST pivot. Three pivot paths:
+### TLC-020 — Async Consult slice skeleton (Sprint 1 of 3)
+
+**Status:** ✅ done (2a44164; Codex APPROVE first-try)
+**Sprint:** Sprint 8
+**Actual commits:** 1 (cleanest Codex run yet)
+**Decision rule:** 4 (new unblocked slice work)
+
+4th application of the BLOCKED-aware skeleton recipe. 2 branded IDs (ConsultId, ConsultEventId per CDM §3 #15-16) + 17-state CONSULT_STATES vocabulary (canonical from State Machines v1.1 §3) + plugin shell + smoke test. Sprint 9 + 10 continue the slice authoring.
+
+---
+
+## Sprint 9 — proposed (PM confirms at Sprint 9 kickoff; verification gate runs)
+
+### TLC-021 — Async Consult slice authoring (Sprint 2 of 3)
+
+**Status:** todo (candidate; PM verifies at Sprint 9 kickoff)
+**Sprint:** Sprint 9
+**Estimated commits:** 5-8
+**Decision rule:** 4 (new unblocked slice work)
+
+Repos + service layer + state machine transition logic + initial HTTP handlers. PM kickoff actions:
+- Re-check Promotion Ledger for SI-001 closure (P-011)
+- Verify CDM §4 Consult / ConsultEvent expansion exists; if not, file SI-005 candidate
+- Read State Machines §3 transition table FULLY (L196-218+; ~30 transitions with guards + actions)
+- Verify Identity / Forms-Intake / Consent public interfaces for cross-slice integration
+- Decide audit-event SI-004 placeholder posture (option (c) from Sprint 8 retro: author with placeholder events + file SI-004 doc)
+
+Likely Sprint 9 sub-stories (PM may sequence at kickoff):
+- TLC-021a: Migration `migrations/020_async_consult.sql` (only if CDM §4 verified)
+- TLC-021b: Repos (consult-repo + consult-event-repo; tenant-scoped)
+- TLC-021c: State machine transition logic
+- TLC-021d: Service layer (initiate / submit / abandon / read)
+- TLC-021e: Initial HTTP handlers
+- TLC-021f: Per-handler integration tests
+
+---
+
+## Sprint 10 — proposed (PM confirms at Sprint 10 kickoff)
+
+### TLC-022 — Async Consult slice authoring (Sprint 3 of 3)
+
+**Status:** todo (candidate)
+**Sprint:** Sprint 10
+**Estimated commits:** 5-10
+
+Full HTTP integration (clinician decision endpoints, patient response, follow-up messaging) + audit event emitters + domain event emitters + cross-tenant isolation tests. Audit event vocabulary either ratified via SI-004 closure OR placeholder events with SI-004 doc as resume gate (decision deferred to Sprint 9 PM kickoff per Sprint 8 retro).
+
+---
+
+## Sprint 11+ — proposed (sequenced through EHBG §10b)
+
+**Status flag at Sprint 7 close (HISTORICAL — Sprint 8 executed Path b):** the testable-without-upstream-blockers backlog is depleted. Three pivot paths were considered:
 
 ### Path (a) — Slice 4 schema authoring (if SI-001 closes upstream)
 
@@ -392,6 +443,10 @@ PM may resequence based on SI closures + emergent priorities.
 
 ## Done (rolling archive — last 3 sprints visible)
 
+### Sprint 8 — closed 2026-05-05
+
+- TLC-020 — Async Consult slice skeleton (2a44164; Codex APPROVE first-try; 4th recipe application; first non-blocked slice authoring since Sprint 1)
+
 ### Sprint 7 — closed 2026-05-05
 
 - TLC-018 — Perf budget infra scaffold (d677fd3 + d879a79 fix-forward; Codex HIGH closed; re-verify APPROVE; SCAFFOLDS OR-218 — does NOT close)
@@ -402,8 +457,3 @@ PM may resequence based on SI closures + emergent priorities.
 
 - TLC-016 — RLS policy coverage lockdown (75640ef + 2dece96 fix-forward; Codex MEDIUM closed; re-verify APPROVE; 46 cases across 21 tenant-scoped tables)
 - TLC-017 — Build-vs-spec traceability matrix (c9bf34c; living-doc convention r1; closes OR-216)
-
-### Sprint 5 — closed 2026-05-05
-
-- TLC-013 — Idempotency invariant lockdown (3e37433 + 0f4a757 fix-forward; Codex HIGH closed; re-verify APPROVE)
-- TLC-015 — ORT v1.5 testable items audit (1eab1a6; 4 verified-real Sprint 6+ candidates surfaced)
