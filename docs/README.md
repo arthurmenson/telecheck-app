@@ -55,6 +55,9 @@ Anything that becomes canonical guidance gets promoted **to the spec repo** via 
 ```
 docs/
 ├── README.md                                  # this file
+├── SCRUM_OPERATING_MODEL.md                   # ⭐ Scrum framework: roles, cadence, DoD, ceremonies
+├── PRODUCT_BACKLOG.md                         # ⭐ Prioritized story backlog (single source of truth)
+├── SPRINT_1_PLAN.md                           # Sprint 1 plan (in progress)
 ├── AUTONOMOUS_TURN_SUMMARY_2026-05-05.md      # Cumulative summary of the multi-day autonomous turn
 ├── FORMS_INTAKE_SLICE_STATUS_2026-05-05.md    # Slice 1 (Forms-Intake + JWT-migration) handoff
 ├── IDENTITY_SLICE_STATUS_2026-05-05.md        # Slice 2 (Identity + JWT) handoff
