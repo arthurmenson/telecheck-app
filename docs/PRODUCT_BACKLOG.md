@@ -1,7 +1,7 @@
 # Product Backlog — Telecheck-app
 
 **Owner:** project-manager agent
-**Last reviewed:** 2026-05-05 (Sprint 4 close → Sprint 5 kickoff prep)
+**Last reviewed:** 2026-05-05 (Sprint 5 close → Sprint 6 kickoff prep)
 **Story format:** `TLC-NNN — title`
 
 ---
@@ -249,40 +249,79 @@ PM grep at kickoff: clean bill of health for current modules (only `submission-s
 
 ---
 
-## Sprint 5 — proposed (PM confirms at Sprint 5 kickoff)
+## Sprint 5 — DONE (closed 2026-05-05 at 1eab1a6; review/retro pending commit)
 
-### TLC-013 — Idempotency invariant (I-016) regression test
+### TLC-013 — Idempotency invariant lockdown (close 2 IDEMPOTENCY v5.1 gaps)
 
-**Status:** todo (candidate; PM verifies coverage at kickoff)
+**Status:** ✅ done (3e37433 + 0f4a757 Codex HIGH fix-forward; Codex re-verify APPROVE)
 **Sprint:** Sprint 5
-**Estimated commits:** 1-2
-**Decision rule:** 3 (diminishing-returns hygiene)
+**Actual commits:** 2 (story + fix-forward)
 
-PM verify-before-authoring at kickoff: grep `tests/integration/idempotency*.test.ts` for existing coverage of I-016 invariants (tenant-scoped key namespacing per IDEMPOTENCY v5.1; replay returns identical response; idempotency-key TTL enforced). Author only the genuine gaps; descope if covered.
+Cross-tenant 4-tuple PK case + TTL expiry case. Codex idempotency-r5 HIGH closed via distinct-payload TTL test rewrite.
 
-### TLC-014 — Tenant-isolation regression for tenant-config admin reads
+### TLC-014 — Tenant-config admin-read tenant-isolation regression
 
-**Status:** todo (candidate; PM verifies at kickoff)
+**Status:** ❌ DESCOPED at Sprint 5 kickoff
+**Reason:** PM verified §4b adapter-configs cross-tenant case structurally proves the same RLS pattern for ccr-configs + tenant-brand. Authoring would duplicate.
+
+### TLC-015 — ORT v1.5 launch-readiness items audit
+
+**Status:** ✅ done (1eab1a6; audit doc filed with 4 verified-real Sprint 6+ candidates)
 **Sprint:** Sprint 5
-**Estimated commits:** 0-1
+**Actual commits:** 1
 
-PM verify-before-authoring: check whether `tests/integration/tenant-config-admin-http.test.ts` §4b cross-tenant case + the existing 9 cases sufficiently cover the admin GET surface. Likely descope candidate.
-
-### TLC-015 — ORT v1.5 launch-readiness items audit (research)
-
-**Status:** todo (candidate)
-**Sprint:** Sprint 5
-**Estimated commits:** 1 (research) + variable (Sprint 6+ depends on findings)
-
-PM reads `Telecheck_Operational_Readiness_Tracker_v1_5.md` and surfaces which items are testable in this repo (e.g., "rate limiting configured", "idempotency keys tenant-scoped", "audit-chain genesis hash documented"). Output document determines Sprint 6+ work. Research-shaped first; execution scope determined by audit output.
-
-### Process item for Sprint 5 PM kickoff
-
-PM should propose convention for coverage-audit doc filenames: rename to non-dated single living doc OR establish `docs/audits/` folder with dated artifacts. Currently `docs/CRISIS_DETECTION_COVERAGE_AUDIT_2026-05-05.md` is date-stamped but it's intended as a living artifact.
+Research-shaped audit. PM brief had hallucinated 3 ORT IDs (OR-253/244/255 — don't exist); SM read ORT directly, surfaced 5 real testable items (OR-112/216/218/208/236) and 4 Sprint 6+ candidates.
 
 ---
 
-## Sprint 6+ — proposed (sequenced through EHBG §10b)
+## Sprint 6 — proposed (PM confirms at Sprint 6 kickoff)
+
+Sprint 6 candidates are pre-validated by TLC-015 ORT audit (`docs/ORT_V1_5_TESTABLE_ITEMS_AUDIT.md`):
+
+### TLC-016 — RLS policy static-analysis lockdown (OR-112 + OR-236)
+
+**Status:** todo (candidate; PM verifies at kickoff per "verify before authoring")
+**Sprint:** Sprint 6
+**Estimated commits:** 1-2
+**Decision rule:** 3
+
+Static-analysis test (sibling to canonical-glossary.test.ts pattern) asserting every tenant-scoped table in migrations/ has a corresponding RLS POLICY row. PM verify-before-authoring at kickoff: confirm no existing test asserts this; if there is, descope. Codex FIRE on narrow scope (novel test class).
+
+### TLC-017 — Build-vs-spec traceability matrix consolidation (OR-216)
+
+**Status:** todo (candidate)
+**Sprint:** Sprint 6
+**Estimated commits:** 1
+**Decision rule:** 6
+
+Consolidate existing slice status docs into a single traceability matrix mapping each implemented invariant / endpoint / state-machine to the test file(s) covering it.
+
+### TLC-018 — Foundation-layer perf budget tests (OR-218)
+
+**Status:** todo (candidate; lower priority)
+**Sprint:** Sprint 6 OR Sprint 7
+**Estimated commits:** 2-3
+
+Per-foundation-layer perf assertions (idempotency lookup, audit emit, RLS query) under representative load. Lower priority because most surfaces depend on unauthored slices.
+
+### TLC-019 — Data-filtering implementation status doc (OR-208)
+
+**Status:** todo (candidate; lowest priority)
+**Sprint:** Sprint 6 (filler) OR Sprint 7
+**Estimated commits:** 1
+**Decision rule:** 6
+
+Status doc capturing ADR-023's 3-layer enforcement decision rationale + the test surface that proves it. ADR-023 implicit closure already exists; this doc makes it explicit.
+
+### Process item for Sprint 6 PM kickoff
+
+Extend PM rubric "wire-protocol vocabulary check" sub-rule to cover spec-corpus identifiers (ORT row IDs, ADR numbers, Promotion Ledger entry IDs, slice PRD section references). Sprint 5 retro deliverable. PM brief at Sprint 6 should include explicit verification of any spec-corpus identifier cited.
+
+Also: PM brief should include `internal canonicalization patterns` check when test depends on internal API contracts (URL canonicalization, header normalization, key formatting). Sprint 5 retro process change #2.
+
+---
+
+## Sprint 7+ — proposed (sequenced through EHBG §10b)
 
 | Sprint | EHBG mapping                                                     | Indicative stories                                                                                                                                                                                                        |
 | ------ | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -313,6 +352,11 @@ PM may resequence based on SI closures + emergent priorities.
 
 ## Done (rolling archive — last 3 sprints visible)
 
+### Sprint 5 — closed 2026-05-05
+
+- TLC-013 — Idempotency invariant lockdown (3e37433 + 0f4a757 fix-forward; Codex HIGH closed; re-verify APPROVE)
+- TLC-015 — ORT v1.5 testable items audit (1eab1a6; 4 verified-real Sprint 6+ candidates surfaced)
+
 ### Sprint 4 — closed 2026-05-05
 
 - TLC-010 — Subscription module skeleton (da597c6; 3rd skeleton-recipe application + 2 wiring tests)
@@ -322,8 +366,3 @@ PM may resequence based on SI closures + emergent priorities.
 
 - TLC-007 — Med Interaction module skeleton (2f89661; 3 branded IDs + plugin shell + 2 wiring tests)
 - TLC-009 — Tenant-config admin-write 503 surface (ad711fb; 5 mutation stubs + readiness probe + 7 tests)
-
-### Sprint 2 — closed 2026-05-05
-
-- TLC-004 — Tenant-config Admin Backend read handlers (f12a142; 4 GET routes + 9 tests + adapter-config-repo + ADR-024 redaction view)
-- TLC-006 — Forms-intake operator-edit emit-site wiring (8a0956a; 2 parallel domain-event emitters + 4 envelope-shape tests; chose option (b) lighter path)
