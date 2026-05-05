@@ -18,6 +18,7 @@
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { emitAccountActivatedAudit, emitAccountCreatedAudit } from '../../audit.js';
+import { emitAccountActivatedDomainEvent, emitAccountCreatedDomainEvent } from '../../events.js';
 import * as accountRepo from '../repositories/account-repo.js';
 import type { Account, AccountId, AccountGender, AccountType } from '../types.js';
 
@@ -113,6 +114,13 @@ export async function createAccount(
         },
         tx,
       );
+      // Domain event emission alongside audit (same tx).
+      await emitAccountCreatedDomainEvent(tx, {
+        tenantId: ctx.tenantId,
+        accountId: account.account_id,
+        countryOfCare: ctx.countryOfCare,
+        occurredAt: account.created_at,
+      });
     },
     externalTx,
   );
@@ -170,6 +178,11 @@ export async function activateAccount(
         },
         tx,
       );
+      await emitAccountActivatedDomainEvent(tx, {
+        tenantId: ctx.tenantId,
+        accountId: activated.account_id,
+        occurredAt: activated.updated_at,
+      });
       return activated;
     });
   }
@@ -186,6 +199,11 @@ export async function activateAccount(
     },
     externalTx,
   );
+  await emitAccountActivatedDomainEvent(externalTx, {
+    tenantId: ctx.tenantId,
+    accountId: activated.account_id,
+    occurredAt: activated.updated_at,
+  });
   return activated;
 }
 
