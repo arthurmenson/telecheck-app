@@ -134,6 +134,17 @@ const THRESHOLDS: readonly ScenarioThreshold[] = [
     p95MaxMicros: 20,
     label: '§8 validateTransition: UnsupportedTransitionError',
   },
+  // emitAudit DB-backed bench (Sprint 17 / TLC-027 EXECUTE).
+  // Generous initial threshold (50ms) — DB-backed scenarios have
+  // disk + network roundtrip + advisory-lock contention dominating
+  // wall time. Sprint 18+ tightens after CI variance is observed,
+  // per Sprint 13 / TLC-023c §3 threshold-tightening pattern.
+  {
+    taskNameMatch:
+      'emit-audit happy-path single-row append on existing chain',
+    p95MaxMicros: 50000,
+    label: '§9 emit-audit: happy-path single-row append (DB-backed)',
+  },
 ];
 
 // ---------------------------------------------------------------------------

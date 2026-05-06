@@ -212,9 +212,125 @@ export function clearTestPool(): void {
   _pool = null;
 }
 
+// ---------------------------------------------------------------------------
+// Bench-mode pool override (Sprint 17 / TLC-027 closure of Codex r10-B)
+// ---------------------------------------------------------------------------
+
+/**
+ * Bench-mode pool override. When set (via `setBenchPool()` from
+ * tests/perf/db/setup.ts), `getPool()` returns this REAL pg.Pool instead
+ * of constructing the production pool from `config.databaseUrl`.
+ *
+ * Distinct from `setTestPool()` because:
+ *
+ *   - `setTestPool()` translates BEGIN/COMMIT/ROLLBACK to nested savepoints
+ *     against ONE shared client — correct for integration-test SAVEPOINT
+ *     isolation, WRONG for bench mode because:
+ *
+ *       a) `pg_advisory_xact_lock` (used by audit_records hash-chain
+ *          trigger; see migration 002) is RELEASED at outer-transaction
+ *          end. With savepoint-translation, all bench iterations share
+ *          the outer transaction → advisory lock held for whole bench
+ *          session → measurement does NOT reflect production per-request
+ *          lock lifetime.
+ *
+ *       b) Bench iterations don't have real commit durability; they roll
+ *          back at session end. Cross-connection visibility patterns
+ *          (e.g., a different connection observing a committed audit
+ *          row) are not exercised.
+ *
+ *       c) Production contention/failure behavior (concurrent INSERTs on
+ *          the same partition deadlocking on the advisory lock) is
+ *          unmeasurable.
+ *
+ *   - `setBenchPool()` returns a REAL pg.Pool. Bench iterations get
+ *     fresh connections per call, run real BEGIN/COMMIT/ROLLBACK, hold
+ *     advisory locks for real per-iteration lifetime. Measurements
+ *     reflect the production code path AS PRODUCTION RUNS IT.
+ *
+ *   - State accumulation across iterations is acceptable because the
+ *     hash-chain-extend cost is roughly constant per row (FOR UPDATE
+ *     on the latest partition row). After the bench session, the bench
+ *     setup file's afterAll TRUNCATEs accumulated rows.
+ *
+ * Closes Codex perf-bench-r10-B MEDIUM 2026-05-05 (which flagged that
+ * Sprint 14 TLC-025-SCAFFOLD's setTestPool-based design would have
+ * measured the wrong thing for emit-audit hash-chain bench).
+ *
+ * Mutually exclusive with `setTestPool()`. A test process operates as
+ * EITHER integration mode OR bench mode, never both. Calling both is
+ * a configuration error; the bench override wins (last-set-wins; see
+ * `getPool()` priority order).
+ */
+let _benchPoolOverride: pg.Pool | null = null;
+
+export interface BenchPoolConfig {
+  /** Connection string for the bench app role (NOT superuser). */
+  connectionString: string;
+  /**
+   * Max pool size. Defaults to 5 — bounded because bench iterations are
+   * sequential, not concurrent. Higher values waste connection slots.
+   */
+  max?: number;
+}
+
+/**
+ * Bench-only: install a real pg.Pool against `BENCH_DATABASE_URL`. Called
+ * by tests/perf/db/setup.ts beforeAll once migrations + role setup
+ * complete.
+ *
+ * Production code MUST NOT call this — there is no mode where a real
+ * deployment overrides the production pool with a different DB.
+ *
+ * Returns the pool reference so the caller can call `pool.end()` in
+ * afterAll for cleanup.
+ */
+export function setBenchPool(cfg: BenchPoolConfig): pg.Pool {
+  if (_benchPoolOverride !== null) {
+    return _benchPoolOverride;
+  }
+  const pool = new Pool({
+    connectionString: cfg.connectionString,
+    max: cfg.max ?? 5,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 5_000,
+    // Bench mode is local-only by design (BENCH_DATABASE_URL must NOT
+    // match production DATABASE_URL; enforced by tests/perf/db/setup.ts
+    // collision check). No SSL.
+    ssl: false,
+  });
+
+  pool.on('error', (err) => {
+    // Same posture as production pool: surface but do not exit.
+    // eslint-disable-next-line no-console
+    console.error('[db.bench] unexpected pool error:', err);
+  });
+
+  _benchPoolOverride = pool;
+  // Reset _pool so getPool() picks up the override on next call.
+  _pool = null;
+  return pool;
+}
+
+/**
+ * Bench-only: clear + close the bench pool. Called by
+ * tests/perf/db/setup.ts in afterAll for cleanliness.
+ */
+export async function clearBenchPool(): Promise<void> {
+  if (_benchPoolOverride !== null) {
+    const pool = _benchPoolOverride;
+    _benchPoolOverride = null;
+    _pool = null;
+    await pool.end();
+  }
+}
+
 export function getPool(): pg.Pool {
   if (_testPoolOverride !== null) {
     return _testPoolOverride;
+  }
+  if (_benchPoolOverride !== null) {
+    return _benchPoolOverride;
   }
   if (_pool === null) {
     _pool = new Pool({

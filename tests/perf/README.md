@@ -100,10 +100,36 @@ Sprint 12 retro recorded this as **the first finding class where iterative fix-f
 | --- | --- | --- | --- |
 | `tests/perf/audit/crisis-detect.bench.ts` | 7 / TLC-018 | `crisisDetector.detect` (I-019 hot path) | §1–§4 (4 scenarios) |
 | `tests/perf/state-machine/validate-transition.bench.ts` | 12 / TLC-024 | `validateTransition` (Async Consult slice hot path) | §5–§8 (1 happy + 3 reject paths) |
+| `tests/perf/audit/emit-audit.bench.ts` | 17 / TLC-027 | `emitAudit` hash-chain append (DB-backed) | §9 (happy-path single-row append) |
 
-8 bench scenarios total. Per-scenario p95 thresholds enforced by `tests/perf/check-thresholds.ts` against vitest bench `--outputJson` capture.
+9 bench scenarios total (8 pure-function + 1 DB-backed). Per-scenario p95 thresholds enforced by `tests/perf/check-thresholds.ts` against vitest bench `--outputJson` capture.
 
-**Bench-mode DB-backed corpus** is NOT yet provided at v0.1. Targets that require Postgres (e.g., `emitAudit` hash chain, `withTenantBoundConnection`, idempotency lookup, repo CRUD) are deferred to Sprint 13+ pending bench-mode ephemeral-DB setup investment.
+**Bench-mode DB-backed corpus** infrastructure landed Sprint 17 / TLC-027 (rebuilt from the reverted Sprint 14 / TLC-025 attempt; closes Codex `perf-bench-r10` 2 HIGH + 2 MEDIUM findings). Real `pg.Pool` via `setBenchPool()` (no savepoint translation), URL canonicalization, schema_migrations tracking, always-on setupFiles with `requireBenchDb()` gate.
+
+### Running DB-backed benches
+
+```bash
+# 1. Provision a dedicated bench Postgres (DO NOT reuse dev or test DB)
+createdb telecheck_bench
+
+# 2. Set BENCH_DATABASE_URL in your .env (or shell env)
+export BENCH_DATABASE_URL=postgresql://telecheck_bench:password@localhost:5432/telecheck_bench
+
+# 3. Run benches as usual
+npm run bench
+```
+
+`tests/perf/db/setup.ts` runs as `setupFiles` always (Sprint 17 / TLC-027 r10-A closure: was conditional on env presence, which fail-opened). The setup file's `beforeAll` fast-exits with success when `BENCH_DATABASE_URL` is unset, so pure-function benches still run with no Postgres dependency. DB-backed bench files explicitly call `requireBenchDb()` — throws clear actionable error when env is unset rather than silently falling back to dev DB.
+
+**Fail-closed canonicalized URL collision check** (r10-C closure): `BENCH_DATABASE_URL` MUST canonicalize-differently from `DATABASE_URL` and `TEST_DATABASE_URL` (host:port/db comparison; auth credentials, query strings, host-alias variations normalized out).
+
+**Tracked migration apply** (r10-D closure): bench DB has its own `schema_migrations_bench` table; each migration applies at most once; partial-apply failures leave the row un-INSERTed so the next session re-attempts and fails explicitly rather than silently skipping.
+
+**Sprint 18+ DB-backed bench expansion path:**
+- §10+ `idempotency.lookupIdempotencyRecord` — DB-backed; pre-populate per-tenant fixture; bench the lookup + miss + replay paths
+- §11+ `withTenantBoundConnection` — RLS context-set + first-query latency
+- §12+ repo CRUD on a representative table (e.g., consent_records insert + read)
+- Threshold tightening: after `perf.yml` accumulates 3-5 stable runs of §9, capture observed p95, set tightened ceiling per Sprint 13 / TLC-023c §3 worksheet
 
 ## Per-slice landing pattern
 
@@ -127,8 +153,8 @@ The example bench at `tests/perf/audit/crisis-detect.bench.ts` shows the pattern
 | Surface | Bench-able now? | Why / why not |
 | --- | --- | --- |
 | `crisisDetector.detect` | ✅ yes | Pure function; no DB; hot path; example bench landed |
-| `idempotency.lookupIdempotencyRecord` | ⚠️ partial | DB-backed; needs ephemeral Postgres in bench harness — defer to Sprint 8+ |
-| `emitAudit` (hash chain) | ⚠️ partial | DB-backed for FOR UPDATE serialization — same blocker |
+| `idempotency.lookupIdempotencyRecord` | ⚠️ infra ready | Sprint 17 bench-mode DB infra landed; first scenario Sprint 18+ |
+| `emitAudit` (hash chain) | ✅ yes | Sprint 17 / TLC-027 §9 happy-path single-row append landed (`tests/perf/audit/emit-audit.bench.ts`) |
 | `tenant-context` resolution | ✅ yes | Pure function (host-header → tenant lookup); host-header parsing benchable now |
 | `errorEnvelope.buildErrorEnvelope` | ✅ yes | Pure function |
 | Per-slice service handlers | ⛔ no until slice ships | E.g., `med-interaction.signal.check` BLOCKED on Med Interaction Engine slice PRD ratification |
