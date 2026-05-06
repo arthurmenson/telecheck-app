@@ -44,8 +44,8 @@ import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import { hasActiveConsent } from '../../../consent/index.js';
 import {
-  getSubmissionForBinding,
   type FormSubmissionId,
+  verifySubmissionBindingEligibility,
 } from '../../../forms-intake/index.js';
 import type { AccountId } from '../../../identity/internal/types.js';
 import {
@@ -319,42 +319,27 @@ export async function submit(
     assertConsultOwnership(current, actor.accountId);
 
     // Guard: form_complete — verify forms_submission status + ownership
-    // BEFORE constructing the GuardContext (per Codex async-consult-r9
-    // HIGH closure 2026-05-05). Composite FK alone proves tenant + id
-    // match but does NOT prove status='submitted' or patient_id match.
-    // We verify both here in the same transaction.
-    const submission = await getSubmissionForBinding(
+    // via the cross-slice authorization-enforcing helper (Codex
+    // async-consult-r10 HIGH closure 2026-05-05). The helper enforces
+    // all 3 checks INSIDE forms-intake (tenant scope, patient ownership,
+    // bind-eligible status) and returns only a minimal {valid, reason?}
+    // result — PHI never crosses the module boundary.
+    const eligibility = await verifySubmissionBindingEligibility(
       ctx.tenantId,
       intakeFormSubmissionId,
+      actor.accountId,
       tx,
     );
-    if (submission === null) {
-      // Tenant-blind: don't distinguish "submission doesn't exist" from
-      // "submission exists in another tenant" or "submission belongs to
-      // another patient". Return generic SubmitGuardNotSatisfiedError.
+    if (!eligibility.valid) {
+      if (eligibility.reason === 'wrong_status') {
+        throw new FormSubmissionNotTerminalError(
+          intakeFormSubmissionId,
+          'non-bind-eligible',
+        );
+      }
+      // not_found OR wrong_patient: tenant-blind / cross-patient-blind.
+      // Don't distinguish — both surface as form_not_complete.
       throw new SubmitGuardNotSatisfiedError(consultId, 'form_not_complete');
-    }
-    if (submission.patient_id !== actor.accountId) {
-      // Same as above — tenant-blind from the cross-patient perspective.
-      throw new SubmitGuardNotSatisfiedError(consultId, 'form_not_complete');
-    }
-    // Bind-eligible statuses: forms_submission must be past the patient's
-    // submission boundary. 'submitted' is the canonical first terminal
-    // state; AI processing or clinician review may have advanced it
-    // further already (concurrent independent forms-intake processing) —
-    // any post-patient-submission state is bind-eligible.
-    //
-    // Per `SubmissionStatus` type at forms-intake/internal/types.ts:41-49:
-    //   'in_progress' / 'paused' / 'abandoned' / 'declined' — NOT bind-eligible
-    //   'submitted' / 'ai_evaluated' / 'physician_reviewed' / 'approved' — bind-eligible
-    const bindEligibleStatuses = [
-      'submitted',
-      'ai_evaluated',
-      'physician_reviewed',
-      'approved',
-    ] as const;
-    if (!(bindEligibleStatuses as readonly string[]).includes(submission.status)) {
-      throw new FormSubmissionNotTerminalError(intakeFormSubmissionId, submission.status);
     }
 
     // Guard: active_consent (cross-slice Consent gate). hasActiveConsent
@@ -620,20 +605,72 @@ export async function resume(
   );
 }
 
-/** SUBMITTED → PROCESSING on `process` event (no guard). */
+/**
+ * SUBMITTED → PROCESSING on `process` event (no guard).
+ *
+ * **System/operational transition** — NOT a patient action. Triggered
+ * by the AI service when it picks up a SUBMITTED consult for processing
+ * (per State Machines v1.1 §3 row 6 + PRD §1: "AI Mode 2 prepares
+ * clinical summary"). Per Codex async-consult-r10 HIGH closure
+ * 2026-05-05: this transition does NOT enforce patient ownership —
+ * a worker / clinician / AI service actor invoking it cannot be
+ * required to "be" the patient.
+ *
+ * Sprint 10 v0.1 simplification: actor is recorded as a system actor
+ * (not validated against consult.patient_id). Sprint 11+ adds explicit
+ * RBAC role check ('platform_ai_safety' or 'system_worker') when
+ * the AI service ships.
+ *
+ * No HTTP route exposes this transition at v0.1. The handler surface
+ * for `POST /v0/async-consult/:id/process` is intentionally OMITTED
+ * — process is internal, not a user-facing operation. AI service
+ * (when authored) calls this service function directly with a
+ * service-account actor.
+ */
 export async function process(
   ctx: TenantContext,
-  actor: { actorId: string; accountId: AccountId },
+  actor: { actorId: string },
   consultId: ConsultId,
   externalTx?: DbTransaction,
 ): Promise<Consult> {
-  return unguardedTransition(
-    ctx,
-    actor,
-    consultId,
-    { event: 'process', guard: {} },
-    externalTx,
-  );
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    const current = await consultRepo.findConsultById(ctx.tenantId, consultId, tx);
+    if (current === null) throw new ConsultNotFoundError(consultId);
+
+    // No assertConsultOwnership — process is a system/operational
+    // transition. The audit chain records actor.actorId (the AI service
+    // actor or worker actor) for forensic traceability.
+
+    const guardCtx: GuardContext = { event: 'process', guard: {} };
+    const toState = validateTransition(current.state, 'process', guardCtx);
+
+    const updated = await consultRepo.updateConsultState(
+      {
+        consult_id: consultId,
+        tenant_id: ctx.tenantId,
+        to_state: toState,
+        expected_from_state: current.state,
+      },
+      tx,
+    );
+    if (updated === null) throw new ConsultStateConflictError(consultId);
+
+    await consultEventRepo.createStateTransitionEvent(
+      {
+        consult_event_id: asConsultEventId(ulid()),
+        consult_id: consultId,
+        tenant_id: ctx.tenantId,
+        from_state: current.state,
+        to_state: toState,
+        actor_id: actor.actorId,
+      },
+      tx,
+    );
+
+    return updated;
+  }, externalTx);
 }
 
 /** AWAITING_DATA → UNDER_REVIEW on `patient_responds` event (no guard). */

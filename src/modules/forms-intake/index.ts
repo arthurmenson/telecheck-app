@@ -73,24 +73,64 @@ export async function getActiveDeployment(
 }
 
 /**
- * getSubmissionForBinding — used by Async Consult slice to verify a
- * forms_submission row before binding it to a consult at the
- * INTAKE → SUBMITTED transition. Returns the full submission record
- * (or null if not found / cross-tenant filtered).
- *
- * Caller MUST verify the returned submission's `patient_id` matches
- * the consult's patient_id AND `status` is terminal ('submitted'
- * or 'completed' — NOT 'in_progress' or 'paused') before binding.
- *
- * Per Codex async-consult-r9 HIGH closure 2026-05-05: this cross-slice
- * surface exists specifically to prevent same-tenant attackers from
- * binding incomplete or wrong-patient submissions to consults via a
- * known submission_id.
+ * Result type for `verifySubmissionBindingEligibility`. Encapsulates
+ * the authorization decision without exposing full submission PHI
+ * across the module boundary.
  */
-export async function getSubmissionForBinding(
+export type SubmissionBindingValidity =
+  | { valid: true }
+  | { valid: false; reason: 'not_found' | 'wrong_patient' | 'wrong_status' };
+
+/**
+ * verifySubmissionBindingEligibility — authorization-enforcing
+ * forms-intake helper for cross-slice binding (Async Consult,
+ * future Refill, etc.).
+ *
+ * Per Codex async-consult-r10 HIGH closure 2026-05-05: this REPLACES
+ * the earlier `getSubmissionForBinding` which exposed the full
+ * `FormSubmission` (including PHI `responses` payload) across the
+ * module boundary. That was a trust-boundary regression — any
+ * cross-module caller could read PHI by supplying tenantId +
+ * submissionId without proving patient ownership.
+ *
+ * This function enforces all 3 binding-eligibility checks INSIDE
+ * forms-intake (verifying tenant scope, patient ownership, status
+ * eligibility) and returns ONLY a minimal {valid, reason?}
+ * authorization result. PHI never crosses the module boundary.
+ *
+ * Tenant-blind error reporting: all three failure modes
+ * (not_found / wrong_patient / wrong_status) are returned with
+ * the same shape; the caller can choose to map to a uniform
+ * tenant-blind error envelope per I-025 if appropriate. Not_found
+ * AND wrong_patient AND cross-tenant are indistinguishable by the
+ * caller's external surface — only wrong_status reveals the
+ * submission's existence (acceptable because by the time we get
+ * to status-check, the caller has already proven patient ownership).
+ */
+export async function verifySubmissionBindingEligibility(
   tenantId: TenantId,
   submissionId: FormSubmissionId,
+  expectedPatientId: string,
   externalTx?: DbClient,
-): Promise<FormSubmission | null> {
-  return findSubmissionById(tenantId, submissionId, externalTx);
+): Promise<SubmissionBindingValidity> {
+  const submission = await findSubmissionById(tenantId, submissionId, externalTx);
+  if (submission === null) {
+    return { valid: false, reason: 'not_found' };
+  }
+  if (submission.patient_id !== expectedPatientId) {
+    // Tenant-blind from the cross-patient perspective: don't reveal
+    // whether the submission belongs to a different patient.
+    return { valid: false, reason: 'wrong_patient' };
+  }
+  // Bind-eligible statuses (post-patient-submission lifecycle states).
+  const bindEligibleStatuses: ReadonlyArray<FormSubmission['status']> = [
+    'submitted',
+    'ai_evaluated',
+    'physician_reviewed',
+    'approved',
+  ];
+  if (!bindEligibleStatuses.includes(submission.status)) {
+    return { valid: false, reason: 'wrong_status' };
+  }
+  return { valid: true };
 }
