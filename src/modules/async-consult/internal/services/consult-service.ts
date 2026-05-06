@@ -652,9 +652,19 @@ export async function resume(
  * a stable target; until SI-007 closes, it unconditionally throws.
  *
  * No HTTP route exposes this transition at v0.1 (process is internal,
- * not user-facing). Handler-layer integration tests use direct DB
- * seeding to advance consults to PROCESSING for testing the next
- * transitions; service callers unconditionally hit AiServiceNotWiredError.
+ * not user-facing). PROCESSING state is **unreachable at v0.1** —
+ * the SUBMITTED → PROCESSING transition cannot be made through the
+ * service layer until SI-007 closes. Per Codex async-consult-r12
+ * HIGH closure 2026-05-05: do NOT bypass via direct DB writes —
+ * doing so would create PROCESSING rows without consult_events
+ * audit entries, breaking forensic source-of-truth and recovery
+ * paths that rely on consult_events.
+ *
+ * Tests that need PROCESSING state to test downstream transitions
+ * (deferred ai_complete / claim / etc.) MUST wait for SI-007.
+ * Sprint 10 integration tests cover the Sprint 9-supported
+ * transitions only (initiate / submit / abandon / resume / etc.);
+ * PROCESSING-dependent test paths are deferred.
  */
 export async function process(
   _ctx: TenantContext,
