@@ -1,8 +1,8 @@
 # TLC-023c — Branch protection wire-up for `Performance benchmarks` workflow
 
-**Status:** prepared 2026-05-05 (Sprint 12); extended Sprint 13 / TLC-026 with §2.1 CI baseline capture procedure + machine-enforced metadata guard via `.github/workflows/baseline-refresh-guard.yml` (2026-05-05, Codex r6 fix-forward); awaiting Evans's emergency-only-access execution.
+**Status:** prepared 2026-05-05 (Sprint 12); extended Sprint 13 / TLC-026 with §2.1 CI baseline capture procedure + machine-enforced metadata guard via `.github/workflows/baseline-refresh-guard.yml` (2026-05-05, Codex r6 + r7 fix-forward chain — labeled-field parsing + GH API validation + always-run + early-exit); awaiting Evans's emergency-only-access execution.
 
-**Sprint reference:** Sprint 12 / TLC-023c authored this doc. Sprint 11 TLC-023b landed the `perf.yml` workflow. Sprint 13 / TLC-026 landed (a) the in-process closure-path infrastructure — manifest-check helper + self-test mode in `tests/perf/check-thresholds.ts`, wired into `perf.yml` — and (b) `.github/workflows/baseline-refresh-guard.yml` machine-enforcing the §2.1 required metadata (closes Codex perf-bench-r6 MEDIUM). This doc remains the Evans-side execution playbook; Sprint 14+ executes it.
+**Sprint reference:** Sprint 12 / TLC-023c authored this doc. Sprint 11 TLC-023b landed the `perf.yml` workflow. Sprint 13 / TLC-026 landed (a) the in-process closure-path infrastructure — manifest-check helper + self-test mode in `tests/perf/check-thresholds.ts`, wired into `perf.yml` — and (b) `.github/workflows/baseline-refresh-guard.yml` machine-enforcing the §2.1 required metadata via labeled-field parsing + GH API validation (closes Codex perf-bench-r6 + r7 MEDIUM). This doc remains the Evans-side execution playbook; Sprint 14+ executes it.
 
 ---
 
@@ -115,9 +115,9 @@ for (const file of data.files || []) {
 
 Sprint 13 / TLC-026 landed:
 - Manifest-check helper + self-test mode in `tests/perf/check-thresholds.ts` (commit `4380a73` + r5 fix-forward `36b477c` extracting `runGate()` so `selfTest()` exercises the same gate semantics `main()` uses)
-- Machine-enforced metadata guard in `.github/workflows/baseline-refresh-guard.yml` (Codex r6 fix-forward) — fails any PR that modifies `tests/perf/baseline.json` without the required commit/PR metadata
+- Machine-enforced metadata guard in `.github/workflows/baseline-refresh-guard.yml` (Codex r6 + r7 fix-forward chain) — runs on EVERY PR (no path filter, per r7-B closure), early-exits with success when `tests/perf/baseline.json` is unchanged; otherwise enforces labeled-field parsing + GH API validation (per r7-A closure)
 
-This section documents the Sprint 14+ baseline-capture flow that executes against that infrastructure. The workflow above MACHINE-ENFORCES the metadata requirements stated below — there is no "audit trail discoverable later" loophole.
+This section documents the Sprint 14+ baseline-capture flow that executes against that infrastructure. The workflow MACHINE-ENFORCES the metadata requirements stated below; loose regex grep on PR text was rejected by Codex r7-A as insufficient (incidental timestamps + hex strings could satisfy the prior pattern). There is no "audit trail discoverable later" loophole.
 
 ### Prerequisite: 3-5 stable main runs
 
@@ -163,47 +163,71 @@ npx tsx tests/perf/check-thresholds.ts tests/perf/baseline.json
 
 ### Commit discipline
 
+The commit body MUST include three labeled fields the `baseline-refresh-guard.yml` workflow parses with anchored patterns. Loose grep was insufficient (Codex perf-bench-r7 MEDIUM closure: "Run-Id" without label could match any 10+ digit timestamp); labeled fields rule out incidental matches.
+
 ```bash
-# Step 6: Commit with explicit baseline-refresh scope tag.
+# Step 6: Commit with required metadata. The labeled fields below are
+# parsed by the baseline-refresh-guard workflow; the run id is then
+# validated against the GitHub Actions API (run must exist, must be
+# the Performance benchmarks workflow, must have completed=success,
+# and its head_sha must prefix-match the cited Source-SHA).
 git add tests/perf/baseline.json
+SHORT_SOURCE_SHA="$(git rev-parse --short=7 "$STABLE_RUN_HEAD_SHA")"
 git commit -m "chore(perf): [scope=baseline-refresh] CI-calibrated baseline from run $STABLE_RUN_ID
 
-Captured from perf.yml run $STABLE_RUN_ID on main (commit <sha-from-step-1>).
+Captured from perf.yml run on main with the metadata below.
 Manifest coverage verified locally (8/8 scenarios) before commit.
 All 8 thresholds PASS against the captured baseline.
 
 Replaces local-laptop Sprint 7 baseline. Closes the v0.1 trade-off
 documented at tests/perf/README.md §'Known v0.1 trade-off'.
 
+Run-Id: $STABLE_RUN_ID
+Source-SHA: $SHORT_SOURCE_SHA
+
 Sprint reference: Sprint 14+ TLC-026 execution path (Sprint 13 built
 the closure path; this commit executes against it).
 "
 ```
 
+(`STABLE_RUN_HEAD_SHA` here is the `headSha` field from `gh run list` output in Step 1.)
+
 **Required commit/PR metadata (machine-enforced):**
-- `[scope=baseline-refresh]` literal tag in the PR title/body OR any commit message on the PR
-- A GitHub run id (10+ contiguous digits) — the `STABLE_RUN_ID` from Step 1
-- A source-commit SHA (7+ char hex) — the `headSha` from `gh run list`
+- `[scope=baseline-refresh]` literal tag — anywhere in PR title/body OR any commit message on the PR
+- `Run-Id: <10+ digit number>` labeled field — the `STABLE_RUN_ID` from Step 1
+- `Source-SHA: <7-40 char lowercase hex>` labeled field — `git rev-parse --short=7 $STABLE_RUN_HEAD_SHA`, OR the full 40-char hex
 
 ### Enforcement mechanism
 
-Per Codex perf-bench-r6 MEDIUM closure 2026-05-05, the metadata above is **machine-enforced** via `.github/workflows/baseline-refresh-guard.yml` (Sprint 13 fix-forward landed alongside this §2.1 update). The workflow:
+Per Codex perf-bench-r6 + r7 MEDIUM closures 2026-05-05, the metadata above is **machine-enforced** via `.github/workflows/baseline-refresh-guard.yml`. The workflow:
 
-- Triggers `on: pull_request` with `paths: tests/perf/baseline.json` — runs ONLY when the baseline file changes
-- Runs as a separate CI check named `Baseline refresh guard / verify-metadata`
-- Inspects PR title + body + commit messages for the 3 required metadata patterns
-- Fails the check (blocks merge) if any pattern is missing, with explicit pointers to this section + the Codex finding-class context
+- Triggers `on: pull_request` for ALL PRs to main (no `paths:` filter — Codex r7-B closure: a path-filtered required-check leaves non-baseline PRs hung on a missing context, so the workflow must always produce a check)
+- First step inspects `git diff --name-only ${BASE_SHA} ${HEAD_SHA}` for `tests/perf/baseline.json`. If absent, the workflow EARLY-EXITS with success — non-baseline PRs pass instantly with no metadata check.
+- If `tests/perf/baseline.json` did change, runs:
+  1. **Labeled-field parsing** — anchored regex for `[Rr]un-[Ii]d:[[:space:]]*\d{10,}` and `[Ss]ource-[Ss][Hh][Aa]:[[:space:]]*[0-9a-f]{7,40}` (Codex r7-A closure: bare `\b\d{10,}\b` accepts incidental timestamps; bare `\b[0-9a-f]{7,40}\b` accepts incidental hex)
+  2. **GH API validation** via `gh api /repos/.../actions/runs/{Run-Id}`:
+     - Run must exist (gh fail-fasts on 404)
+     - `name == "Performance benchmarks"` (rules out citing a CI-yml or unrelated workflow run)
+     - `conclusion == "success"` (rules out flaky/cancelled/failed runs)
+     - `head_sha` prefix-matches the cited `Source-SHA` (rules out citing a real run with a fabricated/mismatched code-state SHA)
 
-**This replaces the prior doc-only-discipline framing.** The `[scope=baseline-refresh]` tag is no longer "something future operators grep for" — it is a CI-enforced precondition for merging any change to `tests/perf/baseline.json`. Codex r3 MEDIUM 2026-05-05 closed "doc-only churn discipline" via revert; r6 MEDIUM 2026-05-05 closed "we said enforcement but only documented it" via the workflow above. Same finding class, one layer up; closed by code, not prose.
+**This replaces the prior doc-only-discipline framing.** The `[scope=baseline-refresh]` tag is no longer "something future operators grep for" — it is a CI-enforced precondition for merging any change to `tests/perf/baseline.json`. Multi-round closure trajectory:
+- r3: doc-only churn discipline → revert
+- r6: doc-only enforcement claim → add CI workflow with regex grep
+- r7-A: regex grep accepts incidental matches → labeled fields + GH API validation
+- r7-B: path-filter required-check problem → always-run + early-exit
 
-**Sprint 14+ branch-protection wire-up** (per TLC-023c §1 PUT command pattern): when Evans executes the required-status-check append, include `Baseline refresh guard / verify-metadata` alongside `Performance benchmarks / bench` so missing metadata blocks merge in branch protection too, not just CI.
+**Sprint 14+ branch-protection wire-up** (per TLC-023c §1 PUT command pattern): when Evans executes the required-status-check append, include `Baseline refresh guard / verify-metadata` alongside `Performance benchmarks / bench`. Per r7-B closure, the workflow now runs on every PR (early-exits with success when baseline.json unchanged), so requiring it does NOT block unrelated PRs — every PR produces this check.
 
-### Anti-patterns explicitly forbidden (Codex perf-bench-r2/r3/r6 finding class)
+### Anti-patterns explicitly forbidden (Codex perf-bench-r2/r3/r6/r7 finding class)
 
-- ❌ **Local-laptop regen committed as baseline.** Codex perf-bench-r2 MEDIUM 2026-05-05 closed this — the v0.1 baseline scope is "CI-calibrated only" until launch. Local regens for self-test fixtures are fine; they do not replace `tests/perf/baseline.json`.
+- ❌ **Local-laptop regen committed as baseline.** Codex perf-bench-r2 MEDIUM 2026-05-05 closed this — the v0.1 baseline scope is "CI-calibrated only" until launch. Local regens for self-test fixtures are fine; they do not replace `tests/perf/baseline.json`. (Now also enforced via `Run-Id` API validation: a fake run id fails the gh api lookup; a real run id from a non-perf.yml run fails the workflow-name check.)
 - ❌ **Skipping manifest-check verification.** The Sprint 13 helper exists to catch silent gate-bypass; bypassing it during the baseline capture procedure defeats the closure-path-built-Sprint-13 enforcement.
-- ❌ **Skipping required metadata.** Codex perf-bench-r3 MEDIUM 2026-05-05 closed the prior doc-only-discipline failure mode by reverting the local-laptop baseline; r6 MEDIUM 2026-05-05 closed the "we claimed enforcement but only documented it" recurrence by adding the `baseline-refresh-guard.yml` CI workflow. Required metadata = `[scope=baseline-refresh]` + GH run id + source SHA, all checked by the workflow.
-- ❌ **Committing a baseline from a flaky run.** If the `gh run list` output mixes success + failure within the 3-5 window, investigate the failures before treating any success as a baseline. A baseline captured from a "lucky" run encodes survivor bias. (This anti-pattern is operator-discipline; the CI guard validates the *metadata* but not the *quality* of the source run — Sprint 14+ retro evaluates whether to extend the guard to also validate the source run's success state.)
+- ❌ **Skipping required metadata.** Closure trajectory: r3 → revert; r6 → workflow with regex grep; r7-A → labeled fields + GH API validation. Required metadata = `[scope=baseline-refresh]` literal tag + `Run-Id:` labeled field + `Source-SHA:` labeled field, all checked by the workflow. Run id is then validated against the GitHub Actions API; cited Source-SHA must prefix-match the run's head_sha.
+- ❌ **Citing a cancelled/failed run as baseline.** Codex r7-A closure validates `conclusion == "success"` via API; cancelled/failed runs are rejected before merge.
+- ❌ **Citing a perf.yml run with a mismatched Source-SHA.** Codex r7-A closure validates the cited Source-SHA prefix-matches the run's actual `head_sha`. Fabricated short SHAs are rejected.
+- ❌ **Citing a non-perf.yml run** (e.g., a ci.yml run id). Codex r7-A closure validates `name == "Performance benchmarks"`. Wrong-workflow citations are rejected.
+- ❌ **Committing a baseline from a flaky run.** If `gh run list` output mixes success + failure within the 3-5 window, investigate the failures before treating any success as a baseline. A baseline captured from a "lucky" run encodes survivor bias. (This anti-pattern is operator-discipline; the CI guard validates the cited run was *successful* but does not assess whether the surrounding runs reveal flake. Sprint 14+ retro evaluates whether to extend the guard to require N consecutive prior successes.)
 
 ---
 

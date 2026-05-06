@@ -1,45 +1,66 @@
 # Telecheck — baseline-refresh metadata guard
 #
-# Sprint 13 / TLC-026 fix-forward (Codex perf-bench-r6 MEDIUM closure
-# 2026-05-05). Closes r6 finding: the [scope=baseline-refresh]
-# commit-message tag enforcement claimed in
-# docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1 was doc-only-discipline
-# (same class as Codex r3 closure pattern). r6 correctly flagged that
-# a tag described as "enforcement" but only checkable by future
-# operators grepping git log is the same control weakness §2.1 claims
-# to eliminate.
+# Sprint 13 / TLC-026 fix-forward (Codex perf-bench-r6 + r7 MEDIUM
+# closures 2026-05-05). r6: the [scope=baseline-refresh] tag was
+# documented as enforcement but only checkable post-merge by grep
+# (same control weakness the section claimed to eliminate). r6
+# fix-forward (commit 6c9c244) added this workflow with regex grep
+# of PR title/body/commit messages. r7 MEDIUM (2 findings) flagged
+# that v1 was still inadequate:
+#   r7-A: loose regex grep accepts unrelated numbers (timestamps,
+#         build IDs) and hex strings — provenance not enforced
+#   r7-B: a path-filtered workflow set as a required branch-
+#         protection check leaves non-baseline PRs hung on a
+#         missing/pending context, blocking unrelated merges
 #
-# This workflow IS the enforcement: any PR that modifies
-# tests/perf/baseline.json MUST carry the required metadata in the
-# PR title/body or commit messages on the PR. Missing metadata fails
-# the check, blocking merge.
+# r7 fix-forward (this commit):
+#   - r7-A: replace loose grep with ANCHORED LABELED FIELDS
+#     (`Run-Id: <id>`, `Source-SHA: <sha>`) plus GH API VALIDATION
+#     (the run id must exist, must have completed successfully, must
+#     be the Performance benchmarks workflow, must have head_sha
+#     matching the cited Source-SHA)
+#   - r7-B: workflow now triggers on ALL pull_requests (no paths
+#     filter); first step early-exits with success when
+#     tests/perf/baseline.json is unchanged. The required check is
+#     therefore always produced, and Sprint 14+ branch protection
+#     can require it without blocking unrelated PRs.
 #
 # Required metadata (per docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1):
-#   1. Literal `[scope=baseline-refresh]` tag (so audit trail is grep-able)
-#   2. A GitHub run id (10+ contiguous digits) for CI-runner provenance
-#   3. A source-commit SHA (7+ char hex) so the baseline is bound to a
-#      specific code state, not a moving target
+#   1. `[scope=baseline-refresh]` literal tag (anywhere in PR
+#      title/body/commit messages)
+#   2. `Run-Id: <10+ digit number>` labeled field
+#   3. `Source-SHA: <7-40 char lowercase hex>` labeled field
+# Plus GH API validation:
+#   - The cited run id must exist via /repos/.../actions/runs/{id}
+#   - Its `name` must equal "Performance benchmarks"
+#   - Its `conclusion` must equal "success"
+#   - Its `head_sha` must START WITH the cited Source-SHA (so the
+#     short SHA is a valid prefix of the full run head_sha)
 #
-# Anti-pattern this prevents (per Codex perf-bench-r2/r3/r6 finding class):
+# Anti-pattern this prevents (Codex perf-bench-r2/r3/r6/r7 finding class):
 #   A local-laptop or flaky-run baseline silently committed without
-#   provenance. r2 closed local-laptop committed-as-baseline; r3 closed
-#   doc-only-discipline as fix-forward; r6 closes "we said enforcement
-#   but only documented it" — same class one layer up.
+#   provenance. Multi-round adversarial review converged here:
+#     r2: local-laptop baseline → revert
+#     r3: doc-only churn discipline → revert
+#     r6: doc-only enforcement claim → add CI workflow
+#     r7-A: loose regex → anchored labeled fields + API validation
+#     r7-B: path-filter required-check → always-run + early-exit
 #
 # Why a separate workflow (not extending perf.yml or ci.yml):
-#   - perf.yml's job is bench execution + threshold check; mixing in
+#   - perf.yml's job is bench execution + threshold check; mixing
 #     metadata enforcement on a different file path couples concerns
-#   - ci.yml runs on every PR; this workflow runs ONLY when
-#     tests/perf/baseline.json changes (paths filter)
+#   - ci.yml runs on every PR but does NOT inspect commit/PR
+#     metadata; same coupling concern
 #   - Keeps the failure mode visible as a distinct CI check
 #     ("Baseline refresh guard / verify-metadata") that branch
 #     protection can require independently when Sprint 14+ wires it
 #
-# Future Sprint 14+ branch-protection wire-up:
+# Sprint 14+ branch-protection wire-up:
 #   gh api -X PUT repos/:owner/:repo/branches/main/protection \
 #     --field "required_status_checks[contexts][]=Baseline refresh guard / verify-metadata"
-#   (Append to the existing required-checks array per
-#    docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §1.)
+#   This is now safe (per r7-B closure) because the workflow ALWAYS
+#   runs on every PR — it just exits early with success when
+#   tests/perf/baseline.json is unchanged.
 #
 # Spec references:
 #   - ORT v1.5 OR-218 (Tier 1 launch-blocking)
@@ -51,12 +72,11 @@ name: Baseline refresh guard
 on:
   pull_request:
     branches: [main]
-    paths:
-      - 'tests/perf/baseline.json'
 
 permissions:
   contents: read
   pull-requests: read
+  actions: read  # required for gh api /actions/runs/{id} validation
 
 jobs:
   verify-metadata:
@@ -70,8 +90,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify baseline-refresh metadata
+      # r7-B closure: workflow runs on every PR; this step early-exits
+      # with success when tests/perf/baseline.json is unchanged. Sprint
+      # 14+ branch protection can therefore require this check without
+      # leaving non-baseline PRs hung on a missing context.
+      - name: Detect baseline.json changes (skip-with-success if unchanged)
+        id: detect
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" | grep -Fxq 'tests/perf/baseline.json'; then
+            echo "baseline_changed=true" >> "$GITHUB_OUTPUT"
+            echo "tests/perf/baseline.json changed; metadata enforcement engaged."
+          else
+            echo "baseline_changed=false" >> "$GITHUB_OUTPUT"
+            echo "tests/perf/baseline.json unchanged; skipping metadata checks (success)."
+          fi
+
+      # r7-A closure: replace loose regex with ANCHORED LABELED FIELDS
+      # + GH API validation. Old approach matched any 10+ digit number
+      # (timestamps, build IDs) and any 7-40 hex token (incidental
+      # SHAs in unrelated text). New approach requires explicit field
+      # labels AND validates the cited run via GH API.
+      - name: Verify baseline-refresh metadata (labeled fields + GH API)
+        if: steps.detect.outputs.baseline_changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -79,44 +126,72 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Collect metadata sources: PR title + PR body + every commit
-          # message on the PR. Either a maintainer-style PR-title-as-
-          # metadata flow OR a commit-message-discipline flow satisfies.
-          # A squash-merge with the metadata in the squash commit body
-          # also passes (PR body is preserved by GH default squash).
+          # Collect inspection sources: PR title + PR body + every
+          # commit message on the PR.
           COMMIT_MESSAGES="$(git log --format=%B "${BASE_SHA}..${HEAD_SHA}" || true)"
-          # Concatenate to a single haystack. Use newline separator so
-          # multi-line bodies/messages stay distinguishable.
-          ALL="${PR_TITLE}
-          ${PR_BODY:-}
-          ${COMMIT_MESSAGES}"
+          ALL=$(printf '%s\n%s\n%s\n' "${PR_TITLE}" "${PR_BODY:-}" "${COMMIT_MESSAGES}")
 
           # ----- Required check 1: [scope=baseline-refresh] literal -----
           if ! printf '%s\n' "$ALL" | grep -F -q '[scope=baseline-refresh]'; then
             echo "::error::baseline.json change is missing [scope=baseline-refresh] tag in PR title/body or commit messages."
-            echo "See docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1 for the required metadata."
-            echo "Anti-pattern: silently regenerating baseline.json without provenance (Codex perf-bench-r2/r3/r6 finding class)."
+            echo "See docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1 for the required commit/PR metadata template."
             exit 1
           fi
 
-          # ----- Required check 2: GH run id (10+ contiguous digits) -----
-          # GitHub Actions run ids are typically 10-12 digit numbers.
-          # Lower bound at 10 to avoid false positives on small ints.
-          if ! printf '%s\n' "$ALL" | grep -E -q '\b[0-9]{10,}\b'; then
-            echo "::error::baseline.json change is missing a GH run id (10+ contiguous digits) in PR title/body or commit messages."
+          # ----- Required check 2: anchored Run-Id field -----
+          # Match: 'Run-Id:' (colon required) + optional whitespace +
+          # 10+ digits. Field label rules out incidental timestamps.
+          RUN_ID=$(printf '%s\n' "$ALL" | grep -oE '[Rr]un-[Ii]d:[[:space:]]*[0-9]{10,}' | head -1 | grep -oE '[0-9]{10,}' || true)
+          if [[ -z "$RUN_ID" ]]; then
+            echo "::error::baseline.json change is missing 'Run-Id: <10+ digit number>' labeled field in PR title/body or commit messages."
             echo "Required to bind the baseline to a specific CI-runner capture."
-            echo "Example: 'Captured from perf.yml run 1234567890123' in the commit body."
+            echo "Example: 'Run-Id: 1234567890123' on its own line in the commit body."
             exit 1
           fi
 
-          # ----- Required check 3: source-commit SHA (7+ char hex) -----
-          # Standard short-SHA pattern. Required so the baseline is
-          # bound to a specific code state at capture time.
-          if ! printf '%s\n' "$ALL" | grep -E -q '\b[0-9a-f]{7,40}\b'; then
-            echo "::error::baseline.json change is missing a source-commit SHA (7+ char hex) in PR title/body or commit messages."
+          # ----- Required check 3: anchored Source-SHA field -----
+          # Match: 'Source-SHA:' + optional whitespace + 7-40 lowercase
+          # hex. Field label rules out incidental SHAs.
+          SOURCE_SHA=$(printf '%s\n' "$ALL" | grep -oE '[Ss]ource-[Ss][Hh][Aa]:[[:space:]]*[0-9a-f]{7,40}' | head -1 | grep -oE '[0-9a-f]{7,40}' || true)
+          if [[ -z "$SOURCE_SHA" ]]; then
+            echo "::error::baseline.json change is missing 'Source-SHA: <7-40 char lowercase hex>' labeled field in PR title/body or commit messages."
             echo "Required so the baseline's code-state provenance is auditable."
+            echo "Example: 'Source-SHA: a1b2c3d' on its own line in the commit body."
             exit 1
           fi
 
-          echo "OK: baseline.json change includes [scope=baseline-refresh] tag + GH run id + source-commit SHA."
-          echo "Audit-trail metadata verified. Sprint 14+ baseline-refresh execution is unblocked when Evans is reachable for the gh api PUT (per TLC-023c §1)."
+          echo "Labeled fields parsed: Run-Id=${RUN_ID} Source-SHA=${SOURCE_SHA}"
+
+          # ----- Required check 4: GH API validation of the cited run -----
+          # Verify: run exists; conclusion=success; workflow=Performance
+          # benchmarks; head_sha starts with the cited Source-SHA.
+          # gh api fail-fasts with non-zero on missing run.
+          RUN_DATA=$(gh api "/repos/${REPO}/actions/runs/${RUN_ID}" --jq '{conclusion, head_sha, name}')
+          CONCLUSION=$(printf '%s' "$RUN_DATA" | jq -r '.conclusion')
+          RUN_HEAD_SHA=$(printf '%s' "$RUN_DATA" | jq -r '.head_sha')
+          WORKFLOW_NAME=$(printf '%s' "$RUN_DATA" | jq -r '.name')
+
+          if [[ "$WORKFLOW_NAME" != "Performance benchmarks" ]]; then
+            echo "::error::Run-Id ${RUN_ID} workflow is '${WORKFLOW_NAME}', not 'Performance benchmarks'."
+            echo "Baseline must come from the perf.yml workflow, not an unrelated run."
+            exit 1
+          fi
+
+          if [[ "$CONCLUSION" != "success" ]]; then
+            echo "::error::Run-Id ${RUN_ID} conclusion is '${CONCLUSION}', not 'success'."
+            echo "Baseline must come from a successful CI run, not flaky/cancelled/failed."
+            exit 1
+          fi
+
+          # Source-SHA may be a short prefix; require it to prefix-match
+          # the run's full head_sha.
+          if [[ "${RUN_HEAD_SHA:0:${#SOURCE_SHA}}" != "$SOURCE_SHA" ]]; then
+            echo "::error::Run-Id ${RUN_ID} head_sha is '${RUN_HEAD_SHA}'; cited Source-SHA '${SOURCE_SHA}' is not a prefix."
+            echo "The baseline must come from the same CI run that captured the source code state cited."
+            exit 1
+          fi
+
+          echo "OK: baseline.json change validated against GH API."
+          echo "  Run-Id ${RUN_ID} exists, completed=success, workflow='Performance benchmarks',"
+          echo "  head_sha=${RUN_HEAD_SHA} (prefix-matches cited Source-SHA ${SOURCE_SHA})."
+          echo "Sprint 14+ baseline-refresh execution is unblocked when Evans is reachable for the gh api PUT (per TLC-023c §1)."
