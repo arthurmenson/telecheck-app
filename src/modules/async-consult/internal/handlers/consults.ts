@@ -385,15 +385,21 @@ export async function listConsultEventsHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  requireActorContext(req); // auth required; we don't need actor.accountId here
+  const actor = requireActorContext(req);
   const consultId: ConsultId = asConsultId(req.params.id);
 
-  // Note: the service layer doesn't apply ownership filtering on read
-  // (the existing pattern is RLS + composite FK + explicit tenant
-  // predicate at the repo level). A same-tenant patient could read
-  // another patient's event history if they know the consult_id.
-  // Sprint 11+ adds explicit ownership read-side filtering when the
-  // delegate-grant Authorization layer is wired.
-  const events = await consultService.listEvents(ctx, consultId);
-  return reply.code(200).send({ events: events.map(toPatientEventView) });
+  // Service layer enforces patient ownership (Codex async-consult-r13
+  // HIGH closure 2026-05-05). ConsultNotFoundError + ConsultPatientOwnershipError
+  // both map to tenant-blind 404 per I-025.
+  try {
+    const events = await consultService.listEvents(
+      ctx,
+      { accountId: actor.accountId as AccountId },
+      consultId,
+    );
+    return reply.code(200).send({ events: events.map(toPatientEventView) });
+  } catch (err) {
+    if (mapServiceError(err, reply, req.id)) return;
+    throw err;
+  }
 }

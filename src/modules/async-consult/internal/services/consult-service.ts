@@ -700,14 +700,38 @@ export async function patientResponds(
 
 /**
  * List a consult's event history. Used by the GET
- * /v0/async-consult/:id/events handler. Composite FK + RLS + explicit
- * tenant predicate (3 layers per I-023) ensure cross-tenant queries
- * return empty.
+ * /v0/async-consult/:id/events handler.
+ *
+ * Defense-in-depth (per Codex async-consult-r13 HIGH closure 2026-05-05):
+ *   Layer 1: Composite FK + RLS + explicit tenant predicate at the
+ *            repo layer (cross-TENANT prevention)
+ *   Layer 2: Patient ownership assertion at the service layer
+ *            (cross-PATIENT prevention within the same tenant)
+ *
+ * Without Layer 2, a same-tenant patient who knows another patient's
+ * consult_id could read that patient's lifecycle event history,
+ * leaking actor identifiers + state-transition timing metadata.
+ *
+ * Throws ConsultNotFoundError if consult doesn't exist (or is in
+ * another tenant — RLS-filtered). Throws ConsultPatientOwnershipError
+ * if the consult exists in this tenant but the actor isn't the patient.
+ * Handler maps both to tenant-blind 404 per I-025.
  */
 export async function listEvents(
   ctx: TenantContext,
+  actor: { accountId: AccountId },
   consultId: ConsultId,
   externalTx?: DbTransaction,
 ): Promise<ConsultEvent[]> {
-  return consultEventRepo.listConsultEvents(ctx.tenantId, consultId, externalTx);
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    const consult = await consultRepo.findConsultById(ctx.tenantId, consultId, tx);
+    if (consult === null) throw new ConsultNotFoundError(consultId);
+
+    // Layer 2: cross-patient prevention within same tenant
+    assertConsultOwnership(consult, actor.accountId);
+
+    return consultEventRepo.listConsultEvents(ctx.tenantId, consultId, tx);
+  }, externalTx);
 }
