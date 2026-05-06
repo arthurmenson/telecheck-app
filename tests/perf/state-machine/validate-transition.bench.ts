@@ -170,11 +170,7 @@ describe('validateTransition — §4 UnsupportedTransitionError (claim — Sprin
         // SPRINT_10_DEFERRED_EVENTS. validateTransition throws
         // UnsupportedTransitionError BEFORE transition lookup +
         // event/context match check (Codex async-consult-r8 closure).
-        validateTransition(
-          'QUEUED',
-          'claim' as Parameters<typeof validateTransition>[1],
-          ctx,
-        );
+        validateTransition('QUEUED', 'claim' as Parameters<typeof validateTransition>[1], ctx);
         throw new Error(
           'Bench fidelity violation: validateTransition returned normally; ' +
             'expected UnsupportedTransitionError',

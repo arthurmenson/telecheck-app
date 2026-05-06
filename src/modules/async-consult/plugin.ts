@@ -23,9 +23,7 @@ import fp from 'fastify-plugin';
 
 import { registerAsyncConsultRoutes } from './routes.js';
 
-const asyncConsultPluginImpl: FastifyPluginAsync = async (
-  app: FastifyInstance,
-): Promise<void> => {
+const asyncConsultPluginImpl: FastifyPluginAsync = async (app: FastifyInstance): Promise<void> => {
   await app.register(registerAsyncConsultRoutes, { prefix: '/v0/async-consult' });
 };
 

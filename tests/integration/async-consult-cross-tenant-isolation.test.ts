@@ -114,9 +114,8 @@ describe('async-consult cross-tenant isolation — §1 service-layer (I-023 + I-
     // (RLS + composite FK + explicit tenant predicate filter cross-tenant
     // out at the repo layer; service throws ConsultNotFoundError if it
     // tries to load — but findConsultById itself returns null directly)
-    const consultRepo = await import(
-      '../../src/modules/async-consult/internal/repositories/consult-repo.ts'
-    );
+    const consultRepo =
+      await import('../../src/modules/async-consult/internal/repositories/consult-repo.ts');
     const found = await withTenantContext(T_US, () =>
       consultRepo.findConsultById(T_US, ghConsult.consult_id),
     );
@@ -246,11 +245,7 @@ describe('async-consult fail-closed transitions — §2 SI-006 + SI-007 gates', 
 
     await expect(
       withTenantContext(T_US, () =>
-        consultService.process(
-          US_CTX,
-          { actorId: 'system_worker' },
-          arbitraryConsultId,
-        ),
+        consultService.process(US_CTX, { actorId: 'system_worker' }, arbitraryConsultId),
       ),
     ).rejects.toThrow(consultService.AiServiceNotWiredError);
   });

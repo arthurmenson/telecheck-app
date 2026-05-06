@@ -151,31 +151,28 @@ describe('I-023 RLS policy coverage lockdown — §1 per-table structural assert
     },
   );
 
-  it.each(TENANT_SCOPED_TABLES)(
-    '§1.%s has at least one RLS policy attached',
-    async (tableName) => {
-      const client = getTestClient();
-      // Do NOT assert on policyname — three name conventions exist in
-      // production migrations:
-      //   - `tenant_isolation`        (19 tables; default convention)
-      //   - `audit_tenant_isolation`  (audit_records only)
-      //   - `tenant_users_visibility` (tenant_users only — special-cased
-      //                                 for platform-admin cross-tenant
-      //                                 visibility per TLC-005)
-      // Asserting a fixed name would silently pass-for-wrong-reason on
-      // the exceptions OR fail when those exceptions are correct.
-      // This lockdown asserts policy PRESENCE only; functional behavior
-      // (USING / WITH CHECK expressions) is covered by the per-slice
-      // cross-tenant tests.
-      const r = await client.query<{ policyname: string }>(
-        `SELECT policyname
+  it.each(TENANT_SCOPED_TABLES)('§1.%s has at least one RLS policy attached', async (tableName) => {
+    const client = getTestClient();
+    // Do NOT assert on policyname — three name conventions exist in
+    // production migrations:
+    //   - `tenant_isolation`        (19 tables; default convention)
+    //   - `audit_tenant_isolation`  (audit_records only)
+    //   - `tenant_users_visibility` (tenant_users only — special-cased
+    //                                 for platform-admin cross-tenant
+    //                                 visibility per TLC-005)
+    // Asserting a fixed name would silently pass-for-wrong-reason on
+    // the exceptions OR fail when those exceptions are correct.
+    // This lockdown asserts policy PRESENCE only; functional behavior
+    // (USING / WITH CHECK expressions) is covered by the per-slice
+    // cross-tenant tests.
+    const r = await client.query<{ policyname: string }>(
+      `SELECT policyname
            FROM pg_policies
           WHERE tablename = $1`,
-        [tableName],
-      );
-      expect(r.rows.length).toBeGreaterThanOrEqual(1);
-    },
-  );
+      [tableName],
+    );
+    expect(r.rows.length).toBeGreaterThanOrEqual(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
