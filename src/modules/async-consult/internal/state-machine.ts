@@ -263,41 +263,93 @@ function validateGuard(ctx: GuardContext): void {
 }
 
 /**
+ * Thrown when the guard context's `event` field does not match the
+ * caller's separately-requested event. Codex async-consult-r8 HIGH
+ * closure 2026-05-05: prevents a runtime caller (queue consumer,
+ * external API path) from supplying a context for the wrong event
+ * (e.g., requesting 'submit' but supplying an 'abandon' context to
+ * skip submit's form_complete + active_consent guards).
+ */
+export class GuardContextEventMismatchError extends Error {
+  constructor(
+    public readonly requestedEvent: SupportedTransitionEvent,
+    public readonly contextEvent: string,
+  ) {
+    super(
+      `Guard context event mismatch: requested transition '${requestedEvent}' but ` +
+        `context describes '${contextEvent}'. The state machine refuses to advance — ` +
+        `caller MUST pass a context whose .event matches the requested event.`,
+    );
+    this.name = 'GuardContextEventMismatchError';
+  }
+}
+
+/**
  * Validate a transition request with guard context. Returns the
  * destination state on success; throws on failure.
  *
+ * The `event` parameter is REQUIRED and must equal `ctx.event` —
+ * Codex async-consult-r8 HIGH closure 2026-05-05. Without the
+ * separate `event` param, a runtime caller could supply a context
+ * for the wrong event (e.g., requesting 'submit' but supplying an
+ * 'abandon' context with hours_since_activity, bypassing 'submit's
+ * form_complete + active_consent guards). The dual parameter forces
+ * the caller to commit to an event explicitly, and the runtime
+ * assertion catches event/context mismatches before transition
+ * lookup or guard validation.
+ *
  * Throws:
+ *   - `Error` if the requested event is not recognized at all
+ *     (programmer error / corrupt input)
  *   - `UnsupportedTransitionError` if the event is recognized but
  *     deferred to Sprint 10
- *   - `Error` if the event is not recognized at all (programmer error)
+ *   - `GuardContextEventMismatchError` if `event !== ctx.event`
  *   - `InvalidTransitionError` if the from-state doesn't permit the event
  *   - `GuardNotSatisfiedError` if the guard context's runtime values
  *     don't satisfy the documented State Machines §3 guard
  *
- * Caller MUST construct the typed GuardContext (the function signature
- * forces it). The compile-time discriminated-union type system
- * prevents missing guard fields; the runtime validateGuard() prevents
- * unsatisfied numeric/boolean guards.
+ * Defense-in-depth posture for guard enforcement (4 layers):
+ *   Layer 1: Compile-time TypeScript discriminated union — the caller
+ *            cannot construct a context with missing guard fields
+ *            for typed call sites
+ *   Layer 2: Runtime event/context match assertion (this fix)
+ *   Layer 3: Runtime guard value validation (validateGuard())
+ *   Layer 4: Optimistic-concurrency UPDATE in repo (consult-repo.ts)
  */
 export function validateTransition(
   from: ConsultState,
+  event: SupportedTransitionEvent,
   ctx: GuardContext,
 ): ConsultState {
-  if (!isSupportedEvent(ctx.event)) {
-    // Compile-time the discriminated union prevents this; runtime check
-    // catches a downcast / external caller path.
-    throw new Error(`Unrecognized transition event: '${String(ctx.event)}'`);
+  // Layer A: validate the requested event is recognized + supported
+  if (isSprint10DeferredEvent(event)) {
+    throw new UnsupportedTransitionError(event);
+  }
+  if (!isSupportedEvent(event)) {
+    // Compile-time the SupportedTransitionEvent type prevents this;
+    // runtime catches downcast / external caller paths.
+    throw new Error(`Unrecognized transition event: '${String(event)}'`);
   }
 
-  // Look up the transition in the supported table
+  // Layer B: ENFORCE event/context match (Codex async-consult-r8 HIGH).
+  // Compile-time the discriminated union steers callers toward
+  // matching event + ctx.event, but a runtime caller (queue consumer,
+  // external API decoding untyped JSON) might supply a mismatched pair.
+  // Refuse to proceed; surface as a programmer-error class.
+  if (event !== ctx.event) {
+    throw new GuardContextEventMismatchError(event, ctx.event);
+  }
+
+  // Layer C: look up the transition in the supported table
   const transition = SUPPORTED_TRANSITIONS.find(
-    (t) => t.from === from && t.event === ctx.event,
+    (t) => t.from === from && t.event === event,
   );
   if (transition === undefined) {
-    throw new InvalidTransitionError(from, ctx.event);
+    throw new InvalidTransitionError(from, event);
   }
 
-  // Validate the guard's runtime values
+  // Layer D: validate the guard's runtime values (boolean/numeric
+  // truth checks beyond the type-system shape enforcement)
   validateGuard(ctx);
 
   return transition.to;
