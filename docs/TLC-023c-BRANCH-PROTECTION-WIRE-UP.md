@@ -1,8 +1,8 @@
 # TLC-023c — Branch protection wire-up for `Performance benchmarks` workflow
 
-**Status:** prepared 2026-05-05 (Sprint 12); extended Sprint 13 / TLC-026 with §2.1 CI baseline capture procedure + machine-enforced metadata guard via `.github/workflows/baseline-refresh-guard.yml` (2026-05-05, Codex r6 + r7 fix-forward chain — labeled-field parsing + GH API validation + always-run + early-exit); awaiting Evans's emergency-only-access execution.
+**Status:** prepared 2026-05-05 (Sprint 12); extended Sprint 13 / TLC-026 with §2.1 CI baseline capture procedure + machine-enforced metadata guard via `.github/workflows/baseline-refresh-guard.yml` (2026-05-05, Codex r6 → r7 → r8 fix-forward chain — full-line anchored labeled-field parsing + GH API validation + triple-dot merge-base diff + always-run + early-exit); awaiting Evans's emergency-only-access execution.
 
-**Sprint reference:** Sprint 12 / TLC-023c authored this doc. Sprint 11 TLC-023b landed the `perf.yml` workflow. Sprint 13 / TLC-026 landed (a) the in-process closure-path infrastructure — manifest-check helper + self-test mode in `tests/perf/check-thresholds.ts`, wired into `perf.yml` — and (b) `.github/workflows/baseline-refresh-guard.yml` machine-enforcing the §2.1 required metadata via labeled-field parsing + GH API validation (closes Codex perf-bench-r6 + r7 MEDIUM). This doc remains the Evans-side execution playbook; Sprint 14+ executes it.
+**Sprint reference:** Sprint 12 / TLC-023c authored this doc. Sprint 11 TLC-023b landed the `perf.yml` workflow. Sprint 13 / TLC-026 landed (a) the in-process closure-path infrastructure — manifest-check helper + self-test mode in `tests/perf/check-thresholds.ts`, wired into `perf.yml` — and (b) `.github/workflows/baseline-refresh-guard.yml` machine-enforcing the §2.1 required metadata via full-line anchored labeled-field parsing + GH API validation + triple-dot merge-base PR diff (closes Codex perf-bench-r6 + r7 + r8 MEDIUM). This doc remains the Evans-side execution playbook; Sprint 14+ executes it.
 
 ---
 
@@ -194,17 +194,19 @@ the closure path; this commit executes against it).
 
 **Required commit/PR metadata (machine-enforced):**
 - `[scope=baseline-refresh]` literal tag — anywhere in PR title/body OR any commit message on the PR
-- `Run-Id: <10+ digit number>` labeled field — the `STABLE_RUN_ID` from Step 1
-- `Source-SHA: <7-40 char lowercase hex>` labeled field — `git rev-parse --short=7 $STABLE_RUN_HEAD_SHA`, OR the full 40-char hex
+- `Run-Id: <10+ digit number>` labeled field — **on its own line** (anchored regex per Codex r8-B closure: leading/trailing whitespace allowed, but the line must consist solely of the label + colon + value). The value is the `STABLE_RUN_ID` from Step 1.
+- `Source-SHA: <7-40 char lowercase hex>` labeled field — **on its own line** (same anchoring rules). The value is `git rev-parse --short=7 $STABLE_RUN_HEAD_SHA`, OR the full 40-char hex.
+
+Embedded label substrings in prose (e.g., a paragraph mentioning "the Run-Id: 1234567890" inline) are **rejected** by the anchored regex. Operators must place each field on its own line in the commit body or PR description.
 
 ### Enforcement mechanism
 
 Per Codex perf-bench-r6 + r7 MEDIUM closures 2026-05-05, the metadata above is **machine-enforced** via `.github/workflows/baseline-refresh-guard.yml`. The workflow:
 
 - Triggers `on: pull_request` for ALL PRs to main (no `paths:` filter — Codex r7-B closure: a path-filtered required-check leaves non-baseline PRs hung on a missing context, so the workflow must always produce a check)
-- First step inspects `git diff --name-only ${BASE_SHA} ${HEAD_SHA}` for `tests/perf/baseline.json`. If absent, the workflow EARLY-EXITS with success — non-baseline PRs pass instantly with no metadata check.
-- If `tests/perf/baseline.json` did change, runs:
-  1. **Labeled-field parsing** — anchored regex for `[Rr]un-[Ii]d:[[:space:]]*\d{10,}` and `[Ss]ource-[Ss][Hh][Aa]:[[:space:]]*[0-9a-f]{7,40}` (Codex r7-A closure: bare `\b\d{10,}\b` accepts incidental timestamps; bare `\b[0-9a-f]{7,40}\b` accepts incidental hex)
+- First step inspects `git diff --name-only ${BASE_SHA}...${HEAD_SHA}` (TRIPLE-DOT, merge-base semantics — Codex r8-A closure) for `tests/perf/baseline.json`. If absent, the workflow EARLY-EXITS with success — non-baseline PRs pass instantly with no metadata check. Two-dot diff was rejected by r8-A because it would misclassify an unrelated PR if main itself changed `baseline.json` after the PR branched (the PR head still differs from BASE_SHA for that file even though the PR didn't touch it).
+- If `tests/perf/baseline.json` did change in this PR, runs:
+  1. **Full-line anchored labeled-field parsing** — regex `^[[:space:]]*[Rr]un-[Ii]d:[[:space:]]*[0-9]{10,}[[:space:]]*$` and `^[[:space:]]*[Ss]ource-[Ss][Hh][Aa]:[[:space:]]*[0-9a-f]{7,40}[[:space:]]*$` (Codex r8-B closure: r7-A's unanchored grep accepted `fooRun-Id: 1234567890` substring matches; r8-B anchors to whole lines so only deliberate metadata fields on their own line satisfy the contract)
   2. **GH API validation** via `gh api /repos/.../actions/runs/{Run-Id}`:
      - Run must exist (gh fail-fasts on 404)
      - `name == "Performance benchmarks"` (rules out citing a CI-yml or unrelated workflow run)
@@ -216,6 +218,8 @@ Per Codex perf-bench-r6 + r7 MEDIUM closures 2026-05-05, the metadata above is *
 - r6: doc-only enforcement claim → add CI workflow with regex grep
 - r7-A: regex grep accepts incidental matches → labeled fields + GH API validation
 - r7-B: path-filter required-check problem → always-run + early-exit
+- r8-A: two-dot diff misclassifies after main updates baseline → triple-dot merge-base diff
+- r8-B: labeled fields not actually anchored → full-line anchored regex
 
 **Sprint 14+ branch-protection wire-up** (per TLC-023c §1 PUT command pattern): when Evans executes the required-status-check append, include `Baseline refresh guard / verify-metadata` alongside `Performance benchmarks / bench`. Per r7-B closure, the workflow now runs on every PR (early-exits with success when baseline.json unchanged), so requiring it does NOT block unrelated PRs — every PR produces this check.
 

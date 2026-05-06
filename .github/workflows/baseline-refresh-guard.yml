@@ -13,8 +13,8 @@
 #         protection check leaves non-baseline PRs hung on a
 #         missing/pending context, blocking unrelated merges
 #
-# r7 fix-forward (this commit):
-#   - r7-A: replace loose grep with ANCHORED LABELED FIELDS
+# r7 fix-forward (commit 8308dfb):
+#   - r7-A: replace loose grep with LABELED FIELDS
 #     (`Run-Id: <id>`, `Source-SHA: <sha>`) plus GH API VALIDATION
 #     (the run id must exist, must have completed successfully, must
 #     be the Performance benchmarks workflow, must have head_sha
@@ -24,6 +24,22 @@
 #     tests/perf/baseline.json is unchanged. The required check is
 #     therefore always produced, and Sprint 14+ branch protection
 #     can require it without blocking unrelated PRs.
+#
+# r8 fix-forward (this commit):
+#   - r8-A: replace TWO-DOT diff (BASE..HEAD) with TRIPLE-DOT diff
+#     (BASE...HEAD, merge-base semantics) so the file list reflects
+#     what THIS PR introduces, not the snapshot delta between base
+#     tip and head tip. Two-dot would misclassify any unrelated PR
+#     after main itself changed tests/perf/baseline.json — the PR
+#     head still differs from BASE_SHA for that file even though the
+#     PR didn't touch it. Triple-dot diffs against the merge-base
+#     of the two tips, which is the correct PR change set.
+#   - r8-B: r7-A's labeled-field grep matched substrings anywhere in
+#     a line; e.g., 'fooRun-Id: 1234567890' passed the contract.
+#     r8-B anchors the regex to FULL LINES (^...[[:space:]]*$) so
+#     only deliberate metadata fields on their own line satisfy the
+#     check. Sub-extracts the value from the matched line via second
+#     grep -oE.
 #
 # Required metadata (per docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1):
 #   1. `[scope=baseline-refresh]` literal tag (anywhere in PR
@@ -101,20 +117,31 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" | grep -Fxq 'tests/perf/baseline.json'; then
+          # r8-A closure (Codex perf-bench-r8 MEDIUM 2026-05-05):
+          # use TRIPLE-DOT diff (merge-base semantics) so the file list
+          # reflects what THIS PR introduces, not the snapshot
+          # difference between base tip and head tip. Two-dot diff
+          # would misclassify any unrelated PR after main itself
+          # changed tests/perf/baseline.json — the PR head still
+          # differs from BASE_SHA for that file even though the PR
+          # didn't touch it. Triple-dot diffs against the merge-base
+          # of the two tips, which is the correct PR change set.
+          if git diff --name-only "${BASE_SHA}...${HEAD_SHA}" | grep -Fxq 'tests/perf/baseline.json'; then
             echo "baseline_changed=true" >> "$GITHUB_OUTPUT"
-            echo "tests/perf/baseline.json changed; metadata enforcement engaged."
+            echo "tests/perf/baseline.json changed (triple-dot PR diff); metadata enforcement engaged."
           else
             echo "baseline_changed=false" >> "$GITHUB_OUTPUT"
-            echo "tests/perf/baseline.json unchanged; skipping metadata checks (success)."
+            echo "tests/perf/baseline.json unchanged in this PR (triple-dot diff vs merge-base); skipping metadata checks (success)."
           fi
 
-      # r7-A closure: replace loose regex with ANCHORED LABELED FIELDS
-      # + GH API validation. Old approach matched any 10+ digit number
-      # (timestamps, build IDs) and any 7-40 hex token (incidental
-      # SHAs in unrelated text). New approach requires explicit field
-      # labels AND validates the cited run via GH API.
-      - name: Verify baseline-refresh metadata (labeled fields + GH API)
+      # r7-A closure (refined by r8-B): replace loose regex with
+      # FULL-LINE ANCHORED LABELED FIELDS + GH API validation. r7-A
+      # closure (commit 8308dfb) used unanchored grep that still
+      # matched 'fooRun-Id: 1234567890' anywhere in a line. r8-B
+      # closure (this commit) anchors to start-of-line / end-of-line
+      # so only deliberate metadata fields on their own line pass —
+      # incidental embedded label substrings are rejected.
+      - name: Verify baseline-refresh metadata (full-line anchored fields + GH API)
         if: steps.detect.outputs.baseline_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -127,8 +154,11 @@ jobs:
           set -euo pipefail
 
           # Collect inspection sources: PR title + PR body + every
-          # commit message on the PR.
-          COMMIT_MESSAGES="$(git log --format=%B "${BASE_SHA}..${HEAD_SHA}" || true)"
+          # commit message on the PR. Use TRIPLE-DOT range (merge-base
+          # semantics) per r8-A closure — same as the detect step
+          # above — so the commit list is the PR's commits, not all
+          # commits between base tip and head tip.
+          COMMIT_MESSAGES="$(git log --format=%B "${BASE_SHA}...${HEAD_SHA}" || true)"
           ALL=$(printf '%s\n%s\n%s\n' "${PR_TITLE}" "${PR_BODY:-}" "${COMMIT_MESSAGES}")
 
           # ----- Required check 1: [scope=baseline-refresh] literal -----
@@ -138,29 +168,39 @@ jobs:
             exit 1
           fi
 
-          # ----- Required check 2: anchored Run-Id field -----
-          # Match: 'Run-Id:' (colon required) + optional whitespace +
-          # 10+ digits. Field label rules out incidental timestamps.
-          RUN_ID=$(printf '%s\n' "$ALL" | grep -oE '[Rr]un-[Ii]d:[[:space:]]*[0-9]{10,}' | head -1 | grep -oE '[0-9]{10,}' || true)
-          if [[ -z "$RUN_ID" ]]; then
-            echo "::error::baseline.json change is missing 'Run-Id: <10+ digit number>' labeled field in PR title/body or commit messages."
+          # ----- Required check 2: full-line anchored Run-Id field -----
+          # Match a WHOLE LINE that is exactly: optional leading
+          # whitespace + 'Run-Id:' (colon required) + optional
+          # whitespace + 10+ digits + optional trailing whitespace.
+          # Anchors '^' / '$' rule out 'fooRun-Id: 1234567890' and
+          # similar incidental embeddings (Codex r8-B closure).
+          # Extract the digits from the matched line via second grep.
+          RUN_ID_LINE=$(printf '%s\n' "$ALL" | grep -E '^[[:space:]]*[Rr]un-[Ii]d:[[:space:]]*[0-9]{10,}[[:space:]]*$' | head -1 || true)
+          if [[ -z "$RUN_ID_LINE" ]]; then
+            echo "::error::baseline.json change is missing 'Run-Id: <10+ digit number>' labeled field on its own line in PR title/body or commit messages."
             echo "Required to bind the baseline to a specific CI-runner capture."
-            echo "Example: 'Run-Id: 1234567890123' on its own line in the commit body."
+            echo "The field must appear on a line of its own (anchored regex per Codex r8-B closure):"
+            echo "  Run-Id: 1234567890123"
+            echo "Embedded matches like 'fooRun-Id: 123...' or inline references in prose are rejected."
             exit 1
           fi
+          RUN_ID=$(printf '%s' "$RUN_ID_LINE" | grep -oE '[0-9]{10,}')
 
-          # ----- Required check 3: anchored Source-SHA field -----
-          # Match: 'Source-SHA:' + optional whitespace + 7-40 lowercase
-          # hex. Field label rules out incidental SHAs.
-          SOURCE_SHA=$(printf '%s\n' "$ALL" | grep -oE '[Ss]ource-[Ss][Hh][Aa]:[[:space:]]*[0-9a-f]{7,40}' | head -1 | grep -oE '[0-9a-f]{7,40}' || true)
-          if [[ -z "$SOURCE_SHA" ]]; then
-            echo "::error::baseline.json change is missing 'Source-SHA: <7-40 char lowercase hex>' labeled field in PR title/body or commit messages."
+          # ----- Required check 3: full-line anchored Source-SHA field -----
+          # Same anchoring as Run-Id; extract the hex value from the
+          # matched line.
+          SOURCE_SHA_LINE=$(printf '%s\n' "$ALL" | grep -E '^[[:space:]]*[Ss]ource-[Ss][Hh][Aa]:[[:space:]]*[0-9a-f]{7,40}[[:space:]]*$' | head -1 || true)
+          if [[ -z "$SOURCE_SHA_LINE" ]]; then
+            echo "::error::baseline.json change is missing 'Source-SHA: <7-40 char lowercase hex>' labeled field on its own line in PR title/body or commit messages."
             echo "Required so the baseline's code-state provenance is auditable."
-            echo "Example: 'Source-SHA: a1b2c3d' on its own line in the commit body."
+            echo "The field must appear on a line of its own (anchored regex per Codex r8-B closure):"
+            echo "  Source-SHA: a1b2c3d"
+            echo "Embedded matches in prose are rejected."
             exit 1
           fi
+          SOURCE_SHA=$(printf '%s' "$SOURCE_SHA_LINE" | grep -oE '[0-9a-f]{7,40}')
 
-          echo "Labeled fields parsed: Run-Id=${RUN_ID} Source-SHA=${SOURCE_SHA}"
+          echo "Full-line anchored fields parsed: Run-Id=${RUN_ID} Source-SHA=${SOURCE_SHA}"
 
           # ----- Required check 4: GH API validation of the cited run -----
           # Verify: run exists; conclusion=success; workflow=Performance
