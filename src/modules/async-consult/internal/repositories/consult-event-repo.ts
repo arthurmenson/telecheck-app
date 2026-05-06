@@ -134,10 +134,14 @@ export async function createStateTransitionEvent(
  * List the event history for a consult, ordered by created_at ascending
  * (oldest first; canonical lifecycle replay order).
  *
- * Cross-tenant note: the composite FK ensures the parent consult is in
- * the same tenant, AND the RLS policy on consult_events filters by
- * `tenant_id = current_tenant_id()`. Two layers of enforcement — even
- * if a consult_id from another tenant is supplied, this returns empty.
+ * Cross-tenant note: 3 layers of enforcement —
+ *   (1) Explicit `tenant_id = $2` predicate (Codex async-consult-r6
+ *       MEDIUM closure 2026-05-05; defense-in-depth on externalTx path)
+ *   (2) Composite FK `consult_events_tenant_consult_fk` ensures the
+ *       parent consult is in the same tenant
+ *   (3) RLS policy `tenant_isolation` on consult_events
+ * Even if a consult_id from another tenant is supplied, this returns
+ * empty.
  */
 export async function listConsultEvents(
   tenantId: string,
@@ -151,9 +155,9 @@ export async function listConsultEvents(
   return runner(async (client) => {
     const result = await client.query<ConsultEventRow>(
       `SELECT ${CONSULT_EVENT_COLUMNS} FROM consult_events
-        WHERE consult_id = $1
+        WHERE consult_id = $1 AND tenant_id = $2
         ORDER BY created_at ASC, id ASC`,
-      [consultId],
+      [consultId, tenantId],
     );
     return result.rows.map(rowToConsultEvent);
   });

@@ -135,10 +135,19 @@ export async function createConsult(
  * exists in the current tenant context.
  *
  * Cross-tenant note (I-023 / I-025): if a consult with the given id
- * exists in ANOTHER tenant, this query returns null because RLS
- * filters it out. The handler layer maps null → 404 per I-025
- * tenant-blind error envelope; the caller cannot distinguish
- * "doesn't exist" from "exists in another tenant".
+ * exists in ANOTHER tenant, this query returns null because BOTH the
+ * explicit `tenant_id = $2` predicate AND RLS filter it out. The
+ * handler layer maps null → 404 per I-025 tenant-blind error envelope;
+ * the caller cannot distinguish "doesn't exist" from "exists in
+ * another tenant".
+ *
+ * Defense-in-depth: explicit tenant_id predicate per Codex
+ * async-consult-r6 HIGH closure 2026-05-05. RLS alone is insufficient
+ * on the externalTx path because the connection's tenant context is
+ * whatever the caller already bound — a service/test/retry path with
+ * a stale or wrong tenant context could otherwise read cross-tenant
+ * rows. The explicit predicate guarantees same-tenant filtering
+ * independent of the connection's RLS context.
  */
 export async function findConsultById(
   tenantId: string,
@@ -151,8 +160,9 @@ export async function findConsultById(
         withTenantBoundConnection(tenantId, fn);
   return runner(async (client) => {
     const result = await client.query<ConsultRow>(
-      `SELECT ${CONSULT_COLUMNS} FROM consults WHERE id = $1`,
-      [consultId],
+      `SELECT ${CONSULT_COLUMNS} FROM consults
+        WHERE id = $1 AND tenant_id = $2`,
+      [consultId, tenantId],
     );
     if (result.rows.length === 0) return null;
     const row = result.rows[0];
@@ -190,6 +200,10 @@ export interface UpdateConsultStateInput {
  * (i.e., the consult was already advanced past `expected_from_state`
  * by another caller). Caller decides how to surface that — the service
  * layer typically maps null → conflict error.
+ *
+ * Defense-in-depth: explicit `tenant_id = $N` predicate per Codex
+ * async-consult-r6 HIGH closure 2026-05-05. Same rationale as
+ * findConsultById — RLS alone is insufficient on the externalTx path.
  */
 export async function updateConsultState(
   input: UpdateConsultStateInput,
@@ -207,9 +221,15 @@ export async function updateConsultState(
         `UPDATE consults
             SET state = $1,
                 intake_form_submission_id = $2
-          WHERE id = $3 AND state = $4
+          WHERE id = $3 AND tenant_id = $4 AND state = $5
           RETURNING ${CONSULT_COLUMNS}`,
-        [input.to_state, input.intake_form_submission_id, input.consult_id, input.expected_from_state],
+        [
+          input.to_state,
+          input.intake_form_submission_id,
+          input.consult_id,
+          input.tenant_id,
+          input.expected_from_state,
+        ],
       );
       if (result.rows.length === 0) return null;
       return rowToConsult(result.rows[0] as ConsultRow);
@@ -218,9 +238,9 @@ export async function updateConsultState(
     const result = await client.query<ConsultRow>(
       `UPDATE consults
           SET state = $1
-        WHERE id = $2 AND state = $3
+        WHERE id = $2 AND tenant_id = $3 AND state = $4
         RETURNING ${CONSULT_COLUMNS}`,
-      [input.to_state, input.consult_id, input.expected_from_state],
+      [input.to_state, input.consult_id, input.tenant_id, input.expected_from_state],
     );
     if (result.rows.length === 0) return null;
     return rowToConsult(result.rows[0] as ConsultRow);
