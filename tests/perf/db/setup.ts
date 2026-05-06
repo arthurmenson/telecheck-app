@@ -87,17 +87,15 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import pg from 'pg';
-// pg-connection-string is a direct dep of `pg`; `pg.defaults` and the
-// pool both use it internally to parse connection strings. We import
-// it explicitly so the bench-mode collision guard canonicalizes URLs
-// using the SAME parser pg uses to actually connect — closing Codex
-// r12 HIGH 2026-05-06: prior canonicalization used Web URL parser +
-// URLSearchParams.get() (first-wins for duplicates) which diverged
-// from pg's last-wins semantics for ?host= and ?port= overrides.
-import { parse as parsePgConnectionString } from 'pg-connection-string';
 import { afterAll, beforeAll } from 'vitest';
 
 import { setBenchPool, clearBenchPool } from '../../../src/lib/db.ts';
+
+// canonicalizeDbUrl is extracted to a dedicated file (Sprint 17 r13
+// fix-forward) so the regression test in tests/contracts/canonicalize-
+// db-url.test.ts can import it without dragging the beforeAll/afterAll
+// hooks this setup file registers.
+import { canonicalizeDbUrl } from './canonicalize-db-url.ts';
 
 const { Client } = pg;
 
@@ -130,60 +128,13 @@ export function requireBenchDb(): void {
 }
 
 // ---------------------------------------------------------------------------
-// URL canonicalization (Codex r10-C closure)
+// URL canonicalization (Codex r10-C → r11-2 → r12 → r13 closure trajectory)
+// canonicalizeDbUrl is imported from `./canonicalize-db-url.ts` (top of file).
+// The dedicated split keeps the function regression-testable
+// (`tests/contracts/canonicalize-db-url.test.ts`) without dragging this
+// setup file's beforeAll/afterAll hooks into the test runner. See the
+// dedicated file's header for the full r10-C → r13 trajectory.
 // ---------------------------------------------------------------------------
-
-/**
- * Canonicalize a Postgres URL for collision-check comparison. Returns
- * a tuple of (host, port, dbname) lowercase, with port defaulted to
- * 5432 and dbname stripped of leading slash.
- *
- * Per Codex r10-C: string-equality on raw URLs lets the same physical
- * DB pass the collision guard via auth-credential differences, query
- * strings, port-spelling variations, host aliases, etc. This function
- * extracts only the parts that identify the actual database target.
- *
- * Returns null if the URL is unparseable; callers fail-closed in that
- * case (treat unparseable URL as collision-suspect).
- */
-function canonicalizeDbUrl(url: string | undefined): string | null {
-  if (url === undefined || url === '') return null;
-  try {
-    // r12 closure (Codex 2026-05-06): use the SAME parser pg actually
-    // uses to connect (pg-connection-string). This handles:
-    //   - Last-wins for duplicate ?host= and ?port= query params
-    //     (`URLSearchParams.get()` is first-wins; diverges from pg)
-    //   - ?port= override of the URL port (prior canonicalization
-    //     ignored query-port entirely)
-    //   - IPv6 brackets, percent-encoded hosts, socket-host forms
-    //   - All cases the Web URL parser missed
-    //
-    // Trajectory of the same finding-class:
-    //   r10-C (Sprint 14): string-equality bypassed by any URL-form
-    //     difference → fixed via Web URL parser canonicalization
-    //   r11-2 (Sprint 17 r1): ignored ?host= query-host → fixed by
-    //     reading searchParams.get('host')
-    //   r12 (Sprint 17 r2): URLSearchParams first-wins diverged from
-    //     pg's last-wins; ?port= ignored → fixed via pg-connection-
-    //     string parser (this commit)
-    const cfg = parsePgConnectionString(url);
-    if (cfg.host === undefined || cfg.host === null) {
-      // pg won't connect either; treat as unparseable.
-      return null;
-    }
-    const host = String(cfg.host).toLowerCase();
-    const port =
-      cfg.port === null || cfg.port === undefined ? '5432' : String(cfg.port);
-    const dbname = (
-      cfg.database === null || cfg.database === undefined
-        ? ''
-        : String(cfg.database)
-    ).toLowerCase();
-    return `${host}:${port}/${dbname}`;
-  } catch {
-    return null;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Migration runner with schema_migrations_bench tracking
