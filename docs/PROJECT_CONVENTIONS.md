@@ -9,6 +9,7 @@ Authoring discipline: **read this doc before authoring schema migrations, repos,
 **Revision history:**
 - **r1 (2026-05-05, Sprint 10 / TLC-022):** initial codification of Sprint 6/9/10 patterns.
 - **r2 (2026-05-05, Sprint 15 / TLC-028):** Sprint 13 + Sprint 14 retro patterns — §5.4 closure-path-overclaim pre-emption pattern; §5.5 structural-constraint-not-code-defect escalation pattern (Sprint 12 original + Sprint 14 round-1 environment-availability extension); §6 sub-rule 5 environment-dependency check at planning (raises PM rubric from 4 → 5 sub-rules — first new sub-rule since Sprint 6 baseline).
+- **r3 (2026-05-06, Sprint 18 / TLC-033):** Sprint 17 retro patterns. §5.4 extended with 6th finding-class (**module-load class** — does the file's top-level imports + import-side-effect-calls throw under the CI workflow that loads it?). §5.4 also extended with **lockdown-test pinning rule** (after 3+ rounds of Codex fix-forward on the same finding-class, pin resolved invariants as a lockdown contract test). Sprint 17 canonical examples: `tests/contracts/canonicalize-db-url.test.ts` 19-case lockdown pins r10-C → r11-2 → r12 → r13 trajectory; `requireBenchDb()` at module-load throw + `*.db.bench.ts` glob exclude pins module-load class. NEW §5.6 dual-close milestone pattern (when a sprint closes BOTH an escalation AND an ORT row, document explicitly in retro + traceability matrix bump). Sprint 17 = first dual-close milestone (TLC-027 escalation + OR-218 ORT row).
 
 ---
 
@@ -222,10 +223,13 @@ await withTransaction(async (tx) => {
 - **Loose-grep class:** are regex patterns anchored, or substring-loose? (Sprint 13 r7-A: bare `\b\d{10,}\b` accepts incidental timestamps; r8-B: `[Rr]un-[Ii]d:` accepts `fooRun-Id:` substring matches.)
 - **Wrong-git-semantics class:** is the diff semantic correct for the trigger context? (Sprint 13 r8-A: two-dot diff misclassifies PRs after main updates target file; triple-dot merge-base is required for PR-change-set semantics.)
 - **Path-filter required-check class:** does the workflow always run for the trigger context, or could path filtering leave required-checks hung on a missing context? (Sprint 13 r7-B: path-filtered required-check blocks unrelated PRs.)
+- **Module-load class** (Sprint 17 r17-CI / Sprint 18 r3 codification): does the file's top-level imports + import-side-effect-calls throw under the CI workflow that loads it? (Sprint 17 first-EXECUTE landing: `tests/perf/audit/emit-audit.bench.ts` called `requireBenchDb()` at module-load → threw in CI's `perf.yml` which doesn't set `BENCH_DATABASE_URL` → vitest collected the file → entire bench session failed even though only this ONE bench file actually needed the env. Closed at fix-forward by renaming to `*.db.bench.ts` + `vitest.bench.config.ts` glob exclude. Pre-empt at authoring time: when a bench / test / setup file has top-level calls that throw on missing env, ensure the workflow that loads it actually sets the env, OR rename to a glob-excluded variant.)
 
 **Why:** Sprint 13's r5 → r6 → r7-A → r7-B → r8-A → r8-B chain demonstrated that every layer of "enforcement" is itself a candidate for the same overclaim class Codex has been hammering on. r5 was hollow-coverage in a scaffold built to prevent hollow coverage. r6 was doc-only-discipline in a §"Enforcement mechanism" section. r7-A was loose-grep in a workflow titled "Verify metadata." r7-B + r8-A + r8-B continued the pattern at successively finer layers. Pre-empting these classes at authoring time saves a Codex round each.
 
 **Sprint 14 corollary — scaffold-can-be-structural-too:** the closure-path-overclaim recurrence can manifest at the SCAFFOLD architecture layer, not just at the in-scaffold-code layer. Sprint 14's TLC-025-SCAFFOLD authored bench-mode setup using `setTestPool()`'s BEGIN/COMMIT savepoint translation — a pattern that's correct for integration tests but breaks `pg_advisory_xact_lock` lifetime semantics for the planned `emitAudit` bench. The scaffold would have measured the wrong thing. Codex r10-B caught this in one pass.
+
+**Sprint 17 / TLC-033 extension — lockdown-test pinning rule:** after 3+ rounds of Codex fix-forward on the SAME finding-class within a single sub-story, pin the resolved invariants from EACH round as a lockdown contract test (under `tests/contracts/`) so future regressions on any round's invariant fail the lockdown rather than requiring another Codex round. Sprint 17 canonical example: `tests/contracts/canonicalize-db-url.test.ts` 19-case lockdown pins the URL-canonicalization trajectory r10-C → r11-2 → r12 → r13. Each round's invariant is a discrete `it()` block with the round citation in the test name. The lockdown is a one-time investment that prevents the same finding-class from re-emerging in a later sprint when the original closure rationale isn't fresh.
 
 ### §5.5 Structural-constraint-not-code-defect escalation pattern (Sprint 12 retro original + Sprint 14 retro extension)
 
@@ -249,6 +253,17 @@ await withTransaction(async (tx) => {
 - The finding has a contained-scope fix that doesn't require env-validation (regex anchoring, type-narrowing, doc-edit) — fix-forward
 - The finding is on a non-env-dependent code path (lint-rule violation, missing test on pure-function helper) — fix-forward
 - The fix is a Sprint N+1 story scoped against env that's BLOCKED but the fix itself is in-budget for a future env-available sprint — escalate but document the env-availability precondition
+
+### §5.6 Dual-close milestone pattern (Sprint 17 retro / Sprint 18 codification)
+
+**Rule:** when a sprint closes BOTH a previously-escalated Codex finding-class AND a Tier 1 ORT row, document the dual-close explicitly in:
+1. Sprint review/retro ACCEPTANCE line (call out "first/Nth dual-close milestone")
+2. `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` revision bump with both closures
+3. Cumulative-state recompute in retro (Codex closures + ORT rows closed + escalation status)
+
+**Why:** Sprint 17 demonstrated that escalations + ORT rows closing in the same sprint compound the closure-trajectory's signal value — Sprint 14 escalated TLC-025 → Sprint 17 closed it AND the OR-218 ORT row that the escalated TLC-027 was infrastructure for. The dual-close is non-obvious reading retros sequentially; documenting it explicitly preserves the milestone signal for future sprint-history readers.
+
+**Sprint 17 canonical example:** TLC-027 (Sprint 14 escalation) + OR-218 (Tier 1 ORT row) both closed 2026-05-06. First-ever dual-close. Documented in `docs/SPRINT_17_REVIEW.md` ACCEPTANCE line + `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r3 → r4 revision bump.
 
 ---
 
