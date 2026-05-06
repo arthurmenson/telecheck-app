@@ -370,6 +370,9 @@ describe('async-consult HTTP — §3 handler-level tenant-blind 404 (I-025)', ()
 
     // Patient B abandons A's consult via HTTP — must 404, not 403.
     // Sprint 21 / TLC-040: JWT auth migration (see §3a comment).
+    // POST also needs explicit empty-body + content-type so Fastify's
+    // default body-parser doesn't 400 the request before reaching the
+    // handler precedence test (TLC-040 r2 fix-forward).
     const tokenB = mintTokenForAccount(T_US, patientB);
     const r = await app!.inject({
       method: 'POST',
@@ -377,7 +380,9 @@ describe('async-consult HTTP — §3 handler-level tenant-blind 404 (I-025)', ()
       headers: {
         host: 'heroshealth.com',
         authorization: `Bearer ${tokenB}`,
+        'content-type': 'application/json',
       },
+      payload: {},
     });
 
     expect(r.statusCode).toBe(404);
