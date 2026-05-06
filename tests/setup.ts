@@ -234,56 +234,69 @@ async function seedMinimalRbac(client: Client): Promise<void> {
 const TEST_APP_ROLE = 'telecheck_test_app';
 
 async function installTestAppRole(client: Client): Promise<void> {
-  // Idempotent across test-process restarts: DROP-then-CREATE would invalidate
-  // grants from a prior run; CREATE IF NOT EXISTS uses DO block.
-  await client.query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${TEST_APP_ROLE}') THEN
-        CREATE ROLE ${TEST_APP_ROLE} NOLOGIN NOSUPERUSER NOBYPASSRLS;
-      END IF;
-    END
-    $$;
-  `);
+  // Sprint 23 / TLC-044: serialize role install across vitest forks via
+  // a session-level advisory lock. Without this lock, multiple parallel
+  // test forks each call installTestAppRole at beforeAll time and race
+  // on Postgres catalog rows backing GRANT/REVOKE ON ALL TABLES /
+  // FUNCTIONS, producing `tuple concurrently updated` errors. Same
+  // serialization pattern as Sprint 19 TLC-034 (applyMigrations).
+  // Lock-key derivation: hashtext is deterministic, int4-output, and
+  // matches the convention used in tests/setup.ts:applyMigrations.
+  await client.query(`SELECT pg_advisory_lock(hashtext('telecheck_test_install_role')::int)`);
+  try {
+    // Idempotent across test-process restarts: DROP-then-CREATE would invalidate
+    // grants from a prior run; CREATE IF NOT EXISTS uses DO block.
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${TEST_APP_ROLE}') THEN
+          CREATE ROLE ${TEST_APP_ROLE} NOLOGIN NOSUPERUSER NOBYPASSRLS;
+        END IF;
+      END
+      $$;
+    `);
 
-  // Schema + table grants — broad enough for tests to INSERT / SELECT against
-  // every PHI table; RLS still filters cross-tenant rows.
-  await client.query(`GRANT USAGE ON SCHEMA public TO ${TEST_APP_ROLE}`);
-  await client.query(
-    `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${TEST_APP_ROLE}`,
-  );
-  await client.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${TEST_APP_ROLE}`);
-  await client.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${TEST_APP_ROLE}`);
+    // Schema + table grants — broad enough for tests to INSERT / SELECT against
+    // every PHI table; RLS still filters cross-tenant rows.
+    await client.query(`GRANT USAGE ON SCHEMA public TO ${TEST_APP_ROLE}`);
+    await client.query(
+      `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${TEST_APP_ROLE}`,
+    );
+    await client.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${TEST_APP_ROLE}`);
+    await client.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${TEST_APP_ROLE}`);
 
-  // Strip UPDATE / DELETE on append-only tables to mirror the production
-  // privilege posture per I-003 (and the matching forms-engine snapshot
-  // append-only discipline). The append-only triggers in migration 002 +
-  // forms-intake snapshot migration would also block mutation, but having
-  // both REVOKE + trigger is the platform-floor pattern: a privilege
-  // assertion test (i003-audit-append-only.test.ts) verifies the privilege
-  // layer alone is denying.
-  //
-  // (Patch 2026-05-03 per Codex CI-fix adversarial review MEDIUM-1: the
-  //  prior broad `GRANT ... ON ALL TABLES` left audit_records mutation
-  //  privileges granted to the test role, and the I-003 privilege test
-  //  was using `toBeLessThanOrEqual(1)` so CI passed even with the grant
-  //  active. The combination normalized a production shape where the app
-  //  role can attempt audit mutation — a layer of belt that I-003 expects
-  //  to be in place independently of the suspenders.)
-  await client.query(`REVOKE UPDATE, DELETE ON audit_records FROM ${TEST_APP_ROLE}`);
-  // forms_snapshot is also append-only per Forms/Intake slice; revoke
-  // pre-emptively if the table exists. The IF EXISTS pattern via DO block
-  // tolerates skeleton-state runs where forms_snapshot hasn't been created
-  // by the slice migration yet.
-  await client.query(`
-    DO $$
-    BEGIN
-      IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'forms_snapshot' AND relkind = 'r') THEN
-        EXECUTE 'REVOKE UPDATE, DELETE ON forms_snapshot FROM ${TEST_APP_ROLE}';
-      END IF;
-    END
-    $$;
-  `);
+    // Strip UPDATE / DELETE on append-only tables to mirror the production
+    // privilege posture per I-003 (and the matching forms-engine snapshot
+    // append-only discipline). The append-only triggers in migration 002 +
+    // forms-intake snapshot migration would also block mutation, but having
+    // both REVOKE + trigger is the platform-floor pattern: a privilege
+    // assertion test (i003-audit-append-only.test.ts) verifies the privilege
+    // layer alone is denying.
+    //
+    // (Patch 2026-05-03 per Codex CI-fix adversarial review MEDIUM-1: the
+    //  prior broad `GRANT ... ON ALL TABLES` left audit_records mutation
+    //  privileges granted to the test role, and the I-003 privilege test
+    //  was using `toBeLessThanOrEqual(1)` so CI passed even with the grant
+    //  active. The combination normalized a production shape where the app
+    //  role can attempt audit mutation — a layer of belt that I-003 expects
+    //  to be in place independently of the suspenders.)
+    await client.query(`REVOKE UPDATE, DELETE ON audit_records FROM ${TEST_APP_ROLE}`);
+    // forms_snapshot is also append-only per Forms/Intake slice; revoke
+    // pre-emptively if the table exists. The IF EXISTS pattern via DO block
+    // tolerates skeleton-state runs where forms_snapshot hasn't been created
+    // by the slice migration yet.
+    await client.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'forms_snapshot' AND relkind = 'r') THEN
+          EXECUTE 'REVOKE UPDATE, DELETE ON forms_snapshot FROM ${TEST_APP_ROLE}';
+        END IF;
+      END
+      $$;
+    `);
+  } finally {
+    await client.query(`SELECT pg_advisory_unlock(hashtext('telecheck_test_install_role')::int)`);
+  }
 }
 
 // ---------------------------------------------------------------------------
