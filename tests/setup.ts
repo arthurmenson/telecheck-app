@@ -83,56 +83,95 @@ export function getTestClient(): Client {
 const MIGRATIONS_DIR = resolve(import.meta.dirname ?? __dirname, '../migrations');
 
 async function applyMigrations(client: Client): Promise<void> {
-  // Sprint 19 / TLC-034 closure: serialize concurrent migration applies
-  // across vitest forks via pg_advisory_lock. Without this lock, when
-  // vitest's `pool: 'forks'` spawns N parallel test-file forks, each
-  // fork's tests/setup.ts beforeAll calls applyMigrations against the
-  // shared TEST_DATABASE_URL. Concurrent CREATE FUNCTION / CREATE
-  // POLICY / CREATE TRIGGER calls update Postgres catalog rows
-  // (pg_proc, pg_policy, pg_trigger) and Postgres surfaces this as
-  // "tuple concurrently updated" errors on whichever fork loses the
-  // race.
+  // Sprint 19 / TLC-034 closure (initial): pg_advisory_lock around the
+  // apply loop serializes vitest-fork applyMigrations calls across the
+  // shared TEST_DATABASE_URL.
   //
-  // Fix: take a session-scoped advisory lock keyed on a stable hash of
-  // 'telecheck_test_migrations'. Only one fork at a time enters the
-  // migration-apply loop. Other forks block briefly on the lock; when
-  // they get the lock, the IF NOT EXISTS guards in each migration make
-  // their applyMigrations a no-op against the already-migrated schema.
-  // Lock auto-releases on connection close (session-scoped) so a
-  // crashing fork doesn't strand the lock.
+  // TLC-034 fix-forward (Codex r15 HIGH closure): the advisory lock
+  // alone is insufficient because the replay path swallowed any
+  // 'already exists' error at FILE granularity. If a fork failed mid-
+  // file (e.g., on a non-idempotent CREATE TRIGGER catalog race
+  // between Postgres internal locks + concurrent transactions), the
+  // next fork would hit 'already exists' on the early objects, swallow
+  // it, and SKIP THE REST OF THE FILE — leaving the schema partially
+  // migrated with no error surfaced to the test.
   //
-  // Why advisory lock vs globalSetup refactor: 4-line change vs
-  // restructuring the whole setup-file architecture. The migrations
-  // already are idempotent via IF NOT EXISTS guards; serializing the
-  // apply loop is sufficient to eliminate the catalog race.
+  // Fix-forward: track applied migrations in a `schema_migrations`
+  // table. Each migration is applied AT MOST ONCE across the whole
+  // Postgres database (not just per-fork). Each apply runs in a
+  // transaction with the tracking-row INSERT — partial applies leave
+  // the row uninserted, so a failed apply is RETRIED on next session
+  // rather than skipped. This is the same pattern Sprint 17 / TLC-027
+  // landed for bench-mode (`schema_migrations_bench` in
+  // tests/perf/db/setup.ts; see Codex r10-D + r11-1 closures).
   //
-  // Key derivation: pg's `hashtext()` returns int4. Pass to
-  // `pg_advisory_lock(int4)` overload. The literal string is what
-  // identifies the lock domain — any other application using a
-  // different key won't collide.
+  // The advisory lock is preserved as defense-in-depth: it serializes
+  // the schema_migrations apply loop so two forks can't both attempt
+  // to INSERT INTO schema_migrations + run the same migration SQL
+  // simultaneously. Without the lock, the first fork's INSERT would
+  // succeed; the second fork's INSERT would fail with primary-key
+  // conflict AFTER having executed the SQL — leading to a phantom
+  // re-application that the tracking table can't undo.
+  //
+  // Key derivation: hashtext() returns int4. Pass to
+  // pg_advisory_lock(bigint) overload via implicit int4 → int8 cast.
+  // The literal string identifies the lock domain — any other
+  // application using a different key won't collide.
   await client.query("SELECT pg_advisory_lock(hashtext('telecheck_test_migrations')::int)");
   try {
+    // Bootstrap the tracking table. Idempotent across calls.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        filename     TEXT PRIMARY KEY,
+        applied_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        checksum_sha TEXT NOT NULL
+      )
+    `);
+
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((f) => f.endsWith('.sql') && !f.startsWith('rollback'))
       .sort(); // lexicographic sort → 000, 001, 002 ... is correct
 
+    // Read already-applied set. Subsequent forks skip migrations
+    // already applied by the first fork — no replay, no 'already
+    // exists' swallow, no partial-apply mask.
+    const appliedResult = await client.query<{ filename: string }>(
+      'SELECT filename FROM schema_migrations',
+    );
+    const applied = new Set(appliedResult.rows.map((r) => r.filename));
+
     for (const file of files) {
+      if (applied.has(file)) {
+        continue;
+      }
       const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8');
+      const checksum = `len=${String(sql.length)}`;
+
+      // Atomic apply + track: BEGIN; SQL; INSERT; COMMIT. If anything
+      // fails: ROLLBACK; throw with context; tracking row not inserted
+      // so next session retries. NO 'already exists' swallow.
+      await client.query('BEGIN');
       try {
         await client.query(sql);
+        await client.query(
+          'INSERT INTO schema_migrations (filename, checksum_sha) VALUES ($1, $2)',
+          [file, checksum],
+        );
+        await client.query('COMMIT');
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        // Idempotent: IF NOT EXISTS guards in migrations make re-runs safe.
-        // Skip "already exists" errors but fail on everything else.
-        if (!message.includes('already exists')) {
-          throw new Error(`Migration ${file} failed: ${message}`);
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          // Best-effort rollback; original error throws below.
         }
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Migration ${file} failed (transactional apply+track): ${message}. ` +
+            `ROLLBACK issued; tracking row NOT inserted; next session will re-attempt.`,
+        );
       }
     }
   } finally {
-    // Release the lock so the next fork can proceed. Failure to release
-    // here is non-fatal because session-end auto-releases anyway, but
-    // explicit release frees the lock immediately.
     try {
       await client.query("SELECT pg_advisory_unlock(hashtext('telecheck_test_migrations')::int)");
     } catch {
