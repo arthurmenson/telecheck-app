@@ -214,10 +214,25 @@ const errorEnvelopePluginImpl = async (fastify: FastifyInstance): Promise<void> 
       request.log.warn({ statusCode, code: error.code, requestId: request.id }, 'Request error');
     }
 
+    // Sprint 28 / TLC-047 audit: this is a Fastify `setErrorHandler`
+    // lifecycle callback — NOT a regular request handler. Fastify's
+    // documented signature is `(error, request, reply) => void | Promise<void>`;
+    // the return value is ignored (Fastify uses reply.send() to drive the
+    // response, NOT the callback's return value as in regular handlers).
+    // Therefore the `void reply.send()` pattern here does NOT trigger the
+    // §5.9 Fastify-idiom-mismatch finding-class that motivated Sprint 24
+    // TLC-045's `return reply` fix in async-consult/handlers/consults.ts —
+    // that fix targeted regular handlers where Fastify auto-wraps the
+    // return value of an undefined-returning handler with a phantom
+    // reply.send(undefined). setErrorHandler does not auto-wrap.
     void reply.code(statusCode).type('application/json').send(envelope);
   });
 
-  // Fastify 5.x: also handle not-found at the plugin level for uniform envelope
+  // Fastify 5.x: also handle not-found at the plugin level for uniform envelope.
+  // Same TLC-047 audit conclusion as setErrorHandler above: this is a
+  // setNotFoundHandler lifecycle callback; the `void reply.send()` pattern
+  // is correct for this Fastify entry-point and does NOT trigger the §5.9
+  // finding-class.
   fastify.setNotFoundHandler((request: FastifyRequest, reply: FastifyReply) => {
     const envelope: ErrorEnvelope = {
       error: {
