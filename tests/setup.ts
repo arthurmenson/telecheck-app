@@ -194,8 +194,22 @@ async function applyMigrations(client: Client): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function seedMinimalRbac(client: Client): Promise<void> {
-  // Attempt to seed; if the rbac_roles table does not exist yet, skip silently.
-  // The i012-prescribing.test.ts file documents the stub workaround.
+  // Sprint 28 / TLC-044 lock-key audit conclusion (2026-05-06): this
+  // function does NOT need pg_advisory_lock serialization across vitest
+  // forks. The INSERT uses `ON CONFLICT (role_id) DO NOTHING`, which is
+  // concurrency-safe by design — concurrent INSERTs of the same role_id
+  // value race on the unique-index check; PostgreSQL serializes that
+  // race internally and the loser's row is dropped without error.
+  // Unlike `installTestAppRole`'s `GRANT ... ON ALL TABLES` (TLC-044) or
+  // `applyMigrations`' DDL (TLC-034), this seed touches NO catalog rows
+  // that could trigger `tuple concurrently updated`.
+  //
+  // Audit scope: Sprint 28 / TLC-044 lock-key audit re-scanned all of
+  // tests/setup.ts for DDL or catalog-touching operations:
+  //   - applyMigrations (TLC-034 advisory-lock — serialized)
+  //   - installTestAppRole (TLC-044 advisory-lock — serialized)
+  //   - seedMinimalRbac (this function — ON CONFLICT-safe, NO lock needed)
+  // No other parallel-fork race candidates found.
   try {
     await client.query(`
       INSERT INTO rbac_roles (role_id, role_name, tenant_id, action_classes)
