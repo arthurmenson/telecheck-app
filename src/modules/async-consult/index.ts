@@ -48,11 +48,7 @@ export type {
   ConsultEventType,
 } from './internal/types.js';
 
-export {
-  asConsultId,
-  asConsultEventId,
-  CONSULT_STATES,
-} from './internal/types.js';
+export { asConsultId, asConsultEventId, CONSULT_STATES } from './internal/types.js';
 
 // Fastify plugin for app.ts wiring. Currently exposes only `/health` + `/ready`.
 export { asyncConsultPlugin } from './plugin.js';

@@ -112,11 +112,7 @@ interface ErrorEnvelopeBody {
   };
 }
 
-function makeErrorEnvelope(
-  reqId: string,
-  code: string,
-  message: string,
-): ErrorEnvelopeBody {
+function makeErrorEnvelope(reqId: string, code: string, message: string): ErrorEnvelopeBody {
   return { error: { code, message, request_id: reqId } };
 }
 
@@ -130,38 +126,24 @@ function makeErrorEnvelope(
  *
  * Other service-layer errors map per the canonical codes.
  */
-function mapServiceError(
-  err: unknown,
-  reply: FastifyReply,
-  reqId: string,
-): boolean {
+function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): boolean {
   if (err instanceof consultService.ConsultNotFoundError) {
     void reply
       .code(404)
-      .send(
-        makeErrorEnvelope(reqId, 'internal.resource.not_found', 'Consult not found.'),
-      );
+      .send(makeErrorEnvelope(reqId, 'internal.resource.not_found', 'Consult not found.'));
     return true;
   }
   if (err instanceof consultService.ConsultPatientOwnershipError) {
     // Tenant-blind / cross-patient-blind: 404, not 403
     void reply
       .code(404)
-      .send(
-        makeErrorEnvelope(reqId, 'internal.resource.not_found', 'Consult not found.'),
-      );
+      .send(makeErrorEnvelope(reqId, 'internal.resource.not_found', 'Consult not found.'));
     return true;
   }
   if (err instanceof consultService.ConsultStateConflictError) {
     void reply
       .code(409)
-      .send(
-        makeErrorEnvelope(
-          reqId,
-          'internal.resource.conflict',
-          'Consult state conflict.',
-        ),
-      );
+      .send(makeErrorEnvelope(reqId, 'internal.resource.conflict', 'Consult state conflict.'));
     return true;
   }
   if (
@@ -239,9 +221,7 @@ export async function initiateConsultHandler(
     // patient" from "validation failed" — same 400 envelope.
     return reply
       .code(400)
-      .send(
-        makeErrorEnvelope(req.id, 'internal.request.invalid', 'Invalid initiate body.'),
-      );
+      .send(makeErrorEnvelope(req.id, 'internal.request.invalid', 'Invalid initiate body.'));
   }
 
   try {

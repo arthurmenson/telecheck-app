@@ -60,10 +60,7 @@ import {
 } from '../../events.js';
 import * as consultEventRepo from '../repositories/consult-event-repo.js';
 import * as consultRepo from '../repositories/consult-repo.js';
-import {
-  type GuardContext,
-  validateTransition,
-} from '../state-machine.js';
+import { type GuardContext, validateTransition } from '../state-machine.js';
 import {
   asConsultEventId,
   asConsultId,
@@ -356,10 +353,7 @@ export async function submit(
     );
     if (!eligibility.valid) {
       if (eligibility.reason === 'wrong_status') {
-        throw new FormSubmissionNotTerminalError(
-          intakeFormSubmissionId,
-          'non-bind-eligible',
-        );
+        throw new FormSubmissionNotTerminalError(intakeFormSubmissionId, 'non-bind-eligible');
       }
       // not_found OR wrong_patient: tenant-blind / cross-patient-blind.
       // Don't distinguish — both surface as form_not_complete.
@@ -368,13 +362,7 @@ export async function submit(
 
     // Guard: active_consent (cross-slice Consent gate). hasActiveConsent
     // returns boolean — do not invent a consent row if missing.
-    const consentActive = await hasActiveConsent(
-      ctx,
-      actor.accountId,
-      'care',
-      null,
-      tx,
-    );
+    const consentActive = await hasActiveConsent(ctx, actor.accountId, 'care', null, tx);
     if (!consentActive) {
       throw new SubmitGuardNotSatisfiedError(consultId, 'no_active_consent');
     }
@@ -620,13 +608,7 @@ export async function resume(
   consultId: ConsultId,
   externalTx?: DbTransaction,
 ): Promise<Consult> {
-  return unguardedTransition(
-    ctx,
-    actor,
-    consultId,
-    { event: 'resume', guard: {} },
-    externalTx,
-  );
+  return unguardedTransition(ctx, actor, consultId, { event: 'resume', guard: {} }, externalTx);
 }
 
 /**

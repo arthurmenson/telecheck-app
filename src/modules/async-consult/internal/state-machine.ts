@@ -341,9 +341,7 @@ export function validateTransition(
   }
 
   // Layer C: look up the transition in the supported table
-  const transition = SUPPORTED_TRANSITIONS.find(
-    (t) => t.from === from && t.event === event,
-  );
+  const transition = SUPPORTED_TRANSITIONS.find((t) => t.from === from && t.event === event);
   if (transition === undefined) {
     throw new InvalidTransitionError(from, event);
   }

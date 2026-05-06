@@ -23,9 +23,7 @@ import fp from 'fastify-plugin';
 
 import { registerSubscriptionRoutes } from './routes.js';
 
-const subscriptionPluginImpl: FastifyPluginAsync = async (
-  app: FastifyInstance,
-): Promise<void> => {
+const subscriptionPluginImpl: FastifyPluginAsync = async (app: FastifyInstance): Promise<void> => {
   await app.register(registerSubscriptionRoutes, { prefix: '/v0/subscription' });
 };
 
