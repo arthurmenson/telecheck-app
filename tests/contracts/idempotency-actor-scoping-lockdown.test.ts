@@ -87,19 +87,17 @@ describe('idempotency.ts — actor-id resolution lockdown', () => {
     expect(actorContextIdx).toBeLessThan(xActorIdIdx);
   });
 
-  it("§1c 'anonymous' is the final fallback (not the first read)", () => {
-    // The 'anonymous' literal must come AFTER both actorContext and
-    // x-actor-id reads. If a future refactor places 'anonymous' as
-    // the primary lookup or removes the JWT check, this test fails.
+  it("§1c resolution chain ends with 'anonymous' fallback after JWT + header reads", () => {
+    // Anchor on the exact resolution-chain expression rather than a
+    // bare 'anonymous' string match — the file's prose comments also
+    // contain the word 'anonymous' (the closure-context comment
+    // explains the bug + fix), and a bare indexOf would match those
+    // first. The regex below captures the whole nullish-coalescing
+    // chain to pin the resolution shape directly.
     const src = readFileSync(IDEMPOTENCY_SRC_PATH, 'utf8');
-    // Anchor on the exact resolution chain pattern. The chain shape:
-    //   request.actorContext?.accountId ??
-    //     (request.headers['x-actor-id'] ...) ??
-    //     'anonymous';
-    // We assert all three appear in this order.
-    const actorContextIdx = src.indexOf('request.actorContext?.accountId');
-    const anonymousIdx = src.indexOf("'anonymous'");
-    expect(anonymousIdx).toBeGreaterThan(actorContextIdx);
+    expect(src).toMatch(
+      /request\.actorContext\?\.accountId\s*\?\?\s*\(?request\.headers\[['"]x-actor-id['"]\][^)]*\)?\s*\?\?\s*['"]anonymous['"]/,
+    );
   });
 
   // ---------------------------------------------------------------------------
