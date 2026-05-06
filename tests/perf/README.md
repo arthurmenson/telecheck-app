@@ -61,6 +61,22 @@ Until those three conditions hold:
 - `--compare baseline.json` runs but only diffs against the 4 crisis-detect scenarios; validate-transition `--compare` output shows "no baseline match" at v0.1 (acceptable signal noise; no enforcement value lost because threshold gate covers all 8 scenarios)
 - Future commits that regenerate baseline.json need `--scope=baseline-refresh` rationale in the commit message AND must come from a CI-calibrated capture, not a local run
 
+### Known v0.1 trade-off (Codex perf-bench-r2/r3/r4 acknowledged)
+
+Codex iteration produced 3 valid MEDIUM findings across rounds r2-r4 on the perf gate's relative-regression coverage. The findings converge on a structural observation: **at v0.1 there is no perfect baseline strategy**:
+
+- **Commit local-laptop baseline:** weakens relative-regression detection for the captured scenarios (Codex r2)
+- **Revert baseline + doc-only discipline:** discipline is not enforceable (Codex r3)
+- **Revert baseline + scope to crisis-detect only:** validate-transition has no relative-regression coverage; first CI-calibrated baseline could encode already-regressed behavior (Codex r4)
+
+**v0.1 trade-off accepted:** `check-thresholds.ts` absolute floor is the v0.1 enforcement boundary. Validate-transition relative-regression coverage is **deferred to Sprint 13 TLC-026** (track as explicit story, not a doc-only deferral). Sprint 13 closes the loop via:
+
+1. Capture baseline from a controlled CI run (after `perf.yml` has 3-5 stable main runs)
+2. Add a manifest-check helper to `check-thresholds.ts` that fails the gate if any expected scenario lacks a baseline entry (Codex r4 recommended fix; not implementable in Sprint 12 budget)
+3. Tighten thresholds based on observed CI variance
+
+Sprint 12 retro records this as **the first finding class where iterative fix-forward couldn't close in-sprint** because the underlying constraint (need real CI variance data to make non-arbitrary trade-offs) is structural, not a code defect.
+
 ## Bench corpus at v0.1
 
 | Bench file | Sprint | Target | Scenarios |
