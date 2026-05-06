@@ -67,6 +67,22 @@ import { parse as parsePgConnectionString } from 'pg-connection-string';
  */
 export function canonicalizeDbUrl(url: string | undefined): string | null {
   if (url === undefined || url === '') return null;
+
+  // Sprint 20 / TLC-039 closure (Codex r17 implicit, surfaced by my own
+  // PR #11 §E lockdown test): pg-connection-string is permissive and
+  // will parse ARBITRARY strings into a partial config (e.g.,
+  // 'this is not a url' parses to host='base', database='this is not a url').
+  // Reject inputs that don't look like a proper postgres URL up front
+  // — otherwise the §E "not-a-url string → null" lockdown invariant
+  // breaks.
+  //
+  // Accept: postgresql:// or postgres:// scheme prefix (case-insensitive)
+  // Reject: anything else
+  const schemeMatch = /^postgres(ql)?:\/\//i.test(url);
+  if (!schemeMatch) {
+    return null;
+  }
+
   try {
     const cfg = parsePgConnectionString(url);
 
