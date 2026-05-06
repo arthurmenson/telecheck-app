@@ -40,6 +40,18 @@ Until those three conditions hold:
 - Operators read trends, not pass/fail
 - OR-218 stays OPEN in the ORT; this scaffold reduces its remaining work but does not retire the row
 
+## Baseline.json provenance + churn discipline
+
+`tests/perf/baseline.json` is regenerated as a unit by `vitest bench --outputJson tests/perf/baseline.json`. Vitest does NOT support partial / additive baseline updates — every regen captures all currently-collected scenarios.
+
+**Per Codex perf-bench-r2 MEDIUM closure 2026-05-05:** baseline regen during a sub-story that ONLY adds new bench scenarios will also overwrite the unrelated previously-captured scenarios (e.g., TLC-024 added validate-transition scenarios but also reset the crisis-detect measurements). This weakens regression detection in the unaffected scenarios because the committed baseline now reflects whatever local-noise was present at the regen moment.
+
+**Discipline (Sprint 12 retro will codify):**
+
+1. **At Sprint 13+, regenerate baseline.json from a controlled CI run** (not a local laptop) once `perf.yml` has 3-5 stable runs on main. The CI-calibrated baseline becomes the regression-detection reference; local regens are NOT committed unless explicitly justified.
+2. **Until Sprint 13 CI calibration**, baseline.json captures local-dev-laptop measurements as a v0.1 placeholder. Threshold enforcement via `check-thresholds.ts` is the absolute pass/fail gate; baseline `--compare` is signal-only.
+3. **Rationale-required commits**: any commit that regenerates baseline.json MUST include an explicit reason in the commit message (e.g., "TLC-024: baseline regen captures new validate-transition scenarios; crisis-detect values overwritten as side effect — placeholder until Sprint 13 CI calibration"). Sprint 12 TLC-024 commits did this implicitly; future commits MUST do so explicitly.
+
 ## Bench corpus at v0.1
 
 | Bench file | Sprint | Target | Scenarios |
