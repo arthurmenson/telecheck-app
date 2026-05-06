@@ -168,6 +168,23 @@ Done stories move to `SPRINT_<N>_REVIEW.md` and are removed from the active back
 3. Scrum Master commits sprint plan to `docs/SPRINT_<N>_PLAN.md`
 4. Iteration loop begins
 
+### Differentiated commit-budget calibration (Sprint 14 retro extension; codified Sprint 15 / TLC-028)
+
+Story commit-budget calibration depends on whether the story is executable in the autonomous shell or requires environment dependencies the autonomous shell doesn't have:
+
+| Story class | Slack | Fix-forward reserves | Empirical derivation |
+| --- | --- | --- | --- |
+| **"Executable here"** — full execution possible in the autonomous shell (no Postgres / gh auth / Redis / secrets / CI-access dependency for verification) | 1.2× | 2 | Sprint 5 baseline; Sprint 11 retro confirmation |
+| **"Needs env" — PLAN-ONLY** — planning artifact only; no code execution; deliverable is acceptance criteria + design doc + escalation conditions | 1.0× | 0 | Sprint 14 retro NEW (PLAN-ONLY differentiation); no fix-forward expected on PLAN-ONLY because revisions are bounded doc edits |
+| **"Needs env" — EXECUTE** — full execution; environment-available sprint (Postgres + gh auth + secrets + CI access available; not the autonomous shell) | 1.5× | 4 | Sprint 12 + Sprint 13 over-budget evidence; Sprint 13 retro proposal; framework/perf calibration |
+
+**Why the calibration differs by story class:**
+- "Executable here" stories iterate within the shell; Codex fix-forwards consume reserves at observed Sprint 1-11 rates (~2 reserves average for novel-of-class work)
+- "Needs env" PLAN-ONLY stories don't run code; the PLAN-ONLY artifact's revisions are bounded doc edits with low Codex iteration
+- "Needs env" EXECUTE stories run real code against real environment; iteration cost is higher because environment-coupled defects (lock semantics, schema drift, RBAC edge cases) surface that the autonomous shell can't catch — Sprint 12 + 13 framework/perf work both ran 117-133% utilization
+
+**Sprint 14 / TLC-025-SCAFFOLD precedent:** authoring "needs env" EXECUTE work in the autonomous shell (without env validation) cost ~400 lines authored + full revert + escalation = ~5 wasted commits relative to a properly-deferred PLAN-ONLY approach. Sprint 14 retro NEW PM rubric sub-rule 5 requires checking env-dependency at planning time to avoid this misalignment.
+
 ---
 
 ## Sprint review protocol

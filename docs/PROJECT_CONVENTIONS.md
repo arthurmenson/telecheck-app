@@ -8,6 +8,7 @@ Authoring discipline: **read this doc before authoring schema migrations, repos,
 
 **Revision history:**
 - **r1 (2026-05-05, Sprint 10 / TLC-022):** initial codification of Sprint 6/9/10 patterns.
+- **r2 (2026-05-05, Sprint 15 / TLC-028):** Sprint 13 + Sprint 14 retro patterns — §5.4 closure-path-overclaim pre-emption pattern; §5.5 structural-constraint-not-code-defect escalation pattern (Sprint 12 original + Sprint 14 round-1 environment-availability extension); §6 sub-rule 5 environment-dependency check at planning (raises PM rubric from 4 → 5 sub-rules — first new sub-rule since Sprint 6 baseline).
 
 ---
 
@@ -210,15 +211,59 @@ await withTransaction(async (tx) => {
 
 **Rule:** HIGH Codex findings = fix-forward in-sprint (no exceptions). MEDIUM findings on contract-lockdown surfaces (`tests/contracts/`) where the fix is trivial (≤5 LOC) AND the finding hits the test's core value proposition = fix-forward in-sprint. General MEDIUM-deferral rule remains for non-contract-lockdown surfaces.
 
+**Exception:** when §5.5 structural-constraint escalation applies, HIGH-severity findings can be ESCALATED to a Sprint N+1 story without in-sprint closure. Sprint 14's TLC-025 r10 (2 HIGH + 2 MEDIUM, all environment-availability constrained) is the precedent — first-ever HIGH-severity escalation; first sprint with zero in-sprint Codex closures.
+
+### §5.4 Closure-path-overclaim pre-emption pattern (Sprint 13 retro)
+
+**Rule:** when authoring a closure-path artifact (CI workflow, enforcement scaffold, gate-correctness self-test, machine-enforced metadata guard, etc.), pre-emptively check at authoring time:
+
+- **Hollow-coverage class:** does the layer I'm building actually exercise the gate path it claims to protect, or only helper functions in isolation? (Sprint 13 r5: `selfTest()` called helpers in isolation rather than driving fixtures through `runGate()`.)
+- **Doc-only-discipline class:** is the "enforcement" claim machine-enforced or just documented? (Sprint 13 r6: `[scope=baseline-refresh]` tag described as enforcement but only checkable post-merge by grep.)
+- **Loose-grep class:** are regex patterns anchored, or substring-loose? (Sprint 13 r7-A: bare `\b\d{10,}\b` accepts incidental timestamps; r8-B: `[Rr]un-[Ii]d:` accepts `fooRun-Id:` substring matches.)
+- **Wrong-git-semantics class:** is the diff semantic correct for the trigger context? (Sprint 13 r8-A: two-dot diff misclassifies PRs after main updates target file; triple-dot merge-base is required for PR-change-set semantics.)
+- **Path-filter required-check class:** does the workflow always run for the trigger context, or could path filtering leave required-checks hung on a missing context? (Sprint 13 r7-B: path-filtered required-check blocks unrelated PRs.)
+
+**Why:** Sprint 13's r5 → r6 → r7-A → r7-B → r8-A → r8-B chain demonstrated that every layer of "enforcement" is itself a candidate for the same overclaim class Codex has been hammering on. r5 was hollow-coverage in a scaffold built to prevent hollow coverage. r6 was doc-only-discipline in a §"Enforcement mechanism" section. r7-A was loose-grep in a workflow titled "Verify metadata." r7-B + r8-A + r8-B continued the pattern at successively finer layers. Pre-empting these classes at authoring time saves a Codex round each.
+
+**Sprint 14 corollary — scaffold-can-be-structural-too:** the closure-path-overclaim recurrence can manifest at the SCAFFOLD architecture layer, not just at the in-scaffold-code layer. Sprint 14's TLC-025-SCAFFOLD authored bench-mode setup using `setTestPool()`'s BEGIN/COMMIT savepoint translation — a pattern that's correct for integration tests but breaks `pg_advisory_xact_lock` lifetime semantics for the planned `emitAudit` bench. The scaffold would have measured the wrong thing. Codex r10-B caught this in one pass.
+
+### §5.5 Structural-constraint-not-code-defect escalation pattern (Sprint 12 retro original + Sprint 14 retro extension)
+
+**Rule (combined):** when a Codex finding class converges on "this requires data/environment we don't have yet" — either across 3+ fix-forward rounds (original Sprint 12 codification) **OR** at Codex round 1 if the findings all require an environment dependency the autonomous shell doesn't have (Sprint 14 extension) — escalate to a Sprint N+1 story rather than continuing iterative fix-forward. The Sprint N retro records this explicitly. Distinct from §5.1 5+ rounds = pause cap (which addresses scope inflation, not structural data/environment gaps).
+
+**Original (Sprint 12) trigger conditions:**
+- 3+ fix-forward rounds on the same finding class
+- Each round produces a valid finding while introducing the next round's complaint
+- Underlying constraint is structural (e.g., needs CI calibration; needs a slice that doesn't exist yet; needs a spec ratification upstream)
+
+**Extension (Sprint 14) trigger conditions:**
+- Codex round 1 (no prior fix-forward rounds required)
+- Findings all require an environment dependency the autonomous shell doesn't have (Postgres, gh auth, Redis, secrets, CI access, etc.)
+- Closing any finding would require either a production-code change ruled out at planning OR hands-on env-validation infeasible in the autonomous shell
+
+**Closure precedents:**
+- TLC-024 r4 → Sprint 13 TLC-026 [Sprint 12 original pattern; closed Sprint 13 via 4-round fix-forward chain converging at r9 APPROVED clean]
+- TLC-025 r10 → Sprint 15+ TLC-027 [Sprint 14 extension pattern; pending — first HIGH-severity escalation; first sprint with zero in-sprint closures]
+
+**When NOT to escalate (still fix-forward):**
+- The finding has a contained-scope fix that doesn't require env-validation (regex anchoring, type-narrowing, doc-edit) — fix-forward
+- The finding is on a non-env-dependent code path (lint-rule violation, missing test on pure-function helper) — fix-forward
+- The fix is a Sprint N+1 story scoped against env that's BLOCKED but the fix itself is in-budget for a future env-available sprint — escalate but document the env-availability precondition
+
 ---
 
-## §6 PM-brief verification gate (Sprint 6 + Evans 2026-05-05 oversight directive)
+## §6 PM-brief verification gate (Sprint 6 + Evans 2026-05-05 oversight directive; Sprint 14 sub-rule 5 extension)
 
 See `docs/SCRUM_OPERATING_MODEL.md` §"PM-brief verification gate" for the full mechanical procedure. Summary:
 
 - After PM brief returns, SM mechanically verifies every cited identifier against its source-of-truth file BEFORE accepting the brief.
-- 4 PM rubric sub-rules under decision rule 4 govern PM brief content (verify before authoring; wire-protocol vocabulary check; spec-corpus identifier check; internal-canonicalization-pattern check).
-- 5 consecutive clean PM briefs since the gate was instituted at `804c294`. Sprint 3 + Sprint 5 hallucination class has not recurred.
+- **5 PM rubric sub-rules** under decision rule 4 govern PM brief content (raised from 4 → 5 at Sprint 14 retro):
+  1. Verify before authoring
+  2. Wire-protocol vocabulary check
+  3. Spec-corpus identifier check
+  4. Internal-canonicalization-pattern check
+  5. **Environment-dependency check at planning** (Sprint 14 retro NEW): for each proposed sub-story, explicitly check whether closure requires an environment dependency (Postgres, Redis, gh auth, secrets, CI access) the autonomous shell doesn't have. If YES, split into PLAN-ONLY (planning artifact + escalation conditions) and EXECUTE (env-available sprint). If NO, execute. Sprint 14 / TLC-025 cost demonstrated the rule's value: ~400 lines authored, full revert, escalation.
+- **9 consecutive clean PM briefs** since the gate was instituted at `804c294` (PM hallucination class has not recurred since Sprint 6 baseline; Sprint 3 + Sprint 5 hallucination class is eradicated).
 
 ---
 
