@@ -1,0 +1,129 @@
+{
+  "files": [
+    {
+      "filepath": "C:/Menson Special/Telecheck Project/telecheck-app/tests/perf/audit/crisis-detect.bench.ts",
+      "groups": [
+        {
+          "fullName": "tests/perf/audit/crisis-detect.bench.ts > crisisDetector.detect — §1 short clean text",
+          "benchmarks": [
+            {
+              "id": "-1221789046_0_0",
+              "name": "detect on ~35-char clean string returns no-crisis",
+              "rank": 1,
+              "rme": 0.4278407244469114,
+              "samples": [],
+              "totalTime": 500.00009999997707,
+              "min": 0.00009999999997489795,
+              "max": 0.32939999999996417,
+              "hz": 5668282.866343686,
+              "period": 0.0001764202711084967,
+              "mean": 0.0001764202711084967,
+              "variance": 4.203109220054045e-7,
+              "sd": 0.0006483139069967607,
+              "sem": 3.8510090101112113e-7,
+              "df": 2834141,
+              "critical": 1.96,
+              "moe": 7.547977659817974e-7,
+              "p75": 0.0002000000000066393,
+              "p99": 0.0004000000000132786,
+              "p995": 0.0004999999999881766,
+              "p999": 0.0005999999999630745,
+              "sampleCount": 2834142,
+              "median": 0.0001999999999497959
+            }
+          ]
+        },
+        {
+          "fullName": "tests/perf/audit/crisis-detect.bench.ts > crisisDetector.detect — §2 short crisis text",
+          "benchmarks": [
+            {
+              "id": "-1221789046_1_0",
+              "name": "detect on ~24-char crisis string returns crisis-detected",
+              "rank": 1,
+              "rme": 0.41201329423966804,
+              "samples": [],
+              "totalTime": 500.0000999993165,
+              "min": 0,
+              "max": 0.5612999999998465,
+              "hz": 9106348.178742813,
+              "period": 0.00010981350376370697,
+              "mean": 0.00010981350376370697,
+              "variance": 2.4262533940865404e-7,
+              "sd": 0.0004925701365375839,
+              "sem": 2.308399154983933e-7,
+              "df": 4553174,
+              "critical": 1.96,
+              "moe": 4.5244623437685084e-7,
+              "p75": 0.00010000000020227162,
+              "p99": 0.00029999999992469384,
+              "p995": 0.0003000000001520675,
+              "p999": 0.0003999999998995918,
+              "sampleCount": 4553175,
+              "median": 0.00009999999997489795
+            }
+          ]
+        },
+        {
+          "fullName": "tests/perf/audit/crisis-detect.bench.ts > crisisDetector.detect — §3 long clean text",
+          "benchmarks": [
+            {
+              "id": "-1221789046_2_0",
+              "name": "detect on ~5 KB clean narrative returns no-crisis",
+              "rank": 1,
+              "rme": 0.580106959748832,
+              "samples": [],
+              "totalTime": 500.02280000001974,
+              "min": 0.026499999999941792,
+              "max": 0.370600000000195,
+              "hz": 33732.4617997406,
+              "period": 0.0296450346831102,
+              "mean": 0.0296450346831102,
+              "variance": 0.0001298511438191857,
+              "sd": 0.01139522460591215,
+              "sem": 0.00008774128031463131,
+              "df": 16866,
+              "critical": 1.96,
+              "moe": 0.00017197290941667738,
+              "p75": 0.02750000000014552,
+              "p99": 0.0749999999998181,
+              "p995": 0.0874999999996362,
+              "p999": 0.1906000000003587,
+              "sampleCount": 16867,
+              "median": 0.027299999999740976
+            }
+          ]
+        },
+        {
+          "fullName": "tests/perf/audit/crisis-detect.bench.ts > crisisDetector.detect — §4 long text with crisis at end (worst case)",
+          "benchmarks": [
+            {
+              "id": "-1221789046_3_0",
+              "name": "detect on ~5 KB narrative with crisis at end returns crisis-detected",
+              "rank": 1,
+              "rme": 0.6994853064882418,
+              "samples": [],
+              "totalTime": 500.00779999996803,
+              "min": 0.0161999999991167,
+              "max": 0.4677999999998974,
+              "hz": 53919.158861125215,
+              "period": 0.01854628338278813,
+              "mean": 0.01854628338278813,
+              "variance": 0.0001181078381094637,
+              "sd": 0.010867743008990583,
+              "sem": 0.0000661880240623844,
+              "df": 26959,
+              "critical": 1.96,
+              "moe": 0.00012972852716227343,
+              "p75": 0.01710000000002765,
+              "p99": 0.044200000000273576,
+              "p995": 0.060099999999692955,
+              "p999": 0.2235000000000582,
+              "sampleCount": 26960,
+              "median": 0.01680000000033033
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

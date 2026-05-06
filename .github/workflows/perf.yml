@@ -1,0 +1,104 @@
+# Telecheck — performance benchmarks workflow
+#
+# Sprint 11 / TLC-023b. Closes the second + third of OR-218's three
+# closure conditions (per tests/perf/README.md):
+#   2. `npm run bench` wired into CI
+#   3. Baseline comparison output (vitest bench --compare) detects
+#      regressions across PRs
+#
+# v0.1 posture (Sprint 11):
+#   - `continue-on-error: true` — warn-only at first landing
+#   - 3-5 stable runs needed before TLC-023c flips to required-blocking
+#
+# Per `tests/perf/README.md:24-30` the v0.1 → required-blocking transition
+# is gradual by design. Day-1 blocking would re-introduce the flake-induced
+# merge friction the scaffold was built to avoid.
+#
+# Why a separate workflow (not extending ci.yml):
+#   - Bench job needs no Postgres service container (pure-function bench
+#     corpus per tests/perf/README.md)
+#   - Different concurrency posture (one bench run per PR is sufficient)
+#   - Different timeout characteristics (bench iterations sample for
+#     fixed time per scenario, not pass/fail)
+#
+# Spec references:
+#   - ORT v1.5 OR-218 (Tier 1 launch-blocking; verified at
+#     Telecheck_Operational_Readiness_Todo_v1_5.md:129)
+#   - tests/perf/README.md (operating model + closure path)
+#   - I-019 (crisis detection — the bench target)
+
+name: Performance benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# One bench run per PR HEAD; cancel superseded runs.
+concurrency:
+  group: perf-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Run benchmarks + threshold check + baseline comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Sprint 11 / TLC-023b: warn-only landing. TLC-023c flips to false
+    # after 3-5 stable runs measure CI-runner variance distribution.
+    continue-on-error: true
+
+    env:
+      # Stub values for env validation (config.ts requires DATABASE_URL +
+      # REDIS_URL but the bench harness doesn't touch them — pure-function
+      # bench corpus per tests/perf/README.md).
+      NODE_ENV: test
+      DATABASE_URL: postgres://x:y@localhost:5432/z
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run benchmarks (capture output JSON)
+        run: |
+          npx vitest bench --run -c vitest.bench.config.ts \
+            --outputJson tests/perf/bench-output.json
+
+      - name: Threshold check
+        run: |
+          npx tsx tests/perf/check-thresholds.ts \
+            tests/perf/bench-output.json
+
+      - name: Baseline comparison
+        # `vitest bench --compare <baseline-file>` runs the benches AGAIN
+        # and prints relative deltas vs the committed baseline. Useful as
+        # PR-review signal even when the threshold check passes (catches
+        # gradual drift that hasn't yet breached the threshold).
+        run: |
+          npx vitest bench --run -c vitest.bench.config.ts \
+            --compare tests/perf/baseline.json
+        continue-on-error: true
+
+      - name: Upload bench output as artifact
+        # Bench JSON is artifact-attached for post-mortem investigation.
+        # No fixed retention beyond the GH default (90 days).
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output-${{ github.run_id }}
+          path: tests/perf/bench-output.json
+          retention-days: 30

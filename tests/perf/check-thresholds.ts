@@ -92,22 +92,26 @@ const THRESHOLDS: readonly ScenarioThreshold[] = [
 // Vitest bench JSON shape (per `vitest bench --outputJson` output)
 // ---------------------------------------------------------------------------
 
+/**
+ * Vitest 2.1 outputJson shape: latency percentiles are reported
+ * DIRECTLY on the benchmark task object, not nested under `.result`.
+ * Fields verified against actual `tests/perf/baseline.json` produced
+ * by `vitest bench --outputJson` 2026-05-05.
+ */
 interface BenchTaskResult {
   name: string;
-  result?: {
-    /** Mean operations per second. */
-    hz?: number;
-    /** Latency stats in milliseconds. */
-    min?: number;
-    max?: number;
-    mean?: number;
-    p75?: number;
-    p99?: number;
-    p995?: number;
-    p999?: number;
-    /** p95 isn't always reported by Vitest 2; fallback to p99 if absent. */
-    p95?: number;
-  };
+  /** Mean operations per second (ops/sec). */
+  hz?: number;
+  /** Latency stats in milliseconds. */
+  min?: number;
+  max?: number;
+  mean?: number;
+  p75?: number;
+  p99?: number;
+  p995?: number;
+  p999?: number;
+  /** p95 isn't always reported by Vitest 2; fallback to p99 if absent. */
+  p95?: number;
 }
 
 interface BenchFileResult {
@@ -171,13 +175,13 @@ function flattenTasks(output: BenchOutput): BenchTaskResult[] {
 function p95OrConservativeFallback(
   task: BenchTaskResult,
 ): { value: number; source: 'p95' | 'p99-fallback' } | null {
-  if (task.result?.p95 !== undefined) {
-    return { value: task.result.p95, source: 'p95' };
+  if (task.p95 !== undefined) {
+    return { value: task.p95, source: 'p95' };
   }
-  if (task.result?.p99 !== undefined) {
+  if (task.p99 !== undefined) {
     // p99 over-strict; over-flagging is safe. Sprint 12+ may revisit
     // if false-positive flake rate becomes problematic.
-    return { value: task.result.p99, source: 'p99-fallback' };
+    return { value: task.p99, source: 'p99-fallback' };
   }
   return null;
 }
