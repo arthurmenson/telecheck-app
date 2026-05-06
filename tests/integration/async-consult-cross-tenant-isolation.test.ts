@@ -29,7 +29,9 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
-import { asTenantId } from '../../src/lib/glossary.ts';
+import { config } from '../../src/lib/config.ts';
+import { asTenantId, type TenantId } from '../../src/lib/glossary.ts';
+import { issueAccessToken } from '../../src/lib/jwt.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import * as consultService from '../../src/modules/async-consult/internal/services/consult-service.ts';
@@ -87,6 +89,31 @@ async function seedAccount(ctx: TenantContext, phonePrefix: string): Promise<Acc
     ),
   );
   return accountId;
+}
+
+/**
+ * Mint a JWT access token for a seeded patient account. Sprint 21 /
+ * TLC-040 closure: replaces the legacy `x-actor-id` header stub that
+ * stopped working when the auth-context plugin migrated to JWT-based
+ * auth (per Identity & Authentication Spec v1.0 §3.3). Tests that
+ * exercise HTTP handlers requiring `requireActorContext()` MUST mint
+ * a token via this helper and pass it as `Authorization: Bearer
+ * <token>`.
+ *
+ * Uses `issueAccessToken` directly (no OTP/login round-trip) since
+ * the goal here is to authenticate as a known patient for the
+ * handler-precedence test, not to exercise the full auth flow.
+ */
+function mintTokenForAccount(tenantId: TenantId, accountId: AccountId): string {
+  return issueAccessToken(
+    {
+      account_id: accountId,
+      tenant_id: tenantId,
+      session_id: ulid(),
+      country_of_care: tenantId === T_US ? 'US' : 'GH',
+    },
+    config.jwtSigningKey,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -300,14 +327,20 @@ describe('async-consult HTTP — §3 handler-level tenant-blind 404 (I-025)', ()
     );
 
     // Patient B (same tenant, different patient) attempts to read A's
-    // events via the HTTP handler. Pre-auth header stub set so
-    // requireActorContext + requireTenantContext both succeed.
+    // events via the HTTP handler. Sprint 21 / TLC-040: mint a JWT for
+    // patient B (auth-context plugin migrated from x-actor-id header
+    // stubs to JWT-based auth per Identity Spec v1.0 §3.3). Auth
+    // succeeds (token belongs to a real same-tenant account); the
+    // 404 must come from the SERVICE LAYER's
+    // ConsultPatientOwnershipError (mapped to tenant-blind 404 per
+    // I-025), not from auth.
+    const tokenB = mintTokenForAccount(T_US, patientB);
     const r = await app!.inject({
       method: 'GET',
       url: `/v0/async-consult/${consultA.consult_id}/events`,
       headers: {
         host: 'heroshealth.com',
-        'x-actor-id': patientB,
+        authorization: `Bearer ${tokenB}`,
       },
     });
 
@@ -335,13 +368,15 @@ describe('async-consult HTTP — §3 handler-level tenant-blind 404 (I-025)', ()
       ),
     );
 
-    // Patient B abandons A's consult via HTTP — must 404, not 403
+    // Patient B abandons A's consult via HTTP — must 404, not 403.
+    // Sprint 21 / TLC-040: JWT auth migration (see §3a comment).
+    const tokenB = mintTokenForAccount(T_US, patientB);
     const r = await app!.inject({
       method: 'POST',
       url: `/v0/async-consult/${consultA.consult_id}/abandon`,
       headers: {
         host: 'heroshealth.com',
-        'x-actor-id': patientB,
+        authorization: `Bearer ${tokenB}`,
       },
     });
 
