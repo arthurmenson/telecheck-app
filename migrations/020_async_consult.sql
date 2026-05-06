@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS consults (
     -- patient_id references the patient's Account row (per CDM §4.6 /
     -- Identity Slice PRD); operator-facing identifier. Not nullable —
     -- every consult is tied to a patient.
+    --
+    -- Composite FK against (accounts.tenant_id, accounts.account_id) —
+    -- per Codex async-consult-r1 HIGH closure 2026-05-05. Enforces at
+    -- the DB layer that a consult can only be created against a patient
+    -- in the SAME tenant; prevents cross-tenant patient binding even
+    -- when the cross-tenant attacker knows a patient_id from another
+    -- tenant. accounts has the matching UNIQUE (tenant_id, account_id)
+    -- per migration 012:181 explicitly added "for downstream composite-
+    -- FK pattern" — this is exactly that pattern in use.
     patient_id                          VARCHAR(26) NOT NULL,
 
     -- Consult type discriminator per PRD §1 / §2:
@@ -109,13 +118,37 @@ CREATE TABLE IF NOT EXISTS consults (
     current_program_catalog_entry_id    VARCHAR(26) NULL,
 
     -- Forms-Intake dependency: populated at INTAKE → SUBMITTED transition.
-    -- References forms_submission(id) per migration 010 (forms-intake
-    -- submission table). FK constraint deferred to SI-005 closure to
-    -- avoid coupling against placeholder column shape.
+    -- References forms_submission per migration 006 (forms-intake
+    -- submission table). The forms_submission PK is `submission_id`.
+    --
+    -- Composite FK against (forms_submission.tenant_id,
+    -- forms_submission.submission_id) — per Codex async-consult-r1
+    -- MEDIUM closure 2026-05-05. Enforces at the DB layer that a
+    -- consult can only reference an intake submission in the SAME
+    -- tenant. forms_submission has the matching UNIQUE constraint
+    -- per migration 006:503.
     intake_form_submission_id           VARCHAR(26) NULL,
 
     created_at                          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at                          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at                          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Composite UNIQUE per Codex async-consult-r1 HIGH closure 2026-05-05.
+    -- Enables consult_events.consult_id composite FK against
+    -- (consults.tenant_id, consults.id) so events cannot reference a
+    -- consult from a different tenant even if the consult's id is known.
+    -- Mirror of the migration 012:181 "downstream composite-FK pattern".
+    UNIQUE (tenant_id, id),
+
+    -- Composite FK on patient ownership (cross-tenant patient binding
+    -- prevention).
+    FOREIGN KEY (tenant_id, patient_id)
+        REFERENCES accounts (tenant_id, account_id),
+
+    -- Composite FK on intake form submission (cross-tenant intake
+    -- binding prevention; nullable so applies only when populated at
+    -- the INTAKE → SUBMITTED transition).
+    FOREIGN KEY (tenant_id, intake_form_submission_id)
+        REFERENCES forms_submission (tenant_id, submission_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_consults_tenant
@@ -166,11 +199,21 @@ CREATE TABLE IF NOT EXISTS consult_events (
 
     -- v0.1 placeholder columns; SI-005 resume gate
 
-    consult_id  VARCHAR(26)  NOT NULL REFERENCES consults(id),
+    -- consult_id references the parent consult.
+    --
+    -- Composite FK (tenant_id, consult_id) → consults (tenant_id, id)
+    -- per Codex async-consult-r1 HIGH closure 2026-05-05. Without the
+    -- composite FK, a tenant-A insert could write a consult_event
+    -- referencing tenant-B's consult by knowing the consult id — RLS
+    -- on consult_events.tenant_id would still pass, corrupting the
+    -- consult lifecycle history. Composite FK makes this structurally
+    -- impossible at the DB layer.
+    consult_id  VARCHAR(26)  NOT NULL,
 
     -- Denormalized tenant_id for RLS scoping (avoids cross-table join in
-    -- policy expression). Application layer + RLS enforce that this
-    -- matches the parent consult's tenant_id.
+    -- policy expression). The composite FK below structurally enforces
+    -- that this matches the parent consult's tenant_id — defense in
+    -- depth alongside the application layer + RLS WITH CHECK.
     tenant_id   TEXT         NOT NULL REFERENCES tenants(id),
 
     -- Event discriminator. Sprint 9 emits:
@@ -197,7 +240,11 @@ CREATE TABLE IF NOT EXISTS consult_events (
     -- need structured detail.
     metadata    JSONB        NULL,
 
-    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- Composite FK enforces same-tenant relationship to the parent
+    -- consult (Codex async-consult-r1 HIGH closure 2026-05-05).
+    FOREIGN KEY (tenant_id, consult_id) REFERENCES consults (tenant_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_consult_events_consult

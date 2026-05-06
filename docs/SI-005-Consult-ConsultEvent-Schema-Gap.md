@@ -77,7 +77,7 @@ When SI-005 closes:
 -- v0.1 placeholder columns; SI-005 resume gate
 id                              VARCHAR(26)  PRIMARY KEY
 tenant_id                       TEXT         NOT NULL REFERENCES tenants(id)
-patient_id                      VARCHAR(26)  NOT NULL  -- FK to accounts(id) (operator-facing patient identifier)
+patient_id                      VARCHAR(26)  NOT NULL
 consult_type                    VARCHAR(50)  NOT NULL CHECK (...)  -- 'program' | 'general'
 modality                        VARCHAR(20)  NOT NULL CHECK (...)  -- 'async' | 'sync' (per PRD §1; ADR-012 conversion)
 state                           VARCHAR(30)  NOT NULL CHECK (...)  -- CONSULT_STATES enum (17 values)
@@ -85,6 +85,15 @@ current_program_catalog_entry_id VARCHAR(26) NULL  -- nullable; PRD §15 depende
 intake_form_submission_id       VARCHAR(26)  NULL  -- nullable; PRD §15 dependency on Forms-Intake; populated at INTAKE → SUBMITTED
 created_at                      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 updated_at                      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+
+-- Codex async-consult-r1 HIGH closure 2026-05-05: composite UNIQUE +
+-- composite FKs structurally enforce same-tenant relationships at the
+-- DB layer. NOT placeholders — these are permanent cross-tenant safety
+-- guarantees that any future SI-005 column-set ratification must preserve.
+UNIQUE (tenant_id, id)
+FOREIGN KEY (tenant_id, patient_id) REFERENCES accounts (tenant_id, account_id)
+FOREIGN KEY (tenant_id, intake_form_submission_id)
+    REFERENCES forms_submission (tenant_id, submission_id)
 ```
 
 ## Placeholder column set (Sprint 9 / TLC-021a — `consult_events` table)
@@ -92,15 +101,32 @@ updated_at                      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 ```sql
 -- v0.1 placeholder columns; SI-005 resume gate
 id          VARCHAR(26)  PRIMARY KEY
-consult_id  VARCHAR(26)  NOT NULL REFERENCES consults(id)
+consult_id  VARCHAR(26)  NOT NULL  -- composite FK below; not bare REFERENCES
 tenant_id   TEXT         NOT NULL REFERENCES tenants(id)  -- denormalized for RLS
-event_type  VARCHAR(80)  NOT NULL  -- e.g. 'state_transition', 'audit_emit'
+event_type  VARCHAR(80)  NOT NULL  -- e.g. 'state_transition'
 from_state  VARCHAR(30)  NULL  -- nullable for non-transition events
 to_state    VARCHAR(30)  NULL  -- nullable for non-transition events
 actor_id    VARCHAR(26)  NULL  -- nullable for system-generated events
 metadata    JSONB        NULL  -- nullable; per-event detail
 created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+
+-- Codex async-consult-r1 HIGH closure 2026-05-05: composite FK to
+-- consults (tenant_id, id). Without this, a tenant-A insert could
+-- write a consult_event referencing tenant-B's consult by knowing the
+-- consult id — RLS on consult_events.tenant_id would still pass,
+-- corrupting the consult lifecycle history. Composite FK makes this
+-- structurally impossible.
+FOREIGN KEY (tenant_id, consult_id) REFERENCES consults (tenant_id, id)
 ```
+
+## Cross-tenant safety constraints (NOT placeholders; permanent)
+
+The composite UNIQUE + 3 composite FKs added at Sprint 9 / TLC-021a Codex async-consult-r1 HIGH closure are NOT placeholders. They are permanent cross-tenant safety guarantees that must survive SI-005 column-set ratification. Any future migration that expands the column set MUST preserve them:
+
+1. `consults UNIQUE (tenant_id, id)` — required to support consult_events composite FK
+2. `consults FK (tenant_id, patient_id) → accounts (tenant_id, account_id)` — patient ownership cross-tenant binding prevention
+3. `consults FK (tenant_id, intake_form_submission_id) → forms_submission (tenant_id, submission_id)` — intake binding cross-tenant prevention
+4. `consult_events FK (tenant_id, consult_id) → consults (tenant_id, id)` — event history cross-tenant prevention
 
 ## Sprint reference
 
