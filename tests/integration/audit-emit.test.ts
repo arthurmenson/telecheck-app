@@ -711,10 +711,15 @@ describe('emitAudit — hash chain envelope construction', () => {
     const uniqueTenantStr = `Telecheck-Test${randomSuffix}`;
     const uniqueTenant: TenantId = asTenantId(uniqueTenantStr);
     const client = getTestClient();
+    // r3 (Sprint 30 corrective): the r2 INSERT used `consumer_dba: $1`
+    // (= the tenant id) which violated the
+    // `consumer_dba_starts_heros_health` CHECK constraint
+    // (migrations/001_tenants.sql) requiring consumer_dba LIKE
+    // 'Heros Health%'. Use a constraint-compliant value.
     await client.query(
       `INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain, country_of_care, kms_key_alias, status, activated_at)
-       VALUES ($1, $1, $1, 'Test Genesis', $1, 'US', 'alias/test-genesis-key', 'active', NOW())`,
-      [uniqueTenantStr],
+       VALUES ($1, $1, $2, 'Test Genesis', $3, 'US', 'alias/test-genesis-key', 'active', NOW())`,
+      [uniqueTenantStr, `Heros Health Test ${randomSuffix}`, `${randomSuffix}.test.example`],
     );
     const expectedGenesis = computeGenesisHashHex(`${uniqueTenantStr}:PLATFORM`);
     const uniqueResource = `cfg_genesis_${Math.random().toString(36).slice(2, 12)}`;
