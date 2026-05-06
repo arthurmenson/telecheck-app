@@ -135,7 +135,11 @@ describe('tenant-config admin-write — §1 PATCH /v0/admin/tenant-brand', () =>
     const r = await app!.inject({
       method: 'PATCH',
       url: '/v0/admin/tenant-brand',
-      headers: { host: 'heroshealth.com', authorization: `Bearer ${token}` },
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
       payload: { brand_name: 'Should Not Be Accepted' },
     });
     expect(r.statusCode).toBe(503);
@@ -153,7 +157,11 @@ describe('tenant-config admin-write — §2 PATCH /v0/admin/ccr-configs/:configK
     const r = await app!.inject({
       method: 'PATCH',
       url: '/v0/admin/ccr-configs/some.key',
-      headers: { host: 'heroshealth.com', authorization: `Bearer ${token}` },
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
       payload: { config_value: { ignored: true } },
     });
     expect(r.statusCode).toBe(503);
@@ -171,7 +179,11 @@ describe('tenant-config admin-write — §3 POST /v0/admin/adapter-configs', () 
     const r = await app!.inject({
       method: 'POST',
       url: '/v0/admin/adapter-configs',
-      headers: { host: 'heroshealth.com', authorization: `Bearer ${token}` },
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
       payload: {
         adapter_type: 'pharmacy',
         adapter_name: 'truepill',
@@ -199,7 +211,11 @@ describe('tenant-config admin-write — §4 PATCH /v0/admin/adapter-configs/:ada
     const r = await app!.inject({
       method: 'PATCH',
       url: `/v0/admin/adapter-configs/${ulid()}`,
-      headers: { host: 'heroshealth.com', authorization: `Bearer ${token}` },
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
       payload: { status: 'inactive' },
     });
     expect(r.statusCode).toBe(503);
@@ -217,7 +233,11 @@ describe('tenant-config admin-write — §5 DELETE /v0/admin/adapter-configs/:ad
     const r = await app!.inject({
       method: 'DELETE',
       url: `/v0/admin/adapter-configs/${ulid()}`,
-      headers: { host: 'heroshealth.com', authorization: `Bearer ${token}` },
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
     });
     expect(r.statusCode).toBe(503);
     expect503Envelope(r.json<ErrorEnvelope>());
@@ -259,7 +279,7 @@ describe('tenant-config admin-write — §7 JWT auth gate fires before 503', () 
     const r = await app!.inject({
       method: 'PATCH',
       url: '/v0/admin/tenant-brand',
-      headers: { host: 'heroshealth.com' },
+      headers: { host: 'heroshealth.com', 'idempotency-key': ulid() },
       payload: { brand_name: 'X' },
     });
     expect(r.statusCode).toBe(401);
