@@ -15,9 +15,22 @@
  *
  * The `--self-test` flag exercises the manifest-check + threshold logic
  * against synthetic fixtures (good case + missing-scenario case + tail-
- * percentile-missing case). Codex perf-bench-r4 escalation closure
- * (Sprint 13 / TLC-026) — gives the gate-correctness logic explicit
- * test coverage without requiring a full Postgres test setup.
+ * percentile-missing case + malformed values).
+ *
+ * Codex perf-bench-r5 MEDIUM closure (Sprint 13 fix-forward 2026-05-05):
+ * the gate logic after JSON parsing is extracted as a pure function
+ * `runGate(tasks): GateResult` so `main()` AND `selfTest()` exercise the
+ * SAME gate semantics. Earlier Sprint 13 implementation (`4380a73`)
+ * had selfTest() calling `verifyManifestCoverage()` and
+ * `p95OrConservativeFallback()` directly, which Codex correctly flagged
+ * as the same closure-path-overclaim class as r2/r3/r4: enforceable-
+ * looking CI coverage that doesn't actually guard the advertised
+ * failure mode (manifest-before-threshold ordering + threshold-loop
+ * fail-on-no-data behavior). Fix-forward: §A/§B/§C/§D fixtures now
+ * drive synthetic bench output through runGate() and assert the
+ * GateResult shape, including §B's "manifestFailed=true AND
+ * thresholdResults.length==0" assertion that proves missing scenarios
+ * short-circuit BEFORE the threshold loop runs.
  *
  * Why a separate script (vs vitest assertion):
  *   Vitest's bench() doesn't natively support assertions. The
@@ -295,101 +308,333 @@ function verifyManifestCoverage(
 }
 
 // ---------------------------------------------------------------------------
+// Gate function (pure; drives both main() and selfTest())
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-threshold result shape. Captures every branch in the gate's
+ * decision so selfTest() can assert against them without re-implementing
+ * gate semantics.
+ */
+type ThresholdStatus = 'ok' | 'breach' | 'no-data' | 'no-task';
+
+interface ThresholdResult {
+  threshold: ScenarioThreshold;
+  status: ThresholdStatus;
+  /** Set when status is 'ok' or 'breach' (we successfully measured a value). */
+  valueMicros?: number;
+  /** Set when status is 'ok' or 'breach'. */
+  source?: 'p95' | 'p99-fallback';
+}
+
+/**
+ * Gate verdict. Returned by runGate() so main() can format it for CI
+ * stdout/stderr AND selfTest() can assert against it.
+ *
+ * Critical invariant for Codex perf-bench-r5 closure:
+ *   manifestFailed === true  =>  thresholdResults.length === 0
+ * (i.e., when manifest coverage fails, the per-threshold loop is
+ * SHORT-CIRCUITED. selfTest §B asserts this — proves the
+ * manifest-before-threshold ordering claim is enforced, not just
+ * documented.)
+ */
+interface GateResult {
+  coverage: ManifestCoverageResult;
+  manifestFailed: boolean;
+  thresholdResults: readonly ThresholdResult[];
+  breached: number;
+  matched: number;
+  exitCode: 0 | 1;
+}
+
+/**
+ * Pure gate function. Takes the flattened bench tasks; returns a
+ * structured verdict. Does NOT log to stdout/stderr — caller decides
+ * formatting.
+ *
+ * Codex perf-bench-r5 closure (Sprint 13 fix-forward 2026-05-05):
+ * extracting this from main() lets selfTest() exercise the SAME gate
+ * semantics CI uses, so a future regression that reorders or weakens
+ * the gate is caught by --self-test before bench harness runs.
+ */
+function runGate(tasks: readonly BenchTaskResult[]): GateResult {
+  const expected = getExpectedScenarios();
+  const coverage = verifyManifestCoverage(tasks, expected);
+
+  // Manifest-before-threshold short-circuit. If any expected scenario
+  // is missing, the threshold loop does NOT run.
+  if (coverage.missing > 0) {
+    return {
+      coverage,
+      manifestFailed: true,
+      thresholdResults: [],
+      breached: 0,
+      matched: 0,
+      exitCode: 1,
+    };
+  }
+
+  const thresholdResults: ThresholdResult[] = [];
+  let breached = 0;
+  let matched = 0;
+
+  for (const threshold of THRESHOLDS) {
+    const task = tasks.find((t) => t.name.includes(threshold.taskNameMatch));
+    if (task === undefined) {
+      // Should be unreachable because the manifest check above already
+      // guarantees every threshold has a matching task. Defensive in
+      // case THRESHOLDS expands without manifest sync.
+      thresholdResults.push({ threshold, status: 'no-task' });
+      breached += 1;
+      continue;
+    }
+    matched += 1;
+
+    const result = p95OrConservativeFallback(task);
+    if (result === null) {
+      thresholdResults.push({ threshold, status: 'no-data' });
+      breached += 1;
+      continue;
+    }
+
+    const valueMicros = result.value * 1000;
+    if (valueMicros > threshold.p95MaxMicros) {
+      thresholdResults.push({
+        threshold,
+        status: 'breach',
+        valueMicros,
+        source: result.source,
+      });
+      breached += 1;
+    } else {
+      thresholdResults.push({
+        threshold,
+        status: 'ok',
+        valueMicros,
+        source: result.source,
+      });
+    }
+  }
+
+  return {
+    coverage,
+    manifestFailed: false,
+    thresholdResults,
+    breached,
+    matched,
+    exitCode: breached > 0 ? 1 : 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Self-test (--self-test flag)
 // ---------------------------------------------------------------------------
 
 /**
- * Lightweight self-test exercising:
- *   §A good case — all expected scenarios present + p99 within limits → pass
- *   §B missing-scenario case — synthetic output missing §3 long clean →
- *      manifest-check fails the gate even before threshold-check loops
- *   §C tail-percentile-missing case — task present but no p95/p99 →
- *      threshold-check fails the gate via "neither p95 nor p99 data"
+ * Self-test driving synthetic bench output through runGate() — the
+ * same function main() calls. Per Codex perf-bench-r5 MEDIUM closure
+ * (Sprint 13 fix-forward 2026-05-05): earlier r4 closure had selfTest
+ * calling helper functions in isolation, which is hollow-coverage —
+ * a future regression that reorders main()'s gate calls would not
+ * be caught. Fix-forward exercises runGate() so the gate semantics
+ * CI relies on are the gate semantics --self-test asserts.
  *
- * No Postgres / file I/O required. Runs entirely off in-memory fixtures.
- * Codex perf-bench-r4 closure: gives the gate-correctness logic explicit
- * test coverage without expanding the test infra investment.
+ * Sections:
+ *   §A good case — all 8 expected scenarios present + p99 within limits
+ *      → manifestFailed=false, breached=0, matched=8, exitCode=0
+ *   §B missing-scenario case — drop §3 long clean from input
+ *      → manifestFailed=true, thresholdResults.length=0, exitCode=1
+ *      (CRITICAL: short-circuit means the threshold loop did NOT run)
+ *   §C tail-percentile-missing — task present, no p95/p99
+ *      → manifestFailed=false, status='no-data' for that scenario,
+ *      breached>=1, exitCode=1
+ *   §D malformed values — null / NaN / negative p99
+ *      → same as §C: status='no-data' (isValidLatencyNumber rejects),
+ *      breached>=1, exitCode=1
+ *
+ * Runs entirely off in-memory fixtures. No Postgres / file I/O.
  */
 function selfTest(): number {
   const expected = getExpectedScenarios();
 
-  // §A — good case
+  // §A — good case: all 8 scenarios present, p99=1μs (well under limits)
   const goodTasks: BenchTaskResult[] = expected.map((s) => ({
     name: `bench harness: ${s.taskNameMatch}`,
-    p99: 0.001, // 1μs — well under all thresholds
+    p99: 0.001, // 1μs in milliseconds
   }));
-  const goodCoverage = verifyManifestCoverage(goodTasks, expected);
-  if (goodCoverage.missing !== 0) {
+  const goodResult = runGate(goodTasks);
+  if (goodResult.manifestFailed) {
     console.error(
-      `SELF-TEST §A FAIL: good case had ${goodCoverage.missing} missing; expected 0`,
+      `SELF-TEST §A FAIL: good case had manifestFailed=true; expected false`,
+    );
+    return 1;
+  }
+  if (goodResult.breached !== 0) {
+    console.error(
+      `SELF-TEST §A FAIL: good case had breached=${goodResult.breached}; expected 0`,
+    );
+    return 1;
+  }
+  if (goodResult.matched !== expected.length) {
+    console.error(
+      `SELF-TEST §A FAIL: good case had matched=${goodResult.matched}; expected ${expected.length}`,
+    );
+    return 1;
+  }
+  if (goodResult.thresholdResults.length !== expected.length) {
+    console.error(
+      `SELF-TEST §A FAIL: good case had thresholdResults.length=${goodResult.thresholdResults.length}; expected ${expected.length}`,
+    );
+    return 1;
+  }
+  if (goodResult.exitCode !== 0) {
+    console.error(
+      `SELF-TEST §A FAIL: good case exitCode=${goodResult.exitCode}; expected 0`,
     );
     return 1;
   }
 
-  // §B — missing-scenario case (drop §3 long clean from the input)
+  // §B — missing-scenario case: drop §3 long clean. The CRITICAL
+  // assertion is that the threshold loop did NOT run (short-circuit).
+  // This is what proves manifest-before-threshold ordering, not just
+  // that the helper reports a missing label.
   const missingTasks = goodTasks.filter(
     (t) => !t.name.includes('detect on ~5 KB clean narrative returns no-crisis'),
   );
-  const missingCoverage = verifyManifestCoverage(missingTasks, expected);
-  if (missingCoverage.missing !== 1) {
+  const missingResult = runGate(missingTasks);
+  if (!missingResult.manifestFailed) {
     console.error(
-      `SELF-TEST §B FAIL: missing-scenario case had ${missingCoverage.missing} missing; expected 1`,
+      `SELF-TEST §B FAIL: missing-scenario case had manifestFailed=false; expected true`,
+    );
+    return 1;
+  }
+  if (missingResult.thresholdResults.length !== 0) {
+    console.error(
+      `SELF-TEST §B FAIL: missing-scenario case had thresholdResults.length=${missingResult.thresholdResults.length}; ` +
+        `expected 0 (manifest fail must short-circuit before threshold loop)`,
+    );
+    return 1;
+  }
+  if (missingResult.coverage.missing !== 1) {
+    console.error(
+      `SELF-TEST §B FAIL: missing-scenario case had coverage.missing=${missingResult.coverage.missing}; expected 1`,
     );
     return 1;
   }
   if (
-    !missingCoverage.missingLabels.some((l) =>
+    !missingResult.coverage.missingLabels.some((l) =>
       l.includes('crisis-detect: long clean text'),
     )
   ) {
     console.error(
-      `SELF-TEST §B FAIL: missing-scenario label list didn't include the dropped scenario`,
+      `SELF-TEST §B FAIL: missingLabels did not include the dropped scenario`,
     );
     return 1;
   }
-
-  // §C — tail-percentile-missing case (task present but no p95/p99)
-  const tailMissingTask: BenchTaskResult = {
-    name: 'bench harness: detect on ~35-char clean string returns no-crisis',
-    // No p95, no p99 — should fail per p95OrConservativeFallback contract
-  };
-  const tailFallback = p95OrConservativeFallback(tailMissingTask);
-  if (tailFallback !== null) {
+  if (missingResult.exitCode !== 1) {
     console.error(
-      `SELF-TEST §C FAIL: p95OrConservativeFallback should return null when both p95 + p99 are missing; got ${JSON.stringify(tailFallback)}`,
+      `SELF-TEST §B FAIL: missing-scenario exitCode=${missingResult.exitCode}; expected 1`,
     );
     return 1;
   }
 
-  // §D — runtime-validation rejection of malformed values (Codex
-  // perf-yml-r1 MEDIUM closure — verify isValidLatencyNumber rejects
-  // null / NaN / strings / negative numbers)
-  const malformedNullTask: BenchTaskResult = {
-    name: 'bench harness: detect on ~24-char crisis string returns crisis-detected',
-    p99: null as unknown as number,
-  };
-  if (p95OrConservativeFallback(malformedNullTask) !== null) {
-    console.error('SELF-TEST §D FAIL: p99: null should not pass validation');
+  // §C — tail-percentile-missing: all scenarios present (manifest OK),
+  // but §1's task has no p95 + no p99. Threshold loop runs (manifest
+  // didn't short-circuit) and the no-data branch fires for §1.
+  const tailMissingTasks: BenchTaskResult[] = expected.map((s, idx) => ({
+    name: `bench harness: ${s.taskNameMatch}`,
+    // §1 (idx 0) has no p99/p95; rest have p99=1μs
+    ...(idx === 0 ? {} : { p99: 0.001 }),
+  }));
+  const tailResult = runGate(tailMissingTasks);
+  if (tailResult.manifestFailed) {
+    console.error(
+      `SELF-TEST §C FAIL: tail-missing case had manifestFailed=true; expected false (manifest OK; only tail-data missing)`,
+    );
     return 1;
   }
-  const malformedNanTask: BenchTaskResult = {
-    name: 'bench harness: detect on ~24-char crisis string returns crisis-detected',
-    p99: Number.NaN,
-  };
-  if (p95OrConservativeFallback(malformedNanTask) !== null) {
-    console.error('SELF-TEST §D FAIL: p99: NaN should not pass validation');
+  if (tailResult.thresholdResults.length !== expected.length) {
+    console.error(
+      `SELF-TEST §C FAIL: tail-missing case had thresholdResults.length=${tailResult.thresholdResults.length}; expected ${expected.length} (threshold loop must run)`,
+    );
     return 1;
   }
-  const malformedNegativeTask: BenchTaskResult = {
-    name: 'bench harness: detect on ~24-char crisis string returns crisis-detected',
-    p99: -1,
-  };
-  if (p95OrConservativeFallback(malformedNegativeTask) !== null) {
-    console.error('SELF-TEST §D FAIL: p99: -1 should not pass validation');
+  const noDataResults = tailResult.thresholdResults.filter(
+    (r) => r.status === 'no-data',
+  );
+  if (noDataResults.length !== 1) {
+    console.error(
+      `SELF-TEST §C FAIL: expected exactly 1 'no-data' threshold result; got ${noDataResults.length}`,
+    );
+    return 1;
+  }
+  if (
+    noDataResults[0]?.threshold.taskNameMatch !==
+    'detect on ~35-char clean string returns no-crisis'
+  ) {
+    console.error(
+      `SELF-TEST §C FAIL: 'no-data' result fired for wrong scenario: ${noDataResults[0]?.threshold.label}`,
+    );
+    return 1;
+  }
+  if (tailResult.breached < 1) {
+    console.error(
+      `SELF-TEST §C FAIL: tail-missing case had breached=${tailResult.breached}; expected >= 1`,
+    );
+    return 1;
+  }
+  if (tailResult.exitCode !== 1) {
+    console.error(
+      `SELF-TEST §C FAIL: tail-missing exitCode=${tailResult.exitCode}; expected 1`,
+    );
     return 1;
   }
 
-  console.log('SELF-TEST PASS: §A good / §B missing-scenario / §C tail-missing / §D malformed-values all behave correctly');
+  // §D — malformed values: §2's p99 is null/NaN/negative across 3
+  // sub-fixtures. isValidLatencyNumber must reject all three;
+  // p95OrConservativeFallback returns null; runGate emits 'no-data'.
+  for (const malformed of [null as unknown as number, Number.NaN, -1]) {
+    const malformedTasks: BenchTaskResult[] = expected.map((s, idx) => ({
+      name: `bench harness: ${s.taskNameMatch}`,
+      // §2 (idx 1) has the malformed p99
+      ...(idx === 1 ? { p99: malformed } : { p99: 0.001 }),
+    }));
+    const malResult = runGate(malformedTasks);
+    if (malResult.manifestFailed) {
+      console.error(
+        `SELF-TEST §D FAIL: malformed=${String(malformed)} had manifestFailed=true; expected false`,
+      );
+      return 1;
+    }
+    const malNoData = malResult.thresholdResults.filter(
+      (r) => r.status === 'no-data',
+    );
+    if (malNoData.length !== 1) {
+      console.error(
+        `SELF-TEST §D FAIL: malformed=${String(malformed)} expected 1 'no-data'; got ${malNoData.length}`,
+      );
+      return 1;
+    }
+    if (
+      malNoData[0]?.threshold.taskNameMatch !==
+      'detect on ~24-char crisis string returns crisis-detected'
+    ) {
+      console.error(
+        `SELF-TEST §D FAIL: malformed=${String(malformed)} 'no-data' fired for wrong scenario: ${malNoData[0]?.threshold.label}`,
+      );
+      return 1;
+    }
+    if (malResult.exitCode !== 1) {
+      console.error(
+        `SELF-TEST §D FAIL: malformed=${String(malformed)} exitCode=${malResult.exitCode}; expected 1`,
+      );
+      return 1;
+    }
+  }
+
+  console.log(
+    'SELF-TEST PASS: §A good / §B missing-scenario short-circuits / §C tail-missing / §D malformed-values — all drive runGate() and assert gate semantics',
+  );
   return 0;
 }
 
@@ -440,17 +685,18 @@ function main(): number {
     return 1;
   }
 
-  // Manifest-coverage check (Sprint 13 / TLC-026): runs BEFORE the
-  // per-threshold loop so missing scenarios fail the gate explicitly,
-  // not as a side effect of the threshold-loop's "no matching bench
-  // task" path.
+  // Run the gate. Same function selfTest() exercises — see Codex
+  // perf-bench-r5 closure rationale at top of file.
+  const result = runGate(tasks);
   const expected = getExpectedScenarios();
-  const coverage = verifyManifestCoverage(tasks, expected);
-  if (coverage.missing > 0) {
+
+  // Manifest-coverage failure: short-circuited; threshold loop did
+  // NOT run. Format + return.
+  if (result.manifestFailed) {
     console.error(
-      `MANIFEST COVERAGE FAILURE: ${coverage.missing}/${expected.length} expected scenarios missing from bench output:`,
+      `MANIFEST COVERAGE FAILURE: ${result.coverage.missing}/${expected.length} expected scenarios missing from bench output:`,
     );
-    for (const label of coverage.missingLabels) {
+    for (const label of result.coverage.missingLabels) {
       console.error(`  - ${label}`);
     }
     console.error(
@@ -458,60 +704,54 @@ function main(): number {
         'every required scenario. This typically means a bench file was ' +
         'deleted, renamed, or the bench runner crashed mid-execution.',
     );
-    return 1;
+    return result.exitCode;
   }
 
-  let breached = 0;
-  let matched = 0;
-  for (const threshold of THRESHOLDS) {
-    const task = tasks.find((t) => t.name.includes(threshold.taskNameMatch));
-    if (task === undefined) {
-      // Should be unreachable due to manifest coverage check above,
-      // but defensive in case THRESHOLDS expands without manifest sync.
+  // Per-threshold formatting.
+  for (const tr of result.thresholdResults) {
+    if (tr.status === 'no-task') {
       console.error(
-        `Threshold ${threshold.label}: no matching bench task (looking for "${threshold.taskNameMatch}")`,
+        `Threshold ${tr.threshold.label}: no matching bench task (looking for "${tr.threshold.taskNameMatch}")`,
       );
-      breached += 1;
       continue;
     }
-    matched += 1;
-
-    const result = p95OrConservativeFallback(task);
-    if (result === null) {
+    if (tr.status === 'no-data') {
       console.error(
-        `Threshold ${threshold.label}: bench task "${task.name}" has neither p95 nor p99 data — failing gate`,
+        `Threshold ${tr.threshold.label}: bench task has neither p95 nor p99 data — failing gate`,
       );
-      breached += 1;
       continue;
     }
-
-    const valueMicros = result.value * 1000;
-    const sourceLabel = result.source === 'p95' ? 'p95' : 'p99 (over-strict fallback; p95 missing)';
-    if (valueMicros > threshold.p95MaxMicros) {
+    const sourceLabel =
+      tr.source === 'p95'
+        ? 'p95'
+        : 'p99 (over-strict fallback; p95 missing)';
+    const valueMicros = tr.valueMicros ?? 0;
+    if (tr.status === 'breach') {
       console.error(
-        `THRESHOLD BREACH ${threshold.label}: ${sourceLabel} ${valueMicros.toFixed(2)}μs > limit ${threshold.p95MaxMicros}μs`,
+        `THRESHOLD BREACH ${tr.threshold.label}: ${sourceLabel} ${valueMicros.toFixed(2)}μs > limit ${tr.threshold.p95MaxMicros}μs`,
       );
-      breached += 1;
     } else {
       console.log(
-        `OK ${threshold.label}: ${sourceLabel} ${valueMicros.toFixed(2)}μs <= limit ${threshold.p95MaxMicros}μs`,
+        `OK ${tr.threshold.label}: ${sourceLabel} ${valueMicros.toFixed(2)}μs <= limit ${tr.threshold.p95MaxMicros}μs`,
       );
     }
   }
 
-  if (matched < THRESHOLDS.length) {
+  if (result.matched < THRESHOLDS.length) {
     console.error(
-      `Matched ${matched}/${THRESHOLDS.length} thresholds — ` +
-        `${THRESHOLDS.length - matched} bench task(s) not found in output`,
+      `Matched ${result.matched}/${THRESHOLDS.length} thresholds — ` +
+        `${THRESHOLDS.length - result.matched} bench task(s) not found in output`,
     );
   }
 
-  if (breached > 0) {
-    console.error(`\n${breached} threshold breach(es) — failing CI gate`);
-    return 1;
+  if (result.breached > 0) {
+    console.error(`\n${result.breached} threshold breach(es) — failing CI gate`);
+    return result.exitCode;
   }
-  console.log(`\nAll ${THRESHOLDS.length} thresholds passed (manifest coverage: ${coverage.matched}/${expected.length} scenarios verified)`);
-  return 0;
+  console.log(
+    `\nAll ${THRESHOLDS.length} thresholds passed (manifest coverage: ${result.coverage.matched}/${expected.length} scenarios verified)`,
+  );
+  return result.exitCode;
 }
 
 process.exit(main());
