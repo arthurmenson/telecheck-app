@@ -27,10 +27,30 @@
 
 -- Step 1: Drop RLS policies. Both tables use the standard `tenant_isolation`
 -- name (matches the 19+ other tenant-scoped tables — see Sprint 6 / TLC-016
--- RLS policy coverage lockdown). DROP POLICY IF EXISTS implicitly handles
--- table-not-present (PG raises a notice but doesn't abort).
-DROP POLICY IF EXISTS tenant_isolation ON consult_events;
-DROP POLICY IF EXISTS tenant_isolation ON consults;
+-- RLS policy coverage lockdown).
+--
+-- Note (Codex async-consult-r5 HIGH closure 2026-05-05): DROP POLICY
+-- IF EXISTS guards the POLICY name, not the target table — if the table
+-- is missing (partial-apply state), the statement aborts before the
+-- guarded trigger/table cleanup at Steps 2-3 can run. Universal rule
+-- for migration rollbacks: ANY operation against a table (DROP POLICY,
+-- DROP TRIGGER, ALTER TABLE DROP CONSTRAINT, etc.) requires a
+-- to_regclass() existence check in rollback contexts. DROP TABLE IF
+-- EXISTS itself is the only table-targeting statement that's
+-- table-existence-safe by default.
+DO $$
+BEGIN
+    IF to_regclass('consult_events') IS NOT NULL THEN
+        DROP POLICY IF EXISTS tenant_isolation ON consult_events;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF to_regclass('consults') IS NOT NULL THEN
+        DROP POLICY IF EXISTS tenant_isolation ON consults;
+    END IF;
+END$$;
 
 -- Step 2: Drop triggers + trigger functions. DROP TRIGGER IF EXISTS
 -- aborts if the table is missing (same hazard as constraint DROPs);
