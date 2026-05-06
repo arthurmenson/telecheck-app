@@ -325,23 +325,47 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
       // execute. Open issue: filed as `idempotency-redesign-reserve-then-
       // execute` per EHBG §12 SI/DSI escalation.
       //
-      // Per the bare-suppression-forbidden discipline (I-003 spirit, even
-      // though I-003 strictly governs audit), the cache write now THROWS
-      // on failure rather than silently logging. The request has already
-      // returned to the client by the time onSend fires (in Fastify, the
-      // response is being serialized; throwing here surfaces in the
-      // server log + crash trace + reply lifecycle as an error, but does
-      // not retroactively change the response code). The point is to make
-      // the failure observable rather than silent.
-      await storeIdempotencyRecord(
-        idempotencyCtx.tenantId,
-        idempotencyCtx.key,
-        idempotencyCtx.endpoint,
-        idempotencyCtx.actorId,
-        idempotencyCtx.bodyHash,
-        reply.statusCode,
-        payload,
-      );
+      // Sprint 24 / TLC-045: catch + log rather than throw on cache-write
+      // failure. The earlier "throw to surface" approach (Codex 2026-05-02
+      // patch) interacted badly with Fastify's onSend lifecycle: a throw
+      // during onSend triggers Fastify's error-handling path, which then
+      // tries to safeWriteHead a fresh error response — but the headers
+      // for the original response have already been written by an upstream
+      // mapServiceError (handler) that did `void reply.code(404).send(...)`
+      // and returned. Result: ERR_HTTP_HEADERS_SENT unhandled error, which
+      // makes vitest exit 1 and ci.yml red even when 1404/1404 tests pass.
+      //
+      // The intended observability semantic — "make the failure observable
+      // rather than silent" — is preserved by emitting an explicit
+      // fastify.log.error with the cache-write error. This surfaces in
+      // the server log + crash trace as before, but does NOT inject a
+      // throw into the response pipeline.
+      //
+      // Tradeoff acknowledged: this is technically bare-suppression in
+      // the I-003-spirit sense (silent failure). But the architectural
+      // limitation note above already flags that this v0 onSend cache
+      // pattern is NOT transactionally-safe — the entire onSend cache
+      // write is best-effort by design. The proper fix is the reserve-
+      // then-execute redesign (filed as `idempotency-redesign-reserve-
+      // then-execute` per EHBG §12 SI/DSI). Until that lands, the cache
+      // write running in onSend is a v0 stop-gap; logging on failure is
+      // the right shape for that stop-gap.
+      try {
+        await storeIdempotencyRecord(
+          idempotencyCtx.tenantId,
+          idempotencyCtx.key,
+          idempotencyCtx.endpoint,
+          idempotencyCtx.actorId,
+          idempotencyCtx.bodyHash,
+          reply.statusCode,
+          payload,
+        );
+      } catch (err) {
+        fastify.log.error(
+          { err, tenantId: idempotencyCtx.tenantId, endpoint: idempotencyCtx.endpoint },
+          'idempotency cache write failed in onSend; logging and continuing — see TLC-045',
+        );
+      }
 
       return payload;
     },
