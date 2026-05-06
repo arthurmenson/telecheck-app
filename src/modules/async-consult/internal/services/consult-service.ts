@@ -157,6 +157,30 @@ export class PaymentNotVerifiedError extends Error {
 }
 
 /**
+ * Thrown when the AI Service slice is not yet authored. Per Codex
+ * async-consult-r11 HIGH closure 2026-05-05: `process` is fail-closed
+ * at v0.1 because it lacks an authorization gate (AI Service slice
+ * doesn't exist yet to validate service-actor role). Mirrors the
+ * startIntake pattern (fail-closed pending SI-006). SI-007 candidate
+ * filed when AI Service slice authoring begins.
+ *
+ * The exported service function exists so the eventual AI Service
+ * caller has a stable target; until then it unconditionally throws.
+ * Operators advance consults via direct DB during testing.
+ */
+export class AiServiceNotWiredError extends Error {
+  constructor(public readonly consultId: ConsultId) {
+    super(
+      `AI Service slice not yet authored — process transition ` +
+        `is fail-closed at v0.1 (consult ${consultId}). The exported ` +
+        `service function awaits SI-007 (AI Service slice authoring + ` +
+        `service-account RBAC integration).`,
+    );
+    this.name = 'AiServiceNotWiredError';
+  }
+}
+
+/**
  * Thrown when a forms_submission referenced for binding is not in a
  * terminal status (must be 'submitted' or 'completed' — not
  * 'in_progress' or 'paused'). Per Codex async-consult-r9 HIGH closure
@@ -606,71 +630,42 @@ export async function resume(
 }
 
 /**
- * SUBMITTED → PROCESSING on `process` event (no guard).
+ * SUBMITTED → PROCESSING on `process` event.
  *
- * **System/operational transition** — NOT a patient action. Triggered
- * by the AI service when it picks up a SUBMITTED consult for processing
+ * **FAIL-CLOSED at v0.1** per Codex async-consult-r11 HIGH closure
+ * 2026-05-05. This transition is a system/operational action triggered
+ * by the AI Service when it picks up a SUBMITTED consult for processing
  * (per State Machines v1.1 §3 row 6 + PRD §1: "AI Mode 2 prepares
- * clinical summary"). Per Codex async-consult-r10 HIGH closure
- * 2026-05-05: this transition does NOT enforce patient ownership —
- * a worker / clinician / AI service actor invoking it cannot be
- * required to "be" the patient.
+ * clinical summary"). The AI Service slice does NOT exist yet at v0.1.
  *
- * Sprint 10 v0.1 simplification: actor is recorded as a system actor
- * (not validated against consult.patient_id). Sprint 11+ adds explicit
- * RBAC role check ('platform_ai_safety' or 'system_worker') when
- * the AI service ships.
+ * Without an AI Service slice + service-account RBAC integration, this
+ * function has no way to validate that the caller is authorized to
+ * advance any consult into PROCESSING. Earlier rounds attempted:
+ *   r10: removed patient ownership (rightly — process is system, not
+ *        patient action) but left no auth gate.
+ *   r11: still has no auth gate — exported state-mutating function
+ *        any caller can invoke with arbitrary actorId.
  *
- * No HTTP route exposes this transition at v0.1. The handler surface
- * for `POST /v0/async-consult/:id/process` is intentionally OMITTED
- * — process is internal, not a user-facing operation. AI service
- * (when authored) calls this service function directly with a
- * service-account actor.
+ * Same pattern as startIntake (fail-closed pending SI-006 Payment).
+ * `process` is fail-closed pending SI-007 (AI Service slice authoring).
+ * The exported function exists so the eventual AI Service caller has
+ * a stable target; until SI-007 closes, it unconditionally throws.
+ *
+ * No HTTP route exposes this transition at v0.1 (process is internal,
+ * not user-facing). Handler-layer integration tests use direct DB
+ * seeding to advance consults to PROCESSING for testing the next
+ * transitions; service callers unconditionally hit AiServiceNotWiredError.
  */
 export async function process(
-  ctx: TenantContext,
-  actor: { actorId: string },
+  _ctx: TenantContext,
+  _actor: { actorId: string },
   consultId: ConsultId,
-  externalTx?: DbTransaction,
+  _externalTx?: DbTransaction,
 ): Promise<Consult> {
-  return withTransaction(async (tx) => {
-    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
-
-    const current = await consultRepo.findConsultById(ctx.tenantId, consultId, tx);
-    if (current === null) throw new ConsultNotFoundError(consultId);
-
-    // No assertConsultOwnership — process is a system/operational
-    // transition. The audit chain records actor.actorId (the AI service
-    // actor or worker actor) for forensic traceability.
-
-    const guardCtx: GuardContext = { event: 'process', guard: {} };
-    const toState = validateTransition(current.state, 'process', guardCtx);
-
-    const updated = await consultRepo.updateConsultState(
-      {
-        consult_id: consultId,
-        tenant_id: ctx.tenantId,
-        to_state: toState,
-        expected_from_state: current.state,
-      },
-      tx,
-    );
-    if (updated === null) throw new ConsultStateConflictError(consultId);
-
-    await consultEventRepo.createStateTransitionEvent(
-      {
-        consult_event_id: asConsultEventId(ulid()),
-        consult_id: consultId,
-        tenant_id: ctx.tenantId,
-        from_state: current.state,
-        to_state: toState,
-        actor_id: actor.actorId,
-      },
-      tx,
-    );
-
-    return updated;
-  }, externalTx);
+  // Fail closed. The AI Service slice does not exist yet; there is
+  // no authorization source-of-truth for this transition. SI-007
+  // resume gate.
+  throw new AiServiceNotWiredError(consultId);
 }
 
 /** AWAITING_DATA → UNDER_REVIEW on `patient_responds` event (no guard). */
