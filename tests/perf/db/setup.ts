@@ -87,6 +87,14 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import pg from 'pg';
+// pg-connection-string is a direct dep of `pg`; `pg.defaults` and the
+// pool both use it internally to parse connection strings. We import
+// it explicitly so the bench-mode collision guard canonicalizes URLs
+// using the SAME parser pg uses to actually connect — closing Codex
+// r12 HIGH 2026-05-06: prior canonicalization used Web URL parser +
+// URLSearchParams.get() (first-wins for duplicates) which diverged
+// from pg's last-wins semantics for ?host= and ?port= overrides.
+import { parse as parsePgConnectionString } from 'pg-connection-string';
 import { afterAll, beforeAll } from 'vitest';
 
 import { setBenchPool, clearBenchPool } from '../../../src/lib/db.ts';
@@ -141,23 +149,36 @@ export function requireBenchDb(): void {
 function canonicalizeDbUrl(url: string | undefined): string | null {
   if (url === undefined || url === '') return null;
   try {
-    const parsed = new URL(url);
-    // r11-2 closure (Codex 2026-05-06): libpq supports query-string
-    // host overrides via `?host=...` (e.g., for unix-socket connections
-    // or alternative resolver paths). The query host SUPERSEDES the
-    // URL hostname when present. The prior canonicalization compared
-    // only `parsed.hostname`, allowing a bench URL with `?host=/var/run/
-    // postgresql` to canonicalize differently from a TCP DATABASE_URL
-    // that points at the same physical DB.
+    // r12 closure (Codex 2026-05-06): use the SAME parser pg actually
+    // uses to connect (pg-connection-string). This handles:
+    //   - Last-wins for duplicate ?host= and ?port= query params
+    //     (`URLSearchParams.get()` is first-wins; diverges from pg)
+    //   - ?port= override of the URL port (prior canonicalization
+    //     ignored query-port entirely)
+    //   - IPv6 brackets, percent-encoded hosts, socket-host forms
+    //   - All cases the Web URL parser missed
     //
-    // Fix: when ?host= is set, use it (lowercased) instead of
-    // parsed.hostname. This matches libpq's actual connection target
-    // selection.
-    const queryHost = parsed.searchParams.get('host');
-    const host = (queryHost ?? parsed.hostname).toLowerCase();
-    const port = parsed.port === '' ? '5432' : parsed.port;
-    // pathname is "/dbname"; strip leading slash; lowercase.
-    const dbname = decodeURIComponent(parsed.pathname.replace(/^\//, '')).toLowerCase();
+    // Trajectory of the same finding-class:
+    //   r10-C (Sprint 14): string-equality bypassed by any URL-form
+    //     difference → fixed via Web URL parser canonicalization
+    //   r11-2 (Sprint 17 r1): ignored ?host= query-host → fixed by
+    //     reading searchParams.get('host')
+    //   r12 (Sprint 17 r2): URLSearchParams first-wins diverged from
+    //     pg's last-wins; ?port= ignored → fixed via pg-connection-
+    //     string parser (this commit)
+    const cfg = parsePgConnectionString(url);
+    if (cfg.host === undefined || cfg.host === null) {
+      // pg won't connect either; treat as unparseable.
+      return null;
+    }
+    const host = String(cfg.host).toLowerCase();
+    const port =
+      cfg.port === null || cfg.port === undefined ? '5432' : String(cfg.port);
+    const dbname = (
+      cfg.database === null || cfg.database === undefined
+        ? ''
+        : String(cfg.database)
+    ).toLowerCase();
     return `${host}:${port}/${dbname}`;
   } catch {
     return null;
