@@ -60,15 +60,20 @@ import { describe, expect, it } from 'vitest';
 import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
-// The 21 tenant-scoped tables that MUST have RLS enabled + a tenant policy.
-// Verified at the SM verification gate (Sprint 6 PM kickoff) via
-// `grep "CREATE POLICY.*ON " migrations/*.sql` returning exactly these 21
-// distinct tables.
+// The 23 tenant-scoped tables that MUST have RLS enabled + a tenant policy.
+//
+// Initial inventory (21 tables): verified at the Sprint 6 PM kickoff via
+// `grep "CREATE POLICY.*ON " migrations/*.sql`.
+//
+// Sprint 9 / TLC-021a addition (+2 tables): `consults` + `consult_events`
+// from migration 020_async_consult.sql. Per the lockdown's design, intentional
+// schema additions UPDATE this list (and the count); unintentional changes
+// (drops, renames, missed RLS-attachment) trigger the §2 count drift test.
 //
 // If a future migration adds a tenant-scoped table, it MUST be added here
-// AND the migration MUST attach a tenant-isolation policy. The count
-// assertion at §2 catches the latter; this list catches the former at
-// the per-table assertions in §1.
+// AND the migration MUST attach a tenant-isolation policy. The §2 count
+// assertion catches the latter; this list catches the former at the
+// per-table assertions in §1.
 // ---------------------------------------------------------------------------
 const TENANT_SCOPED_TABLES = [
   'accounts',
@@ -78,6 +83,8 @@ const TENANT_SCOPED_TABLES = [
   'ccr_configs',
   'consent',
   'consent_versions',
+  'consult_events',
+  'consults',
   'delegation_scopes',
   'delegations',
   'domain_events_outbox',
