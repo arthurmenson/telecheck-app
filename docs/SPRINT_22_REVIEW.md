@@ -1,13 +1,17 @@
 # Sprint 22 Review — Telecheck-app autonomous build
 
+> **Note (Sprint 30 cleanup, 2026-05-06):** This sprint review was authored by an autonomous Claude agent and self-graded "FULL ACCEPTANCE." It was not independently reviewed at the time of merge. Cumulative state claims (test counts, finding counts, CI status, milestone declarations) reflect the agent's view at write time; subsequent independent review (Agent X + Codex, Sprint 30) found that several propagate stale state across sprints and that "fully green ci.yml" momentarily true at write time has been undermined by later flake findings (see `docs/TLC-050-Audit-Emit-Platform-Genesis-Flake.md`). Body retained as the agent's contemporaneous account; ceremonial closure language softened per PROJECT_CONVENTIONS §5.12 retroactive cleanup.
+
+---
+
 **Sprint:** 22
-**Sprint goal:** TLC-040 §3b + TLC-041 §1-7 + §7a — investigate shared `expected 400 to be ___` symptom and land single fix-forward — **FULL ACCEPTANCE.**
+**Sprint goal:** TLC-040 §3b + TLC-041 §1-7 + §7a — investigate shared `expected 400 to be ___` symptom and land single fix-forward — agent-graded ACCEPTANCE (pending external review).
 **Sprint start commit:** `f3cb207` (Sprint 21 close).
 **Sprint end commit:** `<this commit>` (Sprint 22 close on `feat/sprint-22-close` PR #19).
 **Total commits in sprint:** 2 across 2 PRs (PR #18: `2a748ad` idempotency-header fix; PR #19: this Sprint 22 close commit) of 5 budget = 40% utilization.
 **CI status at sprint end:** PR #18 required CI PASS (verify-metadata + Performance benchmarks). ci.yml `Build, lint, typecheck, test`: 95/101 (vs 93/101 pre-Sprint-22 = **+2 test files**, +8 test cases). All target tests passing.
 
-**ACCEPTANCE: FULL.** Sprint 21's "shared root-cause" hypothesis confirmed: TLC-040 §3b and TLC-041 §1-7 both blocked by the same idempotency middleware returning 400 `internal.idempotency.missing_key` for state-changing requests without `Idempotency-Key` header per IDEMPOTENCY v5.1 contract. ONE investigation + ONE fix closed 8 test cases across 2 files.
+**Sprint outcome (agent-graded; pending external review):** Sprint 21's "shared root-cause" hypothesis confirmed: TLC-040 §3b and TLC-041 §1-7 both blocked by the same idempotency middleware returning 400 `internal.idempotency.missing_key` for state-changing requests without `Idempotency-Key` header per IDEMPOTENCY v5.1 contract. ONE investigation + ONE fix closed 8 test cases across 2 files.
 
 ---
 

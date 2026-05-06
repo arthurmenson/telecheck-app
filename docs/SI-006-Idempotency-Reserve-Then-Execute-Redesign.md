@@ -3,8 +3,14 @@
 **Filed:** 2026-05-06 (Sprint 27 / TLC-046)
 **Filer:** Autonomous-arc Claude session
 **Filed under:** EHBG §12 SI/DSI (Spec Issue / Design Spec Issue) escalation
-**Severity:** ARCHITECTURAL LIMITATION — non-blocking at v0; blocking before first slice with serious concurrent-write semantics
+**Severity:** ARCHITECTURAL LIMITATION — blocking before any slice with patient-visible state mutation (Sprint 30 corrected scope; see "Severity / blocking conditions" below)
 **Owner:** Engineering Lead (per EHBG §12 default ownership for SI/DSI)
+**Revision history:**
+- v0.1 (2026-05-06, Sprint 27 / TLC-046): initial filing
+- **v0.2 (2026-05-06, Sprint 30 corrections):** three corrections per Agent X / Codex Sprint 30 SME advisory:
+  1. Removed false claim that `processing_state` column "needs verification" — the column already exists in `migrations/005_idempotency_keys.sql:77-84` with the correct CHECK constraint
+  2. Filled in the duplicate-key handling pseudocode that v0.1 glossed over (Postgres aborted-tx semantics + recommended approach)
+  3. Reframed the gate: the redesign is BLOCKING before any patient-visible state-mutating slice (not just Pharmacy); Async-Consult and Consent already past that line
 
 ---
 
@@ -105,10 +111,42 @@ Sprint 22 (TLC-040 §3b + TLC-041) closed test-side gaps where state-changing te
 - **`src/lib/idempotency.ts`:** the v0 plugin's preHandler + onSend hooks must be removed or repurposed. The plugin should still parse the header, validate format, and short-circuit on cache replay (read-only); but the cache WRITE must move into handlers.
 - **Each state-changing handler:** must wrap business logic in a transaction that:
   1. INSERTs into `idempotency_keys` with `processing_state='pending'` as first statement
-  2. Handles duplicate-key error: lookup existing → either replay (completed) or 409 (pending)
+  2. Handles duplicate-key (4-tuple unique) outcome: lookup existing → either replay (completed) or 409 (pending). See "Duplicate-key handling" below for the Postgres semantics that the naive INSERT-then-catch pattern fails on.
   3. Runs business logic
   4. UPDATEs `idempotency_keys` to `processing_state='completed'` as last statement before COMMIT
-- **`migrations/`:** add `processing_state` column to `idempotency_keys` if not already present (currently per migration 005 the schema uses `response_status` directly — needs verification).
+- **`migrations/`:** the `processing_state` column already exists in `migrations/005_idempotency_keys.sql:77-84` with `CHECK (processing_state IN ('pending', 'completed'))` and `DEFAULT 'pending'`. No schema migration required for the redesign. (v0.1 of this doc incorrectly listed this as needing verification; corrected in v0.2.)
+
+### Duplicate-key handling (Sprint 30 / v0.2 expansion)
+
+The naive shape — `try { INSERT } catch (e) { if e.code === '23505' { SELECT existing } }` — does NOT work in Postgres. When an INSERT raises `unique_violation`, the surrounding transaction enters an **aborted state** in which subsequent statements (including the SELECT meant to fetch the existing row) fail with `current transaction is aborted, commands ignored until end of transaction block`. This is documented Postgres behavior; `tests/setup.ts:397-411` already encounters and handles the same condition for unrelated reasons.
+
+**Recommended approach (use this):**
+
+```sql
+-- Single statement; no aborted-tx hazard:
+INSERT INTO idempotency_keys (tenant_id, key, endpoint, actor_id, request_hash, processing_state)
+VALUES ($1, $2, $3, $4, decode($5, 'hex'), 'pending')
+ON CONFLICT (tenant_id, key, endpoint, actor_id) DO NOTHING
+RETURNING tenant_id;
+```
+
+If `RETURNING` produces a row → INSERT succeeded → run business logic, then UPDATE `processing_state='completed'`.
+If `RETURNING` produces zero rows → conflict (existing record) → SELECT it in a fresh statement (no aborted tx because the INSERT did not raise; `ON CONFLICT DO NOTHING` is silent):
+
+```sql
+SELECT processing_state, response_status, response_body
+FROM idempotency_keys
+WHERE tenant_id = $1 AND key = $2 AND endpoint = $3 AND actor_id = $4;
+```
+
+If `processing_state='pending'` → 409 (concurrent in-flight request).
+If `processing_state='completed'` → replay cached response.
+
+**Alternative approach (use only if specific need):** wrap the INSERT in a `SAVEPOINT` so the duplicate-key throw is contained and can be caught + recovered. More complex; only justified if you need branch-specific behavior on the conflict (e.g., different error response for body-mismatch vs in-flight).
+
+**Approach NOT recommended for PHI/audit paths:** the `INSERT ... ON CONFLICT (...) DO UPDATE ... RETURNING xmax = 0 AS inserted` "xmax trick" — while clever (`xmax=0` distinguishes inserted vs updated rows), it triggers UPDATE semantics and can interact with row-level triggers in surprising ways. Sprint 30 cross-family review (Codex) flagged this as an anti-pattern in audit-sensitive contexts. Avoid.
+
+**Hard rule for handlers:** if `withIdempotency` throws (handler logic raised an exception that propagated), the surrounding transaction MUST roll back. The handler MUST NOT catch-and-commit after withIdempotency throws — that would leave the `processing_state='pending'` reservation orphaned and block all future requests with the same idempotency key for the 24h TTL window.
 
 ### Testing strategy
 
@@ -118,42 +156,83 @@ Sprint 22 (TLC-040 §3b + TLC-041) closed test-side gaps where state-changing te
 
 ### Helper API (proposal)
 
+v0.1 sketched a helper that returned `T | { __replay: ... }` — a discriminated-union sentinel. Sprint 30 review flagged this as fragile (every call site must type-narrow on the sentinel; easy to forget). v0.2 proposes a thrown-replay pattern that mirrors how Fastify expects errors to propagate:
+
 ```typescript
 // src/lib/idempotency.ts — exposed for handler use after redesign
+
+export class IdempotencyReplayError extends Error {
+  readonly cachedStatus: number;
+  readonly cachedBody: unknown;
+  constructor(status: number, body: unknown) {
+    super('idempotent replay');
+    this.cachedStatus = status;
+    this.cachedBody = body;
+  }
+}
+
+export class IdempotencyInFlightError extends Error {
+  constructor() { super('idempotent request in flight'); }
+}
+
 export async function withIdempotency<T>(
-  client: DbClient,                          // running inside business transaction
-  ctx: { tenantId, idempotencyKey, endpoint, actorId, bodyHash },
+  client: DbClient,           // running inside business transaction
+  ctx: { tenantId: string; idempotencyKey: string; endpoint: string; actorId: string; bodyHash: string },
   body: () => Promise<T>,
-): Promise<T | { __replay: { statusCode: number; body: unknown } }>;
+): Promise<T>;
+// throws:
+//   IdempotencyReplayError       — if existing record has processing_state='completed'
+//   IdempotencyInFlightError     — if existing record has processing_state='pending'
+//   <whatever body() throws>     — propagated; caller's tx should roll back
 ```
 
 Handler usage:
 
 ```typescript
-const result = await db.transaction(async (client) => {
-  return await withIdempotency(client, ctx, async () => {
-    return await consultService.abandon(...);
+try {
+  const result = await db.transaction(async (client) => {
+    return await withIdempotency(client, ctx, async () => {
+      return await consultService.abandon(...);
+    });
   });
-});
-if ('__replay' in result) {
-  return reply.code(result.__replay.statusCode).send(result.__replay.body);
+  return reply.code(200).send(toView(result));
+} catch (err) {
+  if (err instanceof IdempotencyReplayError) {
+    return reply.code(err.cachedStatus).send(err.cachedBody);
+  }
+  if (err instanceof IdempotencyInFlightError) {
+    return reply.code(409).send(makeErrorEnvelope(req.id, 'internal.idempotency.in_flight', 'Request in flight; retry shortly.'));
+  }
+  throw err;
 }
-return reply.code(200).send(toView(result));
 ```
+
+**Carve-outs to document inline in the helper:**
+- `withIdempotency` is for state-changing endpoints only. The plugin still handles GET/HEAD/OPTIONS exemption (`isExempt` at `idempotency.ts:174`); handlers wrapping their state-changing logic in `withIdempotency` don't need to re-check exempt-ness.
+- The helper expects a tenant-bound DB connection (RLS context already set for the tenant). It does NOT call `withTenantBoundConnection` itself — that's the handler's responsibility (and is done by `requireTenantContext` middleware in current handlers).
 
 ---
 
-## Severity / blocking conditions
+## Severity / blocking conditions (v0.2 corrected scope)
 
-**v0 acceptable for:** single-request-at-a-time flows where concurrent same-key requests are rare or the business action is itself idempotent (e.g., authenticated patient creating consults — rare to have concurrent retries within 24h TTL).
+**v0.1 framing was too generous.** v0.1 said the redesign was BLOCKING only before the Pharmacy slice, with v0 "acceptable for" rare-concurrent-retry flows. Sprint 30 cross-family review (Agent X + Codex) flagged that two slices ALREADY in the codebase have patient-visible state mutations:
+
+- **Async-Consult** (e.g., POST /v0/consults/:id/abandon, /resume, /patient-responds — `src/modules/async-consult/internal/handlers/consults.ts`): a patient mobile-app retry could double-emit `consult_abandoned` audit events, polluting the I-003 hash chain and producing two distinct ConsultEvent rows with the same idempotency key. Not as severe as double-charging but corrupts audit-trail linearity.
+- **Consent** (e.g., POST /v0/consents/grant, /revoke — `src/modules/consent/internal/handlers/consents.ts`): concurrent retries could leave consent state ambiguous (one request sees `granted`, the other sees `revoked`).
+
+Both are past the "v0 acceptable" line. The redesign is therefore BLOCKING **before any slice with patient-visible state mutation** — which means it should land **next sprint**, not "before Pharmacy."
+
+**v0 strictly acceptable for:** read-only / GET endpoints (idempotency middleware exempts these per `src/lib/idempotency.ts:174 isExempt`); pre-auth flows that don't mutate persistent state; endpoints whose action is itself naturally idempotent under retry (UPDATE-by-PK to a value the client already chose).
 
 **v0 NOT acceptable for:**
-- Payment processing (concurrent retry could double-charge)
-- Pharmacy / medication-request submission (concurrent retry could create duplicate orders)
+- Async-Consult state transitions (already implemented; should be retrofitted in same sprint as the redesign)
+- Consent grant/revoke (already implemented; same)
+- Payment processing (not yet implemented; concurrent retry could double-charge)
+- Pharmacy / medication-request submission (not yet implemented; concurrent retry could create duplicate orders)
 - Webhook receivers from upstream systems with at-least-once delivery guarantees
 - Any endpoint where the business action mutates external state (third-party API call, message queue publish, etc.)
 
-**Blocking before:** first slice landing serious concurrent-write semantics. Per build sequence (EHBG §10 + ART backlog), Pharmacy + Refill v2.1 slice is the first such slice. **MUST be redesigned before Pharmacy slice lands.**
+**Blocking before:** the next state-mutating slice land OR a slice retrofit pass on Async-Consult + Consent — whichever comes first. **Recommend Sprint 31 scope.**
 
 ---
 
