@@ -103,7 +103,22 @@ Sprint 12 retro recorded this as **the first finding class where iterative fix-f
 
 8 bench scenarios total. Per-scenario p95 thresholds enforced by `tests/perf/check-thresholds.ts` against vitest bench `--outputJson` capture.
 
-**Bench-mode DB-backed corpus** is NOT yet provided at v0.1. Targets that require Postgres (e.g., `emitAudit` hash chain, `withTenantBoundConnection`, idempotency lookup, repo CRUD) are deferred to Sprint 13+ pending bench-mode ephemeral-DB setup investment.
+**Bench-mode DB-backed corpus** infrastructure landed Sprint 14 / TLC-025-SCAFFOLD (`tests/perf/db/setup.ts`); the first DB-backed bench scenario lands Sprint 15+ once CI verifies the scaffold's migration-apply + seed + non-superuser-role wiring works end-to-end against a real Postgres. Until then, targets that require Postgres (`emitAudit` hash chain, `withTenantBoundConnection`, idempotency lookup, repo CRUD) remain "scaffolded; first scenario lands Sprint 15+".
+
+### Running DB-backed benches (Sprint 14 onward)
+
+```bash
+# 1. Provision a dedicated bench Postgres (DO NOT reuse dev or test DB)
+createdb telecheck_bench
+
+# 2. Set BENCH_DATABASE_URL in your .env (or shell env)
+export BENCH_DATABASE_URL=postgresql://telecheck_bench:password@localhost:5432/telecheck_bench
+
+# 3. Run benches as usual
+npm run bench
+```
+
+`tests/perf/db/setup.ts` runs as `setupFiles` only when `BENCH_DATABASE_URL` is set. Without it, only pure-function benches run (crisis-detect, validate-transition); same as Sprint 7-13 behavior. The setup file fail-closes if `BENCH_DATABASE_URL` collides with `DATABASE_URL` or `TEST_DATABASE_URL` (prevent dev/test DB pollution by bench iterations).
 
 ## Per-slice landing pattern
 
@@ -127,8 +142,8 @@ The example bench at `tests/perf/audit/crisis-detect.bench.ts` shows the pattern
 | Surface | Bench-able now? | Why / why not |
 | --- | --- | --- |
 | `crisisDetector.detect` | ✅ yes | Pure function; no DB; hot path; example bench landed |
-| `idempotency.lookupIdempotencyRecord` | ⚠️ partial | DB-backed; needs ephemeral Postgres in bench harness — defer to Sprint 8+ |
-| `emitAudit` (hash chain) | ⚠️ partial | DB-backed for FOR UPDATE serialization — same blocker |
+| `idempotency.lookupIdempotencyRecord` | ⚠️ scaffold landed | Sprint 14 / TLC-025-SCAFFOLD landed `tests/perf/db/setup.ts`; first scenario lands Sprint 15+ post-CI verification |
+| `emitAudit` (hash chain) | ⚠️ scaffold landed | Same — Sprint 14 scaffold; first scenario Sprint 15+ |
 | `tenant-context` resolution | ✅ yes | Pure function (host-header → tenant lookup); host-header parsing benchable now |
 | `errorEnvelope.buildErrorEnvelope` | ✅ yes | Pure function |
 | Per-slice service handlers | ⛔ no until slice ships | E.g., `med-interaction.signal.check` BLOCKED on Med Interaction Engine slice PRD ratification |

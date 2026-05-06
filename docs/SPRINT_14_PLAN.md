@@ -1,7 +1,9 @@
 # Sprint 14 Plan — Telecheck-app autonomous build
 
 **Sprint:** 14
-**Sprint goal:** TLC-025 DB-backed bench infrastructure investment (bench-mode ephemeral Postgres setup + 1 example DB-backed bench scenario). Defer OR-218 execution path to Sprint 15+ pending Evans-side signal on `perf.yml` run accumulation.
+**Sprint goal:** TLC-025-SCAFFOLD: bench-mode ephemeral Postgres setup file infrastructure (NO actual DB-backed bench scenario at Sprint 14 — that requires CI verification of the scaffold first; deferred to Sprint 15+). Defer OR-218 execution path to Sprint 15+ pending Evans-side signal on `perf.yml` run accumulation.
+
+**Scope-narrowing rationale (added 2026-05-05 during execution):** Authoring a DB-backed bench scenario in this autonomous shell would land code that lint+tsc can verify structurally but cannot actually run (no local Postgres in the shell environment). Per Sprint 13 retro's pre-emption pattern — "every layer is a candidate for the same overclaim class" — landing un-runnable bench code risks the same iteration cycle Codex flagged 4 times on TLC-026's enforcement scaffold. Sprint 14 lands the infrastructure (verifiable: lint, tsc, ESLint, schema-shape correctness against existing `tests/setup.ts` patterns) and explicitly hands off the bench-scenario execution to Sprint 15+ once CI validates the scaffold works end-to-end.
 **Sprint start commit:** `fdb464a` (Sprint 13 review/retro filed; TLC-026 closure-path FULLY landed)
 **Commit budget:** 7 (5 estimated × 1.2 slack + 2 fix-forward reserves; framework/perf heuristic per Sprint 13 retro proposed bump from 1.2× / 2-reserves to 1.5× / 4-reserves — going halfway: 1.4× / 2-reserves for this sprint, re-evaluate at Sprint 14 retro)
 **Codex strategy:** FIRE on bench-mode setup landing + 1st DB-backed bench landing; SKIP on doc-only updates. Anticipate iterative findings on schema/connection/teardown patterns per Sprint 13 r5/r6/r7/r8 chain — pre-empt with explicit "is this enforceable code or doc-only-discipline?" check at authoring time.
