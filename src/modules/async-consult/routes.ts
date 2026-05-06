@@ -24,6 +24,15 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import {
+  abandonConsultHandler,
+  initiateConsultHandler,
+  listConsultEventsHandler,
+  patientRespondsConsultHandler,
+  resumeConsultHandler,
+  submitConsultHandler,
+} from './internal/handlers/consults.js';
+
 export const registerAsyncConsultRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
@@ -61,8 +70,21 @@ export const registerAsyncConsultRoutes: FastifyPluginAsync = async (
     });
   });
 
-  // Real routes (POST /v0/async-consult, GET /v0/async-consult/:id, etc.)
-  // land in Sprints 9-10 when the slice authoring continues. The handler
-  // surface is intentionally absent here so that any premature wiring
-  // breaks at typecheck time rather than reaching production half-built.
+  // Sprint 10 / TLC-021e: 6 routes for the supported transitions.
+  //
+  // NOT exposed at v0.1:
+  //   - POST /:id/start-intake (fail-closed pending SI-006 Payment slice)
+  //   - POST /:id/process     (fail-closed pending SI-007 AI Service slice)
+  //
+  // Both transitions exist as exported service functions so the eventual
+  // upstream callers (Payment slice; AI Service slice) have stable
+  // targets, but neither is reachable through HTTP at v0.1 — see Codex
+  // async-consult-r9 / r10 / r11 / r12 closure rationale in
+  // src/modules/async-consult/internal/services/consult-service.ts.
+  app.post('/', initiateConsultHandler);
+  app.post('/:id/submit', submitConsultHandler);
+  app.post('/:id/abandon', abandonConsultHandler);
+  app.post('/:id/resume', resumeConsultHandler);
+  app.post('/:id/patient-responds', patientRespondsConsultHandler);
+  app.get('/:id/events', listConsultEventsHandler);
 };
