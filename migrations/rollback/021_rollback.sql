@@ -12,7 +12,24 @@
 --          NOT roll back this migration without rolling back 020 as well.
 -- =============================================================================
 
-ALTER TABLE consult_events DROP CONSTRAINT IF EXISTS consult_events_tenant_consult_fk;
-ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_intake_fk;
-ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_patient_fk;
-ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_id_id_unique;
+-- to_regclass guards per Codex async-consult-r4 HIGH closure 2026-05-05.
+-- Plain ALTER TABLE ... DROP CONSTRAINT IF EXISTS aborts when the table
+-- itself doesn't exist (IF EXISTS applies to the constraint, not the
+-- table). Wrap in DO blocks with to_regclass() existence checks so this
+-- rollback is safe across partial-apply states.
+
+DO $$
+BEGIN
+    IF to_regclass('consult_events') IS NOT NULL THEN
+        ALTER TABLE consult_events DROP CONSTRAINT IF EXISTS consult_events_tenant_consult_fk;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF to_regclass('consults') IS NOT NULL THEN
+        ALTER TABLE consults DROP CONSTRAINT IF EXISTS consults_tenant_intake_fk;
+        ALTER TABLE consults DROP CONSTRAINT IF EXISTS consults_tenant_patient_fk;
+        ALTER TABLE consults DROP CONSTRAINT IF EXISTS consults_tenant_id_id_unique;
+    END IF;
+END$$;

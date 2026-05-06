@@ -16,28 +16,39 @@
 --   consult_events → consults (FK)
 --   consults       → tenants (001), accounts (012)
 
--- Step 1: Drop named constraints in dependency order — composite FKs
--- before the parent UNIQUE they reference. Per Codex async-consult-r3
--- HIGH closure 2026-05-05: constraints are named in both migration 020
--- inline and migration 021 ALTER, so this rollback's drop-by-name pattern
--- works across both apply paths (fresh-DB + upgraded-DB).
-ALTER TABLE consult_events DROP CONSTRAINT IF EXISTS consult_events_tenant_consult_fk;
-ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_intake_fk;
-ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_patient_fk;
-ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_id_id_unique;
+-- Note on constraint drops (Codex async-consult-r4 HIGH closure 2026-05-05):
+-- Earlier rollback drafts explicitly dropped the named composite UNIQUE +
+-- composite FKs before the table drops. That pattern was unsafe across
+-- partial-apply states because `ALTER TABLE ... DROP CONSTRAINT IF EXISTS`
+-- aborts when the TABLE itself doesn't exist (`IF EXISTS` applies to the
+-- constraint, not the table). DROP TABLE IF EXISTS at Step 4 below handles
+-- constraint cleanup automatically as part of the table teardown — that's
+-- table-existence-safe and matches the migration 019 rollback discipline.
 
--- Step 2: Drop RLS policies. Both tables use the standard `tenant_isolation`
--- name (matches the 19 other tenant-scoped tables — see Sprint 6 / TLC-016
--- RLS policy coverage lockdown).
+-- Step 1: Drop RLS policies. Both tables use the standard `tenant_isolation`
+-- name (matches the 19+ other tenant-scoped tables — see Sprint 6 / TLC-016
+-- RLS policy coverage lockdown). DROP POLICY IF EXISTS implicitly handles
+-- table-not-present (PG raises a notice but doesn't abort).
 DROP POLICY IF EXISTS tenant_isolation ON consult_events;
 DROP POLICY IF EXISTS tenant_isolation ON consults;
 
--- Step 3: Drop triggers + trigger functions.
-DROP TRIGGER IF EXISTS consults_updated_at ON consults;
+-- Step 2: Drop triggers + trigger functions. DROP TRIGGER IF EXISTS
+-- aborts if the table is missing (same hazard as constraint DROPs);
+-- guard with to_regclass per Codex async-consult-r4 HIGH closure.
+DO $$
+BEGIN
+    IF to_regclass('consults') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS consults_updated_at ON consults;
+    END IF;
+END$$;
 
 DROP FUNCTION IF EXISTS consults_set_updated_at();
 
--- Step 4: Drop tables in FK-dependency order.
--- consult_events references consults via FK; must drop first.
+-- Step 3: Drop tables in FK-dependency order.
+-- consult_events references consults via FK; must drop first. DROP TABLE
+-- IF EXISTS cascades constraint cleanup automatically — the named
+-- composite UNIQUE + composite FKs added at TLC-021a fix-forward rounds
+-- get torn down here without needing explicit ALTER TABLE DROP CONSTRAINT
+-- (which would have aborted on missing-table partial-apply states).
 DROP TABLE IF EXISTS consult_events;
 DROP TABLE IF EXISTS consults;
