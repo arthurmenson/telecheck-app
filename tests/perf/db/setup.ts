@@ -142,7 +142,19 @@ function canonicalizeDbUrl(url: string | undefined): string | null {
   if (url === undefined || url === '') return null;
   try {
     const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
+    // r11-2 closure (Codex 2026-05-06): libpq supports query-string
+    // host overrides via `?host=...` (e.g., for unix-socket connections
+    // or alternative resolver paths). The query host SUPERSEDES the
+    // URL hostname when present. The prior canonicalization compared
+    // only `parsed.hostname`, allowing a bench URL with `?host=/var/run/
+    // postgresql` to canonicalize differently from a TCP DATABASE_URL
+    // that points at the same physical DB.
+    //
+    // Fix: when ?host= is set, use it (lowercased) instead of
+    // parsed.hostname. This matches libpq's actual connection target
+    // selection.
+    const queryHost = parsed.searchParams.get('host');
+    const host = (queryHost ?? parsed.hostname).toLowerCase();
     const port = parsed.port === '' ? '5432' : parsed.port;
     // pathname is "/dbname"; strip leading slash; lowercase.
     const dbname = decodeURIComponent(parsed.pathname.replace(/^\//, '')).toLowerCase();
@@ -173,12 +185,28 @@ async function ensureMigrationTrackingTable(client: pg.Client): Promise<void> {
 }
 
 /**
- * Apply each migration file at most once. Per Codex r10-D: NO
- * "already exists" substring matching. If a migration partially
- * applies and throws, its row is NOT inserted, so the next session
- * re-attempts and fails explicitly. This prevents silent full-file
- * skips after a duplicate-object error within a non-idempotent
- * migration.
+ * Apply each migration file at most once, ATOMICALLY (apply + track
+ * in one transaction). Per Codex r11-1 closure (Sprint 17 fix-forward):
+ * the prior implementation ran SQL then INSERTed the tracking row in
+ * SEPARATE statements — a crash between the two left a successful
+ * migration UNTRACKED, and the next session would replay it against
+ * an already-mutated schema (failing on non-idempotent DDL like
+ * CREATE POLICY / CREATE TRIGGER).
+ *
+ * Fix: wrap apply + tracking insert in BEGIN/COMMIT. If apply fails:
+ * ROLLBACK; tracking row not inserted; throw. If tracking insert
+ * fails: ROLLBACK (which also rolls back the apply if migrations are
+ * fully transactional); throw. There's no "applied but untracked"
+ * state.
+ *
+ * Caveat: some migration files contain non-transactional DDL
+ * (e.g., CREATE INDEX CONCURRENTLY). Those will throw inside BEGIN
+ * with a clear "cannot run within transaction" error — which is
+ * correct fail-loud behavior. Sprint 18+ may add a per-migration
+ * "non-transactional" flag if any future migration needs that path.
+ *
+ * Per Codex r10-D (closed Sprint 17 EXECUTE): NO "already exists"
+ * substring matching that would mask non-idempotent DDL skips.
  */
 async function applyMigrationsTracked(client: pg.Client): Promise<void> {
   await ensureMigrationTrackingTable(client);
@@ -198,39 +226,29 @@ async function applyMigrationsTracked(client: pg.Client): Promise<void> {
       continue;
     }
     const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8');
-    // Compute a simple length-based "checksum" — full SHA-256 would be
-    // ideal but the imports here intentionally avoid `crypto` to keep
-    // the setup file self-contained. Length-based detection at least
-    // catches the "the migration file changed but we still skip" case
-    // for future debug; full SHA when this proves a real problem.
     const checksum = `len=${String(sql.length)}`;
 
+    // r11-1 closure: atomic apply+track. BEGIN; SQL; INSERT; COMMIT.
+    // If anything fails: ROLLBACK; throw with context.
+    await client.query('BEGIN');
     try {
       await client.query(sql);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // NO "already exists" swallow. If a migration fails, fail loud
-      // and leave the tracking row un-inserted so the next session
-      // re-attempts.
-      throw new Error(
-        `Bench DB migration ${file} failed: ${message}. ` +
-          `Tracking row NOT inserted; next bench session will re-attempt.`,
-      );
-    }
-
-    // Apply succeeded; record in tracking table. If THIS insert fails
-    // (e.g., concurrent session), the migration ran but isn't tracked
-    // — log + continue rather than fail the whole bench session.
-    try {
       await client.query(
-        'INSERT INTO schema_migrations_bench (filename, checksum_sha) VALUES ($1, $2) ON CONFLICT (filename) DO NOTHING',
+        'INSERT INTO schema_migrations_bench (filename, checksum_sha) VALUES ($1, $2)',
         [file, checksum],
       );
+      await client.query('COMMIT');
     } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // Best-effort rollback; if it also fails, the throw below
+        // surfaces the original error.
+      }
       const message = err instanceof Error ? err.message : String(err);
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[bench setup] migration ${file} applied but tracking-table insert failed: ${message}; continuing`,
+      throw new Error(
+        `Bench DB migration ${file} failed (transactional apply+track): ${message}. ` +
+          `ROLLBACK issued; tracking row NOT inserted; next bench session will re-attempt.`,
       );
     }
   }
@@ -263,6 +281,60 @@ async function seedMinimalTenants(client: pg.Client): Promise<void> {
         'bench files relying on canonical tenants must verify presence',
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Constrained bench-app role (Codex r11-3 closure — Sprint 17 fix-forward)
+//
+// Per Codex r11-3 HIGH 2026-05-06: bench iterations connecting as
+// superuser bypass RLS regardless of `current_tenant_id()` (Postgres
+// kernel rule for SUPERUSER + FORCE ROW LEVEL SECURITY). This means
+// the bench measures a privileged path that does NOT exercise the
+// production RLS-enforcement layer — and could miss real-world overhead.
+//
+// Fix: install a NOLOGIN, NOSUPERUSER, NOBYPASSRLS bench-app role with
+// the same privilege posture as `telecheck_test_app` (per
+// `tests/setup.ts:installTestAppRole()`). Bench iterations issue
+// `SET LOCAL ROLE telecheck_bench_app` inside their transaction so
+// queries run AS that role; RLS applies; emit-audit measures the
+// production-equivalent path.
+//
+// Mirrors `tests/setup.ts:installTestAppRole` deliberately so future
+// changes to one MUST be propagated to the other.
+// ---------------------------------------------------------------------------
+
+const BENCH_APP_ROLE = 'telecheck_bench_app';
+
+async function installBenchAppRole(client: pg.Client): Promise<void> {
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${BENCH_APP_ROLE}') THEN
+        CREATE ROLE ${BENCH_APP_ROLE} NOLOGIN NOSUPERUSER NOBYPASSRLS;
+      END IF;
+    END
+    $$;
+  `);
+
+  await client.query(`GRANT USAGE ON SCHEMA public TO ${BENCH_APP_ROLE}`);
+  await client.query(
+    `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${BENCH_APP_ROLE}`,
+  );
+  await client.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${BENCH_APP_ROLE}`);
+  await client.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${BENCH_APP_ROLE}`);
+
+  // Mirror tests/setup.ts: revoke UPDATE/DELETE on append-only audit_records
+  // (I-003 platform-floor; production privilege posture).
+  await client.query(`REVOKE UPDATE, DELETE ON audit_records FROM ${BENCH_APP_ROLE}`);
+  await client.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'forms_snapshot' AND relkind = 'r') THEN
+        EXECUTE 'REVOKE UPDATE, DELETE ON forms_snapshot FROM ${BENCH_APP_ROLE}';
+      END IF;
+    END
+    $$;
+  `);
 }
 
 // ---------------------------------------------------------------------------
@@ -313,11 +385,30 @@ beforeAll(async () => {
   // Seed canonical operator tenants for bench scenarios that need them.
   await seedMinimalTenants(_benchAdminClient);
 
+  // r11-3 closure: install constrained bench-app role for RLS-applicable
+  // bench iterations. Bench files issue `SET LOCAL ROLE telecheck_bench_app`
+  // inside their transaction to drop privileges from superuser to the
+  // constrained role for the iteration.
+  await installBenchAppRole(_benchAdminClient);
+
   // Install the bench pool override — REAL pg.Pool, not savepoint
   // translation (closes r10-B). Pool config defaults to max=5;
   // bench iterations are sequential so higher max wastes connections.
   setBenchPool({ connectionString, max: 5 });
 });
+
+// ---------------------------------------------------------------------------
+// Public exports for DB-backed bench files
+// ---------------------------------------------------------------------------
+
+/**
+ * Name of the constrained bench-app role created by `installBenchAppRole()`.
+ * DB-backed bench files import this and issue `SET LOCAL ROLE ${BENCH_APP_ROLE_NAME}`
+ * inside their transaction to drop superuser privilege for the iteration —
+ * making RLS apply, matching the production code path measurement
+ * fidelity per Codex r11-3 closure.
+ */
+export const BENCH_APP_ROLE_NAME = BENCH_APP_ROLE;
 
 // ---------------------------------------------------------------------------
 // Vitest afterAll — TRUNCATE accumulated state + close cleanly

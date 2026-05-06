@@ -100,6 +100,20 @@ let _testPoolOverride: pg.Pool | null = null;
  * deployment wants pool.connect() to return a single fixed connection.
  */
 export function setTestPool(client: DbClient): void {
+  // r11-4 closure (Sprint 17 fix-forward 2026-05-06): mutual-exclusion
+  // assertion. A test process operates as EITHER integration mode
+  // (savepoint translation) OR bench mode (real pool); never both.
+  // Calling setTestPool while a bench pool is already installed would
+  // create silent ambiguity — the prior getPool() priority order
+  // returned testPool first, so a bench harness would silently fall
+  // back to savepoint translation, breaking the lock-semantics
+  // guarantee TLC-027 was authored to preserve.
+  if (_benchPoolOverride !== null) {
+    throw new Error(
+      'setTestPool: bench-mode pool is already installed. ' +
+        'Test mode and bench mode are mutually exclusive. Call clearBenchPool() first.',
+    );
+  }
   // Build a structural-typed pool wrapper. We cast to pg.Pool because the
   // app code paths only call `connect()` and the connection's `query` /
   // `release`. Anything else (idleTimeout, on('error'), end()) is noop'd
@@ -286,6 +300,15 @@ export interface BenchPoolConfig {
  * afterAll for cleanup.
  */
 export function setBenchPool(cfg: BenchPoolConfig): pg.Pool {
+  // r11-4 closure (Sprint 17 fix-forward 2026-05-06): mutual-exclusion
+  // assertion against test-mode pool override. See setTestPool() for
+  // rationale.
+  if (_testPoolOverride !== null) {
+    throw new Error(
+      'setBenchPool: integration-test pool is already installed. ' +
+        'Test mode and bench mode are mutually exclusive. Call clearTestPool() first.',
+    );
+  }
   if (_benchPoolOverride !== null) {
     return _benchPoolOverride;
   }
@@ -326,11 +349,17 @@ export async function clearBenchPool(): Promise<void> {
 }
 
 export function getPool(): pg.Pool {
-  if (_testPoolOverride !== null) {
-    return _testPoolOverride;
-  }
+  // r11-4 closure (Sprint 17 fix-forward 2026-05-06): bench pool wins
+  // priority over test pool. Defense-in-depth alongside the mutual-
+  // exclusion check at setter time. If both somehow get installed
+  // (e.g., a future composition error), the bench-mode lock-semantics
+  // guarantee is preserved rather than silently bypassed via savepoint
+  // translation.
   if (_benchPoolOverride !== null) {
     return _benchPoolOverride;
+  }
+  if (_testPoolOverride !== null) {
+    return _testPoolOverride;
   }
   if (_pool === null) {
     _pool = new Pool({

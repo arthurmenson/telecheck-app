@@ -66,12 +66,22 @@ export default defineConfig({
     include: [],
     exclude: ['node_modules', 'dist'],
 
-    // Benchmark configuration: only collect *.bench.ts files under
-    // tests/perf/. The test runner's `include` glob does NOT match
-    // `.bench.ts`, so this is a strict separation.
+    // Benchmark configuration: only collect pure-function bench files
+    // (*.bench.ts) under tests/perf/. DB-backed bench files use the
+    // *.db.bench.ts suffix and are EXCLUDED from this default config —
+    // they require BENCH_DATABASE_URL + a Postgres service container,
+    // and run via a separate workflow / config (perf-db.yml planned
+    // Sprint 18+).
+    //
+    // Sprint 17 / TLC-027 fix-forward (r11-CI-module-load closure):
+    // earlier attempt put emit-audit.bench.ts under the default glob,
+    // which caused vitest to load it (and call requireBenchDb() at
+    // module level) in CI's perf.yml that doesn't set
+    // BENCH_DATABASE_URL — failing the entire bench session. The
+    // .db.bench.ts naming convention separates the two contexts cleanly.
     benchmark: {
       include: ['tests/perf/**/*.bench.ts'],
-      exclude: ['node_modules', 'dist'],
+      exclude: ['node_modules', 'dist', 'tests/perf/**/*.db.bench.ts'],
       reporters: ['default'],
     },
 

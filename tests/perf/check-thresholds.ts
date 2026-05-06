@@ -102,8 +102,7 @@ const THRESHOLDS: readonly ScenarioThreshold[] = [
     label: '§3 crisis-detect: long clean text',
   },
   {
-    taskNameMatch:
-      'detect on ~5 KB narrative with crisis at end returns crisis-detected',
+    taskNameMatch: 'detect on ~5 KB narrative with crisis at end returns crisis-detected',
     p95MaxMicros: 300,
     label: '§4 crisis-detect: long text with crisis at end (worst case)',
   },
@@ -117,34 +116,37 @@ const THRESHOLDS: readonly ScenarioThreshold[] = [
     label: '§5 validateTransition: happy path',
   },
   {
-    taskNameMatch:
-      'validateTransition SUBMITTED + start_intake throws InvalidTransitionError',
+    taskNameMatch: 'validateTransition SUBMITTED + start_intake throws InvalidTransitionError',
     p95MaxMicros: 20,
     label: '§6 validateTransition: InvalidTransitionError',
   },
   {
-    taskNameMatch:
-      'validateTransition INTAKE + abandon (30h) throws GuardNotSatisfiedError',
+    taskNameMatch: 'validateTransition INTAKE + abandon (30h) throws GuardNotSatisfiedError',
     p95MaxMicros: 20,
     label: '§7 validateTransition: GuardNotSatisfiedError',
   },
   {
-    taskNameMatch:
-      'validateTransition QUEUED + claim throws UnsupportedTransitionError',
+    taskNameMatch: 'validateTransition QUEUED + claim throws UnsupportedTransitionError',
     p95MaxMicros: 20,
     label: '§8 validateTransition: UnsupportedTransitionError',
   },
-  // emitAudit DB-backed bench (Sprint 17 / TLC-027 EXECUTE).
-  // Generous initial threshold (50ms) — DB-backed scenarios have
-  // disk + network roundtrip + advisory-lock contention dominating
-  // wall time. Sprint 18+ tightens after CI variance is observed,
-  // per Sprint 13 / TLC-023c §3 threshold-tightening pattern.
-  {
-    taskNameMatch:
-      'emit-audit happy-path single-row append on existing chain',
-    p95MaxMicros: 50000,
-    label: '§9 emit-audit: happy-path single-row append (DB-backed)',
-  },
+  // §9 emit-audit DB-backed bench is REMOVED from THRESHOLDS at Sprint
+  // 17 / TLC-027 fix-forward (Codex r11 closure path). Reason: §9 lives
+  // in tests/perf/audit/emit-audit.db.bench.ts which is excluded from
+  // the default vitest.bench.config.ts glob (only pure-function
+  // *.bench.ts files run by perf.yml; DB-backed *.db.bench.ts files
+  // require BENCH_DATABASE_URL + Postgres service container).
+  //
+  // Sprint 18+ adds §9 back when:
+  //   1. NEW perf-db.yml workflow exists with Postgres service +
+  //      BENCH_DATABASE_URL set
+  //   2. NEW vitest.bench.db.config.ts wires the .db.bench.ts glob
+  //   3. NEW check-thresholds-db.ts (or flag-gated check-thresholds.ts)
+  //      enforces §9 separately from the pure-function gate
+  //
+  // Until then, the canonical perf.yml gate covers 8 pure-function
+  // scenarios; manifest-check helper + self-test continue to verify
+  // those 8.
 ];
 
 // ---------------------------------------------------------------------------
@@ -240,11 +242,7 @@ function flattenTasks(output: BenchOutput): BenchTaskResult[] {
  * negative number.
  */
 function isValidLatencyNumber(value: unknown): value is number {
-  return (
-    typeof value === 'number' &&
-    Number.isFinite(value) &&
-    value >= 0
-  );
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
 function p95OrConservativeFallback(
@@ -475,15 +473,11 @@ function selfTest(): number {
   }));
   const goodResult = runGate(goodTasks);
   if (goodResult.manifestFailed) {
-    console.error(
-      `SELF-TEST §A FAIL: good case had manifestFailed=true; expected false`,
-    );
+    console.error(`SELF-TEST §A FAIL: good case had manifestFailed=true; expected false`);
     return 1;
   }
   if (goodResult.breached !== 0) {
-    console.error(
-      `SELF-TEST §A FAIL: good case had breached=${goodResult.breached}; expected 0`,
-    );
+    console.error(`SELF-TEST §A FAIL: good case had breached=${goodResult.breached}; expected 0`);
     return 1;
   }
   if (goodResult.matched !== expected.length) {
@@ -499,9 +493,7 @@ function selfTest(): number {
     return 1;
   }
   if (goodResult.exitCode !== 0) {
-    console.error(
-      `SELF-TEST §A FAIL: good case exitCode=${goodResult.exitCode}; expected 0`,
-    );
+    console.error(`SELF-TEST §A FAIL: good case exitCode=${goodResult.exitCode}; expected 0`);
     return 1;
   }
 
@@ -533,13 +525,9 @@ function selfTest(): number {
     return 1;
   }
   if (
-    !missingResult.coverage.missingLabels.some((l) =>
-      l.includes('crisis-detect: long clean text'),
-    )
+    !missingResult.coverage.missingLabels.some((l) => l.includes('crisis-detect: long clean text'))
   ) {
-    console.error(
-      `SELF-TEST §B FAIL: missingLabels did not include the dropped scenario`,
-    );
+    console.error(`SELF-TEST §B FAIL: missingLabels did not include the dropped scenario`);
     return 1;
   }
   if (missingResult.exitCode !== 1) {
@@ -570,9 +558,7 @@ function selfTest(): number {
     );
     return 1;
   }
-  const noDataResults = tailResult.thresholdResults.filter(
-    (r) => r.status === 'no-data',
-  );
+  const noDataResults = tailResult.thresholdResults.filter((r) => r.status === 'no-data');
   if (noDataResults.length !== 1) {
     console.error(
       `SELF-TEST §C FAIL: expected exactly 1 'no-data' threshold result; got ${noDataResults.length}`,
@@ -595,9 +581,7 @@ function selfTest(): number {
     return 1;
   }
   if (tailResult.exitCode !== 1) {
-    console.error(
-      `SELF-TEST §C FAIL: tail-missing exitCode=${tailResult.exitCode}; expected 1`,
-    );
+    console.error(`SELF-TEST §C FAIL: tail-missing exitCode=${tailResult.exitCode}; expected 1`);
     return 1;
   }
 
@@ -617,9 +601,7 @@ function selfTest(): number {
       );
       return 1;
     }
-    const malNoData = malResult.thresholdResults.filter(
-      (r) => r.status === 'no-data',
-    );
+    const malNoData = malResult.thresholdResults.filter((r) => r.status === 'no-data');
     if (malNoData.length !== 1) {
       console.error(
         `SELF-TEST §D FAIL: malformed=${String(malformed)} expected 1 'no-data'; got ${malNoData.length}`,
@@ -732,10 +714,7 @@ function main(): number {
       );
       continue;
     }
-    const sourceLabel =
-      tr.source === 'p95'
-        ? 'p95'
-        : 'p99 (over-strict fallback; p95 missing)';
+    const sourceLabel = tr.source === 'p95' ? 'p95' : 'p99 (over-strict fallback; p95 missing)';
     const valueMicros = tr.valueMicros ?? 0;
     if (tr.status === 'breach') {
       console.error(

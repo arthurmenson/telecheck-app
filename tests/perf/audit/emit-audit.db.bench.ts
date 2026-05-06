@@ -47,11 +47,15 @@ import { bench, describe } from 'vitest';
 import { type AuditDbClient, type AuditEnvelopeInput, emitAudit } from '../../../src/lib/audit.ts';
 import { withTransaction } from '../../../src/lib/db.ts';
 import { asTenantId, type TenantId } from '../../../src/lib/glossary.ts';
-import { requireBenchDb } from '../db/setup.ts';
+import { withTenantContext } from '../../../src/lib/rls.ts';
+import { BENCH_APP_ROLE_NAME, requireBenchDb } from '../db/setup.ts';
 
-// r10-A closure: fail-fast at bench-file load if BENCH_DATABASE_URL
-// is unset. Otherwise the bench would silently use the production
-// app pool (DATABASE_URL stub or dev DB).
+// r10-A closure: fail-fast at bench-file load if BENCH_DATABASE_URL is
+// unset. The `.db.bench.ts` naming convention + the vitest.bench.config
+// glob exclusion (Sprint 17 fix-forward) ensures this file isn't loaded
+// by the default perf.yml workflow; only the planned Sprint 18+
+// perf-db.yml workflow (with BENCH_DATABASE_URL set + Postgres service
+// container) loads it.
 requireBenchDb();
 
 // ---------------------------------------------------------------------------
@@ -120,19 +124,37 @@ describe('emitAudit — DB-backed perf', () => {
   bench(
     '§9 emit-audit happy-path single-row append on existing chain',
     async () => {
-      // Production code path: withTransaction → BEGIN → emitAudit
-      // (which INSERTs, trigger fires, RETURNING reads back) → COMMIT.
+      // Production-equivalent code path:
+      //   1. withTransaction → BEGIN
+      //   2. SET LOCAL ROLE telecheck_bench_app — drop superuser
+      //      privilege for the iteration so RLS APPLIES (Codex r11-3
+      //      closure; bench measures the constrained path the
+      //      production app role takes, not a privileged bypass).
+      //      LOCAL means the role auto-resets at COMMIT/ROLLBACK; the
+      //      pool gets a fresh-tenant connection back for the next
+      //      iteration without leaked role state.
+      //   3. withTenantContext('Telecheck-US', ...) — sets RLS
+      //      session variable so audit_records INSERT passes the RLS
+      //      tenant_id-filter policy.
+      //   4. emitAudit → INSERT → BEFORE-INSERT trigger fires hash-chain
+      //      computation under pg_advisory_xact_lock → RETURNING reads
+      //      back trigger-authoritative columns.
+      //   5. COMMIT (releases advisory lock; LOCAL role auto-resets).
+      //
       // Real pg_advisory_xact_lock per-iteration lifetime per Codex
-      // r10-B closure (setBenchPool returns real pool, not savepoint
-      // translation).
+      // r10-B closure (setBenchPool returns real pool).
       await withTransaction(async (tx) => {
-        await emitAudit(buildBenchInput(), tx as unknown as AuditDbClient);
+        await tx.query(`SET LOCAL ROLE ${BENCH_APP_ROLE_NAME}`);
+        await withTenantContext(tx, 'Telecheck-US', async () => {
+          await emitAudit(buildBenchInput(), tx as unknown as AuditDbClient);
+        });
       });
     },
     {
-      // Lower iterations than pure-function benches (DB roundtrip
-      // dominates wall time). Vitest will still aggregate
-      // statistically over the bench window.
+      // Lower iterations than pure-function benches (DB roundtrip +
+      // RLS context-set + advisory-lock acquire-release dominates
+      // wall time). Vitest still aggregates statistically over the
+      // bench window.
       iterations: 50,
       warmupIterations: 5,
     },
