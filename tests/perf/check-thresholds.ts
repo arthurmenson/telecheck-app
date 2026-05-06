@@ -65,26 +65,54 @@ interface ScenarioThreshold {
 }
 
 const THRESHOLDS: readonly ScenarioThreshold[] = [
+  // crisisDetector.detect (Sprint 7 / TLC-018)
   {
     taskNameMatch: 'detect on ~35-char clean string returns no-crisis',
     p95MaxMicros: 2,
-    label: '§1 short clean text',
+    label: '§1 crisis-detect: short clean text',
   },
   {
     taskNameMatch: 'detect on ~24-char crisis string returns crisis-detected',
     p95MaxMicros: 1.5,
-    label: '§2 short crisis text',
+    label: '§2 crisis-detect: short crisis text',
   },
   {
     taskNameMatch: 'detect on ~5 KB clean narrative returns no-crisis',
     p95MaxMicros: 200,
-    label: '§3 long clean text',
+    label: '§3 crisis-detect: long clean text',
   },
   {
     taskNameMatch:
       'detect on ~5 KB narrative with crisis at end returns crisis-detected',
     p95MaxMicros: 300,
-    label: '§4 long text with crisis at end (worst case)',
+    label: '§4 crisis-detect: long text with crisis at end (worst case)',
+  },
+  // validateTransition (Sprint 12 / TLC-024).
+  // §5 happy path = pure logic, tight. §6/§7/§8 = reject paths
+  // including V8 stack-capture overhead (production-realistic;
+  // handler layers map throws to HTTP envelopes).
+  {
+    taskNameMatch: 'validateTransition INITIATED + start_intake returns INTAKE',
+    p95MaxMicros: 2,
+    label: '§5 validateTransition: happy path',
+  },
+  {
+    taskNameMatch:
+      'validateTransition SUBMITTED + start_intake throws InvalidTransitionError',
+    p95MaxMicros: 20,
+    label: '§6 validateTransition: InvalidTransitionError',
+  },
+  {
+    taskNameMatch:
+      'validateTransition INTAKE + abandon (30h) throws GuardNotSatisfiedError',
+    p95MaxMicros: 20,
+    label: '§7 validateTransition: GuardNotSatisfiedError',
+  },
+  {
+    taskNameMatch:
+      'validateTransition QUEUED + claim throws UnsupportedTransitionError',
+    p95MaxMicros: 20,
+    label: '§8 validateTransition: UnsupportedTransitionError',
   },
 ];
 

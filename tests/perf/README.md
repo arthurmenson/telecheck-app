@@ -40,6 +40,17 @@ Until those three conditions hold:
 - Operators read trends, not pass/fail
 - OR-218 stays OPEN in the ORT; this scaffold reduces its remaining work but does not retire the row
 
+## Bench corpus at v0.1
+
+| Bench file | Sprint | Target | Scenarios |
+| --- | --- | --- | --- |
+| `tests/perf/audit/crisis-detect.bench.ts` | 7 / TLC-018 | `crisisDetector.detect` (I-019 hot path) | §1–§4 (4 scenarios) |
+| `tests/perf/state-machine/validate-transition.bench.ts` | 12 / TLC-024 | `validateTransition` (Async Consult slice hot path) | §5–§8 (1 happy + 3 reject paths) |
+
+8 bench scenarios total. Per-scenario p95 thresholds enforced by `tests/perf/check-thresholds.ts` against vitest bench `--outputJson` capture.
+
+**Bench-mode DB-backed corpus** is NOT yet provided at v0.1. Targets that require Postgres (e.g., `emitAudit` hash chain, `withTenantBoundConnection`, idempotency lookup, repo CRUD) are deferred to Sprint 13+ pending bench-mode ephemeral-DB setup investment.
+
 ## Per-slice landing pattern
 
 When a new slice ships, slice authors add a per-slice benchmark file under `tests/perf/<slice>/<surface>.bench.ts`. Pattern:
