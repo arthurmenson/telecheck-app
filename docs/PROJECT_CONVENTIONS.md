@@ -10,6 +10,7 @@ Authoring discipline: **read this doc before authoring schema migrations, repos,
 - **r1 (2026-05-05, Sprint 10 / TLC-022):** initial codification of Sprint 6/9/10 patterns.
 - **r2 (2026-05-05, Sprint 15 / TLC-028):** Sprint 13 + Sprint 14 retro patterns — §5.4 closure-path-overclaim pre-emption pattern; §5.5 structural-constraint-not-code-defect escalation pattern (Sprint 12 original + Sprint 14 round-1 environment-availability extension); §6 sub-rule 5 environment-dependency check at planning (raises PM rubric from 4 → 5 sub-rules — first new sub-rule since Sprint 6 baseline).
 - **r3 (2026-05-06, Sprint 18 / TLC-033):** Sprint 17 retro patterns. §5.4 extended with 6th finding-class (**module-load class** — does the file's top-level imports + import-side-effect-calls throw under the CI workflow that loads it?). §5.4 also extended with **lockdown-test pinning rule** (after 3+ rounds of Codex fix-forward on the same finding-class, pin resolved invariants as a lockdown contract test). Sprint 17 canonical examples: `tests/contracts/canonicalize-db-url.test.ts` 19-case lockdown pins r10-C → r11-2 → r12 → r13 trajectory; `requireBenchDb()` at module-load throw + `*.db.bench.ts` glob exclude pins module-load class. NEW §5.6 dual-close milestone pattern (when a sprint closes BOTH an escalation AND an ORT row, document explicitly in retro + traceability matrix bump). Sprint 17 = first dual-close milestone (TLC-027 escalation + OR-218 ORT row).
+- **r4 (2026-05-06, Sprint 25 / TLC-038):** Sprint 19→24 CI-recovery-arc retro patterns (5 sprints; 8 PRs landed; ci.yml 91/101 → fully green workflow conclusion). NEW §5.7 shared-root-cause cluster discipline (Sprint 22 canonical: TLC-040 §3b + TLC-041 §1-7 → 8 cases, 1 commit, 40% budget); NEW §5.8 pattern-mirror SKIP discipline (Sprint 23 canonical: TLC-044 mirrors Sprint 19 TLC-034 advisory-lock); NEW §5.9 Fastify-idiom-mismatch finding-class (Sprint 24 canonical: TLC-045 r2 `void reply.send(); return;` → `return reply` after `reply.send()`); NEW §5.10 r1-r2 hypothesis-iteration discipline (Sprint 24 canonical: r1 idempotency.ts hypothesis wrong → r2 handler-pattern hypothesis right). Three+ proof-points each.
 
 ---
 
@@ -264,6 +265,80 @@ await withTransaction(async (tx) => {
 **Why:** Sprint 17 demonstrated that escalations + ORT rows closing in the same sprint compound the closure-trajectory's signal value — Sprint 14 escalated TLC-025 → Sprint 17 closed it AND the OR-218 ORT row that the escalated TLC-027 was infrastructure for. The dual-close is non-obvious reading retros sequentially; documenting it explicitly preserves the milestone signal for future sprint-history readers.
 
 **Sprint 17 canonical example:** TLC-027 (Sprint 14 escalation) + OR-218 (Tier 1 ORT row) both closed 2026-05-06. First-ever dual-close. Documented in `docs/SPRINT_17_REVIEW.md` ACCEPTANCE line + `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r3 → r4 revision bump.
+
+---
+
+### §5.7 Shared-root-cause cluster discipline (Sprint 22 retro / Sprint 25 codification)
+
+**Rule:** when 2+ tickets share a diagnostic shape (same expected-vs-actual symptom, same upstream-of-handler position, same test-infra signature), defer them as a cluster and investigate together. ONE root-cause find closes ALL members.
+
+**Why:** Sprint 21 attempted to fix TLC-040 §3b in isolation (2 PR rounds, both unsuccessful) before Sprint 21 retro flagged that §3b's `expected 400 to be 404` shape matched TLC-041's `expected 400 to be 503` exactly — both non-GET, both with valid auth, both 400-fires-before-handler. Sprint 22 investigated the cluster ONCE, found `src/lib/idempotency.ts` returning 400 `internal.idempotency.missing_key` for state-changing requests without `Idempotency-Key` header per IDEMPOTENCY v5.1, and closed 8 test cases across 2 files in 1 commit. The "investigate ONCE, close MANY" leverage is large: Sprint 22 used 40% of commit budget to close what 4 isolated investigations might have used 200%+ of budget on.
+
+**Diagnostic shape recognition cues** (high signal for sharing root cause):
+- Same HTTP status code expected vs same status code actual
+- All non-GET (or all GET) — request method clusters
+- Same `expected X to be Y` symptom across multiple test files
+- Symptom fires upstream of the assertion's target (e.g., 400 before reaching the 404-or-503 handler precedence test)
+- Failing tests have the same test-helper / fixture signature
+
+**Sprint 22 canonical example:** TLC-040 §3b (POST /:id/abandon) + TLC-041 §1-7 (PATCH/POST/DELETE under /v0/admin/*) → both `expected 400 to be ___` → both fixed by adding `'idempotency-key': ulid()` header. 8 test cases / 2 files / 1 commit / 40% budget.
+
+**Anti-pattern (avoid):** investigating each ticket in isolation when the cluster shape is visible at PM-brief authoring time. Either commit to the isolated investigation explicitly, OR defer to a cluster investigation. Don't drift between the two.
+
+---
+
+### §5.8 Pattern-mirror SKIP discipline (Sprint 23 retro / Sprint 25 codification)
+
+**Rule:** when the second instance of an already-closed finding-class appears (same fix shape applies; same architectural rationale), Codex round is OPTIONAL — pattern-mirror is **novel-of-class-NEGATIVE** per §5.2. Apply the prior fix; no Codex round; cap fix-cost at ~1 commit.
+
+**Why:** Sprint 19 TLC-034 closed migration concurrency via `pg_advisory_lock(hashtext('telecheck_test_migrations')::int)` serialization. Sprint 23 TLC-044 surfaced a sibling failure: 6 test files failing with `tuple concurrently updated` at `installTestAppRole`'s GRANT/REVOKE statements — a mirror-image race on Postgres catalog rows during parallel-fork test setup. The fix is structurally identical (advisory-lock with a distinct lock-key domain). No new architectural insight surfaced; no Codex round needed; closed in 1 commit.
+
+**Pattern-mirror identification cues:**
+- Same root-cause class as a previously-closed ticket (e.g., "parallel-fork race on Postgres catalog rows")
+- Same fix shape (e.g., "wrap with `pg_advisory_lock(hashtext(...)::int)`")
+- Distinct call-site / context (e.g., applyMigrations vs installTestAppRole)
+- No new abstractions or architectural decisions introduced by the second fix
+
+**Escalation gate:** if the mirror-fix DOESN'T close the second instance in 1 commit, the apparent mirror is NOT actually a mirror — escalate to fresh investigation (likely a related-but-distinct finding-class). Cap iteration in pattern-mirror SKIP mode at 1 commit; if it spills, switch modes.
+
+**Sprint 23 canonical example:** TLC-044 mirrors TLC-034. Both wrap a Postgres-catalog-touching parallel-fork operation in `pg_advisory_lock`. Distinct lock-key domains (`telecheck_test_install_role` vs `telecheck_test_migrations`) so they don't share queues. Closed 6 files in 1 commit; no Codex round.
+
+---
+
+### §5.9 Fastify-idiom-mismatch finding-class (Sprint 24 retro / Sprint 25 codification)
+
+**Rule:** when CI surfaces a Node/Fastify lifecycle error (`ERR_HTTP_HEADERS_SENT`, `ECONNRESET`, `ERR_STREAM_PREMATURE_CLOSE`, `Cannot set headers after they are sent to the client`) that isn't a test logic failure (i.e., the test PASSED), suspect a handler-pattern mismatch with the framework version — NOT an application logic bug.
+
+**Why:** Sprint 24 TLC-045's first hypothesis blamed `src/lib/idempotency.ts:onSend` because the unhandled error fired during the §3b POST /abandon test path that newly exercised the idempotency middleware after Sprint 22's idempotency-key fix. r1 fix (catch+log on storeIdempotencyRecord throws) did NOT close the issue. Re-investigation found the actual root cause was in `src/modules/async-consult/internal/handlers/consults.ts`'s `mapServiceError` pattern: `void reply.code(404).send(...)` + `return;` (undefined). In Fastify v5, returning undefined when the reply hasn't finished its onSend pipeline triggers a phantom `reply.send(undefined)` that races with the first send → `safeWriteHead` on already-sent headers.
+
+**Fix idioms:**
+- **Fastify v5:** when a handler has already called `reply.send()` (or invoked a helper that did), `return reply;` rather than `return;`. This signals to Fastify "I've handled the response, don't auto-wrap my return value."
+- **Avoid `void reply.send(...)`** in error-mapping or fall-through branches. Either `await reply.send(...)` or `return reply.send(...)`. The fire-and-forget shape interacts badly with Fastify's lifecycle.
+- For helper functions that call `reply.send()` internally and return a boolean (like `mapServiceError`), have the caller `return reply` after the helper returns true.
+
+**Cue: TEST PASSED + UNHANDLED ERROR.** This combination is the strongest fingerprint of a Fastify-idiom-mismatch. The response was correct (test asserts the right thing); the error fired during reply finalization AFTER the test moved on. App logic is fine; framework integration is wrong.
+
+**Sprint 24 canonical example:** TLC-045 r2 — change `if (mapServiceError(err, reply, req.id)) return;` → `return reply;` at all 6 call sites in async-consult handlers. Closes the unhandled `ERR_HTTP_HEADERS_SENT` error in §3b's POST /abandon path. ci.yml workflow conclusion goes fully green for the first time in the autonomous arc.
+
+---
+
+### §5.10 r1-r2 hypothesis-iteration discipline (Sprint 24 retro / Sprint 25 codification)
+
+**Rule:** when an r1 fix lands and CI shows the same symptom unchanged, the **hypothesis is wrong**, not the implementation. Iterate to a corrected hypothesis from CI evidence + source inspection inside the same sprint cap (budget 1 r2). If r2 also misses, escalate to investigation-sprint deferral.
+
+**Why:** when a hypothesis is wrong, retrying the same fix shape (or larger versions of it) wastes budget. The right move is to update the hypothesis from new CI evidence — often the unchanged-symptom result IS the new evidence. Sprint 24 TLC-045 hypothesized r1 was the fix (wrap storeIdempotencyRecord in try/catch); when r1 landed and CI still showed `ERR_HTTP_HEADERS_SENT`, the corrected hypothesis came from the persistence pattern: error survives even when the suspected throw-site is gagged → throw-site isn't the source. Stack-trace re-inspection + handler-pattern check identified the real source in async-consult handlers. r2 closed cleanly.
+
+**Hypothesis-iteration mechanics:**
+1. **r1 hypothesis:** generated at sprint planning from initial evidence. Land r1 fix.
+2. **r1 verdict:** if CI green → r1 was right. If CI shows same symptom → hypothesis is wrong; update it.
+3. **r2 hypothesis:** generated from r1 verdict + new CI evidence + source re-inspection. Land r2 fix.
+4. **r2 verdict:** if CI green → close. If still red → DON'T author r3 inside the same sprint; defer to investigation sprint.
+
+**Budget shape:** r1-r2 fits in a 5-commit sprint cap (1 r1 + 1 r2 + 1 close + 2 reserves). r3+ implies the symptom needs deeper investigation than the sprint cap supports — escalate cleanly.
+
+**Defense-in-depth retention:** even when r1 was the wrong primary hypothesis, the r1 change may still be the right shape (better practice; aligned-with-design-intent; future-proofing). Keep r1 if so. Sprint 24 retained r1 (idempotency.ts catch+log) as defense-in-depth even though r2 (handler return-reply) was the actual root-cause fix.
+
+**Sprint 24 canonical example:** TLC-045. r1 idempotency.ts catch+log → wrong primary hypothesis but retained as DiD. r2 async-consult `return reply` → right hypothesis, closed cleanly.
 
 ---
 
