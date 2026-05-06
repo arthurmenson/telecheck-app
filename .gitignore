@@ -63,3 +63,4 @@ secrets/
 
 # Generated OpenAPI client
 src/generated/
+*.tmp
