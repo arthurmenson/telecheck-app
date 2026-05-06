@@ -222,8 +222,29 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
 
     // Extract tenant and actor from request context
     const tenantId = request.tenantContext?.tenantId ?? 'unknown';
-    // STUB: actor ID from header placeholder; auth module will populate req.actor.id
-    const actorId = (request.headers['x-actor-id'] as string | undefined) ?? 'anonymous';
+    // Sprint 26 / TLC-048 (Codex retrospective HIGH closure): the idempotency
+    // cache key is `(tenant_id, idempotency_key, endpoint, actor_id)`. After
+    // Sprint 21 migrated authenticated tests from `x-actor-id` header to JWT
+    // bearer tokens, falling back to `x-actor-id` here meant ALL JWT-
+    // authenticated requests bucketed as `actor_id='anonymous'`, collapsing
+    // the per-actor isolation the v5.1 contract requires. Two different
+    // authenticated patients in the same tenant using the same idempotency
+    // key on the same endpoint would either:
+    //   - Get a false 409 (different bodies → spurious body-mismatch reject)
+    //   - Or replay each other's cached response (same body → cross-actor
+    //     PHI exposure)
+    // Both outcomes violate IDEMPOTENCY v5.1 §1 actor-scoping + I-023 tenant
+    // isolation hygiene. Fix: read from request.actorContext (populated by
+    // auth-context plugin on JWT verify); preserve `x-actor-id` ONLY as the
+    // stub-fallback for legacy paths still using the header during migration.
+    // `anonymous` remains the final fallback for pre-auth state-changing
+    // endpoints (rare, but the namespace must be deterministic — we don't
+    // want preHandler to throw, that's the §5.9 Fastify-idiom-mismatch
+    // anti-pattern).
+    const actorId =
+      request.actorContext?.accountId ??
+      (request.headers['x-actor-id'] as string | undefined) ??
+      'anonymous';
     const endpoint = normalizedPath;
 
     // Look up cache against the migration 005 idempotency_keys table.

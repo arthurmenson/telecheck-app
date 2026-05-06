@@ -514,4 +514,125 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
     expect(secondBody['template_id']).toBeDefined();
     expect(secondBody['template_id']).not.toBe(firstBody['template_id']);
   });
+
+  // -------------------------------------------------------------------------
+  // Sprint 26 / TLC-048 — Codex retrospective HIGH finding closure.
+  //
+  // Background: the existing actor-independence test at line 282 uses
+  // `x-actor-id` headers (legacy stub path). Sprint 21+ migrated tests
+  // from `x-actor-id` to JWT bearer tokens for authenticated endpoints,
+  // but `src/lib/idempotency.ts:226` still read from the header and fell
+  // back to `'anonymous'` when absent. After the migration, ALL JWT-
+  // authenticated requests bucketed as `actor_id='anonymous'` —
+  // collapsing per-actor isolation.
+  //
+  // This test pins the JWT-actor-scoping fix: after `idempotency.ts`
+  // reads from `request.actorContext?.accountId`, two distinct JWT-
+  // authenticated patients in the same tenant using the same
+  // Idempotency-Key on the same endpoint MUST be treated as independent
+  // cache records — neither false 409 (different bodies) nor cross-actor
+  // replay (same body).
+  //
+  // Endpoint choice: POST /v0/async-consult/:id/abandon. Both patients
+  // probe a non-existent consult ID, so the service throws
+  // ConsultNotFoundError → 404 via mapServiceError. The 404 response
+  // gets cached. The TEST shape: two distinct ULIDs → two distinct
+  // 404 responses → idempotency_keys table has TWO rows (one per
+  // actor) with distinct actor_id values matching the JWT account_id
+  // (NOT 'anonymous'). If the bug were still present, both rows would
+  // share actor_id='anonymous' and one would have body-mismatch-409'd
+  // the other — neither happens with the fix.
+  // -------------------------------------------------------------------------
+  it('§NEW (TLC-048) JWT-authenticated actors do not collapse to anonymous in idempotency cache', async () => {
+    // Lazy-import to avoid hoisting interference; same shape as
+    // async-consult-cross-tenant-isolation.test.ts mintTokenForAccount.
+    const { issueAccessToken } = await import('../../src/lib/jwt.ts');
+    const { config } = await import('../../src/lib/config.ts');
+    const { asAccountId } = await import('../../src/modules/identity/internal/types.ts');
+
+    const idempotencyKey = ulid();
+    const accountIdA = asAccountId(`acct_${ulid()}`);
+    const accountIdB = asAccountId(`acct_${ulid()}`);
+
+    const { asTenantId } = await import('../../src/lib/glossary.ts');
+    const tenantUS = asTenantId(TENANT_US);
+
+    const tokenA = issueAccessToken(
+      {
+        account_id: accountIdA,
+        tenant_id: tenantUS,
+        session_id: ulid(),
+        country_of_care: 'US',
+      },
+      config.jwtSigningKey,
+    );
+    const tokenB = issueAccessToken(
+      {
+        account_id: accountIdB,
+        tenant_id: tenantUS,
+        session_id: ulid(),
+        country_of_care: 'US',
+      },
+      config.jwtSigningKey,
+    );
+
+    // Each request probes a distinct non-existent consult ID — service
+    // throws ConsultNotFoundError → 404 via mapServiceError (Sprint 24
+    // return-reply pattern). The 404 cache write is what we're testing.
+    const consultIdA = ulid();
+    const consultIdB = ulid();
+
+    const respA = await inject({
+      method: 'POST',
+      url: `/v0/async-consult/${consultIdA}/abandon`,
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${tokenA}`,
+        'idempotency-key': idempotencyKey,
+        'content-type': 'application/json',
+      },
+      payload: {},
+    });
+    expect(respA.statusCode).toBe(404);
+
+    const respB = await inject({
+      method: 'POST',
+      url: `/v0/async-consult/${consultIdB}/abandon`,
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${tokenB}`,
+        'idempotency-key': idempotencyKey,
+        'content-type': 'application/json',
+      },
+      payload: {},
+    });
+    // CRITICAL: this MUST be 404 (handler ran for actor B) — NOT 409
+    // body-mismatch (which would prove actor A and actor B share the
+    // 'anonymous' bucket and got different bodies tripping the
+    // mismatch path).
+    expect(respB.statusCode).toBe(404);
+
+    // Direct cache-table inspection: two records exist for the same
+    // (tenant_id, key, endpoint) with distinct actor_ids matching the
+    // JWT account_id values — NOT 'anonymous'.
+    const client = getTestClient();
+    await withTenantContext(TENANT_US, async () => {
+      const result = await client.query<{ actor_id: string; response_status: number }>(
+        `SELECT actor_id, response_status
+           FROM idempotency_keys
+          WHERE tenant_id = $1
+            AND key = $2
+            AND endpoint LIKE '/v0/async-consult/%/abandon'
+          ORDER BY actor_id`,
+        [TENANT_US, idempotencyKey],
+      );
+      const actorIds = result.rows.map((r) => r.actor_id);
+      // Two rows = per-actor independence held.
+      expect(actorIds).toHaveLength(2);
+      // Neither row collapsed to 'anonymous' — JWT actorContext was read.
+      expect(actorIds).not.toContain('anonymous');
+      // Each row's actor_id matches the corresponding JWT's accountId.
+      expect(actorIds.sort()).toEqual([accountIdA, accountIdB].sort());
+    });
+  });
 });
