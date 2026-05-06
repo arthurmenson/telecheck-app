@@ -41,6 +41,11 @@ export type {
   ConsultId,
   ConsultEventId,
   ConsultState,
+  ConsultType,
+  ConsultModality,
+  Consult,
+  ConsultEvent,
+  ConsultEventType,
 } from './internal/types.js';
 
 export {
