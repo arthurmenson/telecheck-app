@@ -1,0 +1,68 @@
+fix(test+chore): TLC-034 migration-concurrency advisory lock + TLC-035 .gitattributes EOL normalization (Sprint 19)
+
+Closes two pre-existing main-red issues identified at Sprint 18 retro:
+
+TLC-034 (migration-concurrency flake on parallel test workers):
+  Root cause: vitest's `pool: 'forks'` spawns N parallel test-file
+  processes; each fork's tests/setup.ts beforeAll calls applyMigrations
+  against the shared TEST_DATABASE_URL. Concurrent CREATE FUNCTION /
+  CREATE POLICY / CREATE TRIGGER calls update Postgres catalog rows
+  (pg_proc, pg_policy, pg_trigger) and Postgres surfaces this as
+  "tuple concurrently updated" errors on whichever fork loses the
+  race.
+
+  Fix: take a session-scoped pg_advisory_lock keyed on a stable hash of
+  'telecheck_test_migrations' before applyMigrations enters its loop;
+  release in finally. Only one fork at a time enters the migration-
+  apply loop. Other forks block briefly on the lock; when they get
+  the lock, the IF NOT EXISTS guards in each migration make their
+  applyMigrations a no-op against the already-migrated schema.
+
+  Why advisory lock vs globalSetup refactor: 4-line change vs
+  restructuring the whole setup-file architecture. Migrations are
+  already idempotent via IF NOT EXISTS guards; serializing the apply
+  loop is sufficient to eliminate the catalog race.
+
+  Files: tests/setup.ts (+ ~30 lines, net pg_advisory_lock /
+  pg_advisory_unlock pair around the existing apply loop with
+  inline rationale comment).
+
+TLC-035 (.gitattributes EOL normalization):
+  Root cause: Sprint 18 PR #10 + #12 rebases produced 15 prettier
+  "violation" warnings post-rebase that turned out to be EOL-only
+  drift (Windows host's `core.autocrlf=true` converts LF → CRLF in
+  working copy; LF stored in repo). Without a .gitattributes file,
+  every Windows-host autonomous shell rebase risks the same drift
+  cycle.
+
+  Fix: NEW .gitattributes with `* text=auto eol=lf` + explicit per-
+  extension rules for ts/tsx/js/json/md/yml/yaml/sql/sh + binary
+  marker for png/jpg/gif/ico/pdf/zip/gz. Forces LF in repo
+  regardless of host OS.
+
+  Files:
+    - NEW .gitattributes (~30 lines incl. rationale comment)
+    - 14 source files: EOL renormalization (post-renormalize
+      git add); content unchanged
+
+Verification:
+  - npm run lint clean
+  - npx tsc --noEmit clean
+  - npm run format:check clean (post-renormalize; ALL files PASS)
+  - 14 file modifications post-renormalize are EOL-only; no
+    functional changes; git diff with --ignore-all-space confirms
+    zero content changes
+
+Sprint 19 commit count: 1 of estimated 3-4 budget (kickoff + this
+combined commit + Sprint 19 review/retro). Codex SKIP per §5.2 pure-
+chore + test-infra fix (no novel-of-class authoring).
+
+Spec references:
+  - docs/SPRINT_18_RETRO.md "Process changes for Sprint 19" (TLC-034
+    + TLC-035 candidates proposed)
+  - docs/SPRINT_19_PLAN.md (next commit; Sprint 19 close)
+  - tests/setup.ts applyMigrations (the function this commit hardens)
+  - vitest.config.ts pool: 'forks' (the parallelism that produces
+    the catalog race)
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>

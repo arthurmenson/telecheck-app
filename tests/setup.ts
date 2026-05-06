@@ -83,21 +83,60 @@ export function getTestClient(): Client {
 const MIGRATIONS_DIR = resolve(import.meta.dirname ?? __dirname, '../migrations');
 
 async function applyMigrations(client: Client): Promise<void> {
-  const files = readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.endsWith('.sql') && !f.startsWith('rollback'))
-    .sort(); // lexicographic sort → 000, 001, 002 ... is correct
+  // Sprint 19 / TLC-034 closure: serialize concurrent migration applies
+  // across vitest forks via pg_advisory_lock. Without this lock, when
+  // vitest's `pool: 'forks'` spawns N parallel test-file forks, each
+  // fork's tests/setup.ts beforeAll calls applyMigrations against the
+  // shared TEST_DATABASE_URL. Concurrent CREATE FUNCTION / CREATE
+  // POLICY / CREATE TRIGGER calls update Postgres catalog rows
+  // (pg_proc, pg_policy, pg_trigger) and Postgres surfaces this as
+  // "tuple concurrently updated" errors on whichever fork loses the
+  // race.
+  //
+  // Fix: take a session-scoped advisory lock keyed on a stable hash of
+  // 'telecheck_test_migrations'. Only one fork at a time enters the
+  // migration-apply loop. Other forks block briefly on the lock; when
+  // they get the lock, the IF NOT EXISTS guards in each migration make
+  // their applyMigrations a no-op against the already-migrated schema.
+  // Lock auto-releases on connection close (session-scoped) so a
+  // crashing fork doesn't strand the lock.
+  //
+  // Why advisory lock vs globalSetup refactor: 4-line change vs
+  // restructuring the whole setup-file architecture. The migrations
+  // already are idempotent via IF NOT EXISTS guards; serializing the
+  // apply loop is sufficient to eliminate the catalog race.
+  //
+  // Key derivation: pg's `hashtext()` returns int4. Pass to
+  // `pg_advisory_lock(int4)` overload. The literal string is what
+  // identifies the lock domain — any other application using a
+  // different key won't collide.
+  await client.query("SELECT pg_advisory_lock(hashtext('telecheck_test_migrations')::int)");
+  try {
+    const files = readdirSync(MIGRATIONS_DIR)
+      .filter((f) => f.endsWith('.sql') && !f.startsWith('rollback'))
+      .sort(); // lexicographic sort → 000, 001, 002 ... is correct
 
-  for (const file of files) {
-    const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8');
-    try {
-      await client.query(sql);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // Idempotent: IF NOT EXISTS guards in migrations make re-runs safe.
-      // Skip "already exists" errors but fail on everything else.
-      if (!message.includes('already exists')) {
-        throw new Error(`Migration ${file} failed: ${message}`);
+    for (const file of files) {
+      const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8');
+      try {
+        await client.query(sql);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Idempotent: IF NOT EXISTS guards in migrations make re-runs safe.
+        // Skip "already exists" errors but fail on everything else.
+        if (!message.includes('already exists')) {
+          throw new Error(`Migration ${file} failed: ${message}`);
+        }
       }
+    }
+  } finally {
+    // Release the lock so the next fork can proceed. Failure to release
+    // here is non-fatal because session-end auto-releases anyway, but
+    // explicit release frees the lock immediately.
+    try {
+      await client.query("SELECT pg_advisory_unlock(hashtext('telecheck_test_migrations')::int)");
+    } catch {
+      // Best-effort; session-end will auto-release.
     }
   }
 }
