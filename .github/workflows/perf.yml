@@ -48,9 +48,21 @@ jobs:
     name: Run benchmarks + threshold check + baseline comparison
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Sprint 11 / TLC-023b: warn-only landing. TLC-023c flips to false
-    # after 3-5 stable runs measure CI-runner variance distribution.
-    continue-on-error: true
+    # Per Codex perf-yml-r1 HIGH closure 2026-05-05: NO job-level
+    # continue-on-error. The workflow MUST fail on threshold breach
+    # so operators see the failure in PR checks.
+    #
+    # "Warn-only landing at v0.1" is achieved at the BRANCH-PROTECTION
+    # layer (this workflow is NOT a required check in branch protection
+    # until TLC-023c flips it to required after 3-5 stable runs).
+    # NOT at the workflow-level (continue-on-error: true would make
+    # threshold breaches invisible-to-CI even when branch protection
+    # adds the workflow as required).
+    #
+    # Branch-protection wiring (TLC-023c):
+    #   gh api repos/:owner/:repo/branches/main/protection \
+    #     --field "required_status_checks[contexts][]=Performance benchmarks / bench"
+    # Evans coordinates this when ready (emergency-only-access scope).
 
     env:
       # Stub values for env validation (config.ts requires DATABASE_URL +

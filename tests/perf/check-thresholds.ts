@@ -172,13 +172,29 @@ function flattenTasks(output: BenchOutput): BenchTaskResult[] {
  * Returns null only when neither p95 nor p99 is reported by Vitest;
  * caller fails the gate in that case.
  */
+/**
+ * Runtime validation per Codex perf-yml-r1 MEDIUM closure 2026-05-05:
+ * `!== undefined` is insufficient because `null`, NaN, strings, and
+ * negative numbers all pass that check. A malformed bench output
+ * with `p99: null` would compute `null * 1000 = 0` and report OK,
+ * defeating the gate. Reject anything that isn't a finite non-
+ * negative number.
+ */
+function isValidLatencyNumber(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= 0
+  );
+}
+
 function p95OrConservativeFallback(
   task: BenchTaskResult,
 ): { value: number; source: 'p95' | 'p99-fallback' } | null {
-  if (task.p95 !== undefined) {
+  if (isValidLatencyNumber(task.p95)) {
     return { value: task.p95, source: 'p95' };
   }
-  if (task.p99 !== undefined) {
+  if (isValidLatencyNumber(task.p99)) {
     // p99 over-strict; over-flagging is safe. Sprint 12+ may revisit
     // if false-positive flake rate becomes problematic.
     return { value: task.p99, source: 'p99-fallback' };
