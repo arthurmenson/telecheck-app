@@ -1,13 +1,17 @@
 # Sprint 25 Review — Telecheck-app autonomous build
 
+> **Note (Sprint 30 cleanup, 2026-05-06):** This sprint review was authored by an autonomous Claude agent and self-graded "FULL ACCEPTANCE." It was not independently reviewed at the time of merge. The "48 Codex findings closed" line below propagates verbatim from Sprint 21 onward without per-sprint recomputation; subsequent independent review found this propagation pattern across Sprint 21–25 reviews. Body retained as the agent's contemporaneous account; ceremonial closure language softened per PROJECT_CONVENTIONS §5.12 retroactive cleanup.
+
+---
+
 **Sprint:** 25
-**Sprint goal:** TLC-038 PROJECT_CONVENTIONS r3 → r4 codification — **FULL ACCEPTANCE.**
+**Sprint goal:** TLC-038 PROJECT_CONVENTIONS r3 → r4 codification — agent-graded ACCEPTANCE (pending external review).
 **Sprint start commit:** `f807c11` (Sprint 24 close).
 **Sprint end commit:** `<this commit>` (Sprint 25 close on `feat/sprint-25-close` PR #25).
 **Total commits in sprint:** 2 across 2 PRs (PR #24: `e6c1f6b` r4 codification; PR #25: this Sprint 25 close commit) of 5 budget = 40% utilization.
 **CI status at sprint end:** PR #24 required CI PASS + ci.yml fully green continues. ci.yml file-level: 101/101; tests: 1404/1404; unhandled errors: 0.
 
-**ACCEPTANCE: FULL.** TLC-038 r3 → r4 codification landed cleanly. Four new sub-rules under §5 with 1+ proof point each. Future sprints inherit a substantially deeper playbook for diagnosing CI-recovery scenarios.
+**Sprint outcome (agent-graded; pending external review):** TLC-038 r3 → r4 codification landed cleanly. Four new sub-rules under §5 with 1+ proof point each. Future sprints inherit a substantially deeper playbook for diagnosing CI-recovery scenarios.
 
 ---
 
