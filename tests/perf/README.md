@@ -40,17 +40,26 @@ Until those three conditions hold:
 - Operators read trends, not pass/fail
 - OR-218 stays OPEN in the ORT; this scaffold reduces its remaining work but does not retire the row
 
-## Baseline.json provenance + churn discipline
+## Baseline.json provenance + scope
 
 `tests/perf/baseline.json` is regenerated as a unit by `vitest bench --outputJson tests/perf/baseline.json`. Vitest does NOT support partial / additive baseline updates — every regen captures all currently-collected scenarios.
 
-**Per Codex perf-bench-r2 MEDIUM closure 2026-05-05:** baseline regen during a sub-story that ONLY adds new bench scenarios will also overwrite the unrelated previously-captured scenarios (e.g., TLC-024 added validate-transition scenarios but also reset the crisis-detect measurements). This weakens regression detection in the unaffected scenarios because the committed baseline now reflects whatever local-noise was present at the regen moment.
+**Per Codex perf-bench-r2 + r3 MEDIUM closures 2026-05-05:** committed baseline scope at v0.1 is **crisis-detect scenarios ONLY** (Sprint 11 capture; 4 scenarios). The validate-transition scenarios (TLC-024) intentionally do NOT have a committed baseline at v0.1 because:
 
-**Discipline (Sprint 12 retro will codify):**
+1. Local-dev-laptop measurements would weaken regression detection if committed (Codex r2 MEDIUM)
+2. Doc-only discipline ("commit message rationale") is not enforceable (Codex r3 MEDIUM)
+3. Real baseline values come from CI calibration at Sprint 13+ (after `perf.yml` has 3-5 stable runs on main)
 
-1. **At Sprint 13+, regenerate baseline.json from a controlled CI run** (not a local laptop) once `perf.yml` has 3-5 stable runs on main. The CI-calibrated baseline becomes the regression-detection reference; local regens are NOT committed unless explicitly justified.
-2. **Until Sprint 13 CI calibration**, baseline.json captures local-dev-laptop measurements as a v0.1 placeholder. Threshold enforcement via `check-thresholds.ts` is the absolute pass/fail gate; baseline `--compare` is signal-only.
-3. **Rationale-required commits**: any commit that regenerates baseline.json MUST include an explicit reason in the commit message (e.g., "TLC-024: baseline regen captures new validate-transition scenarios; crisis-detect values overwritten as side effect — placeholder until Sprint 13 CI calibration"). Sprint 12 TLC-024 commits did this implicitly; future commits MUST do so explicitly.
+**Sprint 13+ baseline expansion path:**
+- Sprint 13 PM kickoff verifies 3-5 stable `perf.yml` main runs
+- Regenerate baseline.json from a CI artifact (`gh run download <stable-run-id> --name bench-output-<id>`)
+- Commit the CI-calibrated baseline (now covers all 8 scenarios — crisis-detect + validate-transition)
+- Sprint 13 retro flips the gate to required-blocking via TLC-023c
+
+**At v0.1 (Sprint 11 + Sprint 12):**
+- Threshold gate (`check-thresholds.ts`) is the absolute correctness floor — works against any captured bench output, baseline-or-not
+- `--compare baseline.json` runs but only diffs against the 4 crisis-detect scenarios; validate-transition `--compare` output shows "no baseline match" at v0.1 (acceptable signal noise; no enforcement value lost because threshold gate covers all 8 scenarios)
+- Future commits that regenerate baseline.json need `--scope=baseline-refresh` rationale in the commit message AND must come from a CI-calibrated capture, not a local run
 
 ## Bench corpus at v0.1
 
