@@ -137,17 +137,25 @@ CREATE TABLE IF NOT EXISTS consults (
     -- (consults.tenant_id, consults.id) so events cannot reference a
     -- consult from a different tenant even if the consult's id is known.
     -- Mirror of the migration 012:181 "downstream composite-FK pattern".
-    UNIQUE (tenant_id, id),
+    --
+    -- Constraint NAMED to match migration 021's idempotent ADD CONSTRAINT
+    -- per Codex async-consult-r3 HIGH closure 2026-05-05 — so rollback
+    -- 021_rollback.sql can drop by the same name across both apply paths
+    -- (fresh-DB inline + upgraded-DB ALTER).
+    CONSTRAINT consults_tenant_id_id_unique UNIQUE (tenant_id, id),
 
     -- Composite FK on patient ownership (cross-tenant patient binding
-    -- prevention).
-    FOREIGN KEY (tenant_id, patient_id)
+    -- prevention). NAMED per Codex async-consult-r3 HIGH closure.
+    CONSTRAINT consults_tenant_patient_fk
+        FOREIGN KEY (tenant_id, patient_id)
         REFERENCES accounts (tenant_id, account_id),
 
     -- Composite FK on intake form submission (cross-tenant intake
     -- binding prevention; nullable so applies only when populated at
-    -- the INTAKE → SUBMITTED transition).
-    FOREIGN KEY (tenant_id, intake_form_submission_id)
+    -- the INTAKE → SUBMITTED transition). NAMED per Codex
+    -- async-consult-r3 HIGH closure.
+    CONSTRAINT consults_tenant_intake_fk
+        FOREIGN KEY (tenant_id, intake_form_submission_id)
         REFERENCES forms_submission (tenant_id, submission_id)
 );
 
@@ -244,7 +252,12 @@ CREATE TABLE IF NOT EXISTS consult_events (
 
     -- Composite FK enforces same-tenant relationship to the parent
     -- consult (Codex async-consult-r1 HIGH closure 2026-05-05).
-    FOREIGN KEY (tenant_id, consult_id) REFERENCES consults (tenant_id, id)
+    --
+    -- NAMED per Codex async-consult-r3 HIGH closure 2026-05-05 — so
+    -- rollback 021_rollback.sql can drop by the same name across both
+    -- apply paths (fresh-DB inline + upgraded-DB ALTER).
+    CONSTRAINT consult_events_tenant_consult_fk
+        FOREIGN KEY (tenant_id, consult_id) REFERENCES consults (tenant_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_consult_events_consult

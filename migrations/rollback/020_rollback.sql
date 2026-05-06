@@ -16,18 +16,28 @@
 --   consult_events → consults (FK)
 --   consults       → tenants (001), accounts (012)
 
--- Step 1: Drop RLS policies. Both tables use the standard `tenant_isolation`
+-- Step 1: Drop named constraints in dependency order — composite FKs
+-- before the parent UNIQUE they reference. Per Codex async-consult-r3
+-- HIGH closure 2026-05-05: constraints are named in both migration 020
+-- inline and migration 021 ALTER, so this rollback's drop-by-name pattern
+-- works across both apply paths (fresh-DB + upgraded-DB).
+ALTER TABLE consult_events DROP CONSTRAINT IF EXISTS consult_events_tenant_consult_fk;
+ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_intake_fk;
+ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_patient_fk;
+ALTER TABLE consults       DROP CONSTRAINT IF EXISTS consults_tenant_id_id_unique;
+
+-- Step 2: Drop RLS policies. Both tables use the standard `tenant_isolation`
 -- name (matches the 19 other tenant-scoped tables — see Sprint 6 / TLC-016
 -- RLS policy coverage lockdown).
 DROP POLICY IF EXISTS tenant_isolation ON consult_events;
 DROP POLICY IF EXISTS tenant_isolation ON consults;
 
--- Step 2: Drop triggers + trigger functions.
+-- Step 3: Drop triggers + trigger functions.
 DROP TRIGGER IF EXISTS consults_updated_at ON consults;
 
 DROP FUNCTION IF EXISTS consults_set_updated_at();
 
--- Step 3: Drop tables in FK-dependency order.
+-- Step 4: Drop tables in FK-dependency order.
 -- consult_events references consults via FK; must drop first.
 DROP TABLE IF EXISTS consult_events;
 DROP TABLE IF EXISTS consults;
