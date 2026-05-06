@@ -370,9 +370,12 @@ describe('async-consult HTTP — §3 handler-level tenant-blind 404 (I-025)', ()
 
     // Patient B abandons A's consult via HTTP — must 404, not 403.
     // Sprint 21 / TLC-040: JWT auth migration (see §3a comment).
-    // POST also needs explicit empty-body + content-type so Fastify's
-    // default body-parser doesn't 400 the request before reaching the
-    // handler precedence test (TLC-040 r2 fix-forward).
+    // Sprint 22 / TLC-040 r3 closure: state-changing requests (POST/
+    // PATCH/DELETE) require Idempotency-Key per IDEMPOTENCY v5.1.
+    // Without it, the idempotency middleware returns 400
+    // `internal.idempotency.missing_key` BEFORE reaching the handler
+    // precedence test. Add the header so the request gets through to
+    // the I-025 tenant-blind 404 path.
     const tokenB = mintTokenForAccount(T_US, patientB);
     const r = await app!.inject({
       method: 'POST',
@@ -381,6 +384,7 @@ describe('async-consult HTTP — §3 handler-level tenant-blind 404 (I-025)', ()
         host: 'heroshealth.com',
         authorization: `Bearer ${tokenB}`,
         'content-type': 'application/json',
+        'idempotency-key': ulid(),
       },
       payload: {},
     });
