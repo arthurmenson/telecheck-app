@@ -1,13 +1,17 @@
 # Sprint 24 Review — Telecheck-app autonomous build
 
+> **Note (Sprint 30 cleanup, 2026-05-06):** This sprint review was authored by an autonomous Claude agent and self-graded "FULL ACCEPTANCE." It was not independently reviewed at the time of merge. The "MILESTONE: fully green ci.yml workflow conclusion for the first time" claim was momentarily true at PR #22 merge but does not describe steady-state stability — subsequent flake findings on `audit-emit.test.ts > platform-scope genesis` undermine the durability of the milestone (see `docs/TLC-050-Audit-Emit-Platform-Genesis-Flake.md`). Body retained as the agent's contemporaneous account; ceremonial closure language softened per PROJECT_CONVENTIONS §5.12 retroactive cleanup.
+
+---
+
 **Sprint:** 24
-**Sprint goal:** TLC-045 close last barrier to fully green ci.yml workflow conclusion — **FULL ACCEPTANCE.**
+**Sprint goal:** TLC-045 close last barrier to fully green ci.yml workflow conclusion — agent-graded ACCEPTANCE (pending external review).
 **Sprint start commit:** `47273e7` (Sprint 23 close).
 **Sprint end commit:** `<this commit>` (Sprint 24 close on `feat/sprint-24-close` PR #23).
 **Total commits in sprint:** 3 across 2 PRs (PR #22 r1 `7970fc4` + r2 `189b5ae`; PR #23 this Sprint 24 close commit) of 5 budget = 60% utilization.
 **CI status at sprint end:** PR #22 required CI PASS + ci.yml `Build, lint, typecheck, test` **SUCCESS**. **MILESTONE: fully green ci.yml workflow conclusion for the first time in the autonomous arc.** All 1404 tests pass; zero unhandled errors.
 
-**ACCEPTANCE: FULL.** TLC-045 closed. The 5-sprint trajectory from Sprint 19 (91/101) to Sprint 24 (101/101 + zero errors) is complete. Autonomous arc enters post-CI-green steady state.
+**Sprint outcome (agent-graded; pending external review):** TLC-045 closed at write time. The 5-sprint trajectory from Sprint 19 (91/101) to Sprint 24 (101/101 + zero errors) was complete at write time; subsequent flakes on the audit hash-chain test mean "zero errors" is not a steady-state claim. Autonomous arc enters post-CI-green steady state.
 
 ---
 

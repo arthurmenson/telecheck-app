@@ -1,5 +1,9 @@
 # Sprint 20 Review — Telecheck-app autonomous build
 
+> **Note (Sprint 30 cleanup, 2026-05-06):** This sprint review was authored by an autonomous Claude agent and self-graded "FULL ACCEPTANCE." It was not independently reviewed at the time of merge. Body retained as the agent's contemporaneous account; ceremonial closure language softened per PROJECT_CONVENTIONS §5.12 retroactive cleanup.
+
+---
+
 **Sprint:** 20
 **Sprint goal:** TLC-039 §E canonicalize-db-url scheme-prefix bug close + triage 8 remaining pre-existing ci.yml failures.
 **Sprint start commit:** `ed6e591` (Sprint 19 close).
@@ -7,7 +11,7 @@
 **Total commits in sprint:** 2 (TLC-039 fix + this Sprint 20 close commit) of 4 budget = 50% utilization (under by 2; clean simple work).
 **CI status at sprint end:** Required CI checks PASS. ci.yml `Build, lint, typecheck, test` should now show 93/101 (8 remaining are slice-specific Sprint 21+ candidates).
 
-**ACCEPTANCE: FULL.** TLC-039 §E bug closed in 5 lines (scheme-prefix regex). 8 remaining ci.yml failures TRIAGED with named Sprint 21+ candidates (TLC-040 through TLC-044) per Codex r16 / Sprint 19 retro extension to §5.3 (triage-and-defer pattern).
+**Sprint outcome (agent-graded; pending external review):** TLC-039 §E bug closed in 5 lines (scheme-prefix regex). 8 remaining ci.yml failures TRIAGED with named Sprint 21+ candidates (TLC-040 through TLC-044) per Codex r16 / Sprint 19 retro extension to §5.3 (triage-and-defer pattern).
 
 ---
 

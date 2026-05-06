@@ -679,10 +679,36 @@ describe('emitAudit — hash chain envelope construction', () => {
   });
 
   it('platform-scope genesis: SHA-256("GENESIS:<tenant>:PLATFORM")', async () => {
-    // Same exact-derivation pin for the PLATFORM partition.
-    const expectedGenesis = computeGenesisHashHex(`${TENANT_US}:PLATFORM`);
+    // Sprint 30 / TLC-050 fix (Codex Sprint 30 verification of Agent X
+    // diagnosis): use a unique throwaway tenant per test invocation so
+    // the partition key `${tenant}:PLATFORM` cannot collide with any
+    // other test in the run that emits a platform-scope audit record.
+    //
+    // Why this is the right fix: the trigger at
+    // migrations/002_audit_chain.sql:480-506 partitions hash chains by
+    // `tenant_id || ':' || COALESCE(target_patient_id, 'PLATFORM')`.
+    // The patient-scope sibling test at line 659 already correctly
+    // uses a `uniquePatient` random suffix to avoid cross-test
+    // collision; this test was the only hash-chain-genesis test using
+    // a fixed `TENANT_US:PLATFORM` partition. Randomizing the
+    // resource_id (which is NOT part of the partition key) doesn't
+    // isolate the partition. Codex Sprint 30 verification ruled out
+    // the RELEASE SAVEPOINT cross-test theory; the real cause is
+    // partition-key non-uniqueness in this single test fixture.
+    //
+    // Fresh-tenant insertion: the savepoint cycle rolls back this
+    // INSERT at test end, so no leakage.
+    const uniqueTenantStr = `Telecheck-Genesis-${Math.random().toString(36).slice(2, 10)}`;
+    const uniqueTenant: TenantId = asTenantId(uniqueTenantStr);
+    const client = getTestClient();
+    await client.query(
+      `INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain, country_of_care, kms_key_alias, status, activated_at)
+       VALUES ($1, $1, $1, 'Test Genesis', $1, 'US', 'alias/test-genesis-key', 'active', NOW())`,
+      [uniqueTenantStr],
+    );
+    const expectedGenesis = computeGenesisHashHex(`${uniqueTenantStr}:PLATFORM`);
     const uniqueResource = `cfg_genesis_${Math.random().toString(36).slice(2, 12)}`;
-    await withTenantContext(TENANT_US, async () => {
+    await withTenantContext(uniqueTenant, async () => {
       const env = await emitAudit(
         baseInput({
           target_patient_id: null,
@@ -690,12 +716,13 @@ describe('emitAudit — hash chain envelope construction', () => {
           resource_type: 'config',
           resource_id: uniqueResource,
           category: 'B',
+          tenant_id: uniqueTenant,
         }),
         getTx(),
       );
       expect(env.hash_chain.sequence_number).toBe(1);
       expect(env.hash_chain.previous_hash).toBe(expectedGenesis);
-      expect(env.hash_chain.partition).toBe(`${TENANT_US}:PLATFORM`);
+      expect(env.hash_chain.partition).toBe(`${uniqueTenantStr}:PLATFORM`);
     });
   });
 
