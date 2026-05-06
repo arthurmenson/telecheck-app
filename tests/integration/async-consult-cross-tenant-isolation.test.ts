@@ -25,8 +25,10 @@
  *   - Codex async-consult-r9..r13 closures (defense-in-depth posture)
  */
 
-import { describe, expect, it } from 'vitest';
+import type { FastifyInstance } from 'fastify';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { buildApp } from '../../src/app.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
@@ -251,5 +253,105 @@ describe('async-consult fail-closed transitions — §2 SI-006 + SI-007 gates', 
         ),
       ),
     ).rejects.toThrow(consultService.AiServiceNotWiredError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §3 Handler-level tenant-blind 404 (Codex async-consult-r15 MEDIUM closure)
+//
+// The trust boundary that matters for I-025 is the HTTP response. The
+// service-level assertions in §1 prove the right error class is thrown;
+// these handler-level assertions prove the right HTTP envelope is
+// returned: 404 internal.resource.not_found for BOTH cross-tenant +
+// cross-patient mismatch — byte-identical to a "doesn't exist" response.
+// A handler regression that returned 403 (or any distinguishing
+// envelope) would surface here, even if the service-level tests still
+// passed.
+// ---------------------------------------------------------------------------
+
+let app: FastifyInstance | null = null;
+
+beforeAll(async () => {
+  process.env['NODE_ENV'] = 'test';
+  app = await buildApp({ logger: false });
+  await app.ready();
+});
+
+afterAll(async () => {
+  if (app !== null) {
+    await app.close();
+  }
+});
+
+describe('async-consult HTTP — §3 handler-level tenant-blind 404 (I-025)', () => {
+  it('§3a same-tenant cross-patient GET /:id/events returns 404 (NOT 403)', async () => {
+    const patientA = await seedAccount(US_CTX, '+1');
+    const patientB = await seedAccount(US_CTX, '+1');
+
+    // Seed patient A's consult via the service layer (initiate works
+    // without payment guard since it's the INITIAL INSERT, not a
+    // start_intake transition).
+    const consultA = await withTenantContext(T_US, () =>
+      consultService.initiate(
+        US_CTX,
+        { actorId: patientA },
+        {
+          account_id: patientA,
+          consult_type: 'general',
+          modality: 'async',
+          current_program_catalog_entry_id: null,
+        },
+      ),
+    );
+
+    // Patient B (same tenant, different patient) attempts to read A's
+    // events via the HTTP handler. Pre-auth header stub set so
+    // requireActorContext + requireTenantContext both succeed.
+    const r = await app!.inject({
+      method: 'GET',
+      url: `/v0/async-consult/${consultA.consult_id}/events`,
+      headers: {
+        host: 'heroshealth.com',
+        'x-actor-id': patientB,
+      },
+    });
+
+    // Tenant-blind 404 — the handler MUST NOT distinguish "doesn't
+    // exist" from "exists but not yours" per I-025.
+    expect(r.statusCode).toBe(404);
+    const body = r.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe('internal.resource.not_found');
+  });
+
+  it('§3b same-tenant cross-patient POST /:id/abandon returns 404 (write-path tenant-blind)', async () => {
+    const patientA = await seedAccount(US_CTX, '+1');
+    const patientB = await seedAccount(US_CTX, '+1');
+
+    const consultA = await withTenantContext(T_US, () =>
+      consultService.initiate(
+        US_CTX,
+        { actorId: patientA },
+        {
+          account_id: patientA,
+          consult_type: 'general',
+          modality: 'async',
+          current_program_catalog_entry_id: null,
+        },
+      ),
+    );
+
+    // Patient B abandons A's consult via HTTP — must 404, not 403
+    const r = await app!.inject({
+      method: 'POST',
+      url: `/v0/async-consult/${consultA.consult_id}/abandon`,
+      headers: {
+        host: 'heroshealth.com',
+        'x-actor-id': patientB,
+      },
+    });
+
+    expect(r.statusCode).toBe(404);
+    const body = r.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe('internal.resource.not_found');
   });
 });
