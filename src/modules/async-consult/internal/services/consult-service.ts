@@ -43,6 +43,10 @@ import { withTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import { hasActiveConsent } from '../../../consent/index.js';
+import {
+  getSubmissionForBinding,
+  type FormSubmissionId,
+} from '../../../forms-intake/index.js';
 import type { AccountId } from '../../../identity/internal/types.js';
 import {
   emitConsultAbandonedAudit,
@@ -117,6 +121,61 @@ export class AbandonGuardNotSatisfiedError extends Error {
   }
 }
 
+/**
+ * Thrown when the actor doesn't own the consult (patient_id mismatch
+ * AND no delegate grant). Per Codex async-consult-r9 HIGH closure
+ * 2026-05-05: prevents same-tenant attackers from mutating consults
+ * by knowing another patient's consult_id. Service layer maps to 404
+ * (NOT 403) per I-025 tenant-blind error envelope — leaking "exists
+ * but not yours" would reveal cross-patient existence to a same-tenant
+ * attacker.
+ */
+export class ConsultPatientOwnershipError extends Error {
+  constructor(public readonly consultId: ConsultId) {
+    super(`Actor does not own consult ${consultId}`);
+    this.name = 'ConsultPatientOwnershipError';
+  }
+}
+
+/**
+ * Thrown when the actor attempts startIntake without proven payment
+ * confirmation. Per Codex async-consult-r9 HIGH closure 2026-05-05:
+ * Sprint 10 fails closed — startIntake is REJECTED at v0.1 because
+ * the Payment slice doesn't exist yet (SI-006 candidate). Operators
+ * advance consults manually for testing via direct DB; production
+ * service rejects until SI-006 closes.
+ */
+export class PaymentNotVerifiedError extends Error {
+  constructor(public readonly consultId: ConsultId) {
+    super(
+      `Payment not verified for consult ${consultId}: ` +
+        `start_intake is fail-closed at v0.1 pending SI-006 (Payment slice integration). ` +
+        `Production callers must wait for SI-006 closure.`,
+    );
+    this.name = 'PaymentNotVerifiedError';
+  }
+}
+
+/**
+ * Thrown when a forms_submission referenced for binding is not in a
+ * terminal status (must be 'submitted' or 'completed' — not
+ * 'in_progress' or 'paused'). Per Codex async-consult-r9 HIGH closure
+ * 2026-05-05: prevents incomplete submissions from being bound to
+ * consults at INTAKE → SUBMITTED.
+ */
+export class FormSubmissionNotTerminalError extends Error {
+  constructor(
+    public readonly submissionId: string,
+    public readonly status: string,
+  ) {
+    super(
+      `Forms submission ${submissionId} has non-terminal status '${status}'; ` +
+        `must be 'submitted' or 'completed' to bind to a consult`,
+    );
+    this.name = 'FormSubmissionNotTerminalError';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -128,6 +187,27 @@ export class AbandonGuardNotSatisfiedError extends Error {
 function hoursSince(isoTimestamp: string): number {
   const elapsedMs = Date.now() - new Date(isoTimestamp).getTime();
   return elapsedMs / (1000 * 60 * 60);
+}
+
+/**
+ * Verify the actor owns the consult. Per Codex async-consult-r9 HIGH
+ * closure 2026-05-05: prevents same-tenant attackers from mutating
+ * consults by knowing another patient's consult_id.
+ *
+ * v0.1 ownership rule: actor.accountId === consult.patient_id.
+ * Sprint 11+ adds delegate-grant authorization (a delegate may act on
+ * behalf of the patient if a Consent slice delegation grants the
+ * scope). For v0.1, only direct patient ownership permits mutation.
+ *
+ * Throws ConsultPatientOwnershipError on mismatch; the handler layer
+ * maps to 404 (NOT 403) per I-025 tenant-blind error envelope —
+ * leaking "exists but not yours" would reveal cross-patient existence
+ * to a same-tenant attacker.
+ */
+function assertConsultOwnership(consult: Consult, actorAccountId: AccountId): void {
+  if (consult.patient_id !== actorAccountId) {
+    throw new ConsultPatientOwnershipError(consult.consult_id);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +302,7 @@ export async function submit(
   ctx: TenantContext,
   actor: { actorId: string; accountId: AccountId },
   consultId: ConsultId,
-  intakeFormSubmissionId: string,
+  intakeFormSubmissionId: FormSubmissionId,
   externalTx?: DbTransaction,
 ): Promise<Consult> {
   return withTransaction(async (tx) => {
@@ -231,6 +311,51 @@ export async function submit(
     // Read current state — null → 404 mapped at handler per I-025
     const current = await consultRepo.findConsultById(ctx.tenantId, consultId, tx);
     if (current === null) throw new ConsultNotFoundError(consultId);
+
+    // Authorization: actor must own this consult (per Codex
+    // async-consult-r9 HIGH closure 2026-05-05). Prevents same-tenant
+    // attacker who knows another patient's consult_id from advancing
+    // it through their own consent context.
+    assertConsultOwnership(current, actor.accountId);
+
+    // Guard: form_complete — verify forms_submission status + ownership
+    // BEFORE constructing the GuardContext (per Codex async-consult-r9
+    // HIGH closure 2026-05-05). Composite FK alone proves tenant + id
+    // match but does NOT prove status='submitted' or patient_id match.
+    // We verify both here in the same transaction.
+    const submission = await getSubmissionForBinding(
+      ctx.tenantId,
+      intakeFormSubmissionId,
+      tx,
+    );
+    if (submission === null) {
+      // Tenant-blind: don't distinguish "submission doesn't exist" from
+      // "submission exists in another tenant" or "submission belongs to
+      // another patient". Return generic SubmitGuardNotSatisfiedError.
+      throw new SubmitGuardNotSatisfiedError(consultId, 'form_not_complete');
+    }
+    if (submission.patient_id !== actor.accountId) {
+      // Same as above — tenant-blind from the cross-patient perspective.
+      throw new SubmitGuardNotSatisfiedError(consultId, 'form_not_complete');
+    }
+    // Bind-eligible statuses: forms_submission must be past the patient's
+    // submission boundary. 'submitted' is the canonical first terminal
+    // state; AI processing or clinician review may have advanced it
+    // further already (concurrent independent forms-intake processing) —
+    // any post-patient-submission state is bind-eligible.
+    //
+    // Per `SubmissionStatus` type at forms-intake/internal/types.ts:41-49:
+    //   'in_progress' / 'paused' / 'abandoned' / 'declined' — NOT bind-eligible
+    //   'submitted' / 'ai_evaluated' / 'physician_reviewed' / 'approved' — bind-eligible
+    const bindEligibleStatuses = [
+      'submitted',
+      'ai_evaluated',
+      'physician_reviewed',
+      'approved',
+    ] as const;
+    if (!(bindEligibleStatuses as readonly string[]).includes(submission.status)) {
+      throw new FormSubmissionNotTerminalError(intakeFormSubmissionId, submission.status);
+    }
 
     // Guard: active_consent (cross-slice Consent gate). hasActiveConsent
     // returns boolean — do not invent a consent row if missing.
@@ -245,12 +370,9 @@ export async function submit(
       throw new SubmitGuardNotSatisfiedError(consultId, 'no_active_consent');
     }
 
-    // Guard: form_complete (v0.1: caller-asserted; Sprint 11+ may add a
-    // forms-intake state read to verify). Caller proves form completeness
-    // by passing the submission id — if the submission isn't complete,
-    // the composite FK at INSERT time would fail. We trust the FK at v0.1.
-
-    // State machine validation with typed GuardContext (proves both guards)
+    // State machine validation with typed GuardContext (proves both guards
+    // — at this point form_complete + active_consent have both been
+    // verified above; the GuardContext type just commits to those proofs).
     const guardCtx: GuardContext = {
       event: 'submit',
       guard: { form_complete: true, active_consent: true },
@@ -331,6 +453,9 @@ export async function abandon(
     const current = await consultRepo.findConsultById(ctx.tenantId, consultId, tx);
     if (current === null) throw new ConsultNotFoundError(consultId);
 
+    // Authorization: actor must own this consult (Codex r9 HIGH closure)
+    assertConsultOwnership(current, actor.accountId);
+
     const hoursSinceActivity = hoursSince(current.updated_at);
     if (hoursSinceActivity < 48) {
       throw new AbandonGuardNotSatisfiedError(consultId, hoursSinceActivity);
@@ -403,7 +528,7 @@ export async function abandon(
  */
 async function unguardedTransition(
   ctx: TenantContext,
-  actor: { actorId: string },
+  actor: { actorId: string; accountId: AccountId },
   consultId: ConsultId,
   guardCtx: GuardContext,
   externalTx?: DbTransaction,
@@ -413,6 +538,9 @@ async function unguardedTransition(
 
     const current = await consultRepo.findConsultById(ctx.tenantId, consultId, tx);
     if (current === null) throw new ConsultNotFoundError(consultId);
+
+    // Authorization: actor must own this consult (Codex r9 HIGH closure)
+    assertConsultOwnership(current, actor.accountId);
 
     const toState = validateTransition(current.state, guardCtx.event, guardCtx);
 
@@ -446,29 +574,40 @@ async function unguardedTransition(
 /**
  * INITIATED → INTAKE on `start_intake` event.
  *
- * v0.1 stub: payment_confirmed is hard-coded true. SI-006 candidate
- * (payment confirmation cross-slice integration) tracked in Sprint
- * 10 plan §11. Real payment service integration is Sprint 11+.
+ * **FAIL-CLOSED at v0.1** per Codex async-consult-r9 HIGH closure
+ * 2026-05-05. The Payment slice does NOT exist yet — there is no
+ * production-grade source of truth for `payment_confirmed`. Hard-
+ * coding `true` would let unpaid consults advance through the
+ * payment-guarded transition with the audit trail recording the
+ * transition as if payment had been verified — that's the exact
+ * bug Codex flagged.
+ *
+ * Sprint 11+ closure path: SI-006 candidate (Payment slice
+ * authoring + cross-slice payment-verification surface). When
+ * SI-006 closes, this function reads the payment status from the
+ * Payment slice public interface, constructs the GuardContext only
+ * if confirmed, and proceeds.
+ *
+ * Until then: any caller invoking startIntake gets PaymentNotVerifiedError.
+ * Operators can advance consults manually via direct DB during testing
+ * (handler-layer integration tests use direct DB seeding for INTAKE
+ * state setup rather than going through this service).
  */
 export async function startIntake(
-  ctx: TenantContext,
-  actor: { actorId: string },
+  _ctx: TenantContext,
+  _actor: { actorId: string; accountId: AccountId },
   consultId: ConsultId,
-  externalTx?: DbTransaction,
+  _externalTx?: DbTransaction,
 ): Promise<Consult> {
-  return unguardedTransition(
-    ctx,
-    actor,
-    consultId,
-    { event: 'start_intake', guard: { payment_confirmed: true } },
-    externalTx,
-  );
+  // Fail closed. Do NOT advance through the payment guard with a
+  // hard-coded value. SI-006 resume gate.
+  throw new PaymentNotVerifiedError(consultId);
 }
 
 /** ABANDONED → INTAKE on `resume` event (no guard). */
 export async function resume(
   ctx: TenantContext,
-  actor: { actorId: string },
+  actor: { actorId: string; accountId: AccountId },
   consultId: ConsultId,
   externalTx?: DbTransaction,
 ): Promise<Consult> {
@@ -484,7 +623,7 @@ export async function resume(
 /** SUBMITTED → PROCESSING on `process` event (no guard). */
 export async function process(
   ctx: TenantContext,
-  actor: { actorId: string },
+  actor: { actorId: string; accountId: AccountId },
   consultId: ConsultId,
   externalTx?: DbTransaction,
 ): Promise<Consult> {
@@ -500,7 +639,7 @@ export async function process(
 /** AWAITING_DATA → UNDER_REVIEW on `patient_responds` event (no guard). */
 export async function patientResponds(
   ctx: TenantContext,
-  actor: { actorId: string },
+  actor: { actorId: string; accountId: AccountId },
   consultId: ConsultId,
   externalTx?: DbTransaction,
 ): Promise<Consult> {

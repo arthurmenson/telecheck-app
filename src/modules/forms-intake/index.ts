@@ -16,10 +16,19 @@
  *   - Slice PRD v2.1 §17 (`intake_subscription_intent` event consumed by Pharmacy + Refill)
  */
 
+import type { DbClient } from '../../lib/db.js';
 import type { TenantId } from '../../lib/glossary.js';
 
-import { findActiveDeployment } from './internal/repositories/submission-repo.js';
-import type { FormDeployment, ProgramCatalogEntryId } from './internal/types.js';
+import {
+  findActiveDeployment,
+  findSubmissionById,
+} from './internal/repositories/submission-repo.js';
+import type {
+  FormDeployment,
+  FormSubmission,
+  FormSubmissionId,
+  ProgramCatalogEntryId,
+} from './internal/types.js';
 
 // ---------------------------------------------------------------------------
 // Public type re-exports
@@ -30,7 +39,7 @@ import type { FormDeployment, ProgramCatalogEntryId } from './internal/types.js'
 // payload directly. This preserves the extraction-ready boundary per ADR-001.
 // ---------------------------------------------------------------------------
 
-export type { FormDeployment } from './internal/types.js';
+export type { FormDeployment, FormSubmission } from './internal/types.js';
 export type {
   FormDeploymentId,
   FormSubmissionId,
@@ -61,4 +70,27 @@ export async function getActiveDeployment(
   programCatalogEntryId: ProgramCatalogEntryId,
 ): Promise<FormDeployment | null> {
   return findActiveDeployment(tenantId, programCatalogEntryId);
+}
+
+/**
+ * getSubmissionForBinding — used by Async Consult slice to verify a
+ * forms_submission row before binding it to a consult at the
+ * INTAKE → SUBMITTED transition. Returns the full submission record
+ * (or null if not found / cross-tenant filtered).
+ *
+ * Caller MUST verify the returned submission's `patient_id` matches
+ * the consult's patient_id AND `status` is terminal ('submitted'
+ * or 'completed' — NOT 'in_progress' or 'paused') before binding.
+ *
+ * Per Codex async-consult-r9 HIGH closure 2026-05-05: this cross-slice
+ * surface exists specifically to prevent same-tenant attackers from
+ * binding incomplete or wrong-patient submissions to consults via a
+ * known submission_id.
+ */
+export async function getSubmissionForBinding(
+  tenantId: TenantId,
+  submissionId: FormSubmissionId,
+  externalTx?: DbClient,
+): Promise<FormSubmission | null> {
+  return findSubmissionById(tenantId, submissionId, externalTx);
 }
