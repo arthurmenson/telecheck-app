@@ -1,0 +1,122 @@
+# Telecheck — baseline-refresh metadata guard
+#
+# Sprint 13 / TLC-026 fix-forward (Codex perf-bench-r6 MEDIUM closure
+# 2026-05-05). Closes r6 finding: the [scope=baseline-refresh]
+# commit-message tag enforcement claimed in
+# docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1 was doc-only-discipline
+# (same class as Codex r3 closure pattern). r6 correctly flagged that
+# a tag described as "enforcement" but only checkable by future
+# operators grepping git log is the same control weakness §2.1 claims
+# to eliminate.
+#
+# This workflow IS the enforcement: any PR that modifies
+# tests/perf/baseline.json MUST carry the required metadata in the
+# PR title/body or commit messages on the PR. Missing metadata fails
+# the check, blocking merge.
+#
+# Required metadata (per docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1):
+#   1. Literal `[scope=baseline-refresh]` tag (so audit trail is grep-able)
+#   2. A GitHub run id (10+ contiguous digits) for CI-runner provenance
+#   3. A source-commit SHA (7+ char hex) so the baseline is bound to a
+#      specific code state, not a moving target
+#
+# Anti-pattern this prevents (per Codex perf-bench-r2/r3/r6 finding class):
+#   A local-laptop or flaky-run baseline silently committed without
+#   provenance. r2 closed local-laptop committed-as-baseline; r3 closed
+#   doc-only-discipline as fix-forward; r6 closes "we said enforcement
+#   but only documented it" — same class one layer up.
+#
+# Why a separate workflow (not extending perf.yml or ci.yml):
+#   - perf.yml's job is bench execution + threshold check; mixing in
+#     metadata enforcement on a different file path couples concerns
+#   - ci.yml runs on every PR; this workflow runs ONLY when
+#     tests/perf/baseline.json changes (paths filter)
+#   - Keeps the failure mode visible as a distinct CI check
+#     ("Baseline refresh guard / verify-metadata") that branch
+#     protection can require independently when Sprint 14+ wires it
+#
+# Future Sprint 14+ branch-protection wire-up:
+#   gh api -X PUT repos/:owner/:repo/branches/main/protection \
+#     --field "required_status_checks[contexts][]=Baseline refresh guard / verify-metadata"
+#   (Append to the existing required-checks array per
+#    docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §1.)
+#
+# Spec references:
+#   - ORT v1.5 OR-218 (Tier 1 launch-blocking)
+#   - docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1 (procedure)
+#   - tests/perf/README.md §"Baseline.json provenance + scope"
+
+name: Baseline refresh guard
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/perf/baseline.json'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-metadata:
+    name: verify-metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout PR (full history for commit-message inspection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify baseline-refresh metadata
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Collect metadata sources: PR title + PR body + every commit
+          # message on the PR. Either a maintainer-style PR-title-as-
+          # metadata flow OR a commit-message-discipline flow satisfies.
+          # A squash-merge with the metadata in the squash commit body
+          # also passes (PR body is preserved by GH default squash).
+          COMMIT_MESSAGES="$(git log --format=%B "${BASE_SHA}..${HEAD_SHA}" || true)"
+          # Concatenate to a single haystack. Use newline separator so
+          # multi-line bodies/messages stay distinguishable.
+          ALL="${PR_TITLE}
+          ${PR_BODY:-}
+          ${COMMIT_MESSAGES}"
+
+          # ----- Required check 1: [scope=baseline-refresh] literal -----
+          if ! printf '%s\n' "$ALL" | grep -F -q '[scope=baseline-refresh]'; then
+            echo "::error::baseline.json change is missing [scope=baseline-refresh] tag in PR title/body or commit messages."
+            echo "See docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md §2.1 for the required metadata."
+            echo "Anti-pattern: silently regenerating baseline.json without provenance (Codex perf-bench-r2/r3/r6 finding class)."
+            exit 1
+          fi
+
+          # ----- Required check 2: GH run id (10+ contiguous digits) -----
+          # GitHub Actions run ids are typically 10-12 digit numbers.
+          # Lower bound at 10 to avoid false positives on small ints.
+          if ! printf '%s\n' "$ALL" | grep -E -q '\b[0-9]{10,}\b'; then
+            echo "::error::baseline.json change is missing a GH run id (10+ contiguous digits) in PR title/body or commit messages."
+            echo "Required to bind the baseline to a specific CI-runner capture."
+            echo "Example: 'Captured from perf.yml run 1234567890123' in the commit body."
+            exit 1
+          fi
+
+          # ----- Required check 3: source-commit SHA (7+ char hex) -----
+          # Standard short-SHA pattern. Required so the baseline is
+          # bound to a specific code state at capture time.
+          if ! printf '%s\n' "$ALL" | grep -E -q '\b[0-9a-f]{7,40}\b'; then
+            echo "::error::baseline.json change is missing a source-commit SHA (7+ char hex) in PR title/body or commit messages."
+            echo "Required so the baseline's code-state provenance is auditable."
+            exit 1
+          fi
+
+          echo "OK: baseline.json change includes [scope=baseline-refresh] tag + GH run id + source-commit SHA."
+          echo "Audit-trail metadata verified. Sprint 14+ baseline-refresh execution is unblocked when Evans is reachable for the gh api PUT (per TLC-023c §1)."
