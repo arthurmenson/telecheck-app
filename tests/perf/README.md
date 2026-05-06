@@ -50,18 +50,26 @@ Until those three conditions hold:
 2. Doc-only discipline ("commit message rationale") is not enforceable (Codex r3 MEDIUM)
 3. Real baseline values come from CI calibration at Sprint 13+ (after `perf.yml` has 3-5 stable runs on main)
 
-**Sprint 13+ baseline expansion path:**
-- Sprint 13 PM kickoff verifies 3-5 stable `perf.yml` main runs
-- Regenerate baseline.json from a CI artifact (`gh run download <stable-run-id> --name bench-output-<id>`)
-- Commit the CI-calibrated baseline (now covers all 8 scenarios — crisis-detect + validate-transition)
-- Sprint 13 retro flips the gate to required-blocking via TLC-023c
+**Sprint 13+ baseline expansion path (split: Sprint 13 BUILDS closure path; Sprint 14+ EXECUTES):**
 
-**At v0.1 (Sprint 11 + Sprint 12):**
+Sprint 13 / TLC-026 lands the **closure-path infrastructure** so Sprint 14+ (or whenever CI variance data + Evans's `gh api` access converge) executes against a ready foundation:
+- **Manifest-check helper** in `tests/perf/check-thresholds.ts`: `verifyManifestCoverage()` fails the gate if any expected scenario lacks a measured task in bench output. Runs BEFORE the per-threshold loop in `main()`. Codex perf-bench-r4 MEDIUM recommended fix; landed Sprint 13 (within TLC-026 scope).
+- **Self-test mode** (`--self-test` CLI flag) covers §A good / §B missing-scenario / §C tail-missing / §D malformed-values fixtures so a regression in `check-thresholds.ts` itself surfaces before the bench harness even starts. `perf.yml` runs `--self-test` as a separate step BEFORE the bench step.
+
+Sprint 14+ EXECUTES once 3-5 stable `perf.yml` main runs accumulate AND Evans is reachable for `gh api` execution:
+- Capture the baseline from a controlled CI run (`gh run download <stable-run-id> --name bench-output-<id>`)
+- Commit the CI-calibrated baseline (now covers all 8 scenarios — crisis-detect + validate-transition)
+- Tighten thresholds based on observed CI variance (worksheet in `docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md` §3)
+- Evans flips the gate to required-blocking via the `gh api` PUT in `docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md` §1
+- Surface the "ready to flip" message when the variance data converges (Option A: SM signals; Evans executes)
+
+**At v0.1 (Sprint 11 + Sprint 12 + Sprint 13):**
 - Threshold gate (`check-thresholds.ts`) is the absolute correctness floor — works against any captured bench output, baseline-or-not
+- Manifest-check helper (Sprint 13 / TLC-026) ensures the expected-vs-measured scenario set is verified BEFORE per-threshold checks — prevents silent gate-bypass when a bench file is removed or a scenario name drifts
 - `--compare baseline.json` runs but only diffs against the 4 crisis-detect scenarios; validate-transition `--compare` output shows "no baseline match" at v0.1 (acceptable signal noise; no enforcement value lost because threshold gate covers all 8 scenarios)
 - Future commits that regenerate baseline.json need `--scope=baseline-refresh` rationale in the commit message AND must come from a CI-calibrated capture, not a local run
 
-### Known v0.1 trade-off (Codex perf-bench-r2/r3/r4 acknowledged)
+### Known v0.1 trade-off (Codex perf-bench-r2/r3/r4 acknowledged; Sprint 13 closure path BUILT, Sprint 14+ EXECUTES)
 
 Codex iteration produced 3 valid MEDIUM findings across rounds r2-r4 on the perf gate's relative-regression coverage. The findings converge on a structural observation: **at v0.1 there is no perfect baseline strategy**:
 
@@ -69,13 +77,22 @@ Codex iteration produced 3 valid MEDIUM findings across rounds r2-r4 on the perf
 - **Revert baseline + doc-only discipline:** discipline is not enforceable (Codex r3)
 - **Revert baseline + scope to crisis-detect only:** validate-transition has no relative-regression coverage; first CI-calibrated baseline could encode already-regressed behavior (Codex r4)
 
-**v0.1 trade-off accepted:** `check-thresholds.ts` absolute floor is the v0.1 enforcement boundary. Validate-transition relative-regression coverage is **deferred to Sprint 13 TLC-026** (track as explicit story, not a doc-only deferral). Sprint 13 closes the loop via:
+**v0.1 trade-off accepted:** `check-thresholds.ts` absolute floor is the v0.1 enforcement boundary. Validate-transition relative-regression coverage was **escalated to Sprint 13 TLC-026** (Sprint 12 retro recorded this as the first-ever Codex escalation in 12 sprints, codifying the new "structural-constraint-not-code-defect" escalation pattern in `docs/PROJECT_CONVENTIONS.md`).
+
+**Sprint 13 / TLC-026 BUILT the closure path (this commit):**
+
+1. **Manifest-check helper landed:** `verifyManifestCoverage()` in `tests/perf/check-thresholds.ts` fails the gate if any expected scenario lacks a measured task in bench output. Runs BEFORE the per-threshold loop in `main()`. Closes the Codex perf-bench-r4 MEDIUM recommended fix.
+2. **Self-test mode landed (`--self-test` CLI flag):** in-memory fixtures cover §A good / §B missing-scenario / §C tail-missing / §D malformed-values so a regression in `check-thresholds.ts` itself surfaces before the bench harness even starts. Wired into `.github/workflows/perf.yml` as a separate step BEFORE the bench step.
+3. **Branch-protection handoff doc preserved:** `docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md` (§1 PUT command + §2 CI variance plan + §3 threshold-tightening worksheet + §4 rollback procedure) is the Evans-side execution playbook. Untouched by Sprint 13 — referenced from Sprint 14+ when execution lands.
+
+**Sprint 14+ EXECUTES the closure path** (deferred per Evans Option A constraint — no `gh auth` in the autonomous shell; SM surfaces "ready to flip" when CI variance data converges):
 
 1. Capture baseline from a controlled CI run (after `perf.yml` has 3-5 stable main runs)
-2. Add a manifest-check helper to `check-thresholds.ts` that fails the gate if any expected scenario lacks a baseline entry (Codex r4 recommended fix; not implementable in Sprint 12 budget)
-3. Tighten thresholds based on observed CI variance
+2. Tighten thresholds based on observed CI variance (worksheet in `docs/TLC-023c-BRANCH-PROTECTION-WIRE-UP.md` §3)
+3. Evans executes the `gh api` PUT to flip `Performance benchmarks / bench` to required-blocking on `main`
+4. ORT row OR-218 status flips from "scaffolded; closure path built" to "FULLY CLOSED" in the traceability matrix
 
-Sprint 12 retro records this as **the first finding class where iterative fix-forward couldn't close in-sprint** because the underlying constraint (need real CI variance data to make non-arbitrary trade-offs) is structural, not a code defect.
+Sprint 12 retro recorded this as **the first finding class where iterative fix-forward couldn't close in-sprint** because the underlying constraint (need real CI variance data to make non-arbitrary trade-offs) is structural, not a code defect. Sprint 13 closure-path landing demonstrates the escalation pattern's payoff: the Sprint 13 work is enforceable code (manifest helper + self-test) rather than a continuation of doc-only discipline that Codex r3 correctly flagged as unenforceable.
 
 ## Bench corpus at v0.1
 

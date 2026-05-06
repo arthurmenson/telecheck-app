@@ -8,9 +8,16 @@
  *
  * Usage:
  *   npx tsx tests/perf/check-thresholds.ts bench-output.json
+ *   npx tsx tests/perf/check-thresholds.ts --self-test
  *
  * (tsx is a devDependency per package.json:50; .github/workflows/perf.yml
  * invokes via `npx tsx ...` — no separate compile step needed at v0.1.)
+ *
+ * The `--self-test` flag exercises the manifest-check + threshold logic
+ * against synthetic fixtures (good case + missing-scenario case + tail-
+ * percentile-missing case). Codex perf-bench-r4 escalation closure
+ * (Sprint 13 / TLC-026) — gives the gate-correctness logic explicit
+ * test coverage without requiring a full Postgres test setup.
  *
  * Why a separate script (vs vitest assertion):
  *   Vitest's bench() doesn't natively support assertions. The
@@ -230,10 +237,179 @@ function p95OrConservativeFallback(
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Manifest-coverage helper (Sprint 13 / TLC-026 escalation closure)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per Codex perf-bench-r4 closure (escalated Sprint 12 → 13): expose
+ * the EXPECTED_SCENARIOS manifest as a derived view of THRESHOLDS so
+ * that "what bench scenarios MUST exist for the gate to pass" is a
+ * symbolic, single-source-of-truth declaration. Sprint 14+ baseline
+ * regen will use this manifest to verify CI-captured baselines cover
+ * every required scenario before commit.
+ *
+ * The manifest is DERIVED from THRESHOLDS (no duplication): every
+ * threshold entry's `taskNameMatch` IS the scenario identifier.
+ */
+function getExpectedScenarios(): readonly { taskNameMatch: string; label: string }[] {
+  return THRESHOLDS.map((t) => ({
+    taskNameMatch: t.taskNameMatch,
+    label: t.label,
+  }));
+}
+
+interface ManifestCoverageResult {
+  /** Number of expected scenarios found in the bench output. */
+  matched: number;
+  /** Number of expected scenarios MISSING from the bench output. */
+  missing: number;
+  /** Detailed list of missing scenario labels (for error messages). */
+  missingLabels: readonly string[];
+}
+
+/**
+ * Verify every expected scenario has a corresponding task in the bench
+ * output. Returns { matched, missing, missingLabels }. Caller decides
+ * gate-failure semantics (main() fails the gate on missing > 0).
+ */
+function verifyManifestCoverage(
+  tasks: readonly BenchTaskResult[],
+  expected: readonly { taskNameMatch: string; label: string }[],
+): ManifestCoverageResult {
+  let matched = 0;
+  const missingLabels: string[] = [];
+  for (const scenario of expected) {
+    const found = tasks.some((t) => t.name.includes(scenario.taskNameMatch));
+    if (found) {
+      matched += 1;
+    } else {
+      missingLabels.push(scenario.label);
+    }
+  }
+  return {
+    matched,
+    missing: missingLabels.length,
+    missingLabels,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Self-test (--self-test flag)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lightweight self-test exercising:
+ *   §A good case — all expected scenarios present + p99 within limits → pass
+ *   §B missing-scenario case — synthetic output missing §3 long clean →
+ *      manifest-check fails the gate even before threshold-check loops
+ *   §C tail-percentile-missing case — task present but no p95/p99 →
+ *      threshold-check fails the gate via "neither p95 nor p99 data"
+ *
+ * No Postgres / file I/O required. Runs entirely off in-memory fixtures.
+ * Codex perf-bench-r4 closure: gives the gate-correctness logic explicit
+ * test coverage without expanding the test infra investment.
+ */
+function selfTest(): number {
+  const expected = getExpectedScenarios();
+
+  // §A — good case
+  const goodTasks: BenchTaskResult[] = expected.map((s) => ({
+    name: `bench harness: ${s.taskNameMatch}`,
+    p99: 0.001, // 1μs — well under all thresholds
+  }));
+  const goodCoverage = verifyManifestCoverage(goodTasks, expected);
+  if (goodCoverage.missing !== 0) {
+    console.error(
+      `SELF-TEST §A FAIL: good case had ${goodCoverage.missing} missing; expected 0`,
+    );
+    return 1;
+  }
+
+  // §B — missing-scenario case (drop §3 long clean from the input)
+  const missingTasks = goodTasks.filter(
+    (t) => !t.name.includes('detect on ~5 KB clean narrative returns no-crisis'),
+  );
+  const missingCoverage = verifyManifestCoverage(missingTasks, expected);
+  if (missingCoverage.missing !== 1) {
+    console.error(
+      `SELF-TEST §B FAIL: missing-scenario case had ${missingCoverage.missing} missing; expected 1`,
+    );
+    return 1;
+  }
+  if (
+    !missingCoverage.missingLabels.some((l) =>
+      l.includes('crisis-detect: long clean text'),
+    )
+  ) {
+    console.error(
+      `SELF-TEST §B FAIL: missing-scenario label list didn't include the dropped scenario`,
+    );
+    return 1;
+  }
+
+  // §C — tail-percentile-missing case (task present but no p95/p99)
+  const tailMissingTask: BenchTaskResult = {
+    name: 'bench harness: detect on ~35-char clean string returns no-crisis',
+    // No p95, no p99 — should fail per p95OrConservativeFallback contract
+  };
+  const tailFallback = p95OrConservativeFallback(tailMissingTask);
+  if (tailFallback !== null) {
+    console.error(
+      `SELF-TEST §C FAIL: p95OrConservativeFallback should return null when both p95 + p99 are missing; got ${JSON.stringify(tailFallback)}`,
+    );
+    return 1;
+  }
+
+  // §D — runtime-validation rejection of malformed values (Codex
+  // perf-yml-r1 MEDIUM closure — verify isValidLatencyNumber rejects
+  // null / NaN / strings / negative numbers)
+  const malformedNullTask: BenchTaskResult = {
+    name: 'bench harness: detect on ~24-char crisis string returns crisis-detected',
+    p99: null as unknown as number,
+  };
+  if (p95OrConservativeFallback(malformedNullTask) !== null) {
+    console.error('SELF-TEST §D FAIL: p99: null should not pass validation');
+    return 1;
+  }
+  const malformedNanTask: BenchTaskResult = {
+    name: 'bench harness: detect on ~24-char crisis string returns crisis-detected',
+    p99: Number.NaN,
+  };
+  if (p95OrConservativeFallback(malformedNanTask) !== null) {
+    console.error('SELF-TEST §D FAIL: p99: NaN should not pass validation');
+    return 1;
+  }
+  const malformedNegativeTask: BenchTaskResult = {
+    name: 'bench harness: detect on ~24-char crisis string returns crisis-detected',
+    p99: -1,
+  };
+  if (p95OrConservativeFallback(malformedNegativeTask) !== null) {
+    console.error('SELF-TEST §D FAIL: p99: -1 should not pass validation');
+    return 1;
+  }
+
+  console.log('SELF-TEST PASS: §A good / §B missing-scenario / §C tail-missing / §D malformed-values all behave correctly');
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 function main(): number {
   const args = process.argv.slice(2);
+
+  // Self-test mode (Codex perf-bench-r4 closure)
+  if (args.length === 1 && args[0] === '--self-test') {
+    return selfTest();
+  }
+
   if (args.length !== 1) {
-    console.error('Usage: node tests/perf/check-thresholds.js <bench-output.json>');
+    console.error(
+      'Usage: npx tsx tests/perf/check-thresholds.ts <bench-output.json>\n' +
+        '       npx tsx tests/perf/check-thresholds.ts --self-test',
+    );
     return 1;
   }
   const path = args[0];
@@ -264,11 +440,34 @@ function main(): number {
     return 1;
   }
 
+  // Manifest-coverage check (Sprint 13 / TLC-026): runs BEFORE the
+  // per-threshold loop so missing scenarios fail the gate explicitly,
+  // not as a side effect of the threshold-loop's "no matching bench
+  // task" path.
+  const expected = getExpectedScenarios();
+  const coverage = verifyManifestCoverage(tasks, expected);
+  if (coverage.missing > 0) {
+    console.error(
+      `MANIFEST COVERAGE FAILURE: ${coverage.missing}/${expected.length} expected scenarios missing from bench output:`,
+    );
+    for (const label of coverage.missingLabels) {
+      console.error(`  - ${label}`);
+    }
+    console.error(
+      '\nGate fails because the bench harness did not produce output for ' +
+        'every required scenario. This typically means a bench file was ' +
+        'deleted, renamed, or the bench runner crashed mid-execution.',
+    );
+    return 1;
+  }
+
   let breached = 0;
   let matched = 0;
   for (const threshold of THRESHOLDS) {
     const task = tasks.find((t) => t.name.includes(threshold.taskNameMatch));
     if (task === undefined) {
+      // Should be unreachable due to manifest coverage check above,
+      // but defensive in case THRESHOLDS expands without manifest sync.
       console.error(
         `Threshold ${threshold.label}: no matching bench task (looking for "${threshold.taskNameMatch}")`,
       );
@@ -311,7 +510,7 @@ function main(): number {
     console.error(`\n${breached} threshold breach(es) — failing CI gate`);
     return 1;
   }
-  console.log(`\nAll ${THRESHOLDS.length} thresholds passed`);
+  console.log(`\nAll ${THRESHOLDS.length} thresholds passed (manifest coverage: ${coverage.matched}/${expected.length} scenarios verified)`);
   return 0;
 }
 

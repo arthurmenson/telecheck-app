@@ -85,6 +85,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Self-test threshold + manifest helper
+        # Sprint 13 / TLC-026: gate-correctness self-test runs FIRST so
+        # a regression in check-thresholds.ts itself surfaces before
+        # the bench harness even starts. Uses in-memory fixtures for
+        # §A good / §B missing-scenario / §C tail-missing /
+        # §D malformed-values. No bench output needed.
+        run: npx tsx tests/perf/check-thresholds.ts --self-test
+
       - name: Run benchmarks (capture output JSON)
         run: |
           npx vitest bench --run -c vitest.bench.config.ts \
