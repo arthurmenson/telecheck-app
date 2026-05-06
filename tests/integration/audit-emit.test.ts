@@ -698,7 +698,17 @@ describe('emitAudit — hash chain envelope construction', () => {
     //
     // Fresh-tenant insertion: the savepoint cycle rolls back this
     // INSERT at test end, so no leakage.
-    const uniqueTenantStr = `Telecheck-Genesis-${Math.random().toString(36).slice(2, 10)}`;
+    //
+    // r2 (Sprint 30 corrective): the r1 attempt at
+    // `Telecheck-Genesis-<base36>` included digits + a hyphen and
+    // failed the asTenantId regex `/^Telecheck-[A-Z][A-Za-z]+$/` at
+    // CI. Random suffix must be letters-only.
+    const LETTERS = 'abcdefghijklmnopqrstuvwxyz';
+    let randomSuffix = '';
+    for (let i = 0; i < 10; i += 1) {
+      randomSuffix += LETTERS[Math.floor(Math.random() * 26)];
+    }
+    const uniqueTenantStr = `Telecheck-Test${randomSuffix}`;
     const uniqueTenant: TenantId = asTenantId(uniqueTenantStr);
     const client = getTestClient();
     await client.query(
