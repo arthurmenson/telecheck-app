@@ -6,7 +6,7 @@
 
 1. Each foundation-layer + slice-layer hot-path has explicit p95 thresholds
 2. `npm run bench` is wired into CI as a **required** check
-3. Baseline comparison output (e.g., `vitest bench --baseline`) detects regressions across PRs
+3. Baseline comparison output (via `vitest bench --outputJson <file>` for capture + `vitest bench --compare <baseline-file>` for diff) detects regressions across PRs
 
 Until those three conditions hold, OR-218 remains **OPEN**. Sprint 11 PM kickoff brief MUST re-list OR-218 as launch-blocking and propose the promotion-path stories.
 
@@ -31,8 +31,8 @@ Per Sprint 7 plan + Sprint 11 hardening tag, the bench harness lands in this com
 
 The promotion path (Sprint 11 hardening / launch-prep):
 1. **Add explicit p95 thresholds** to each bench (e.g., `crisisDetector.detect` p95 < 100μs on representative inputs)
-2. **Wire `npm run bench` into CI as a required gate** (separate workflow if needed; baseline comparison via `vitest bench --baseline <prev-baseline-file>`)
-3. **Add baseline comparison output** so regressions surface in PR reviews even when CI is non-blocking
+2. **Wire `npm run bench` into CI as a required gate** (separate workflow `.github/workflows/perf.yml` per Sprint 11 / TLC-023b; baseline comparison via `vitest bench --outputJson <new-output>` for capture + `vitest bench --compare <baseline-file>` for diff against committed `tests/perf/baseline.json`)
+3. **Add baseline comparison output** so regressions surface in PR reviews even when CI is non-blocking. Per-scenario p95 thresholds enforced by `tests/perf/check-thresholds.ts` reading the captured JSON output.
 4. Re-evaluate the OR-218 status at Sprint 11 PM kickoff; only then mark CLOSED in the ORT.
 
 Until those three conditions hold:
