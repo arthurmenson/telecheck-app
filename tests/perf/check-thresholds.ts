@@ -7,7 +7,10 @@
  * malformed input.
  *
  * Usage:
- *   node tests/perf/check-thresholds.js bench-output.json
+ *   npx tsx tests/perf/check-thresholds.ts bench-output.json
+ *
+ * (tsx is a devDependency per package.json:50; .github/workflows/perf.yml
+ * invokes via `npx tsx ...` — no separate compile step needed at v0.1.)
  *
  * Why a separate script (vs vitest assertion):
  *   Vitest's bench() doesn't natively support assertions. The
@@ -147,16 +150,34 @@ function flattenTasks(output: BenchOutput): BenchTaskResult[] {
   return collected;
 }
 
-function p95FromTask(task: BenchTaskResult): number | null {
-  // Vitest 2.1 reports p99 + p995 + p999; sometimes p95. Use p95 if
-  // present; otherwise interpolate p95 ≈ (p75 + p99) / 2 as a
-  // conservative-toward-overshoot fallback (we'd rather over-flag than
-  // under-flag a regression).
-  if (task.result?.p95 !== undefined) return task.result.p95;
-  const p75 = task.result?.p75;
-  const p99 = task.result?.p99;
-  if (p75 !== undefined && p99 !== undefined) {
-    return (p75 + p99) / 2;
+/**
+ * Per Codex perf-thresholds-r1 HIGH closure 2026-05-05: the prior
+ * implementation interpolated p95 ≈ (p75 + p99) / 2 when p95 was
+ * missing. That is mathematically WRONG for tail estimation —
+ * since p95 is only guaranteed to be between p75 and p99, the
+ * midpoint can be LOWER than the true p95 whenever the latency
+ * distribution has a steep tail. A scenario whose true p95
+ * exceeds the threshold could pass CI under the midpoint
+ * approximation, defeating per-scenario p95 enforcement entirely.
+ *
+ * Correct fallback: use p99 directly. p99 ≥ true p95 always, so
+ * comparing p99 against the p95-threshold over-flags rather than
+ * under-flags. Over-flagging is the safe direction (operators see
+ * a flaky-perf signal; under-flagging silently ships regressions).
+ *
+ * Returns null only when neither p95 nor p99 is reported by Vitest;
+ * caller fails the gate in that case.
+ */
+function p95OrConservativeFallback(
+  task: BenchTaskResult,
+): { value: number; source: 'p95' | 'p99-fallback' } | null {
+  if (task.result?.p95 !== undefined) {
+    return { value: task.result.p95, source: 'p95' };
+  }
+  if (task.result?.p99 !== undefined) {
+    // p99 over-strict; over-flagging is safe. Sprint 12+ may revisit
+    // if false-positive flake rate becomes problematic.
+    return { value: task.result.p99, source: 'p99-fallback' };
   }
   return null;
 }
@@ -208,24 +229,25 @@ function main(): number {
     }
     matched += 1;
 
-    const p95Ms = p95FromTask(task);
-    if (p95Ms === null) {
+    const result = p95OrConservativeFallback(task);
+    if (result === null) {
       console.error(
-        `Threshold ${threshold.label}: bench task "${task.name}" has no p95 / p75+p99 data`,
+        `Threshold ${threshold.label}: bench task "${task.name}" has neither p95 nor p99 data — failing gate`,
       );
       breached += 1;
       continue;
     }
 
-    const p95Micros = p95Ms * 1000;
-    if (p95Micros > threshold.p95MaxMicros) {
+    const valueMicros = result.value * 1000;
+    const sourceLabel = result.source === 'p95' ? 'p95' : 'p99 (over-strict fallback; p95 missing)';
+    if (valueMicros > threshold.p95MaxMicros) {
       console.error(
-        `THRESHOLD BREACH ${threshold.label}: p95 ${p95Micros.toFixed(2)}μs > limit ${threshold.p95MaxMicros}μs`,
+        `THRESHOLD BREACH ${threshold.label}: ${sourceLabel} ${valueMicros.toFixed(2)}μs > limit ${threshold.p95MaxMicros}μs`,
       );
       breached += 1;
     } else {
       console.log(
-        `OK ${threshold.label}: p95 ${p95Micros.toFixed(2)}μs <= limit ${threshold.p95MaxMicros}μs`,
+        `OK ${threshold.label}: ${sourceLabel} ${valueMicros.toFixed(2)}μs <= limit ${threshold.p95MaxMicros}μs`,
       );
     }
   }
