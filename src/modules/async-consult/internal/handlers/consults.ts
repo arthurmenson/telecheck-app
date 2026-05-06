@@ -237,7 +237,7 @@ export async function initiateConsultHandler(
     );
     return reply.code(201).send(toPatientConsultView(consult));
   } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return;
+    if (mapServiceError(err, reply, req.id)) return reply;
     throw err;
   }
 }
@@ -276,7 +276,7 @@ export async function submitConsultHandler(
     );
     return reply.code(200).send(toPatientConsultView(consult));
   } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return;
+    if (mapServiceError(err, reply, req.id)) return reply;
     throw err;
   }
 }
@@ -301,7 +301,7 @@ export async function abandonConsultHandler(
     );
     return reply.code(200).send(toPatientConsultView(consult));
   } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return;
+    if (mapServiceError(err, reply, req.id)) return reply;
     throw err;
   }
 }
@@ -326,7 +326,7 @@ export async function resumeConsultHandler(
     );
     return reply.code(200).send(toPatientConsultView(consult));
   } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return;
+    if (mapServiceError(err, reply, req.id)) return reply;
     throw err;
   }
 }
@@ -351,7 +351,7 @@ export async function patientRespondsConsultHandler(
     );
     return reply.code(200).send(toPatientConsultView(consult));
   } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return;
+    if (mapServiceError(err, reply, req.id)) return reply;
     throw err;
   }
 }
@@ -379,7 +379,7 @@ export async function listConsultEventsHandler(
     );
     return reply.code(200).send({ events: events.map(toPatientEventView) });
   } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return;
+    if (mapServiceError(err, reply, req.id)) return reply;
     throw err;
   }
 }
