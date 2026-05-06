@@ -1,0 +1,43 @@
+# Sprint 19 / TLC-035 — EOL normalization
+#
+# Forces LF line endings in the repository regardless of host OS, with
+# auto-conversion for text files. Eliminates EOL-induced rebase drift
+# that Sprint 18 PR #10 + #12 hit on Windows-host autonomous shell
+# (Windows defaults `core.autocrlf=true` → CRLF in working copy → LF
+# stored in repo → prettier on Windows sees CRLF and warns even when
+# repo content is correct).
+#
+# Sprint 18 retro proposed TLC-035 as the codified fix; landed in
+# Sprint 19 alongside TLC-034 advisory-lock fix because rebases of
+# the TLC-034 PR would themselves trigger the same EOL drift this
+# file prevents.
+#
+# Spec references:
+#   - docs/SPRINT_18_RETRO.md "Process changes for Sprint 19" (TLC-035
+#     candidate proposed)
+#   - docs/SPRINT_19_PLAN.md (this sprint)
+#
+# All text files default to auto-detected text + LF in repo.
+* text=auto eol=lf
+
+# Source/test files explicitly LF (defensive — covers extensions that
+# auto-detection might misclassify on certain platforms).
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sql text eol=lf
+*.sh text eol=lf
+
+# Binary files — disable text conversion outright.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
