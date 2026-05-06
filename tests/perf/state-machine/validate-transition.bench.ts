@@ -52,6 +52,9 @@ import { bench, describe } from 'vitest';
 
 import {
   type GuardContext,
+  GuardNotSatisfiedError,
+  InvalidTransitionError,
+  UnsupportedTransitionError,
   validateTransition,
 } from '../../../src/modules/async-consult/internal/state-machine.ts';
 
@@ -87,10 +90,27 @@ describe('validateTransition — §2 InvalidTransitionError (SUBMITTED + start_i
   bench(
     'validateTransition SUBMITTED + start_intake throws InvalidTransitionError',
     () => {
+      // Per Codex perf-bench-r1 MEDIUM closure 2026-05-05: catch ONLY
+      // the expected error class; rethrow others. Without this, a
+      // regression that returns normally OR throws a cheaper error
+      // would silently complete the bench and let check-thresholds.ts
+      // report OK while no longer measuring production-realistic
+      // reject-path cost.
       try {
         validateTransition('SUBMITTED', 'start_intake', ctx);
-      } catch {
-        // Throw-cost is part of the measurement (handler maps to HTTP)
+        // Reaching here = expected throw didn't happen. Surface as
+        // bench failure (rethrow propagates to vitest).
+        throw new Error(
+          'Bench fidelity violation: validateTransition returned normally; ' +
+            'expected InvalidTransitionError',
+        );
+      } catch (err) {
+        if (!(err instanceof InvalidTransitionError)) {
+          // Wrong error class (or the fidelity-violation Error from
+          // the missing-throw branch above). Rethrow to fail the bench.
+          throw err;
+        }
+        // Expected throw — V8 stack-capture cost is the measurement.
       }
     },
     { time: 500 },
@@ -113,8 +133,14 @@ describe('validateTransition — §3 GuardNotSatisfiedError (abandon + 30h < 48h
     () => {
       try {
         validateTransition('INTAKE', 'abandon', ctx);
-      } catch {
-        // Throw-cost is part of the measurement
+        throw new Error(
+          'Bench fidelity violation: validateTransition returned normally; ' +
+            'expected GuardNotSatisfiedError',
+        );
+      } catch (err) {
+        if (!(err instanceof GuardNotSatisfiedError)) {
+          throw err;
+        }
       }
     },
     { time: 500 },
@@ -140,17 +166,23 @@ describe('validateTransition — §4 UnsupportedTransitionError (claim — Sprin
     'validateTransition QUEUED + claim throws UnsupportedTransitionError',
     () => {
       try {
-        // 'claim' is a SupportedTransitionEvent string but the runtime
-        // shape doesn't matter for this test — the function should
-        // throw UnsupportedTransitionError before transition lookup
-        // because 'claim' is in SPRINT_10_DEFERRED_EVENTS.
+        // 'claim' is a Sprint-10-deferred event listed in
+        // SPRINT_10_DEFERRED_EVENTS. validateTransition throws
+        // UnsupportedTransitionError BEFORE transition lookup +
+        // event/context match check (Codex async-consult-r8 closure).
         validateTransition(
           'QUEUED',
           'claim' as Parameters<typeof validateTransition>[1],
           ctx,
         );
-      } catch {
-        // Throw-cost is part of the measurement
+        throw new Error(
+          'Bench fidelity violation: validateTransition returned normally; ' +
+            'expected UnsupportedTransitionError',
+        );
+      } catch (err) {
+        if (!(err instanceof UnsupportedTransitionError)) {
+          throw err;
+        }
       }
     },
     { time: 500 },
