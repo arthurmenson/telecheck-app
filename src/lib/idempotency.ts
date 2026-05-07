@@ -302,8 +302,15 @@ const DEFAULT_TTL_SECONDS = 86400; // 24h per IDEMPOTENCY v5.1
  * Defense-in-depth: Fastify's default routing is case-sensitive +
  * trailing-slash-strict, so such variants return 404 before reaching
  * the handler. Normalizing here is belt-and-suspenders.
+ *
+ * Exported so cross-cutting helpers (e.g., `src/lib/audit-dedupe.ts`)
+ * can align their own TTLs to the same per-endpoint contract — a
+ * cross-cutting marker MUST NOT outlive the idempotency cache row it
+ * is gated against, otherwise a stale marker can suppress a
+ * legitimate emit after the cache expires (Sprint 34 audit-dedupe SI
+ * Codex review HIGH closure 2026-05-08).
  */
-function ttlSecondsForEndpoint(endpoint: string): number {
+export function ttlSecondsForEndpoint(endpoint: string): number {
   const normalized = endpoint.toLowerCase().replace(/\/+$/, '');
   return ENDPOINT_TTL_OVERRIDES.get(normalized) ?? DEFAULT_TTL_SECONDS;
 }

@@ -468,6 +468,7 @@ async function runCrisisGate(
         idempotencyKey: idempotencyCtx.idempotencyKey,
         endpoint: idempotencyCtx.endpoint,
         actorId: idempotencyCtx.actorId,
+        bodyHash: idempotencyCtx.bodyHash,
         auditAction: 'crisis_detection_trigger',
       });
       if (!claimed) {
@@ -652,6 +653,7 @@ export async function pauseSubmission(
             idempotencyKey: idempotencyCtx.idempotencyKey,
             endpoint: idempotencyCtx.endpoint,
             actorId: idempotencyCtx.actorId,
+            bodyHash: idempotencyCtx.bodyHash,
             auditAction: 'crisis_detection_trigger.merged_set',
           });
           if (!claimed) {

@@ -60,6 +60,7 @@ function freshIdentity(overrides: Partial<AuditDedupeIdentity> = {}): AuditDedup
     idempotencyKey: ulid(),
     endpoint: `/v0/test/audit-dedupe/${random}`,
     actorId: `acct_${random}`,
+    bodyHash: `bodyhash_${random}`,
     auditAction: 'crisis_detection_trigger',
     ...overrides,
   };
@@ -255,6 +256,7 @@ describe('audit-dedupe — Group E: computeAuditDedupeKey', () => {
       { ...base, idempotencyKey: ulid() },
       { ...base, endpoint: '/v0/test/audit-dedupe/different-endpoint' },
       { ...base, actorId: `acct_${ulid().slice(-10)}` },
+      { ...base, bodyHash: `bodyhash_${ulid().slice(-10)}` },
       { ...base, auditAction: 'crisis_detection_trigger.merged_set' },
     ];
     const baseHash = computeAuditDedupeKey(base);
@@ -280,5 +282,65 @@ describe('audit-dedupe — Group E: computeAuditDedupeKey', () => {
       idempotencyKey: random,
     });
     expect(computeAuditDedupeKey(a)).not.toBe(computeAuditDedupeKey(b));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group F — bodyHash discriminates (post-cache-expiry safety)
+// ---------------------------------------------------------------------------
+
+describe('audit-dedupe — Group F: bodyHash discriminates', () => {
+  it('same idempotency 4-tuple but different bodyHash yields a fresh marker', async () => {
+    // Closes Codex Sprint 34 audit-dedupe SI 2026-05-08 HIGH:
+    // without bodyHash in the identity, a stale marker (e.g., from a
+    // prior 24h-cache-expired attempt) could suppress a legitimate
+    // crisis audit on a NEW request that coincidentally reuses the
+    // same Idempotency-Key with different content. With bodyHash in
+    // the dedupe identity, the new body produces a different dedupe
+    // key + a fresh marker → audit emits correctly.
+    const base = freshIdentity();
+    const differentBody = { ...base, bodyHash: `bodyhash_${ulid().slice(-10)}` };
+
+    const claimedBase = await inTenantTx(base.tenantId, (tx) => claimAuditDedupeSlot(tx, base));
+    const claimedDifferent = await inTenantTx(differentBody.tenantId, (tx) =>
+      claimAuditDedupeSlot(tx, differentBody),
+    );
+
+    // Both first-claims succeed — bodyHash differentiates.
+    expect(claimedBase).toBe(true);
+    expect(claimedDifferent).toBe(true);
+
+    // Each is independently locked on retry with the same body.
+    const retryBase = await inTenantTx(base.tenantId, (tx) => claimAuditDedupeSlot(tx, base));
+    expect(retryBase).toBe(false);
+  });
+
+  it('post-cache-expiry-different-body path: stale marker does NOT suppress legitimate emit', async () => {
+    // Same scenario the Codex review flagged: a marker was claimed at
+    // T=0 for body A; the idempotency cache expires at T=24h; at
+    // T=25h a client reuses the same Idempotency-Key with body B.
+    // Without bodyHash in the dedupe identity, the still-live marker
+    // from body A would suppress the body-B audit — losing a safety-
+    // critical Category A record. With bodyHash, the body-B identity
+    // hashes to a different dedupe key + claims a fresh marker.
+    const baseIdentity = freshIdentity();
+    const claimedA = await inTenantTx(baseIdentity.tenantId, (tx) =>
+      claimAuditDedupeSlot(tx, baseIdentity),
+    );
+    expect(claimedA).toBe(true);
+
+    // Simulate the cache-expiry + key-reuse + different-body scenario.
+    // The marker from body A is still live; we don't expire it. The
+    // body-B claim attempt is on the SAME 4-tuple PLUS different
+    // bodyHash.
+    const sameKeyDifferentBody = {
+      ...baseIdentity,
+      bodyHash: `bodyhash_different_${ulid().slice(-10)}`,
+    };
+    const claimedB = await inTenantTx(sameKeyDifferentBody.tenantId, (tx) =>
+      claimAuditDedupeSlot(tx, sameKeyDifferentBody),
+    );
+    // Body-B's audit emit IS NOT suppressed by body-A's marker.
+    expect(claimedB).toBe(true);
   });
 });

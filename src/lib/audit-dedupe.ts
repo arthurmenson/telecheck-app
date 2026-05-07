@@ -58,25 +58,49 @@
 import crypto from 'crypto';
 
 import type { DbClient } from './db.js';
+import { ttlSecondsForEndpoint } from './idempotency.js';
 
 /**
- * The 5-tuple from which a dedupe key is computed. Matches the
- * idempotency cache 4-tuple (tenant_id + idempotency_key + endpoint +
- * actor_id) plus the `auditAction` so a single request emitting
- * multiple distinct Category A audits gets distinct dedupe keys.
+ * The 6-tuple from which a dedupe key is computed.
+ *
+ *   tenantId          — tenant scope
+ *   idempotencyKey    — client's Idempotency-Key header (ULID)
+ *   endpoint          — route pattern serving the request
+ *   actorId           — resolved actor for the cache 4-tuple
+ *   bodyHash          — SHA-256 hex of the request body
+ *   auditAction       — AUDIT_EVENTS v5.2 catalog action ID
+ *
+ * Matches the idempotency cache 4-tuple PLUS bodyHash + auditAction.
+ *
+ * Why bodyHash is part of the key (Sprint 34 audit-dedupe SI Codex
+ * 2026-05-08 HIGH closure): without bodyHash, a client that
+ * coincidentally reuses the same Idempotency-Key after the cache
+ * expires (24h default) — but with a different request body —
+ * would hit the still-live 30-day marker and have its Category A
+ * audit silently SUPPRESSED. The marker would falsely match. With
+ * bodyHash in the key, a different body produces a different
+ * dedupe key + a fresh marker; the audit emits correctly. Defense
+ * in depth on top of TTL alignment (which bounds the staleness
+ * window via `ttlSecondsForAuditDedupeMarker`).
+ *
+ * Why auditAction is part of the key: a single request emitting
+ * multiple distinct Category A audits (e.g., the patch-side and
+ * merged-set crisis-gate paths in `pauseSubmission`) gets distinct
+ * dedupe keys so each emission is de-duped independently.
  */
 export interface AuditDedupeIdentity {
   tenantId: string;
   idempotencyKey: string;
   endpoint: string;
   actorId: string;
+  bodyHash: string;
   /** AUDIT_EVENTS v5.2 catalog action ID (e.g., 'crisis_detection_trigger'). */
   auditAction: string;
 }
 
 /**
  * Compute the deterministic dedupe key for an idempotency-protected
- * audit emission. SHA-256 hex of the 5-tuple joined by ASCII unit
+ * audit emission. SHA-256 hex of the 6-tuple joined by ASCII unit
  * separator (\x1F) so no value can collide with a literal-character
  * concatenation of another tuple's fields.
  *
@@ -90,9 +114,28 @@ export function computeAuditDedupeKey(identity: AuditDedupeIdentity): string {
     identity.idempotencyKey,
     identity.endpoint,
     identity.actorId,
+    identity.bodyHash,
     identity.auditAction,
   ].join(SEP);
   return crypto.createHash('sha256').update(input).digest('hex');
+}
+
+/**
+ * Marker TTL aligned to the idempotency cache TTL for the same
+ * endpoint. The marker MUST NOT outlive the cache row it is gated
+ * against — a stale marker would suppress a legitimate emit on a
+ * fresh post-cache-expiry request (Sprint 34 audit-dedupe SI Codex
+ * 2026-05-08 HIGH closure).
+ *
+ * Default 24h endpoints: marker TTL = 24h, cache TTL = 24h → aligned.
+ * Auth-flow override endpoints: marker TTL = 900s, cache TTL = 900s
+ * → aligned.
+ *
+ * This delegates to `idempotency.ttlSecondsForEndpoint`, which is the
+ * single source of truth for the per-endpoint TTL contract.
+ */
+export function ttlSecondsForAuditDedupeMarker(endpoint: string): number {
+  return ttlSecondsForEndpoint(endpoint);
 }
 
 /**
@@ -127,12 +170,19 @@ export async function claimAuditDedupeSlot(
   identity: AuditDedupeIdentity,
 ): Promise<boolean> {
   const dedupeKey = computeAuditDedupeKey(identity);
+  const ttlSeconds = ttlSecondsForAuditDedupeMarker(identity.endpoint);
+  // expires_at is set explicitly to NOW() + per-endpoint cache TTL so
+  // the marker cannot outlive its companion idempotency cache row.
+  // The migration-022 column default (NOW() + INTERVAL '30 days') is
+  // OVERRIDDEN here — the schema default is a safe upper bound for
+  // crash-recovery, but the runtime contract is tight TTL alignment.
+  // Per Sprint 34 audit-dedupe SI Codex 2026-05-08 HIGH closure.
   const result = await client.query<{ tenant_id: string }>(
-    `INSERT INTO audit_dedupe_markers (tenant_id, dedupe_key)
-     VALUES ($1, $2)
+    `INSERT INTO audit_dedupe_markers (tenant_id, dedupe_key, expires_at)
+     VALUES ($1, $2, NOW() + ($3 || ' seconds')::interval)
      ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
      RETURNING tenant_id`,
-    [identity.tenantId, dedupeKey],
+    [identity.tenantId, dedupeKey, ttlSeconds],
   );
   return result.rows.length > 0;
 }
