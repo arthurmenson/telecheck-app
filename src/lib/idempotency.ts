@@ -199,6 +199,25 @@ export function markIdempotencyManagedByHandler(request: FastifyRequest): void {
  * migrating to `withIdempotency`. Throws if the request is missing the
  * Idempotency-Key header (handlers should not reach this point — the
  * preHandler returns 400 earlier).
+ *
+ * Endpoint derivation: uses the URL with query string stripped, NOT the
+ * Fastify route pattern. This is intentional — the preHandler's cache
+ * lookup and the legacy-onSend cache write also key on raw URL, and all
+ * three paths must agree for replay to work. (An earlier PR-F1 r2 draft
+ * switched to `request.routeOptions.url` for tighter TTL-override
+ * matching; that introduced drift between cache lookup and cache write
+ * for parametric routes — the cache write would key on
+ * `/v0/async-consult/:id/submit` while the preHandler lookup keyed on
+ * `/v0/async-consult/abc/submit`, so retries would always cache-miss.
+ * Reverted in PR-F1 r3.)
+ *
+ * The TTL-override-bypass concern that motivated the route-pattern
+ * change is handled at lookup time via `ttlSecondsForEndpoint`, which
+ * normalizes the endpoint (lowercase + trailing-slash strip) before
+ * map lookup so case/slash variants can't slip through. Fastify's
+ * default routing is also case-sensitive + trailing-slash-strict, so
+ * such variants return 404 before reaching the handler in the first
+ * place — the normalization is defense-in-depth.
  */
 export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
   const idempotencyKey = request.headers['idempotency-key'];
@@ -219,6 +238,85 @@ export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
     actorId,
     bodyHash: hashBody(rawBody),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Per-endpoint TTL overrides for the idempotency cache.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-endpoint TTL overrides for the idempotency cache.
+ *
+ * Default TTL is 24h (86400s) per IDEMPOTENCY v5.1. Overrides reduce TTL
+ * for endpoints whose response_body contains sensitive plaintext that
+ * SHOULD NOT dwell in the cache table for 24h.
+ *
+ * Sprint 33 / SI-006 PR-F (security hardening per AppSec review of
+ * Sprint 33 identity-handler migration). The auth-flow paths cache
+ * plaintext access_token + refresh_token to satisfy the IDEMPOTENCY
+ * v5.1 retry contract.
+ *
+ * SECURITY ALIGNMENT (post Sprint 33 AppSec gate verification 2026-05-07):
+ * The cache TTL MUST be >= the JWT access_token TTL so that an
+ * idempotency replay never returns a token that has already expired
+ * in the JWT layer (which would surface as a confusing 401 to a
+ * legitimate retry). Conversely, the cache TTL MUST be <= the JWT
+ * access_token TTL plus a small grace window — caching a body whose
+ * access_token has long-since expired wastes DB rows and extends the
+ * plaintext-credentials-in-cache exposure window beyond the bearer
+ * token's own lifetime, which is the right upper bound for the
+ * sensitive material.
+ *
+ * The platform-floor JWT access_token TTL is 900s (15 min), defined by
+ * `ACCESS_TOKEN_TTL_SECONDS` at `src/lib/jwt.ts:62` and pinned by
+ * `tests/unit/jwt.test.ts:73`. We therefore align the cache TTL to
+ * 900s for these auth-flow paths — exact match to the access_token
+ * lifetime, no slack on either side.
+ *
+ * vs. 24h default: the cache exposure window for plaintext credentials
+ * is reduced 96x (24h / 15min). vs. the original 5-minute draft: the
+ * cache no longer expires before the JWT, so retries within the JWT
+ * lifetime always replay successfully (not silently restart the OTP
+ * flow). The refresh_token has its own 30-day TTL (session-service.ts);
+ * its replay window is bounded by the cache row, not by the cache TTL
+ * relative to refresh_token TTL, because refresh_token rotation +
+ * session-revocation is enforced at the session layer.
+ *
+ * Adding a path to this map requires explicit AppSec review of:
+ *   1. What sensitive material the response_body contains
+ *   2. The TTL of any bearer token in the body (cache TTL = bearer TTL)
+ *   3. Confirmation that any session-revocation path also invalidates
+ *      the cached row (or accepts the cache-replay-window risk)
+ */
+const ENDPOINT_TTL_OVERRIDES: ReadonlyMap<string, number> = new Map([
+  // 900s = JWT access_token TTL (jwt.ts:62 ACCESS_TOKEN_TTL_SECONDS).
+  // Cache TTL aligned exactly to access_token lifetime so retries within
+  // the token's own window replay successfully and the cache row is
+  // purged the moment its bearer token would expire anyway.
+  ['/v0/identity/login/verify', 900], // plaintext access_token + refresh_token in body
+  ['/v0/identity/registration/verify', 900], // plaintext PatientAccountView + tokens
+]);
+
+const DEFAULT_TTL_SECONDS = 86400; // 24h per IDEMPOTENCY v5.1
+
+/**
+ * Look up the TTL override for an endpoint, normalizing the path to
+ * close case/trailing-slash bypass paths.
+ *
+ * Per Codex Sprint 33 PR-F1 r2 adversarial review 2026-05-07 (HIGH-1):
+ * the override map is keyed by exact strings; without normalization,
+ * a request reaching the handler via any path variant that doesn't
+ * bytewise-match would silently fall back to the 24h default. For the
+ * auth-flow paths whose cached body contains plaintext bearer tokens,
+ * that's a 96x exposure-window regression.
+ *
+ * Defense-in-depth: Fastify's default routing is case-sensitive +
+ * trailing-slash-strict, so such variants return 404 before reaching
+ * the handler. Normalizing here is belt-and-suspenders.
+ */
+function ttlSecondsForEndpoint(endpoint: string): number {
+  const normalized = endpoint.toLowerCase().replace(/\/+$/, '');
+  return ENDPOINT_TTL_OVERRIDES.get(normalized) ?? DEFAULT_TTL_SECONDS;
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +465,29 @@ export async function withIdempotency<TBody>(
     [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId],
   );
 
+  // Sprint 33 / SI-006 PR-F1 r4: separate reservation-lock TTL from
+  // cached-response TTL.
+  //
+  // The pending row's expires_at is the RESERVATION LOCK lifetime —
+  // how long another concurrent request will see this 4-tuple as
+  // in-flight. If a handler stalls (slow dependency, long-running
+  // verification) and the reservation TTL expires, the next retry will
+  // purge the pending row and re-execute the handler, causing
+  // duplicate side effects. The reservation lock should therefore use
+  // the DEFAULT 24h TTL (column default — generous lock lifetime;
+  // stuck handlers should be diagnosed, not raced).
+  //
+  // The COMPLETED row's expires_at is the CACHED-RESPONSE dwell time —
+  // how long the cached body lives in the DB. THIS is where the
+  // ENDPOINT_TTL_OVERRIDES map applies (e.g., 900s for auth-flow paths
+  // whose body contains plaintext bearer tokens — bounded by the
+  // bearer's own validity).
+  //
+  // Net effect: stuck-handler safety + correct sensitive-response
+  // dwell-time bound. The override TTL is applied at the
+  // pending->completed UPDATE below, NOT at the pending INSERT.
+  // Per Codex Sprint 33 PR-F1 r3 adversarial review 2026-05-07
+  // (HIGH-3).
   const insertResult = await client.query<{ tenant_id: string }>(
     `INSERT INTO idempotency_keys
        (tenant_id, key, endpoint, actor_id, request_hash,
@@ -399,11 +520,18 @@ export async function withIdempotency<TBody>(
     // The `processing_state='pending'` guard prevents a second concurrent
     // UPDATE from corrupting the row.
     // ---------------------------------------------------------------------
+    // Per Sprint 33 / SI-006 PR-F1 r4: apply ENDPOINT_TTL_OVERRIDES at
+    // the pending->completed transition, NOT at reservation INSERT
+    // (see HIGH-3 closure note above). Sets expires_at to NOW() +
+    // (ttlSeconds || ' seconds')::interval, replacing the column
+    // default (24h) inherited at INSERT time.
+    const completedTtlSeconds = ttlSecondsForEndpoint(ctx.endpoint);
     await client.query(
       `UPDATE idempotency_keys
           SET processing_state = 'completed',
               response_status  = $5,
-              response_body    = $6::jsonb
+              response_body    = $6::jsonb,
+              expires_at       = NOW() + ($7 || ' seconds')::interval
         WHERE tenant_id   = $1
           AND key         = $2
           AND endpoint    = $3
@@ -416,6 +544,7 @@ export async function withIdempotency<TBody>(
         ctx.actorId,
         payload.status,
         payload.body === null || payload.body === undefined ? null : JSON.stringify(payload.body),
+        completedTtlSeconds,
       ],
     );
 
@@ -572,12 +701,24 @@ async function storeIdempotencyRecord(
 ): Promise<void> {
   // Same RLS gating as lookupIdempotencyRecord — bind tenant context
   // before INSERTing into the FORCE RLS table. (Patch v0.3 — 2026-05-02.)
+  //
+  // SECURITY: the legacy onSend writer must honor ENDPOINT_TTL_OVERRIDES
+  // too. Without this, handlers that have NOT yet migrated to
+  // withIdempotency (e.g., identity login/verify before Sprint 33 PR-F3
+  // lands) would cache plaintext bearer-token responses for the
+  // migration default of 24h regardless of the override map. The
+  // explicit `expires_at = NOW() + ($8 || ' seconds')::interval` cast
+  // matches the withIdempotency reservation INSERT so both paths agree.
+  // Per Codex Sprint 33 PR-F1 r2 adversarial review 2026-05-07 (HIGH-2).
+  const ttlSeconds = ttlSecondsForEndpoint(endpoint);
   await withTenantBoundConnection(tenantId, async (client) => {
     await client.query(
       `INSERT INTO idempotency_keys (
           tenant_id, key, endpoint, actor_id,
-          request_hash, response_status, response_body, processing_state
-       ) VALUES ($1, $2, $3, $4, decode($5, 'hex'), $6, $7::jsonb, 'completed')
+          request_hash, response_status, response_body, processing_state,
+          expires_at
+       ) VALUES ($1, $2, $3, $4, decode($5, 'hex'), $6, $7::jsonb, 'completed',
+                  NOW() + ($8 || ' seconds')::interval)
        ON CONFLICT (tenant_id, key, endpoint, actor_id) DO NOTHING`,
       [
         tenantId,
@@ -587,6 +728,7 @@ async function storeIdempotencyRecord(
         bodyHash,
         statusCode,
         body === null || body === undefined ? null : JSON.stringify(body),
+        ttlSeconds,
       ],
     );
   });
