@@ -174,24 +174,28 @@ export function resolveActorId(request: FastifyRequest): string {
 }
 
 /**
- * Mark the request as having had its idempotency caching managed by a
- * handler-side `withIdempotency` call. The plugin's onSend hook (legacy
- * v0 cache write) reads this flag and skips its own write — preventing
- * a duplicate INSERT (no-op via ON CONFLICT DO NOTHING but still a
- * wasted round-trip).
+ * @deprecated since Sprint 33 / SI-006 PR-E (2026-05-07).
  *
- * Migrated handlers MUST call this after `withIdempotency` resolves
- * with a value. The `IdempotencyReplayError` and `IdempotencyInFlightError`
- * paths do NOT need to call this — they short-circuit via the catch
- * block, no business logic ran, and the legacy onSend would no-op
- * anyway because the request never reaches a state where its own cache
- * write would apply (the handler returns the cached/409 response without
- * setting up its own ctx).
+ * Originally a flag-set helper that told the legacy onSend cache-write
+ * hook to skip writing for handlers that owned their own
+ * reserve-then-execute path via `withIdempotency`. The legacy onSend
+ * hook + `storeIdempotencyRecord` were REMOVED in PR-E once every
+ * state-changing handler migrated. This function is now a documented
+ * no-op kept ONLY so the 50+ existing call sites continue to compile
+ * during the cleanup-sweep PR (Sprint 34) — calling it has no
+ * runtime effect.
+ *
+ * New handlers MUST NOT call this. Use `withIdempotentExecution` (which
+ * already owns reserve + write + completion in the handler-owned tx);
+ * no separate flag is needed because no legacy path remains to opt out
+ * of. Source-grep lockdown in `tests/integration/idempotency-helper.test.ts`
+ * pins the absence of `addHook('onSend')` and `storeIdempotencyRecord`
+ * so future regressions cannot reintroduce the legacy path.
  */
-export function markIdempotencyManagedByHandler(request: FastifyRequest): void {
-  // @ts-expect-error: dynamic property attachment for plugin/handler
-  // communication. Read by the legacy onSend hook in this same module.
-  request._idempotencyManagedByHandler = true;
+export function markIdempotencyManagedByHandler(_request: FastifyRequest): void {
+  // No-op. See doc-comment above. PR-E removed the legacy onSend path
+  // that this flag controlled; the function is preserved as an export
+  // only to keep existing call sites compiling.
 }
 
 /**
@@ -672,67 +676,18 @@ async function lookupIdempotencyRecord(
   });
 }
 
-/**
- * Persist a cached response for the 4-tuple key. ON CONFLICT DO NOTHING
- * because two concurrent requests with the same key+endpoint+actor would
- * race the INSERT — the first wins, the second's response is dropped (its
- * caller still got the response on its own connection, this is just the
- * cache write losing).
- *
- * Sprint 32 / SI-006 PR-A status: this function and the onSend hook below
- * are PRESERVED as backward-compat for handlers not yet migrated to
- * `withIdempotency`. Once Async-Consult (PR-B) and Consent (PR-C) handlers
- * migrate, no caller writes via this path — and PR-E removes the function
- * and the onSend hook with a source-grep lockdown.
- *
- * Until then, both paths coexist: handlers using `withIdempotency` get
- * transactional reserve-then-execute; legacy handlers continue to rely on
- * the best-effort onSend cache write. preHandler replay works for both
- * (cache rows from either path read identically).
- */
-async function storeIdempotencyRecord(
-  tenantId: string,
-  key: string,
-  endpoint: string,
-  actorId: string,
-  bodyHash: string,
-  statusCode: number,
-  body: unknown,
-): Promise<void> {
-  // Same RLS gating as lookupIdempotencyRecord — bind tenant context
-  // before INSERTing into the FORCE RLS table. (Patch v0.3 — 2026-05-02.)
-  //
-  // SECURITY: the legacy onSend writer must honor ENDPOINT_TTL_OVERRIDES
-  // too. Without this, handlers that have NOT yet migrated to
-  // withIdempotency (e.g., identity login/verify before Sprint 33 PR-F3
-  // lands) would cache plaintext bearer-token responses for the
-  // migration default of 24h regardless of the override map. The
-  // explicit `expires_at = NOW() + ($8 || ' seconds')::interval` cast
-  // matches the withIdempotency reservation INSERT so both paths agree.
-  // Per Codex Sprint 33 PR-F1 r2 adversarial review 2026-05-07 (HIGH-2).
-  const ttlSeconds = ttlSecondsForEndpoint(endpoint);
-  await withTenantBoundConnection(tenantId, async (client) => {
-    await client.query(
-      `INSERT INTO idempotency_keys (
-          tenant_id, key, endpoint, actor_id,
-          request_hash, response_status, response_body, processing_state,
-          expires_at
-       ) VALUES ($1, $2, $3, $4, decode($5, 'hex'), $6, $7::jsonb, 'completed',
-                  NOW() + ($8 || ' seconds')::interval)
-       ON CONFLICT (tenant_id, key, endpoint, actor_id) DO NOTHING`,
-      [
-        tenantId,
-        key,
-        endpoint,
-        actorId,
-        bodyHash,
-        statusCode,
-        body === null || body === undefined ? null : JSON.stringify(body),
-        ttlSeconds,
-      ],
-    );
-  });
-}
+// `storeIdempotencyRecord` (the legacy onSend cache writer) was REMOVED
+// in Sprint 33 / SI-006 PR-E. Every state-changing handler is now
+// migrated to `withIdempotency` (handler-driven reserve-then-execute),
+// which writes the cached row atomically with the business mutation.
+// The legacy best-effort onSend write is no longer needed and posed a
+// transactional-safety hazard (cache row could persist after a
+// rolled-back business write, or vice-versa).
+//
+// Source-grep lockdown in `tests/integration/idempotency-helper.test.ts`
+// pins the absence of this function and the onSend hook so future
+// regressions cannot reintroduce the legacy path. See PR-E commit
+// for the full migration history.
 
 // ---------------------------------------------------------------------------
 // Exempt endpoint patterns
@@ -892,85 +847,32 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
       // Fall through to context stash + handler invocation.
     }
 
-    // First request OR pending-record pass-through. Stash context on
-    // the request — handlers that have NOT migrated to `withIdempotency`
-    // (legacy v0 path) read this for their own cache-write needs.
-    // Migrated handlers can also read it (or call buildIdempotencyCtx
-    // directly).
-    // @ts-expect-error: dynamic property attachment for within-request communication
-    request._idempotencyKey = {
-      tenantId,
-      key: idempotencyKey as string,
-      endpoint,
-      actorId,
-      bodyHash,
-    };
+    // First request OR pending-record pass-through. The handler runs.
+    //
+    // Migrated handlers (every state-changing endpoint as of PR-E) call
+    // `withIdempotency` / `withIdempotentExecution` which builds its own
+    // IdempotencyCtx via `buildIdempotencyCtx(request)` and owns the
+    // reservation INSERT, business mutation, and completion UPDATE
+    // atomically inside one tx. No request-level stash is needed.
+    //
+    // The legacy `request._idempotencyKey` stash + the onSend cache
+    // writer that consumed it were REMOVED in Sprint 33 / SI-006 PR-E.
+    // See the comment block above the deleted `storeIdempotencyRecord`
+    // for full context.
   });
 
-  // Sprint 32 / SI-006 PR-A status: this onSend hook is PRESERVED as
-  // backward-compat. It will be REMOVED in PR-E once Async-Consult
-  // (PR-B) and Consent (PR-C) handlers migrate to `withIdempotency`.
+  // Sprint 33 / SI-006 PR-E (2026-05-07): the legacy onSend cache-write
+  // hook was REMOVED. Every state-changing handler is now migrated to
+  // `withIdempotency`, which writes the cached row atomically with the
+  // business mutation inside the handler-owned transaction. The onSend
+  // best-effort write was both redundant (no migrated handler relied on
+  // it) and transactionally unsafe (it could cache a 200 after the
+  // business tx rolled back, or vice-versa).
   //
-  // The v0 onSend write is best-effort and not transactionally-safe;
-  // PR-A introduces the safe alternative (`withIdempotency`) without
-  // removing the legacy path so existing tests stay green during the
-  // multi-PR migration.
-  //
-  // After PR-B + PR-C land, no migrated handler relies on this hook.
-  // The lockdown test in PR-E pins the absence of `addHook('onSend', ...)`
-  // — at that point removing this block is safe.
-  fastify.addHook(
-    'onSend',
-    async (request: FastifyRequest, reply: FastifyReply, payload: unknown) => {
-      // @ts-expect-error: dynamic property from preHandler
-      const idempotencyCtx = request._idempotencyKey as
-        | {
-            tenantId: string;
-            key: string;
-            endpoint: string;
-            actorId: string;
-            bodyHash: string;
-          }
-        | undefined;
-
-      if (!idempotencyCtx) return payload;
-
-      // -----------------------------------------------------------------
-      // Skip the legacy onSend write when the handler used
-      // `withIdempotency` (handler-driven path). The handler signals
-      // this by attaching `_idempotencyManagedByHandler: true` to the
-      // request after a successful `withIdempotency` invocation. This
-      // prevents a duplicate INSERT (which would no-op via ON CONFLICT
-      // DO NOTHING anyway, but better to skip the round-trip).
-      // -----------------------------------------------------------------
-      // @ts-expect-error: dynamic property from migrated handlers
-      if (request._idempotencyManagedByHandler === true) {
-        return payload;
-      }
-
-      // Sprint 24 / TLC-045: catch + log rather than throw on cache-write
-      // failure — Fastify onSend lifecycle does not tolerate throws after
-      // the response headers have been written.
-      try {
-        await storeIdempotencyRecord(
-          idempotencyCtx.tenantId,
-          idempotencyCtx.key,
-          idempotencyCtx.endpoint,
-          idempotencyCtx.actorId,
-          idempotencyCtx.bodyHash,
-          reply.statusCode,
-          payload,
-        );
-      } catch (err) {
-        fastify.log.error(
-          { err, tenantId: idempotencyCtx.tenantId, endpoint: idempotencyCtx.endpoint },
-          'idempotency cache write failed in onSend; logging and continuing — see TLC-045',
-        );
-      }
-
-      return payload;
-    },
-  );
+  // Source-grep lockdown in tests pins the absence of `addHook('onSend')`
+  // and `storeIdempotencyRecord` so future regressions cannot reintroduce
+  // the legacy path. See `tests/integration/idempotency-helper.test.ts`
+  // Group F.
 };
 
 export const idempotencyPlugin = fp(idempotencyPluginImpl, {

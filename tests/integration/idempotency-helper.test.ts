@@ -330,6 +330,21 @@ describe('withIdempotency — Group E: pending-row in-flight detection', () => {
 // ---------------------------------------------------------------------------
 
 describe('withIdempotency — Group F: source-grep discipline lockdown', () => {
+  /**
+   * Read idempotency.ts once for all source-grep assertions in this
+   * group. Resolves relative to the test-file directory so it works
+   * under both ESM (`import.meta.dirname`) and CJS (`__dirname`)
+   * test runners.
+   */
+  async function readIdempotencySource(): Promise<string> {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    return fs.readFileSync(
+      path.resolve(import.meta.dirname ?? __dirname, '../../src/lib/idempotency.ts'),
+      'utf8',
+    );
+  }
+
   it('idempotency.ts opens SAVEPOINT idempotency_reserve as the first statement', async () => {
     // Source-grep lockdown: the SAVEPOINT-as-tx-discipline-check is the
     // mechanism that throws "SAVEPOINT can only be used in transaction
@@ -339,13 +354,38 @@ describe('withIdempotency — Group F: source-grep discipline lockdown', () => {
     // source-grep replaces what was a vacuous Group E `expect(typeof
     // withIdempotency).toBe('function')` check (PR-D r1 / Codex review
     // CHALLENGE).
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-    const src = fs.readFileSync(
-      path.resolve(import.meta.dirname ?? __dirname, '../../src/lib/idempotency.ts'),
-      'utf8',
-    );
+    const src = await readIdempotencySource();
     expect(src).toMatch(/SAVEPOINT\s+idempotency_reserve/);
     expect(src).toMatch(/RELEASE\s+SAVEPOINT\s+idempotency_reserve/);
+  });
+
+  it('idempotency.ts has NO legacy onSend cache-write hook (PR-E lockdown)', async () => {
+    // Sprint 33 / SI-006 PR-E (2026-05-07): the legacy onSend cache-
+    // write hook was REMOVED once every state-changing handler migrated
+    // to withIdempotency. The hook was a transactional-safety hazard —
+    // it could persist a cached 200 response after the business
+    // transaction rolled back, or cache a 4xx error envelope that then
+    // tripped body-mismatch 409 on a legitimate corrected retry.
+    //
+    // This source-grep pins the absence of the regression vector:
+    //   - No `addHook('onSend', ...)` registration
+    //   - No `storeIdempotencyRecord` function (the legacy writer)
+    //   - No `_idempotencyKey` request stash (preHandler→onSend
+    //     communication channel)
+    //   - No `_idempotencyManagedByHandler` flag READ (set as no-op
+    //     for backward-compat; nothing should consume it)
+    //
+    // Reintroducing any of these would silently re-enable the dual-
+    // write path and break the IDEMPOTENCY v5.1 atomicity contract
+    // for migrated handlers. The lockdown is intentionally strict.
+    const src = await readIdempotencySource();
+    expect(src).not.toMatch(/addHook\(\s*['"]onSend['"]/);
+    expect(src).not.toMatch(/(?:^|\s)async\s+function\s+storeIdempotencyRecord\b/);
+    expect(src).not.toMatch(/request\._idempotencyKey\s*=/);
+    // The flag-set in markIdempotencyManagedByHandler became a no-op
+    // in PR-E (the function is preserved as an export so existing call
+    // sites still compile during the Sprint 34 cleanup-sweep). No code
+    // path should READ the flag any more.
+    expect(src).not.toMatch(/request\._idempotencyManagedByHandler\s*===/);
   });
 });
