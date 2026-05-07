@@ -33,6 +33,8 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import type { AccountId } from '../../../identity/internal/types.js';
 import * as consentService from '../services/consent-service.js';
@@ -104,6 +106,17 @@ function isEvidence(v: unknown): v is ConsentEvidence {
 }
 
 // ---------------------------------------------------------------------------
+// Service-error mapping for withIdempotentExecution. Consent handlers don't
+// currently distinguish service-error classes for HTTP status mapping —
+// errors propagate to Fastify's global error handler. Return false to
+// signal "I didn't map; propagate the throw."
+// ---------------------------------------------------------------------------
+
+function mapServiceError(): boolean {
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // POST /v0/consent/consents
 // ---------------------------------------------------------------------------
 
@@ -111,6 +124,12 @@ export async function grantConsentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 PR-C: mark managed-by-handler at the TOP so legacy onSend
+  // never caches anything from this request (validation 400, success
+  // path, or service throws — all go through withIdempotency cache
+  // management or rollback, not through the legacy onSend write).
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const body = (req.body ?? {}) as GrantBody;
@@ -140,8 +159,15 @@ export async function grantConsentHandler(
   if (body.scope_id !== undefined) grantInput.scope_id = body.scope_id;
   if (body.expires_at !== undefined) grantInput.expires_at = body.expires_at;
 
-  const consent = await consentService.grantConsent(ctx, { actorId: actor.accountId }, grantInput);
-  return reply.code(201).send(toPatientView(consent));
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    const consent = await consentService.grantConsent(
+      ctx,
+      { actorId: actor.accountId },
+      grantInput,
+      tx,
+    );
+    return { status: 201, view: toPatientView(consent) };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +178,8 @@ export async function revokeConsentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006 PR-C: see grantConsentHandler.
+
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const body = (req.body ?? {}) as RevokeBody;
@@ -182,21 +210,28 @@ export async function revokeConsentHandler(
   };
   if (body.scope_id !== undefined) revokeInput.scope_id = body.scope_id;
 
-  const revoked = await consentService.revokeConsent(
-    ctx,
-    { actorId: actor.accountId },
-    revokeInput,
-  );
-  if (revoked === null) {
-    return reply.code(404).send({
-      error: {
-        code: 'internal.resource.not_found',
-        message: 'No active consent to revoke.',
-        request_id: req.id,
-      },
-    });
-  }
-  return reply.code(200).send(toPatientView(revoked));
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    const revoked = await consentService.revokeConsent(
+      ctx,
+      { actorId: actor.accountId },
+      revokeInput,
+      tx,
+    );
+    if (revoked === null) {
+      // 404 for no-active-consent. Cached so retry replays the same 404.
+      return {
+        status: 404,
+        view: {
+          error: {
+            code: 'internal.resource.not_found',
+            message: 'No active consent to revoke.',
+            request_id: req.id,
+          },
+        } as unknown as Omit<Consent, 'tenant_id'>,
+      };
+    }
+    return { status: 200, view: toPatientView(revoked) };
+  });
 }
 
 // ---------------------------------------------------------------------------
