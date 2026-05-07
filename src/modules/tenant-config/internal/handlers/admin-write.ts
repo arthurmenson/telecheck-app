@@ -35,6 +35,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 
 const ADMIN_WRITE_BLOCKED_MSG =
   'Admin Backend slice v1.1 is not yet implemented in this environment. ' +
@@ -50,6 +51,16 @@ export async function patchTenantBrandHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 PR (tenant-config migration): mark managed-by-handler at the
+  // TOP of every state-changing handler — even pure 503 stubs — so the
+  // legacy onSend hook NEVER caches the 503 response. Without this, a
+  // future legitimate retry under the same Idempotency-Key would replay
+  // the cached 503 (or trip body-mismatch 409 on a corrected body),
+  // creating a 24h dead-end. When this slice is real-implemented under
+  // Admin Backend v1.1, the handler will adopt the full
+  // withIdempotentExecution wrapper; this 1-line addition is forward-
+  // compatible and non-load-bearing for the 503-stub path.
+  markIdempotencyManagedByHandler(req);
   // JWT-auth still required BEFORE the 503 — matches read-handler posture
   // so unauthenticated probes can't enumerate the mutation surface.
   requireActorContext(req);
@@ -64,6 +75,7 @@ export async function patchCcrConfigHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006: see patchTenantBrandHandler.
   requireActorContext(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
@@ -76,6 +88,7 @@ export async function createAdapterConfigHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006: see patchTenantBrandHandler.
   requireActorContext(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
@@ -88,6 +101,7 @@ export async function patchAdapterConfigHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006: see patchTenantBrandHandler.
   requireActorContext(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
@@ -100,6 +114,7 @@ export async function deleteAdapterConfigHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006: see patchTenantBrandHandler.
   requireActorContext(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
