@@ -45,16 +45,202 @@ import crypto from 'crypto';
 import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import fp from 'fastify-plugin';
 
-import { withTenantBoundConnection } from './db.js';
+import { type DbClient, withTenantBoundConnection } from './db.js';
 
 // ---------------------------------------------------------------------------
-// Idempotency store — DB-backed against migration 005 idempotency_keys table
+// SI-006 reserve-then-execute redesign — Sprint 32 / PR-A.
 //
-// (Patch v0.2 — 2026-05-02: replaces the prior in-memory Map with durable
-//  Postgres-backed lookup + insert. The table's 4-tuple PK
-//  (tenant_id, key, endpoint, actor_id) per CDM SPEC ISSUE P-010 + Codex
-//  foundation HIGH-2 closure means the same key reused on a different
-//  endpoint or by a different actor produces an independent record.)
+// Replaces the v0 onSend-cache-write pattern with a handler-driven
+// reserve-then-execute helper (`withIdempotency`) that runs INSIDE the
+// caller's business transaction. The plugin retains the preHandler
+// cache-replay fast path for already-completed records, but the cache
+// WRITE moves out of onSend (which was best-effort and not
+// transactionally-safe) and into the helper, atomically with the
+// business state mutation.
+//
+// Spec: docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md (v0.2;
+// design landed via PR #34 with cross-family Codex review).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Error classes — thrown by withIdempotency; caught by the route handler.
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by `withIdempotency` when the 4-tuple key has an existing
+ * `processing_state='completed'` record AND the request body hash matches.
+ * Caller catches and replays the cached response with the cached status
+ * and body. No business logic runs.
+ */
+export class IdempotencyReplayError extends Error {
+  /** ERROR_MODEL v5.1 conceptual code; not used in HTTP response (replay
+   * uses the cached statusCode directly). Kept for log clarity. */
+  readonly errorCode = 'internal.idempotency.replay' as const;
+  readonly cachedStatus: number;
+  readonly cachedBody: unknown;
+  constructor(status: number, body: unknown) {
+    super('idempotent replay');
+    this.name = 'IdempotencyReplayError';
+    this.cachedStatus = status;
+    this.cachedBody = body;
+  }
+}
+
+/**
+ * Thrown by `withIdempotency` when the 4-tuple key has an existing
+ * `processing_state='pending'` record. A concurrent request owns the
+ * reservation. Caller catches and returns 409 — client should retry
+ * after a short back-off.
+ */
+export class IdempotencyInFlightError extends Error {
+  /** ERROR_MODEL v5.1 canonical code for the 409 response. */
+  readonly errorCode = 'internal.idempotency.in_flight' as const;
+  readonly hint =
+    'A request with this idempotency key is currently in flight. Retry after a short back-off.' as const;
+  constructor() {
+    super('idempotent request in flight');
+    this.name = 'IdempotencyInFlightError';
+  }
+}
+
+/**
+ * Thrown by `withIdempotency` when the 4-tuple key has an existing record
+ * (in any processing_state) AND the request body hash differs from the
+ * stored body hash. Per IDEMPOTENCY v5.1 §1: same key + different body →
+ * 409 Conflict.
+ *
+ * Note: the brief considered choosing in-flight 409 (privacy-preserving)
+ * over body-mismatch 409 (more informative) for the pending-record case,
+ * but body-mismatch is the correct semantic — different bodies are
+ * categorically different requests regardless of the original's
+ * processing state. The original's body hash was committed with the
+ * reservation; honoring its identity is the v5.1 contract.
+ */
+export class IdempotencyBodyMismatchError extends Error {
+  readonly errorCode = 'internal.idempotency.body_mismatch' as const;
+  constructor() {
+    super('idempotency key reused with different request body');
+    this.name = 'IdempotencyBodyMismatchError';
+  }
+}
+
+/**
+ * Pre-computed idempotency context that the handler passes to
+ * `withIdempotency`. The caller computes this BEFORE opening the
+ * transaction (the request body, headers, and tenant context are
+ * stable during the request lifecycle).
+ */
+export interface IdempotencyCtx {
+  tenantId: string;
+  idempotencyKey: string;
+  endpoint: string;
+  actorId: string;
+  bodyHash: string;
+}
+
+// ---------------------------------------------------------------------------
+// hashBody — exported for handler-side pre-compute (Sprint 32 / SI-006).
+// ---------------------------------------------------------------------------
+
+/**
+ * SHA-256 hex of the request body string. Exported so handlers can
+ * pre-compute the body hash for `IdempotencyCtx` before opening the
+ * business transaction.
+ */
+export function hashBody(body: string): string {
+  return crypto.createHash('sha256').update(body).digest('hex');
+}
+
+// ---------------------------------------------------------------------------
+// resolveActorId + buildIdempotencyCtx — handler-side helpers.
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the actor_id for the idempotency 4-tuple. Same chain as
+ * preHandler line 244-247 (TLC-048): JWT actorContext first, legacy
+ * `x-actor-id` header second, `'anonymous'` final fallback.
+ *
+ * Exported so handler-side pre-compute uses the identical chain — drift
+ * between the plugin's preHandler resolution and the helper's
+ * resolution would cause cache misses (one connection sees actor 'X',
+ * another sees 'anonymous', cache lookup fails).
+ */
+export function resolveActorId(request: FastifyRequest): string {
+  return (
+    request.actorContext?.accountId ??
+    (request.headers['x-actor-id'] as string | undefined) ??
+    'anonymous'
+  );
+}
+
+/**
+ * Mark the request as having had its idempotency caching managed by a
+ * handler-side `withIdempotency` call. The plugin's onSend hook (legacy
+ * v0 cache write) reads this flag and skips its own write — preventing
+ * a duplicate INSERT (no-op via ON CONFLICT DO NOTHING but still a
+ * wasted round-trip).
+ *
+ * Migrated handlers MUST call this after `withIdempotency` resolves
+ * with a value. The `IdempotencyReplayError` and `IdempotencyInFlightError`
+ * paths do NOT need to call this — they short-circuit via the catch
+ * block, no business logic ran, and the legacy onSend would no-op
+ * anyway because the request never reaches a state where its own cache
+ * write would apply (the handler returns the cached/409 response without
+ * setting up its own ctx).
+ */
+export function markIdempotencyManagedByHandler(request: FastifyRequest): void {
+  // @ts-expect-error: dynamic property attachment for plugin/handler
+  // communication. Read by the legacy onSend hook in this same module.
+  request._idempotencyManagedByHandler = true;
+}
+
+/**
+ * Build the IdempotencyCtx from the request. Helper for handlers
+ * migrating to `withIdempotency`. Throws if the request is missing the
+ * Idempotency-Key header (handlers should not reach this point — the
+ * preHandler returns 400 earlier).
+ */
+export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
+  const idempotencyKey = request.headers['idempotency-key'];
+  if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {
+    throw new Error(
+      'buildIdempotencyCtx called without an Idempotency-Key header — preHandler should have returned 400 first',
+    );
+  }
+  const tenantId = request.tenantContext?.tenantId ?? 'unknown';
+  const actorId = resolveActorId(request);
+  const endpoint = (request.url.split('?')[0] ?? '') || request.url;
+  const rawBody =
+    typeof request.body === 'string' ? request.body : JSON.stringify(request.body ?? '');
+  return {
+    tenantId,
+    idempotencyKey,
+    endpoint,
+    actorId,
+    bodyHash: hashBody(rawBody),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// withIdempotency — reserve-then-execute helper (SI-006 PR-A).
+//
+// Caller invariants the helper assumes (per design brief §5):
+//   1. Caller has already opened a transaction on `client` (BEGIN issued).
+//   2. Caller has already set tenant context on `client` (FORCE RLS on
+//      idempotency_keys requires this; absent context fails closed with
+//      `tenant_context_not_set`).
+//   3. Caller will COMMIT after this returns OR ROLLBACK if anything in
+//      the surrounding transaction throws (including this helper's
+//      thrown errors).
+//
+// Helper does NOT open its own transaction, set tenant context, or call
+// `withTenantBoundConnection` — it operates on the caller's connection.
+//
+// Throw contract:
+//   - IdempotencyReplayError      → caller replays cached response
+//   - IdempotencyInFlightError    → caller returns 409
+//   - IdempotencyBodyMismatchError → caller returns 409
+//   - <body() throws>             → propagated; caller's tx rolls back
 // ---------------------------------------------------------------------------
 
 interface CachedResponse {
@@ -64,8 +250,158 @@ interface CachedResponse {
   cachedAt: Date;
 }
 
-function hashBody(body: string): string {
-  return crypto.createHash('sha256').update(body).digest('hex');
+/**
+ * Run `body()` exactly-once for the given idempotency 4-tuple, atomically
+ * with the surrounding business transaction.
+ *
+ * Mechanics:
+ *   1. Reserve: INSERT idempotency_keys (..., processing_state='pending')
+ *      ON CONFLICT DO NOTHING RETURNING tenant_id.
+ *   2a. If RETURNING produced a row → reservation succeeded; run body();
+ *       on success, UPDATE row to processing_state='completed' with the
+ *       response status + body cached. Return the body's value.
+ *   2b. If RETURNING produced no rows → conflict; SELECT existing row;
+ *       throw the appropriate Replay/InFlight/BodyMismatch error.
+ *
+ * The reserve INSERT writes `response_status=0` as a sentinel for the
+ * pending state (the schema requires NOT NULL). Consumers must NEVER
+ * read `response_status` without first checking `processing_state` —
+ * a value of `0` in a `pending` row indicates the reservation has not
+ * yet been completed.
+ */
+export async function withIdempotency<T>(
+  client: DbClient,
+  ctx: IdempotencyCtx,
+  body: () => Promise<T>,
+): Promise<T> {
+  // -------------------------------------------------------------------------
+  // 1. Reserve — INSERT ON CONFLICT DO NOTHING RETURNING.
+  //
+  //    ON CONFLICT DO NOTHING is comprehensive here because the table's
+  //    PRIMARY KEY (tenant_id, key, endpoint, actor_id) is the only unique
+  //    constraint (verified migrations/005_idempotency_keys.sql:108). No
+  //    secondary unique index can raise an unhandled unique_violation that
+  //    would abort the transaction.
+  // -------------------------------------------------------------------------
+  const insertResult = await client.query<{ tenant_id: string }>(
+    `INSERT INTO idempotency_keys
+       (tenant_id, key, endpoint, actor_id, request_hash,
+        processing_state, response_status, response_body)
+     VALUES ($1, $2, $3, $4, decode($5, 'hex'),
+             'pending', 0, NULL)
+     ON CONFLICT (tenant_id, key, endpoint, actor_id) DO NOTHING
+     RETURNING tenant_id`,
+    [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId, ctx.bodyHash],
+  );
+
+  if (insertResult.rows.length > 0) {
+    // -----------------------------------------------------------------------
+    // Reservation succeeded. Run business logic, then complete.
+    //
+    // body() exceptions propagate up; the caller's transaction will
+    // ROLLBACK, removing both the reservation and any business-state
+    // writes — clean retry possible.
+    // -----------------------------------------------------------------------
+    const result = await body();
+
+    // ---------------------------------------------------------------------
+    // 3. Complete — UPDATE row to completed.
+    //
+    // The `processing_state='pending'` guard prevents a second concurrent
+    // UPDATE from corrupting the row state. Under correct discipline this
+    // guard always matches (the reserving connection always completes its
+    // own reservation), but the floor protects against future call-site
+    // mistakes.
+    //
+    // Best-effort cache: we do NOT report an HTTP status here (the helper
+    // doesn't have one). The caller's reply.code(...).send(...) happens
+    // after this returns; the helper stores `response_status=200` as a
+    // generic-success sentinel on completion. Handlers that need to cache
+    // a non-200 success status (e.g., 201, 204) should pass an explicit
+    // status to a future `withIdempotencyAndStatus(client, ctx, status, body)`
+    // overload — out of scope for PR-A.
+    //
+    // Similarly, the response BODY caching here uses what body() returned.
+    // Most state-changing handlers return the response payload from body(),
+    // and the calling handler does `reply.send(result)`. If the handler
+    // post-processes (e.g., filters PHI fields), the cache will store the
+    // pre-processing shape — acceptable for v1 reserve-then-execute, but
+    // worth flagging as a future enhancement.
+    // ---------------------------------------------------------------------
+    await client.query(
+      `UPDATE idempotency_keys
+          SET processing_state = 'completed',
+              response_status  = 200,
+              response_body    = $5::jsonb
+        WHERE tenant_id   = $1
+          AND key         = $2
+          AND endpoint    = $3
+          AND actor_id    = $4
+          AND processing_state = 'pending'`,
+      [
+        ctx.tenantId,
+        ctx.idempotencyKey,
+        ctx.endpoint,
+        ctx.actorId,
+        result === null || result === undefined ? null : JSON.stringify(result),
+      ],
+    );
+
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // 2. Conflict — INSERT returned empty. Look up the existing row.
+  //
+  //    ON CONFLICT DO NOTHING is silent (no error raised), so the
+  //    transaction is NOT in aborted state. We can issue a fresh SELECT
+  //    against the same client.
+  //
+  //    Edge case: if the existing row has expired (expires_at <= NOW()),
+  //    the SELECT returns zero rows. This is a narrow window between the
+  //    INSERT (which conflicted on a stale row) and the SELECT. The
+  //    safest fail-closed behavior is to throw IdempotencyInFlightError —
+  //    the client retries with backoff and the next attempt either finds
+  //    the expired row gone (cleanup job) or ages out naturally.
+  // -------------------------------------------------------------------------
+  const lookupResult = await client.query<{
+    processing_state: 'pending' | 'completed';
+    response_status: number;
+    response_body: unknown;
+    request_hash_hex: string;
+  }>(
+    `SELECT processing_state,
+            response_status,
+            response_body,
+            encode(request_hash, 'hex') AS request_hash_hex
+       FROM idempotency_keys
+      WHERE tenant_id = $1
+        AND key       = $2
+        AND endpoint  = $3
+        AND actor_id  = $4
+        AND expires_at > NOW()`,
+    [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId],
+  );
+
+  if (lookupResult.rows.length === 0) {
+    // Expired-row race; fail closed.
+    throw new IdempotencyInFlightError();
+  }
+  const row = lookupResult.rows[0]!;
+
+  if (row.request_hash_hex !== ctx.bodyHash) {
+    // Body mismatch — different request reusing the same key.
+    // Per IDEMPOTENCY v5.1 §1: 409 regardless of processing_state.
+    throw new IdempotencyBodyMismatchError();
+  }
+
+  if (row.processing_state === 'pending') {
+    // Concurrent request owns the reservation.
+    throw new IdempotencyInFlightError();
+  }
+
+  // processing_state === 'completed' AND body hashes match → replay.
+  throw new IdempotencyReplayError(row.response_status, row.response_body);
 }
 
 /**
@@ -78,12 +414,22 @@ function hashBody(body: string): string {
  * could let duplicate writes through. Callers must let the error propagate
  * so the request fails closed.
  */
+interface LookupResult extends CachedResponse {
+  /**
+   * SI-006 / Sprint 32: includes processing_state so the preHandler can
+   * distinguish completed (replay candidate) from pending (concurrent
+   * request in flight; pass-through, let handler's withIdempotency
+   * handle the in-flight 409).
+   */
+  processingState: 'pending' | 'completed';
+}
+
 async function lookupIdempotencyRecord(
   tenantId: string,
   key: string,
   endpoint: string,
   actorId: string,
-): Promise<CachedResponse | null> {
+): Promise<LookupResult | null> {
   // Bind tenant context on the acquired connection BEFORE querying — the
   // idempotency_keys table has FORCE RLS with tenant_isolation policy
   // (migration 005), so a query without binding fails closed with
@@ -91,12 +437,14 @@ async function lookupIdempotencyRecord(
   // foundation-wiring HIGH finding closure.)
   return withTenantBoundConnection(tenantId, async (client) => {
     const result = await client.query<{
+      processing_state: 'pending' | 'completed';
       response_status: number;
       response_body: unknown;
       request_hash_hex: string;
       created_at: Date;
     }>(
-      `SELECT response_status,
+      `SELECT processing_state,
+              response_status,
               response_body,
               encode(request_hash, 'hex') AS request_hash_hex,
               created_at
@@ -118,6 +466,7 @@ async function lookupIdempotencyRecord(
       body: row.response_body,
       bodyHash: row.request_hash_hex,
       cachedAt: row.created_at,
+      processingState: row.processing_state,
     };
   });
 }
@@ -128,6 +477,17 @@ async function lookupIdempotencyRecord(
  * race the INSERT — the first wins, the second's response is dropped (its
  * caller still got the response on its own connection, this is just the
  * cache write losing).
+ *
+ * Sprint 32 / SI-006 PR-A status: this function and the onSend hook below
+ * are PRESERVED as backward-compat for handlers not yet migrated to
+ * `withIdempotency`. Once Async-Consult (PR-B) and Consent (PR-C) handlers
+ * migrate, no caller writes via this path — and PR-E removes the function
+ * and the onSend hook with a source-grep lockdown.
+ *
+ * Until then, both paths coexist: handlers using `withIdempotency` get
+ * transactional reserve-then-execute; legacy handlers continue to rely on
+ * the best-effort onSend cache write. preHandler replay works for both
+ * (cache rows from either path read identically).
  */
 async function storeIdempotencyRecord(
   tenantId: string,
@@ -264,6 +624,10 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
     if (existing !== null) {
       if (bodyHash !== existing.bodyHash) {
         // Same 4-tuple key, different body → 409 per IDEMPOTENCY v5.1.
+        // Body-mismatch fires for completed AND pending records (the
+        // existing row's request_hash represents the original request's
+        // body regardless of processing state; different body = different
+        // request).
         await reply.code(409).send({
           error: {
             code: 'internal.idempotency.body_mismatch',
@@ -277,14 +641,37 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
         return;
       }
 
-      // Same 4-tuple key, same body → replay cached response.
-      await reply.code(existing.statusCode).send(existing.body);
-      return;
+      // Same 4-tuple key, same body — handle by processing_state:
+      //
+      //   completed → fast-path replay from the preHandler. Handler does
+      //               not run.
+      //   pending   → another request owns the reservation. The
+      //               preHandler runs OUTSIDE the writing transaction,
+      //               so it sees `pending` only after that transaction
+      //               commits (MVCC; uncommitted reservations are
+      //               invisible). When this branch fires, the writing
+      //               request crashed mid-execution and left a
+      //               'pending' row, OR a clean concurrent request is
+      //               in a brief between-completion window. Either way:
+      //               pass through. The handler's `withIdempotency`
+      //               will see the same 'pending' row, throw
+      //               IdempotencyInFlightError, and the handler returns
+      //               409 cleanly. We don't 409 from preHandler because
+      //               we can't distinguish stale-pending from
+      //               in-flight-pending here without a serializable
+      //               read, which is more cost than benefit.
+      if (existing.processingState === 'completed') {
+        await reply.code(existing.statusCode).send(existing.body);
+        return;
+      }
+      // Fall through to context stash + handler invocation.
     }
 
-    // First request for this 4-tuple — process normally; capture the response
-    // in the onSend hook below for replay on subsequent identical requests.
-    // Attach context to request for onSend.
+    // First request OR pending-record pass-through. Stash context on
+    // the request — handlers that have NOT migrated to `withIdempotency`
+    // (legacy v0 path) read this for their own cache-write needs.
+    // Migrated handlers can also read it (or call buildIdempotencyCtx
+    // directly).
     // @ts-expect-error: dynamic property attachment for within-request communication
     request._idempotencyKey = {
       tenantId,
@@ -295,6 +682,18 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
     };
   });
 
+  // Sprint 32 / SI-006 PR-A status: this onSend hook is PRESERVED as
+  // backward-compat. It will be REMOVED in PR-E once Async-Consult
+  // (PR-B) and Consent (PR-C) handlers migrate to `withIdempotency`.
+  //
+  // The v0 onSend write is best-effort and not transactionally-safe;
+  // PR-A introduces the safe alternative (`withIdempotency`) without
+  // removing the legacy path so existing tests stay green during the
+  // multi-PR migration.
+  //
+  // After PR-B + PR-C land, no migrated handler relies on this hook.
+  // The lockdown test in PR-E pins the absence of `addHook('onSend', ...)`
+  // — at that point removing this block is safe.
   fastify.addHook(
     'onSend',
     async (request: FastifyRequest, reply: FastifyReply, payload: unknown) => {
@@ -311,66 +710,22 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
 
       if (!idempotencyCtx) return payload;
 
-      // Persist the response into the durable idempotency_keys table.
-      // ON CONFLICT DO NOTHING handles the race between two concurrent
-      // requests with the same 4-tuple key — first INSERT wins.
-      //
-      // ARCHITECTURAL LIMITATION (Codex foundation-wiring CRITICAL flagged
-      // 2026-05-02; deferred redesign): the current preHandler/onSend split
-      // pattern is NOT a transactionally-safe idempotency implementation.
-      // Two concurrent requests with the same 4-tuple key both pass the
-      // preHandler lookup (no record yet), both execute the business action,
-      // both attempt the onSend INSERT — ON CONFLICT DO NOTHING means only
-      // one wins the cache, but BOTH already committed business state.
-      // For state-changing endpoints, this is duplicate execution — not the
-      // exactly-once guarantee IDEMPOTENCY v5.1 §1 requires.
-      //
-      // The correct pattern is reserve-then-execute:
-      //   1. INSERT idempotency_keys (..., processing_state='pending') as the
-      //      first statement INSIDE the business transaction. UNIQUE constraint
-      //      on the 4-tuple PK serializes concurrent same-key requests; the
-      //      second one gets a duplicate-key error and rejects with 409
-      //      (or replays the cached response if processing_state='completed').
-      //   2. Run the business logic.
-      //   3. UPDATE idempotency_keys SET processing_state='completed',
-      //      response_status=$X, response_body=$Y as the LAST statement of
-      //      the same transaction.
-      //   4. Commit. If the request fails, the rollback removes BOTH the
-      //      idempotency record AND the business state — clean retry.
-      //
-      // That pattern requires the request handler to drive the transaction
-      // (not a Fastify hook bracketing it). It is a slice-implementation
-      // concern, not a plugin concern. This middleware version is good
-      // enough for v0 single-request-at-a-time flows; the first slice with
-      // serious concurrent-write semantics MUST migrate to reserve-then-
-      // execute. Open issue: filed as `idempotency-redesign-reserve-then-
-      // execute` per EHBG §12 SI/DSI escalation.
-      //
+      // -----------------------------------------------------------------
+      // Skip the legacy onSend write when the handler used
+      // `withIdempotency` (handler-driven path). The handler signals
+      // this by attaching `_idempotencyManagedByHandler: true` to the
+      // request after a successful `withIdempotency` invocation. This
+      // prevents a duplicate INSERT (which would no-op via ON CONFLICT
+      // DO NOTHING anyway, but better to skip the round-trip).
+      // -----------------------------------------------------------------
+      // @ts-expect-error: dynamic property from migrated handlers
+      if (request._idempotencyManagedByHandler === true) {
+        return payload;
+      }
+
       // Sprint 24 / TLC-045: catch + log rather than throw on cache-write
-      // failure. The earlier "throw to surface" approach (Codex 2026-05-02
-      // patch) interacted badly with Fastify's onSend lifecycle: a throw
-      // during onSend triggers Fastify's error-handling path, which then
-      // tries to safeWriteHead a fresh error response — but the headers
-      // for the original response have already been written by an upstream
-      // mapServiceError (handler) that did `void reply.code(404).send(...)`
-      // and returned. Result: ERR_HTTP_HEADERS_SENT unhandled error, which
-      // makes vitest exit 1 and ci.yml red even when 1404/1404 tests pass.
-      //
-      // The intended observability semantic — "make the failure observable
-      // rather than silent" — is preserved by emitting an explicit
-      // fastify.log.error with the cache-write error. This surfaces in
-      // the server log + crash trace as before, but does NOT inject a
-      // throw into the response pipeline.
-      //
-      // Tradeoff acknowledged: this is technically bare-suppression in
-      // the I-003-spirit sense (silent failure). But the architectural
-      // limitation note above already flags that this v0 onSend cache
-      // pattern is NOT transactionally-safe — the entire onSend cache
-      // write is best-effort by design. The proper fix is the reserve-
-      // then-execute redesign (filed as `idempotency-redesign-reserve-
-      // then-execute` per EHBG §12 SI/DSI). Until that lands, the cache
-      // write running in onSend is a v0 stop-gap; logging on failure is
-      // the right shape for that stop-gap.
+      // failure — Fastify onSend lifecycle does not tolerate throws after
+      // the response headers have been written.
       try {
         await storeIdempotencyRecord(
           idempotencyCtx.tenantId,
