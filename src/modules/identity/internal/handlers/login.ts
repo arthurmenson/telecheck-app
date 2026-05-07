@@ -311,21 +311,37 @@ export async function loginVerifyHandler(
 /**
  * NOT migrated to withIdempotentExecution at this commit — the v1.0
  * implementation is a pure read (no state mutation, no audit emission;
- * "no-op rotation" returns the existing session view). Migrating a
- * read-only path provides no transactional benefit and is a small risk
- * (the cached response includes session metadata; replaying it at all
- * is wrong if the session state changes between requests).
+ * "no-op rotation" returns the existing session view).
+ *
+ * SECURITY (Sprint 33 / SI-006 PR-F3 r4 — Codex 2026-05-07 MEDIUM
+ * closure): the response is NOT actually invariant. After a successful
+ * refresh, a logout/revoke can change the session state — but a cached
+ * 200 response would replay an active-session view from the legacy
+ * onSend cache, masking revocation for the cache TTL. The pre-r4
+ * comment claimed "the response is invariant for the same
+ * refresh_token (it's a read)"; that was wrong because session state
+ * is mutable.
+ *
+ * Fix: call `markIdempotencyManagedByHandler(req)` at the TOP so the
+ * legacy onSend hook NEVER writes a cache row for this endpoint. Every
+ * request runs `findActiveSessionByRefreshToken` live, so a revoked
+ * session is detected on every retry. No cached response can replay
+ * an active-looking view post-revocation.
  *
  * When real refresh-token rotation lands (issue new plaintext + hash;
  * revoke previous; emit identity_session_rotated audit), migrate this
- * handler to the same pattern as loginVerifyHandler. Until then, the
- * legacy onSend cache write applies — and is acceptable because the
- * response is invariant for the same refresh_token (it's a read).
+ * handler to the same pattern as loginVerifyHandler — the rotation
+ * path WILL want idempotency-cache replay so a network-blip retry
+ * returns the SAME rotated tokens (not a fresh rotation that orphans
+ * the original).
  */
 export async function sessionRefreshHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 PR-F3 r4 — skip legacy onSend cache write. See doc-comment.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as SessionRefreshBody;
 
