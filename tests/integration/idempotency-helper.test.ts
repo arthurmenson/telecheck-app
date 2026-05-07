@@ -330,6 +330,48 @@ describe('withIdempotency — Group E: pending-row in-flight detection', () => {
 // ---------------------------------------------------------------------------
 
 describe('withIdempotency — Group F: source-grep discipline lockdown', () => {
+  /**
+   * Read idempotency.ts once for all source-grep assertions in this
+   * group. Resolves relative to the test-file directory so it works
+   * under both ESM (`import.meta.dirname`) and CJS (`__dirname`)
+   * test runners.
+   */
+  async function readIdempotencySource(): Promise<string> {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    return fs.readFileSync(
+      path.resolve(import.meta.dirname ?? __dirname, '../../src/lib/idempotency.ts'),
+      'utf8',
+    );
+  }
+
+  /**
+   * Strip TypeScript comments so source-grep assertions fire against
+   * actual code, not the doc-comments that reference removed symbols
+   * (e.g., the explanatory block in idempotency.ts that mentions
+   * `addHook('onSend', ...)` in prose). Without stripping, lockdown
+   * patterns produce false positives on the very comments that
+   * document the removal. Hardening per Codex Sprint 33 PR-E review
+   * 2026-05-07 (MEDIUM closure).
+   *
+   * Strips `/star ... star/` block comments and `// ...` line
+   * comments (the slash-star spelling cannot be quoted literally inside
+   * this very block comment without terminating it early). The
+   * implementation is tolerant of multi-line block comments and
+   * preserves string-literal contents (e.g., the `'onSend'` reference
+   * in a comment is stripped, but a real `addHook('onSend')` call in
+   * code is preserved because string-literal handling is left to the
+   * regex; we don't fully parse TS, just remove comment syntax). The
+   * patterns below are designed to match any reasonable spelling of
+   * the regression — quoted-string property access, whitespace
+   * variants, function-vs-arrow declaration forms, etc.
+   */
+  function stripComments(src: string): string {
+    return src
+      .replace(/\/\*[\s\S]*?\*\//g, '') // block comments
+      .replace(/(^|[^:\\])\/\/.*$/gm, '$1'); // line comments (avoid matching inside http://, file://)
+  }
+
   it('idempotency.ts opens SAVEPOINT idempotency_reserve as the first statement', async () => {
     // Source-grep lockdown: the SAVEPOINT-as-tx-discipline-check is the
     // mechanism that throws "SAVEPOINT can only be used in transaction
@@ -339,13 +381,68 @@ describe('withIdempotency — Group F: source-grep discipline lockdown', () => {
     // source-grep replaces what was a vacuous Group E `expect(typeof
     // withIdempotency).toBe('function')` check (PR-D r1 / Codex review
     // CHALLENGE).
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-    const src = fs.readFileSync(
-      path.resolve(import.meta.dirname ?? __dirname, '../../src/lib/idempotency.ts'),
-      'utf8',
-    );
+    const src = await readIdempotencySource();
     expect(src).toMatch(/SAVEPOINT\s+idempotency_reserve/);
     expect(src).toMatch(/RELEASE\s+SAVEPOINT\s+idempotency_reserve/);
+  });
+
+  it('idempotency.ts has NO legacy onSend cache-write hook (PR-E lockdown)', async () => {
+    // Sprint 33 / SI-006 PR-E (2026-05-07): the legacy onSend cache-
+    // write hook was REMOVED once every state-changing handler migrated
+    // to withIdempotency. The hook was a transactional-safety hazard —
+    // it could persist a cached 200 response after the business
+    // transaction rolled back, or cache a 4xx error envelope that then
+    // tripped body-mismatch 409 on a legitimate corrected retry.
+    //
+    // The patterns below run against COMMENT-STRIPPED source so the
+    // doc-comments that reference these symbols by name don't trigger
+    // false positives. They're designed to catch any reasonable
+    // spelling of a regression:
+    //   - addHook with any whitespace + dotted/bracket/template access
+    //   - storeIdempotencyRecord declared as function, async function,
+    //     const-assigned-arrow, or method
+    //   - _idempotencyKey assigned via dot OR bracket property access
+    //   - _idempotencyManagedByHandler READ in any conditional /
+    //     comparison form (=== / !== / standalone truthy check)
+    //
+    // Reintroducing any of these would silently re-enable the dual-
+    // write path and break IDEMPOTENCY v5.1 atomicity for migrated
+    // handlers. The lockdown is intentionally strict.
+    const code = stripComments(await readIdempotencySource());
+
+    // The legacy onSend hook registration in any reasonable spelling.
+    // Matches: addHook('onSend', ...), addHook ("onSend"), addHook(
+    //   `onSend` ), bracket-access ['addHook']('onSend'), etc. The key
+    // tell is the literal 'onSend' / "onSend" / `onSend` string used
+    // as Fastify's hook-name argument — there is no other reason for
+    // this string to appear in idempotency.ts code.
+    expect(code).not.toMatch(/['"`]onSend['"`]/);
+
+    // The legacy storeIdempotencyRecord identifier as a declaration
+    // OR a call site. Catches:
+    //   async function storeIdempotencyRecord(...)
+    //   function storeIdempotencyRecord(...)
+    //   const storeIdempotencyRecord = async (...) => ...
+    //   const storeIdempotencyRecord = function (...) ...
+    //   await storeIdempotencyRecord(...)
+    expect(code).not.toMatch(/\bstoreIdempotencyRecord\b/);
+
+    // The preHandler→onSend communication stash. Catches dot AND
+    // bracket property assignment:
+    //   request._idempotencyKey = { ... }
+    //   request['_idempotencyKey'] = { ... }
+    //   request[`_idempotencyKey`] = { ... }
+    expect(code).not.toMatch(/_idempotencyKey['"`\]]?\s*=[^=]/);
+
+    // The legacy flag READ. The flag is SET by the preserved no-op
+    // helper, so a literal `_idempotencyManagedByHandler =` write IS
+    // expected to be absent (it was removed from the helper body). A
+    // READ in any form would indicate the legacy onSend logic is
+    // back. Catches:
+    //   request._idempotencyManagedByHandler === true
+    //   if (request._idempotencyManagedByHandler) { ... }
+    //   request._idempotencyManagedByHandler ? a : b
+    //   request['_idempotencyManagedByHandler']
+    expect(code).not.toMatch(/_idempotencyManagedByHandler\b/);
   });
 });
