@@ -269,13 +269,28 @@ export async function registrationVerifyHandler(
       // failure anywhere atomically rolls back the OTP consumption too.
       const accountId = asAccountId(ulid());
 
-      // SI-006 PR-F3 r2 (Codex review fix 2026-05-07 MEDIUM): catch the
+      // SI-006 PR-F3 r3 (Codex review fix 2026-05-07): catch the
       // SQLSTATE 23505 (uq_account_tenant_phone unique violation) that
       // surfaces when two registration verifies race with the same phone.
       // Return a cached PHONE_TAKEN 400 so retries replay the
       // deterministic envelope instead of re-running the conflict-prone
-      // INSERT (which would re-throw 23505 each time, surface as 500
-      // through the global error handler, and pollute observability).
+      // INSERT.
+      //
+      // SAVEPOINT discipline (Codex r2-review HIGH closure 2026-05-07):
+      // a failed INSERT puts the surrounding Postgres transaction into
+      // the aborted state — every subsequent statement except
+      // ROLLBACK / SAVEPOINT / RELEASE fails with "current transaction is
+      // aborted". Without containment, withIdempotency's downstream
+      // UPDATE-to-completed would fail too, surfacing the original 500
+      // and never caching the PHONE_TAKEN envelope.
+      //
+      // Wrap createAccount in `SAVEPOINT phone_take_check` … on 23505,
+      // ROLLBACK TO SAVEPOINT (which clears the aborted state and leaves
+      // the outer tx healthy for the idempotency UPDATE); on success,
+      // RELEASE the savepoint and proceed. Other 23505 collisions
+      // (account_id PK) re-throw to bubble through the standard error
+      // path.
+      await tx.query('SAVEPOINT phone_take_check');
       let created: Account;
       try {
         created = await accountService.createAccount(
@@ -296,11 +311,11 @@ export async function registrationVerifyHandler(
           },
           tx,
         );
+        await tx.query('RELEASE SAVEPOINT phone_take_check');
       } catch (err) {
         // pg DatabaseError exposes `.code` for the SQLSTATE; check for
-        // 23505 (unique_violation) AND the constraint name to ensure we
-        // only swallow the phone-uniqueness collision (other unique
-        // constraints — e.g., account_id PK — should propagate).
+        // 23505 AND the constraint name to ensure we only swallow the
+        // phone-uniqueness collision.
         if (
           err !== null &&
           typeof err === 'object' &&
@@ -309,11 +324,20 @@ export async function registrationVerifyHandler(
           'constraint' in err &&
           (err as { constraint?: unknown }).constraint === 'uq_account_tenant_phone'
         ) {
+          // ROLLBACK TO SAVEPOINT clears the aborted state from the
+          // failed INSERT and restores the outer tx for the
+          // withIdempotency UPDATE-to-completed.
+          await tx.query('ROLLBACK TO SAVEPOINT phone_take_check');
+          await tx.query('RELEASE SAVEPOINT phone_take_check');
           return {
             status: 400,
             view: makeErrorEnvelope(req.id, PHONE_TAKEN, 'Phone number is already registered.'),
           };
         }
+        // Any other failure: roll back the savepoint anyway (so the
+        // caller's tx isn't poisoned) and re-throw.
+        await tx.query('ROLLBACK TO SAVEPOINT phone_take_check');
+        await tx.query('RELEASE SAVEPOINT phone_take_check');
         throw err;
       }
 
