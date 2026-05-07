@@ -465,24 +465,38 @@ export async function withIdempotency<TBody>(
     [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId],
   );
 
-  // Per-endpoint TTL override (Sprint 33 / SI-006 PR-F security
-  // hardening). Default 24h per IDEMPOTENCY v5.1; auth-flow endpoints
-  // that cache plaintext credentials override to 300s (see
-  // ENDPOINT_TTL_OVERRIDES). The `($6 || ' seconds')::interval` cast
-  // ensures Postgres treats the integer as an interval literal —
-  // equivalent to INTERVAL '300 seconds' for ttlSeconds=300. Overrides
-  // the migration 005 column default (NOW() + INTERVAL '24 hours').
-  const ttlSeconds = ttlSecondsForEndpoint(ctx.endpoint);
-
+  // Sprint 33 / SI-006 PR-F1 r4: separate reservation-lock TTL from
+  // cached-response TTL.
+  //
+  // The pending row's expires_at is the RESERVATION LOCK lifetime —
+  // how long another concurrent request will see this 4-tuple as
+  // in-flight. If a handler stalls (slow dependency, long-running
+  // verification) and the reservation TTL expires, the next retry will
+  // purge the pending row and re-execute the handler, causing
+  // duplicate side effects. The reservation lock should therefore use
+  // the DEFAULT 24h TTL (column default — generous lock lifetime;
+  // stuck handlers should be diagnosed, not raced).
+  //
+  // The COMPLETED row's expires_at is the CACHED-RESPONSE dwell time —
+  // how long the cached body lives in the DB. THIS is where the
+  // ENDPOINT_TTL_OVERRIDES map applies (e.g., 900s for auth-flow paths
+  // whose body contains plaintext bearer tokens — bounded by the
+  // bearer's own validity).
+  //
+  // Net effect: stuck-handler safety + correct sensitive-response
+  // dwell-time bound. The override TTL is applied at the
+  // pending->completed UPDATE below, NOT at the pending INSERT.
+  // Per Codex Sprint 33 PR-F1 r3 adversarial review 2026-05-07
+  // (HIGH-3).
   const insertResult = await client.query<{ tenant_id: string }>(
     `INSERT INTO idempotency_keys
        (tenant_id, key, endpoint, actor_id, request_hash,
-        processing_state, response_status, response_body, expires_at)
+        processing_state, response_status, response_body)
      VALUES ($1, $2, $3, $4, decode($5, 'hex'),
-             'pending', 0, NULL, NOW() + ($6 || ' seconds')::interval)
+             'pending', 0, NULL)
      ON CONFLICT (tenant_id, key, endpoint, actor_id) DO NOTHING
      RETURNING tenant_id`,
-    [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId, ctx.bodyHash, ttlSeconds],
+    [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId, ctx.bodyHash],
   );
 
   if (insertResult.rows.length > 0) {
@@ -506,11 +520,18 @@ export async function withIdempotency<TBody>(
     // The `processing_state='pending'` guard prevents a second concurrent
     // UPDATE from corrupting the row.
     // ---------------------------------------------------------------------
+    // Per Sprint 33 / SI-006 PR-F1 r4: apply ENDPOINT_TTL_OVERRIDES at
+    // the pending->completed transition, NOT at reservation INSERT
+    // (see HIGH-3 closure note above). Sets expires_at to NOW() +
+    // (ttlSeconds || ' seconds')::interval, replacing the column
+    // default (24h) inherited at INSERT time.
+    const completedTtlSeconds = ttlSecondsForEndpoint(ctx.endpoint);
     await client.query(
       `UPDATE idempotency_keys
           SET processing_state = 'completed',
               response_status  = $5,
-              response_body    = $6::jsonb
+              response_body    = $6::jsonb,
+              expires_at       = NOW() + ($7 || ' seconds')::interval
         WHERE tenant_id   = $1
           AND key         = $2
           AND endpoint    = $3
@@ -523,6 +544,7 @@ export async function withIdempotency<TBody>(
         ctx.actorId,
         payload.status,
         payload.body === null || payload.body === undefined ? null : JSON.stringify(payload.body),
+        completedTtlSeconds,
       ],
     );
 
