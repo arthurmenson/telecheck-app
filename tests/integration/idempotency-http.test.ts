@@ -576,6 +576,34 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
       config.jwtSigningKey,
     );
 
+    // PR-B r3 (Sprint 32): seed both accounts in the database so the
+    // initiate handler's FK to accounts(tenant_id, account_id) is
+    // satisfied. Mirrors the seedAccount pattern in
+    // async-consult-cross-tenant-isolation.test.ts.
+    const { createAccount } =
+      await import('../../src/modules/identity/internal/repositories/account-repo.ts');
+    const { uniquePhone } = await import('../helpers/unique-phone.ts');
+    for (const accountId of [accountIdA, accountIdB]) {
+      await withTenantContext(TENANT_US, async () =>
+        createAccount(
+          {
+            account_id: accountId,
+            tenant_id: tenantUS,
+            phone_e164: uniquePhone('+1'),
+            first_name: 'Test',
+            last_name: 'Patient',
+            date_of_birth: '1990-01-01',
+            gender: 'prefer_not_to_say',
+            country_of_residence: 'US',
+            country_of_care: 'US',
+          },
+          async () => {
+            /* no-op tx callback */
+          },
+        ),
+      );
+    }
+
     // PR-B Sprint 32 update: previously this test used POST /:id/abandon
     // with non-existent IDs to trigger a 404 cached response. After PR-B
     // migrated async-consult handlers to withIdempotency, failed requests
