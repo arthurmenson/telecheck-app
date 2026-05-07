@@ -199,6 +199,21 @@ export function markIdempotencyManagedByHandler(request: FastifyRequest): void {
  * migrating to `withIdempotency`. Throws if the request is missing the
  * Idempotency-Key header (handlers should not reach this point — the
  * preHandler returns 400 earlier).
+ *
+ * SECURITY: The endpoint key prefers Fastify's matched route pattern
+ * (`request.routeOptions.url`) over the raw request URL. The routed
+ * pattern is the canonical invariant — Fastify has already normalized
+ * case + trailing slashes during routing — so a TTL override (e.g.,
+ * 900s for the auth-flow paths) cannot be bypassed by sending a path
+ * variant (`/v0/identity/login/verify/`, mounted-prefix variation,
+ * etc.) that would silently fall back to the 24h default and leave
+ * plaintext tokens in cache for a day. Per Codex Sprint 33 PR-F1
+ * adversarial review 2026-05-07 (HIGH-1).
+ *
+ * The fallback to `request.url` covers test harnesses that synthesize
+ * requests without going through Fastify's router (no `routeOptions`);
+ * route-pattern handling in production code paths is the primary
+ * surface.
  */
 export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
   const idempotencyKey = request.headers['idempotency-key'];
@@ -209,7 +224,14 @@ export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
   }
   const tenantId = request.tenantContext?.tenantId ?? 'unknown';
   const actorId = resolveActorId(request);
-  const endpoint = (request.url.split('?')[0] ?? '') || request.url;
+  // Prefer the matched Fastify route pattern over raw URL — see SECURITY
+  // note in the doc-comment above. Falls back to URL-without-querystring
+  // if route metadata is unavailable (e.g., test harness without router).
+  const routedPattern = request.routeOptions?.url;
+  const endpoint =
+    routedPattern && routedPattern.length > 0
+      ? routedPattern
+      : (request.url.split('?')[0] ?? '') || request.url;
   const rawBody =
     typeof request.body === 'string' ? request.body : JSON.stringify(request.body ?? '');
   return {
