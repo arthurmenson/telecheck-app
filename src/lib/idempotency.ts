@@ -343,18 +343,32 @@ export async function withIdempotency<TBody>(
   //    (PRIMARY KEY tenant_id+key+endpoint+actor_id per
   //    migrations/005_idempotency_keys.sql:108). Conflicts ONLY on
   //    non-expired rows.
+  //
+  // PR-A r3 (Sprint 32 / Codex verification round on PR-D): split
+  // DELETE and INSERT into TWO statements. The earlier r2 design used
+  // a single statement with `WITH purged AS (DELETE ...) INSERT ...`,
+  // but Postgres CTE snapshot-isolation means the modifying CTE and
+  // the sub-INSERT see the SAME snapshot — the INSERT still conflicts
+  // on the row the DELETE just removed (per
+  // https://www.postgresql.org/docs/current/queries-with.html on data-
+  // modifying CTE visibility). Runtime evidence: PR-D's Group D
+  // expired-row recovery test exercised this case and got
+  // IdempotencyInFlightError instead of a fresh reservation. Two
+  // separate statements within the same SAVEPOINT see the DELETE's
+  // effect for the subsequent INSERT.
   // -------------------------------------------------------------------------
+  await client.query(
+    `DELETE FROM idempotency_keys
+      WHERE tenant_id = $1
+        AND key       = $2
+        AND endpoint  = $3
+        AND actor_id  = $4
+        AND expires_at <= NOW()`,
+    [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId],
+  );
+
   const insertResult = await client.query<{ tenant_id: string }>(
-    `WITH purged AS (
-       DELETE FROM idempotency_keys
-        WHERE tenant_id = $1
-          AND key       = $2
-          AND endpoint  = $3
-          AND actor_id  = $4
-          AND expires_at <= NOW()
-       RETURNING 1
-     )
-     INSERT INTO idempotency_keys
+    `INSERT INTO idempotency_keys
        (tenant_id, key, endpoint, actor_id, request_hash,
         processing_state, response_status, response_body)
      VALUES ($1, $2, $3, $4, decode($5, 'hex'),
