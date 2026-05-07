@@ -743,6 +743,17 @@ const EXEMPT_PATHS = new Set([
   '/patients/:id/locale',
   '/patients/:id/notification-preferences',
   '/health',
+  // Sprint 33 / SI-006 PR-F3 r5 (Codex 2026-05-07 MEDIUM closure):
+  // /v0/identity/sessions/refresh is a session-state read whose
+  // response is NOT invariant — a logout/revoke between requests
+  // changes the session validity. Caching ANY response at this
+  // endpoint risks replaying an active-session view post-revocation
+  // for the cache TTL. The handler also calls
+  // markIdempotencyManagedByHandler to skip onSend writes, but adding
+  // the path here ALSO bypasses preHandler lookup so any pre-existing
+  // cache rows (e.g., upgrade from a deploy that cached refresh
+  // responses on the legacy path) are not replayed. Defense in depth.
+  '/v0/identity/sessions/refresh',
 ]);
 
 function isExempt(method: string, url: string): boolean {
