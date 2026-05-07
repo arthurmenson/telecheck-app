@@ -42,7 +42,7 @@ import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import * as accountService from '../services/account-service.js';
 import * as otpService from '../services/otp-service.js';
-import { asAccountId, asOtpId } from '../types.js';
+import { asAccountId, asOtpId, type Account } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Sentinel error codes (mapped to HTTP envelope shapes by the handlers)
@@ -268,24 +268,54 @@ export async function registrationVerifyHandler(
       // Both INSERT + UPDATE + audit emissions are inside this tx; a
       // failure anywhere atomically rolls back the OTP consumption too.
       const accountId = asAccountId(ulid());
-      const created = await accountService.createAccount(
-        ctx,
-        { actorId: 'system' },
-        {
-          account_id: accountId,
-          phone_e164: phone,
-          first_name: firstName,
-          last_name: lastName,
-          date_of_birth: dateOfBirth,
-          gender,
-          ...(body.email !== undefined ? { email: body.email } : {}),
-          ...(body.national_id !== undefined ? { national_id: body.national_id } : {}),
-          ...(body.country_of_residence !== undefined
-            ? { country_of_residence: body.country_of_residence }
-            : {}),
-        },
-        tx,
-      );
+
+      // SI-006 PR-F3 r2 (Codex review fix 2026-05-07 MEDIUM): catch the
+      // SQLSTATE 23505 (uq_account_tenant_phone unique violation) that
+      // surfaces when two registration verifies race with the same phone.
+      // Return a cached PHONE_TAKEN 400 so retries replay the
+      // deterministic envelope instead of re-running the conflict-prone
+      // INSERT (which would re-throw 23505 each time, surface as 500
+      // through the global error handler, and pollute observability).
+      let created: Account;
+      try {
+        created = await accountService.createAccount(
+          ctx,
+          { actorId: 'system' },
+          {
+            account_id: accountId,
+            phone_e164: phone,
+            first_name: firstName,
+            last_name: lastName,
+            date_of_birth: dateOfBirth,
+            gender,
+            ...(body.email !== undefined ? { email: body.email } : {}),
+            ...(body.national_id !== undefined ? { national_id: body.national_id } : {}),
+            ...(body.country_of_residence !== undefined
+              ? { country_of_residence: body.country_of_residence }
+              : {}),
+          },
+          tx,
+        );
+      } catch (err) {
+        // pg DatabaseError exposes `.code` for the SQLSTATE; check for
+        // 23505 (unique_violation) AND the constraint name to ensure we
+        // only swallow the phone-uniqueness collision (other unique
+        // constraints — e.g., account_id PK — should propagate).
+        if (
+          err !== null &&
+          typeof err === 'object' &&
+          'code' in err &&
+          (err as { code?: unknown }).code === '23505' &&
+          'constraint' in err &&
+          (err as { constraint?: unknown }).constraint === 'uq_account_tenant_phone'
+        ) {
+          return {
+            status: 400,
+            view: makeErrorEnvelope(req.id, PHONE_TAKEN, 'Phone number is already registered.'),
+          };
+        }
+        throw err;
+      }
 
       const activated = await accountService.activateAccount(
         ctx,
