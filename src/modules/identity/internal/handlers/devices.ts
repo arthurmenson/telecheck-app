@@ -27,10 +27,15 @@
  *   - Identity & Authentication Spec v1.0 §3.1 / §3.4
  *   - I-003 (audit append-only)
  *   - I-025 (tenant-blind error envelope)
+ *   - SI-006 reserve-then-execute idempotency (POST/DELETE handlers
+ *     migrated to withIdempotentExecution; see src/lib/idempotent-handler.ts).
  */
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import type { DbTransaction } from '../../../../lib/db.js';
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import * as deviceService from '../services/auth-device-service.js';
@@ -66,6 +71,30 @@ function isAttestation(v: unknown): v is AttestationFormat {
 }
 
 // ---------------------------------------------------------------------------
+// Error envelope helper (mirrors async-consult/consent shape)
+// ---------------------------------------------------------------------------
+
+interface ErrorEnvelopeBody {
+  error: { code: string; message: string; request_id: string };
+}
+
+function makeErrorEnvelope(reqId: string, code: string, message: string): ErrorEnvelopeBody {
+  return { error: { code, message, request_id: reqId } };
+}
+
+/**
+ * Devices service has no caller-mappable error classes at v1.0 (the
+ * registration path enforces the multi-device cap by auto-eviction
+ * inside the service, and revoke is idempotent — phantom returns null).
+ * Helper kept for shape parity with other migrated modules; the helper
+ * always returns false so the helper propagates unhandled throws to
+ * Fastify's global error handler.
+ */
+function mapServiceError(_err: unknown, _reply: FastifyReply, _reqId: string): boolean {
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // POST /v0/identity/devices
 // ---------------------------------------------------------------------------
 
@@ -73,6 +102,11 @@ export async function registerDeviceHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
+  // the legacy onSend cache write is skipped on every code path
+  // (validation 400s as well as the success path).
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as RegisterDeviceBody;
 
@@ -81,13 +115,15 @@ export async function registerDeviceHandler(
     !isPlatform(body.platform) ||
     !isString(body.device_public_key)
   ) {
-    return reply.code(400).send({
-      error: {
-        code: 'internal.request.invalid',
-        message: 'account_id, platform (ios|android|web), and device_public_key required.',
-        request_id: req.id,
-      },
-    });
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'account_id, platform (ios|android|web), and device_public_key required.',
+        ),
+      );
   }
 
   const accountId = asAccountId(body.account_id);
@@ -98,25 +134,32 @@ export async function registerDeviceHandler(
     ? body.attestation_format
     : undefined;
 
-  const device = await deviceService.registerDevice(
-    ctx,
-    { actorId: 'system' },
-    {
-      device_id: deviceId,
-      account_id: accountId,
-      platform: body.platform,
-      device_public_key: body.device_public_key,
-      ...(body.device_label !== undefined ? { device_label: body.device_label } : {}),
-      ...(attestationFormat !== undefined ? { attestation_format: attestationFormat } : {}),
-    },
-  );
+  const platform = body.platform;
+  const devicePublicKey = body.device_public_key;
+  const deviceLabel = body.device_label;
 
-  // Strip tenant_id to match the platform's patient-surface discipline.
-  // AuthDevice doesn't have a dedicated `toPatientView` since it carries
-  // no PHI beyond the device public key, but tenant_id MUST NOT leak.
-  const { tenant_id: _stripped, ...patientView } = device;
-  void _stripped;
-  return reply.code(201).send(patientView);
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx: DbTransaction) => {
+    const device = await deviceService.registerDevice(
+      ctx,
+      { actorId: 'system' },
+      {
+        device_id: deviceId,
+        account_id: accountId,
+        platform,
+        device_public_key: devicePublicKey,
+        ...(deviceLabel !== undefined ? { device_label: deviceLabel } : {}),
+        ...(attestationFormat !== undefined ? { attestation_format: attestationFormat } : {}),
+      },
+      tx,
+    );
+
+    // Strip tenant_id to match the platform's patient-surface discipline.
+    // AuthDevice doesn't have a dedicated `toPatientView` since it carries
+    // no PHI beyond the device public key, but tenant_id MUST NOT leak.
+    const { tenant_id: _stripped, ...patientView } = device;
+    void _stripped;
+    return { status: 201, view: patientView };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -163,27 +206,40 @@ export async function revokeDeviceHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const params = (req.params ?? {}) as { deviceId?: string };
 
   if (!isString(params.deviceId)) {
-    return reply.code(400).send({
-      error: {
-        code: 'internal.request.invalid',
-        message: 'deviceId path parameter is required.',
-        request_id: req.id,
-      },
-    });
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'deviceId path parameter is required.',
+        ),
+      );
   }
 
-  // Idempotent: revokeDevice returns null on phantom or already-revoked;
-  // we still respond 204 to prevent enumeration (tenant-blind).
-  await deviceService.revokeDevice(
-    ctx,
-    { actorId: 'system' },
-    asDeviceId(params.deviceId),
-    'patient_unregistered',
-  );
+  const deviceId = asDeviceId(params.deviceId);
 
-  return reply.code(204).send();
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx: DbTransaction) => {
+    // Idempotent: revokeDevice returns null on phantom or already-revoked;
+    // we still respond 204 to prevent enumeration (tenant-blind).
+    await deviceService.revokeDevice(
+      ctx,
+      { actorId: 'system' },
+      deviceId,
+      'patient_unregistered',
+      tx,
+    );
+
+    // 204 No Content — body must be null/undefined for the idempotency
+    // cache to round-trip cleanly (replay re-sends `null` which Fastify
+    // treats as no body for 204).
+    return { status: 204, view: null };
+  });
 }
