@@ -222,6 +222,69 @@ export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
 }
 
 // ---------------------------------------------------------------------------
+// Per-endpoint TTL overrides for the idempotency cache.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-endpoint TTL overrides for the idempotency cache.
+ *
+ * Default TTL is 24h (86400s) per IDEMPOTENCY v5.1. Overrides reduce TTL
+ * for endpoints whose response_body contains sensitive plaintext that
+ * SHOULD NOT dwell in the cache table for 24h.
+ *
+ * Sprint 33 / SI-006 PR-F (security hardening per AppSec review of
+ * Sprint 33 identity-handler migration). The auth-flow paths cache
+ * plaintext access_token + refresh_token to satisfy the IDEMPOTENCY
+ * v5.1 retry contract.
+ *
+ * SECURITY ALIGNMENT (post Sprint 33 AppSec gate verification 2026-05-07):
+ * The cache TTL MUST be >= the JWT access_token TTL so that an
+ * idempotency replay never returns a token that has already expired
+ * in the JWT layer (which would surface as a confusing 401 to a
+ * legitimate retry). Conversely, the cache TTL MUST be <= the JWT
+ * access_token TTL plus a small grace window — caching a body whose
+ * access_token has long-since expired wastes DB rows and extends the
+ * plaintext-credentials-in-cache exposure window beyond the bearer
+ * token's own lifetime, which is the right upper bound for the
+ * sensitive material.
+ *
+ * The platform-floor JWT access_token TTL is 900s (15 min), defined by
+ * `ACCESS_TOKEN_TTL_SECONDS` at `src/lib/jwt.ts:62` and pinned by
+ * `tests/unit/jwt.test.ts:73`. We therefore align the cache TTL to
+ * 900s for these auth-flow paths — exact match to the access_token
+ * lifetime, no slack on either side.
+ *
+ * vs. 24h default: the cache exposure window for plaintext credentials
+ * is reduced 96x (24h / 15min). vs. the original 5-minute draft: the
+ * cache no longer expires before the JWT, so retries within the JWT
+ * lifetime always replay successfully (not silently restart the OTP
+ * flow). The refresh_token has its own 30-day TTL (session-service.ts);
+ * its replay window is bounded by the cache row, not by the cache TTL
+ * relative to refresh_token TTL, because refresh_token rotation +
+ * session-revocation is enforced at the session layer.
+ *
+ * Adding a path to this map requires explicit AppSec review of:
+ *   1. What sensitive material the response_body contains
+ *   2. The TTL of any bearer token in the body (cache TTL = bearer TTL)
+ *   3. Confirmation that any session-revocation path also invalidates
+ *      the cached row (or accepts the cache-replay-window risk)
+ */
+const ENDPOINT_TTL_OVERRIDES: ReadonlyMap<string, number> = new Map([
+  // 900s = JWT access_token TTL (jwt.ts:62 ACCESS_TOKEN_TTL_SECONDS).
+  // Cache TTL aligned exactly to access_token lifetime so retries within
+  // the token's own window replay successfully and the cache row is
+  // purged the moment its bearer token would expire anyway.
+  ['/v0/identity/login/verify', 900], // plaintext access_token + refresh_token in body
+  ['/v0/identity/registration/verify', 900], // plaintext PatientAccountView + tokens
+]);
+
+const DEFAULT_TTL_SECONDS = 86400; // 24h per IDEMPOTENCY v5.1
+
+function ttlSecondsForEndpoint(endpoint: string): number {
+  return ENDPOINT_TTL_OVERRIDES.get(endpoint) ?? DEFAULT_TTL_SECONDS;
+}
+
+// ---------------------------------------------------------------------------
 // withIdempotency — reserve-then-execute helper (SI-006 PR-A r2).
 //
 // PR-A r2 (Sprint 32 / Codex retro fixes 2026-05-07): API and SQL
@@ -367,15 +430,24 @@ export async function withIdempotency<TBody>(
     [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId],
   );
 
+  // Per-endpoint TTL override (Sprint 33 / SI-006 PR-F security
+  // hardening). Default 24h per IDEMPOTENCY v5.1; auth-flow endpoints
+  // that cache plaintext credentials override to 300s (see
+  // ENDPOINT_TTL_OVERRIDES). The `($6 || ' seconds')::interval` cast
+  // ensures Postgres treats the integer as an interval literal —
+  // equivalent to INTERVAL '300 seconds' for ttlSeconds=300. Overrides
+  // the migration 005 column default (NOW() + INTERVAL '24 hours').
+  const ttlSeconds = ttlSecondsForEndpoint(ctx.endpoint);
+
   const insertResult = await client.query<{ tenant_id: string }>(
     `INSERT INTO idempotency_keys
        (tenant_id, key, endpoint, actor_id, request_hash,
-        processing_state, response_status, response_body)
+        processing_state, response_status, response_body, expires_at)
      VALUES ($1, $2, $3, $4, decode($5, 'hex'),
-             'pending', 0, NULL)
+             'pending', 0, NULL, NOW() + ($6 || ' seconds')::interval)
      ON CONFLICT (tenant_id, key, endpoint, actor_id) DO NOTHING
      RETURNING tenant_id`,
-    [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId, ctx.bodyHash],
+    [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId, ctx.bodyHash, ttlSeconds],
   );
 
   if (insertResult.rows.length > 0) {
