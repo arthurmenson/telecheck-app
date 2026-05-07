@@ -29,11 +29,15 @@
  *   - I-003 (audit append-only — every state-changing call emits audit)
  *   - I-025 (tenant-blind error envelope)
  *   - Master PRD v1.10 §17 + Glossary v5.2 C3 (PatientAccountView strip)
+ *   - SI-006 reserve-then-execute idempotency (POST handlers migrated to
+ *     withIdempotentExecution; see src/lib/idempotent-handler.ts).
  */
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { withTenantBoundConnection } from '../../../../lib/db.js';
+import type { DbTransaction } from '../../../../lib/db.js';
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import * as accountService from '../services/account-service.js';
@@ -72,6 +76,42 @@ function isString(v: unknown): v is string {
 }
 
 // ---------------------------------------------------------------------------
+// Error envelope helper
+// ---------------------------------------------------------------------------
+
+interface ErrorEnvelopeBody {
+  error: { code: string; message: string; request_id: string };
+}
+
+function makeErrorEnvelope(reqId: string, code: string, message: string): ErrorEnvelopeBody {
+  return { error: { code, message, request_id: reqId } };
+}
+
+/**
+ * Map service-layer auth-flow errors to HTTP envelopes.
+ *
+ * The OTP service throws a sentinel Error with message=OTP_LOCKOUT_ACTIVE
+ * on cooldown. Per Identity Spec §3 + tenant-blind error discipline, we
+ * surface the sentinel code in the envelope but DO NOT include
+ * tenant-specific timing or count info.
+ */
+function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): boolean {
+  if (err instanceof Error && err.message === otpService.OTP_LOCKOUT_ACTIVE) {
+    void reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          reqId,
+          otpService.OTP_LOCKOUT_ACTIVE,
+          'Too many recent attempts. Please wait before requesting a new code.',
+        ),
+      );
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // POST /registration/start
 // ---------------------------------------------------------------------------
 
@@ -88,41 +128,47 @@ export async function registrationStartHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP
+  // so the legacy onSend hook never writes a cache row regardless of
+  // which path we take (400 missing field, 400 phone taken, 400
+  // lockout, 200 success). withIdempotentExecution owns the cache write
+  // for the success path.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as RegistrationStartBody;
 
   if (!isString(body.phone_e164)) {
-    return reply.code(400).send({
-      error: {
-        code: 'internal.request.invalid',
-        message: 'phone_e164 is required.',
-        request_id: req.id,
-      },
-    });
+    return reply
+      .code(400)
+      .send(makeErrorEnvelope(req.id, 'internal.request.invalid', 'phone_e164 is required.'));
   }
 
-  // Phone collision check — service-layer + DB UNIQUE both catch this,
-  // but checking up-front gives a cleaner error envelope.
-  const existing = await accountService.findAccountByPhoneE164(ctx, body.phone_e164);
-  if (existing !== null) {
-    return reply.code(400).send({
-      error: {
-        code: PHONE_TAKEN,
-        message: 'Phone number is already registered.',
-        request_id: req.id,
-      },
-    });
-  }
+  const phone = body.phone_e164;
 
-  // Issue OTP. issueOtp throws OTP_LOCKOUT_ACTIVE on cooldown.
-  // Use withTenantBoundConnection so set_tenant_context() is called on
-  // the connection BEFORE the INSERT — the otp_challenges RLS policy's
-  // WITH CHECK clause requires current_tenant_id() to match the row's
-  // tenant_id, which only works when the tenant context is bound.
-  try {
-    const phone = body.phone_e164;
-    const { otp } = await withTenantBoundConnection(ctx.tenantId, (tx) =>
-      otpService.issueOtp(
+  return withIdempotentExecution<unknown>(
+    req,
+    reply,
+    mapServiceError,
+    async (tx: DbTransaction) => {
+      // Phone collision check — service-layer + DB UNIQUE both catch this,
+      // but checking up-front gives a cleaner error envelope. Run inside
+      // the same tx as the OTP issue so a concurrent registration that
+      // commits between this read and the issue still yields the correct
+      // PHONE_TAKEN response on the second caller (UNIQUE will throw if
+      // they race).
+      const existing = await accountService.findAccountByPhoneE164(ctx, phone, tx);
+      if (existing !== null) {
+        return {
+          status: 400,
+          view: makeErrorEnvelope(req.id, PHONE_TAKEN, 'Phone number is already registered.'),
+        };
+      }
+
+      // Issue OTP. issueOtp throws OTP_LOCKOUT_ACTIVE on cooldown — the
+      // mapServiceError closure (passed to withIdempotentExecution) maps
+      // that to the 400 envelope.
+      const { otp } = await otpService.issueOtp(
         ctx,
         { actorId: 'system' },
         {
@@ -132,21 +178,10 @@ export async function registrationStartHandler(
           purpose: 'registration',
         },
         tx,
-      ),
-    );
-    return reply.code(200).send({ otp_id: otp.otp_id });
-  } catch (err) {
-    if (err instanceof Error && err.message === otpService.OTP_LOCKOUT_ACTIVE) {
-      return reply.code(400).send({
-        error: {
-          code: otpService.OTP_LOCKOUT_ACTIVE,
-          message: 'Too many recent attempts. Please wait before requesting a new code.',
-          request_id: req.id,
-        },
-      });
-    }
-    throw err;
-  }
+      );
+      return { status: 200, view: { otp_id: otp.otp_id } };
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -158,11 +193,21 @@ export async function registrationStartHandler(
  * transaction. The OTP and the account row + audit emissions ALL share
  * the same transaction, so a failure anywhere rolls back atomically per
  * I-016 (same-tx outbox / audit discipline).
+ *
+ * Idempotency caveat: per IDEMPOTENCY v5.1, retrying with the same key +
+ * same body replays the cached PatientAccountView. Retrying with same
+ * key + different body returns 409 body_mismatch (correct: a second
+ * caller using the same Idempotency-Key with a different OTP code or
+ * profile field is a categorically different request — the client
+ * should regenerate the key to retry).
  */
 export async function registrationVerifyHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark at the TOP. See registrationStartHandler.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as RegistrationVerifyBody;
 
@@ -175,13 +220,15 @@ export async function registrationVerifyHandler(
     !isString(body.date_of_birth) ||
     !isString(body.gender)
   ) {
-    return reply.code(400).send({
-      error: {
-        code: 'internal.request.invalid',
-        message: 'Missing required field(s) on registration verify.',
-        request_id: req.id,
-      },
-    });
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Missing required field(s) on registration verify.',
+        ),
+      );
   }
 
   const phone = body.phone_e164;
@@ -191,63 +238,69 @@ export async function registrationVerifyHandler(
   const dateOfBirth = body.date_of_birth;
   const gender = body.gender;
 
-  return withTenantBoundConnection(ctx.tenantId, async (tx) => {
-    // Step 1: verify OTP. On success, the OTP is consumed inside this tx.
-    const verify = await otpService.verifyOtp(
-      ctx,
-      { actorId: 'system' },
-      { phone_e164: phone, purpose: 'registration', code },
-      tx,
-    );
-    if (!verify.ok) {
-      // Map sentinel to envelope. Tenant-blind: don't leak whether the
-      // challenge expired vs the code was wrong — the wire envelope
-      // surfaces the sentinel code only.
-      return reply.code(400).send({
-        error: {
-          code: verify.errorCode ?? 'internal.request.invalid',
-          message: 'OTP verification failed.',
-          request_id: req.id,
+  return withIdempotentExecution<unknown>(
+    req,
+    reply,
+    mapServiceError,
+    async (tx: DbTransaction) => {
+      // Step 1: verify OTP. On success, the OTP is consumed inside this tx.
+      const verify = await otpService.verifyOtp(
+        ctx,
+        { actorId: 'system' },
+        { phone_e164: phone, purpose: 'registration', code },
+        tx,
+      );
+      if (!verify.ok) {
+        // Map sentinel to envelope. Tenant-blind: don't leak whether the
+        // challenge expired vs the code was wrong — the wire envelope
+        // surfaces the sentinel code only.
+        return {
+          status: 400,
+          view: makeErrorEnvelope(
+            req.id,
+            verify.errorCode ?? 'internal.request.invalid',
+            'OTP verification failed.',
+          ),
+        };
+      }
+
+      // Step 2: create account in pending_verification, then activate.
+      // Both INSERT + UPDATE + audit emissions are inside this tx; a
+      // failure anywhere atomically rolls back the OTP consumption too.
+      const accountId = asAccountId(ulid());
+      const created = await accountService.createAccount(
+        ctx,
+        { actorId: 'system' },
+        {
+          account_id: accountId,
+          phone_e164: phone,
+          first_name: firstName,
+          last_name: lastName,
+          date_of_birth: dateOfBirth,
+          gender,
+          ...(body.email !== undefined ? { email: body.email } : {}),
+          ...(body.national_id !== undefined ? { national_id: body.national_id } : {}),
+          ...(body.country_of_residence !== undefined
+            ? { country_of_residence: body.country_of_residence }
+            : {}),
         },
-      });
-    }
+        tx,
+      );
 
-    // Step 2: create account in pending_verification, then activate.
-    // Both INSERT + UPDATE + audit emissions are inside this tx; a
-    // failure anywhere atomically rolls back the OTP consumption too.
-    const accountId = asAccountId(ulid());
-    const created = await accountService.createAccount(
-      ctx,
-      { actorId: 'system' },
-      {
-        account_id: accountId,
-        phone_e164: phone,
-        first_name: firstName,
-        last_name: lastName,
-        date_of_birth: dateOfBirth,
-        gender,
-        ...(body.email !== undefined ? { email: body.email } : {}),
-        ...(body.national_id !== undefined ? { national_id: body.national_id } : {}),
-        ...(body.country_of_residence !== undefined
-          ? { country_of_residence: body.country_of_residence }
-          : {}),
-      },
-      tx,
-    );
+      const activated = await accountService.activateAccount(
+        ctx,
+        { actorId: 'system' },
+        created.account_id,
+        tx,
+      );
 
-    const activated = await accountService.activateAccount(
-      ctx,
-      { actorId: 'system' },
-      created.account_id,
-      tx,
-    );
+      // activated should be non-null since we just created the account in
+      // pending_verification and immediately flipped it; defensive
+      // fallback to the created row preserves wire shape if the repo's
+      // race-condition guard ever returns null.
+      const finalAccount = activated ?? created;
 
-    // activated should be non-null since we just created the account in
-    // pending_verification and immediately flipped it; defensive
-    // fallback to the created row preserves wire shape if the repo's
-    // race-condition guard ever returns null.
-    const finalAccount = activated ?? created;
-
-    return reply.code(201).send(accountService.toPatientAccountView(finalAccount));
-  });
+      return { status: 201, view: accountService.toPatientAccountView(finalAccount) };
+    },
+  );
 }
