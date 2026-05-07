@@ -363,7 +363,8 @@ export async function updateSubmissionResponsesHandler(
               code: 'internal.resource.conflict',
               message:
                 'Crisis content was detected in the response payload; escalation required.',
-              request_id: req.id,
+              trace_id: req.id,
+              timestamp: new Date().toISOString(),
             },
           },
         };
@@ -389,7 +390,8 @@ export async function updateSubmissionResponsesHandler(
               code: 'internal.request.payload_too_large',
               message:
                 'The response payload is too deeply nested or too large to process.',
-              request_id: req.id,
+              trace_id: req.id,
+              timestamp: new Date().toISOString(),
             },
           },
         };
@@ -406,7 +408,8 @@ export async function updateSubmissionResponsesHandler(
               code: 'internal.request.semantically_invalid',
               message:
                 'The requested form submission cannot be updated in its current state.',
-              request_id: req.id,
+              trace_id: req.id,
+              timestamp: new Date().toISOString(),
             },
           },
         };
@@ -486,7 +489,8 @@ export async function submitSubmissionHandler(
               code: 'internal.request.semantically_invalid',
               message:
                 'The requested form submission cannot be submitted in its current state.',
-              request_id: req.id,
+              trace_id: req.id,
+              timestamp: new Date().toISOString(),
             },
           },
         };
