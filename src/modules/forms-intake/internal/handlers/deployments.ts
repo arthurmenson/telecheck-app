@@ -14,6 +14,8 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireAdminRole } from '../../../../lib/admin-role.js';
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateDeploymentRequestSchema } from '../../schemas.js';
 import {
@@ -21,6 +23,19 @@ import {
   DEPLOYMENT_NOT_FOUND,
 } from '../repositories/submission-repo.js';
 import * as templateService from '../services/template-service.js';
+
+/**
+ * Module-local service-error mapper for `withIdempotentExecution`. The
+ * forms-intake module surfaces preconditions as string-sentinel Error
+ * objects, which are caught + remapped to Fastify httpErrors INSIDE
+ * the body callback (so the surrounding tx rolls back and the reservation
+ * is purged). No domain-specific Error classes flow up to this mapper, so
+ * it is a deliberate no-op — unmapped errors propagate to Fastify's global
+ * error handler. Same shape as async-consult's mapper, just no cases.
+ */
+function mapServiceError(): boolean {
+  return false;
+}
 
 /**
  * Resolve the acting actor's identity. Same shim + production-fail-closed
@@ -75,6 +90,15 @@ export async function createDeploymentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
+  // the legacy onSend hook NEVER writes a cache row for this request,
+  // regardless of code path (validation 400, sentinel 400, service throw,
+  // or success). See createTemplateHandler in templates.ts for the full
+  // body-mismatch-on-retry rationale; mirrored here from retireDeploymentHandler
+  // below now that templateService.createDeployment + submissionRepo.createActiveDeployment
+  // both accept an externalTx threading parameter.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
@@ -88,22 +112,26 @@ export async function createDeploymentHandler(
     );
   }
 
-  try {
-    const deployment = await templateService.createDeployment(ctx, actorId, parsed.data);
-    return reply.code(201).send(deployment);
-  } catch (err) {
-    // Precondition-failure error codes map to 400 with the canonical code
-    // preserved. All other errors propagate to the global error envelope
-    // plugin and surface as 500 with a tenant-blind generic message.
-    const code = err instanceof Error ? err.message : '';
-    if (
-      code === 'forms.deployment.template_not_found' ||
-      code === 'forms.deployment.template_not_published'
-    ) {
-      throw req.server.httpErrors.badRequest(code);
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    try {
+      const deployment = await templateService.createDeployment(ctx, actorId, parsed.data, tx);
+      return { status: 201, view: deployment };
+    } catch (err) {
+      // Precondition-failure error codes map to 400 with the canonical code
+      // preserved. All other errors propagate to the global error envelope
+      // plugin and surface as 500 with a tenant-blind generic message.
+      // Throw inside body() so the surrounding tx rolls back and the
+      // idempotency reservation is purged — clean retry possible.
+      const code = err instanceof Error ? err.message : '';
+      if (
+        code === 'forms.deployment.template_not_found' ||
+        code === 'forms.deployment.template_not_published'
+      ) {
+        throw req.server.httpErrors.badRequest(code);
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }
 
 /**
@@ -166,6 +194,13 @@ export async function retireDeploymentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
+  // the legacy onSend hook NEVER writes a cache row for this request,
+  // regardless of code path (validation 400, sentinel 400, service throw,
+  // or success). See createTemplateHandler in templates.ts for the full
+  // body-mismatch-on-retry rationale.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
@@ -176,18 +211,22 @@ export async function retireDeploymentHandler(
     throw req.server.httpErrors.badRequest('Path param `deploymentId` is required.');
   }
 
-  try {
-    const retired = await templateService.retireDeployment(ctx, actorId, deploymentIdParam);
-    return reply.code(200).send(retired);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message === DEPLOYMENT_NOT_FOUND || message === DEPLOYMENT_ALREADY_RETIRED) {
-      // Tenant-blind 400 per I-025 — the response shape is identical for
-      // "doesn't exist" / "exists in another tenant" / "already retired."
-      throw req.server.httpErrors.badRequest(
-        'The requested form deployment cannot be retired in its current state.',
-      );
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    try {
+      const retired = await templateService.retireDeployment(ctx, actorId, deploymentIdParam, tx);
+      return { status: 200, view: retired };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message === DEPLOYMENT_NOT_FOUND || message === DEPLOYMENT_ALREADY_RETIRED) {
+        // Tenant-blind 400 per I-025 — the response shape is identical for
+        // "doesn't exist" / "exists in another tenant" / "already retired."
+        // Throw inside body() so the surrounding tx rolls back and the
+        // idempotency reservation is purged — clean retry possible.
+        throw req.server.httpErrors.badRequest(
+          'The requested form deployment cannot be retired in its current state.',
+        );
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }

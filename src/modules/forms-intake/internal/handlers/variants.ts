@@ -17,6 +17,8 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireAdminRole } from '../../../../lib/admin-role.js';
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateVariantRequestSchema, PromoteVariantRequestSchema } from '../../schemas.js';
 import {
@@ -26,6 +28,19 @@ import {
   VARIANT_PRECONDITION_FAILED,
 } from '../repositories/submission-repo.js';
 import * as templateService from '../services/template-service.js';
+
+/**
+ * Module-local service-error mapper for `withIdempotentExecution`. The
+ * forms-intake module surfaces preconditions as string-sentinel Error
+ * objects, which are caught + remapped to Fastify httpErrors INSIDE the
+ * body callback (so the surrounding tx rolls back and the reservation is
+ * purged). No domain-specific Error classes flow up to this mapper, so it
+ * is a deliberate no-op — unmapped errors propagate to Fastify's global
+ * error handler.
+ */
+function mapServiceError(): boolean {
+  return false;
+}
 
 /**
  * Resolve the acting tenant admin's identity. Same shim + production-fail-closed
@@ -75,6 +90,12 @@ export async function createVariantHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
+  // the legacy onSend hook NEVER writes a cache row for this request,
+  // regardless of code path. See templates.ts createTemplateHandler for
+  // the full body-mismatch-on-retry rationale.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
@@ -88,18 +109,22 @@ export async function createVariantHandler(
     );
   }
 
-  try {
-    const variant = await templateService.createVariant(ctx, actorId, parsed.data);
-    return reply.code(201).send(variant);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (isHandledVariantSentinel(message)) {
-      throw req.server.httpErrors.badRequest(
-        'The requested variant cannot be created in its current state.',
-      );
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    try {
+      const variant = await templateService.createVariant(ctx, actorId, parsed.data, tx);
+      return { status: 201, view: variant };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isHandledVariantSentinel(message)) {
+        // Throw inside body() so the surrounding tx rolls back and the
+        // idempotency reservation is purged — clean retry possible.
+        throw req.server.httpErrors.badRequest(
+          'The requested variant cannot be created in its current state.',
+        );
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }
 
 /**
@@ -158,6 +183,8 @@ export async function promoteVariantHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006: see createVariantHandler.
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
@@ -177,21 +204,26 @@ export async function promoteVariantHandler(
     );
   }
 
-  try {
-    const promoted = await templateService.promoteVariant(
-      ctx,
-      actorId,
-      variantIdParam,
-      parsed.data,
-    );
-    return reply.code(200).send(promoted);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message === VARIANT_NOT_FOUND || message === VARIANT_NOT_ACTIVE) {
-      throw req.server.httpErrors.badRequest(
-        'The requested variant cannot be promoted in its current state.',
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    try {
+      const promoted = await templateService.promoteVariant(
+        ctx,
+        actorId,
+        variantIdParam,
+        parsed.data,
+        tx,
       );
+      return { status: 200, view: promoted };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message === VARIANT_NOT_FOUND || message === VARIANT_NOT_ACTIVE) {
+        // Throw inside body() so the surrounding tx rolls back and the
+        // idempotency reservation is purged — clean retry possible.
+        throw req.server.httpErrors.badRequest(
+          'The requested variant cannot be promoted in its current state.',
+        );
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }

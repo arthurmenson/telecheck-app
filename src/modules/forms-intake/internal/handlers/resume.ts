@@ -19,10 +19,24 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ResumeSubmissionRequestSchema } from '../../schemas.js';
 import * as submissionService from '../services/submission-service.js';
 import type { PatientId } from '../types.js';
+
+/**
+ * Module-local service-error mapper for `withIdempotentExecution`. The
+ * forms-intake module surfaces preconditions as string-sentinel Error
+ * objects, which are caught + remapped to Fastify httpErrors INSIDE the
+ * body callback. No domain-specific Error classes flow up to this mapper,
+ * so it is a deliberate no-op — unmapped errors propagate to Fastify's
+ * global error handler.
+ */
+function mapServiceError(): boolean {
+  return false;
+}
 
 /**
  * Resolve the request's patient identity for the resume metadata read.
@@ -136,6 +150,12 @@ export async function resumeSubmissionHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
+  // the legacy onSend hook NEVER writes a cache row for this request,
+  // regardless of code path. See templates.ts createTemplateHandler for
+  // the full body-mismatch-on-retry rationale.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   const ownership = resolveResumeOwnership(req);
@@ -152,24 +172,37 @@ export async function resumeSubmissionHandler(
   // The service signature requires a non-null patientId at v0.1 (see
   // file-level identity caveat above). If only the device-anonymous
   // token is presented, surface the same tenant-blind 404 — anonymous-
-  // flow restore is not yet wired.
+  // flow restore is not yet wired. This 404 is thrown BEFORE the
+  // idempotent body opens its tx, so no reservation is left behind.
   if (ownership.patientId === null) {
     throw req.server.httpErrors.notFound('Form resume state not found.');
   }
+  const resolvedPatientId = ownership.patientId;
 
-  const restored = await submissionService.resumeSubmission(
-    ctx,
-    {
-      actorId,
-      patientId: ownership.patientId,
-      deviceAnonymousToken: ownership.deviceAnonymousToken,
-    },
-    parsed.data.resumeToken,
-  );
-  if (restored === null) {
-    throw req.server.httpErrors.notFound('Form resume state not found.');
-  }
-  return reply.code(200).send(restored);
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    const restored = await submissionService.resumeSubmission(
+      ctx,
+      {
+        actorId,
+        patientId: resolvedPatientId,
+        deviceAnonymousToken: ownership.deviceAnonymousToken,
+      },
+      parsed.data.resumeToken,
+      tx,
+    );
+    if (restored === null) {
+      // Tenant-blind 404 per I-025. Throw inside body() so the surrounding
+      // tx rolls back and the idempotency reservation is purged — clean
+      // retry possible. (We deliberately do NOT cache the 404 envelope
+      // here: a 404 on resume can flip to 200 once the resume_state row's
+      // identity gates are re-satisfied via a corrected request, so a
+      // cached 404 would block legitimate retries.)
+      throw req.server.httpErrors.notFound('Form resume state not found.');
+    }
+    // The service returns PatientFormSubmissionView — already projected
+    // (no tenant_id) per Master PRD §17 + Glossary v5.2 C3.
+    return { status: 200, view: restored };
+  });
 }
 
 /**

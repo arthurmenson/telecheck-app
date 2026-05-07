@@ -19,6 +19,8 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import {
   StartSubmissionRequestSchema,
@@ -130,6 +132,19 @@ function isHandledSentinel(message: string): boolean {
 }
 
 /**
+ * Module-local service-error mapper for `withIdempotentExecution`. The
+ * forms-intake module surfaces preconditions as string-sentinel Error
+ * objects, which are caught + remapped to Fastify httpErrors INSIDE the
+ * body callback (so the surrounding tx rolls back and the reservation is
+ * purged). No domain-specific Error classes flow up to this mapper, so it
+ * is a deliberate no-op — unmapped errors propagate to Fastify's global
+ * error handler.
+ */
+function mapServiceError(): boolean {
+  return false;
+}
+
+/**
  * POST /v0/forms/submissions — patient or delegate begins an intake.
  *
  * Sentinel error mapping (tenant-blind 400 per I-025):
@@ -139,6 +154,12 @@ export async function startSubmissionHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
+  // the legacy onSend hook NEVER writes a cache row for this request,
+  // regardless of code path. See templates.ts createTemplateHandler for
+  // the full body-mismatch-on-retry rationale.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   const { patientId, delegateId } = resolvePatient(req);
@@ -152,24 +173,31 @@ export async function startSubmissionHandler(
     );
   }
 
-  try {
-    const submission = await submissionService.startSubmission(
-      ctx,
-      { actorId, patientId, delegateId },
-      parsed.data,
-    );
-    // Patient surface — strip tenant_id per Master PRD v1.10 §17 +
-    // Glossary v5.2 C3 (Codex patient-surface-r0 closure 2026-05-04).
-    return reply.code(201).send(toPatientView(submission));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (isHandledSentinel(message)) {
-      throw req.server.httpErrors.badRequest(
-        'The requested deployment is not available for new submissions.',
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    try {
+      const submission = await submissionService.startSubmission(
+        ctx,
+        { actorId, patientId, delegateId },
+        parsed.data,
+        tx,
       );
+      // Patient surface — strip tenant_id per Master PRD v1.10 §17 +
+      // Glossary v5.2 C3 (Codex patient-surface-r0 closure 2026-05-04).
+      // Projection happens INSIDE the body so the cached response is
+      // post-projection (no tenant_id leak per I-025).
+      return { status: 201, view: toPatientView(submission) };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isHandledSentinel(message)) {
+        // Throw inside body() so the surrounding tx rolls back and the
+        // idempotency reservation is purged — clean retry possible.
+        throw req.server.httpErrors.badRequest(
+          'The requested deployment is not available for new submissions.',
+        );
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }
 
 /**
@@ -255,6 +283,8 @@ export async function updateSubmissionResponsesHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006: see startSubmissionHandler.
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   const { patientId, delegateId } = resolvePatient(req);
@@ -274,61 +304,75 @@ export async function updateSubmissionResponsesHandler(
     );
   }
 
-  try {
-    if (parsed.data.pause === true) {
-      // Explicit save-and-leave path — slice PRD §8.2.
-      const result = await submissionService.pauseSubmission(
+  // The helper's generic TView is bound to a single shape; the two branches
+  // here return different shapes (PauseSubmissionResult vs PatientFormSubmissionView).
+  // Widening to `unknown` keeps both branches assignable without altering
+  // the wire-out — the cached response body is the projected view either way.
+  return withIdempotentExecution<unknown>(req, reply, mapServiceError, async (tx) => {
+    try {
+      if (parsed.data.pause === true) {
+        // Explicit save-and-leave path — slice PRD §8.2. PauseSubmissionResult
+        // already carries a tenant_id-stripped submission view, so no
+        // additional projection step is required.
+        const result = await submissionService.pauseSubmission(
+          ctx,
+          { actorId, patientId, delegateId },
+          submissionIdParam,
+          parsed.data,
+          tx,
+        );
+        return { status: 200, view: result };
+      }
+
+      const submission = await submissionService.updateResponses(
         ctx,
         { actorId, patientId, delegateId },
         submissionIdParam,
         parsed.data,
+        tx,
       );
-      return reply.code(200).send(result);
+      // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
+      // Projection happens INSIDE the body so the cached response is
+      // post-projection (no tenant_id leak per I-025).
+      return { status: 200, view: toPatientView(submission) };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message === CRISIS_DETECTED) {
+        // Per I-019 platform-floor, a positive crisis detection is NOT a
+        // generic 400. The patient surface needs to render crisis
+        // resources + emergency-contact paths (Slice PRD §13). We use
+        // HTTP 409 Conflict with a structured error code so the client
+        // can branch — the response is intentionally distinguishable
+        // from other 4xx classes. The Category A `crisis_detection_trigger`
+        // audit was already committed (in its own tx) before this throw,
+        // so the rollback of the surrounding tx does not cancel the
+        // escalation record.
+        throw req.server.httpErrors.conflict(
+          'Crisis content was detected in the response payload; escalation required.',
+        );
+      }
+      if (message === RESPONSE_PAYLOAD_TOO_LARGE) {
+        // Closes Codex submissions-r1 verify-r2 HIGH 2026-05-03: a deeply
+        // nested response payload (within Fastify's 1 MiB body limit) used
+        // to overflow the recursive crisis scanner's call stack and surface
+        // as a 5xx — bypassing I-019 escalation. The scanner is now
+        // iterative with explicit depth + node-count budgets; payloads
+        // exceeding either budget surface here and reject with HTTP 413.
+        // The Category A audit is NOT emitted on this path because no
+        // string was scanned — there's no detection to record. The rejection
+        // is documented at the I-025 envelope layer as a malformed payload.
+        throw req.server.httpErrors.payloadTooLarge(
+          'The response payload is too deeply nested or too large to process.',
+        );
+      }
+      if (isHandledSentinel(message)) {
+        throw req.server.httpErrors.badRequest(
+          'The requested form submission cannot be updated in its current state.',
+        );
+      }
+      throw err;
     }
-
-    const submission = await submissionService.updateResponses(
-      ctx,
-      { actorId, patientId, delegateId },
-      submissionIdParam,
-      parsed.data,
-    );
-    // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
-    return reply.code(200).send(toPatientView(submission));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message === CRISIS_DETECTED) {
-      // Per I-019 platform-floor, a positive crisis detection is NOT a
-      // generic 400. The patient surface needs to render crisis
-      // resources + emergency-contact paths (Slice PRD §13). We use
-      // HTTP 409 Conflict with a structured error code so the client
-      // can branch — the response is intentionally distinguishable
-      // from other 4xx classes. The Category A `crisis_detection_trigger`
-      // audit was already committed before this throw.
-      throw req.server.httpErrors.conflict(
-        'Crisis content was detected in the response payload; escalation required.',
-      );
-    }
-    if (message === RESPONSE_PAYLOAD_TOO_LARGE) {
-      // Closes Codex submissions-r1 verify-r2 HIGH 2026-05-03: a deeply
-      // nested response payload (within Fastify's 1 MiB body limit) used
-      // to overflow the recursive crisis scanner's call stack and surface
-      // as a 5xx — bypassing I-019 escalation. The scanner is now
-      // iterative with explicit depth + node-count budgets; payloads
-      // exceeding either budget surface here and reject with HTTP 413.
-      // The Category A audit is NOT emitted on this path because no
-      // string was scanned — there's no detection to record. The rejection
-      // is documented at the I-025 envelope layer as a malformed payload.
-      throw req.server.httpErrors.payloadTooLarge(
-        'The response payload is too deeply nested or too large to process.',
-      );
-    }
-    if (isHandledSentinel(message)) {
-      throw req.server.httpErrors.badRequest(
-        'The requested form submission cannot be updated in its current state.',
-      );
-    }
-    throw err;
-  }
+  });
 }
 
 /**
@@ -347,6 +391,8 @@ export async function submitSubmissionHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006: see startSubmissionHandler.
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   const { patientId, delegateId } = resolvePatient(req);
@@ -368,22 +414,27 @@ export async function submitSubmissionHandler(
     );
   }
 
-  try {
-    const submission = await submissionService.submitSubmission(
-      ctx,
-      { actorId, patientId, delegateId },
-      submissionIdParam,
-      parsed.data,
-    );
-    // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
-    return reply.code(200).send(toPatientView(submission));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (isHandledSentinel(message)) {
-      throw req.server.httpErrors.badRequest(
-        'The requested form submission cannot be submitted in its current state.',
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    try {
+      const submission = await submissionService.submitSubmission(
+        ctx,
+        { actorId, patientId, delegateId },
+        submissionIdParam,
+        parsed.data,
+        tx,
       );
+      // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
+      // Projection happens INSIDE the body so the cached response is
+      // post-projection (no tenant_id leak per I-025).
+      return { status: 200, view: toPatientView(submission) };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isHandledSentinel(message)) {
+        throw req.server.httpErrors.badRequest(
+          'The requested form submission cannot be submitted in its current state.',
+        );
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }
