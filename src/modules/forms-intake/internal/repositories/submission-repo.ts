@@ -152,6 +152,7 @@ export async function createActiveDeployment(
     deployedBy: string;
   },
   txCallback: (tx: DbTransaction, deployment: FormDeployment) => Promise<void>,
+  externalTx?: DbTransaction,
 ): Promise<FormDeployment> {
   return withTransaction(async (tx) => {
     await tx.query('SELECT set_tenant_context($1)', [tenantId]);
@@ -200,7 +201,7 @@ export async function createActiveDeployment(
     const deployment = result.rows[0]!;
     await txCallback(tx, deployment);
     return deployment;
-  });
+  }, externalTx);
 }
 
 // ---------------------------------------------------------------------------

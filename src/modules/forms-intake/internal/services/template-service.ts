@@ -349,6 +349,7 @@ export async function createDeployment(
   ctx: TenantContext,
   actorId: string,
   input: CreateDeploymentRequest,
+  externalTx?: DbTransaction,
 ): Promise<FormDeployment> {
   // Precondition 1: template must exist in this tenant.
   const template = await templateRepo.findTemplateById(ctx.tenantId, input.templateId);
@@ -399,6 +400,7 @@ export async function createDeployment(
           actorId,
         });
       },
+      externalTx,
     );
   } catch (err) {
     // The repo throws DEPLOYMENT_TEMPLATE_PRECONDITION_FAILED when its

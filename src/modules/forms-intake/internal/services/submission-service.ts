@@ -353,7 +353,12 @@ export async function updateResponses(
   // crisis detection short-circuits before any state mutates — preserved
   // ordering for the pause path too (`pauseSubmission` calls
   // `runCrisisGate` before the merge).
-  await runCrisisGate(ctx, actor, submissionId, input.responses, externalTx);
+  // NOTE: externalTx intentionally NOT forwarded — runCrisisGate emits
+  // its Category A audit on a fresh independent tx so it commits even
+  // if the caller's tx (handler-owned for SI-006 PR-F2 migrated paths)
+  // rolls back. See runCrisisGate doc-comment for the security
+  // rationale (Sprint 33 / Codex review fix).
+  await runCrisisGate(ctx, actor, submissionId, input.responses);
 
   return submissionRepo.updateSubmissionResponses(
     ctx.tenantId,
@@ -384,17 +389,39 @@ async function runCrisisGate(
   actor: { actorId: string; patientId: PatientId },
   submissionId: FormSubmissionId,
   responses: Record<string, unknown>,
-  externalTx?: DbTransaction,
+  /* externalTx intentionally NOT a parameter — see security note below. */
 ): Promise<void> {
   const crisis = scanResponsesForCrisis(ctx.tenantId, responses);
   if (crisis === null) return;
 
-  // Emit the Category A audit in its own transaction so it commits even
-  // though the response write does NOT run. The escalation event MUST be
-  // durable per I-003 + I-019.
+  // Emit the Category A audit in its own INDEPENDENT transaction so it
+  // commits durably regardless of the caller's transaction outcome.
+  // The escalation event MUST be durable per I-003 + I-019.
   //
-  // When externalTx is supplied (test mode), share that tx — the audit
-  // commits with the test's outer transaction same as anything else.
+  // SECURITY (Sprint 33 / SI-006 PR-F2 r2 fix per Codex adversarial
+  // review 2026-05-07 HIGH closure): an earlier signature accepted
+  // externalTx and forwarded it to withTransaction. That was safe pre-
+  // SI-006 because the only caller passing externalTx was tests (whose
+  // savepoint cleanup rolled back the audit alongside the test data),
+  // and production callers always passed undefined → withTransaction
+  // opened a fresh tx → audit committed independently.
+  //
+  // SI-006 PR-F2 changed that: the migrated production handlers
+  // (updateSubmissionHandler / pauseSubmissionHandler via
+  // withIdempotentExecution) now pass their handler-owned tx as
+  // externalTx so the reservation INSERT + business write + completion
+  // UPDATE are atomic. If runCrisisGate inherited that externalTx, the
+  // audit would join the handler tx and roll back together when the
+  // handler throws CRISIS_DETECTED — silent loss of the durable
+  // escalation record.
+  //
+  // The fix removes the parameter entirely. Production audit emission
+  // is independent. Tests now get an audit row committed outside their
+  // savepoint; existence assertions still pass (the row is queryable)
+  // but the row persists across test runs. This is acceptable: tests
+  // assert existence (not absence), randomized identifiers prevent
+  // false matches across runs, and the test database is reset on
+  // schema changes.
   await withTransaction(async (tx) => {
     await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
     await emitCrisisDetectionTrigger(
@@ -411,7 +438,7 @@ async function runCrisisGate(
       },
       tx,
     );
-  }, externalTx);
+  });
   throw new Error(CRISIS_DETECTED);
 }
 
@@ -474,7 +501,12 @@ export async function pauseSubmission(
   // *this* request) and avoids opening a tx for a payload we'd reject.
   // The merged-set gate inside the atomic tx below is the authoritative
   // gate for the resume_state write per Codex pause-r1 HIGH-2 closure.
-  await runCrisisGate(ctx, actor, submissionId, input.responses, externalTx);
+  // NOTE: externalTx intentionally NOT forwarded — runCrisisGate emits
+  // its Category A audit on a fresh independent tx so it commits even
+  // if the caller's tx (handler-owned for SI-006 PR-F2 migrated paths)
+  // rolls back. See runCrisisGate doc-comment for the security
+  // rationale (Sprint 33 / Codex review fix).
+  await runCrisisGate(ctx, actor, submissionId, input.responses);
 
   // ---------------------------------------------------------------------
   // Atomic orchestration (Codex pause-r1 HIGH-1 closure 2026-05-03)
