@@ -200,20 +200,24 @@ export function markIdempotencyManagedByHandler(request: FastifyRequest): void {
  * Idempotency-Key header (handlers should not reach this point — the
  * preHandler returns 400 earlier).
  *
- * SECURITY: The endpoint key prefers Fastify's matched route pattern
- * (`request.routeOptions.url`) over the raw request URL. The routed
- * pattern is the canonical invariant — Fastify has already normalized
- * case + trailing slashes during routing — so a TTL override (e.g.,
- * 900s for the auth-flow paths) cannot be bypassed by sending a path
- * variant (`/v0/identity/login/verify/`, mounted-prefix variation,
- * etc.) that would silently fall back to the 24h default and leave
- * plaintext tokens in cache for a day. Per Codex Sprint 33 PR-F1
- * adversarial review 2026-05-07 (HIGH-1).
+ * Endpoint derivation: uses the URL with query string stripped, NOT the
+ * Fastify route pattern. This is intentional — the preHandler's cache
+ * lookup and the legacy-onSend cache write also key on raw URL, and all
+ * three paths must agree for replay to work. (An earlier PR-F1 r2 draft
+ * switched to `request.routeOptions.url` for tighter TTL-override
+ * matching; that introduced drift between cache lookup and cache write
+ * for parametric routes — the cache write would key on
+ * `/v0/async-consult/:id/submit` while the preHandler lookup keyed on
+ * `/v0/async-consult/abc/submit`, so retries would always cache-miss.
+ * Reverted in PR-F1 r3.)
  *
- * The fallback to `request.url` covers test harnesses that synthesize
- * requests without going through Fastify's router (no `routeOptions`);
- * route-pattern handling in production code paths is the primary
- * surface.
+ * The TTL-override-bypass concern that motivated the route-pattern
+ * change is handled at lookup time via `ttlSecondsForEndpoint`, which
+ * normalizes the endpoint (lowercase + trailing-slash strip) before
+ * map lookup so case/slash variants can't slip through. Fastify's
+ * default routing is also case-sensitive + trailing-slash-strict, so
+ * such variants return 404 before reaching the handler in the first
+ * place — the normalization is defense-in-depth.
  */
 export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
   const idempotencyKey = request.headers['idempotency-key'];
@@ -224,14 +228,7 @@ export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
   }
   const tenantId = request.tenantContext?.tenantId ?? 'unknown';
   const actorId = resolveActorId(request);
-  // Prefer the matched Fastify route pattern over raw URL — see SECURITY
-  // note in the doc-comment above. Falls back to URL-without-querystring
-  // if route metadata is unavailable (e.g., test harness without router).
-  const routedPattern = request.routeOptions?.url;
-  const endpoint =
-    routedPattern && routedPattern.length > 0
-      ? routedPattern
-      : (request.url.split('?')[0] ?? '') || request.url;
+  const endpoint = (request.url.split('?')[0] ?? '') || request.url;
   const rawBody =
     typeof request.body === 'string' ? request.body : JSON.stringify(request.body ?? '');
   return {
@@ -302,8 +299,24 @@ const ENDPOINT_TTL_OVERRIDES: ReadonlyMap<string, number> = new Map([
 
 const DEFAULT_TTL_SECONDS = 86400; // 24h per IDEMPOTENCY v5.1
 
+/**
+ * Look up the TTL override for an endpoint, normalizing the path to
+ * close case/trailing-slash bypass paths.
+ *
+ * Per Codex Sprint 33 PR-F1 r2 adversarial review 2026-05-07 (HIGH-1):
+ * the override map is keyed by exact strings; without normalization,
+ * a request reaching the handler via any path variant that doesn't
+ * bytewise-match would silently fall back to the 24h default. For the
+ * auth-flow paths whose cached body contains plaintext bearer tokens,
+ * that's a 96x exposure-window regression.
+ *
+ * Defense-in-depth: Fastify's default routing is case-sensitive +
+ * trailing-slash-strict, so such variants return 404 before reaching
+ * the handler. Normalizing here is belt-and-suspenders.
+ */
 function ttlSecondsForEndpoint(endpoint: string): number {
-  return ENDPOINT_TTL_OVERRIDES.get(endpoint) ?? DEFAULT_TTL_SECONDS;
+  const normalized = endpoint.toLowerCase().replace(/\/+$/, '');
+  return ENDPOINT_TTL_OVERRIDES.get(normalized) ?? DEFAULT_TTL_SECONDS;
 }
 
 // ---------------------------------------------------------------------------
@@ -666,12 +679,24 @@ async function storeIdempotencyRecord(
 ): Promise<void> {
   // Same RLS gating as lookupIdempotencyRecord — bind tenant context
   // before INSERTing into the FORCE RLS table. (Patch v0.3 — 2026-05-02.)
+  //
+  // SECURITY: the legacy onSend writer must honor ENDPOINT_TTL_OVERRIDES
+  // too. Without this, handlers that have NOT yet migrated to
+  // withIdempotency (e.g., identity login/verify before Sprint 33 PR-F3
+  // lands) would cache plaintext bearer-token responses for the
+  // migration default of 24h regardless of the override map. The
+  // explicit `expires_at = NOW() + ($8 || ' seconds')::interval` cast
+  // matches the withIdempotency reservation INSERT so both paths agree.
+  // Per Codex Sprint 33 PR-F1 r2 adversarial review 2026-05-07 (HIGH-2).
+  const ttlSeconds = ttlSecondsForEndpoint(endpoint);
   await withTenantBoundConnection(tenantId, async (client) => {
     await client.query(
       `INSERT INTO idempotency_keys (
           tenant_id, key, endpoint, actor_id,
-          request_hash, response_status, response_body, processing_state
-       ) VALUES ($1, $2, $3, $4, decode($5, 'hex'), $6, $7::jsonb, 'completed')
+          request_hash, response_status, response_body, processing_state,
+          expires_at
+       ) VALUES ($1, $2, $3, $4, decode($5, 'hex'), $6, $7::jsonb, 'completed',
+                  NOW() + ($8 || ' seconds')::interval)
        ON CONFLICT (tenant_id, key, endpoint, actor_id) DO NOTHING`,
       [
         tenantId,
@@ -681,6 +706,7 @@ async function storeIdempotencyRecord(
         bodyHash,
         statusCode,
         body === null || body === undefined ? null : JSON.stringify(body),
+        ttlSeconds,
       ],
     );
   });
