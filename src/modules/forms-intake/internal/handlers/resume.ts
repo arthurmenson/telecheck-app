@@ -19,7 +19,6 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ResumeSubmissionRequestSchema } from '../../schemas.js';
@@ -150,12 +149,6 @@ export async function resumeSubmissionHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
-  // the legacy onSend hook NEVER writes a cache row for this request,
-  // regardless of code path. See templates.ts createTemplateHandler for
-  // the full body-mismatch-on-retry rationale.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   const ownership = resolveResumeOwnership(req);

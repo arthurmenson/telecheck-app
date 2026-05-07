@@ -434,15 +434,24 @@ describe('withIdempotency — Group F: source-grep discipline lockdown', () => {
     //   request[`_idempotencyKey`] = { ... }
     expect(code).not.toMatch(/_idempotencyKey['"`\]]?\s*=[^=]/);
 
-    // The legacy flag READ. The flag is SET by the preserved no-op
-    // helper, so a literal `_idempotencyManagedByHandler =` write IS
-    // expected to be absent (it was removed from the helper body). A
-    // READ in any form would indicate the legacy onSend logic is
-    // back. Catches:
+    // The legacy flag READ. Sprint 34 cleanup-sweep DELETED the
+    // `markIdempotencyManagedByHandler` helper itself — no SET, no READ,
+    // no declaration, no call site. The substring must not appear in
+    // code-only source (comment-stripped) in any form. Catches:
     //   request._idempotencyManagedByHandler === true
     //   if (request._idempotencyManagedByHandler) { ... }
     //   request._idempotencyManagedByHandler ? a : b
     //   request['_idempotencyManagedByHandler']
     expect(code).not.toMatch(/_idempotencyManagedByHandler\b/);
+
+    // Sprint 34 SI-006 cleanup-sweep: the helper FUNCTION ITSELF
+    // (`markIdempotencyManagedByHandler`) was deleted from idempotency.ts
+    // along with all 50+ call sites. Pin the function-name absence in
+    // code-only source so any future re-introduction (export,
+    // declaration, call) trips this assertion. The function name strictly
+    // contains the `_idempotencyManagedByHandler` substring above, so
+    // this is a stricter-and-more-specific lockdown layered on top of the
+    // flag-read pin — both regexes run for defense in depth.
+    expect(code).not.toMatch(/\bmarkIdempotencyManagedByHandler\b/);
   });
 });

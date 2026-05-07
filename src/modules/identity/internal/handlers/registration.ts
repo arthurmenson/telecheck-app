@@ -36,7 +36,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { DbTransaction } from '../../../../lib/db.js';
-import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
@@ -128,13 +127,6 @@ export async function registrationStartHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP
-  // so the legacy onSend hook never writes a cache row regardless of
-  // which path we take (400 missing field, 400 phone taken, 400
-  // lockout, 200 success). withIdempotentExecution owns the cache write
-  // for the success path.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as RegistrationStartBody;
 
@@ -205,9 +197,6 @@ export async function registrationVerifyHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark at the TOP. See registrationStartHandler.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as RegistrationVerifyBody;
 

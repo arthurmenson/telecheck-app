@@ -34,7 +34,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { DbTransaction } from '../../../../lib/db.js';
-import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
@@ -102,11 +101,6 @@ export async function registerDeviceHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
-  // the legacy onSend cache write is skipped on every code path
-  // (validation 400s as well as the success path).
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as RegisterDeviceBody;
 
@@ -206,9 +200,6 @@ export async function revokeDeviceHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const params = (req.params ?? {}) as { deviceId?: string };
 

@@ -173,30 +173,15 @@ export function resolveActorId(request: FastifyRequest): string {
   );
 }
 
-/**
- * @deprecated since Sprint 33 / SI-006 PR-E (2026-05-07).
- *
- * Originally a flag-set helper that told the legacy onSend cache-write
- * hook to skip writing for handlers that owned their own
- * reserve-then-execute path via `withIdempotency`. The legacy onSend
- * hook + `storeIdempotencyRecord` were REMOVED in PR-E once every
- * state-changing handler migrated. This function is now a documented
- * no-op kept ONLY so the 50+ existing call sites continue to compile
- * during the cleanup-sweep PR (Sprint 34) — calling it has no
- * runtime effect.
- *
- * New handlers MUST NOT call this. Use `withIdempotentExecution` (which
- * already owns reserve + write + completion in the handler-owned tx);
- * no separate flag is needed because no legacy path remains to opt out
- * of. Source-grep lockdown in `tests/integration/idempotency-helper.test.ts`
- * pins the absence of `addHook('onSend')` and `storeIdempotencyRecord`
- * so future regressions cannot reintroduce the legacy path.
- */
-export function markIdempotencyManagedByHandler(_request: FastifyRequest): void {
-  // No-op. See doc-comment above. PR-E removed the legacy onSend path
-  // that this flag controlled; the function is preserved as an export
-  // only to keep existing call sites compiling.
-}
+// `markIdempotencyManagedByHandler` (the legacy flag-set helper that told
+// the onSend cache-write hook to skip writing for handlers that owned
+// their own reserve-then-execute path) was REMOVED in Sprint 34 SI-006
+// cleanup-sweep. Sprint 33 PR-E removed the legacy onSend hook +
+// `storeIdempotencyRecord` it controlled; the function then survived as
+// a documented no-op until every call site was scrubbed in the cleanup
+// sweep. See commit message and `tests/integration/idempotency-helper.test.ts`
+// Group F lockdown for the regression contract that pins the absence of
+// the function name + the legacy onSend hook + storeIdempotencyRecord.
 
 /**
  * Build the IdempotencyCtx from the request. Helper for handlers
@@ -703,11 +688,10 @@ const EXEMPT_PATHS = new Set([
   // response is NOT invariant — a logout/revoke between requests
   // changes the session validity. Caching ANY response at this
   // endpoint risks replaying an active-session view post-revocation
-  // for the cache TTL. The handler also calls
-  // markIdempotencyManagedByHandler to skip onSend writes, but adding
-  // the path here ALSO bypasses preHandler lookup so any pre-existing
-  // cache rows (e.g., upgrade from a deploy that cached refresh
-  // responses on the legacy path) are not replayed. Defense in depth.
+  // for the cache TTL. Adding the path here bypasses preHandler
+  // lookup so any pre-existing cache rows (e.g., upgrade from a deploy
+  // that cached refresh responses on the legacy onSend path that was
+  // removed in Sprint 33 PR-E) are not replayed. Defense in depth.
   '/v0/identity/sessions/refresh',
 ]);
 
