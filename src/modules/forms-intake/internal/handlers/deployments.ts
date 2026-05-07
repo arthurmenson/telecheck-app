@@ -14,7 +14,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireAdminRole } from '../../../../lib/admin-role.js';
-import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateDeploymentRequestSchema } from '../../schemas.js';
@@ -90,15 +89,6 @@ export async function createDeploymentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
-  // the legacy onSend hook NEVER writes a cache row for this request,
-  // regardless of code path (validation 400, sentinel 400, service throw,
-  // or success). See createTemplateHandler in templates.ts for the full
-  // body-mismatch-on-retry rationale; mirrored here from retireDeploymentHandler
-  // below now that templateService.createDeployment + submissionRepo.createActiveDeployment
-  // both accept an externalTx threading parameter.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
@@ -194,13 +184,6 @@ export async function retireDeploymentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
-  // the legacy onSend hook NEVER writes a cache row for this request,
-  // regardless of code path (validation 400, sentinel 400, service throw,
-  // or success). See createTemplateHandler in templates.ts for the full
-  // body-mismatch-on-retry rationale.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);

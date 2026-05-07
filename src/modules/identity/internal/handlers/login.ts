@@ -60,7 +60,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { DbTransaction } from '../../../../lib/db.js';
-import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
@@ -144,13 +143,6 @@ export async function loginStartHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark at the TOP so the legacy onSend
-  // hook never writes a cache row regardless of which path we take
-  // (validation 400, NO_ACCOUNT 400, ACCOUNT_INACTIVE 400, lockout 400,
-  // success 200). withIdempotentExecution owns the cache write for
-  // every path that returns a value from body().
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as LoginStartBody;
 
@@ -219,9 +211,6 @@ export async function loginVerifyHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark at the TOP. See loginStartHandler.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as LoginVerifyBody;
 
@@ -315,18 +304,20 @@ export async function loginVerifyHandler(
  *
  * SECURITY (Sprint 33 / SI-006 PR-F3 r4 — Codex 2026-05-07 MEDIUM
  * closure): the response is NOT actually invariant. After a successful
- * refresh, a logout/revoke can change the session state — but a cached
- * 200 response would replay an active-session view from the legacy
- * onSend cache, masking revocation for the cache TTL. The pre-r4
- * comment claimed "the response is invariant for the same
- * refresh_token (it's a read)"; that was wrong because session state
- * is mutable.
+ * refresh, a logout/revoke can change the session state, so caching a
+ * 200 response would risk replaying an active-session view post-
+ * revocation for the cache TTL. The pre-r4 comment claimed "the
+ * response is invariant for the same refresh_token (it's a read)";
+ * that was wrong because session state is mutable.
  *
- * Fix: call `markIdempotencyManagedByHandler(req)` at the TOP so the
- * legacy onSend hook NEVER writes a cache row for this endpoint. Every
- * request runs `findActiveSessionByRefreshToken` live, so a revoked
- * session is detected on every retry. No cached response can replay
- * an active-looking view post-revocation.
+ * Defense-in-depth: this endpoint is listed in `EXEMPT_PATHS` in
+ * `src/lib/idempotency.ts` so the preHandler bypasses idempotency
+ * lookup entirely. Every request runs `findActiveSessionByRefreshToken`
+ * live, so a revoked session is detected on every retry. No cached
+ * response can replay an active-looking view post-revocation. The
+ * legacy onSend cache-write hook that necessitated a per-handler opt-
+ * out flag was removed in Sprint 33 PR-E; Sprint 34 cleanup-sweep
+ * removed the no-op `markIdempotencyManagedByHandler` helper itself.
  *
  * When real refresh-token rotation lands (issue new plaintext + hash;
  * revoke previous; emit identity_session_rotated audit), migrate this
@@ -339,9 +330,6 @@ export async function sessionRefreshHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 PR-F3 r4 — skip legacy onSend cache write. See doc-comment.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as SessionRefreshBody;
 
@@ -382,11 +370,6 @@ export async function sessionLogoutHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 reserve-then-execute: mark at the TOP. Phantom-token branch
-  // also returns from inside the helper so the cache row is written for
-  // every code path that produces a 204.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const body = (req.body ?? {}) as SessionLogoutBody;
 

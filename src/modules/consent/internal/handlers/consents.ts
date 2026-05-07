@@ -33,7 +33,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
-import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import type { AccountId } from '../../../identity/internal/types.js';
@@ -124,12 +123,6 @@ export async function grantConsentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // SI-006 PR-C: mark managed-by-handler at the TOP so legacy onSend
-  // never caches anything from this request (validation 400, success
-  // path, or service throws — all go through withIdempotency cache
-  // management or rollback, not through the legacy onSend write).
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const body = (req.body ?? {}) as GrantBody;
@@ -178,8 +171,6 @@ export async function revokeConsentHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // SI-006 PR-C: see grantConsentHandler.
-
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const body = (req.body ?? {}) as RevokeBody;

@@ -46,7 +46,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
-import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import type { AccountId } from '../../../identity/internal/types.js';
@@ -192,16 +191,6 @@ export async function initiateConsultHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  // PR-B r2 (Codex review fix): mark managed-by-handler at the TOP
-  // of every migrated handler so the legacy onSend hook NEVER writes
-  // a cache row for this request — regardless of whether validation
-  // fails, auth mismatches, the service throws, or the request
-  // succeeds. The legitimate cache write happens via
-  // withIdempotency; the legacy onSend write would otherwise cache
-  // FAILED responses (400/404/etc.) and trip body-mismatch 409 on
-  // legitimate corrected retries with the same key.
-  markIdempotencyManagedByHandler(req);
-
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const body = (req.body ?? {}) as InitiateBody;
@@ -255,7 +244,6 @@ export async function submitConsultHandler(
   req: FastifyRequest<{ Params: { id: string } }>,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // PR-B r2: see initiateConsultHandler.
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const consultId = asConsultId(req.params.id);
@@ -293,7 +281,6 @@ export async function abandonConsultHandler(
   req: FastifyRequest<{ Params: { id: string } }>,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // PR-B r2: see initiateConsultHandler.
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const consultId = asConsultId(req.params.id);
@@ -317,7 +304,6 @@ export async function resumeConsultHandler(
   req: FastifyRequest<{ Params: { id: string } }>,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // PR-B r2: see initiateConsultHandler.
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const consultId = asConsultId(req.params.id);
@@ -341,7 +327,6 @@ export async function patientRespondsConsultHandler(
   req: FastifyRequest<{ Params: { id: string } }>,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // PR-B r2: see initiateConsultHandler.
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const consultId = asConsultId(req.params.id);

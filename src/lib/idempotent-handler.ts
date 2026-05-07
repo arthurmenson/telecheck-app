@@ -15,11 +15,12 @@
  *     return { status: 200, view: toPatientView(result) };
  *   });
  *
- * The handler MUST also call `markIdempotencyManagedByHandler(req)` at
- * the TOP of the handler body (before any early returns) so the legacy
- * onSend cache write is skipped on every code path. Migrated handlers
- * are responsible for cache management; the legacy onSend path is for
- * not-yet-migrated handlers only.
+ * The helper now manages cache reservation, write, and completion entirely
+ * inside the handler-owned transaction. No separate per-handler flag-set
+ * is required — the legacy onSend cache-write hook (and its companion
+ * `markIdempotencyManagedByHandler` opt-out flag) were removed in Sprint
+ * 33 PR-E + Sprint 34 cleanup-sweep respectively. Every state-changing
+ * handler uses this helper or `withIdempotency` directly.
  *
  * Spec references:
  *   - docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md (v0.2)
@@ -80,10 +81,10 @@ function envelope(reqId: string, code: string, message: string): IdempotencyErro
  *   6. On service errors: route via `mapServiceError`.
  *   7. On unhandled: throw (Fastify global error handler takes over).
  *
- * The caller MUST have already called `markIdempotencyManagedByHandler(req)`
- * at the top of the handler body so the legacy onSend cache write is
- * skipped on every code path (validation 400s, auth 400s,
- * mapServiceError responses, and the success path here).
+ * The caller does not need any separate flag-set or opt-out call — the
+ * helper owns cache management for every code path it handles, and the
+ * legacy onSend cache-write hook that necessitated such a flag was
+ * removed in Sprint 33 PR-E.
  */
 export async function withIdempotentExecution<TView>(
   req: FastifyRequest,

@@ -23,7 +23,6 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
-import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { asAccountId, type AccountId } from '../../../identity/internal/types.js';
@@ -148,8 +147,6 @@ export async function inviteDelegateHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // SI-006 PR-C: skip legacy onSend cache writes.
-
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const body = (req.body ?? {}) as InviteBody;
@@ -194,8 +191,6 @@ export async function inviteDelegateHandler(
 // SI-006 PR-C: transition wraps the service call in withIdempotentExecution.
 // The service callback receives an externalTx so the reservation INSERT
 // + business mutation + completion UPDATE are atomic.
-// Caller (each handler) is responsible for calling
-// markIdempotencyManagedByHandler at the top of the handler body.
 // ---------------------------------------------------------------------------
 
 async function transition<T>(
@@ -235,7 +230,6 @@ export async function acceptDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({
@@ -258,7 +252,6 @@ export async function declineDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({
@@ -281,7 +274,6 @@ export async function revokeDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const id = (req.params as { id?: string }).id;
   const body = (req.body ?? {}) as RevokeBody;
   if (!isString(id) || !isString(body.reason) || !VALID_REVOKE_REASONS.has(body.reason)) {
@@ -346,7 +338,6 @@ export async function grantScopeHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const id = (req.params as { id?: string }).id;
@@ -384,7 +375,6 @@ export async function revokeScopeHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const params = req.params as { id?: string; scopeId?: string };
