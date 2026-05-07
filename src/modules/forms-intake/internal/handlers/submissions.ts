@@ -347,9 +347,26 @@ export async function updateSubmissionResponsesHandler(
         // audit was already committed (in its own tx) before this throw,
         // so the rollback of the surrounding tx does not cancel the
         // escalation record.
-        throw req.server.httpErrors.conflict(
-          'Crisis content was detected in the response payload; escalation required.',
-        );
+        //
+        // SI-006 PR-F2 r3 (Codex 2026-05-07 HIGH closure): RETURN the 409
+        // as a successful body() result instead of THROWING. Throwing
+        // here would cause withIdempotency to roll back the reservation,
+        // and a client retry with the same Idempotency-Key + body would
+        // re-execute the crisis gate and emit a DUPLICATE Category A
+        // audit (violating IDEMPOTENCY v5.1 exactly-once + polluting
+        // crisis-ops data). Returning a cached 409 means retries replay
+        // from cache without re-running the scanner.
+        return {
+          status: 409,
+          view: {
+            error: {
+              code: 'internal.resource.conflict',
+              message:
+                'Crisis content was detected in the response payload; escalation required.',
+              request_id: req.id,
+            },
+          },
+        };
       }
       if (message === RESPONSE_PAYLOAD_TOO_LARGE) {
         // Closes Codex submissions-r1 verify-r2 HIGH 2026-05-03: a deeply
@@ -361,14 +378,38 @@ export async function updateSubmissionResponsesHandler(
         // The Category A audit is NOT emitted on this path because no
         // string was scanned — there's no detection to record. The rejection
         // is documented at the I-025 envelope layer as a malformed payload.
-        throw req.server.httpErrors.payloadTooLarge(
-          'The response payload is too deeply nested or too large to process.',
-        );
+        //
+        // SI-006 PR-F2 r3: also return-as-cached so retries replay the
+        // 413 instead of re-executing the failing scanner. Same
+        // exactly-once rationale as CRISIS_DETECTED above.
+        return {
+          status: 413,
+          view: {
+            error: {
+              code: 'internal.request.payload_too_large',
+              message:
+                'The response payload is too deeply nested or too large to process.',
+              request_id: req.id,
+            },
+          },
+        };
       }
       if (isHandledSentinel(message)) {
-        throw req.server.httpErrors.badRequest(
-          'The requested form submission cannot be updated in its current state.',
-        );
+        // SI-006 PR-F2 r3: return-as-cached for the same exactly-once
+        // reason. State-machine guard violations are deterministic
+        // outcomes of (input, current state) — replay should return the
+        // same 400 without re-attempting the state mutation.
+        return {
+          status: 400,
+          view: {
+            error: {
+              code: 'internal.request.semantically_invalid',
+              message:
+                'The requested form submission cannot be updated in its current state.',
+              request_id: req.id,
+            },
+          },
+        };
       }
       throw err;
     }
@@ -414,7 +455,11 @@ export async function submitSubmissionHandler(
     );
   }
 
-  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+  // <unknown> widening: success path returns PatientFormSubmissionView,
+  // sentinel-catch path returns an error envelope. Both shapes are
+  // valid cached bodies; the helper's TView is bound to a single type
+  // so we widen.
+  return withIdempotentExecution<unknown>(req, reply, mapServiceError, async (tx) => {
     try {
       const submission = await submissionService.submitSubmission(
         ctx,
@@ -430,9 +475,21 @@ export async function submitSubmissionHandler(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (isHandledSentinel(message)) {
-        throw req.server.httpErrors.badRequest(
-          'The requested form submission cannot be submitted in its current state.',
-        );
+        // SI-006 PR-F2 r3: return-as-cached so retries replay the 400
+        // instead of re-executing the state-machine guard. Same
+        // exactly-once rationale as the update handler's sentinel
+        // catch above.
+        return {
+          status: 400,
+          view: {
+            error: {
+              code: 'internal.request.semantically_invalid',
+              message:
+                'The requested form submission cannot be submitted in its current state.',
+              request_id: req.id,
+            },
+          },
+        };
       }
       throw err;
     }
