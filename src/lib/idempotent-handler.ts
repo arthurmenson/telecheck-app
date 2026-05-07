@@ -39,6 +39,7 @@ import {
   IdempotencyBodyMismatchError,
   IdempotencyInFlightError,
   IdempotencyReplayError,
+  type IdempotencyCtx,
   buildIdempotencyCtx,
   withIdempotency,
 } from './idempotency.js';
@@ -90,7 +91,16 @@ export async function withIdempotentExecution<TView>(
   req: FastifyRequest,
   reply: FastifyReply,
   mapServiceError: ServiceErrorMapper,
-  body: (tx: DbTransaction) => Promise<{ status: number; view: TView }>,
+  body: (
+    tx: DbTransaction,
+    /**
+     * The IdempotencyCtx used to reserve this request's cache slot.
+     * Passed to body callbacks so they can forward it into service-
+     * layer audit-dedupe claims (Sprint 34 audit-dedupe SI). Body
+     * callbacks that don't need it can ignore the parameter.
+     */
+    idempotencyCtx: IdempotencyCtx,
+  ) => Promise<{ status: number; view: TView }>,
 ): Promise<unknown> {
   const tenantCtx = requireTenantContext(req);
   const idempotencyCtx = buildIdempotencyCtx(req);
@@ -103,7 +113,7 @@ export async function withIdempotentExecution<TView>(
       await tx.query('SELECT set_tenant_context($1)', [tenantCtx.tenantId]);
 
       return await withIdempotency(tx, idempotencyCtx, async () => {
-        const result = await body(tx);
+        const result = await body(tx, idempotencyCtx);
         return { status: result.status, body: result.view };
       });
     });

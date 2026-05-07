@@ -35,8 +35,10 @@
 
 import crypto from 'crypto';
 
+import { claimAuditDedupeSlot } from '../../../../lib/audit-dedupe.js';
 import { crisisDetector } from '../../../../lib/crisis-detection.js';
 import { type DbClient, type DbTransaction, withTransaction } from '../../../../lib/db.js';
+import type { IdempotencyCtx } from '../../../../lib/idempotency.js';
 import { kms } from '../../../../lib/kms.js';
 import { logger } from '../../../../lib/logger.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
@@ -348,6 +350,18 @@ export async function updateResponses(
   submissionId: FormSubmissionId,
   input: UpdateSubmissionResponsesRequest,
   externalTx?: DbTransaction,
+  /**
+   * Optional idempotency context. When the caller is on an
+   * idempotency-protected path (HTTP handler), forwarding the ctx
+   * lets `runCrisisGate` claim a dedupe slot before emitting the
+   * Category A audit, closing the Sprint 33 PR-F2 r4 deferred HIGH
+   * (crash-window duplicate audits on retry). Direct service calls
+   * and tests pass undefined and accept the documented duplicate
+   * risk.
+   *
+   * Sprint 34 / SI-006 audit-dedupe SI (2026-05-08).
+   */
+  idempotencyCtx?: IdempotencyCtx,
 ): Promise<FormSubmission> {
   // I-019 platform-floor scan (always-on; never disabled). Runs FIRST so a
   // crisis detection short-circuits before any state mutates — preserved
@@ -358,7 +372,7 @@ export async function updateResponses(
   // if the caller's tx (handler-owned for SI-006 PR-F2 migrated paths)
   // rolls back. See runCrisisGate doc-comment for the security
   // rationale (Sprint 33 / Codex review fix).
-  await runCrisisGate(ctx, actor, submissionId, input.responses);
+  await runCrisisGate(ctx, actor, submissionId, input.responses, idempotencyCtx);
 
   return submissionRepo.updateSubmissionResponses(
     ctx.tenantId,
@@ -389,6 +403,18 @@ async function runCrisisGate(
   actor: { actorId: string; patientId: PatientId },
   submissionId: FormSubmissionId,
   responses: Record<string, unknown>,
+  /**
+   * Optional idempotency context. When supplied, the audit emission
+   * is preceded by a dedupe-slot claim against `audit_dedupe_markers`
+   * — closes the Sprint 33 PR-F2 r4 deferred HIGH (crash-window
+   * duplicate Category A audits on retry of the same idempotency
+   * key). When undefined (e.g., direct service call from a non-HTTP
+   * path or a legacy test), the dedupe step is skipped — caller
+   * accepts the documented duplicate-audit risk on retry.
+   *
+   * Sprint 34 / SI-006 audit-dedupe SI (2026-05-08).
+   */
+  idempotencyCtx?: IdempotencyCtx,
   /* externalTx intentionally NOT a parameter — see security note below. */
 ): Promise<void> {
   const crisis = scanResponsesForCrisis(ctx.tenantId, responses);
@@ -424,6 +450,36 @@ async function runCrisisGate(
   // schema changes.
   await withTransaction(async (tx) => {
     await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    // Sprint 34 / SI-006 audit-dedupe SI: when the caller is on an
+    // idempotency-protected path (idempotencyCtx supplied), claim a
+    // dedupe slot BEFORE emitting the audit. If the slot is already
+    // taken (a prior attempt under the same Idempotency-Key already
+    // emitted on this exact path), skip the emit — the audit is
+    // already durable from the prior attempt. Closes the Sprint 33
+    // PR-F2 r4 deferred HIGH.
+    //
+    // Without idempotencyCtx (direct service call paths, tests), the
+    // dedupe step is skipped — caller accepts the documented duplicate-
+    // audit risk on retry.
+    if (idempotencyCtx !== undefined) {
+      const claimed = await claimAuditDedupeSlot(tx, {
+        tenantId: idempotencyCtx.tenantId,
+        idempotencyKey: idempotencyCtx.idempotencyKey,
+        endpoint: idempotencyCtx.endpoint,
+        actorId: idempotencyCtx.actorId,
+        bodyHash: idempotencyCtx.bodyHash,
+        auditAction: 'crisis_detection_trigger',
+      });
+      if (!claimed) {
+        // Prior attempt already emitted this exact audit on this exact
+        // request. The throw below still fires so the caller's CRISIS_
+        // DETECTED handling proceeds normally — the audit is just
+        // already-durable rather than freshly-emitted.
+        return;
+      }
+    }
+
     await emitCrisisDetectionTrigger(
       {
         tenantId: ctx.tenantId,
@@ -495,6 +551,8 @@ export async function pauseSubmission(
   submissionId: FormSubmissionId,
   input: UpdateSubmissionResponsesRequest,
   externalTx?: DbTransaction,
+  /** See `updateResponses` for idempotencyCtx semantics. */
+  idempotencyCtx?: IdempotencyCtx,
 ): Promise<PauseSubmissionResult> {
   // First-pass I-019 crisis gate on the incoming patch. Identical ordering
   // to auto-save — catches the common case (patient typing crisis text in
@@ -506,7 +564,7 @@ export async function pauseSubmission(
   // if the caller's tx (handler-owned for SI-006 PR-F2 migrated paths)
   // rolls back. See runCrisisGate doc-comment for the security
   // rationale (Sprint 33 / Codex review fix).
-  await runCrisisGate(ctx, actor, submissionId, input.responses);
+  await runCrisisGate(ctx, actor, submissionId, input.responses, idempotencyCtx);
 
   // ---------------------------------------------------------------------
   // Atomic orchestration (Codex pause-r1 HIGH-1 closure 2026-05-03)
@@ -576,8 +634,35 @@ export async function pauseSubmission(
       // Audit MUST commit independently of the outer rollback (I-003 +
       // I-019). Use a fresh tx — withTransaction without externalTx opens
       // a brand-new connection.
+      //
+      // Sprint 34 / SI-006 audit-dedupe SI: claim a dedupe slot before
+      // emit when on an idempotency-protected path. The merged-set
+      // detection uses a distinct audit_action label
+      // ('crisis_detection_trigger.merged_set') so a SINGLE request
+      // that triggers BOTH the patch-side scan AND the merged-set scan
+      // (rare — would require a payload that's individually clean but
+      // crisis-positive only after merging with prior submission state)
+      // emits BOTH audits exactly once each, not de-duped against each
+      // other. Same Sprint 33 PR-F2 r4 deferred HIGH closure.
       await withTransaction(async (auditTx) => {
         await auditTx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+        if (idempotencyCtx !== undefined) {
+          const claimed = await claimAuditDedupeSlot(auditTx, {
+            tenantId: idempotencyCtx.tenantId,
+            idempotencyKey: idempotencyCtx.idempotencyKey,
+            endpoint: idempotencyCtx.endpoint,
+            actorId: idempotencyCtx.actorId,
+            bodyHash: idempotencyCtx.bodyHash,
+            auditAction: 'crisis_detection_trigger.merged_set',
+          });
+          if (!claimed) {
+            // Prior attempt already emitted on the merged-set path. Skip
+            // the emit; the throw below still fires.
+            return;
+          }
+        }
+
         await emitCrisisDetectionTrigger(
           {
             tenantId: ctx.tenantId,
