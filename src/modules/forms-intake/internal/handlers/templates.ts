@@ -19,6 +19,8 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireAdminRole } from '../../../../lib/admin-role.js';
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateTemplateRequestSchema, PublishVersionRequestSchema } from '../../schemas.js';
 import type { ListTemplatesCursor } from '../repositories/template-repo.js';
@@ -28,6 +30,19 @@ import {
 } from '../repositories/template-repo.js';
 import * as templateService from '../services/template-service.js';
 import { PUBLISH_GATES_NOT_IMPLEMENTED } from '../services/template-service.js';
+
+/**
+ * Module-local service-error mapper for `withIdempotentExecution`. The
+ * forms-intake module currently surfaces preconditions as string-sentinel
+ * Error objects, which are caught + remapped to Fastify httpErrors INSIDE
+ * the body callback (so the surrounding tx rolls back and the reservation
+ * is purged). No domain-specific Error classes flow up to this mapper, so
+ * it is a deliberate no-op — unmapped errors propagate to Fastify's global
+ * error handler. Same shape as async-consult's mapper, just no cases.
+ */
+function mapServiceError(): boolean {
+  return false;
+}
 
 /**
  * Resolve the acting actor's identity. PLACEHOLDER pending the Identity &
@@ -94,6 +109,14 @@ export async function createTemplateHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  // SI-006 reserve-then-execute: mark managed-by-handler at the TOP so
+  // the legacy onSend hook NEVER writes a cache row for this request —
+  // regardless of whether validation fails, auth mismatches, the service
+  // throws, or the request succeeds. Without this, a validation 400 would
+  // be cached by legacy onSend and trip body-mismatch 409 on a legitimate
+  // retry with a corrected body.
+  markIdempotencyManagedByHandler(req);
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
@@ -107,9 +130,10 @@ export async function createTemplateHandler(
     );
   }
 
-  const template = await templateService.createDraftTemplate(ctx, actorId, parsed.data);
-
-  return reply.code(201).send(template);
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    const template = await templateService.createDraftTemplate(ctx, actorId, parsed.data, tx);
+    return { status: 201, view: template };
+  });
 }
 
 /**
@@ -285,6 +309,8 @@ export async function publishVersionHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006: see createTemplateHandler.
+
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
@@ -312,38 +338,43 @@ export async function publishVersionHandler(
     );
   }
 
-  try {
-    const published = await templateService.publishVersion(
-      ctx,
-      actorId,
-      versionIdParam,
-      parsed.data,
-    );
-    return reply.code(200).send(published);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message === PUBLISH_VERSION_NOT_FOUND || message === PUBLISH_VERSION_NOT_DRAFT) {
-      // Both sentinels map to the same tenant-blind 400 envelope per I-025
-      // — the response MUST NOT differentiate "doesn't exist" vs "exists
-      // in another tenant" vs "exists but isn't a draft." A precise
-      // operator-facing error code is preserved in the envelope's `code`
-      // field (mapped by the global error envelope plugin) so observability
-      // tooling can distinguish; the wire-out message is uniform.
-      throw req.server.httpErrors.badRequest(
-        'The requested form version cannot be published in its current state.',
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    try {
+      const published = await templateService.publishVersion(
+        ctx,
+        actorId,
+        versionIdParam,
+        parsed.data,
+        tx,
       );
+      return { status: 200, view: published };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message === PUBLISH_VERSION_NOT_FOUND || message === PUBLISH_VERSION_NOT_DRAFT) {
+        // Both sentinels map to the same tenant-blind 400 envelope per I-025
+        // — the response MUST NOT differentiate "doesn't exist" vs "exists
+        // in another tenant" vs "exists but isn't a draft." A precise
+        // operator-facing error code is preserved in the envelope's `code`
+        // field (mapped by the global error envelope plugin) so observability
+        // tooling can distinguish; the wire-out message is uniform.
+        // Throw inside body() so the surrounding tx rolls back and the
+        // idempotency reservation is purged — clean retry possible.
+        throw req.server.httpErrors.badRequest(
+          'The requested form version cannot be published in its current state.',
+        );
+      }
+      if (message === PUBLISH_GATES_NOT_IMPLEMENTED) {
+        // 503 Service Unavailable — the publish governance gates haven't
+        // been implemented in this deployment, so publish is fail-closed.
+        // This surfaces to operators as "publishing is not yet enabled in
+        // this environment" rather than a 400 (which would suggest a
+        // client-fixable problem). Codex publishVersion-r1 CRITICAL closure
+        // 2026-05-03.
+        throw req.server.httpErrors.serviceUnavailable(
+          'Form template publishing is not yet enabled in this environment.',
+        );
+      }
+      throw err;
     }
-    if (message === PUBLISH_GATES_NOT_IMPLEMENTED) {
-      // 503 Service Unavailable — the publish governance gates haven't
-      // been implemented in this deployment, so publish is fail-closed.
-      // This surfaces to operators as "publishing is not yet enabled in
-      // this environment" rather than a 400 (which would suggest a
-      // client-fixable problem). Codex publishVersion-r1 CRITICAL closure
-      // 2026-05-03.
-      throw req.server.httpErrors.serviceUnavailable(
-        'Form template publishing is not yet enabled in this environment.',
-      );
-    }
-    throw err;
-  }
+  });
 }
