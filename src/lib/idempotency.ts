@@ -222,25 +222,45 @@ export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
 }
 
 // ---------------------------------------------------------------------------
-// withIdempotency — reserve-then-execute helper (SI-006 PR-A).
+// withIdempotency — reserve-then-execute helper (SI-006 PR-A r2).
 //
-// Caller invariants the helper assumes (per design brief §5):
-//   1. Caller has already opened a transaction on `client` (BEGIN issued).
-//   2. Caller has already set tenant context on `client` (FORCE RLS on
-//      idempotency_keys requires this; absent context fails closed with
+// PR-A r2 (Sprint 32 / Codex retro fixes 2026-05-07): API and SQL
+// hardening per Codex retrospective findings on the merged PR-A
+// (commit 5509bdb):
+//   - HIGH-1: SAVEPOINT-based transaction-discipline check. Postgres
+//     throws "SAVEPOINT can only be used in transaction blocks" if the
+//     caller isn't inside an explicit BEGIN, so misuse now fails loudly
+//     at the first SAVEPOINT statement instead of silently autocommitting
+//     a 24h-pending blocker.
+//   - HIGH-2: body() now returns `{ status, body }` — caller chooses
+//     the cache-safe projected response. The cache stores the
+//     post-projection shape, eliminating the I-025 / PHI leak risk
+//     of caching pre-projection service results that include tenant_id
+//     and other internal fields.
+//   - MEDIUM-2: DELETE-purge CTE before INSERT atomically clears
+//     expired rows so a stale 24h row no longer blocks a fresh
+//     reservation. The previous expired-row path threw a false
+//     IdempotencyInFlightError until cleanup ran.
+//   - MEDIUM-Concern-10: response_status is now caller-provided
+//     (resolved by the HIGH-2 API change).
+//
+// Caller invariants the helper still assumes:
+//   1. Caller has opened a transaction on `client` (BEGIN issued).
+//      r2 enforces this via SAVEPOINT — undocumented misuse is now a
+//      runtime error, not a silent durability failure.
+//   2. Caller has set tenant context on `client` (FORCE RLS on
+//      idempotency_keys requires this; absent context fails closed via
 //      `tenant_context_not_set`).
-//   3. Caller will COMMIT after this returns OR ROLLBACK if anything in
-//      the surrounding transaction throws (including this helper's
-//      thrown errors).
-//
-// Helper does NOT open its own transaction, set tenant context, or call
-// `withTenantBoundConnection` — it operates on the caller's connection.
+//   3. Caller will COMMIT after this returns OR ROLLBACK if the
+//      surrounding transaction throws.
 //
 // Throw contract:
 //   - IdempotencyReplayError      → caller replays cached response
+//                                    (err.cachedStatus, err.cachedBody)
 //   - IdempotencyInFlightError    → caller returns 409
 //   - IdempotencyBodyMismatchError → caller returns 409
 //   - <body() throws>             → propagated; caller's tx rolls back
+//   - <SAVEPOINT throws>          → caller used non-transactional client
 // ---------------------------------------------------------------------------
 
 interface CachedResponse {
@@ -251,40 +271,90 @@ interface CachedResponse {
 }
 
 /**
+ * Caller-projected cache payload returned by `body()`. The `body` field
+ * is what gets cached AND replayed — handlers MUST project away any
+ * fields they would normally strip before sending to the client (e.g.,
+ * `tenant_id` per I-025, internal IDs, audit metadata).
+ *
+ * Equivalent: handlers that would normally call
+ * `reply.code(status).send(toViewProjection(serviceResult))` must
+ * instead return `{ status, body: toViewProjection(serviceResult) }`
+ * from `body()` and then `reply.code(status).send(returnedBody)` on
+ * the helper's return.
+ */
+export interface IdempotencyCachePayload<TBody = unknown> {
+  /** HTTP status code to cache and replay (e.g., 200, 201, 204). */
+  status: number;
+  /** Response body to cache and replay — MUST be the post-projection
+   * client-facing shape, not the raw service result. */
+  body: TBody;
+}
+
+/**
  * Run `body()` exactly-once for the given idempotency 4-tuple, atomically
  * with the surrounding business transaction.
  *
  * Mechanics:
- *   1. Reserve: INSERT idempotency_keys (..., processing_state='pending')
+ *   0. Open SAVEPOINT — fails fast if caller isn't in a transaction.
+ *   1. Reserve: WITH purged AS (DELETE expired rows), INSERT pending
  *      ON CONFLICT DO NOTHING RETURNING tenant_id.
  *   2a. If RETURNING produced a row → reservation succeeded; run body();
  *       on success, UPDATE row to processing_state='completed' with the
- *       response status + body cached. Return the body's value.
- *   2b. If RETURNING produced no rows → conflict; SELECT existing row;
- *       throw the appropriate Replay/InFlight/BodyMismatch error.
+ *       caller-provided status + body cached. Return body()'s payload.
+ *   2b. If RETURNING produced no rows → conflict on a non-expired row;
+ *       SELECT existing row; throw the appropriate
+ *       Replay/InFlight/BodyMismatch error.
  *
  * The reserve INSERT writes `response_status=0` as a sentinel for the
- * pending state (the schema requires NOT NULL). Consumers must NEVER
- * read `response_status` without first checking `processing_state` —
- * a value of `0` in a `pending` row indicates the reservation has not
- * yet been completed.
+ * pending state. Consumers must check `processing_state='completed'`
+ * before reading `response_status`.
  */
-export async function withIdempotency<T>(
+export async function withIdempotency<TBody>(
   client: DbClient,
   ctx: IdempotencyCtx,
-  body: () => Promise<T>,
-): Promise<T> {
+  body: () => Promise<IdempotencyCachePayload<TBody>>,
+): Promise<IdempotencyCachePayload<TBody>> {
   // -------------------------------------------------------------------------
-  // 1. Reserve — INSERT ON CONFLICT DO NOTHING RETURNING.
+  // 0. Transaction-discipline check via SAVEPOINT (PR-A r2 / HIGH-1).
   //
-  //    ON CONFLICT DO NOTHING is comprehensive here because the table's
-  //    PRIMARY KEY (tenant_id, key, endpoint, actor_id) is the only unique
-  //    constraint (verified migrations/005_idempotency_keys.sql:108). No
-  //    secondary unique index can raise an unhandled unique_violation that
-  //    would abort the transaction.
+  //    SAVEPOINT requires an open explicit transaction. Postgres throws
+  //    `25P01 no_active_sql_transaction` ("SAVEPOINT can only be used in
+  //    transaction blocks") if the caller passed a non-transactional
+  //    client (e.g., raw pool.connect() result without BEGIN). Loud
+  //    failure beats a silent 24h pending blocker.
+  //
+  //    The savepoint is otherwise unused — no rollback to it on conflict
+  //    (ON CONFLICT DO NOTHING doesn't abort the tx; SELECT on the
+  //    next line works fine). We RELEASE it before returning. If body()
+  //    throws, the caller's tx rolls back which transparently releases
+  //    the savepoint as well.
+  // -------------------------------------------------------------------------
+  await client.query('SAVEPOINT idempotency_reserve');
+
+  // -------------------------------------------------------------------------
+  // 1. Reserve — DELETE-purge CTE + INSERT ON CONFLICT DO NOTHING.
+  //
+  //    The CTE atomically clears any expired row for this 4-tuple BEFORE
+  //    the INSERT proceeds (PR-A r2 / MEDIUM-Concern-2). This eliminates
+  //    the false-in-flight failure mode where an expired row continues
+  //    to block fresh reservations until the async cleanup job runs.
+  //
+  //    ON CONFLICT DO NOTHING covers the table's only unique constraint
+  //    (PRIMARY KEY tenant_id+key+endpoint+actor_id per
+  //    migrations/005_idempotency_keys.sql:108). Conflicts ONLY on
+  //    non-expired rows.
   // -------------------------------------------------------------------------
   const insertResult = await client.query<{ tenant_id: string }>(
-    `INSERT INTO idempotency_keys
+    `WITH purged AS (
+       DELETE FROM idempotency_keys
+        WHERE tenant_id = $1
+          AND key       = $2
+          AND endpoint  = $3
+          AND actor_id  = $4
+          AND expires_at <= NOW()
+       RETURNING 1
+     )
+     INSERT INTO idempotency_keys
        (tenant_id, key, endpoint, actor_id, request_hash,
         processing_state, response_status, response_body)
      VALUES ($1, $2, $3, $4, decode($5, 'hex'),
@@ -298,41 +368,28 @@ export async function withIdempotency<T>(
     // -----------------------------------------------------------------------
     // Reservation succeeded. Run business logic, then complete.
     //
-    // body() exceptions propagate up; the caller's transaction will
-    // ROLLBACK, removing both the reservation and any business-state
-    // writes — clean retry possible.
+    // body() returns a caller-projected { status, body } payload. The
+    // body is what gets stored in idempotency_keys.response_body — by
+    // contract, the handler has already projected away any fields that
+    // would otherwise leak (tenant_id per I-025, internal IDs, etc.).
+    //
+    // body() exceptions propagate up; caller's tx rolls back; reservation
+    // gone; clean retry possible.
     // -----------------------------------------------------------------------
-    const result = await body();
+    const payload = await body();
 
     // ---------------------------------------------------------------------
-    // 3. Complete — UPDATE row to completed.
+    // Complete — UPDATE row to processing_state='completed' with the
+    // caller-provided status + projected body.
     //
     // The `processing_state='pending'` guard prevents a second concurrent
-    // UPDATE from corrupting the row state. Under correct discipline this
-    // guard always matches (the reserving connection always completes its
-    // own reservation), but the floor protects against future call-site
-    // mistakes.
-    //
-    // Best-effort cache: we do NOT report an HTTP status here (the helper
-    // doesn't have one). The caller's reply.code(...).send(...) happens
-    // after this returns; the helper stores `response_status=200` as a
-    // generic-success sentinel on completion. Handlers that need to cache
-    // a non-200 success status (e.g., 201, 204) should pass an explicit
-    // status to a future `withIdempotencyAndStatus(client, ctx, status, body)`
-    // overload — out of scope for PR-A.
-    //
-    // Similarly, the response BODY caching here uses what body() returned.
-    // Most state-changing handlers return the response payload from body(),
-    // and the calling handler does `reply.send(result)`. If the handler
-    // post-processes (e.g., filters PHI fields), the cache will store the
-    // pre-processing shape — acceptable for v1 reserve-then-execute, but
-    // worth flagging as a future enhancement.
+    // UPDATE from corrupting the row.
     // ---------------------------------------------------------------------
     await client.query(
       `UPDATE idempotency_keys
           SET processing_state = 'completed',
-              response_status  = 200,
-              response_body    = $5::jsonb
+              response_status  = $5,
+              response_body    = $6::jsonb
         WHERE tenant_id   = $1
           AND key         = $2
           AND endpoint    = $3
@@ -343,26 +400,20 @@ export async function withIdempotency<T>(
         ctx.idempotencyKey,
         ctx.endpoint,
         ctx.actorId,
-        result === null || result === undefined ? null : JSON.stringify(result),
+        payload.status,
+        payload.body === null || payload.body === undefined ? null : JSON.stringify(payload.body),
       ],
     );
 
-    return result;
+    await client.query('RELEASE SAVEPOINT idempotency_reserve');
+    return payload;
   }
 
   // -------------------------------------------------------------------------
-  // 2. Conflict — INSERT returned empty. Look up the existing row.
+  // 2. Conflict — INSERT returned empty (DELETE-purge didn't clear,
+  //    meaning the existing row is non-expired).
   //
-  //    ON CONFLICT DO NOTHING is silent (no error raised), so the
-  //    transaction is NOT in aborted state. We can issue a fresh SELECT
-  //    against the same client.
-  //
-  //    Edge case: if the existing row has expired (expires_at <= NOW()),
-  //    the SELECT returns zero rows. This is a narrow window between the
-  //    INSERT (which conflicted on a stale row) and the SELECT. The
-  //    safest fail-closed behavior is to throw IdempotencyInFlightError —
-  //    the client retries with backoff and the next attempt either finds
-  //    the expired row gone (cleanup job) or ages out naturally.
+  //    Look up the existing row; throw appropriate error.
   // -------------------------------------------------------------------------
   const lookupResult = await client.query<{
     processing_state: 'pending' | 'completed';
@@ -383,20 +434,27 @@ export async function withIdempotency<T>(
     [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId],
   );
 
+  // Release the savepoint on the conflict path before throwing — the
+  // throw will propagate to the caller's outer tx which rolls back, but
+  // RELEASE keeps the local savepoint state clean in case the caller
+  // catches the error and continues without rolling back (rare, but
+  // possible for handler-level error mapping).
+  await client.query('RELEASE SAVEPOINT idempotency_reserve');
+
   if (lookupResult.rows.length === 0) {
-    // Expired-row race; fail closed.
+    // Existing row was either deleted by DELETE-purge AND a concurrent
+    // request slipped between purge and INSERT (extremely narrow), OR
+    // the row was deleted by an external cleanup job between INSERT and
+    // SELECT. Treat as in-flight; client retries.
     throw new IdempotencyInFlightError();
   }
   const row = lookupResult.rows[0]!;
 
   if (row.request_hash_hex !== ctx.bodyHash) {
-    // Body mismatch — different request reusing the same key.
-    // Per IDEMPOTENCY v5.1 §1: 409 regardless of processing_state.
     throw new IdempotencyBodyMismatchError();
   }
 
   if (row.processing_state === 'pending') {
-    // Concurrent request owns the reservation.
     throw new IdempotencyInFlightError();
   }
 
