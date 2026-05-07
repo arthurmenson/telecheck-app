@@ -46,6 +46,15 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
+import { type DbTransaction, withTransaction } from '../../../../lib/db.js';
+import {
+  IdempotencyBodyMismatchError,
+  IdempotencyInFlightError,
+  IdempotencyReplayError,
+  buildIdempotencyCtx,
+  markIdempotencyManagedByHandler,
+  withIdempotency,
+} from '../../../../lib/idempotency.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import type { AccountId } from '../../../identity/internal/types.js';
 import * as consultService from '../services/consult-service.js';
@@ -183,6 +192,82 @@ function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): bool
 }
 
 // ---------------------------------------------------------------------------
+// withIdempotentExecution — shared handler-side helper for SI-006 wraps.
+//
+// Sprint 32 / SI-006 PR-B (Async-Consult retrofit). Each state-changing
+// async-consult handler shares the same shape:
+//   1. Build IdempotencyCtx from the request.
+//   2. Open a transaction; set tenant context.
+//   3. Wrap the service call in `withIdempotency`; project the result
+//      to the patient view inside the helper body so caching is
+//      tenant-id-stripped per I-025.
+//   4. On success: mark request as managed-by-handler (skip legacy
+//      onSend write); reply with the projected view.
+//   5. On idempotency errors: replay / 409 in-flight / 409 body-mismatch.
+//   6. On service errors: route via mapServiceError.
+//   7. On unhandled: throw.
+//
+// The helper inlines this into every handler. Inside the body callback,
+// the handler does just the actual service work + projection.
+// ---------------------------------------------------------------------------
+
+async function withIdempotentExecution<TView>(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  body: (tx: DbTransaction) => Promise<{ status: number; view: TView }>,
+): Promise<unknown> {
+  const tenantCtx = requireTenantContext(req);
+  const idempotencyCtx = buildIdempotencyCtx(req);
+
+  try {
+    const payload = await withTransaction(async (tx) => {
+      // Set tenant context BEFORE calling withIdempotency — the
+      // idempotency_keys table has FORCE RLS; absent context fails
+      // closed via tenant_context_not_set.
+      await tx.query('SELECT set_tenant_context($1)', [tenantCtx.tenantId]);
+
+      return await withIdempotency(tx, idempotencyCtx, async () => {
+        const result = await body(tx);
+        return { status: result.status, body: result.view };
+      });
+    });
+
+    // Skip the legacy onSend cache write — withIdempotency already
+    // committed the cache row inside the transaction.
+    markIdempotencyManagedByHandler(req);
+    return reply.code(payload.status).send(payload.body);
+  } catch (err) {
+    if (err instanceof IdempotencyReplayError) {
+      // Cache hit on completed record. Replay status + body verbatim.
+      markIdempotencyManagedByHandler(req);
+      return reply.code(err.cachedStatus).send(err.cachedBody);
+    }
+    if (err instanceof IdempotencyInFlightError) {
+      // Concurrent same-key request owns the reservation.
+      markIdempotencyManagedByHandler(req);
+      return reply
+        .code(409)
+        .send(makeErrorEnvelope(req.id, 'internal.idempotency.in_flight', err.hint));
+    }
+    if (err instanceof IdempotencyBodyMismatchError) {
+      // Same key, different body — different request reusing the key.
+      markIdempotencyManagedByHandler(req);
+      return reply
+        .code(409)
+        .send(
+          makeErrorEnvelope(
+            req.id,
+            'internal.idempotency.body_mismatch',
+            'Idempotency key already used with a different request body. Generate a new Idempotency-Key for a different request.',
+          ),
+        );
+    }
+    if (mapServiceError(err, reply, req.id)) return reply;
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // POST /v0/async-consult — initiate
 // ---------------------------------------------------------------------------
 
@@ -213,18 +298,13 @@ export async function initiateConsultHandler(
   }
 
   // Authorization: account_id in body MUST match authenticated actor.
-  // This is a defense-in-depth check; the service layer's
-  // assertConsultOwnership covers other paths but initiate is the
-  // initial INSERT so there's no existing consult to assert against.
   if (body.account_id !== actor.accountId) {
-    // Tenant-blind: don't distinguish "you can't initiate for another
-    // patient" from "validation failed" — same 400 envelope.
     return reply
       .code(400)
       .send(makeErrorEnvelope(req.id, 'internal.request.invalid', 'Invalid initiate body.'));
   }
 
-  try {
+  return withIdempotentExecution(req, reply, async (tx) => {
     const consult = await consultService.initiate(
       ctx,
       { actorId: actor.accountId },
@@ -234,12 +314,10 @@ export async function initiateConsultHandler(
         modality: body.modality as ConsultModality,
         current_program_catalog_entry_id: body.current_program_catalog_entry_id ?? null,
       },
+      tx,
     );
-    return reply.code(201).send(toPatientConsultView(consult));
-  } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return reply;
-    throw err;
-  }
+    return { status: 201, view: toPatientConsultView(consult) };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -267,18 +345,16 @@ export async function submitConsultHandler(
       );
   }
 
-  try {
+  return withIdempotentExecution(req, reply, async (tx) => {
     const consult = await consultService.submit(
       ctx,
       { actorId: actor.accountId, accountId: actor.accountId as AccountId },
       consultId,
-      body.intake_form_submission_id,
+      body.intake_form_submission_id as string,
+      tx,
     );
-    return reply.code(200).send(toPatientConsultView(consult));
-  } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return reply;
-    throw err;
-  }
+    return { status: 200, view: toPatientConsultView(consult) };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -293,17 +369,15 @@ export async function abandonConsultHandler(
   const actor = requireActorContext(req);
   const consultId = asConsultId(req.params.id);
 
-  try {
+  return withIdempotentExecution(req, reply, async (tx) => {
     const consult = await consultService.abandon(
       ctx,
       { actorId: actor.accountId, accountId: actor.accountId as AccountId },
       consultId,
+      tx,
     );
-    return reply.code(200).send(toPatientConsultView(consult));
-  } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return reply;
-    throw err;
-  }
+    return { status: 200, view: toPatientConsultView(consult) };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -318,17 +392,15 @@ export async function resumeConsultHandler(
   const actor = requireActorContext(req);
   const consultId = asConsultId(req.params.id);
 
-  try {
+  return withIdempotentExecution(req, reply, async (tx) => {
     const consult = await consultService.resume(
       ctx,
       { actorId: actor.accountId, accountId: actor.accountId as AccountId },
       consultId,
+      tx,
     );
-    return reply.code(200).send(toPatientConsultView(consult));
-  } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return reply;
-    throw err;
-  }
+    return { status: 200, view: toPatientConsultView(consult) };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -343,17 +415,15 @@ export async function patientRespondsConsultHandler(
   const actor = requireActorContext(req);
   const consultId = asConsultId(req.params.id);
 
-  try {
+  return withIdempotentExecution(req, reply, async (tx) => {
     const consult = await consultService.patientResponds(
       ctx,
       { actorId: actor.accountId, accountId: actor.accountId as AccountId },
       consultId,
+      tx,
     );
-    return reply.code(200).send(toPatientConsultView(consult));
-  } catch (err) {
-    if (mapServiceError(err, reply, req.id)) return reply;
-    throw err;
-  }
+    return { status: 200, view: toPatientConsultView(consult) };
+  });
 }
 
 // ---------------------------------------------------------------------------
