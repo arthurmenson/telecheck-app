@@ -576,41 +576,57 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
       config.jwtSigningKey,
     );
 
-    // Each request probes a distinct non-existent consult ID — service
-    // throws ConsultNotFoundError → 404 via mapServiceError (Sprint 24
-    // return-reply pattern). The 404 cache write is what we're testing.
-    const consultIdA = ulid();
-    const consultIdB = ulid();
+    // PR-B Sprint 32 update: previously this test used POST /:id/abandon
+    // with non-existent IDs to trigger a 404 cached response. After PR-B
+    // migrated async-consult handlers to withIdempotency, failed requests
+    // (404 from ConsultNotFoundError) roll back their reservation rather
+    // than persisting it — the new contract is "exactly-once for SUCCESSFUL
+    // requests." So we re-target this test at the SUCCESS path: POST
+    // /v0/async-consult (initiate) with each JWT's own account_id.
+    //
+    // The cross-actor invariant being pinned is unchanged: two distinct
+    // JWT actors in the same tenant + same Idempotency-Key MUST be
+    // isolated in the 4-tuple cache (different actor_id values; neither
+    // 'anonymous'). With initiate, both requests succeed (201 with each
+    // patient's own consult), and both cache rows have distinct
+    // accountId-derived actor_ids.
 
     const respA = await inject({
       method: 'POST',
-      url: `/v0/async-consult/${consultIdA}/abandon`,
+      url: '/v0/async-consult',
       headers: {
         host: 'heroshealth.com',
         authorization: `Bearer ${tokenA}`,
         'idempotency-key': idempotencyKey,
         'content-type': 'application/json',
       },
-      payload: {},
+      payload: {
+        account_id: accountIdA,
+        consult_type: 'general',
+        modality: 'async',
+      },
     });
-    expect(respA.statusCode).toBe(404);
+    expect(respA.statusCode).toBe(201);
 
     const respB = await inject({
       method: 'POST',
-      url: `/v0/async-consult/${consultIdB}/abandon`,
+      url: '/v0/async-consult',
       headers: {
         host: 'heroshealth.com',
         authorization: `Bearer ${tokenB}`,
         'idempotency-key': idempotencyKey,
         'content-type': 'application/json',
       },
-      payload: {},
+      payload: {
+        account_id: accountIdB,
+        consult_type: 'general',
+        modality: 'async',
+      },
     });
-    // CRITICAL: this MUST be 404 (handler ran for actor B) — NOT 409
-    // body-mismatch (which would prove actor A and actor B share the
-    // 'anonymous' bucket and got different bodies tripping the
-    // mismatch path).
-    expect(respB.statusCode).toBe(404);
+    // CRITICAL: actor B MUST get 201 (handler ran for actor B), NOT 409
+    // body-mismatch. A 409 body-mismatch would prove actor A and actor B
+    // share the 'anonymous' bucket — the original TLC-048 bug.
+    expect(respB.statusCode).toBe(201);
 
     // Direct cache-table inspection: two records exist for the same
     // (tenant_id, key, endpoint) with distinct actor_ids matching the
@@ -622,7 +638,7 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
            FROM idempotency_keys
           WHERE tenant_id = $1
             AND key = $2
-            AND endpoint LIKE '/v0/async-consult/%/abandon'
+            AND endpoint = '/v0/async-consult'
           ORDER BY actor_id`,
         [TENANT_US, idempotencyKey],
       );
@@ -633,6 +649,8 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
       expect(actorIds).not.toContain('anonymous');
       // Each row's actor_id matches the corresponding JWT's accountId.
       expect(actorIds.sort()).toEqual([accountIdA, accountIdB].sort());
+      // Both rows cached the success status (201, not the v0 200 default).
+      expect(result.rows.every((r) => r.response_status === 201)).toBe(true);
     });
   });
 });
