@@ -299,112 +299,125 @@ export async function updateSubmissionResponsesHandler(
   // here return different shapes (PauseSubmissionResult vs PatientFormSubmissionView).
   // Widening to `unknown` keeps both branches assignable without altering
   // the wire-out — the cached response body is the projected view either way.
-  return withIdempotentExecution<unknown>(req, reply, mapServiceError, async (tx) => {
-    try {
-      if (parsed.data.pause === true) {
-        // Explicit save-and-leave path — slice PRD §8.2. PauseSubmissionResult
-        // already carries a tenant_id-stripped submission view, so no
-        // additional projection step is required.
-        const result = await submissionService.pauseSubmission(
+  return withIdempotentExecution<unknown>(
+    req,
+    reply,
+    mapServiceError,
+    async (tx, idempotencyCtx) => {
+      try {
+        if (parsed.data.pause === true) {
+          // Explicit save-and-leave path — slice PRD §8.2.
+          // PauseSubmissionResult already carries a tenant_id-stripped
+          // submission view, so no additional projection step is required.
+          //
+          // idempotencyCtx forwarded into the service so runCrisisGate can
+          // claim a dedupe slot before emitting the Category A audit
+          // (Sprint 34 audit-dedupe SI; closes Sprint 33 PR-F2 r4 deferred
+          // HIGH on crash-window duplicate audits).
+          const result = await submissionService.pauseSubmission(
+            ctx,
+            { actorId, patientId, delegateId },
+            submissionIdParam,
+            parsed.data,
+            tx,
+            idempotencyCtx,
+          );
+          return { status: 200, view: result };
+        }
+
+        const submission = await submissionService.updateResponses(
           ctx,
           { actorId, patientId, delegateId },
           submissionIdParam,
           parsed.data,
           tx,
+          idempotencyCtx,
         );
-        return { status: 200, view: result };
-      }
-
-      const submission = await submissionService.updateResponses(
-        ctx,
-        { actorId, patientId, delegateId },
-        submissionIdParam,
-        parsed.data,
-        tx,
-      );
-      // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
-      // Projection happens INSIDE the body so the cached response is
-      // post-projection (no tenant_id leak per I-025).
-      return { status: 200, view: toPatientView(submission) };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (message === CRISIS_DETECTED) {
-        // Per I-019 platform-floor, a positive crisis detection is NOT a
-        // generic 400. The patient surface needs to render crisis
-        // resources + emergency-contact paths (Slice PRD §13). We use
-        // HTTP 409 Conflict with a structured error code so the client
-        // can branch — the response is intentionally distinguishable
-        // from other 4xx classes. The Category A `crisis_detection_trigger`
-        // audit was already committed (in its own tx) before this throw,
-        // so the rollback of the surrounding tx does not cancel the
-        // escalation record.
-        //
-        // SI-006 PR-F2 r3 (Codex 2026-05-07 HIGH closure): RETURN the 409
-        // as a successful body() result instead of THROWING. Throwing
-        // here would cause withIdempotency to roll back the reservation,
-        // and a client retry with the same Idempotency-Key + body would
-        // re-execute the crisis gate and emit a DUPLICATE Category A
-        // audit (violating IDEMPOTENCY v5.1 exactly-once + polluting
-        // crisis-ops data). Returning a cached 409 means retries replay
-        // from cache without re-running the scanner.
-        return {
-          status: 409,
-          view: {
-            error: {
-              code: 'internal.resource.conflict',
-              message: 'Crisis content was detected in the response payload; escalation required.',
-              trace_id: req.id,
-              timestamp: new Date().toISOString(),
+        // Patient surface — strip tenant_id (Codex patient-surface-r0 2026-05-04).
+        // Projection happens INSIDE the body so the cached response is
+        // post-projection (no tenant_id leak per I-025).
+        return { status: 200, view: toPatientView(submission) };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message === CRISIS_DETECTED) {
+          // Per I-019 platform-floor, a positive crisis detection is NOT a
+          // generic 400. The patient surface needs to render crisis
+          // resources + emergency-contact paths (Slice PRD §13). We use
+          // HTTP 409 Conflict with a structured error code so the client
+          // can branch — the response is intentionally distinguishable
+          // from other 4xx classes. The Category A `crisis_detection_trigger`
+          // audit was already committed (in its own tx) before this throw,
+          // so the rollback of the surrounding tx does not cancel the
+          // escalation record.
+          //
+          // SI-006 PR-F2 r3 (Codex 2026-05-07 HIGH closure): RETURN the 409
+          // as a successful body() result instead of THROWING. Throwing
+          // here would cause withIdempotency to roll back the reservation,
+          // and a client retry with the same Idempotency-Key + body would
+          // re-execute the crisis gate and emit a DUPLICATE Category A
+          // audit (violating IDEMPOTENCY v5.1 exactly-once + polluting
+          // crisis-ops data). Returning a cached 409 means retries replay
+          // from cache without re-running the scanner.
+          return {
+            status: 409,
+            view: {
+              error: {
+                code: 'internal.resource.conflict',
+                message:
+                  'Crisis content was detected in the response payload; escalation required.',
+                trace_id: req.id,
+                timestamp: new Date().toISOString(),
+              },
             },
-          },
-        };
-      }
-      if (message === RESPONSE_PAYLOAD_TOO_LARGE) {
-        // Closes Codex submissions-r1 verify-r2 HIGH 2026-05-03: a deeply
-        // nested response payload (within Fastify's 1 MiB body limit) used
-        // to overflow the recursive crisis scanner's call stack and surface
-        // as a 5xx — bypassing I-019 escalation. The scanner is now
-        // iterative with explicit depth + node-count budgets; payloads
-        // exceeding either budget surface here and reject with HTTP 413.
-        // The Category A audit is NOT emitted on this path because no
-        // string was scanned — there's no detection to record. The rejection
-        // is documented at the I-025 envelope layer as a malformed payload.
-        //
-        // SI-006 PR-F2 r3: also return-as-cached so retries replay the
-        // 413 instead of re-executing the failing scanner. Same
-        // exactly-once rationale as CRISIS_DETECTED above.
-        return {
-          status: 413,
-          view: {
-            error: {
-              code: 'internal.request.payload_too_large',
-              message: 'The response payload is too deeply nested or too large to process.',
-              trace_id: req.id,
-              timestamp: new Date().toISOString(),
+          };
+        }
+        if (message === RESPONSE_PAYLOAD_TOO_LARGE) {
+          // Closes Codex submissions-r1 verify-r2 HIGH 2026-05-03: a deeply
+          // nested response payload (within Fastify's 1 MiB body limit) used
+          // to overflow the recursive crisis scanner's call stack and surface
+          // as a 5xx — bypassing I-019 escalation. The scanner is now
+          // iterative with explicit depth + node-count budgets; payloads
+          // exceeding either budget surface here and reject with HTTP 413.
+          // The Category A audit is NOT emitted on this path because no
+          // string was scanned — there's no detection to record. The rejection
+          // is documented at the I-025 envelope layer as a malformed payload.
+          //
+          // SI-006 PR-F2 r3: also return-as-cached so retries replay the
+          // 413 instead of re-executing the failing scanner. Same
+          // exactly-once rationale as CRISIS_DETECTED above.
+          return {
+            status: 413,
+            view: {
+              error: {
+                code: 'internal.request.payload_too_large',
+                message: 'The response payload is too deeply nested or too large to process.',
+                trace_id: req.id,
+                timestamp: new Date().toISOString(),
+              },
             },
-          },
-        };
-      }
-      if (isHandledSentinel(message)) {
-        // SI-006 PR-F2 r3: return-as-cached for the same exactly-once
-        // reason. State-machine guard violations are deterministic
-        // outcomes of (input, current state) — replay should return the
-        // same 400 without re-attempting the state mutation.
-        return {
-          status: 400,
-          view: {
-            error: {
-              code: 'internal.request.semantically_invalid',
-              message: 'The requested form submission cannot be updated in its current state.',
-              trace_id: req.id,
-              timestamp: new Date().toISOString(),
+          };
+        }
+        if (isHandledSentinel(message)) {
+          // SI-006 PR-F2 r3: return-as-cached for the same exactly-once
+          // reason. State-machine guard violations are deterministic
+          // outcomes of (input, current state) — replay should return the
+          // same 400 without re-attempting the state mutation.
+          return {
+            status: 400,
+            view: {
+              error: {
+                code: 'internal.request.semantically_invalid',
+                message: 'The requested form submission cannot be updated in its current state.',
+                trace_id: req.id,
+                timestamp: new Date().toISOString(),
+              },
             },
-          },
-        };
+          };
+        }
+        throw err;
       }
-      throw err;
-    }
-  });
+    },
+  );
 }
 
 /**
