@@ -22,6 +22,9 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
+import type { DbTransaction } from '../../../../lib/db.js';
+import { markIdempotencyManagedByHandler } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { asAccountId, type AccountId } from '../../../identity/internal/types.js';
 import * as delegationService from '../services/delegation-service.js';
@@ -105,6 +108,39 @@ function isString(v: unknown): v is string {
 }
 
 // ---------------------------------------------------------------------------
+// Service-error mapping for withIdempotentExecution.
+//
+// inviteDelegate throws Error with message === DELEGATION_SELF_FORBIDDEN
+// or DELEGATION_CHAIN_FORBIDDEN. Other errors propagate.
+// ---------------------------------------------------------------------------
+
+function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): boolean {
+  if (err instanceof Error) {
+    if (err.message === delegationService.DELEGATION_SELF_FORBIDDEN) {
+      void reply.code(400).send({
+        error: {
+          code: delegationService.DELEGATION_SELF_FORBIDDEN,
+          message: 'Cannot delegate to yourself.',
+          request_id: reqId,
+        },
+      });
+      return true;
+    }
+    if (err.message === delegationService.DELEGATION_CHAIN_FORBIDDEN) {
+      void reply.code(400).send({
+        error: {
+          code: delegationService.DELEGATION_CHAIN_FORBIDDEN,
+          message: 'A delegate cannot create another delegate.',
+          request_id: reqId,
+        },
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // POST /v0/consent/delegations
 // ---------------------------------------------------------------------------
 
@@ -112,6 +148,8 @@ export async function inviteDelegateHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006 PR-C: skip legacy onSend cache writes.
+
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const body = (req.body ?? {}) as InviteBody;
@@ -130,10 +168,10 @@ export async function inviteDelegateHandler(
     });
   }
 
-  try {
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
     const inviteInput: delegationService.InviteDelegateInput = {
       grantor_account_id: actor.accountId as AccountId,
-      delegate_account_id: asAccountId(body.delegate_account_id),
+      delegate_account_id: asAccountId(body.delegate_account_id as string),
       relationship_type: body.relationship_type as DelegationRelationshipType,
     };
     if (body.legal_documentation_id !== undefined) {
@@ -144,35 +182,20 @@ export async function inviteDelegateHandler(
       ctx,
       { actorId: actor.accountId },
       inviteInput,
+      tx,
     );
-    return reply.code(201).send(delegationToPatientView(delegation));
-  } catch (err) {
-    if (err instanceof Error) {
-      if (err.message === delegationService.DELEGATION_SELF_FORBIDDEN) {
-        return reply.code(400).send({
-          error: {
-            code: delegationService.DELEGATION_SELF_FORBIDDEN,
-            message: 'Cannot delegate to yourself.',
-            request_id: req.id,
-          },
-        });
-      }
-      if (err.message === delegationService.DELEGATION_CHAIN_FORBIDDEN) {
-        return reply.code(400).send({
-          error: {
-            code: delegationService.DELEGATION_CHAIN_FORBIDDEN,
-            message: 'A delegate cannot create another delegate.',
-            request_id: req.id,
-          },
-        });
-      }
-    }
-    throw err;
-  }
+    return { status: 201, view: delegationToPatientView(delegation) };
+  });
 }
 
 // ---------------------------------------------------------------------------
 // State transitions
+//
+// SI-006 PR-C: transition wraps the service call in withIdempotentExecution.
+// The service callback receives an externalTx so the reservation INSERT
+// + business mutation + completion UPDATE are atomic.
+// Caller (each handler) is responsible for calling
+// markIdempotencyManagedByHandler at the top of the handler body.
 // ---------------------------------------------------------------------------
 
 async function transition<T>(
@@ -181,28 +204,38 @@ async function transition<T>(
   fn: (
     ctx: ReturnType<typeof requireTenantContext>,
     actor: { actorId: string },
+    tx: DbTransaction,
   ) => Promise<T | null>,
   toView: (v: T) => unknown,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
-  const result = await fn(ctx, { actorId: actor.accountId });
-  if (result === null) {
-    return reply.code(404).send({
-      error: {
-        code: 'internal.resource.not_found',
-        message: 'Delegation transition failed.',
-        request_id: req.id,
-      },
-    });
-  }
-  return reply.code(200).send(toView(result));
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    const result = await fn(ctx, { actorId: actor.accountId }, tx);
+    if (result === null) {
+      // Cache the 404 so retries replay it consistently. The view shape
+      // doesn't match the success view; cast as unknown for the helper's
+      // generic. At runtime the cached body is just JSON.
+      return {
+        status: 404,
+        view: {
+          error: {
+            code: 'internal.resource.not_found',
+            message: 'Delegation transition failed.',
+            request_id: req.id,
+          },
+        } as unknown,
+      };
+    }
+    return { status: 200, view: toView(result) };
+  });
 }
 
 export async function acceptDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({
@@ -216,7 +249,7 @@ export async function acceptDelegationHandler(
   return transition(
     req,
     reply,
-    (ctx, actor) => delegationService.acceptDelegation(ctx, actor, asDelegationId(id)),
+    (ctx, actor, tx) => delegationService.acceptDelegation(ctx, actor, asDelegationId(id), tx),
     delegationToPatientView,
   );
 }
@@ -225,6 +258,7 @@ export async function declineDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({
@@ -238,7 +272,7 @@ export async function declineDelegationHandler(
   return transition(
     req,
     reply,
-    (ctx, actor) => delegationService.declineDelegation(ctx, actor, asDelegationId(id)),
+    (ctx, actor, tx) => delegationService.declineDelegation(ctx, actor, asDelegationId(id), tx),
     delegationToPatientView,
   );
 }
@@ -247,6 +281,7 @@ export async function revokeDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const id = (req.params as { id?: string }).id;
   const body = (req.body ?? {}) as RevokeBody;
   if (!isString(id) || !isString(body.reason) || !VALID_REVOKE_REASONS.has(body.reason)) {
@@ -261,12 +296,13 @@ export async function revokeDelegationHandler(
   return transition(
     req,
     reply,
-    (ctx, actor) =>
+    (ctx, actor, tx) =>
       delegationService.revokeDelegation(
         ctx,
         actor,
         asDelegationId(id),
         body.reason as DelegationRevocationReason,
+        tx,
       ),
     delegationToPatientView,
   );
@@ -310,6 +346,7 @@ export async function grantScopeHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const id = (req.params as { id?: string }).id;
@@ -332,18 +369,22 @@ export async function grantScopeHandler(
     grantInput.visibility_restrictions = body.visibility_restrictions;
   }
 
-  const created = await delegationService.grantScope(
-    ctx,
-    { actorId: actor.accountId, grantorAccountId: actor.accountId as AccountId },
-    grantInput,
-  );
-  return reply.code(201).send(scopeToPatientView(created));
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    const created = await delegationService.grantScope(
+      ctx,
+      { actorId: actor.accountId, grantorAccountId: actor.accountId as AccountId },
+      grantInput,
+      tx,
+    );
+    return { status: 201, view: scopeToPatientView(created) };
+  });
 }
 
 export async function revokeScopeHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  markIdempotencyManagedByHandler(req); // SI-006 PR-C.
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
   const params = req.params as { id?: string; scopeId?: string };
@@ -357,21 +398,27 @@ export async function revokeScopeHandler(
     });
   }
 
-  const revoked = await delegationService.revokeScope(
-    ctx,
-    { actorId: actor.accountId, grantorAccountId: actor.accountId as AccountId },
-    asDelegationScopeId(params.scopeId),
-  );
-  if (revoked === null) {
-    return reply.code(404).send({
-      error: {
-        code: 'internal.resource.not_found',
-        message: 'Scope not found.',
-        request_id: req.id,
-      },
-    });
-  }
-  return reply.code(200).send(scopeToPatientView(revoked));
+  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
+    const revoked = await delegationService.revokeScope(
+      ctx,
+      { actorId: actor.accountId, grantorAccountId: actor.accountId as AccountId },
+      asDelegationScopeId(params.scopeId as string),
+      tx,
+    );
+    if (revoked === null) {
+      return {
+        status: 404,
+        view: {
+          error: {
+            code: 'internal.resource.not_found',
+            message: 'Scope not found.',
+            request_id: req.id,
+          },
+        } as unknown,
+      };
+    }
+    return { status: 200, view: scopeToPatientView(revoked) };
+  });
 }
 
 export async function listScopesForDelegationHandler(
