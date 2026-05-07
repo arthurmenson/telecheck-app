@@ -35,6 +35,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { type DbTransaction, withTransaction } from '../../src/lib/db.ts';
 import {
   IdempotencyBodyMismatchError,
+  IdempotencyInFlightError,
   IdempotencyReplayError,
   type IdempotencyCtx,
   hashBody,
@@ -259,28 +260,92 @@ describe('withIdempotency — Group D: expired-row recovery', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Group E — transaction-discipline check (SAVEPOINT enforcement)
+// Group E — IdempotencyInFlightError on pending row
 // ---------------------------------------------------------------------------
 
-describe('withIdempotency — Group E: transaction discipline', () => {
-  it('throws when caller is not in a transaction (SAVEPOINT enforcement)', async () => {
+describe('withIdempotency — Group E: pending-row in-flight detection', () => {
+  it('manually-seeded pending row → IdempotencyInFlightError on subsequent call', async () => {
     const ctx = freshCtx();
     const client = getTestClient();
-    // Set tenant context but DON'T open a BEGIN. Postgres should
-    // reject the SAVEPOINT statement with code 25P01 / message
-    // "SAVEPOINT can only be used in transaction blocks".
-    await client.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
 
-    // The integration test client is wrapped in a session-wide BEGIN
-    // by tests/setup.ts savepoint pattern, so we can't easily simulate
-    // "no outer transaction" here. This test documents the design
-    // intent; the SAVEPOINT enforcement is tested at the source-code
-    // level by reading idempotency.ts directly. (Codex retro on
-    // PR-A r2 verified this behavior.)
-    //
-    // For runtime evidence of the SAVEPOINT-as-discipline-check, the
-    // helper-side test setup confirms the SAVEPOINT statement is
-    // present at the start of withIdempotency:
-    expect(typeof withIdempotency).toBe('function');
+    // Manually insert a NON-expired pending row for this 4-tuple +
+    // SAME body hash. Mirrors the case where another connection has
+    // reserved but not yet completed.
+    await client.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+    await client.query(
+      `INSERT INTO idempotency_keys
+         (tenant_id, key, endpoint, actor_id, request_hash,
+          processing_state, response_status, response_body,
+          created_at, expires_at)
+       VALUES ($1, $2, $3, $4, decode($5, 'hex'),
+               'pending', 0, NULL,
+               NOW(), NOW() + INTERVAL '24 hours')`,
+      [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId, ctx.bodyHash],
+    );
+
+    // Now call withIdempotency with the same 4-tuple. INSERT conflicts
+    // (row not expired); SELECT finds it; processing_state='pending'
+    // → IdempotencyInFlightError.
+    let bodyExecuted = false;
+    await expect(
+      runWithIdem(ctx, async () => {
+        bodyExecuted = true;
+        return { status: 200, body: { unreachable: true } };
+      }),
+    ).rejects.toThrow(IdempotencyInFlightError);
+    expect(bodyExecuted).toBe(false);
+  });
+
+  it('different body hash on pending row → IdempotencyBodyMismatchError (NOT in-flight)', async () => {
+    const ctx = freshCtx();
+    const client = getTestClient();
+    const originalBodyHash = hashBody('{"original":true}');
+
+    await client.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+    await client.query(
+      `INSERT INTO idempotency_keys
+         (tenant_id, key, endpoint, actor_id, request_hash,
+          processing_state, response_status, response_body,
+          created_at, expires_at)
+       VALUES ($1, $2, $3, $4, decode($5, 'hex'),
+               'pending', 0, NULL,
+               NOW(), NOW() + INTERVAL '24 hours')`,
+      [ctx.tenantId, ctx.idempotencyKey, ctx.endpoint, ctx.actorId, originalBodyHash],
+    );
+
+    // Call with DIFFERENT body hash. Body-mismatch fires regardless
+    // of processing_state per IDEMPOTENCY v5.1 §1.
+    const ctxWithDifferentBody = { ...ctx, bodyHash: hashBody('{"different":true}') };
+    await expect(
+      runWithIdem(ctxWithDifferentBody, async () => ({
+        status: 200,
+        body: { unreachable: true },
+      })),
+    ).rejects.toThrow(IdempotencyBodyMismatchError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group F — source-grep lockdown for SAVEPOINT discipline
+// ---------------------------------------------------------------------------
+
+describe('withIdempotency — Group F: source-grep discipline lockdown', () => {
+  it('idempotency.ts opens SAVEPOINT idempotency_reserve as the first statement', async () => {
+    // Source-grep lockdown: the SAVEPOINT-as-tx-discipline-check is the
+    // mechanism that throws "SAVEPOINT can only be used in transaction
+    // blocks" when a caller passes a non-transactional client. The
+    // integration test setup wraps everything in a session-wide BEGIN
+    // so we can't actually reach that error path at runtime. This
+    // source-grep replaces what was a vacuous Group E `expect(typeof
+    // withIdempotency).toBe('function')` check (PR-D r1 / Codex review
+    // CHALLENGE).
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const src = fs.readFileSync(
+      path.resolve(import.meta.dirname ?? __dirname, '../../src/lib/idempotency.ts'),
+      'utf8',
+    );
+    expect(src).toMatch(/SAVEPOINT\s+idempotency_reserve/);
+    expect(src).toMatch(/RELEASE\s+SAVEPOINT\s+idempotency_reserve/);
   });
 });
