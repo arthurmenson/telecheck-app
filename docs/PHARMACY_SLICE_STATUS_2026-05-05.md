@@ -1,10 +1,36 @@
 # Pharmacy + Refill Slice — Implementation Status
 
-**Date:** 2026-05-05
-**Status:** ⛔ **BLOCKED — Skeleton only at v0.1**
+**Date:** 2026-05-05 (Sprint 33-34 amendment 2026-05-08)
+**Status:** ⛔ **BLOCKED — Skeleton only at v0.1** (unchanged through Sprint 33-34)
 **Final commit:** Sprint 1 / TLC-001 landing commit
-**Blocker:** [SI-001 MedicationRequest schema gap](./SI-001-MedicationRequest-Schema-Gap.md)
-**CI status:** ✅ Green (skeleton only — `/health` returns BLOCKED state)
+**Sprint 33-34 amendment final commit:** no code change — pharmacy module remained at v0.1 skeleton through the SI-006 reserve-then-execute cycle (Pharmacy is in the BLOCKED-aware skeleton group; SI-006 closure work targeted only the implementation-complete slices: forms-intake / identity / consent / async-consult / tenant-config).
+**Blocker:** [SI-001 MedicationRequest schema gap](./SI-001-MedicationRequest-Schema-Gap.md) (still OPEN at the spec corpus governance layer; Promotion Ledger entry P-011 pending)
+**CI status:** ✅ Green (skeleton only — `/health` returns BLOCKED state; `pharmacy-plugin-wiring.test.ts` continues to pass)
+
+---
+
+## Sprint 33-34 amendment (2026-05-08)
+
+The Pharmacy + Refill slice is in the **BLOCKED-aware skeleton group** alongside Subscription (also blocked on SI-001) and Med Interaction Engine (blocked on slice PRD ratification). Sprint 33-34 SI-006 closure work targeted only the implementation-complete slices, so pharmacy was untouched at the source level.
+
+What did NOT change in Sprint 33-34:
+- Module structure (`src/modules/pharmacy/{plugin,routes,internal/types}.ts`) remains as authored at Sprint 1 / TLC-001
+- `routes.ts` continues to mount `/health` returning `{ status: 'ok', module: 'pharmacy', state: 'BLOCKED' }` and slice-specific endpoints returning `{ status: 503 }`
+- `pharmacy-plugin-wiring.test.ts` plugin smoke test continues to pass
+- No schema migrations authored (still BLOCKED on SI-001 — CDM v1.2 §3.5 lists Pharmacy entities #18-#22 in inventory but provides NO §4 field-level expansion)
+
+What benefited indirectly from Sprint 33-34:
+- The cross-cutting `audit_dedupe_markers` table (`migrations/022_audit_dedupe_markers.sql` from Sprint 34 PR #49) is available for any future Category A audit emitter — pharmacy will use this primitive when the slice unblocks.
+- The reserve-then-execute idempotency pattern codified in PROJECT_CONVENTIONS r5 §3.7-§3.9 + the `withIdempotency` + `withIdempotentExecution` helpers in `src/lib/` are ready-to-use for state-changing handlers — pharmacy will follow this pattern from day 1 of slice implementation.
+- The Group F source-grep lockdown in `tests/integration/idempotency-helper.test.ts` extends automatically when pharmacy handlers land (no per-slice lockdown wiring needed).
+
+**On-resume sequencing when SI-001 closes:** the EHBG §10b sprint plan still holds — schema authoring against ratified CDM §4 expansion → repos with composite UNIQUE + composite FK pattern (PROJECT_CONVENTIONS r5 §1.1) → service layer + state-machine guards (per State Machines v1.1 §6 if/when promoted to active state) → HTTP handlers using the reserve-then-execute pattern → audit + domain emitters → cross-tenant isolation tests + idempotency replay regression. Estimated 40-50 commits depending on Codex per-PR adversarial review iteration depth.
+
+### Spec references for the amendment
+
+- `docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md` v0.3 "Implementation Closure" (the redesign that pharmacy will inherit when it unblocks)
+- `docs/PROJECT_CONVENTIONS.md` r5 §3.7 / §3.8 / §3.9 + §1.1 + §5.11 + §5.12 (the patterns pharmacy slice work will follow)
+- `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 (cross-slice cumulative state)
 
 ---
 
