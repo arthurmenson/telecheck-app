@@ -1,9 +1,64 @@
 # Forms / Intake Engine Slice — Implementation Status
 
-**Date:** 2026-05-05
+**Date:** 2026-05-05 (Sprint 33-34 amendment 2026-05-08)
 **Author:** Autonomous turn (Claude Sonnet 4.5)
 **Final commit:** `4ab2663` (forms-intake variant + resume_restored domain events wired at `ba2bc41`; SI-003 raised at `f2a16f3`; test-side flip at `4ab2663`; original Slice 1 stable since pre-`d2b6ea9`; JWT migration through `692206e`; status doc landed at `39a0ede`)
-**CI status:** ✅ Green at `4ab2663`
+**Sprint 33-34 amendment final commit:** `dc06541` (PR #44 PR-F2 forms-intake migration + PR #49 audit-dedupe wiring + PR #48 cleanup-sweep)
+**CI status:** ✅ Green
+
+---
+
+## Sprint 33-34 amendment (2026-05-08)
+
+The Forms-Intake slice received the most security-critical migration in the SI-006 reserve-then-execute cycle because it owns the **I-019 platform-floor crisis-detection gate**. **PR #44 (PR-F2, 5 Codex rounds, 4 HIGH + 1 MEDIUM closures)** migrated 9 state-mutating handlers and rebuilt the Category A audit-emission pattern.
+
+### Migrated handlers
+
+| Handler file | Handler | Endpoint |
+|---|---|---|
+| `templates.ts` | `createTemplateHandler` / `updateTemplateHandler` | POST/PUT `/templates` |
+| `variants.ts` | `createVariantHandler` / `retireVariantHandler` | POST `/variants` (+retire) |
+| `deployments.ts` | `createDeploymentHandler` / `retireDeploymentHandler` | POST `/deployments` (+retire) |
+| `submissions.ts` | `startSubmissionHandler` / `submitSubmissionHandler` | POST `/submissions/start` (+submit) |
+| `resume.ts` | `resumeFormSubmissionHandler` | POST `/submissions/:id/resume` |
+
+### Service-layer change: `externalTx` threading
+
+`template-service.ts:createDeployment` and `submission-repo.ts:createActiveDeployment` gained an optional `externalTx?: DbTransaction` parameter so the handler-owned transaction is reused end-to-end (reservation INSERT + business mutation + completion UPDATE all atomic on the same connection — required for SAVEPOINT idempotency_reserve discipline). When `externalTx` is undefined the service still opens its own transaction (backward-compatible path preserved).
+
+### `runCrisisGate` rebuilt — 3-phase audit-durability hardening
+
+The crisis-detection gate at `submission-service.ts:runCrisisGate` went through 3 distinct hardenings during the cycle, each closing a Codex HIGH:
+
+1. **PR-F2 r2 — Independent-tx Category A audit emission.** Pre-PR-F2 the gate forwarded `externalTx` (the handler's tx) to `emitCrisisDetectionTrigger`. When `runCrisisGate` then threw `CRISIS_DETECTED`, the handler-owned tx rolled back — and the audit rolled back with it. **Silent loss of Category A escalation record violates I-019 + I-003 durability.** Fix: drop the `externalTx` parameter; emit on a fresh `withTransaction(...)` (no `externalTx`). The audit commits independently of business outcome.
+2. **PR-F2 r3 — Return-cached-vs-throw for sentinel paths.** With audit emission durably independent, the next failure mode was: a throw inside `withIdempotency` body callback rolls back the reservation; client retry re-runs the gate, emits a SECOND audit. Fix: `submissions.ts` updateSubmission/submitSubmission/pause handlers now **return** `{ status: 4xx, view: errorEnvelope }` from the body callback for `CRISIS_DETECTED` / `RESPONSE_PAYLOAD_TOO_LARGE` / `isHandledSentinel` instead of throwing httpErrors. Cached 4xx replays from cache; no re-execution; exactly-once preserved.
+3. **PR #49 — `audit_dedupe_markers` cross-cutting infra.** Even with #1 + #2, a process crash between the independent-tx audit commit and the idempotency completion UPDATE leaves the audit durable but the reservation rolled back — a retry under the same Idempotency-Key re-runs the gate. Fix: `runCrisisGate` accepts an optional `idempotencyCtx` parameter; when supplied (HTTP-handler path), claims a slot via `claimAuditDedupeSlot(client, identity)` BEFORE the audit emit. The 6-tuple identity hashes `(tenant_id || idempotency_key || endpoint || actor_id || bodyHash || auditAction)` so cross-tenant + different-body + different-action requests get distinct dedupe keys. If the slot is already claimed (a prior attempt already emitted), skip the emit; the throw still fires.
+
+### Distinct audit_action labels for distinct emit sites
+
+`pauseSubmission` runs `runCrisisGate` BOTH for the patch-side scan AND for the merged-set scan inside the atomic tx. Each site uses a distinct `auditAction` label (`'crisis_detection_trigger'` vs `'crisis_detection_trigger.merged_set'`) so a single request triggering BOTH (rare — would require a payload that's individually clean but crisis-positive only after merging with prior submission state) emits BOTH audits exactly once each, not de-duped against each other.
+
+### `withIdempotentExecution` body-callback widened
+
+PR #49 widened the helper's body-callback signature from `(tx)` to `(tx, idempotencyCtx)` so handlers can forward the ctx into service-layer audit-dedupe claims without re-computing. Backward-compat: existing callers that don't reference the second parameter continued to typecheck.
+
+### Cleanup-sweep impact (PR #48)
+
+`markIdempotencyManagedByHandler(req)` calls deleted from `deployments.ts` (2), `resume.ts` (1), `submissions.ts` (3), `templates.ts` (2), `variants.ts` (2). Functionally a no-op since PR #47 had already removed the legacy onSend hook.
+
+### Test impact
+
+- Existing forms-intake-{templates,variants,deployments,submissions,resume,governance,events,admin,pause,restore,publish}-http tests continued to pass.
+- New: `tests/integration/audit-dedupe.test.ts` (PR #49) — 7 groups covering claim semantics + auditAction discrimination + cross-tenant isolation + purge-expired + bodyHash + post-cache-expiry-different-body + computeAuditDedupeKey collision safety.
+- Documented limitation: tests for non-empty consult_events PHI projection in adjacent slices (e.g., async-consult) wait until SI-001 forms_submission integration enables driving cross-slice transitions cleanly from HTTP integration tests.
+
+### Spec references for the amendment
+
+- `docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md` v0.3 (Implementation Closure section)
+- `docs/PROJECT_CONVENTIONS.md` r5 §3.7 / §3.8 / §3.9 (reserve-then-execute + return-cached-vs-throw + independent-tx Category A + dedupe markers)
+- `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 §1 I-019 row + §2 Forms-Intake slice row + §2 audit-dedupe.ts library row + §3 Forms submission lifecycle row
+- `migrations/022_audit_dedupe_markers.sql` (new table + rollback)
+- `src/lib/audit-dedupe.ts` (new cross-cutting helper)
 
 ---
 
