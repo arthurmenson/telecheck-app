@@ -235,7 +235,7 @@ describe('async-consult HTTP — Group A: happy path lifecycle', () => {
       consult_id: string;
       consult_type: string;
       modality: string;
-      status: string;
+      state: string;
     }>();
     expect(body.consult_id).toBeTruthy();
     expect(body.consult_type).toBe('program');
@@ -246,12 +246,14 @@ describe('async-consult HTTP — Group A: happy path lifecycle', () => {
     // state string would fail this test. State-machine renames are a
     // spec-corpus event; if the canonical label changes, this test
     // updates alongside (Codex Sprint 34 PR-51 review MEDIUM closure
-    // 2026-05-08).
-    expect(body.status).toBe('INITIATED');
+    // 2026-05-08). Field name is `state` per the Consult interface
+    // in src/modules/async-consult/internal/types.ts:127, NOT `status`
+    // (CI-revealed in r4 2026-05-08).
+    expect(body.state).toBe('INITIATED');
     expectNoTenantLeak(response);
   });
 
-  it('A2 GET /v0/async-consult/:id/events returns consult.initiated event (no tenant_id)', async () => {
+  it('A2 GET /v0/async-consult/:id/events returns 200 + empty PHI-safe events array', async () => {
     const { accountId, accessToken } = await seedAuthedPatient();
     const consultId = await initiateConsultViaHttp(accountId, accessToken);
 
@@ -266,19 +268,27 @@ describe('async-consult HTTP — Group A: happy path lifecycle', () => {
       events: Array<{ event_type: string; consult_id: string }>;
     }>();
     expect(Array.isArray(body.events)).toBe(true);
-    // Initiate emits a ConsultEvent with event_type === 'consult.initiated'
-    // (Async Consult Slice PRD §10 + the service-layer event emission in
-    // `initiate` at consult-service.ts; canonical event_type label per
-    // src/modules/async-consult/events.ts:64). Per Codex Sprint 34 PR-51
-    // r2 review 2026-05-08 (MEDIUM closure): assert the exact event_type
-    // AND that it belongs to the consult we just created — a regression
-    // returning some other event_type, omitting consult.initiated, or
-    // returning an unrelated transition would now fail.
-    const initiated = body.events.find((e) => e.event_type === 'consult.initiated');
-    expect(initiated).toBeDefined();
-    expect(initiated!.consult_id).toBe(consultId);
-    // PHI-projection: response body MUST NOT carry tenant_id (Master PRD
-    // v1.10 §17 + Glossary v5.2 C3) or the operating-tenant identifier.
+    // Initiate writes to audit_records + emits a domain event but does
+    // NOT insert into the consult_events table — the consult_events
+    // append-only log is for state-transition records ONLY (per
+    // src/modules/async-consult/internal/services/consult-service.ts —
+    // only `submit`, `abandon`, `resume`, etc. call
+    // consultEventRepo.createStateTransitionEvent; `initiate` does not).
+    // ConsultEventType per types.ts:139 is the singleton 'state_transition'.
+    // So a freshly-initiated consult correctly returns an empty events
+    // array. Pinning a non-empty event_type here would require driving
+    // a transition first, which can't happen cleanly from HTTP without
+    // 48h-aging or seeding a terminal forms_submission. Coverage of
+    // event-row PHI projection on a non-empty result is left to
+    // post-transition tests when those paths become exercisable
+    // (e.g., when SI-001 forms_submission integration lands).
+    //
+    // CI-revealed in PR-51 r4 2026-05-08 — earlier r3 incorrectly
+    // assumed initiate writes a consult_events row.
+    expect(body.events.length).toBe(0);
+    // PHI-projection: response body (even an empty events array) MUST
+    // NOT carry tenant_id (Master PRD v1.10 §17 + Glossary v5.2 C3) or
+    // the operating-tenant identifier.
     expectNoTenantLeak(response);
   });
 });
