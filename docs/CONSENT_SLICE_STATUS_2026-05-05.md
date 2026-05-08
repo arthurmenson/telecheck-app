@@ -1,8 +1,36 @@
 # Consent & Delegated Access Slice — Implementation Status
 
-**Date:** 2026-05-05
+**Date:** 2026-05-05 (Sprint 33-34 amendment 2026-05-08)
 **Final commit:** `e3bc5fb` (8-case domain-events outbox-landing test; 4-case baseline at `f3c759f`; service wiring at `fcfbc3a`; delegation-service direct integration tests at `f4dee93`; consent-service tests at `972a3aa`; HTTP tests at `3f93e6e` / `59292ab`; service+handler scaffold complete at `b7223df`)
+**Sprint 33-34 amendment final commit:** `dc06541` (PR #48 cleanup-sweep removed `markIdempotencyManagedByHandler` calls from consent + delegation handlers as part of the SI-006 reserve-then-execute closure)
 **CI status:** ✅ Green
+
+---
+
+## Sprint 33-34 amendment (2026-05-08)
+
+The Consent & Delegated Access slice already migrated to handler-owned `withIdempotency` in **Sprint 32 PR-C** (pre-Sprint-33; established the pattern that PR-F2/F3/F4 then mirrored). Sprint 33-34 impact on this slice is therefore **light — purely cleanup**:
+
+### Cleanup-sweep impact (PR #48)
+
+`markIdempotencyManagedByHandler(req)` calls were deleted from:
+- `consents.ts` (2 calls — `grantConsentHandler`, `revokeConsentHandler`)
+- `delegations.ts` (6 calls — `inviteDelegate` / `accept` / `decline` / `revoke` / `grantScope` / `revokeScope`)
+
+Functionally a no-op since PR #47 (PR-E) had already removed the legacy onSend hook the flag controlled. The lockdown extension in `tests/integration/idempotency-helper.test.ts` Group F now pins `markIdempotencyManagedByHandler` identifier absence in comment-stripped `idempotency.ts`, so reintroducing the helper anywhere would fail the lockdown.
+
+### What did NOT change in this slice
+
+- Handler shape: `withIdempotentExecution<unknown>(req, reply, mapServiceError, async (tx) => {...})` — same as PR-C established
+- Service-layer signatures: still take optional `externalTx?: DbTransaction`
+- Audit emission: `consent.granted` / `consent.revoked` / `delegation.*` emissions are Category C (operational), NOT Category A — so the audit-dedupe SI (PR #49) does NOT apply. Category C audits inherit the handler's transaction by design (acceptable rollback semantics for non-safety-critical events).
+- 13 routes mounted under `/v0/consent` — no change
+
+### Spec references for the amendment
+
+- `docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md` v0.3 (Implementation Closure section — the consent slice was the second migration target after async-consult; PR-C is cited as one of the original mirrors of PR-B)
+- `docs/PROJECT_CONVENTIONS.md` r5 §3.7 (Reserve-then-execute is the only path)
+- `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 §2 Consent + Delegation slice row (test-files inventory unchanged from r4)
 
 ---
 

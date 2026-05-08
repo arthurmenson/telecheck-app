@@ -1,9 +1,54 @@
 # Identity & Auth Slice — Implementation Status
 
-**Date:** 2026-05-05
+**Date:** 2026-05-05 (Sprint 33-34 amendment 2026-05-08)
 **Author:** Autonomous turn (Claude Sonnet 4.5)
 **Final commit:** `fcd25f4` (9-case domain-events outbox-landing test; 5-case original test at `4fa12b3`; events wiring at `aec04ce` + `663c8fb`; original slice landing at `692206e`)
+**Sprint 33-34 amendment final commit:** `dc06541` (PROJECT_CONVENTIONS r5; SI-006 reserve-then-execute fully landed across Sprint 33 PRs #43-#49 + Sprint 34 PR #51)
 **CI status:** ✅ Green
+
+---
+
+## Sprint 33-34 amendment (2026-05-08)
+
+The Identity & Auth slice received the heaviest-impact migration in the SI-006 reserve-then-execute redesign cycle. **PR #45 (PR-F3, 5 Codex rounds, 2 HIGH + 3 MEDIUM closures)** migrated 8 state-mutating handlers in `src/modules/identity/internal/handlers/` from the legacy preHandler-stash + onSend-cache-write pattern to handler-owned `withIdempotency` reservation:
+
+| Handler | Endpoint | TTL override |
+|---|---|---|
+| `loginInitiateHandler` | `POST /login/initiate` | — (24h default) |
+| `loginVerifyHandler` | `POST /login/verify` | **900s** (aligned to JWT access_token TTL per `jwt.ts:62`) |
+| `logoutHandler` | `POST /logout` | — |
+| `refreshTokenHandler` | `POST /refresh` | — |
+| `registrationInitiateHandler` | `POST /registration/initiate` | — |
+| `registrationVerifyHandler` | `POST /registration/verify` | **900s** (same JWT-aligned reasoning) |
+| `registrationFinalizeHandler` | `POST /registration/finalize` | — |
+| `revokeDeviceHandler` | `POST /devices/:id/revoke` | — |
+
+### Why the auth-flow paths get a TTL override
+
+`loginVerifyHandler` and `registrationVerifyHandler` cache responses whose body contains plaintext `access_token` + `refresh_token` to satisfy the IDEMPOTENCY v5.1 retry contract — a client retrying a network-blip-failed verify must receive the **same** tokens, not a fresh pair, to avoid orphaning the original session. Cached plaintext credentials at the migration default 24h would create a 96x exposure-window regression vs. the 900s JWT TTL. **Cache TTL = JWT TTL** means cached responses cannot outlive the bearer they contain.
+
+### Codex closures specific to Identity
+
+- **PR-F3 r4-r5 sessionRefresh exempt-paths fix:** `POST /v0/identity/sessions/refresh` is now in `EXEMPT_PATHS` — it MUST NOT be cached because `refreshTokenHandler` rotates the refresh token (a `revoked_at` timestamp on the prior session). A cached 200 response would mask a session-revocation race where the second refresh sees the stale-but-still-cached token. The exempt-paths set is the only correct treatment for endpoints whose response is intentionally state-mutating in the auth layer.
+- **PR-F3 PHONE_TAKEN sentinel mapping:** `mapServiceError` now translates `PHONE_TAKEN` (uniqueness violation on `accounts.phone_e164`) to a tenant-blind 400 (was 500 leak). Surfaced by registration-flow concurrency test.
+
+### Per-handler error-mapping completeness
+
+The full identity `mapServiceError` now handles: `OTP_LOCKOUT_ACTIVE` (429), `PHONE_TAKEN` (400), `INVALID_OTP` (400), `OTP_EXPIRED` (400), `SESSION_REVOKED` (401), `INVALID_REFRESH_TOKEN` (401). All routed to ERROR_MODEL v5.1 canonical envelopes; cross-tenant existence is never leaked per I-025.
+
+### Test impact
+
+No new test files added in PR #45; existing identity-{login,registration,devices,accounts-me}-http tests continued to pass under the migrated handler shape. The 4 new MEDIUM closures across the 5 Codex rounds were closed via in-handler edits, not test additions.
+
+### Cleanup-sweep impact (PR #48)
+
+`markIdempotencyManagedByHandler(req)` calls deleted from `login.ts` (4 calls), `registration.ts` (2 calls), `devices.ts` (2 calls). Functionally a no-op since PR #47 (PR-E) had already removed the legacy onSend hook the flag controlled. Lockdown extended to pin `markIdempotencyManagedByHandler` identifier absence in comment-stripped `idempotency.ts`.
+
+### Spec references for the amendment
+
+- `docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md` v0.3 (Implementation Closure section)
+- `docs/PROJECT_CONVENTIONS.md` r5 §3.7 (Reserve-then-execute is the only path) + §3.8 (Return-cached-vs-throw)
+- `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 §1 I-016 row + §2 Identity slice row
 
 ---
 
