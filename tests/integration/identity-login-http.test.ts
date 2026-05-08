@@ -5,12 +5,16 @@
  * POST /v0/identity/sessions/{refresh,logout} end-to-end via Fastify
  * inject().
  *
- * Coverage in this file (4 sections, 11 cases).
+ * Coverage in this file (5 sections, 13 cases).
  *
  * Spec references:
  *   - src/modules/identity/internal/handlers/login.ts (target)
  *   - Identity & Authentication Spec v1.0 §3
  *   - I-025 (tenant-blind: no account enumeration)
+ *   - IDEMPOTENCY v5.1 §1 (cache 4-tuple + replay/body-mismatch — §5)
+ *   - SI-006 reserve-then-execute (Sprint 33-34; §5 pins the v5.1
+ *     contract on /login/verify which is the security-critical
+ *     900s-TTL handler caching plaintext access_token + refresh_token)
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -335,5 +339,142 @@ describe('identity login HTTP — §4 sessions/{refresh,logout}', () => {
       payload: { refresh_token: 'phantom-token-xyz' },
     });
     expect(response.statusCode).toBe(204);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5 — IDEMPOTENCY v5.1 contract on POST /v0/identity/login/verify
+// ---------------------------------------------------------------------------
+//
+// Sprint 33 PR-F3 migrated `loginVerifyHandler` to handler-owned
+// `withIdempotency` AND added a 900s TTL override for this endpoint
+// (aligned to JWT access_token TTL per `jwt.ts:62`). The 900s pin
+// is what makes a network-blip retry safe: the cached response holds
+// plaintext access_token + refresh_token, and cache TTL = JWT TTL
+// means cached responses cannot outlive the bearer they contain.
+//
+// Cases:
+//   §5a same key + same body → cached 200 replay; SAME tokens
+//        returned (proves NO second session was issued — the cache
+//        replay short-circuits at preHandler, the handler body
+//        callback does not run, no second verifyOtp + no second
+//        issueSession side effects)
+//   §5b same key + different body → 409 body_mismatch; the body
+//        hash check fires BEFORE the handler body callback runs,
+//        so the OTP from the first call is NOT reconsumed and the
+//        second call's `code` is NEVER passed to verifyOtp
+//
+// Spec references:
+//   - src/lib/idempotency.ts ENDPOINT_TTL_OVERRIDES + ttlSecondsForEndpoint
+//   - IDEMPOTENCY v5.1 §1 (cache 4-tuple PK; same-body replay;
+//     different-body 409)
+//   - docs/PROJECT_CONVENTIONS.md r5 §3.7 (Reserve-then-execute)
+//   - docs/IDENTITY_SLICE_STATUS_2026-05-05.md Sprint 33-34
+//     amendment (TTL-override rationale: Cache TTL = JWT TTL)
+// ---------------------------------------------------------------------------
+
+describe('identity login HTTP — §5 IDEMPOTENCY v5.1 contract on /login/verify', () => {
+  it('§5a same Idempotency-Key + same body → cached 200 replay (same tokens)', async () => {
+    const { phone, accountId } = await seedActiveAccount();
+    const otpId = asOtpId(ulid());
+    const { codePlaintext } = await withTenantContext(T_US, () =>
+      otpService.issueOtp(
+        US_CTX,
+        { actorId: 'op_seed' },
+        {
+          otp_id: otpId,
+          account_id: asAccountId(accountId),
+          phone_e164: phone,
+          purpose: 'login',
+        },
+        getTestClient(),
+      ),
+    );
+    const idempotencyKey = ulid();
+    const payload = { phone_e164: phone, code: codePlaintext };
+
+    // First request: real verify, OTP consumed, session issued.
+    const first = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/login/verify',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload,
+    });
+    expect(first.statusCode).toBe(200);
+    const firstBody = first.json<{
+      account: { account_id: string };
+      session: { session_id: string };
+      refresh_token: string;
+      access_token: string;
+    }>();
+    expect(firstBody.session.session_id).toBeTruthy();
+
+    // Second request: same key + same body. preHandler cache-replay
+    // short-circuits BEFORE the handler body. NO second verifyOtp,
+    // NO second issueSession. The cached response is replayed
+    // verbatim — same session_id, same tokens.
+    const second = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/login/verify',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload,
+    });
+    expect(second.statusCode).toBe(200);
+    const secondBody = second.json<{
+      account: { account_id: string };
+      session: { session_id: string };
+      refresh_token: string;
+      access_token: string;
+    }>();
+    // The exactly-once contract: same session_id, same tokens, same
+    // account_id. If the handler had re-run, the second call would
+    // have failed verifyOtp (the OTP was consumed by the first
+    // call) — so a successful 200 here with identical tokens
+    // structurally proves the cache replay path.
+    expect(secondBody.session.session_id).toBe(firstBody.session.session_id);
+    expect(secondBody.refresh_token).toBe(firstBody.refresh_token);
+    expect(secondBody.access_token).toBe(firstBody.access_token);
+    expect(secondBody.account.account_id).toBe(firstBody.account.account_id);
+  });
+
+  it('§5b same Idempotency-Key + different body → 409 internal.idempotency.body_mismatch', async () => {
+    const { phone, accountId } = await seedActiveAccount();
+    const otpId = asOtpId(ulid());
+    const { codePlaintext } = await withTenantContext(T_US, () =>
+      otpService.issueOtp(
+        US_CTX,
+        { actorId: 'op_seed' },
+        {
+          otp_id: otpId,
+          account_id: asAccountId(accountId),
+          phone_e164: phone,
+          purpose: 'login',
+        },
+        getTestClient(),
+      ),
+    );
+    const idempotencyKey = ulid();
+
+    const first = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/login/verify',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload: { phone_e164: phone, code: codePlaintext },
+    });
+    expect(first.statusCode).toBe(200);
+
+    // Second request: same key, DIFFERENT body (code flipped). The
+    // body hash check at withIdempotency reservation time fires
+    // BEFORE the handler body callback runs — so verifyOtp is NOT
+    // called with the new code. Returns 409 immediately.
+    const second = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/login/verify',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload: { phone_e164: phone, code: '000000' },
+    });
+    expect(second.statusCode).toBe(409);
+    const errorBody = second.json<{ error: { code: string } }>();
+    expect(errorBody.error.code).toBe('internal.idempotency.body_mismatch');
   });
 });
