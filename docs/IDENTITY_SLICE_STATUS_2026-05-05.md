@@ -30,11 +30,16 @@ The Identity & Auth slice received the heaviest-impact migration in the SI-006 r
 ### Codex closures specific to Identity
 
 - **PR-F3 r4-r5 sessionRefresh exempt-paths fix:** `POST /v0/identity/sessions/refresh` is now in `EXEMPT_PATHS` — it MUST NOT be cached because `refreshTokenHandler` rotates the refresh token (a `revoked_at` timestamp on the prior session). A cached 200 response would mask a session-revocation race where the second refresh sees the stale-but-still-cached token. The exempt-paths set is the only correct treatment for endpoints whose response is intentionally state-mutating in the auth layer.
-- **PR-F3 PHONE_TAKEN sentinel mapping:** `mapServiceError` now translates `PHONE_TAKEN` (uniqueness violation on `accounts.phone_e164`) to a tenant-blind 400 (was 500 leak). Surfaced by registration-flow concurrency test.
+- **PR-F3 PHONE_TAKEN handling — return-cached-vs-throw inside body callback** (per PROJECT_CONVENTIONS r5 §3.8): `registration.ts` `registrationStartHandler` catches the `accountService.PhoneTakenError` (or duplicate-key error) **inside the `withIdempotency` body callback** and **returns** `{ status: 400, view: makeErrorEnvelope(req.id, PHONE_TAKEN, ...) }` — NOT a throw. Throwing would roll back the reservation and break exactly-once on retries. Same pattern at `registrationVerifyHandler` for the post-OTP create-account path. Code: `registration.ts:150-156` + `:264-274` + `:323`.
 
-### Per-handler error-mapping completeness
+### Per-handler error-mapping surface
 
-The full identity `mapServiceError` now handles: `OTP_LOCKOUT_ACTIVE` (429), `PHONE_TAKEN` (400), `INVALID_OTP` (400), `OTP_EXPIRED` (400), `SESSION_REVOKED` (401), `INVALID_REFRESH_TOKEN` (401). All routed to ERROR_MODEL v5.1 canonical envelopes; cross-tenant existence is never leaked per I-025.
+The identity `mapServiceError` functions explicitly route only **`OTP_LOCKOUT_ACTIVE`** (in both `login.ts:mapServiceError` and `registration.ts:mapServiceError`) to a canonical 400 envelope (`makeErrorEnvelope(reqId, otpService.OTP_LOCKOUT_ACTIVE, ...)`). `devices.ts:mapServiceError` is a no-op (returns false). All other identity error surfaces are handled either:
+1. **Inline in the handler body callback** via return-cached-vs-throw (PHONE_TAKEN; PR-F3 r4-r5 closures).
+2. **Inline in handler validation** before the body callback (`!isString(body.phone_e164)` → 400; `body.account_id !== actor.accountId` → 400).
+3. **Propagated to Fastify global error handler** for unmapped exceptions (DB connectivity errors, etc.).
+
+This split — narrow `mapServiceError` + broad inline-in-body handling — matches the §3.8 discipline: only deterministic-4xx-outcomes-of-input get the cached-error treatment; truly-unhandled exceptions roll back the reservation cleanly via Fastify's global handler.
 
 ### Test impact
 
