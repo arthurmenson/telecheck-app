@@ -9,13 +9,16 @@
  *   - phone collision (PHONE_TAKEN) on start with existing phone
  *   - invalid code on verify
  *
- * Coverage in this file (4 sections, 8 cases):
+ * Coverage in this file (5 sections, 10 cases):
  *
  * Spec references:
  *   - src/modules/identity/internal/handlers/registration.ts (target)
  *   - Identity & Authentication Spec v1.0 §2
  *   - Master PRD v1.10 §17 + Glossary v5.2 C3 (no tenant_id in
  *     patient response bodies)
+ *   - IDEMPOTENCY v5.1 §1 (cache 4-tuple + replay/body-mismatch — §5)
+ *   - SI-006 reserve-then-execute (Sprint 33-34 PR-F3 migration of
+ *     registrationVerifyHandler; 900s TTL override)
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -291,5 +294,133 @@ describe('identity registration HTTP — §4 tenant-blind error envelopes', () =
     expect(response.body).not.toContain('Telecheck-US');
     expect(response.body).not.toContain('Telecheck-Ghana');
     expect(response.body.toLowerCase()).not.toContain('heros');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5 — IDEMPOTENCY v5.1 contract on POST /v0/identity/registration/verify
+// ---------------------------------------------------------------------------
+//
+// Sprint 33 PR-F3 migrated `registrationVerifyHandler` to handler-owned
+// `withIdempotency` AND added a 900s TTL override (aligned to JWT
+// access_token TTL per `jwt.ts:62`). Mirrors the pattern from PR #60
+// (devices §4) + PR #61 (login §5).
+//
+// Cases:
+//   §5a same key + same body → cached 201 replay; SAME account_id
+//        returned (proves NO second account was created — if the
+//        handler re-ran, verifyOtp would fail because the OTP is
+//        consumed by the first call)
+//   §5b same key + different body → 409 body_mismatch; the body
+//        hash check fires BEFORE the handler body callback runs
+//
+// The §3.8 PHONE_TAKEN return-cached pattern at registration.ts:321-324
+// is covered separately by §1b + §4a; §5 specifically pins the
+// IDEMPOTENCY v5.1 cache 4-tuple contract on the success-path body.
+// ---------------------------------------------------------------------------
+
+describe('identity registration HTTP — §5 IDEMPOTENCY v5.1 contract on /registration/verify', () => {
+  it('§5a same Idempotency-Key + same body → cached 201 replay (same account_id)', async () => {
+    const phone = uniquePhone();
+    const otpId = asOtpId(ulid());
+    const { codePlaintext } = await withTenantContext(T_US, () =>
+      otpService.issueOtp(
+        US_CTX,
+        { actorId: 'op_seed' },
+        { otp_id: otpId, phone_e164: phone, purpose: 'registration' },
+        getTestClient(),
+      ),
+    );
+    const idempotencyKey = ulid();
+    const payload = {
+      otp_id: otpId,
+      code: codePlaintext,
+      phone_e164: phone,
+      first_name: 'Replay',
+      last_name: 'Test',
+      date_of_birth: '1990-01-01',
+      gender: 'prefer_not_to_say' as const,
+    };
+
+    // First request: real verify, OTP consumed, account created +
+    // activated.
+    const first = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/registration/verify',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload,
+    });
+    expect(first.statusCode).toBe(201);
+    const firstBody = first.json<{ account_id: string; status: string }>();
+    expect(firstBody.account_id).toBeTruthy();
+    expect(firstBody.status).toBe('active');
+
+    // Second request: same key + same body. preHandler cache-replay
+    // short-circuits BEFORE handler body. NO second verifyOtp, NO
+    // second createAccount.
+    const second = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/registration/verify',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload,
+    });
+    expect(second.statusCode).toBe(201);
+    const secondBody = second.json<{ account_id: string; status: string }>();
+    // Exactly-once: same account_id. If handler re-ran, verifyOtp
+    // would fail (OTP consumed) — successful 201 with same
+    // account_id structurally proves cache replay path.
+    expect(secondBody.account_id).toBe(firstBody.account_id);
+    expect(secondBody.status).toBe('active');
+  });
+
+  it('§5b same Idempotency-Key + different body → 409 internal.idempotency.body_mismatch', async () => {
+    const phone = uniquePhone();
+    const otpId = asOtpId(ulid());
+    const { codePlaintext } = await withTenantContext(T_US, () =>
+      otpService.issueOtp(
+        US_CTX,
+        { actorId: 'op_seed' },
+        { otp_id: otpId, phone_e164: phone, purpose: 'registration' },
+        getTestClient(),
+      ),
+    );
+    const idempotencyKey = ulid();
+
+    const first = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/registration/verify',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload: {
+        otp_id: otpId,
+        code: codePlaintext,
+        phone_e164: phone,
+        first_name: 'Original',
+        last_name: 'Name',
+        date_of_birth: '1990-01-01',
+        gender: 'prefer_not_to_say',
+      },
+    });
+    expect(first.statusCode).toBe(201);
+
+    // Second request: same key, DIFFERENT body (first_name changed).
+    // Body hash check at withIdempotency reservation time fires
+    // BEFORE handler body callback. Returns 409 immediately.
+    const second = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/registration/verify',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload: {
+        otp_id: otpId,
+        code: codePlaintext,
+        phone_e164: phone,
+        first_name: 'Different',
+        last_name: 'Name',
+        date_of_birth: '1990-01-01',
+        gender: 'prefer_not_to_say',
+      },
+    });
+    expect(second.statusCode).toBe(409);
+    const errorBody = second.json<{ error: { code: string } }>();
+    expect(errorBody.error.code).toBe('internal.idempotency.body_mismatch');
   });
 });
