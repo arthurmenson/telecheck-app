@@ -6,7 +6,13 @@ Implementation of the Telecheck multi-tenant AI-powered telehealth platform.
 
 ## Status
 
-**Bootstrap commit only — no slice implementation has begun.** The repo scaffold is in place; first slice per Engineering Handoff Build Guide v1.3 §10 is Forms/Intake Engine Slice PRD v2.1.
+**5 modules implementation-complete + 3 BLOCKED-aware skeletons** as of Sprint 34 close (2026-05-08):
+
+- **Implementation-complete:** Forms-Intake (slice PRD v2.1), Identity & Auth (v1.0), Consent + Delegation (v1.0), Async Consult (v1.0), Tenant Configuration (read paths; admin-write 503-stubbed pending Admin Backend slice v1.1 ratification).
+- **BLOCKED-aware skeletons:** Pharmacy + Refill, Subscription (both blocked on SI-001 MedicationRequest schema gap), Medication Interaction Engine (blocked on slice PRD ratification).
+- **Cross-cutting infra:** SI-006 reserve-then-execute idempotency redesign closed across Sprint 33-34 (9 PRs); cross-cutting Category A audit-dedupe primitive at `src/lib/audit-dedupe.ts`; per-tenant KMS + 3-layer RLS + audit hash-chain all live.
+
+Slice-level state lives in `docs/{FORMS_INTAKE,IDENTITY,CONSENT,PHARMACY}_SLICE_STATUS_2026-05-05.md` (each with Sprint 33-34 amendment sections appended). Cumulative cross-slice state lives in `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5. Cross-cutting patterns codified in `docs/PROJECT_CONVENTIONS.md` r5. Spec-issue artifacts in `docs/SI-*.md` (SI-006 closed at v0.3; SI-001/002/003 still open).
 
 ## Tech stack
 
