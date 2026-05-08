@@ -62,4 +62,32 @@ The **`slice-implementation` skill** (per EHBG §13, configured under `.claude/s
 
 ## Status
 
-**Empty at bootstrap.** The first slice (Forms/Intake per EHBG §10) creates the first module here.
+**5 modules implementation-complete + 3 BLOCKED-aware skeletons as of Sprint 34 (2026-05-08).** The remaining 14 modules from the System Architecture v1.2 §13 list await slice authoring.
+
+### Implementation-complete (v1.0 surface)
+
+| Module | Directory | Slice PRD | Notable Sprint 33-34 work |
+|---|---|---|---|
+| **Forms / Intake Engine** | `forms-intake/` | v2.1 | Sprint 33 PR-F2 reserve-then-execute migration (10 handlers); Sprint 34 PR #49 audit-dedupe wiring into `runCrisisGate` |
+| **Identity & Auth** | `identity/` | v1.0 | Sprint 33 PR-F3 reserve-then-execute migration (8 handlers); 900s TTL override on auth-flow paths; sessionRefresh exempt-paths fix |
+| **Consent + Delegated Access** | `consent/` | v1.0 | Sprint 32 PR-C established the reserve-then-execute pattern PR-F2/F3 then mirrored; Sprint 34 cleanup-sweep removed legacy markers |
+| **Async Consult** | `async-consult/` | v1.0 | Sprint 33 PR-F-prep migration (5 handlers); Sprint 34 PR #51 added comprehensive HTTP integration tests + handler `InvalidTransitionError` 500-leak fix |
+| **Tenant Configuration** | `tenant-config/` | v1.0 (read-only paths); Admin Backend v1.1 ratification pending for write paths | Sprint 33 PR-F4 503-stub markers (admin-write fail-closed pending Admin Backend slice ratification) |
+
+### BLOCKED-aware module skeletons (v0.1 health probes only)
+
+| Module | Directory | Blocker |
+|---|---|---|
+| **Pharmacy + Refill** | `pharmacy/` | SI-001 (MedicationRequest schema gap) |
+| **Subscription** | `subscription/` | SI-001 (binds to MedicationRequest via `medication_request_id`) |
+| **Medication Interaction Engine** | `med-interaction/` | Med Interaction Engine slice PRD ratification |
+
+Each skeleton ships `routes.ts` returning `{ status: 503 }` on slice-specific endpoints + `{ status: 200 }` on `/health`. Ready to flip to real implementation as soon as the upstream blocker closes.
+
+### Cross-cutting wins from Sprint 33-34 SI-006 closure
+
+- All 5 implementation-complete modules' state-changing handlers migrated to handler-owned `withIdempotency` (no legacy onSend cache-write hook anywhere — `tests/integration/idempotency-helper.test.ts` Group F source-grep lockdown pins the absence)
+- Cross-cutting Category A audit-dedupe primitive (`src/lib/audit-dedupe.ts`) used by `runCrisisGate` in forms-intake; ready for any future Category A emitter
+- Per-PR Codex adversarial review across the 9-PR SI-006 cycle closed 18 substantive findings (11 HIGH + 7 MEDIUM)
+
+See `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 + `docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md` v0.3 + the per-slice status docs (`docs/{CONSENT,IDENTITY,FORMS_INTAKE,PHARMACY}_SLICE_STATUS_2026-05-05.md`) for the full state.
