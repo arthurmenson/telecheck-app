@@ -117,7 +117,7 @@ jobs:
         # Bench JSON is artifact-attached for post-mortem investigation.
         # No fixed retention beyond the GH default (90 days).
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-output-${{ github.run_id }}
           path: tests/perf/bench-output.json
