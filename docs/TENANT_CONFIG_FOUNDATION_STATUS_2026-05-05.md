@@ -1,9 +1,37 @@
 # Tenant-Config Foundation — Implementation Status
 
-**Date:** 2026-05-05
+**Date:** 2026-05-05 (Sprint 33-34 amendment 2026-05-08)
 **Author:** Autonomous turn (Claude Sonnet 4.5)
 **Final commit:** `c378dd7` (resolveQuietHours tests; resolver+CCR_KEYS at `fb13a90`+`37a7205`; cross-tenant tests at `ecf0f4a`; HTTP layer at `9740e7b`; data layer at `25e6026`; migrations at `eacafeb`+`11fd332`)
-**CI status:** ✅ Green at `c378dd7`
+**Sprint 33-34 amendment final commit:** `dc06541` (PR #46 PR-F4 admin-write 503-stub markers landed alongside the SI-006 reserve-then-execute closure; admin-write paths fail-closed pending Admin Backend slice v1.1 ratification)
+**CI status:** ✅ Green at all amendment commits
+
+---
+
+## Sprint 33-34 amendment (2026-05-08)
+
+The tenant-config foundation read paths shipped at v1.0 in the Sprint 5-7 burst (per the original body below). Sprint 33-34 SI-006 reserve-then-execute closure had a focused impact on this module:
+
+- **PR #46 / PR-F4 (Sprint 33)** — admin-write 503-stub markers landed across `internal/handlers/admin-write.ts` (PATCH `/tenant-brand`, PATCH `/ccr-configs/:configKey`, POST `/adapter-configs`, PATCH `/adapter-configs/:adapterId`, DELETE `/adapter-configs/:adapterId`). Each handler returns `{ status: 503 }` with the canonical error envelope, signaling that admin-write is unavailable pending Admin Backend slice v1.1 ratification (encryption-at-rest + operator auth + cross-tenant break-glass primitives required before write paths can ship). The `/ready` endpoint at `routes.ts` returns 503 in all environments today via `adminWriteReadyHandler`, so Kubernetes/LB readiness probes continue to keep traffic off the admin-write surface. (1 Codex round; clean close.)
+
+What did NOT change in Sprint 33-34:
+- Read paths remain at v1.0: patient-app `GET /v0/tenant-config/me` bootstrap + admin-read endpoints for country profiles, tenant brand, CCR configs, adapter configs all continue to work as authored.
+- Cross-tenant isolation tests (`tenant-config-cross-tenant-isolation.test.ts`) continue to pass; I-023 / I-024 / I-025 enforcement unchanged.
+- CCR resolver service (`ccr-resolver.ts`) and the CCR key registry (`ccr-keys.ts`, including the 11 v1.10-cycle additions for marketing + research) unchanged.
+- Schema layer (`migrations/018_tenant_config.sql` + `migrations/019_adapter_configs_tenant_users.sql`) unchanged.
+
+What benefited indirectly from Sprint 33-34:
+- The 503-stub handlers are now wired through the same canonical error envelope path that the implementation-complete slices use — when Admin Backend v1.1 ratifies and write paths un-stub, they will use the reserve-then-execute idempotency pattern + `withIdempotency` + handler-owned cache writes (per PROJECT_CONVENTIONS r5 §3.7) without any per-handler scaffolding cost.
+- The cross-cutting `audit_dedupe_markers` table (`migrations/022_audit_dedupe_markers.sql`) is available for any Category A audit emit on the future write paths (admin-action audit emission per AUDIT_EVENTS v5.2).
+
+**On-resume sequencing when Admin Backend v1.1 ratifies:** unstub the 5 admin-write handlers (PATCH tenant-brand, PATCH ccr-configs, POST adapter-configs, PATCH adapter-configs, DELETE adapter-configs) → wire `withIdempotency` + reserve-then-execute pattern → emit `tenant_config.<scope>.<verb>` audit events (Category A, dedupe-marker-protected per Sprint 34 PR #49 pattern) → flip `/ready` to return 200 once env-gate criteria are met. Cross-tenant isolation tests already cover the read paths; write-path cross-tenant tests are the new addition.
+
+### Spec references for the amendment
+
+- `docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md` v0.3 "Implementation Closure" (the redesign that admin-write paths will inherit when they unstub)
+- `docs/PROJECT_CONVENTIONS.md` r5 §3.7 / §3.8 / §3.9 + §5.11 + §5.12 (the patterns admin-write handlers will follow)
+- `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 (cross-slice cumulative state; tenant-config row notes Sprint 33 PR-F4 503-stub markers)
+- Master PRD v1.10 §10.5 (program catalog architecture + CCR runtime; the v1.10 cycle's 11 new CCR keys were canonicalized in `ccr-keys.ts` as part of the v1.10.1 hygiene cycle)
 
 ---
 
