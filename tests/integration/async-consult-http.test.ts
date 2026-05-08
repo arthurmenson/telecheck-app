@@ -197,6 +197,12 @@ async function initiateConsultViaHttp(accountId: AccountId, accessToken: string)
     },
   });
   expect(response.statusCode).toBe(201);
+  // Per Codex Sprint 34 PR-51 r2 review 2026-05-08 (MEDIUM closure):
+  // the all-responses tenant-leak invariant must be enforced at the
+  // shared helper boundary too, otherwise future payload/header
+  // changes here become a silent blind spot for callers (A2, B2, B3
+  // depend on this helper).
+  expectNoTenantLeak(response);
   const body = response.json<{ consult_id: string }>();
   return body.consult_id;
 }
@@ -256,11 +262,21 @@ describe('async-consult HTTP — Group A: happy path lifecycle', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    const body = response.json<{ events: Array<{ event_type: string }> }>();
+    const body = response.json<{
+      events: Array<{ event_type: string; consult_id: string }>;
+    }>();
     expect(Array.isArray(body.events)).toBe(true);
-    // Initiate emits at least one ConsultEvent (Async Consult Slice PRD
-    // §10 + the service-layer audit/event emission in `initiate`).
-    expect(body.events.length).toBeGreaterThanOrEqual(1);
+    // Initiate emits a ConsultEvent with event_type === 'consult.initiated'
+    // (Async Consult Slice PRD §10 + the service-layer event emission in
+    // `initiate` at consult-service.ts; canonical event_type label per
+    // src/modules/async-consult/events.ts:64). Per Codex Sprint 34 PR-51
+    // r2 review 2026-05-08 (MEDIUM closure): assert the exact event_type
+    // AND that it belongs to the consult we just created — a regression
+    // returning some other event_type, omitting consult.initiated, or
+    // returning an unrelated transition would now fail.
+    const initiated = body.events.find((e) => e.event_type === 'consult.initiated');
+    expect(initiated).toBeDefined();
+    expect(initiated!.consult_id).toBe(consultId);
     // PHI-projection: response body MUST NOT carry tenant_id (Master PRD
     // v1.10 §17 + Glossary v5.2 C3) or the operating-tenant identifier.
     expectNoTenantLeak(response);
