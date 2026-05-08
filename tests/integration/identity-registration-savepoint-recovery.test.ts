@@ -246,6 +246,18 @@ describe('identity registration — SAVEPOINT recovery contract (PR-F3 r4-r5)', 
       },
     });
 
+    // Diagnostic: if the SAVEPOINT recovery doesn't kick in, the
+    // response would be 500 with whatever Fastify global handler
+    // surfaces. Log the body so CI tells us what error is actually
+    // bubbling up. (Leave this in; cheap to keep, valuable on
+    // future regression.)
+    if (response.statusCode !== 400) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[§1b diagnostic] expected 400, got ${response.statusCode}; body=${response.body.slice(0, 500)}`,
+      );
+    }
+
     expect(response.statusCode).toBe(400);
     const errorBody = response.json<{ error: { code: string } }>();
     expect(errorBody.error.code).toBe('identity.registration.phone_taken');
