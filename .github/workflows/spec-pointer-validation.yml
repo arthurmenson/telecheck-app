@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout app repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: telecheck-app
 
@@ -44,7 +44,7 @@ jobs:
       # arthurmenson/telecheckONE is private (current state), the clone fails. We
       # capture that into a step output so the canary steps can downgrade themselves
       # to advisory warnings rather than blocking CI on an auth gap that lives in
-      # repo-admin (provision SPEC_REPO_TOKEN secret + actions/checkout@v4 with a
+      # repo-admin (provision SPEC_REPO_TOKEN secret + actions/checkout@v6 with a
       # PAT) rather than in this PR's diff.
       #
       # Once the spec corpus is reachable from CI (either made public or
