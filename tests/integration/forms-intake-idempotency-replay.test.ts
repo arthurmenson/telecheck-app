@@ -146,6 +146,12 @@ describe('forms-intake idempotency replay — §1 cache 4-tuple contract', () =>
       headers: adminHeaders(idempotencyKey),
       payload,
     });
+    if (first.statusCode !== 201) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[§1a diagnostic] expected 201, got ${first.statusCode}; body=${first.body.slice(0, 500)}`,
+      );
+    }
     expect(first.statusCode).toBe(201);
     const firstBody = first.json<{ template_id: string; status: string }>();
     expect(firstBody.template_id).toBeTruthy();
