@@ -10,17 +10,19 @@
 
 ## Sprint 33-34 amendment (2026-05-08)
 
-The Forms-Intake slice received the most security-critical migration in the SI-006 reserve-then-execute cycle because it owns the **I-019 platform-floor crisis-detection gate**. **PR #44 (PR-F2, 5 Codex rounds, 4 HIGH + 1 MEDIUM closures)** migrated 9 state-mutating handlers and rebuilt the Category A audit-emission pattern.
+The Forms-Intake slice received the most security-critical migration in the SI-006 reserve-then-execute cycle because it owns the **I-019 platform-floor crisis-detection gate**. **PR #44 (PR-F2, 5 Codex rounds, 4 HIGH + 1 MEDIUM closures)** migrated 10 state-mutating handlers and rebuilt the Category A audit-emission pattern.
 
 ### Migrated handlers
 
-| Handler file | Handler | Endpoint |
+Verified against `src/modules/forms-intake/internal/handlers/*.ts` and the PR #48 cleanup-sweep diff per-file deletion counts (`a02f101`):
+
+| Handler file | Handlers migrated | Endpoints |
 |---|---|---|
-| `templates.ts` | `createTemplateHandler` / `updateTemplateHandler` | POST/PUT `/templates` |
-| `variants.ts` | `createVariantHandler` / `retireVariantHandler` | POST `/variants` (+retire) |
-| `deployments.ts` | `createDeploymentHandler` / `retireDeploymentHandler` | POST `/deployments` (+retire) |
-| `submissions.ts` | `startSubmissionHandler` / `submitSubmissionHandler` | POST `/submissions/start` (+submit) |
-| `resume.ts` | `resumeFormSubmissionHandler` | POST `/submissions/:id/resume` |
+| `templates.ts` | `createTemplateHandler`, `publishVersionHandler` | POST `/templates` + POST `/templates/:templateId/versions/:versionId/publish` |
+| `variants.ts` | `createVariantHandler`, `promoteVariantHandler` | POST `/variants` + POST `/variants/:variantId/promote` |
+| `deployments.ts` | `createDeploymentHandler`, `retireDeploymentHandler` | POST `/deployments` + POST `/deployments/:deploymentId/retire` |
+| `submissions.ts` | `startSubmissionHandler`, **`updateSubmissionResponsesHandler`** (the PATCH handler that runs the I-019 crisis gate via `runCrisisGate`), `submitSubmissionHandler` | POST `/submissions` + PATCH `/submissions/:submissionId/responses` + POST `/submissions/:submissionId/submit` |
+| `resume.ts` | `resumeSubmissionHandler` | POST `/resume` |
 
 ### Service-layer change: `externalTx` threading
 
@@ -31,7 +33,7 @@ The Forms-Intake slice received the most security-critical migration in the SI-0
 The crisis-detection gate at `submission-service.ts:runCrisisGate` went through 3 distinct hardenings during the cycle, each closing a Codex HIGH:
 
 1. **PR-F2 r2 — Independent-tx Category A audit emission.** Pre-PR-F2 the gate forwarded `externalTx` (the handler's tx) to `emitCrisisDetectionTrigger`. When `runCrisisGate` then threw `CRISIS_DETECTED`, the handler-owned tx rolled back — and the audit rolled back with it. **Silent loss of Category A escalation record violates I-019 + I-003 durability.** Fix: drop the `externalTx` parameter; emit on a fresh `withTransaction(...)` (no `externalTx`). The audit commits independently of business outcome.
-2. **PR-F2 r3 — Return-cached-vs-throw for sentinel paths.** With audit emission durably independent, the next failure mode was: a throw inside `withIdempotency` body callback rolls back the reservation; client retry re-runs the gate, emits a SECOND audit. Fix: `submissions.ts` updateSubmission/submitSubmission/pause handlers now **return** `{ status: 4xx, view: errorEnvelope }` from the body callback for `CRISIS_DETECTED` / `RESPONSE_PAYLOAD_TOO_LARGE` / `isHandledSentinel` instead of throwing httpErrors. Cached 4xx replays from cache; no re-execution; exactly-once preserved.
+2. **PR-F2 r3 — Return-cached-vs-throw for sentinel paths.** With audit emission durably independent, the next failure mode was: a throw inside `withIdempotency` body callback rolls back the reservation; client retry re-runs the gate, emits a SECOND audit. Fix: `submissions.ts` `updateSubmissionResponsesHandler` (which runs `runCrisisGate` for both auto-save and pause-mode patches) and `submitSubmissionHandler` now **return** `{ status: 4xx, view: errorEnvelope }` from the body callback for `CRISIS_DETECTED` / `RESPONSE_PAYLOAD_TOO_LARGE` / `isHandledSentinel` instead of throwing httpErrors. Cached 4xx replays from cache; no re-execution; exactly-once preserved.
 3. **PR #49 — `audit_dedupe_markers` cross-cutting infra.** Even with #1 + #2, a process crash between the independent-tx audit commit and the idempotency completion UPDATE leaves the audit durable but the reservation rolled back — a retry under the same Idempotency-Key re-runs the gate. Fix: `runCrisisGate` accepts an optional `idempotencyCtx` parameter; when supplied (HTTP-handler path), claims a slot via `claimAuditDedupeSlot(client, identity)` BEFORE the audit emit. The 6-tuple identity hashes `(tenant_id || idempotency_key || endpoint || actor_id || bodyHash || auditAction)` so cross-tenant + different-body + different-action requests get distinct dedupe keys. If the slot is already claimed (a prior attempt already emitted), skip the emit; the throw still fires.
 
 ### Distinct audit_action labels for distinct emit sites
@@ -44,7 +46,14 @@ PR #49 widened the helper's body-callback signature from `(tx)` to `(tx, idempot
 
 ### Cleanup-sweep impact (PR #48)
 
-`markIdempotencyManagedByHandler(req)` calls deleted from `deployments.ts` (2), `resume.ts` (1), `submissions.ts` (3), `templates.ts` (2), `variants.ts` (2). Functionally a no-op since PR #47 had already removed the legacy onSend hook.
+`markIdempotencyManagedByHandler(req)` call sites deleted (verified against `git show a02f101`):
+- `deployments.ts`: 2 calls (`createDeploymentHandler`, `retireDeploymentHandler`)
+- `resume.ts`: 1 call (`resumeSubmissionHandler`)
+- `submissions.ts`: 3 calls (`startSubmissionHandler`, `updateSubmissionResponsesHandler`, `submitSubmissionHandler`)
+- `templates.ts`: 2 calls (`createTemplateHandler`, `publishVersionHandler`)
+- `variants.ts`: 2 calls (`createVariantHandler`, `promoteVariantHandler`)
+
+Total: 10 call sites + 5 import-line deletions. Functionally a no-op since PR #47 (PR-E) had already removed the legacy onSend hook the flag controlled.
 
 ### Test impact
 
