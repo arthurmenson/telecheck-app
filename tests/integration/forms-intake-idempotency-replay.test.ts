@@ -65,7 +65,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
 import { ulid } from '../../src/lib/ulid.ts';
-import { TENANT_US } from '../helpers/tenant-fixtures.ts';
+import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
 
 const US_HOST = 'localhost';
@@ -126,15 +126,19 @@ function adminHeaders(idempotencyKey: string, actorId: string): Record<string, s
  * spec corpus rename to programCatalogEntryId).
  */
 async function countTemplatesForTriple(programId: string, name: string): Promise<number> {
-  const result = await getTestClient().query<{ count: string }>(
-    `SELECT COUNT(*)::text AS count
-       FROM forms_template
-      WHERE tenant_id = $1
-        AND program_id = $2
-        AND name = $3`,
-    [TENANT_US, programId, name],
-  );
-  return Number(result.rows[0]?.count ?? '0');
+  // forms_template has FORCE RLS — every read MUST set tenant context
+  // first or the row-level-security gate trips with `tenant_context_not_set`.
+  return withTenantContext(TENANT_US, async () => {
+    const result = await getTestClient().query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+         FROM forms_template
+        WHERE tenant_id = $1
+          AND program_id = $2
+          AND name = $3`,
+      [TENANT_US, programId, name],
+    );
+    return Number(result.rows[0]?.count ?? '0');
+  });
 }
 
 // ---------------------------------------------------------------------------
