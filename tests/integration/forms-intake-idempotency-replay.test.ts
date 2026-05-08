@@ -115,17 +115,22 @@ function adminHeaders(idempotencyKey: string, actorId: string): Record<string, s
 
 /**
  * Count rows in `forms_template` that match the given
- * (tenant_id, program_catalog_entry_id, name) triple. Used as the
- * "did the handler run twice" probe — a duplicate handler invocation
- * would create a second row with a different template_id but the
- * same identifying triple.
+ * (tenant_id, program_id, name) triple. Used as the "did the handler
+ * run twice" probe — a duplicate handler invocation would create a
+ * second row with a different template_id but the same identifying
+ * triple.
+ *
+ * Note: the wire-protocol field name is `programCatalogEntryId` but
+ * the DB column is `program_id` (per migration 006:32 — both refer
+ * to the same ProgramCatalogEntry ID; the column name predates the
+ * spec corpus rename to programCatalogEntryId).
  */
 async function countTemplatesForTriple(programId: string, name: string): Promise<number> {
   const result = await getTestClient().query<{ count: string }>(
     `SELECT COUNT(*)::text AS count
        FROM forms_template
       WHERE tenant_id = $1
-        AND program_catalog_entry_id = $2
+        AND program_id = $2
         AND name = $3`,
     [TENANT_US, programId, name],
   );
