@@ -1,11 +1,12 @@
 # Autonomous Turn — Cumulative Summary (2026-05-08)
 
-**Final PR merged:** #78 (this amendment)
+**Final PR merged:** #81 (this amendment)
 **CI status:** ✅ Green
-**Total PRs this autonomous turn:** 20 (#59 through #78)
+**Total PRs this autonomous turn:** 23 (#59 through #81)
 **Predecessor turn:** `docs/AUTONOMOUS_TURN_SUMMARY_2026-05-05.md` (Slice 1-3 hardening + tenant-config foundation; final commit `dd94a27`)
 
-**Amendment 1 (PR #78):** extends the original Phase B README hygiene table to include PRs #75-#77 (the turn summary itself, plus two follow-on doc-status updates that landed after the original summary was committed at PR #75).
+**Amendment 1 (PR #78):** extended the original Phase B README hygiene table to include PRs #75-#77 (the turn summary itself + SCRUM status + TLC-027 closure section).
+**Amendment 2 (PR #81 — this one):** extends the table once more to include PRs #79 (PHARMACY status Sprint 33-34 amendment) + #80 (TENANT_CONFIG_FOUNDATION status Sprint 33-34 amendment). All 5 slice/foundation status docs now carry uniform Sprint 33-34 amendments — the work surface for status-doc hygiene is now genuinely exhausted within autonomous scope.
 
 ---
 
@@ -47,7 +48,10 @@ The autonomous-friendly work surface for documentation hygiene is now substantia
 | #75 | `docs: add autonomous turn summary for 2026-05-08 run` | This file at its initial committed state — captured PRs #59-#74. |
 | #76 | `docs(scrum): bump status header from 'Sprint 1 in progress' to Sprint 34 close` | SCRUM_OPERATING_MODEL.md status pointer was ~33 sprints out of date. Targeted edit: updated header status + added "Operating-model amendments since adoption" list pointing readers at the in-body sprint-tagged sections (Sprint 5 retro PM-brief gate; Sprint 14/15 differentiated commit-budget calibration; Sprint 17 dual-close milestone; Sprint 22 shared-root-cause cluster; Sprint 33-34 SI-006 redesign). |
 | #77 | `docs(tlc-027): add Sprint 17 EXECUTE closure section to top of doc` | Same pattern as PR #74. TLC-027 doc was authored at Sprint 14/15 escalation time with Sprint 15 PM kickoff hand-off as resume gate; per matrix r4 the actual execution landed at Sprint 17 (2026-05-06) closing all 4 r10 findings + first DB-backed bench. Added per-finding closure detail at top + OR-218 branch-protection alignment. Body preserved as audit trail. |
-| #78 | `docs(turn-summary): amend 2026-05-08 turn summary to include PRs #75-#78` | This amendment — extends the original Phase B table to capture the post-#75 follow-on PRs so the turn summary remains the authoritative one-stop doc. |
+| #78 | `docs(turn-summary): amend 2026-05-08 turn summary to include PRs #75-#78` | Amendment 1 — extended the original Phase B table to capture the post-#75 follow-on PRs. |
+| #79 | `docs(pharmacy): add Sprint 33-34 amendment to pharmacy slice status doc` | Aligned PHARMACY_SLICE_STATUS_2026-05-05.md with the established Sprint 33-34 amendment pattern (CONSENT/IDENTITY/FORMS_INTAKE all already had one). Captures BLOCKED-aware status + what benefited indirectly from Sprint 33-34 (audit-dedupe primitive + reserve-then-execute pattern + Group F lockdown extending automatically) so pharmacy can adopt these from day 1 when SI-001 unblocks. |
+| #80 | `docs(tenant-config): add Sprint 33-34 amendment to foundation status doc` | Aligned TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md with the same pattern. Captures Sprint 33 PR-F4 admin-write 503-stub markers (5 handlers fail-closed pending Admin Backend v1.1) + on-resume sequencing for when Admin Backend ratifies. |
+| #81 | `docs(turn-summary): amend 2026-05-08 turn summary (round 2) to include PRs #79-#81` | Amendment 2 (this one) — extends the table once more to include #79/#80 + this self-reference. |
 
 ---
 
@@ -73,13 +77,14 @@ This turn did not author novel runtime patterns — it **pinned existing pattern
 
 ## Stats
 
-- **PRs merged this turn:** 20 (#59 through #78; one self-referential summary + amendment, which is why the count exceeds the unique-deliverable count of 18)
+- **PRs merged this turn:** 23 (#59 through #81; three self-referential summary commits — initial PR #75 + amendment 1 PR #78 + amendment 2 PR #81 — which is why the count exceeds the unique-deliverable count of 20)
 - **Forward migrations:** 23 (000-022; no schema changes this turn)
 - **Production .ts files:** ~78 (2-3 minor handler additions; mostly stable)
 - **Integration test files:** ~88 (5+ added: audit-dedupe Group G + 3 identity §4-§5 + forms-intake-idempotency-replay)
-- **README + status docs refreshed:** 11 (root + docs + src/lib + src/modules + migrations + tests + tests/perf + async-consult; plus 3 new module READMEs; plus SCRUM operating-model status; plus TLC-027 closure section)
+- **README + status docs refreshed:** 13 (root + docs + src/lib + src/modules + migrations + tests + tests/perf + async-consult; plus 3 new module READMEs; plus SCRUM operating-model status; plus TLC-027 closure section; plus PHARMACY + TENANT_CONFIG status doc Sprint 33-34 amendments)
+- **All slice/foundation status docs uniformly Sprint-33-34-amended:** 5 of 5 (CONSENT, IDENTITY, FORMS_INTAKE, PHARMACY, TENANT_CONFIG_FOUNDATION)
 - **Spec Issues open:** 5 (SI-001/002/003/004/005)
-- **CI status at final PR (#78) merge:** ✅ Green (CLEAN)
+- **CI status at final PR (#81) merge:** ✅ Green (CLEAN)
 
 ---
 
