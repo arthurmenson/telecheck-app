@@ -147,6 +147,25 @@ function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): bool
       .send(makeErrorEnvelope(reqId, 'internal.resource.conflict', 'Consult state conflict.'));
     return true;
   }
+  // State-machine InvalidTransitionError + UnsupportedTransitionError
+  // (from internal/state-machine.ts) bubble out of unguardedTransition
+  // when a caller drives an event that the current state doesn't accept
+  // (e.g., POST /:id/patient-responds on a consult in INITIATED rather
+  // than AWAITING_DATA). Pre-Sprint-34 these slipped to Fastify's global
+  // 500 handler — tenant-blind 409 is the correct semantic (the
+  // resource is in a state that doesn't allow this transition; same
+  // shape as ConsultStateConflictError above). Per Sprint 34 PR-51 r4
+  // CI-revealed handler-mapping gap (closes a 500 leak surfaced by
+  // tests/integration/async-consult-http.test.ts B3).
+  if (
+    err instanceof Error &&
+    (err.name === 'InvalidTransitionError' || err.name === 'UnsupportedTransitionError')
+  ) {
+    void reply
+      .code(409)
+      .send(makeErrorEnvelope(reqId, 'internal.resource.conflict', 'Consult state conflict.'));
+    return true;
+  }
   if (
     err instanceof consultService.SubmitGuardNotSatisfiedError ||
     err instanceof consultService.AbandonGuardNotSatisfiedError ||
