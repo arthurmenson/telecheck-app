@@ -1,4 +1,23 @@
-# tests/perf/ — Foundation-layer performance benchmarks
+# tests/perf/ — Performance benchmarks (OR-218 FULLY CLOSED 2026-05-06)
+
+## Status update — Sprint 34 (2026-05-08)
+
+**ORT row OR-218 is FULLY CLOSED** as of Sprint 17 (2026-05-06) per `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r4. The closure path that the original Sprint 7 scaffold framed as "Sprint 14+ EXECUTES" actually executed at Sprint 17 / TLC-027. Specifically:
+
+1. **Three conditions for OR-218 closure** (originally listed below as the gate):
+   - ✅ Each foundation-layer hot-path has explicit p95 thresholds (`tests/perf/check-thresholds.ts` enforces 9 scenarios)
+   - ✅ `npm run bench` is wired into CI as a required check (`.github/workflows/perf.yml` + `Run benchmarks + threshold check + baseline comparison` is a required context on `main`)
+   - ✅ Baseline comparison output detects regressions across PRs (machine-enforced via `.github/workflows/baseline-refresh-guard.yml` — full-line anchored regex + GH API validation + triple-dot merge-base diff + always-run + early-exit)
+2. **DB-backed bench infrastructure landed** (Sprint 17 / TLC-027 — rebuilt from the reverted Sprint 14 / TLC-025 attempt; closes Codex `perf-bench-r10` 2 HIGH + 2 MEDIUM findings). Real `pg.Pool` via `setBenchPool()` in `src/lib/db.ts`; constrained `telecheck_bench_app` Postgres role; canonicalized URL collision guard via `pg-connection-string` parser; tracked migration apply via `schema_migrations_bench`.
+3. **Branch protection installed** via `gh api -X PUT repos/arthurmenson/telecheck-app/branches/main/protection` 2026-05-06 with required contexts `Run benchmarks + threshold check + baseline comparison` + `verify-metadata`. Verified via independent GET. Repo flipped public (Evans 2026-05-06) to enable branch protection on free GitHub plan.
+
+**The body of this README below is preserved for traceability** — it captures the Sprint 7 → Sprint 13 closure-path-built / Sprint 14+ EXECUTES discipline as it stood at the time, and the Codex `perf-bench-r1` through `perf-bench-r10` adversarial review trajectory. References to "OR-218 stays OPEN" are now historical; the actual ORT state is FULLY CLOSED. References to "Sprint 14+ EXECUTES" are now historical; execution happened at Sprint 17.
+
+The bench corpus has not grown since Sprint 17. The "Sprint 18+ DB-backed bench expansion path" listed below remains accurate as a forward-looking todo: idempotency lookup, withTenantBoundConnection, repo CRUD per slice. None of those have been authored as of Sprint 34 close.
+
+---
+
+## Original framing (Sprint 7 / TLC-018; preserved for traceability)
 
 **Sprint 7 / TLC-018.** **SCAFFOLDS** ORT row OR-218 ("Performance and load test plan — interaction engine <2s, emergency <60s under p95 load — scope expanded 2026-04-25 to include AI lab interpretation accuracy regression per ADR-019"; verified at `Telecheck_Operational_Readiness_Todo_v1_5.md:129`).
 
@@ -9,6 +28,8 @@
 3. Baseline comparison output (via `vitest bench --outputJson <file>` for capture + `vitest bench --compare <baseline-file>` for diff) detects regressions across PRs
 
 Until those three conditions hold, OR-218 remains **OPEN**. Sprint 11 PM kickoff brief MUST re-list OR-218 as launch-blocking and propose the promotion-path stories.
+
+> **2026-05-08 update:** all three conditions hold as of Sprint 17 (2026-05-06); see top-of-file Status update.
 
 ## Operating model (v0.1)
 
@@ -100,7 +121,7 @@ Sprint 12 retro recorded this as **the first finding class where iterative fix-f
 | --- | --- | --- | --- |
 | `tests/perf/audit/crisis-detect.bench.ts` | 7 / TLC-018 | `crisisDetector.detect` (I-019 hot path) | §1–§4 (4 scenarios) |
 | `tests/perf/state-machine/validate-transition.bench.ts` | 12 / TLC-024 | `validateTransition` (Async Consult slice hot path) | §5–§8 (1 happy + 3 reject paths) |
-| `tests/perf/audit/emit-audit.bench.ts` | 17 / TLC-027 | `emitAudit` hash-chain append (DB-backed) | §9 (happy-path single-row append) |
+| `tests/perf/audit/emit-audit.db.bench.ts` | 17 / TLC-027 | `emitAudit` hash-chain append (DB-backed) | §9 (happy-path single-row append) |
 
 9 bench scenarios total (8 pure-function + 1 DB-backed). Per-scenario p95 thresholds enforced by `tests/perf/check-thresholds.ts` against vitest bench `--outputJson` capture.
 
