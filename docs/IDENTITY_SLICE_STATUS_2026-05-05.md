@@ -10,18 +10,20 @@
 
 ## Sprint 33-34 amendment (2026-05-08)
 
-The Identity & Auth slice received the heaviest-impact migration in the SI-006 reserve-then-execute redesign cycle. **PR #45 (PR-F3, 5 Codex rounds, 2 HIGH + 3 MEDIUM closures)** migrated 8 state-mutating handlers in `src/modules/identity/internal/handlers/` from the legacy preHandler-stash + onSend-cache-write pattern to handler-owned `withIdempotency` reservation:
+The Identity & Auth slice received the heaviest-impact migration in the SI-006 reserve-then-execute redesign cycle. **PR #45 (PR-F3, 5 Codex rounds, 2 HIGH + 3 MEDIUM closures)** migrated state-mutating handlers in `src/modules/identity/internal/handlers/` from the legacy preHandler-stash + onSend-cache-write pattern to handler-owned `withIdempotency` reservation.
 
-| Handler | Endpoint | TTL override |
-|---|---|---|
-| `loginInitiateHandler` | `POST /login/initiate` | — (24h default) |
-| `loginVerifyHandler` | `POST /login/verify` | **900s** (aligned to JWT access_token TTL per `jwt.ts:62`) |
-| `logoutHandler` | `POST /logout` | — |
-| `refreshTokenHandler` | `POST /refresh` | — |
-| `registrationInitiateHandler` | `POST /registration/initiate` | — |
-| `registrationVerifyHandler` | `POST /registration/verify` | **900s** (same JWT-aligned reasoning) |
-| `registrationFinalizeHandler` | `POST /registration/finalize` | — |
-| `revokeDeviceHandler` | `POST /devices/:id/revoke` | — |
+Verified against `src/modules/identity/routes.ts` + `src/lib/idempotency.ts:ENDPOINT_TTL_OVERRIDES`:
+
+| Handler | Route registration | Mounted as | Migration shape |
+|---|---|---|---|
+| `loginStartHandler` | `app.post('/login/start', ...)` | `POST /v0/identity/login/start` | `withIdempotentExecution`, default 24h TTL |
+| `loginVerifyHandler` | `app.post('/login/verify', ...)` | `POST /v0/identity/login/verify` | `withIdempotentExecution`, **900s TTL override** (cached body has plaintext `access_token` + `refresh_token`; aligned to JWT TTL per `jwt.ts:62`) |
+| `sessionRefreshHandler` | `app.post('/sessions/refresh', ...)` | `POST /v0/identity/sessions/refresh` | **NOT migrated to `withIdempotentExecution`** — added to `EXEMPT_PATHS` instead per PR-F3 r4-r5 (refresh-token rotation must NOT be cached; see "Codex closures" below) |
+| `sessionLogoutHandler` | `app.post('/sessions/logout', ...)` | `POST /v0/identity/sessions/logout` | `withIdempotentExecution`, default 24h TTL |
+| `registrationStartHandler` | `app.post('/registration/start', ...)` | `POST /v0/identity/registration/start` | `withIdempotentExecution` + body-callback PHONE_TAKEN return-cached pattern (§3.8) |
+| `registrationVerifyHandler` | `app.post('/registration/verify', ...)` | `POST /v0/identity/registration/verify` | `withIdempotentExecution`, **900s TTL override** (same JWT-alignment rationale; body has tokens via `PatientAccountView`) |
+| `registerDeviceHandler` | `app.post('/devices', ...)` | `POST /v0/identity/devices` | `withIdempotentExecution`, default 24h TTL |
+| `revokeDeviceHandler` | `app.delete('/devices/:deviceId', ...)` | `DELETE /v0/identity/devices/:deviceId` | `withIdempotentExecution`, default 24h TTL |
 
 ### Why the auth-flow paths get a TTL override
 
@@ -47,7 +49,16 @@ No new test files added in PR #45; existing identity-{login,registration,devices
 
 ### Cleanup-sweep impact (PR #48)
 
-`markIdempotencyManagedByHandler(req)` calls deleted from `login.ts` (4 calls), `registration.ts` (2 calls), `devices.ts` (2 calls). Functionally a no-op since PR #47 (PR-E) had already removed the legacy onSend hook the flag controlled. Lockdown extended to pin `markIdempotencyManagedByHandler` identifier absence in comment-stripped `idempotency.ts`.
+`markIdempotencyManagedByHandler(req)` call sites deleted (verified against `git show a02f101`):
+- `login.ts`: 4 calls (`loginStartHandler`, `loginVerifyHandler`, `sessionRefreshHandler`, `sessionLogoutHandler`)
+- `registration.ts`: 2 calls (`registrationStartHandler`, `registrationVerifyHandler`)
+- `devices.ts`: 2 calls (`registerDeviceHandler`, `revokeDeviceHandler`)
+
+Total: 8 call sites + 3 import-line deletions. Functionally a no-op since PR #47 (PR-E) had already removed the legacy onSend hook the flag controlled.
+
+Note: `sessionRefreshHandler` had a `markIdempotencyManagedByHandler` call from its initial PR-F3 migration attempt that was reverted in PR-F3 r4-r5 (added to `EXEMPT_PATHS` instead). The cleanup-sweep removed the leftover marker call alongside the others.
+
+Lockdown extended in `tests/integration/idempotency-helper.test.ts` Group F to pin `markIdempotencyManagedByHandler` identifier absence in comment-stripped `idempotency.ts`.
 
 ### Spec references for the amendment
 
