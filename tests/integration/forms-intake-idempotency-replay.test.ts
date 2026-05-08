@@ -89,12 +89,24 @@ afterAll(async () => {
  * the pattern in forms-intake-templates-http.test.ts — the actor-context
  * shim accepts `x-actor-id` + `x-actor-roles` + `x-actor-admin-tenant`
  * for tenant_admin operations on admin endpoints.
+ *
+ * IMPORTANT: the IDEMPOTENCY v5.1 cache 4-tuple PK is
+ * `(tenant_id, idempotency_key, endpoint, actor_id)`. For replay tests
+ * the SECOND call MUST use the same `actor_id` as the first or the
+ * cache lookup will miss (different keys → handler runs again →
+ * uniqueness-constraint violation surfaces as 500). The
+ * `actorId` parameter pins the actor across replay pairs; pass the
+ * same string to both `adminHeaders()` calls in a §replay test.
+ *
+ * Lesson learned: PR #63 r1 used `ulid().slice(-6)` to mint a fresh
+ * actor_id per call, which silently broke replay path. r2 fix
+ * threads actorId from the test scope.
  */
-function adminHeaders(idempotencyKey: string): Record<string, string> {
+function adminHeaders(idempotencyKey: string, actorId: string): Record<string, string> {
   return {
     host: US_HOST,
     'idempotency-key': idempotencyKey,
-    'x-actor-id': `op_idem_${ulid().slice(-6)}`,
+    'x-actor-id': actorId,
     'x-actor-roles': 'tenant_admin',
     'x-actor-admin-tenant': TENANT_US,
     'content-type': 'application/json',
@@ -129,6 +141,11 @@ describe('forms-intake idempotency replay — §1 cache 4-tuple contract', () =>
     const programId = `prog_idem_${ulid().slice(-8)}`;
     const name = `idem-test-${ulid().slice(-6)}`;
     const idempotencyKey = ulid();
+    // Pin actor_id across both calls — IDEMPOTENCY v5.1 cache PK is
+    // `(tenant_id, idempotency_key, endpoint, actor_id)` so a fresh
+    // actor_id on the second call would silently miss the cache.
+    const actorId = `op_idem_${ulid().slice(-6)}`;
+    const headers = adminHeaders(idempotencyKey, actorId);
     const payload = {
       programCatalogEntryId: programId,
       name,
@@ -143,27 +160,21 @@ describe('forms-intake idempotency replay — §1 cache 4-tuple contract', () =>
     const first = await app!.inject({
       method: 'POST',
       url: '/v0/forms/templates',
-      headers: adminHeaders(idempotencyKey),
+      headers,
       payload,
     });
-    if (first.statusCode !== 201) {
-      // eslint-disable-next-line no-console
-      console.error(
-        `[§1a diagnostic] expected 201, got ${first.statusCode}; body=${first.body.slice(0, 500)}`,
-      );
-    }
     expect(first.statusCode).toBe(201);
     const firstBody = first.json<{ template_id: string; status: string }>();
     expect(firstBody.template_id).toBeTruthy();
     expect(firstBody.status).toBe('draft');
 
-    // Second request: same key + same body. preHandler cache-replay
-    // short-circuits BEFORE the handler body callback runs. NO second
-    // forms_template insert, NO second audit emission.
+    // Second request: same key + same body + SAME actor_id.
+    // preHandler cache-replay short-circuits BEFORE the handler body
+    // callback runs. NO second forms_template insert.
     const second = await app!.inject({
       method: 'POST',
       url: '/v0/forms/templates',
-      headers: adminHeaders(idempotencyKey),
+      headers,
       payload,
     });
     expect(second.statusCode).toBe(201);
@@ -174,21 +185,20 @@ describe('forms-intake idempotency replay — §1 cache 4-tuple contract', () =>
     // Discrimination probe: exactly 1 row in forms_template for the
     // (tenant_id, programCatalogEntryId, name) triple. A handler-
     // re-run would have created a second row with a different
-    // template_id but the same identifying triple. The strict count
-    // check is what proves the cache replay path served the second
-    // request, not just "same template_id by coincidence".
+    // template_id but the same identifying triple.
     expect(await countTemplatesForTriple(programId, name)).toBe(1);
   });
 
   it('§1b POST /v0/forms/templates same key + different body → 409 internal.idempotency.body_mismatch', async () => {
     const programId = `prog_idem_mm_${ulid().slice(-8)}`;
     const idempotencyKey = ulid();
-    const baseHeaders = adminHeaders(idempotencyKey);
+    const actorId = `op_idem_${ulid().slice(-6)}`;
+    const headers = adminHeaders(idempotencyKey, actorId);
 
     const first = await app!.inject({
       method: 'POST',
       url: '/v0/forms/templates',
-      headers: baseHeaders,
+      headers,
       payload: {
         programCatalogEntryId: programId,
         name: 'original-name',
@@ -200,13 +210,13 @@ describe('forms-intake idempotency replay — §1 cache 4-tuple contract', () =>
     });
     expect(first.statusCode).toBe(201);
 
-    // Second request: same key, DIFFERENT body (name flipped). Body
-    // hash check at withIdempotency reservation time fires BEFORE
-    // the handler body callback runs. Returns 409 immediately.
+    // Second request: same key + same actor, DIFFERENT body (name
+    // flipped). Body hash check at withIdempotency reservation time
+    // fires BEFORE the handler body callback runs.
     const second = await app!.inject({
       method: 'POST',
       url: '/v0/forms/templates',
-      headers: baseHeaders,
+      headers,
       payload: {
         programCatalogEntryId: programId,
         name: 'different-name',
@@ -221,9 +231,7 @@ describe('forms-intake idempotency replay — §1 cache 4-tuple contract', () =>
     expect(errorBody.error.code).toBe('internal.idempotency.body_mismatch');
 
     // Tenant-blind: the 409 envelope MUST NOT leak the operating-
-    // tenant identifier (I-025). This is the admin surface so
-    // tenant_id MAY appear in success envelopes — but error
-    // envelopes are tenant-blind regardless of surface.
+    // tenant identifier (I-025).
     expect(second.body).not.toContain(TENANT_US);
   });
 });
