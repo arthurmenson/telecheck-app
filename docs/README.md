@@ -72,20 +72,29 @@ docs/
                                                # decisions that don't rise to platform-architecture level
 ```
 
-## Implementation status (post-Consent-slice landing)
+## Implementation status (post-Sprint-34 SI-006 closure, 2026-05-08)
 
 | Slice (per EHBG §10b)            | Status                     | Pointer                                         |
 | -------------------------------- | -------------------------- | ----------------------------------------------- |
-| Slice 1 — Forms-Intake v2.1      | ✅ Implementation-complete | `FORMS_INTAKE_SLICE_STATUS_2026-05-05.md`       |
-| Slice 2 — Identity & Auth + JWT  | ✅ Implementation-complete | `IDENTITY_SLICE_STATUS_2026-05-05.md`           |
-| Slice 3 — Consent + Delegation   | ✅ Implementation-complete | `CONSENT_SLICE_STATUS_2026-05-05.md`            |
+| Slice 1 — Forms-Intake v2.1      | ✅ Implementation-complete (Sprint 33-34 amendment landed) | `FORMS_INTAKE_SLICE_STATUS_2026-05-05.md` |
+| Slice 2 — Identity & Auth + JWT  | ✅ Implementation-complete (Sprint 33-34 amendment landed) | `IDENTITY_SLICE_STATUS_2026-05-05.md`     |
+| Slice 3 — Consent + Delegation   | ✅ Implementation-complete (Sprint 33-34 amendment landed) | `CONSENT_SLICE_STATUS_2026-05-05.md`      |
+| Slice — Async Consult            | ✅ Implementation-complete | `BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 §2 (full HTTP coverage added Sprint 34 PR #51) |
 | Slice 4 — Pharmacy + Refill v2.1 | ⛔ Blocked on **SI-001**   | `SI-001-MedicationRequest-Schema-Gap.md`        |
-| Slices 5-17                      | Not started                | per EHBG §10b sprint plan                       |
-| **Foundation: tenant-config**    | ✅ Implementation-complete | `TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md` |
+| Slices 5-17 (other)              | Not started                | per EHBG §10b sprint plan                       |
+| **Foundation: tenant-config**    | ✅ Implementation-complete (read paths); admin-write 503-stubbed pending Admin Backend v1.1 | `TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md` |
+
+**Sprint 33-34 SI-006 closure landed across 9 PRs (#43–#49 + #51).** Reserve-then-execute idempotency redesign is now the canonical pattern for state-changing handlers; legacy onSend cache-write hook removed under Group F source-grep lockdown. Cross-cutting `audit_dedupe_markers` (PR #49 + migration 022) closes the deferred crash-window duplicate-Category-A-audit HIGH. See:
+
+- `SI-006-Idempotency-Reserve-Then-Execute-Redesign.md` v0.3 "Implementation Closure" section
+- `BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 (cumulative state)
+- `PROJECT_CONVENTIONS.md` r5 §3.7 / §3.8 / §3.9 + §5.11 / §5.12 (codified patterns)
 
 **Foundation note:** the tenant-config layer (CDM §4.2-§4.6) is NOT a slice from the EHBG sprint plan — it's foundational utility infrastructure that every CCR-driven downstream slice depends on. It was unblocked alongside Slice 3 because none of its entities reference `medication_requests`. Schema, repos, CCR resolver service, and a patient-app `GET /v0/tenant-config/me` bootstrap endpoint are live. AdapterConfig + TenantUser service layers are scaffolded at the schema level but their service/HTTP wiring belongs with Admin Backend slice v1.1 (encryption-at-rest + operator auth).
 
 **Cross-cutting hardening landed alongside Slice 3:** cross-tenant isolation tests for consent + delegation services (I-023 / I-024 / I-025); I-025 tenant-blindness regression for HTTP error envelopes; full HTTP coverage of all 12 routes mounted under `/v0/consent`; service-layer direct integration tests for both consent-service and delegation-service; idempotency replay regression for consent endpoints; I-003 audit-chain regression for the 8 Slice 3 lifecycle events.
+
+**Cross-cutting hardening landed Sprint 33-34:** IDEMPOTENCY v5.1 contract HTTP coverage added to identity (devices §4 / login §5 / registration §5 — PRs #60 / #61 / #62) + forms-intake templates (PR #63); audit-dedupe documented-limitation regression marker (PR #59); CI activates openapi-conformance test via spec-corpus clone (PR #64); README refreshes for src/lib + migrations + src/modules (PRs #65 / #66 / #67).
 
 ## When in doubt
 
