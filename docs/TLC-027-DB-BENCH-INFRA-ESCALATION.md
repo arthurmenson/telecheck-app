@@ -1,6 +1,25 @@
 # TLC-027 — DB-backed bench infrastructure (Sprint 15+ escalation from TLC-025)
 
-**Status:** ESCALATED 2026-05-05 from Sprint 14 / TLC-025-SCAFFOLD per Codex `perf-bench-r10` adversarial review (2 HIGH + 2 MEDIUM findings against commit `208e9b5`). The Sprint 14 SCAFFOLD attempt was reverted at `af193e7`. TLC-027 is the proper Sprint 15+ rebuild against an environment that includes Postgres for validation.
+**Status:** ✅ **CLOSED 2026-05-06** at Sprint 17 EXECUTE per `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r4. All four r10 findings (2 HIGH + 2 MEDIUM) closed cleanly:
+
+- **r10-A HIGH** — always-on `setupFiles` + `requireBenchDb()` gate (no env-conditional setupFiles selection); the gate fail-closes when env unset rather than silently falling back to dev DB.
+- **r10-B HIGH** — no `setTestPool` savepoint translation in bench mode; `setBenchPool()` returns a real `pg.Pool` so bench code paths see actual transaction lifecycles (matters for `pg_advisory_xact_lock` per-partition behavior in `migrations/002_audit_chain.sql`).
+- **r10-C MEDIUM** — canonicalized URL collision guard via `pg-connection-string` parser (`BENCH_DATABASE_URL` MUST canonicalize-differently from `DATABASE_URL` and `TEST_DATABASE_URL`; auth credentials, query strings, host-alias variations normalized out before comparison).
+- **r10-D MEDIUM** — tracked migration apply via dedicated `schema_migrations_bench` table; each migration applies at most once; partial-apply failures leave the row un-INSERTed so the next session re-attempts and fails explicitly rather than silently skipping.
+
+First DB-backed bench landed alongside: `tests/perf/audit/emit-audit.db.bench.ts` §9 happy-path single-row hash-chain append. The `.db.` infix on the filename marks it as opt-in DB-backed (the `requireBenchDb()` call throws cleanly when env unset).
+
+OR-218 closure also landed at Sprint 17 (branch protection installed via `gh api PUT repos/arthurmenson/telecheck-app/branches/main/protection` 2026-05-06; required contexts `Run benchmarks + threshold check + baseline comparison` + `verify-metadata` on `main`; `strict: true`, `enforce_admins: false`, `allow_force_pushes: false`; verified via independent GET).
+
+**Sprint reference:** Sprint 14 / TLC-025 (escalated 2026-05-05) → Sprint 17 / TLC-027 EXECUTE close 2026-05-06. The Sprint 15 PM kickoff hand-off (§"Sprint 15 PM kickoff hand-off" below) is preserved as audit trail — the actual execution happened at Sprint 17 once Postgres availability + Evans's `gh api` access converged.
+
+The body of this doc below is preserved for traceability — it captures the r10 finding-by-finding analysis + closure plan as it stood at escalation time. Sprint 17 EXECUTE landed against this plan faithfully; no plan revisions needed.
+
+---
+
+## Original framing (preserved from Sprint 14 escalation; Sprint 17 EXECUTE landed against this faithfully)
+
+**ESCALATED 2026-05-05 from Sprint 14 / TLC-025-SCAFFOLD** per Codex `perf-bench-r10` adversarial review (2 HIGH + 2 MEDIUM findings against commit `208e9b5`). The Sprint 14 SCAFFOLD attempt was reverted at `af193e7`. TLC-027 is the proper Sprint 15+ rebuild against an environment that includes Postgres for validation.
 
 **Sprint reference:** Sprint 14 / TLC-025 (escalated 2026-05-05) → Sprint 15+ TLC-027.
 
