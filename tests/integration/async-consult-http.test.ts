@@ -160,6 +160,23 @@ async function seedAuthedPatient(): Promise<SeedResult> {
 }
 
 /**
+ * Assert that a response body — success OR error envelope — leaks
+ * neither the literal `tenant_id` JSON key nor the operating-tenant
+ * identifier (`Telecheck-US`) anywhere in its serialized body.
+ *
+ * Per Codex Sprint 34 PR-51 review 2026-05-08 (MEDIUM closure): PHI
+ * projection is a contract for ALL responses, not just successes —
+ * an error envelope that accidentally echoed `tenant_id` would still
+ * leak the operating-tenant identifier to a patient surface (Master
+ * PRD v1.10 §17 + Glossary v5.2 C3). Apply this guard to every
+ * `app.inject()` response in this file.
+ */
+function expectNoTenantLeak(response: { body: string }): void {
+  expect(response.body).not.toContain('"tenant_id"');
+  expect(response.body).not.toContain('Telecheck-US');
+}
+
+/**
  * Initiate a consult via the HTTP path (not direct service call) so the
  * caller can chain follow-on transitions against a real created row.
  * Returns the new consult_id.
@@ -218,10 +235,14 @@ describe('async-consult HTTP — Group A: happy path lifecycle', () => {
     expect(body.consult_type).toBe('program');
     expect(body.modality).toBe('async');
     // Per State Machines v1.1 §3, initiate creates the consult in
-    // INITIATED state. Other slices may rename — assert presence, not
-    // exact label, to keep the test robust to future state-machine
-    // renames that are spec-canonical.
-    expect(body.status).toBeTruthy();
+    // INITIATED. Asserting the exact canonical state — not just
+    // truthy — so a handler regression returning some other non-empty
+    // state string would fail this test. State-machine renames are a
+    // spec-corpus event; if the canonical label changes, this test
+    // updates alongside (Codex Sprint 34 PR-51 review MEDIUM closure
+    // 2026-05-08).
+    expect(body.status).toBe('INITIATED');
+    expectNoTenantLeak(response);
   });
 
   it('A2 GET /v0/async-consult/:id/events returns consult.initiated event (no tenant_id)', async () => {
@@ -242,8 +263,7 @@ describe('async-consult HTTP — Group A: happy path lifecycle', () => {
     expect(body.events.length).toBeGreaterThanOrEqual(1);
     // PHI-projection: response body MUST NOT carry tenant_id (Master PRD
     // v1.10 §17 + Glossary v5.2 C3) or the operating-tenant identifier.
-    expect(response.body).not.toContain('"tenant_id"');
-    expect(response.body).not.toContain('Telecheck-US');
+    expectNoTenantLeak(response);
   });
 });
 
@@ -270,6 +290,7 @@ describe('async-consult HTTP — Group B: state-machine guard violations', () =>
     expect(response.statusCode).toBe(404);
     const body = response.json<{ error: { code: string } }>();
     expect(body.error.code).toBe('internal.resource.not_found');
+    expectNoTenantLeak(response);
   });
 
   it('B2 POST abandon on a freshly-initiated consult → 422 (< 48h guard)', async () => {
@@ -294,6 +315,7 @@ describe('async-consult HTTP — Group B: state-machine guard violations', () =>
     expect(response.statusCode).toBe(422);
     const body = response.json<{ error: { code: string } }>();
     expect(body.error.code).toBe('internal.request.semantically_invalid');
+    expectNoTenantLeak(response);
   });
 
   it('B3 POST patient-responds on a consult in INTAKE → 409 state conflict', async () => {
@@ -319,6 +341,7 @@ describe('async-consult HTTP — Group B: state-machine guard violations', () =>
     expect(response.statusCode).toBe(409);
     const body = response.json<{ error: { code: string } }>();
     expect(body.error.code).toBe('internal.resource.conflict');
+    expectNoTenantLeak(response);
   });
 });
 
@@ -339,6 +362,7 @@ describe('async-consult HTTP — Group C: auth failures', () => {
       },
     });
     expect(response.statusCode).toBe(401);
+    expectNoTenantLeak(response);
   });
 
   it('C2 POST initiate with body.account_id ≠ JWT.accountId → 400', async () => {
@@ -367,6 +391,7 @@ describe('async-consult HTTP — Group C: auth failures', () => {
     expect(response.statusCode).toBe(400);
     const body = response.json<{ error: { code: string } }>();
     expect(body.error.code).toBe('internal.request.invalid');
+    expectNoTenantLeak(response);
   });
 });
 
@@ -388,6 +413,7 @@ describe('async-consult HTTP — Group D: body validation', () => {
       payload: { consult_type: 'program', modality: 'async' },
     });
     expect(response.statusCode).toBe(400);
+    expectNoTenantLeak(response);
   });
 
   it('D2 invalid consult_type → 400', async () => {
@@ -407,6 +433,7 @@ describe('async-consult HTTP — Group D: body validation', () => {
       },
     });
     expect(response.statusCode).toBe(400);
+    expectNoTenantLeak(response);
   });
 
   it('D3 invalid modality → 400', async () => {
@@ -426,6 +453,7 @@ describe('async-consult HTTP — Group D: body validation', () => {
       },
     });
     expect(response.statusCode).toBe(400);
+    expectNoTenantLeak(response);
   });
 });
 
@@ -470,6 +498,8 @@ describe('async-consult HTTP — Group E: idempotency replay', () => {
     const secondBody = second.json<{ consult_id: string }>();
     // Replay returns the SAME consult_id — no new row was created.
     expect(secondBody.consult_id).toBe(firstBody.consult_id);
+    expectNoTenantLeak(first);
+    expectNoTenantLeak(second);
   });
 
   it('E2 same key + different body → 409 internal.idempotency.body_mismatch', async () => {
@@ -502,6 +532,8 @@ describe('async-consult HTTP — Group E: idempotency replay', () => {
     expect(second.statusCode).toBe(409);
     const body = second.json<{ error: { code: string } }>();
     expect(body.error.code).toBe('internal.idempotency.body_mismatch');
+    expectNoTenantLeak(first);
+    expectNoTenantLeak(second);
   });
 });
 
@@ -532,7 +564,6 @@ describe('async-consult HTTP — Group F: PHI projection', () => {
     // The handler projects via toPatientConsultView which strips
     // tenant_id (consults.ts:70). Patient surface MUST NOT render the
     // operating-tenant identifier per Master PRD v1.10 §17 + C3.
-    expect(response.body).not.toContain('"tenant_id"');
-    expect(response.body).not.toContain('Telecheck-US');
+    expectNoTenantLeak(response);
   });
 });
