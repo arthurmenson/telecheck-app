@@ -1,9 +1,11 @@
 # Autonomous Turn — Cumulative Summary (2026-05-08)
 
-**Final PR merged:** #74
+**Final PR merged:** #78 (this amendment)
 **CI status:** ✅ Green
-**Total PRs this autonomous turn:** 16 (#59 through #74)
+**Total PRs this autonomous turn:** 20 (#59 through #78)
 **Predecessor turn:** `docs/AUTONOMOUS_TURN_SUMMARY_2026-05-05.md` (Slice 1-3 hardening + tenant-config foundation; final commit `dd94a27`)
+
+**Amendment 1 (PR #78):** extends the original Phase B README hygiene table to include PRs #75-#77 (the turn summary itself, plus two follow-on doc-status updates that landed after the original summary was committed at PR #75).
 
 ---
 
@@ -42,6 +44,10 @@ The autonomous-friendly work surface for documentation hygiene is now substantia
 | #72 | `docs(async-consult): refresh README to reflect Sprint 34 implementation-complete state` | Replaced ~26-sprint-stale "SKELETON (Sprint 1 of 3)" framing with the actual implementation-complete state, preserving the 17-state vocabulary + PRD §12 vs State Machines §3 reconciliation note. |
 | #73 | `docs(tests): refresh tests/README.md to reflect Sprint 34 actual state` | "Empty at bootstrap" → "88+ integration test files at Sprint 34 close"; new Test database section documenting per-test SAVEPOINT isolation + FORCE RLS gotcha; new Bench mode section + Sprint 33-34 SI-006 closure additions. |
 | #74 | `docs(perf): add Sprint 17 OR-218 closure status update to tests/perf/README.md` | Sprint 7 framing of "OR-218 stays OPEN" + "Sprint 14+ EXECUTES" updated with status-update preamble noting OR-218 FULLY CLOSED at Sprint 17 / TLC-027 (branch protection installed 2026-05-06). Body preserved as audit trail. Also fixed bench-file name typo. |
+| #75 | `docs: add autonomous turn summary for 2026-05-08 run` | This file at its initial committed state — captured PRs #59-#74. |
+| #76 | `docs(scrum): bump status header from 'Sprint 1 in progress' to Sprint 34 close` | SCRUM_OPERATING_MODEL.md status pointer was ~33 sprints out of date. Targeted edit: updated header status + added "Operating-model amendments since adoption" list pointing readers at the in-body sprint-tagged sections (Sprint 5 retro PM-brief gate; Sprint 14/15 differentiated commit-budget calibration; Sprint 17 dual-close milestone; Sprint 22 shared-root-cause cluster; Sprint 33-34 SI-006 redesign). |
+| #77 | `docs(tlc-027): add Sprint 17 EXECUTE closure section to top of doc` | Same pattern as PR #74. TLC-027 doc was authored at Sprint 14/15 escalation time with Sprint 15 PM kickoff hand-off as resume gate; per matrix r4 the actual execution landed at Sprint 17 (2026-05-06) closing all 4 r10 findings + first DB-backed bench. Added per-finding closure detail at top + OR-218 branch-protection alignment. Body preserved as audit trail. |
+| #78 | `docs(turn-summary): amend 2026-05-08 turn summary to include PRs #75-#78` | This amendment — extends the original Phase B table to capture the post-#75 follow-on PRs so the turn summary remains the authoritative one-stop doc. |
 
 ---
 
@@ -67,13 +73,13 @@ This turn did not author novel runtime patterns — it **pinned existing pattern
 
 ## Stats
 
-- **PRs merged this turn:** 16 (#59 through #74)
+- **PRs merged this turn:** 20 (#59 through #78; one self-referential summary + amendment, which is why the count exceeds the unique-deliverable count of 18)
 - **Forward migrations:** 23 (000-022; no schema changes this turn)
 - **Production .ts files:** ~78 (2-3 minor handler additions; mostly stable)
 - **Integration test files:** ~88 (5+ added: audit-dedupe Group G + 3 identity §4-§5 + forms-intake-idempotency-replay)
-- **README files refreshed:** 9 (root + docs + src/lib + src/modules + migrations + tests + tests/perf + async-consult; plus 3 new module READMEs)
+- **README + status docs refreshed:** 11 (root + docs + src/lib + src/modules + migrations + tests + tests/perf + async-consult; plus 3 new module READMEs; plus SCRUM operating-model status; plus TLC-027 closure section)
 - **Spec Issues open:** 5 (SI-001/002/003/004/005)
-- **CI status at final PR (#74) merge:** ✅ Green (CLEAN)
+- **CI status at final PR (#78) merge:** ✅ Green (CLEAN)
 
 ---
 
