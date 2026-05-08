@@ -11,6 +11,7 @@
   1. Removed false claim that `processing_state` column "needs verification" — the column already exists in `migrations/005_idempotency_keys.sql:77-84` with the correct CHECK constraint
   2. Filled in the duplicate-key handling pseudocode that v0.1 glossed over (Postgres aborted-tx semantics + recommended approach)
   3. Reframed the gate: the redesign is BLOCKING before any patient-visible state-mutating slice (not just Pharmacy); Async-Consult and Consent already past that line
+- **v0.3 (2026-05-08, Sprint 33-34 IMPLEMENTATION CLOSURE):** SI-006 fully landed across 9 PRs (#43-#49 + #51). Closure section added at the bottom of this doc; Status flipped from `Open` to `Resolved`. The IDEMPOTENCY contract bump (v5.1 → v5.2) referenced in v0.2's Closure path is left for the spec corpus governance cycle — not in this app repo's scope. The implementation as-landed is faithful to the v0.2 design with three runtime additions surfaced by the Codex per-PR review series (per-endpoint TTL overrides; reservation-lock vs cached-response TTL split; cross-cutting `audit_dedupe_markers` for Category A audit durability on idempotency-protected paths).
 
 ---
 
@@ -249,8 +250,71 @@ Both are past the "v0 acceptable" line. The redesign is therefore BLOCKING **bef
 ## Status
 
 - **Filed:** 2026-05-06 (Sprint 27 / TLC-046)
-- **Open:** awaiting Engineering Lead acceptance + slice owner assignment
-- **Closure path:** when redesign lands, mark this SI as Resolved; bump IDEMPOTENCY contract from v5.1 → v5.2 (or whatever the spec authority decides) noting the implementation pattern is now reserve-then-execute.
+- **Resolved:** 2026-05-08 (Sprint 33-34) — implementation landed; see "Implementation Closure" section below.
+- **Closure path executed:** redesign landed across 9 PRs in Sprint 33-34. IDEMPOTENCY contract bump (v5.1 → v5.2) referenced in v0.2 is **deferred to the spec corpus governance cycle** — not in this app repo's scope. The reserve-then-execute implementation here uses contract v5.1 semantics faithfully; the future v5.2 bump would document that the pattern is canonical, not change runtime behavior.
+
+---
+
+## Implementation Closure (Sprint 33-34, 2026-05-08)
+
+This section documents what landed against the v0.2 design plus three runtime additions surfaced by the Codex per-PR review series (18 substantive findings closed across 11 PR iterations).
+
+### Faithful to the v0.2 design
+
+- **`withIdempotency` helper** at `src/lib/idempotency.ts` owns reserve + execute + completion atomically inside the caller's business transaction. SAVEPOINT `idempotency_reserve` enforces tx-discipline (caller must hold a transaction).
+- **Reservation INSERT** uses `processing_state='pending'`; on success the body callback runs; on success the row is updated to `'completed'` with the cached response.
+- **DELETE-purge of expired rows** runs as a separate statement immediately before the INSERT (split from the original WITH-CTE design after Postgres CTE snapshot-isolation evidence in PR-D Group D).
+- **Three error classes** route the response: `IdempotencyReplayError` (cache hit, replay), `IdempotencyInFlightError` (pending row from another connection, 409), `IdempotencyBodyMismatchError` (4-tuple match but body hash differs, 409).
+- **Caller pattern** unified via `src/lib/idempotent-handler.ts` `withIdempotentExecution<TView>(req, reply, mapServiceError, body)`. Body callback signature is `(tx, idempotencyCtx) => Promise<{ status, view }>`. Service-layer projections (no `tenant_id` leak per I-025) happen INSIDE the body callback so the cached response is post-projection.
+
+### Three runtime additions (Codex review-driven)
+
+1. **Per-endpoint TTL overrides** (PR #43, 4 Codex rounds). `ENDPOINT_TTL_OVERRIDES` map in `idempotency.ts` lets specific endpoints override the IDEMPOTENCY v5.1 default 24h cache TTL. Auth-flow paths (`/v0/identity/login/verify`, `/v0/identity/registration/verify`) cache plaintext bearer tokens to satisfy the v5.1 retry contract; their TTL is bound to **900s aligned to the JWT `access_token` TTL** (`jwt.ts:62 ACCESS_TOKEN_TTL_SECONDS`). The pin: cache TTL = JWT TTL means cached responses cannot outlive the bearer they contain. Path normalization (lowercase + trailing-slash strip) inside `ttlSecondsForEndpoint` closes case/slash bypass paths.
+
+2. **Reservation-lock vs cached-response TTL split** (PR #43 r4, Codex HIGH-3). The pending row's `expires_at` is the **reservation-lock lifetime** — how long another concurrent request sees this 4-tuple as in-flight. The completed row's `expires_at` is the **cached-response dwell time**. These were originally conflated; if a handler stalled past the override TTL, another retry could purge the reservation and re-execute the irreversible side effects, breaking exactly-once. Fix: the pending INSERT keeps the migration-005 column-default 24h reservation-lock; the override TTL is applied only at the pending → completed UPDATE.
+
+3. **Cross-cutting Category A audit-dedupe** (PR #49, 2 Codex rounds, closes PR-F2 r4 deferred HIGH). `migrations/022_audit_dedupe_markers.sql` adds an `audit_dedupe_markers (tenant_id, dedupe_key)` PK table with per-endpoint TTL alignment. `src/lib/audit-dedupe.ts` exports `claimAuditDedupeSlot(client, identity)` for callers emitting Category A audits on idempotency-protected paths. The dedupe identity is a 6-tuple SHA-256 hex of `(tenant_id || idempotency_key || endpoint || actor_id || bodyHash || auditAction)` joined by ASCII unit separator (0x1F). Without bodyHash in the identity, a stale marker could suppress a legitimate emit on a fresh post-cache-expiry request with different content; with bodyHash, the dedupe is precise.
+
+### Source-grep regression lockdowns (Group F in `tests/integration/idempotency-helper.test.ts`)
+
+Pins absence of:
+- `addHook('onSend')` registration — legacy cache-write hook removed
+- `storeIdempotencyRecord` — legacy writer function removed
+- `request._idempotencyKey =` — legacy preHandler→onSend stash removed
+- `_idempotencyManagedByHandler` — legacy opt-out flag removed
+- `markIdempotencyManagedByHandler` identifier (Sprint 34 cleanup-sweep)
+
+Patterns run against **comment-stripped source** so doc-comments referencing removed symbols by name don't false-positive. Reintroducing any of these would fail the lockdown immediately.
+
+### Cross-PR Codex review cadence
+
+Each PR iteration in this sequence ran Codex `adversarial-review --base main` against the branch HEAD (per PROJECT_CONVENTIONS §5 review discipline). The convergence pattern matched the v1.10.1 hygiene cycle's asymptote: each round closed some HIGHs but typically revealed 1-2 subtler ones in the same area. PR-F1 needed 4 rounds; PR-F2 needed 5; PR-F3 needed 5; PR #51 needed 4 (with the 4th surfaced by CI's real-DB run, not Codex). Total 18 substantive findings closed (11 HIGH + 7 MEDIUM).
+
+### PR sequence (chronological)
+
+| PR | Title | Cumulative Codex closures |
+|---|---|---|
+| #43 | PR-F1 — per-endpoint TTL overrides + reservation/cache TTL split | 3 HIGH |
+| #44 | PR-F2 — forms-intake migration + crisis-audit independence + cached-4xx alignment | 3 HIGH + 1 MEDIUM |
+| #45 | PR-F3 — identity migration + sessionRefresh exempt | 2 HIGH + 3 MEDIUM |
+| #46 | PR-F4 — tenant-config 503-stub markers | 0 (Codex APPROVE r1) |
+| #47 | PR-E — onSend cache-write removal + Group F lockdown | 1 MEDIUM |
+| #48 | cleanup-sweep — delete `markIdempotencyManagedByHandler` | 0 (Codex APPROVE r1) |
+| #49 | audit-dedupe SI — `audit_dedupe_markers` + bodyHash + per-endpoint TTL | 1 HIGH |
+| #50 | CI dependency-review advisory (unrelated infra fix) | 0 |
+| #51 | async-consult HTTP integration tests + handler `InvalidTransitionError` mapping | 4 MEDIUM |
+
+### Documented limitations (out-of-scope for SI-006)
+
+1. **Marker-claimed-emit-fails leaves audit missing.** If `claimAuditDedupeSlot` succeeds but the subsequent audit emission fails (DB error, network failure), the marker stays — a retry will skip the emit and the audit is lost. Documented in `src/lib/audit-dedupe.ts` header. If a caller needs guaranteed audit emission, it should use a compensating-action pattern (Sprint 35+ if real-world need surfaces).
+
+2. **Pre-existing crash-window for non-idempotency-protected Category A audits.** Audits emitted from non-idempotency-protected paths (e.g., direct service calls, cron jobs) don't have dedupe protection. Out of scope; the I-019 + I-003 durability contract is satisfied at the per-emission level. If retry-driven duplication becomes a real ops concern, generalize the dedupe pattern.
+
+3. **Async-consult HTTP test coverage gaps deferred:** state transitions requiring 48h-aging or terminal forms_submission seeding can't be exercised cleanly from HTTP-only integration. Tests for non-empty consult_events PHI projection wait until SI-001 forms_submission integration lands.
+
+### Spec corpus follow-on (deferred)
+
+Per v0.2 Closure path: bump IDEMPOTENCY contract v5.1 → v5.2 in the spec corpus (`telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_Contracts_Pack_v5_00_IDEMPOTENCY.md`) noting the canonical implementation pattern is now reserve-then-execute. **Not in this app repo's scope** — gated on spec-corpus governance cycle. The runtime is correct against v5.1; v5.2 would be a documentation/intent bump.
 
 ---
 
