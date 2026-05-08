@@ -344,3 +344,84 @@ describe('audit-dedupe — Group F: bodyHash discriminates', () => {
     expect(claimedB).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Group G — documented-limitation regression marker
+// ---------------------------------------------------------------------------
+
+describe('audit-dedupe — Group G: documented-limitation regression marker', () => {
+  /**
+   * Codifies the KNOWN LIMITATION documented at `src/lib/audit-dedupe.ts:42-47`:
+   *
+   *   "if the marker INSERT commits but the subsequent audit emit
+   *    fails (DB error, network failure, etc.), the marker stays —
+   *    a retry will skip the emit, leaving the audit missing."
+   *
+   * This is a deliberate scope decision for SI-006: the dedupe
+   * helper is a bare claim/skip primitive, not a guaranteed-emission
+   * coordinator. If a future change adds compensating-action logic
+   * (e.g., outbox pattern, marker-with-emit-status field, retry
+   * queue) that closes the gap, this test will start FAILING — at
+   * which point the engineer making the change should update both
+   * the test below AND the KNOWN LIMITATION block in audit-dedupe.ts.
+   *
+   * The test simulates the failure mode by:
+   *   1. Claim a slot via `claimAuditDedupeSlot` — succeeds
+   *   2. Do NOT call any audit-emit code (simulating an emit
+   *      failure that left the marker behind without emitting)
+   *   3. A second claim attempt for the same identity — returns
+   *      false (suppression)
+   *
+   * The point being pinned: step 3 returns false EVEN THOUGH no
+   * audit was actually emitted in step 2. That's the gap. A future
+   * compensating-action implementation would either let step 3
+   * succeed (because no emit happened so no dedupe is warranted)
+   * OR add a separate observability signal that the marker is
+   * "claimed but emit-pending".
+   */
+  it('marker claimed without subsequent emit still suppresses retry (documented gap)', async () => {
+    const identity = freshIdentity();
+
+    // Step 1: claim slot — caller IS NOW responsible for emitting
+    // the audit. The contract returns true (first claim).
+    const firstClaim = await inTenantTx(identity.tenantId, (tx) =>
+      claimAuditDedupeSlot(tx, identity),
+    );
+    expect(firstClaim).toBe(true);
+
+    // Step 2: simulate an audit-emit failure by NOT calling any
+    // audit-emit code. The marker is now in `audit_dedupe_markers`
+    // but no row exists in `audit_records` for this identity.
+    //
+    // The runCrisisGate caller pattern at
+    // submission-service.ts:466-490 emits the audit AFTER claiming
+    // the slot. If that emit throws, the catch in runCrisisGate
+    // would propagate up. The marker INSERT, however, was committed
+    // by `claimAuditDedupeSlot`'s `withTransaction(async (tx) => ...)`
+    // which is independent of the audit-emit's own transaction. So
+    // the marker survives an audit-emit failure.
+
+    // Step 3: a retry attempt under the same identity — the gap.
+    // The marker is still present; claimAuditDedupeSlot returns
+    // false; the caller (e.g., a retried HTTP request hitting the
+    // same idempotency 4-tuple) skips the audit emit. Net result:
+    // the audit was NEVER successfully written, and never will be
+    // for this exact 5-tuple under the current implementation.
+    const retryClaim = await inTenantTx(identity.tenantId, (tx) =>
+      claimAuditDedupeSlot(tx, identity),
+    );
+    expect(retryClaim).toBe(false);
+
+    // If a future engineer adds compensating-action logic (e.g., a
+    // separate `emit_status` column on the marker, an outbox-pattern
+    // emit-with-marker, or a marker-without-emit cleanup job that
+    // re-claims the slot when no audit row exists), this assertion
+    // becomes the canary — it will start failing when the gap closes,
+    // at which point the engineer should update audit-dedupe.ts's
+    // KNOWN LIMITATION block AND this test together.
+    //
+    // The assertion phrasing is deliberate: "expect(retryClaim).toBe(false)"
+    // codifies CURRENT behavior; flip to `.toBe(true)` (and update
+    // the doc comment) when the gap closes.
+  });
+});
