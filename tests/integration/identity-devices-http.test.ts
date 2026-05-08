@@ -4,11 +4,14 @@
  * Exercises POST/GET /v0/identity/devices and DELETE /v0/identity/devices/
  * :deviceId end-to-end via Fastify inject().
  *
- * Coverage in this file (3 sections, 9 cases).
+ * Coverage in this file (4 sections, 11 cases).
  *
  * Spec references:
  *   - src/modules/identity/internal/handlers/devices.ts (target)
  *   - Identity & Authentication Spec v1.0 §3.1 (biometric) + §3.4 (max 3)
+ *   - IDEMPOTENCY v5.1 §1 (cache 4-tuple + replay/body-mismatch — §4)
+ *   - SI-006 reserve-then-execute (Sprint 33-34; the §4 idempotency
+ *     contract is what PR-F3 migrated to handler-owned `withIdempotency`)
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -273,5 +276,110 @@ describe('identity devices HTTP — §3 DELETE /devices/:deviceId', () => {
       headers: { host: 'localhost', 'idempotency-key': ulid() },
     });
     expect(response.statusCode).toBe(204);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §4 — IDEMPOTENCY v5.1 contract on POST /v0/identity/devices
+// ---------------------------------------------------------------------------
+//
+// Sprint 33 PR-F3 migrated `registerDeviceHandler` to `withIdempotency`
+// reserve-then-execute. Pre-this-section the cache contract had zero
+// HTTP-level coverage on this endpoint (or any identity endpoint). The
+// two cases below pin the load-bearing v5.1 invariants:
+//
+//   §4a same key + same body → cached 201 replay (the `device_id`
+//        returned on retry IS the same row — no second registration
+//        side effect)
+//   §4b same key + different body → 409
+//        `internal.idempotency.body_mismatch` (the v5.1 §1 reuse
+//        contract — different bodies are categorically different
+//        requests and the helper rejects them deterministically)
+//
+// Spec references:
+//   - src/lib/idempotency.ts (withIdempotency reserve-then-execute)
+//   - src/lib/idempotent-handler.ts (withIdempotentExecution helper)
+//   - IDEMPOTENCY v5.1 §1 (cache 4-tuple PK; same-body replay; different-
+//     body 409)
+//   - docs/PROJECT_CONVENTIONS.md r5 §3.7 (Reserve-then-execute is the
+//     only path for state-changing handlers)
+// ---------------------------------------------------------------------------
+
+describe('identity devices HTTP — §4 IDEMPOTENCY v5.1 contract', () => {
+  it('§4a same Idempotency-Key + same body → cached 201 replay (same device_id)', async () => {
+    const accountId = await seedActiveAccount();
+    const idempotencyKey = ulid();
+    const payload = {
+      account_id: accountId,
+      platform: 'ios' as const,
+      device_label: 'iPhone 15',
+      device_public_key: 'BASE64-replay-test',
+    };
+
+    const first = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/devices',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload,
+    });
+    expect(first.statusCode).toBe(201);
+    const firstBody = first.json<{ device_id: string }>();
+    expect(firstBody.device_id).toBeTruthy();
+
+    // Second request with same key + same body. withIdempotency's
+    // preHandler cache-replay fast path short-circuits; the handler
+    // body callback does NOT run; no second registerDevice service
+    // call happens. The cached response is replayed verbatim.
+    const second = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/devices',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload,
+    });
+    expect(second.statusCode).toBe(201);
+    const secondBody = second.json<{ device_id: string }>();
+    // The same device_id MUST come back — proves a single underlying
+    // row was created, not two distinct registrations.
+    expect(secondBody.device_id).toBe(firstBody.device_id);
+
+    // PHI projection still holds on the replay path.
+    expect(second.body).not.toContain('"tenant_id"');
+    expect(second.body).not.toContain('Telecheck-US');
+  });
+
+  it('§4b same Idempotency-Key + different body → 409 internal.idempotency.body_mismatch', async () => {
+    const accountId = await seedActiveAccount();
+    const idempotencyKey = ulid();
+
+    const first = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/devices',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload: {
+        account_id: accountId,
+        platform: 'ios',
+        device_public_key: 'BASE64-original',
+      },
+    });
+    expect(first.statusCode).toBe(201);
+
+    // Second request: same key, DIFFERENT body (platform flipped to
+    // android, key changed). Per IDEMPOTENCY v5.1 §1: same key +
+    // different body → 409 with code internal.idempotency.body_mismatch.
+    // The body hash check at withIdempotency reservation time fires
+    // BEFORE any business logic runs.
+    const second = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/devices',
+      headers: { host: 'localhost', 'idempotency-key': idempotencyKey },
+      payload: {
+        account_id: accountId,
+        platform: 'android',
+        device_public_key: 'BASE64-different',
+      },
+    });
+    expect(second.statusCode).toBe(409);
+    const errorBody = second.json<{ error: { code: string } }>();
+    expect(errorBody.error.code).toBe('internal.idempotency.body_mismatch');
   });
 });
