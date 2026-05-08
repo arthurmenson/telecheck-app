@@ -72,12 +72,41 @@ jobs:
       # in kms.ts ensures this value is NEVER reached in production — it throws
       # before deriveTenantKey is called. Value mirrors .env.example.
       TENANT_KMS_LOCAL_DEV_KEY: dev-only-not-for-production-32-chars
+      # Spec-corpus path for tests/contracts/openapi-conformance.test.ts.
+      # The conformance test resolves this env var to find Telecheck_OpenAPI_v0_2.md.
+      # Without this, the test logs `[openapi-conformance] OpenAPI spec not found
+      # at: ...` and silently passes (its early-return on `!specExists()`).
+      # Cloning the sibling spec repo and pointing TELECHECK_SPEC_PATH at the
+      # bundle directory activates the spec-presence + length assertions.
+      TELECHECK_SPEC_PATH: "${{ github.workspace }}/telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE"
       # Force CI mode in tooling (e.g., disables interactive prompts in any future setup script).
       CI: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Clone the spec corpus into a sibling directory so
+      # tests/contracts/openapi-conformance.test.ts can resolve
+      # Telecheck_OpenAPI_v0_2.md via TELECHECK_SPEC_PATH (set above).
+      # Pattern matches .github/workflows/spec-pointer-validation.yml —
+      # public clone, no auth required (telecheckONE is public).
+      #
+      # `continue-on-error: true` preserves the test's existing
+      # bootstrap-mode soft-gate posture: if the clone fails (network
+      # blip, repo briefly unavailable, future privacy flip without
+      # PAT setup), the openapi-conformance test silently skips per
+      # its existing `!specExists()` early-return — the same
+      # behavior the workflow had before this step was added. When
+      # telecheckONE is reliably reachable AND the conformance test
+      # has real per-endpoint assertions (currently all it.todo()),
+      # remove this `continue-on-error` line to harden the gate.
+      - name: Clone spec corpus
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/arthurmenson/telecheckONE.git telecheckONE
+          ls "telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_OpenAPI_v0_2.md" || \
+            echo "::warning::OpenAPI spec file missing from cloned bundle (clone may have partially succeeded)"
 
       - name: Setup Node 20 LTS
         uses: actions/setup-node@v4
