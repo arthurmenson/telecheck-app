@@ -2,7 +2,15 @@
 
 **Adopted:** 2026-05-05 per Evans's directive.
 **Cadence:** 1-week sprints. Sprint kickoff = Monday-equivalent (autonomous-turn boundary). Sprint review = Friday-equivalent.
-**Status:** Sprint 1 in progress.
+**Status:** Sprint 34 closed 2026-05-08 (SI-006 reserve-then-execute idempotency redesign + audit-dedupe SI fully landed across 9 PRs in Sprints 33-34; v1.10 PRD canonical at spec corpus per Promotion Ledger P-008/P-009). Sprint 35 awaits PM kickoff.
+
+**Operating-model amendments since adoption** (this header is the only stable status pointer; protocol edits below preserve their authoring sprint inline):
+- Sprint 5 retro — added §"PM-brief verification gate" (PM hallucination as a recurring failure class)
+- Sprint 14 retro / Sprint 15 TLC-028 — three-way differentiated commit-budget calibration
+- Sprint 17 retro — dual-close milestone pattern (escalation + ORT row in same sprint)
+- Sprint 22 retro — shared-root-cause cluster discipline (TLC-040 §3b + TLC-041 §1-7 → 1 commit, 40% budget)
+- Sprint 27+ — Codex companion-script invocation pattern (`codex-companion.mjs adversarial-review`)
+- Sprint 33-34 — SI-006 reserve-then-execute redesign as canonical pattern for state-changing handlers (cumulative 18 substantive Codex closures across 11 PR iterations; documented in PROJECT_CONVENTIONS r5 §3.7-§3.9 + §5.11-§5.12)
 
 ---
 
