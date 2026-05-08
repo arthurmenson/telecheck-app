@@ -1,49 +1,50 @@
-# Async Consult module — SKELETON (Sprint 1 of 3)
+# `src/modules/async-consult/` — Async Consult module
 
-## Status (v0.1 skeleton — Sprint 8 / TLC-020)
+Implementation of **Async Consult Slice PRD v1.0** (Canonical for development).
 
-This module is a **directory skeleton** authored at Sprint 8 (TLC-020) — the 4th application of the blocked-aware skeleton recipe (after pharmacy TLC-001 in Sprint 1, med-interaction TLC-007 in Sprint 3, subscription TLC-010 in Sprint 4). Async Consult is the first **non-blocked** slice authoring since Sprint 1 — pre-pave runway exhausted at Sprint 7 retro; Sprint 8 pivots per Path (b).
+This module owns the platform's asynchronous consult primitive — patient-initiated intake, clinician review, prescription / advice / referral / decline branches, and the patient-responds follow-up cycle. Per the slice PRD, async consult is the first non-blocked clinical workflow on the platform: it does not depend on real-time scheduling (which Sync Video Consult handles) and is the entry point for the Mode 2 protocol-execution agent (per ADR-002, preserved at v1.0 active levels per ADR-029).
 
-## Slice authoring sequencing (Sprints 8 → 9 → 10)
+## Status: implementation-complete at v1.0 (Sprint 33-34 close, 2026-05-08)
 
-| Sprint | Story | Scope | DoD signal |
-| --- | --- | --- | --- |
-| **Sprint 8 (THIS)** | TLC-020 | Module skeleton + plugin shell + branded IDs + state vocabulary + plugin smoke test | Plugin smoke test passes (2 cases) |
-| **Sprint 9** | TLC-021 | Repos (tenant-scoped) + service layer + state-machine transition logic + initial HTTP handlers (POST /v0/async-consult initiate, POST /v0/async-consult/:id/submit, POST /v0/async-consult/:id/abandon, GET /v0/async-consult/:id) | First end-to-end test passes; State Machines §3 transitions wired |
-| **Sprint 10** | TLC-022 | Full HTTP integration (clinician decision endpoints, patient response, follow-up messaging) + audit event emitters + domain event emitters + cross-tenant isolation tests | OR-218 perf benches added per Sprint 11 promotion path |
+All 6 functional routes mounted under `/v0/async-consult` (plus `/health` and `/ready`) are implemented end-to-end with HTTP-level integration tests, service-layer direct integration tests, cross-tenant isolation tests, and (post-Sprint 33-34) idempotency-replay regression on state-changing handlers.
 
-## What ships at v0.1 (Sprint 8)
+Sprint 33 PR-F-prep migrated 5 handlers to the reserve-then-execute idempotency pattern. Sprint 34 PR #51 added comprehensive HTTP integration tests + closed a handler bug where `InvalidTransitionError` and `UnsupportedTransitionError` leaked as 500 responses (now mapped to tenant-blind 409 per I-025) — 4 Codex rounds (r1→r4) including a CI-revealed handler bug closure.
 
-- Module directory boundary (per ADR-001 modular monolith)
-- Fastify plugin shell registering `/v0/async-consult`
-- Liveness probe (`GET /health` → 200) with informational `blocked` metadata
-- Readiness probe (`GET /ready` → 503) — Kubernetes/LB will keep traffic off
-- Branded ID types (`ConsultId`, `ConsultEventId`) — identifier hygiene only
-- State value const enum `CONSULT_STATES` (17 values per State Machines §3) — typed-only, no transition logic
-- Plugin smoke test (`tests/integration/async-consult-plugin-wiring.test.ts`)
+## Module structure (per `src/modules/README.md` template)
 
-## What does NOT ship at v0.1 (Sprint 8)
+```
+async-consult/
+├── index.ts              ← public interface (cross-module-safe exports)
+├── plugin.ts             ← Fastify plugin entry point (registered in src/app.ts under /v0/async-consult)
+├── routes.ts             ← Fastify route registration (6 routes + /health + /ready)
+├── audit.ts              ← AUDIT_EVENTS v5.2 emitters
+├── events.ts             ← DOMAIN_EVENTS v5.2 emitters
+└── internal/             ← module-private; no cross-module imports allowed
+    ├── types.ts                    ← branded IDs (ConsultId, ConsultEventId) + row-shape types
+    ├── state-machine.ts            ← typed-graph state-machine wrapping State Machines v1.1 §3 (~30 transitions, 17 canonical states)
+    ├── handlers/
+    │   └── consults.ts             ← initiate / submit / abandon / resume / patient-responds + listConsultEvents
+    ├── services/
+    │   └── consult-service.ts      ← business logic + state-machine guards
+    └── repositories/
+        ├── consult-repo.ts         ← tenant-scoped DB access for `consults`
+        └── consult-event-repo.ts   ← tenant-scoped DB access for `consult_events`
+```
 
-- Row-shape interfaces for Consult / ConsultEvent (await CDM §4 expansion + Sprint 9 authoring)
-- Repository files (Sprint 9)
-- Service layer (Sprint 9)
-- State-machine transition logic (Sprint 9 — ~30 transitions per State Machines §3 transition table at L196-218+)
-- HTTP handlers (Sprint 9 + 10)
-- Audit event emitters (Sprint 10 — pending AUDIT_EVENTS contract ratification; PRD §13 enumerates 11 events not in canonical contract; SI-004 candidate)
-- Domain event emitters (Sprint 10 — same posture)
-- Cross-tenant isolation tests (Sprint 10)
-- Migration files (Sprint 9 — pending CDM §4 expansion verification at Sprint 9 PM kickoff)
+## Routes (under `/v0/async-consult`)
 
-## Why the skeleton ships before the rest
+| Method | Path | Handler | Description |
+|---|---|---|---|
+| GET | `/health` | inline | liveness probe |
+| GET | `/ready` | inline | readiness probe |
+| POST | `/` | `initiateConsultHandler` | patient initiates a new consult (idempotency-protected) |
+| POST | `/:id/submit` | `submitConsultHandler` | patient submits the intake (idempotency-protected) |
+| POST | `/:id/abandon` | `abandonConsultHandler` | patient abandons an in-progress consult (idempotency-protected) |
+| POST | `/:id/resume` | `resumeConsultHandler` | patient resumes an abandoned consult before expiry (idempotency-protected) |
+| POST | `/:id/patient-responds` | `patientRespondsConsultHandler` | patient responds to clinician request for additional data (idempotency-protected) |
+| GET | `/:id/events` | `listConsultEventsHandler` | list lifecycle events for a consult |
 
-Per EHBG §10b sprint sequencing, slice authoring is split across multiple sprints because:
-
-1. **Module boundary stable on day 1** — `src/app.ts` registers `asyncConsultPlugin` once; plugin internals can evolve without re-touching `app.ts` across sprints
-2. **Downstream slices can typed-import branded IDs + state vocabulary** — Pharmacy + Refill, RPM/CCM, Adverse Events, Messaging, Payment all reference Consult types per PRD §15 Dependencies; they can compile clean against typed references before Sprint 9 lands repos/services
-3. **Reproducible recipe** — 4th application of the BLOCKED-aware skeleton recipe; near-zero authoring cost for the boundary itself
-4. **Liveness/readiness pattern is consistent** — applies the Sprint 1 Codex MEDIUM finding (`pharmacy-blocked-handler`) a-priori (now the standing rule)
-
-## State value vocabulary (17 canonical states from State Machines §3)
+## State vocabulary (17 canonical states from State Machines v1.1 §3)
 
 ```
 INITIATED, INTAKE, ABANDONED, SUBMITTED, PROCESSING, QUEUED,
@@ -51,53 +52,55 @@ UNDER_REVIEW, PRESCRIBED, ADVISED, AWAITING_DATA, ESCALATED_TO_SYNC,
 DECLINED, REFERRED, FOLLOW_UP, COMPLETED, EXPIRED, CLOSED
 ```
 
-PRD v1.0 §12 lists 16 states; the difference between PRD §12 and State Machines §3:
-- **PRD §12 has `DECISION_MADE`** — State Machines §3 absorbs this into UNDER_REVIEW branch points (transitions go from UNDER_REVIEW directly to PRESCRIBED / ADVISED / AWAITING_DATA / ESCALATED_TO_SYNC / DECLINED / REFERRED, not via a DECISION_MADE intermediate state)
-- **State Machines §3 adds `EXPIRED`** — `ABANDONED → expire → 14d → EXPIRED` (`Telecheck_State_Machines_v1_1.md:200`)
-- **State Machines §3 adds `CLOSED`** — `AWAITING_DATA → timeout → 14d → CLOSED` (`Telecheck_State_Machines_v1_1.md:212`)
+Per CLAUDE.md hard rule "Slice PRD vs State Machines v1.1 → State Machines wins", the canonical inventory is 17 states (not the 16 listed in PRD v1.0 §12). Differences:
+- PRD §12 had `DECISION_MADE`; State Machines §3 absorbs into UNDER_REVIEW branch points
+- State Machines §3 adds `EXPIRED` (`ABANDONED → expire → 14d → EXPIRED`)
+- State Machines §3 adds `CLOSED` (`AWAITING_DATA → timeout → 14d → CLOSED`)
 
-Per CLAUDE.md hard rule "Slice PRD vs State Machines v1.1 → State Machines wins", the canonical inventory is 17 states (State Machines §3).
+## Schema
 
-## Cross-slice dependency posture (per PRD §15)
+Owned migrations:
+- `migrations/020_async_consult.sql` — `consults` + `consult_events` (composite UNIQUE on self for `consult_events` FK; composite FK to `accounts` + `forms_submission`)
+- `migrations/021_async_consult_tenant_boundary_constraints.sql` — Codex-driven fix-forward for cross-tenant boundary constraints (idempotent ALTERs covering the upgraded-DB path)
 
-PRD §15 lists 14 cross-slice dependencies. Skeleton ships without wiring any of them. Sprint 9 + 10 wire the available ones:
+Composite UNIQUE + composite FK pattern per PROJECT_CONVENTIONS r5 §1.1.
 
-| Dependency | Available today? | Wire-up sprint |
-| --- | --- | --- |
-| Identity & Auth | ✅ (Sprint 1) | Sprint 9 (auth context for clinician + patient) |
-| Forms/Intake Engine | ✅ (Sprint 0) | Sprint 9 (intake form rendering) |
-| Consent & Delegation | ✅ (Sprint 1) | Sprint 9 (delegate context) |
-| AI Clinical Assistant Mode 2 | ⚠️ no module yet | Sprint 10+ (or AI Service slice authoring) |
-| Med Interaction Engine | ⚠️ skeleton only | Sprint 10+ when Med-Interaction service ships |
-| Pharmacy + Refill | ⚠️ BLOCKED on SI-001 | Sprint 4 of EHBG §10b (whenever SI-001 closes) |
-| Subscription | ⚠️ skeleton only | Sprint 10+ |
-| Labs, RPM/CCM, Adverse Events, Payment, Messaging | ⛔ not yet authored | Sprint 11+ per EHBG §10b |
-| Herb-Drug | ⛔ not yet authored | Sprint 11+ |
+## Cross-slice dependency posture
 
-## On-resume notes (Sprint 9 kickoff)
+| Dependency | Status | Notes |
+|---|---|---|
+| Identity & Auth | ✅ wired | actor context for clinician + patient |
+| Forms/Intake Engine | ✅ wired | intake form rendering + submission |
+| Consent & Delegation | ✅ wired | delegate context + scope-grant matrix |
+| AI Clinical Assistant Mode 2 | ⏳ deferred | awaits AI Service slice authoring |
+| Med Interaction Engine | ⏳ skeleton-only | awaits Med Interaction Engine slice PRD ratification |
+| Pharmacy + Refill | ⛔ BLOCKED | SI-001 (MedicationRequest schema gap) |
+| Subscription | ⛔ BLOCKED | SI-001 |
 
-When Sprint 9 begins:
+## Integration test coverage
 
-1. Read State Machines §3 transition table fully (`Telecheck_State_Machines_v1_1.md:196-218+`) — all ~30 transitions
-2. Author `internal/state-machine.ts` with the transition table as a typed graph + guards
-3. Author `internal/repositories/consult-repo.ts` + `internal/repositories/consult-event-repo.ts` (tenant-scoped per I-023)
-4. Author `internal/services/consult-service.ts` — initiate / submit / abandon / read
-5. Add HTTP handlers under `internal/handlers/consult.ts` — POST /v0/async-consult, GET /v0/async-consult/:id, POST /v0/async-consult/:id/submit, POST /v0/async-consult/:id/abandon
-6. Author migration `migrations/020_async_consult.sql` — verify CDM §4 expansion exists at PM kickoff (if not, file SI-005 candidate)
-7. Wire Identity (req.actorContext) + Forms/Intake (intake form rendering) + Consent (delegate context) cross-slice dependencies
-8. Author tenant-scoped integration tests + cross-tenant isolation tests
-9. Codex FIRE on every Sprint 9 commit (slice authoring novelty)
+Located in `tests/integration/`:
+
+- `async-consult-http.test.ts` — comprehensive HTTP coverage: happy path + state-machine guards + auth + body validation + idempotency replay/body-mismatch + PHI projection (552 lines, 13 cases across 6 groups; landed Sprint 34 PR #51)
+- `async-consult-cross-tenant-isolation.test.ts` — I-023 / I-024 / I-025 enforcement
+- `async-consult-plugin-wiring.test.ts` — plugin smoke test
+
+The handler `mapServiceError` extension to map `InvalidTransitionError` + `UnsupportedTransitionError` → tenant-blind 409 (was: 500 leak) was closed in PR #51 r3. The `expectNoTenantLeak(response)` shared helper is applied to ALL response surfaces (success + every error envelope).
 
 ## Spec references
 
-- ADR-001 modular monolith
-- ADR-029 AI workload taxonomy (Mode 2 prep per PRD §1)
+- ADR-001 (modular monolith)
+- ADR-002 (two-mode AI architecture; Mode 2 protocol-execution agent — preserved at v1.0 active levels per ADR-029)
+- ADR-029 (AI workload taxonomy; prospectively supersedes ADR-002 — Async Consult ships at v1.0 active levels of ADR-002 + ADR-005 + I-012 reject-unless gate)
 - Async Consult Slice PRD v1.0
-- State Machines v1.1 §3 (canonical state inventory — SOURCE OF TRUTH)
-- CDM v1.2 §3 entities #15 (Consult) + #16 (ConsultEvent)
-- I-023 / I-025 / I-027 platform invariants
-- EHBG §10b sprint plan (Async Consult sequencing per multi-sprint slice precedent)
+- Canonical Data Model v1.2 §3 entities #15 (Consult) + #16 (ConsultEvent)
+- State Machines v1.1 §3 (consult lifecycle — SOURCE OF TRUTH for 17 states + ~30 transitions)
+- Contracts Pack v5.2 INVARIANTS (I-003 audit append-only, I-012 prescribing reject-unless three-clause rule, I-019 crisis-detection platform-floor, I-023 / I-024 / I-025 / I-027 tenant isolation), AUDIT_EVENTS, DOMAIN_EVENTS, IDEMPOTENCY (v5.1)
+- Tenant Threading Addendum v1.0 §3.X (async consult slice)
 
 ## Sprint reference
 
-Authored Sprint 8 (TLC-020) on the autonomous Scrum cycle. **First non-blocked slice authoring since Sprint 1** (pre-pave runway exhausted at Sprint 7 retro). PM-brief verification gate was the 3rd consecutive clean run (Evans 2026-05-05 oversight directive). Sprint 9 + 10 continue the slice; Sprint 11 hardening adds OR-218 perf benches.
+- Sprint 8 (TLC-020) — initial skeleton authored; first non-blocked slice authoring since Sprint 1 (pre-pave runway exhausted at Sprint 7 retro)
+- Sprints 9-10 (TLC-021 / TLC-022) — repos + service + state-machine + initial HTTP handlers; full HTTP integration + audit/domain emitters + cross-tenant isolation tests
+- Sprint 33 PR-F-prep — reserve-then-execute idempotency migration (5 handlers)
+- Sprint 34 PR #51 — comprehensive HTTP integration tests + handler `InvalidTransitionError` 500-leak fix (4 Codex rounds)
