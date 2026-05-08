@@ -7,6 +7,7 @@ Authoring discipline: **read this doc before authoring schema migrations, repos,
 **Living artifact** — amend in place when new patterns emerge; bump the revision-line below.
 
 **Revision history:**
+- **r5 (2026-05-08, Sprint 33-34 / SI-006 closure):** Sprint 33-34 SI-006 reserve-then-execute redesign + audit-dedupe SI patterns. NEW §3.7 reserve-then-execute (handler-owned idempotency cache atomically) — Sprint 33 PR-A through PR-E + cleanup-sweep canonical; NEW §3.8 return-cached-vs-throw discipline for sentinel paths inside `withIdempotency` — Sprint 33 PR-F2 r3 canonical (CRISIS_DETECTED + RESPONSE_PAYLOAD_TOO_LARGE + isHandledSentinel return-as-cached path); NEW §3.9 independent-tx Category A audit emission with dedupe markers — Sprint 33 PR-F2 r2 (independent-tx) + Sprint 34 PR #49 (audit_dedupe_markers + bodyHash + per-endpoint TTL alignment); NEW §5.11 comment-stripped source-grep for regression lockdowns — Sprint 33 PR-E r2 canonical (Group F lockdown stripComments helper); NEW §5.12 asymptotic-convergence expectation on cross-cutting concurrency changes — Sprint 33-34 cumulative pattern (18 substantive Codex findings closed across 11 PR iterations; matched the v1.10.1 hygiene cycle's 12-round asymptote). Three+ proof-points per sub-rule.
 - **r1 (2026-05-05, Sprint 10 / TLC-022):** initial codification of Sprint 6/9/10 patterns.
 - **r2 (2026-05-05, Sprint 15 / TLC-028):** Sprint 13 + Sprint 14 retro patterns — §5.4 closure-path-overclaim pre-emption pattern; §5.5 structural-constraint-not-code-defect escalation pattern (Sprint 12 original + Sprint 14 round-1 environment-availability extension); §6 sub-rule 5 environment-dependency check at planning (raises PM rubric from 4 → 5 sub-rules — first new sub-rule since Sprint 6 baseline).
 - **r3 (2026-05-06, Sprint 18 / TLC-033):** Sprint 17 retro patterns. §5.4 extended with 6th finding-class (**module-load class** — does the file's top-level imports + import-side-effect-calls throw under the CI workflow that loads it?). §5.4 also extended with **lockdown-test pinning rule** (after 3+ rounds of Codex fix-forward on the same finding-class, pin resolved invariants as a lockdown contract test). Sprint 17 canonical examples: `tests/contracts/canonicalize-db-url.test.ts` 19-case lockdown pins r10-C → r11-2 → r12 → r13 trajectory; `requireBenchDb()` at module-load throw + `*.db.bench.ts` glob exclude pins module-load class. NEW §5.6 dual-close milestone pattern (when a sprint closes BOTH an escalation AND an ORT row, document explicitly in retro + traceability matrix bump). Sprint 17 = first dual-close milestone (TLC-027 escalation + OR-218 ORT row).
@@ -170,6 +171,65 @@ await withTransaction(async (tx) => {
 **Why:** PHI exposed to cross-slice callers expands the trust boundary of the providing slice indefinitely. Once a function returns `FormSubmission` with the responses payload, ANY future cross-module caller can read PHI by supplying tenantId + submissionId.
 
 **Pattern:** `forms-intake/index.ts:verifySubmissionBindingEligibility` (Sprint 10 r10 closure) — returns `{valid: boolean; reason?: ...}`, never the full submission. Replaced earlier `getSubmissionForBinding` which returned the full PHI row.
+
+### §3.7 Reserve-then-execute is the only path for state-changing handlers (Sprint 33-34 SI-006 closure)
+
+**Rule:** every state-changing HTTP handler MUST own its idempotency cache atomically via `withIdempotency` / `withIdempotentExecution`. The reservation INSERT, business mutation, completion UPDATE, and cached-response write all run inside ONE handler-owned transaction. The legacy preHandler-lookup + onSend-cache-write split (which existed pre-Sprint 33) is DEAD — the hook + writer + stash flag are gone, and Group F source-grep lockdowns pin their absence so a future regression cannot silently reintroduce dual-write semantics.
+
+**Why:** the v0 split was not transactionally-safe. Two concurrent requests with the same 4-tuple key both passed the preHandler lookup, both executed business actions, both raced the onSend INSERT — `ON CONFLICT DO NOTHING` ensured only one cache row won, but BOTH committed business state. Duplicate execution. Plus subtler failure modes Codex surfaced through 11 PR iterations: legacy onSend ignored TTL overrides (PR-F1 r2); cached 4xx envelopes tripped body-mismatch 409 on legitimate corrected retries (PR-F2 r3); reservation-lock TTL conflated with cached-response TTL allowed stuck-handler dup-execute (PR-F1 r4); session-revoke window orphaned cached 200 (PR-F3 r4-r5).
+
+**Pattern:** `src/lib/idempotent-handler.ts:withIdempotentExecution<TView>(req, reply, mapServiceError, body)`. Body callback signature is `(tx, idempotencyCtx) => Promise<{ status, view }>` — the `view` is the caller-projected response (no tenant_id leak per I-025; projection happens INSIDE the body callback so the cached response is post-projection). The `idempotencyCtx` second parameter is forwarded to service-layer audit-dedupe claims (see §3.9).
+
+**Per-endpoint TTL overrides:** `src/lib/idempotency.ts:ENDPOINT_TTL_OVERRIDES` maps specific endpoints to a TTL different from the IDEMPOTENCY v5.1 default 24h. Auth-flow paths (`/v0/identity/login/verify`, `/v0/identity/registration/verify`) cache plaintext bearer tokens to satisfy the v5.1 retry contract; their TTL is bound to **900s aligned to the JWT `access_token` TTL** (`jwt.ts:62`). The pin: cache TTL = JWT TTL means cached responses cannot outlive the bearer they contain. Path normalization (lowercase + trailing-slash strip) inside `ttlSecondsForEndpoint` closes case/slash bypass paths.
+
+**Reservation-lock vs cached-response TTL split:** the pending row's `expires_at` is the **reservation-lock lifetime**; the completed row's `expires_at` is the **cached-response dwell time**. The pending INSERT keeps the migration-005 column-default 24h reservation-lock; the override TTL is applied only at the pending → completed UPDATE.
+
+**Source-grep lockdown:** `tests/integration/idempotency-helper.test.ts` Group F pins absence of `addHook('onSend')`, `storeIdempotencyRecord`, `request._idempotencyKey =`, `_idempotencyManagedByHandler`, and the helper-function name `markIdempotencyManagedByHandler` itself. See §5.11 for the comment-stripping convention.
+
+**Canonical proof-points:**
+- PR #43 PR-F1 (TTL overrides + reservation/cache TTL split, 4 Codex rounds, 3 HIGH closures)
+- PR #47 PR-E (legacy onSend cache-write removal + Group F lockdown, 2 Codex rounds, 1 MEDIUM closure)
+- PR #48 cleanup-sweep (delete `markIdempotencyManagedByHandler` + 31 call sites + lockdown extension)
+- 5 migrated handler modules: async-consult, consent + delegations, forms-intake, identity, tenant-config (503-stub markers)
+
+### §3.8 Return-cached-vs-throw discipline for sentinel paths inside withIdempotency (Sprint 33 PR-F2 r3 canonical)
+
+**Rule:** when a deterministic 4xx outcome occurs inside `withIdempotency` body callback (CRISIS_DETECTED, payload-too-large, state-machine guard violations, validation sentinels, body-validation failures), the handler MUST **return** a `{ status: 4xx, view: errorEnvelope }` from the body callback rather than **throw** an httpError. Throwing rolls back the reservation; cached return commits the row so retries replay deterministically.
+
+**Why:** the failure mode is exactly-once-on-retry. A throw inside `withIdempotency` body causes the SAVEPOINT rollback → reservation row gone → client retry with same Idempotency-Key sees no completed cache row → handler runs again → re-emits Category A audits, re-runs crisis scanner, re-fires irreversible side effects. The exactly-once IDEMPOTENCY v5.1 §1 guarantee is violated. Return-as-cached commits the 4xx envelope; the next retry hits the cache and replays the same 409 / 422 without re-execution.
+
+**Pattern:** `src/modules/forms-intake/internal/handlers/submissions.ts` (Sprint 33 PR-F2 r3 closure). Three sentinel-classes converted from throw to return-as-cached:
+- `CRISIS_DETECTED` → `{ status: 409, view: { error: { code: 'internal.resource.conflict', ... } } }`
+- `RESPONSE_PAYLOAD_TOO_LARGE` → `{ status: 413, view: { error: { code: 'internal.request.payload_too_large', ... } } }`
+- `isHandledSentinel(message)` → `{ status: 400, view: { error: { code: 'internal.request.semantically_invalid', ... } } }`
+
+The error-envelope shape MUST match the canonical `ErrorEnvelope` from `src/lib/error-envelope.ts` (`code` + `message` + `trace_id` + `timestamp`) so cached and Fastify-global-handler-routed responses are indistinguishable to clients (PR-F2 r4 medium closure).
+
+**Throw is still correct for:** unhandled exceptions (DB failures, connectivity errors, programming bugs) — those SHOULD roll back the reservation so a clean retry is possible. Only deterministic-4xx-outcomes-of-input get the return-as-cached treatment.
+
+**Generic widening note:** when the body's success path returns `{ status, view: ServiceTypedView }` and the sentinel-catch returns `{ status, view: ErrorEnvelope }`, declare the helper generic as `withIdempotentExecution<unknown>(...)` so both shapes are assignable. The cached body is JSON regardless; the type widening is purely compile-time.
+
+**Canonical proof-points:** PR-F2 r3 (CRISIS_DETECTED + RESPONSE_PAYLOAD_TOO_LARGE + isHandledSentinel migration); PR-F2 r4 (envelope-shape alignment to `error-envelope.ts`); PR #51 r4 (CI-revealed `InvalidTransitionError` 500 leak — fixed by adding mapping to handler `mapServiceError`, NOT by adding return-as-cached because the throw originates outside `withIdempotency` body).
+
+### §3.9 Independent-tx Category A audit emission with dedupe markers (Sprint 33 PR-F2 r2 + Sprint 34 PR #49)
+
+**Rule:** Category A audit emissions (per AUDIT_EVENTS v5.2 §Category A — `crisis_detection_trigger`, prescribing.* execution_rejected, etc.) on idempotency-protected handler paths MUST follow this 3-step pattern:
+1. **Emit on a fresh independent transaction.** Open a `withTransaction(...)` with NO `externalTx` argument. The handler-owned business tx and the audit emission MUST be different transactions so the audit survives a business-tx rollback (which is the I-019 + I-003 durability contract — even if the handler throws CRISIS_DETECTED and the business state never persists, the escalation event MUST persist).
+2. **Claim a dedupe slot before emit.** When `idempotencyCtx` is supplied (the handler is on an HTTP path), call `claimAuditDedupeSlot(client, identity)` inside the audit tx BEFORE the emit. The 6-tuple identity hashes `(tenant_id, idempotency_key, endpoint, actor_id, bodyHash, auditAction)` so cross-tenant + different-body + different-action requests get distinct dedupe keys.
+3. **Skip emit if marker already claimed.** `claimAuditDedupeSlot` returns `false` when a prior attempt already committed the marker; the caller skips the emit (the audit is already durable from the prior attempt) but the surrounding throw still fires so the handler's CRISIS_DETECTED handling proceeds normally.
+
+**Why:** PR-F2 r4 documented a deferred HIGH: a process crash between the independent-tx audit commit and the idempotency completion UPDATE leaves the audit durable but the reservation rolled back. A retry under the same Idempotency-Key re-runs the gate and emits a SECOND Category A audit. The dedupe marker (Sprint 34 PR #49) closes that gap with a separate `audit_dedupe_markers` table — the marker is independent of audit_records (which is hash-chained append-only; not a place to add dedupe semantics) and aligns its TTL to the per-endpoint idempotency cache TTL so a stale marker can't suppress a legitimate emit on a fresh post-cache-expiry request with different content.
+
+**Pattern:** `src/modules/forms-intake/internal/services/submission-service.ts:runCrisisGate` is the canonical pattern. Service signatures must accept and forward `idempotencyCtx?: IdempotencyCtx` so the handler can pass it through. The `withIdempotentExecution` body callback signature was widened in PR #49 from `(tx)` to `(tx, idempotencyCtx)` specifically to enable this forwarding without re-computing the ctx.
+
+**Distinct audit_action labels for distinct emit sites:** when a single request can trigger multiple Category A audits at different sites (e.g., `pauseSubmission` runs `runCrisisGate` BOTH for the patch-side scan AND for the merged-set scan inside the atomic tx), each site uses a distinct `auditAction` label (`'crisis_detection_trigger'` vs `'crisis_detection_trigger.merged_set'`) so each emission gets a distinct dedupe key — both audits can fire on a single request, and each is exactly-once on retries.
+
+**Documented limitation:** if `claimAuditDedupeSlot` succeeds but the subsequent audit emission fails (DB error mid-tx, network failure), the marker stays — a retry will skip the emit and the audit is lost. Documented at the top of `src/lib/audit-dedupe.ts`. If a caller needs guaranteed audit emission, it should use a compensating-action pattern (out of scope for SI-006).
+
+**Canonical proof-points:**
+- PR-F2 r2 (`runCrisisGate` independent-tx fix; closes the rollback-with-handler-tx HIGH)
+- PR-F2 r3 (return-cached-vs-throw inside `withIdempotency`; closes the duplicate-emit-on-retry HIGH — see §3.8)
+- PR #49 (audit_dedupe_markers cross-cutting infra + bodyHash + per-endpoint TTL alignment; closes the crash-window HIGH that was deferred from PR-F2 r4)
 
 ---
 
@@ -340,6 +400,53 @@ await withTransaction(async (tx) => {
 
 **Sprint 24 canonical example:** TLC-045. r1 idempotency.ts catch+log → wrong primary hypothesis but retained as DiD. r2 async-consult `return reply` → right hypothesis, closed cleanly.
 
+### §5.11 Comment-stripped source-grep for regression lockdowns (Sprint 33 PR-E r2 canonical)
+
+**Rule:** when a source-grep lockdown test pins the absence of a removed symbol, identifier, or code-shape, the grep MUST run against **comment-stripped source**, not raw file content. Doc-comments that intentionally reference removed symbols by name (deprecation notices, tombstone blocks, regression-trigger explanations) would otherwise produce false positives that a future engineer would silence by deleting the explanatory comments — exactly the documentation that makes the lockdown understandable.
+
+**Why:** the SI-006 PR-E lockdown initially used narrow regexes (`addHook(\s*['"]onSend`) to avoid matching comment text. Codex r2 review surfaced that a future regression could reintroduce the legacy path via spelling variants (`addHook ('onSend',`, `fastify['addHook']('onSend')`, `const storeIdempotencyRecord = async (...)=>`, `request['_idempotencyKey'] =`, `if (request._idempotencyManagedByHandler)`) and the narrow regexes would all miss. Broadening the patterns to catch every spelling AND running against raw source would false-positive on the doc-comment block in `idempotency.ts` that says "the legacy onSend hook + storeIdempotencyRecord were REMOVED in PR-E." Stripping comments first lets the patterns be **broad** (catches spelling variants) AND **precise** (no false positives on doc-comments).
+
+**Pattern:** `tests/integration/idempotency-helper.test.ts` Group F `stripComments(src)` helper:
+```typescript
+function stripComments(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')          // block comments
+    .replace(/(^|[^:\\])\/\/.*$/gm, '$1');     // line comments (avoid http://, file://)
+}
+```
+
+The negative-character class `[^:\\]` before `//` avoids stripping URL fragments inside string literals. After stripping, the patterns are deliberately broad:
+- `/['"`]onSend['"`]/` — any quoted form of the literal string
+- `/\bstoreIdempotencyRecord\b/` — bare identifier (decl OR call)
+- `/_idempotencyKey['"`\]]?\s*=[^=]/` — dot OR bracket assignment, excluding `==`
+- `/_idempotencyManagedByHandler\b/` — any read of the legacy flag
+
+**When to apply:** any lockdown test that pins **absence** of a code shape after a substantive removal. NOT needed for lockdowns that pin **presence** (e.g., `expect(src).toMatch(/SAVEPOINT idempotency_reserve/)`) — presence pins don't false-positive on comments because the comment ALSO matches the desired pattern.
+
+**Canonical proof-points:** PR #47 PR-E r2 (Codex MEDIUM closure on regex bypassability); PR #48 cleanup-sweep extending the lockdown to pin `markIdempotencyManagedByHandler` identifier absence (relies on the same comment-stripping helper).
+
+### §5.12 Asymptotic-convergence expectation on cross-cutting concurrency changes (Sprint 33-34 cumulative pattern)
+
+**Rule:** when a sub-story touches cross-cutting concurrency / atomicity / multi-handler contracts, expect **asymptotic Codex review convergence** — each round closes some HIGHs but typically reveals 1-2 subtler ones in the same area. Plan budget for 4-5 rounds per such PR. Do NOT trigger §5.1 (5+ rounds = pause) on the first 4 rounds when the iteration shape is "found new HIGH each round, fixed it, surfaced the next one". Trigger §5.1 only when rounds stop closing findings AND start oscillating between fixes that contradict each other.
+
+**Why:** the SI-006 cycle PRs converged like this:
+- PR #43 PR-F1: r1 → r4 (4 rounds, 3 HIGH closures) — TTL bypass → legacy-onSend gap → reservation-lock TTL conflict
+- PR #44 PR-F2: r1 → r5 (5 rounds, 4 HIGH/1 MEDIUM) — crisis audit rolled back → sentinel-throw replay → cached-envelope shape → audit-dedupe-deferred-HIGH (closed in #49)
+- PR #45 PR-F3: r1 → r5 (5 rounds, 2 HIGH/3 MEDIUM) — token-cache TTL gate → PHONE_TAKEN unmapped → aborted-tx poison → sessionRefresh cache → upgrade-path replay
+- PR #51 r1 → r4 (4 rounds, 4 MEDIUM) — assertion-strength + PHI-leak helper-coverage + event_type pinning + CI-revealed handler bug
+
+Each round was productive: a real new finding closed, not the same finding re-litigated. The pattern matches the v1.10.1 hygiene cycle's 12-round asymptote (~95 findings closed) and the Sprint 25 retro § §5.7 shared-root-cause cluster discipline.
+
+**How to recognize it (vs §5.1 trigger):**
+- ✅ asymptotic-convergence pattern: each round closes a finding distinct from prior rounds; cumulative findings increase monotonically; the area-under-review is genuinely cross-cutting (touches multiple atomicity contracts, concurrency boundaries, or shared invariants).
+- ❌ §5.1 trigger pattern: rounds 4+ surface findings that contradict prior fixes; a round's fix opens a finding the previous round's fix had closed; or the same finding-class re-appears in a new spelling.
+
+**Test for "cross-cutting":** does the change touch (a) `withIdempotency` / `withIdempotentExecution` / cache semantics, OR (b) audit-emission paths that cross transactions, OR (c) multi-handler shared invariants (RLS + KMS + tenant context), OR (d) state-machine guards that can fire from multiple slices? If yes, use the asymptotic budget. If no, use the standard §5.1 cap.
+
+**Mitigation: per-PR Codex review, not just final-PR review.** Run `codex-companion adversarial-review --base main` on each substantive iteration of the PR, not only at sprint exit. Each iteration's review surfaces 1-2 findings; closing them in-PR keeps the trajectory linear instead of accumulating into a single intractable batch.
+
+**Canonical proof-points:** Sprint 33-34 cumulative — 18 substantive findings closed across 11 PR iterations on 7 PRs. Zero §5.1 escalations. Zero contradicting fix oscillations. The pattern matched the v1.10.1 hygiene cycle's published asymptote behavior.
+
 ---
 
 ## §6 PM-brief verification gate (Sprint 6 + Evans 2026-05-05 oversight directive; Sprint 14 sub-rule 5 extension)
@@ -377,10 +484,15 @@ See `docs/SCRUM_OPERATING_MODEL.md` §"PM-brief verification gate" for the full 
 - ADR-001 (modular monolith — public-interface-only cross-module access)
 - ADR-023 (Model A multi-tenancy)
 - Master PRD v1.10 §17 + Glossary v5.2 C3 (tenant_id stripped from patient surfaces)
+- IDEMPOTENCY v5.1 §1 (cache 4-tuple + exactly-once execution)
+- AUDIT_EVENTS v5.2 §Category A (Category A audit durability requirements)
 - Sprint 9 + Sprint 10 Codex closure series (async-consult-r1..r15)
+- Sprint 33-34 SI-006 closure series (PRs #43-#49 + #51); see `docs/SI-006-Idempotency-Reserve-Then-Execute-Redesign.md` v0.3 Implementation Closure section
 
 ---
 
 ## Sprint reference
 
 Authored Sprint 10 (TLC-022) on the autonomous Scrum cycle. Closes the Sprint 9 retro #4 process change deliverable (codify Sprint 9 patterns into project conventions doc). Future migrations + repos + services + state machines reference this doc rather than re-deriving the patterns per slice.
+
+**r5 amendment (Sprint 33-34, 2026-05-08):** codifies SI-006 reserve-then-execute redesign + audit-dedupe SI patterns into §3.7 / §3.8 / §3.9 (service-layer) and §5.11 / §5.12 (review discipline). 18 substantive Codex findings closed across 11 PR iterations during the SI-006 cycle; this amendment lifts the patterns out of PR commit messages and SI-006 v0.3 closure section into reusable conventions so future cross-cutting concurrency work doesn't re-derive them.
