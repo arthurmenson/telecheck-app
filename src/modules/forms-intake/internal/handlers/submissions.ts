@@ -160,7 +160,7 @@ export async function startSubmissionHandler(
   const parsed = StartSubmissionRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     throw req.server.httpErrors.badRequest(
-      `Invalid request body: ${parsed.error.errors
+      `Invalid request body: ${parsed.error.issues
         .map((e) => `${e.path.join('.')}: ${e.message}`)
         .join('; ')}`,
     );
@@ -289,7 +289,7 @@ export async function updateSubmissionResponsesHandler(
   const parsed = UpdateSubmissionResponsesRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     throw req.server.httpErrors.badRequest(
-      `Invalid request body: ${parsed.error.errors
+      `Invalid request body: ${parsed.error.issues
         .map((e) => `${e.path.join('.')}: ${e.message}`)
         .join('; ')}`,
     );
@@ -451,7 +451,7 @@ export async function submitSubmissionHandler(
   const parsed = SubmitSubmissionRequestSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
     throw req.server.httpErrors.badRequest(
-      `Invalid request body: ${parsed.error.errors
+      `Invalid request body: ${parsed.error.issues
         .map((e) => `${e.path.join('.')}: ${e.message}`)
         .join('; ')}`,
     );
