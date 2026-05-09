@@ -115,8 +115,14 @@ export default defineConfig({
      * Reporters: default for local development. CI layer adds --reporter junit
      * via the `test` npm script (or CI override). Not hardcoded here to avoid
      * polluting local developer output with JUnit XML.
+     *
+     * In Vitest 2 the canonical way to opt into the default reporter was
+     * `reporters: ['default']`. In Vitest 4 that exact string is interpreted
+     * as a custom-reporter module name and fails to resolve at server-load
+     * time (`ERR_LOAD_URL` from `loadCustomReporterModule`). The Vitest 4
+     * idiom is to omit the field entirely (the default reporter is implicit),
+     * so this line is intentionally absent.
      */
-    reporters: ['default'],
 
     /**
      * Timeout: 30s for integration tests that exercise real Postgres. The per-test
