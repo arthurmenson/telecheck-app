@@ -96,7 +96,7 @@ export async function createDeploymentHandler(
   const parsed = CreateDeploymentRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     throw req.server.httpErrors.badRequest(
-      `Invalid request body: ${parsed.error.errors
+      `Invalid request body: ${parsed.error.issues
         .map((e) => `${e.path.join('.')}: ${e.message}`)
         .join('; ')}`,
     );

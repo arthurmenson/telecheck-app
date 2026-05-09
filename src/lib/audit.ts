@@ -298,7 +298,8 @@ const AuditEnvelopeInputSchema = z.object({
   audit_sensitivity_level: z.enum(['standard', 'high_pii']),
   resource_type: z.string().min(1),
   resource_id: z.string().min(1),
-  detail: z.record(z.unknown()),
+  // zod 4: z.record(V) is now z.record(K, V) — explicit key schema required.
+  detail: z.record(z.string(), z.unknown()),
   country_of_care: z.string().length(2, 'country_of_care must be ISO 3166-1 alpha-2'),
   timestamp: z.string().min(1),
 });
@@ -598,7 +599,7 @@ export async function emitAudit(
   // 1. Required-field validation
   const validationResult = AuditEnvelopeInputSchema.safeParse(input);
   if (!validationResult.success) {
-    const messages = validationResult.error.errors
+    const messages = validationResult.error.issues
       .map((e) => `  ${e.path.join('.')}: ${e.message}`)
       .join('\n');
     throw new Error(

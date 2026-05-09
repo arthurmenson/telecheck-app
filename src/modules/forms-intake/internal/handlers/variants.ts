@@ -96,7 +96,7 @@ export async function createVariantHandler(
   const parsed = CreateVariantRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     throw req.server.httpErrors.badRequest(
-      `Invalid request body: ${parsed.error.errors
+      `Invalid request body: ${parsed.error.issues
         .map((e) => `${e.path.join('.')}: ${e.message}`)
         .join('; ')}`,
     );
@@ -189,7 +189,7 @@ export async function promoteVariantHandler(
   const parsed = PromoteVariantRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     throw req.server.httpErrors.badRequest(
-      `Invalid request body: ${parsed.error.errors
+      `Invalid request body: ${parsed.error.issues
         .map((e) => `${e.path.join('.')}: ${e.message}`)
         .join('; ')}`,
     );

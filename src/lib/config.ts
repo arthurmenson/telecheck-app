@@ -41,37 +41,39 @@ const FeatureFlagsSchema = z.object({
     .string()
     .transform((v) => v === 'true')
     .pipe(
+      // zod 4: errorMap key on z.literal options was renamed to `error`.
+      // Since these are static-message error maps, collapsed to the
+      // simpler `message:` key (equivalent semantically).
       z.literal(false, {
-        errorMap: () => ({
-          message: 'ENABLE_AUTONOMOUS_AGENT must be false at v1.0 — requires ADR-030',
-        }),
+        message: 'ENABLE_AUTONOMOUS_AGENT must be false at v1.0 — requires ADR-030',
       }),
     )
-    .default('false'),
+    // zod 4: .default() on a piped schema must match the OUTPUT type
+    // (post-pipe), which here is the boolean `false` after the
+    // `.transform((v) => v === 'true').pipe(z.literal(false))`. zod 3
+    // accepted the input-shape default `'false'` and routed it through
+    // the transform; zod 4 requires the output-shape literal `false`.
+    .default(false),
 
   ENABLE_MULTI_AGENT_SUPERVISOR: z
     .string()
     .transform((v) => v === 'true')
     .pipe(
       z.literal(false, {
-        errorMap: () => ({
-          message: 'ENABLE_MULTI_AGENT_SUPERVISOR must be false at v1.0 — requires ADR-033',
-        }),
+        message: 'ENABLE_MULTI_AGENT_SUPERVISOR must be false at v1.0 — requires ADR-033',
       }),
     )
-    .default('false'),
+    .default(false),
 
   ENABLE_TOOL_USING_AGENT: z
     .string()
     .transform((v) => v === 'true')
     .pipe(
       z.literal(false, {
-        errorMap: () => ({
-          message: 'ENABLE_TOOL_USING_AGENT must be false at v1.0 — requires ADR-031 + ADR-030',
-        }),
+        message: 'ENABLE_TOOL_USING_AGENT must be false at v1.0 — requires ADR-031 + ADR-030',
       }),
     )
-    .default('false'),
+    .default(false),
 
   // Reserved autonomy levels (AUTONOMY_LEVELS v5.2 §3).
   ENABLE_ACTION_WITH_AUDIT_ONLY: z
@@ -79,26 +81,22 @@ const FeatureFlagsSchema = z.object({
     .transform((v) => v === 'true')
     .pipe(
       z.literal(false, {
-        errorMap: () => ({
-          message:
-            'ENABLE_ACTION_WITH_AUDIT_ONLY must be false at v1.0 — requires ADR-030 + PolicyAuthorization framework + I-012 successor invariant',
-        }),
+        message:
+          'ENABLE_ACTION_WITH_AUDIT_ONLY must be false at v1.0 — requires ADR-030 + PolicyAuthorization framework + I-012 successor invariant',
       }),
     )
-    .default('false'),
+    .default(false),
 
   ENABLE_FULLY_AUTONOMOUS: z
     .string()
     .transform((v) => v === 'true')
     .pipe(
       z.literal(false, {
-        errorMap: () => ({
-          message:
-            'ENABLE_FULLY_AUTONOMOUS must be false at v1.0 — requires ADR-030 + named successor invariant superseding I-012',
-        }),
+        message:
+          'ENABLE_FULLY_AUTONOMOUS must be false at v1.0 — requires ADR-030 + named successor invariant superseding I-012',
       }),
     )
-    .default('false'),
+    .default(false),
 });
 
 const ConfigSchema = z.object({
@@ -196,7 +194,7 @@ function loadConfig() {
 
   const result = ConfigSchema.safeParse(rawEnv);
   if (!result.success) {
-    const messages = result.error.errors
+    const messages = result.error.issues
       .map((e) => `  ${e.path.join('.')}: ${e.message}`)
       .join('\n');
     throw new Error(
@@ -217,7 +215,7 @@ function loadConfig() {
   });
 
   if (!flagResult.success) {
-    const messages = flagResult.error.errors
+    const messages = flagResult.error.issues
       .map((e) => `  ${e.path.join('.')}: ${e.message}`)
       .join('\n');
     throw new Error(

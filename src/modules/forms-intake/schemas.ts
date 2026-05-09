@@ -122,7 +122,9 @@ export type StartSubmissionRequest = z.infer<typeof StartSubmissionRequestSchema
  * explicit save). Engine MUST persist atomically per Slice PRD §8.1.
  */
 export const UpdateSubmissionResponsesRequestSchema = z.object({
-  responses: z.record(z.unknown()),
+  // zod 4: z.record(V) is now z.record(K, V) — explicit key schema required.
+  // String-keyed object map is the original intent.
+  responses: z.record(z.string(), z.unknown()),
   // Indicates whether the patient explicitly clicked "Save and continue
   // later" (Slice PRD §8.2). Drives ResumeState creation + recovery touches.
   pause: z.boolean().optional(),
