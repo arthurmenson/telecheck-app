@@ -82,7 +82,9 @@ export default defineConfig({
     benchmark: {
       include: ['tests/perf/**/*.bench.ts'],
       exclude: ['node_modules', 'dist', 'tests/perf/**/*.db.bench.ts'],
-      reporters: ['default'],
+      // Vitest 4 idiom: omit `reporters` to use the default. Setting
+      // `reporters: ['default']` would route through `loadCustomReporterModule`
+      // and fail with ERR_LOAD_URL.
     },
 
     // Pool: forks for process isolation. Bench runs typically don't
