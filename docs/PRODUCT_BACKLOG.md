@@ -22,8 +22,8 @@
 
 **Sprint plan/review/retro doc coverage:**
 - Sprints 1-27: PLAN + REVIEW + RETRO docs all filed
-- Sprints 28-34: PLAN/REVIEW/RETRO docs MISSING — backfill scheduled as TLC-051 in Sprint 35
-- Source-of-truth for Sprint 28-34 work: matrix r5 + per-PR commit messages + `AUTONOMOUS_TURN_SUMMARY_2026-05-08.md`
+- Sprints 28-34: RETRO docs DELIVERED 2026-05-11 via PR #97 (TLC-051 pulled forward); PLAN + REVIEW docs intentionally NOT backfilled (PLAN docs are pre-execution forecasts; retroactive authoring misrepresents the planning-vs-execution trace)
+- Source-of-truth for Sprint 28-34 work: matrix r5 + per-PR commit messages + `AUTONOMOUS_TURN_SUMMARY_2026-05-08.md` + `AUTONOMOUS_TURN_SUMMARY_2026-05-11.md` + the new SPRINT_28_RETRO.md..SPRINT_34_RETRO.md chain
 
 **Sprint TLC numbering at Sprint 34 close:** last assigned ID = TLC-050 (audit-emit flake tracker). Sprint 35 starts at **TLC-051**.
 
@@ -33,14 +33,14 @@
 
 See `docs/SPRINT_35_PLAN.md` for full acceptance criteria + dependencies + commit budgets. Summary:
 
-### TLC-051 — Sprint 28-34 retro chain backfill
+### TLC-051 — Sprint 28-34 retro chain backfill — ✅ DONE (pulled forward 2026-05-11)
 
-**Status:** todo
-**Sprint:** Sprint 35
-**Estimated commits:** 8
+**Status:** ✅ DONE via PR #97 merged 2026-05-11 (pulled forward into the 2026-05-11 autonomous run from Sprint 35 anchor position; Sprint 35 budget freed ~8 commits for slice work).
+**Sprint:** ~~Sprint 35 anchor~~ → delivered 2026-05-11
+**Estimated commits:** 8 → **Actual: 2 commits, 7 files, 405 LoC**
 **Decision rule:** 3 (diminishing-returns hygiene)
 
-Backfill 7 missing retro docs (Sprints 28-34) using `BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 + per-PR commit messages + `AUTONOMOUS_TURN_SUMMARY_2026-05-08.md` as input.
+Backfilled 7 missing retro docs (Sprints 28-34) using `BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 + per-PR commit messages + `AUTONOMOUS_TURN_SUMMARY_2026-05-08.md` + SI-006 closure doc v0.3 as input. See `docs/SPRINT_28_RETRO.md` through `docs/SPRINT_34_RETRO.md`. 2 `[NEEDS VERIFICATION FROM EVANS]` markers — both about absent SPRINT_NN_PLAN docs (Sprint 29 + Sprint 31).
 
 **Dependencies:** None.
 
