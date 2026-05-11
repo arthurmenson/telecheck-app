@@ -1,0 +1,258 @@
+-- =============================================================================
+-- File:    migrations/023_medication_requests.sql
+-- Purpose: Create the `medication_requests` table — the Pharmacy + Refill
+--          slice's foundational schema per SI-001 DRAFT (CDM v1.2 §4.16
+--          proposal as of 2026-05-11).
+--
+-- STATUS:  SPECULATIVE DRAFT pre-SI-001-ratification.
+--          The schema below is implemented exactly per the SI-001 closure
+--          artifact at
+--            Telecheck_SI_Closure_Cycle_2026-05-11/
+--            Telecheck_SI_001_MedicationRequest_Schema_DRAFT.md
+--          Evans has not yet ratified that artifact into the canonical
+--          CDM v1.2 §4.16. If ratification adjusts column types, FK
+--          targets, CHECK constraints, indexes, or the state enum, this
+--          migration MUST be revised (or superseded by a follow-on
+--          migration) before merge into main.
+--
+-- Spec references:
+--   - Telecheck_SI_001_MedicationRequest_Schema_DRAFT.md (the DRAFT) — §"Proposed CDM §4.16"
+--   - CDM v1.2 §3.5 entity #18 (MedicationRequest inventory row)
+--   - State Machines v1.1 §19 (DRAFT — MedicationRequest lifecycle: 8 states)
+--   - AUDIT_EVENTS v5.2 §Category-A (DRAFT — 11 medication_request.* IDs)
+--   - DOMAIN_EVENTS v5.2 §envelope (DRAFT — 5 medication_request.* types)
+--   - Pharmacy + Refill Slice PRD v2.1 §8
+--   - PROJECT_CONVENTIONS r5 §1.1 (composite UNIQUE + composite FK),
+--                          §1.2 (named constraints),
+--                          §1.3 (RLS mandatory)
+--   - I-003 (audit append-only; supersession-chain pattern), I-012
+--     (prescribing reject-unless three-clause), I-023 (tenant isolation
+--     three-layer), I-025 (tenant-blind errors), I-027 (audit tenant
+--     context), I-031 (high_pii audit class — does NOT apply here)
+--
+-- Append-only semantics:
+--   Discontinuation creates a new row at status='discontinued' with
+--   supersedes_id pointing back at the row it replaces. The replaced row
+--   is UPDATEd to status='superseded' + superseded_by_id under a
+--   controlled UPDATE that the I-003 hash-chain audit captures. Bare
+--   suppression on the prior row would itself be an I-003 violation.
+--
+-- Out-of-scope for THIS migration (deferred):
+--   - product_catalog table (CDM §4.9 — not yet authored in migrations)
+--   - interaction_overrides table (Med Interaction Engine slice)
+--   - refills, dispensings, shipments tables (Pharmacy + Refill follow-on)
+--   - protocols table (referenced by protocol_id; future entity)
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- PRECONDITIONS:
+--   001_tenants.sql      applied (FK target — tenants)
+--   003_rls_helpers.sql  applied (current_tenant_id())
+--   012_accounts.sql     applied (composite-FK target — accounts UNIQUE (tenant_id, account_id))
+--   020+021_async_consult applied (composite-FK target — consults UNIQUE (tenant_id, id))
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS medication_requests (
+
+    -- Identity ---------------------------------------------------------------
+    id                                  VARCHAR(26)  PRIMARY KEY,            -- ULID
+    tenant_id                           VARCHAR(26)  NOT NULL
+                                            REFERENCES tenants(id),
+
+    -- Patient anchor (composite FK enforces same-tenant binding) -------------
+    patient_account_id                  VARCHAR(26)  NOT NULL,
+
+    -- Catalog anchor ---------------------------------------------------------
+    -- TODO(SI-001-ratification): FK target table `product_catalog` does NOT
+    -- yet exist in this codebase (CDM v1.2 §4.9 is inventory-only). The
+    -- composite FK
+    --     FOREIGN KEY (tenant_id, product_catalog_id) REFERENCES
+    --     product_catalog (tenant_id, id)
+    -- will be added in the follow-on migration that introduces
+    -- product_catalog. This DRAFT migration deliberately omits the FK
+    -- constraint so the column lands now without an unresolvable
+    -- target. Application-layer validation enforces non-orphan refs
+    -- until the FK is wired.
+    product_catalog_id                  VARCHAR(26)  NOT NULL,
+
+    -- Clinical detail (snapshot-at-prescribe-time) ---------------------------
+    medication_name                     VARCHAR(200) NOT NULL,               -- snapshot
+    strength                            VARCHAR(80)  NOT NULL,               -- '500mg' etc.
+    formulation                         VARCHAR(40)  NOT NULL,               -- 'tablet' etc.
+    dose_instructions                   TEXT         NOT NULL,
+    quantity                            INTEGER      NOT NULL,
+    quantity_unit                       VARCHAR(20)  NOT NULL,
+    refills_allowed                     INTEGER      NOT NULL,
+    indication                          VARCHAR(200),
+    clinical_notes                      TEXT,
+
+    -- Lifecycle status (see State Machines §19 DRAFT) ------------------------
+    status                              VARCHAR(30)  NOT NULL,
+
+    -- Lifecycle timestamps ---------------------------------------------------
+    prescribed_at                       TIMESTAMPTZ,
+    activated_at                        TIMESTAMPTZ,
+    discontinued_at                     TIMESTAMPTZ,
+    discontinued_reason                 VARCHAR(60),
+    expires_at                          TIMESTAMPTZ,
+
+    -- Authorship (clinician anchor) ------------------------------------------
+    prescribed_by_clinician_account_id  VARCHAR(26),
+    prescribing_consult_id              VARCHAR(26),
+
+    -- Safety integration (Med Interaction Engine) ----------------------------
+    interaction_signals_evaluated_at    TIMESTAMPTZ,
+    interaction_signals_status          VARCHAR(20)  NOT NULL DEFAULT 'pending',
+    -- TODO(SI-001-ratification, Path 1 vs Path 2): the FK target table
+    -- `interaction_overrides` is owned by the Med Interaction Engine slice
+    -- and does not yet exist. Per the SI-001 DRAFT recommendation (Path 1),
+    -- this column may be STRUCK on ratification; held here as nullable to
+    -- mirror the DRAFT exactly. Application-layer validation only.
+    interaction_override_id             VARCHAR(26),
+
+    -- I-012 reject-unless three-clause envelope ------------------------------
+    ai_workload_type                    VARCHAR(40),
+    autonomy_level                      VARCHAR(40),
+    protocol_id                         VARCHAR(26),
+    protocol_version                    VARCHAR(20),
+
+    -- Append-only via supersession -------------------------------------------
+    supersedes_id                       VARCHAR(26),
+    superseded_by_id                    VARCHAR(26),
+
+    -- CCR linkage (denormalized per Tenant Threading Addendum §3.4) ----------
+    country_of_care                     CHAR(2)      NOT NULL,
+
+    -- Standard timestamps ----------------------------------------------------
+    created_at                          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at                          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- ---------------------------------------------------------------------
+    -- Composite UNIQUE for downstream composite-FK pattern (subscription,
+    -- refill, dispensing, shipment will FK against this)
+    -- ---------------------------------------------------------------------
+
+    CONSTRAINT medication_requests_tenant_id_id_unique
+        UNIQUE (tenant_id, id),
+
+    -- ---------------------------------------------------------------------
+    -- Composite FKs (per PROJECT_CONVENTIONS r5 §1.1)
+    -- ---------------------------------------------------------------------
+
+    -- Patient must belong to the same tenant
+    CONSTRAINT medication_requests_tenant_patient_fk
+        FOREIGN KEY (tenant_id, patient_account_id)
+        REFERENCES accounts (tenant_id, account_id),
+
+    -- Prescriber (when set) must belong to the same tenant
+    CONSTRAINT medication_requests_tenant_clinician_fk
+        FOREIGN KEY (tenant_id, prescribed_by_clinician_account_id)
+        REFERENCES accounts (tenant_id, account_id),
+
+    -- Prescribing consult (when set) must belong to the same tenant
+    CONSTRAINT medication_requests_tenant_consult_fk
+        FOREIGN KEY (tenant_id, prescribing_consult_id)
+        REFERENCES consults (tenant_id, id),
+
+    -- NOTE: product_catalog composite FK intentionally OMITTED; see TODO
+    -- above. To be added in the migration that introduces product_catalog.
+
+    -- Supersession-chain self-FKs (composite) -----------------------------
+    CONSTRAINT medication_requests_supersedes_fk
+        FOREIGN KEY (tenant_id, supersedes_id)
+        REFERENCES medication_requests (tenant_id, id),
+    CONSTRAINT medication_requests_superseded_by_fk
+        FOREIGN KEY (tenant_id, superseded_by_id)
+        REFERENCES medication_requests (tenant_id, id),
+
+    -- ---------------------------------------------------------------------
+    -- CHECK constraints (per SI-001 DRAFT §"Proposed CDM §4.16")
+    -- ---------------------------------------------------------------------
+
+    -- State enum validation
+    CONSTRAINT medication_requests_status_valid CHECK (
+        status IN (
+            'draft',
+            'pending_interaction_check',
+            'pending_clinician_review',
+            'active',
+            'discontinued',
+            'superseded',
+            'expired',
+            'rejected'
+        )
+    ),
+
+    -- Discontinuation reason enum
+    CONSTRAINT medication_requests_discontinued_reason_valid CHECK (
+        discontinued_reason IS NULL OR
+        discontinued_reason IN (
+            'clinical_decision',
+            'adverse_event',
+            'patient_request',
+            'replaced_by_new_prescription',
+            'expired',
+            'safety_hold'
+        )
+    ),
+
+    -- Set when discontinued; null otherwise
+    CONSTRAINT medication_requests_discontinued_reason_set_when_discontinued CHECK (
+        (status = 'discontinued') = (discontinued_reason IS NOT NULL)
+    ),
+
+    -- Interaction-signals enum
+    CONSTRAINT medication_requests_interaction_signals_status_valid CHECK (
+        interaction_signals_status IN ('pending', 'clean', 'caution', 'safety_hold')
+    ),
+
+    -- I-012 envelope-population rule: ai_workload_type and autonomy_level
+    -- are both null or both populated. Partial population is invalid.
+    CONSTRAINT medication_requests_i012_envelope_complete CHECK (
+        (ai_workload_type IS NULL AND autonomy_level IS NULL) OR
+        (ai_workload_type IS NOT NULL AND autonomy_level IS NOT NULL)
+    ),
+
+    -- Country-of-care must be ISO 3166-1 alpha-2
+    CONSTRAINT medication_requests_country_valid CHECK (
+        country_of_care ~ '^[A-Z]{2}$'
+    )
+);
+
+-- ---------------------------------------------------------------------------
+-- Row-Level Security per ADR-023 + PROJECT_CONVENTIONS r5 §1.3
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE medication_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE medication_requests FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON medication_requests
+    USING (tenant_id = current_tenant_id())
+    WITH CHECK (tenant_id = current_tenant_id());
+
+-- ---------------------------------------------------------------------------
+-- Indexes (per SI-001 DRAFT §"Proposed CDM §4.16")
+-- ---------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_medication_requests_tenant_patient
+    ON medication_requests (tenant_id, patient_account_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_medication_requests_tenant_clinician
+    ON medication_requests (tenant_id, prescribed_by_clinician_account_id)
+    WHERE prescribed_by_clinician_account_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_medication_requests_tenant_consult
+    ON medication_requests (tenant_id, prescribing_consult_id)
+    WHERE prescribing_consult_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_medication_requests_tenant_status_active
+    ON medication_requests (tenant_id, status)
+    WHERE status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_medication_requests_supersession_chain
+    ON medication_requests (tenant_id, supersedes_id)
+    WHERE supersedes_id IS NOT NULL;
+
+-- Migration 023 complete. medication_requests is now the canonical
+-- prescribing-record table for the Pharmacy + Refill slice (DRAFT
+-- pending SI-001 ratification).
