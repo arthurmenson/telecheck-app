@@ -30,9 +30,18 @@ jobs:
     name: Verify canonical-version pointers match spec corpus
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Soft gate during bootstrap. Flip to false (or remove this line) once the canary set is
-    # stabilized and the spec repo is reliably reachable from the runner.
-    continue-on-error: true
+    # Hard gate. Flipped from soft (`continue-on-error: true`) → hard 2026-05-11
+    # after the telecheckONE repo became reachable from CI (evidence: PR #84
+    # openapi-conformance test surfaced for the first time when its unauthenticated
+    # `git clone` succeeded, indicating the spec corpus is now public OR a
+    # SPEC_REPO_TOKEN was provisioned). With the clone reliably succeeding, the
+    # canary set is now actionable — drift between this repo's CLAUDE.md
+    # "Canonical versions" claims and the spec corpus contents should block PRs.
+    #
+    # If the spec-corpus clone fails again in the future (transient network or
+    # auth-flip), the soft-gate downgrade lives in the step `clone-spec` below
+    # (`continue-on-error: true` + `spec_available=false` step-output gating
+    # the canary steps). Restoring the job-level soft-gate is a one-line revert.
 
     steps:
       - name: Checkout app repo

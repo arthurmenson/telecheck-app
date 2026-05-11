@@ -1,8 +1,185 @@
 # Product Backlog — Telecheck-app
 
 **Owner:** project-manager agent
-**Last reviewed:** 2026-05-05 (Sprint 8 close → Sprint 9 kickoff prep — **Async Consult slice authoring underway**)
+**Last reviewed:** 2026-05-11 (Sprint 35 kickoff prep — refresh after 33-sprint hiatus; prior review 2026-05-05 at Sprint 8 close preserved as historical entries below from the "Sprint 2 — DONE" section onward)
 **Story format:** `TLC-NNN — title`
+
+---
+
+## Status at Sprint 34 close (2026-05-08)
+
+**Cumulative state** (per `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 + `docs/AUTONOMOUS_TURN_SUMMARY_2026-05-08.md`):
+
+- **Implementation-complete slices (v1.0):** forms-intake, identity, consent, async-consult, tenant-config (5 of 5 with uniform Sprint 33-34 status amendments)
+- **BLOCKED-aware skeletons:** pharmacy, subscription, med-interaction (3 of 3)
+- **Spec Issues open at spec corpus governance:** SI-001 (MedicationRequest schema), SI-002 (AUDIT_EVENTS placeholder ratification), SI-003 (DOMAIN_EVENTS placeholder ratification), SI-004 (Async Consult audit events ratification), SI-005 (Consult ConsultEvent schema gap), SI-006 (Idempotency reserve-then-execute) — **SI-006 CLOSED** at implementation via Sprints 33-34 / 9 PRs; SI-001..SI-005 remain open at the spec corpus layer (DRAFT closure proposals authored 2026-05-11 in `Telecheck_SI_Closure_Cycle_2026-05-11/`)
+- **Cumulative Codex closures:** 65+ substantive findings across 35 sprints (47 at Sprint 17 close per matrix r4 + 18 across Sprint 33-34 per matrix r5)
+- **PM-brief verification gate:** ~27 consecutive ALL PASS since Sprint 6 institution
+- **Forward migrations:** 23 (000-022); 5 slice migrations + 18 cross-cutting
+- **Integration test files:** ~88 (Sprint 34 close)
+- **Production .ts files:** ~78
+- **CI status:** ✅ Green at sprint head (5 required checks pass: verify-metadata, Build/lint/typecheck/test, Dependency review (advisory pending TLC-052), Performance benchmarks, Spec Pointer Validation)
+
+**Sprint plan/review/retro doc coverage:**
+- Sprints 1-27: PLAN + REVIEW + RETRO docs all filed
+- Sprints 28-34: PLAN/REVIEW/RETRO docs MISSING — backfill scheduled as TLC-051 in Sprint 35
+- Source-of-truth for Sprint 28-34 work: matrix r5 + per-PR commit messages + `AUTONOMOUS_TURN_SUMMARY_2026-05-08.md`
+
+**Sprint TLC numbering at Sprint 34 close:** last assigned ID = TLC-050 (audit-emit flake tracker). Sprint 35 starts at **TLC-051**.
+
+---
+
+## Sprint 35 candidates (PM finalizes at Sprint 35 kickoff; verification gate runs)
+
+See `docs/SPRINT_35_PLAN.md` for full acceptance criteria + dependencies + commit budgets. Summary:
+
+### TLC-051 — Sprint 28-34 retro chain backfill
+
+**Status:** todo
+**Sprint:** Sprint 35
+**Estimated commits:** 8
+**Decision rule:** 3 (diminishing-returns hygiene)
+
+Backfill 7 missing retro docs (Sprints 28-34) using `BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 + per-PR commit messages + `AUTONOMOUS_TURN_SUMMARY_2026-05-08.md` as input.
+
+**Dependencies:** None.
+
+### TLC-052 — Repo-admin Step 2A follow-up: dependency-review.yml advisory removal
+
+**Status:** blocked (Evans-side Dependency Graph enablement)
+**Sprint:** Sprint 35 (if unblocks) / Sprint 36+ (if not)
+**Estimated commits:** 2
+**Decision rule:** 6 (launch-readiness CI gate hardening)
+
+Remove `continue-on-error: true` from `.github/workflows/dependency-review.yml` once Evans enables Dependency Graph in repo Settings.
+
+**Dependencies:** Evans-side repo settings flip.
+
+### TLC-053 — pino 9→10 dependabot triage (PR #90)
+
+**Status:** todo
+**Sprint:** Sprint 35
+**Estimated commits:** 3
+**Decision rule:** 6 (dependency hygiene)
+
+Review pino 10 breaking changes against `src/lib/logger.ts` + callers; merge or fix-forward.
+
+**Dependencies:** PR #90 exists in dependabot queue.
+
+### TLC-054 — eslint 8→10 + @typescript-eslint v7→v8 upgrade (PR #92)
+
+**Status:** todo
+**Sprint:** Sprint 35
+**Estimated commits:** 5
+**Decision rule:** 6 (dependency hygiene)
+
+Migrate to eslint flat-config + typescript-eslint v8 project-service mode; close newly-flagged rules in-scope or downgrade/track.
+
+**Dependencies:** PR #92 exists in dependabot queue.
+
+### TLC-055 — Pharmacy + Refill v2.1 slice implementation (Sprint 1 of 2-3)
+
+**Status:** CONDITIONAL on SI-001 ratification (Promotion Ledger P-011)
+**Sprint:** Sprint 35 (Sprint 1 of slice) — full slice spans 2-3 sprints
+**Estimated commits:** 12-15 for Sprint 1 (~40-50 commits total across the slice)
+**Decision rule:** 4 (new unblocked slice work)
+
+Schema migration 023 + repos + state machine + cross-tenant isolation test + Codex per-iteration FIRE. Sub-stories TLC-055a..TLC-055e enumerated in `SPRINT_35_PLAN.md`.
+
+**Dependencies:** SI-001 ratification (HARD). DRAFT closure proposal authored 2026-05-11 in `Telecheck_SI_Closure_Cycle_2026-05-11/Telecheck_SI_001_MedicationRequest_Schema_DRAFT.md`. Pre-staging pharmacy slice scaffold in flight 2026-05-11.
+
+### TLC-056 — Subscription slice implementation
+
+**Status:** CONDITIONAL on (a) SI-001 ratification + (b) TLC-055 medication_request schema landed
+**Sprint:** Sprint 35 (unlikely — budget pressure) / Sprint 36
+**Estimated commits:** 8-10
+**Decision rule:** 4 (new unblocked slice work)
+
+FK-binds to `medication_request_id` created by TLC-055. Migration 024 + repos + service + initial HTTP handlers + cross-tenant isolation test.
+
+**Dependencies:** TLC-055 (HARD) + SI-001 (HARD).
+
+### TLC-057 — TLC-050 audit-emit flake recurrence investigation (CONTINGENT)
+
+**Status:** contingent (fires only on recurrence)
+**Sprint:** Sprint 35 if fires / hold otherwise
+**Estimated commits:** 0-8
+**Decision rule:** 1 (CI flake)
+
+Root-cause investigation per `docs/TLC-050-Audit-Emit-Platform-Genesis-Flake.md` §"Investigation steps when picked up". Defensive fix landed Sprint 30; this story fires only on a fresh occurrence.
+
+**Dependencies:** CI recurrence trigger.
+
+---
+
+## Sprint 36+ candidates
+
+- **Med Interaction Engine slice implementation** — pre-conditioned on slice PRD ratification at the spec corpus governance layer (PRD has never been authored per Sprint 3 / TLC-007 PROVISIONAL note). The skeleton exists.
+- **Pharmacy + Refill slice Sprint 2 of 2-3** — handlers + audit emitters + domain event emitters + cross-tenant isolation tests; follow-on to TLC-055
+- **Pharmacy + Refill slice Sprint 3 of 2-3** (if needed) — full HTTP integration + Codex closure batch
+- **Admin Backend slice v1.1** — closes I-024 break-glass workflow gap (per `BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r5 §1 I-024 row); enables 5 tenant-config admin-write 503-stub markers to flip live (per matrix r5 + `TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md` Sprint 33-34 amendment)
+- **Sync Video Consult slice** — LiveKit integration per ADR-021; depends on Async Consult slice (now complete) + vendor account credentials (emergency-only Evans scope)
+- **Labs slice** — AWS Textract Medical integration; depends on vendor account credentials (emergency-only Evans scope)
+- **Research data partnership slice activation** — currently `inactive` per ADR-028 v0.5 CCR launch default; activation requires REC partnership + consent text + DSA template per OR-116/117/118 (out-of-repo)
+
+---
+
+## Blocked / waiting upstream (Sprint 34 close cumulative)
+
+| Story / area | Blocking SI / dependency |
+| --- | --- |
+| Pharmacy + Refill slice real impl | SI-001 (MedicationRequest schema + state machine + AUDIT_EVENTS action IDs + DOMAIN_EVENTS event types — DRAFT closure proposal authored 2026-05-11) |
+| Subscription slice real impl | SI-001 (FK to medication_request_id) + TLC-055 landing |
+| Async Consult audit event vocabulary (post-implementation ratification) | SI-004 (placeholder events live since Sprint 10; DRAFT closure proposal authored 2026-05-11) |
+| Consult / ConsultEvent schema gap | SI-005 (placeholder schema live since Sprint 10; DRAFT closure proposal authored 2026-05-11) |
+| AUDIT_EVENTS placeholder ratification (cross-cutting) | SI-002 (Promotion Ledger P-012; DRAFT closure proposal authored 2026-05-11) |
+| DOMAIN_EVENTS placeholder ratification (cross-cutting) | SI-003 (Promotion Ledger P-013; DRAFT closure proposal authored 2026-05-11) |
+| Med Interaction Engine slice real impl | Slice PRD ratification at spec corpus (currently un-authored) |
+| Admin Backend slice v1.1 real impl | Slice PRD content gaps (5 admin-write surfaces already 503-stubbed) |
+| Repo dependency-review.yml gate hardening | Evans-side Dependency Graph enablement |
+| Vendor integration tests (LiveKit, Anthropic, Bedrock, Twilio/Hubtel, Truepill, Stripe) | Vendor account credentials (emergency-only — Evans's scope) |
+| Production cutover | AWS deployment access (emergency-only — Evans's scope) |
+| Research data partnership activation | REC partnership + consent text + DSA template (out-of-repo) |
+
+---
+
+## Done (rolling archive — last 8 sprints visible; pre-Sprint-28 archive preserved below as historical 2026-05-05-vintage entries)
+
+### Sprint 34 — closed 2026-05-08
+
+Cumulative SI-006 cycle close + audit-dedupe SI close (PRs #49, #51 substantive). Async-consult HTTP coverage gap closed (PR #51 — 552 LOC, 6 groups, 13 cases, 4 Codex rounds). `audit_dedupe_markers` cross-cutting infra landed (PR #49). `BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` bumped r4 → r5. `PROJECT_CONVENTIONS.md` bumped r4 → r5 with §3.7-§3.9 + §5.11-§5.12 codification of Sprint 33-34 patterns.
+
+### Sprint 33 — closed (estimated 2026-05-07)
+
+SI-006 reserve-then-execute redesign primary landing. PRs #43 (TTL overrides — 4 Codex rounds, 3 HIGH closures), #44 (forms-intake migration + crisis-audit independence + cached-4xx-envelope alignment — 5 rounds, 4 HIGH/1 MEDIUM), #45 (identity migration + sessionRefresh exempt-paths fix — 5 rounds, 2 HIGH/3 MEDIUM), #46 (tenant-config 503-stub markers — 1 round), #47 (legacy onSend cache-write removal + Group F lockdown — 2 rounds, 1 MEDIUM), #48 (cleanup-sweep — 1 round).
+
+### Sprint 32 — closed (estimated 2026-05-06)
+
+Pre-SI-006 cycle prep. PR #42 idempotency-helper Group F lockdown initial landing (foundation for Sprint 33 PR-E + #48 cleanup-sweep).
+
+### Sprint 31 — closed (estimated 2026-05-06)
+
+(Authored at retro backfill time per TLC-051; per-PR commit messages cited.)
+
+### Sprint 30 — closed 2026-05-06 (8c7efd5 / PR #33)
+
+Sprint 30 corrective items 2+4 — banners + TLC-050 defensive fix (5-LOC fix per matrix r5).
+
+### Sprint 29 — closed (commit aec2ee7)
+
+TLC-042 + TLC-043 re-validation (transitively resolved per Sprint 27 retro priority 3 prediction).
+
+### Sprint 28 — closed (PR #30)
+
+TLC-047 (`src/lib/error-envelope.ts:217,230` void-reply audit; no fixes needed per commit a74912f) + TLC-044 lock-key audit (no other parallel-fork race candidates found beyond installTestAppRole).
+
+### Sprint 27 — closed 2026-05-06 (commit e225b11 / PR #29)
+
+TLC-046 (SI-006 idempotency redesign filed per EHBG §12) + TLC-049 (actor-scoping lockdown contract pin; r1+r2). 22nd consecutive PM-brief verification gate ALL PASS.
+
+---
+
+[Historical entries below preserved as authored at Sprint 8 close 2026-05-05 — DO NOT REWRITE.]
 
 ---
 
