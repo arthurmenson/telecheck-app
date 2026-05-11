@@ -53,7 +53,7 @@ jobs:
         # repo setting is enabled (the action will then fail PRs on
         # high-severity vulns or denied licenses as designed).
         continue-on-error: true
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           # Block PRs that introduce vulnerabilities at this severity or higher.
           fail-on-severity: high
