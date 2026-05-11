@@ -26,13 +26,23 @@
 
 ## Stories committed
 
-### TLC-051 — Sprint 28-34 retro chain backfill (7 retros)
+### TLC-051 — Sprint 28-34 retro chain backfill (7 retros) — ✅ DONE (pulled forward to 2026-05-11)
 
-**Status:** todo
-**Sprint:** Sprint 35
+**Status:** ✅ **DONE — pulled forward into the 2026-05-11 autonomous run** via PR #97 (branch `docs/sprint-28-34-retro-chain-backfill`). 7 retro docs authored (~405 lines total) by background agent following the SPRINT_27_RETRO.md template strictly. 2 `[NEEDS VERIFICATION FROM EVANS]` markers — both about absent SPRINT_NN_PLAN docs (Sprint 29 + Sprint 31); PLAN docs explicitly OUT-OF-SCOPE per the acceptance criteria; retros anchored via per-PR commit messages.
+**Sprint:** ~~Sprint 35 anchor~~ — DELIVERED EARLY; Sprint 35 budget freed (~8 commits) for slice work + dependabot stack.
 **Class:** "executable here" PLAN-ONLY-shaped — pure docs authoring; no Postgres / CI dependency
-**Estimated commits:** 8 (7 retro docs + 1 close commit; 1.0× slack; no fix-forward reserves — PLAN-ONLY shape)
+**Estimated commits:** 8 (7 retro docs + 1 close commit) — **Actual: 2 commits across 7 files; 405 LoC**
 **Decision rule applied:** 3 (diminishing-returns hygiene) / sprint-retro process discipline
+**Delivery PR:** #97 merged 2026-05-11. See `docs/SPRINT_28_RETRO.md` through `docs/SPRINT_34_RETRO.md`.
+
+**Sprint shapes per the delivered retros (informational):**
+- Sprint 28 (48 lines) — audit-only outcome (clean audit; pattern-mirror SKIP)
+- Sprint 29 (47 lines) — verification-only (TLC-042/043 transitive closure; zero substantive commits)
+- Sprint 30 (56 lines) — external SME advisory triggered corrective work (SI-006 v0.1 → v0.2; PRs #33-#35)
+- Sprint 31 (48 lines) — single-PR filler scope (TLC-019 / OR-208 status doc; PR #36)
+- Sprint 32 (62 lines) — SI-006 PR-A/B/C/D batch (PRs #38-#42; ~8 substantive Codex closures)
+- Sprint 33 (71 lines) — SI-006 PR-F1/F2/F3/F4 + PR-E (PRs #43-#47; 12 substantive Codex closures, 11 fix-forward rounds)
+- Sprint 34 (70 lines) — cleanup-sweep + audit-dedupe SI + async-consult HTTP tests + docs r5 codification (PRs #48-#57)
 
 #### Acceptance criteria
 
@@ -245,12 +255,15 @@
 | TLC-056 — Subscription slice | "executable here" | 8-10 | Yes (SI-001 + TLC-055 partially done) |
 | TLC-057 — TLC-050 flake recurrence | "needs env EXECUTE" | 0-8 (contingent) | Yes (CI recurrence) |
 
-**Sprint 35 commit-budget range:**
-- **Floor (SI-001 still open; no flake recurrence; Evans hasn't flipped Dep-Graph):** ~16 commits (TLC-051 + TLC-053 + TLC-054)
-- **Ceiling (SI-001 ratifies + TLC-055 starts + TLC-052 unblocks):** ~33 commits (TLC-051 + TLC-052 + TLC-053 + TLC-054 + TLC-055)
-- **Most likely (SI-001 still open at kickoff per current 2026-05-11 in-flight state):** ~18-20 commits
+**Sprint 35 commit-budget range (post-TLC-051-pull-forward):**
 
-The most-likely sprint fits comfortably under the 30-commit-budget heuristic. The ceiling at ~33 nudges over but the slice work is the value-driver; Scrum Master may de-prioritize TLC-053/TLC-054 to Sprint 36 if the slice budget needs the room.
+TLC-051 was pulled forward into the 2026-05-11 autonomous run (PR #97 merged 2026-05-11). The ~8 commits originally allocated to it are FREED from the Sprint 35 budget.
+
+- **Floor (SI-001 still open; no flake recurrence; Evans hasn't flipped Dep-Graph):** ~8 commits (TLC-053 + TLC-054 only)
+- **Ceiling (SI-001 ratifies + TLC-055 starts + TLC-052 unblocks):** ~25 commits (TLC-052 + TLC-053 + TLC-054 + TLC-055)
+- **Most likely (SI-001 still open at kickoff):** ~10-12 commits (TLC-053 + TLC-054 + maybe TLC-052)
+
+The floor is now well-under the 30-commit heuristic, leaving ~15-20 commits of headroom for TLC-055 + TLC-056 slice work if SI-001 ratifies before mid-sprint. The freed TLC-051 budget gives Sprint 35 substantially more room for the value-driving slice work.
 
 ---
 
