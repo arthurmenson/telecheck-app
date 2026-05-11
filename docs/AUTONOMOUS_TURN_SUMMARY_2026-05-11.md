@@ -1,9 +1,66 @@
 # Autonomous Turn — Cumulative Summary (2026-05-11)
 
-**Final PR merged in this turn:** TBD (closing PRs at write time: #93, #94, #87, #88, plus parked DRAFT #95)
+**Final PR merged in this turn:** #100 (this amendment)
 **CI status:** ✅ Green on main throughout the run
-**Total PRs touched this turn:** 8 (3 merged + 1 DRAFT-open + closure of dependabot duplicates as superseded)
+**Total PRs this turn:** 11 (8 merged: #93 + #94 + #87 + #88 + #96 + #97 + #98 + #99 + #100; 1 DRAFT-open: #95; superseded dependabot duplicates also closed)
 **Predecessor turn:** `docs/AUTONOMOUS_TURN_SUMMARY_2026-05-08.md` (Phase A test/CI gap closures + Phase B README hygiene; 23 PRs merged across #59-#81)
+
+---
+
+## Amendment 1 (PR #100 — this section appended 2026-05-11 at run-end)
+
+After PR #96 captured the initial summary, three more substantial deliverables landed:
+
+### PR #97 — Sprint 28-34 retro chain backfill (TLC-051 pulled forward)
+
+7 retro docs authored by background agent (~405 lines total) following SPRINT_27_RETRO.md template. Pulled the Sprint 35 anchor story forward into this turn so Sprint 35 has more budget headroom for slice work. 2 `[NEEDS VERIFICATION FROM EVANS]` markers — both about absent SPRINT_NN_PLAN docs (Sprint 29 + Sprint 31).
+
+Per-sprint shapes: Sprint 28 (48 lines audit-only), Sprint 29 (47 lines verification-only), Sprint 30 (56 lines SI-006 v0.1→v0.2 corrective), Sprint 31 (48 lines TLC-019 filler), Sprint 32 (62 lines SI-006 PR-A/B/C/D batch), Sprint 33 (71 lines SI-006 PR-F1/F2/F3/F4+PR-E), Sprint 34 (70 lines cleanup-sweep + audit-dedupe + async-consult HTTP + docs r5).
+
+### PR #98 — AI Cost Optimization Strategy DRAFT
+
+Authored by background agent after Evans surfaced the question "can we apply token economics, caching to reduce claude costs in the development." 214-line strategy doc at `docs/AI_COST_OPTIMIZATION_STRATEGY.md`. Anchored on Anthropic prompt-caching mechanics (10% input on cache hit; 25% write extra; 5-min/1h TTLs; 1024-token min block). Multi-provider abstraction per ADR-020. Model-tiering strategy mapped to WORKLOAD_TAXONOMY v5.2.
+
+Three-tier implementation plan:
+- **Tier 1 (Sprint 35-36):** TLC-058a `src/lib/ai-cache.ts` skeleton + TLC-058b agent-prompt template refactor + TLC-058c cache-hit telemetry
+- **Tier 2 (Sprint 36+):** model-tier routing + cache-hit dashboard + per-CCR tenant-keyed cache layer
+- **Tier 3 (project structure):** spec corpus chunking + skill-file consolidation
+
+Estimated savings (projections, not measurements):
+- Autonomous-run spec corpus reads (per turn, 6 agents): ~3MB → ~800KB (~73%)
+- Mode 1 conversational AI (per 20-turn session): ~200KB → ~60KB (~70%)
+- Mode 2 protocol execution (per evaluation): ~80KB → ~25KB (~69%)
+
+Open decisions for Evans (6 in §10): TLC-058 sprint inclusion; 1h extended TTL approval; Haiku tier acceptable for low-stakes Mode 1; telemetry surface; AUDIT_EVENTS envelope extension scope; Codex review pathway for TLC-058 itself.
+
+Cross-reference gap surfaced: `src/lib/ai-context.ts.resolveAiContext()` doesn't expose `model_version` or `guardrail_template_id`/`protocol_id`. Engineering Lead review recommended before TLC-058a wire-up.
+
+### PR #99 — Sprint 35 plan + PRODUCT_BACKLOG TLC-051-DONE amendment
+
+Mark TLC-051 as DONE in both SPRINT_35_PLAN.md and PRODUCT_BACKLOG.md; update Sprint 35 commit-budget range (floor 16→8; most-likely 18-20→10-12; ceiling 33→25). The freed ~8 commits give Sprint 35 substantial headroom for slice work.
+
+### TLC-058 candidates added to Sprint 35 / 36 backlog (informational; will land in Sprint 35 planning)
+
+The AI cost optimization strategy proposes 3 new candidate stories:
+- **TLC-058a** — `src/lib/ai-cache.ts` skeleton per ADR-020 multi-provider abstraction
+- **TLC-058b** — agent-prompt template refactor with `<spec_context_cached>` block convention
+- **TLC-058c** — cache-hit telemetry helper + JSON daily roll-up
+
+These will surface as PRODUCT_BACKLOG entries once Evans approves the strategy doc (likely in Sprint 35 PM kickoff).
+
+### Codex review on the amendment-cycle work
+
+Codex review was NOT autoinvoked on the retro backfill (TLC-051 is Codex SKIP per §5.2 — pure docs) or the AI cost strategy DRAFT (also pure docs; will run review when Tier 1 code lands). Per the established autoinvoke-on-milestone-exit discipline, the milestone for both is the post-SI-001-ratification slice authoring (TLC-055).
+
+### Final run tally (post-amendment-1)
+
+- **PRs merged in this turn:** 8 (#93 + #94 + #87 + #88 + #96 + #97 + #98 + #99 + #100)
+- **PRs DRAFT-open:** 1 (#95 — pharmacy slice scaffold; Codex blocker documented)
+- **SI closure DRAFT lines authored:** 1380+ across 6 workspace files (`Telecheck_SI_Closure_Cycle_2026-05-11/`)
+- **App-repo doc lines authored:** ~1100+ (Sprint 35 plan + PRODUCT_BACKLOG refresh + 7 sprint retros + AI cost strategy + turn summary amendment)
+- **Codex findings closed inline:** 7 (SI closure cycle)
+- **Background agents spawned:** 7 (4 SI agents + 1 Plan agent + 1 pharmacy scaffold + 1 Codex review + 1 retro backfill + 1 AI cost strategy)
+- **Pharmacy scaffold work parked:** ~1100+ LoC across migration 023 + types + state-machine + medication-request-repo (PR #95 DRAFT; reusable for Sprint 35 / TLC-055 once SI-001 ratifies and ProductCatalog table exists)
 
 ---
 
