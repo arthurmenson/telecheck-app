@@ -96,6 +96,7 @@ const TENANT_SCOPED_TABLES = [
   'forms_variant',
   'idempotency_keys',
   'otp_challenges',
+  'product_catalog', // migration 024 — per CDM v1.2 §4.9 ProductCatalog
   'sessions',
   'tenant_brands',
   'tenant_users',
