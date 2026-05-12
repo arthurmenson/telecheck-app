@@ -95,7 +95,6 @@ const TENANT_SCOPED_TABLES = [
   'forms_template',
   'forms_variant',
   'idempotency_keys',
-  'medication_requests', // migration 025 — per CDM v1.2 §4.16 MedicationRequest (P-011 ratification 2026-05-11)
   'otp_challenges',
   'product_catalog', // migration 024 — per CDM v1.2 §4.9 ProductCatalog
   'sessions',
