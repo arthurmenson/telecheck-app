@@ -137,11 +137,26 @@ export interface ToolDefinition {
  * CacheableAIInvocation — the canonical input to `aiInvoke()`.
  *
  * Cache layering maps to strategy doc §5 tables:
- *   - `systemPrompt`         -> L1 platform-canonical (1h TTL by default)
- *   - `toolCatalog`          -> L1 platform-canonical (1h TTL by default)
- *   - `historyTurns`         -> L3 session (5m TTL by default); the last
- *                                 element is the current user turn (non-cached)
- *   - `turnInput`            -> L4 turn (NOT cached)
+ *   - `systemPrompt`            -> L1 platform-canonical (1h TTL by default;
+ *                                    cache_control breakpoint attached)
+ *   - `toolCatalog`             -> L1 platform-canonical (1h TTL by default;
+ *                                    cache_control breakpoint attached)
+ *   - `nonCachedHistoryTurns`   -> NEVER CACHED — placed AFTER the
+ *                                    cache_control breakpoints (see Codex
+ *                                    Finding HIGH on the v0.1 skeleton
+ *                                    2026-05-11 — PR #104 review)
+ *   - `turnInput`               -> NEVER CACHED — per-turn user input
+ *
+ * **PHI invariant (Codex HIGH closure 2026-05-11):** Conversation history
+ * can contain PHI (medication detail, symptoms, etc.). The v0.1 skeleton
+ * named the field `historyTurns` and described it as "L3 session
+ * cacheable" — that documentation was wrong. Anthropic prompt caching
+ * caches the prefix up to the marked cache_control block; if PHI-bearing
+ * turns appear BEFORE a cache_control breakpoint, they would land in a
+ * cached prefix. Renamed to `nonCachedHistoryTurns` to make the invariant
+ * type-level visible. `buildAnthropicMessages()` MUST place these turns
+ * AFTER every cache_control breakpoint in the request. The new §8 test
+ * asserts this ordering.
  *
  * `model_version` and `guardrail_template_id` / `protocol_id` are taken
  * explicitly off this struct rather than read from ai-context.ts — see the
@@ -156,16 +171,22 @@ export interface CacheableAIInvocation {
   /** Tenant scoping per I-023. Required on every cacheable invocation. */
   tenant_id: TenantId;
 
-  /** System prompt — stable platform-canonical content. */
+  /** System prompt — stable platform-canonical content; CACHED. */
   systemPrompt: string;
 
-  /** Tool catalog — stable platform-canonical content. */
+  /** Tool catalog — stable platform-canonical content; CACHED. */
   toolCatalog: ToolDefinition[];
 
-  /** Conversation history. Empty array for fresh Mode 1 sessions or Mode 2 single-shot calls. */
-  historyTurns: ConversationTurn[];
+  /**
+   * Conversation history — **NEVER CACHED**. Placed AFTER cache_control
+   * breakpoints in `buildAnthropicMessages()`. Can contain PHI safely
+   * because no caching layer reads it. Empty array for fresh Mode 1
+   * sessions or Mode 2 single-shot calls.
+   * (Renamed from `historyTurns` per Codex HIGH closure 2026-05-11.)
+   */
+  nonCachedHistoryTurns: ConversationTurn[];
 
-  /** Per-turn user input — non-cached. */
+  /** Per-turn user input — NEVER CACHED. */
   turnInput: TurnInput;
 
   /** Anthropic model identifier (e.g., 'claude-sonnet-4-5-20250929'). */
@@ -175,10 +196,16 @@ export interface CacheableAIInvocation {
   max_tokens: number;
 
   /**
-   * Resolved `model_version` per ADR-029 audit-envelope requirement.
+   * Caller-asserted `model_version` per ADR-029 audit-envelope requirement.
+   *
+   * **Codex HIGH closure 2026-05-11:** OPTIONAL. When present, must equal
+   * the provider-served `response.model` or `aiInvoke` throws
+   * `ModelVersionMismatchError` (fail-closed). When absent, the resolved
+   * `model_version` on the result + telemetry is taken from `response.model`.
+   *
    * Accepted directly to work around the ai-context.ts cross-ref gap (§11).
    */
-  model_version: string;
+  model_version?: string;
 
   /**
    * Resolved guardrail/protocol identifier per ADR-029. Exactly one of these
@@ -431,6 +458,29 @@ export class AnthropicSDKMissingError extends Error {
   }
 }
 
+/**
+ * Thrown when the caller-supplied `invocation.model_version` disagrees with
+ * the provider-served `response.model`. Codex HIGH closure 2026-05-11
+ * (PR #104 review): the wrapper must NOT emit telemetry / return a
+ * `model_version` that diverges from what the provider actually served.
+ * Failing closed lets the caller re-assert the audit envelope at the call
+ * site before retrying.
+ */
+export class ModelVersionMismatchError extends Error {
+  readonly expected: string;
+  readonly actual: string;
+  constructor(expected: string, actual: string) {
+    super(
+      `ai-cache: invocation.model_version='${expected}' disagrees with provider response.model='${actual}'. ` +
+        'Anthropic may have resolved an alias or routed to a different model than requested; ' +
+        're-assert the audit envelope at the call site before retrying.',
+    );
+    this.name = 'ModelVersionMismatchError';
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic provider implementation
 // ---------------------------------------------------------------------------
@@ -495,7 +545,7 @@ export function buildAnthropicToolBlocks(
  * after the last cache_control block is the variable tail).
  */
 export function buildAnthropicMessages(invocation: CacheableAIInvocation): AnthropicMessageBlock[] {
-  const turns: AnthropicMessageBlock[] = invocation.historyTurns.map((turn) => ({
+  const turns: AnthropicMessageBlock[] = invocation.nonCachedHistoryTurns.map((turn) => ({
     role: turn.role,
     content: turn.content,
   }));
@@ -528,8 +578,23 @@ async function invokeAnthropic(
   const cacheReadTokens = response.usage.cache_read_input_tokens ?? 0;
   const cacheCreationTokens = response.usage.cache_creation_input_tokens ?? 0;
 
+  // Codex HIGH closure 2026-05-11: model_version source must be the
+  // provider-served `response.model`, NOT the caller-supplied
+  // `invocation.model_version`. Anthropic can resolve aliases or route to
+  // a different model than the request asked for; telemetry/audit
+  // consumers must record the model that ACTUALLY served the response.
+  // If `invocation.model_version` was set AND it disagrees with
+  // `response.model`, fail closed — a mismatch indicates a routing change
+  // the caller's audit envelope hasn't accounted for and the call MUST
+  // be re-asserted at the call site before retry.
+  const resolvedModelVersion = response.model;
+  if (invocation.model_version !== undefined && invocation.model_version !== resolvedModelVersion) {
+    throw new ModelVersionMismatchError(invocation.model_version, resolvedModelVersion);
+  }
+
   // Telemetry — strategy doc §10 decision 4 surface. Emit one event per
   // observation; TLC-058c rolls these up into the JSON daily file.
+  // Always use the provider-served `resolvedModelVersion`.
   const timestamp = new Date().toISOString();
   if (cacheReadTokens > 0) {
     providerCtx.telemetry.emit({
@@ -537,7 +602,7 @@ async function invokeAnthropic(
       tenant_id: invocation.tenant_id,
       layer: 'platform',
       provider: 'anthropic',
-      model_version: invocation.model_version,
+      model_version: resolvedModelVersion,
       tokens: { cache_read_input_tokens: cacheReadTokens },
       timestamp,
     });
@@ -547,7 +612,7 @@ async function invokeAnthropic(
       tenant_id: invocation.tenant_id,
       layer: 'platform',
       provider: 'anthropic',
-      model_version: invocation.model_version,
+      model_version: resolvedModelVersion,
       tokens: { cache_creation_input_tokens: cacheCreationTokens },
       timestamp,
     });
@@ -557,7 +622,7 @@ async function invokeAnthropic(
       tenant_id: invocation.tenant_id,
       layer: 'platform',
       provider: 'anthropic',
-      model_version: invocation.model_version,
+      model_version: resolvedModelVersion,
       timestamp,
     });
   }
@@ -576,7 +641,7 @@ async function invokeAnthropic(
       cached_input: cacheReadTokens,
       output: response.usage.output_tokens,
     },
-    model_version: invocation.model_version,
+    model_version: resolvedModelVersion,
     latency_ms: latencyMs,
     provider: 'anthropic',
   };
