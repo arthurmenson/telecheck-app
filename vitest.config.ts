@@ -142,8 +142,34 @@ export default defineConfig({
      * Pool: forks for true process isolation between test files. Integration tests
      * share TEST_DATABASE_URL but each transaction is rolled back — no shared state
      * leaks between test files within a single run.
+     *
+     * TLC-057 diagnostic (2026-05-11): `singleFork: true` forces sequential
+     * test-file execution within the forks pool. Eliminates cross-fork
+     * pollution of the long-lived outer `BEGIN` in tests/setup.ts:390 that
+     * `pg_advisory_xact_lock` operations in migrations/002_audit_chain.sql:506
+     * accumulate against (xact-scope locks release at COMMIT, not at
+     * SAVEPOINT rollback). See `docs/TLC-057-i003-Flake-Static-Analysis-2026-
+     * 05-11.md` §H3 (HIGH confidence root-cause hypothesis).
+     *
+     * Trade-off: slower CI (sequential vs parallel test files). The 4×
+     * recurrence in the 2026-05-11 turn argues the parallelism's
+     * fairness-vs-speed trade was wrong; sequential is the right default
+     * until Sprint 35 / TLC-057 lands the proper fix (move outer BEGIN
+     * from process-scope to per-file scope so locks release between
+     * files; then this diagnostic can be reverted).
+     *
+     * Validation: this commit alone should eliminate the 2 flake-variant
+     * recurrences observed in the 2026-05-11 turn. If CI now stays
+     * deterministically green across 5+ subsequent PR runs, H3 is
+     * empirically validated and TLC-057 can plan the proper fix with
+     * confidence.
      */
     pool: 'forks',
+    poolOptions: {
+      forks: {
+        singleFork: true,
+      },
+    },
 
     /**
      * Print a newline before each test file name for readability in CI logs.
