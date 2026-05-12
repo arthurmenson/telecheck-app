@@ -3,34 +3,9 @@
 **Raised by:** Engineering (autonomous turn 2026-05-04)
 **Date:** 2026-05-04
 **Severity:** high
-**Status:** ✅ **RESOLVED 2026-05-11** — Evans (workstream lead) ratified the SI-001 v0.2 DRAFT with Path 1 on Decision 5 (drop `interaction_override_id` column). Spec corpus updates landed at Promotion Ledger entry **P-011**. See `Telecheck_SI_Closure_Cycle_2026-05-11/Telecheck_SI_001_MedicationRequest_Schema_DRAFT.md` (RATIFIED v1.0) for the full content.
-**Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md` — §4.16 NEW
-**Target slice PRD:** `Telecheck_Pharmacy_Refill_Slice_PRD_v2_1.md` — unblocked
-
----
-
-## Resolution (2026-05-11 P-011)
-
-**Authorized by:** Evans (workstream lead)
-**Recommendation accepted:** approve schema + state machine + audit/domain events as drafted; **Path 1 on Decision 5 — drop `interaction_override_id` column**.
-
-**Spec corpus changes landed at P-011:**
-1. CDM v1.2 §4.16 — NEW entity expansion (MedicationRequest); 35 columns (Path 1 removes `interaction_override_id` from the v0.2 DRAFT count of 36); 6 composite FKs; 7 CHECK constraints (including state-dependent I-012 envelope check); composite UNIQUE for downstream FK targeting; RLS via `current_tenant_id()` helper.
-2. CDM v1.2 §3.5 entity inventory row #18 — footnote updated; canonical §4.16 reference.
-3. State Machines v1.1 §19 — NEW state machine (MedicationRequest lifecycle; 8 active states; 12 transitions; 2 I-012-gated transitions).
-4. AUDIT_EVENTS v5.2 — 6 net-new Category A action IDs (medication_request.{drafted, submitted_for_review, interaction_evaluation_completed, discontinued, superseded, expired}); existing `prescribing.*` set preserved as authoritative I-012 vocabulary.
-5. DOMAIN_EVENTS v5.2 — 5 new cross-module event types (medication_request.{activated, discontinued, superseded, expired, interaction_safety_hold_triggered}).
-6. Artifact Registry v2.10 — amended in place.
-7. Promotion Ledger — P-011 entry appended.
-
-**Unblocks (downstream):**
-- Slice 4 Pharmacy + Refill v2.1 implementation (Sprint 35 / TLC-055; pending PR #95 is now structurally ready to flip from DRAFT to ready-for-review)
-- Subscription slice (already authored at CDM §4.7; gains live FK target)
-- Med Interaction Engine slice (core evaluation surface; subscribes to `medication_request.interaction_safety_hold_triggered` per Path 1)
-
-**Original SI-001 content preserved below for traceability.**
-
----
+**Status:** Open — awaiting product/engineering-lead resolution
+**Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md`
+**Target slice PRD:** `Telecheck_Pharmacy_Refill_Slice_PRD_v2_1.md`
 
 ---
 
