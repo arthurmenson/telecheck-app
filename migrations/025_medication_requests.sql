@@ -498,6 +498,48 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_medication_requests_superseded_by_unique
     ON medication_requests (tenant_id, superseded_by_id)
     WHERE superseded_by_id IS NOT NULL;
 
+-- DEFERRED WORK — supersession reciprocity at the durable boundary (Codex
+-- pharmacy-scaffold-rebuild R12 HIGH finding 2026-05-12; deferred to the
+-- supersession write-path landing in Sprint 35-36 / TLC-055):
+--
+-- The 4 CHECK constraints + 2 partial UNIQUE indexes above catch all
+-- row-local supersession pathologies (self-loops, branching, convergence,
+-- status-mismatched pointers). What they do NOT enforce is RECIPROCITY:
+-- a direct-SQL path or partial-failure could persist
+--     A (status='superseded', superseded_by_id=B)
+-- while B has supersedes_id=NULL or supersedes_id=C (some other row), or
+-- conversely persist
+--     B (status='active', supersedes_id=C)
+-- while C remains active and does not point back at B. Both halves of the
+-- supersession edge would individually pass the row-local CHECKs but the
+-- edge itself is broken — downstream chain traversal would still mis-route.
+--
+-- The clean way to enforce reciprocity is a DEFERRABLE CONSTRAINT TRIGGER
+-- (PL/pgSQL function fired at transaction commit time) that validates both
+-- pointers reference each other. This requires:
+--   1. A PL/pgSQL function `mr_supersession_reciprocity_check()` that
+--      checks every non-null supersedes_id row references a row with
+--      matching superseded_by_id (and vice versa).
+--   2. A CONSTRAINT TRIGGER with DEFERRABLE INITIALLY DEFERRED so the
+--      check runs at COMMIT time (avoids the chicken-and-egg problem where
+--      either pointer can't be set without the other already existing).
+--   3. Transactional supersession-write semantics in the repository: the
+--      INSERT new + UPDATE old must occur in the same transaction so the
+--      deferred constraint sees both halves of the edge.
+--
+-- This deferred-work item is RECORDED HERE rather than shipped now because:
+--   (a) No supersession write path exists in this PR (the repository layer
+--       was deferred to Sprint 35-36 / TLC-055 per the PR description).
+--   (b) The reciprocity invariant is most natural to design alongside the
+--       transactional write semantics, not in advance of them.
+--   (c) The 4 row-local CHECKs + 2 partial UNIQUE indexes above already
+--       catch the common pathologies that direct-SQL writes could hit.
+--
+-- TLC-055 acceptance criterion: when the supersession write path lands,
+-- it MUST include this constraint trigger + dedicated regression tests
+-- (mismatched edges, one-sided pointers, active-parent edges). Tracked as
+-- a follow-on per Codex R12 (session 019e1d9c-dbb9-70d3-9c6c-4e12bf8e968d).
+
 -- Indexes for tenant-scoped lookups + supersession-chain traversal
 CREATE INDEX IF NOT EXISTS idx_medication_requests_tenant_patient
     ON medication_requests (tenant_id, patient_account_id, status);
