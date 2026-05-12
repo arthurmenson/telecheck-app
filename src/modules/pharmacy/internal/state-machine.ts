@@ -36,7 +36,7 @@
  * Defense layers (mirror of async-consult per I-023/I-027 discipline):
  *   Layer 1: validateTransition() — guard context shape + transition validity
  *   Layer 2: optimistic-concurrency WHERE status = $expected_from in the repo
- *   Layer 3: DB CHECK constraint on `status` column (migration 023)
+ *   Layer 3: DB CHECK constraint on `status` column (migration 025)
  *
  * Spec references:
  *   - State Machines v1.1 §19 DRAFT (per SI-001 DRAFT)
@@ -266,7 +266,7 @@ function validateGuard(ctx: GuardContext): void {
     case 'clinician_discontinue':
     case 'patient_request_discontinue':
     case 'adverse_event_discontinue': {
-      // Discontinued reason parity per migration 023 CHECK constraint
+      // Discontinued reason parity per migration 025 CHECK constraint
       const allowed = new Set([
         'clinical_decision',
         'adverse_event',

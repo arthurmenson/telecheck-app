@@ -90,7 +90,7 @@ export type DiscontinuedReason =
 export type InteractionSignalsStatus = 'pending' | 'clean' | 'caution' | 'safety_hold';
 
 // ---------------------------------------------------------------------------
-// MedicationRequest row shape (mirrors migration 023 columns)
+// MedicationRequest row shape (mirrors migration 025 columns)
 // ---------------------------------------------------------------------------
 
 /**
