@@ -349,26 +349,64 @@ CREATE TABLE IF NOT EXISTS medication_requests (
         )
     ),
 
-    -- Interaction-evaluation completion gate (Codex pharmacy-scaffold-rebuild
-    -- R7 HIGH closure 2026-05-12). The state machine enforces this implicitly
-    -- via the transition flow (draft → pending_interaction_check → engine
-    -- writeback flips interaction_signals_status to clean/caution/safety_hold
-    -- → pending_clinician_review → active), but a direct UPDATE bypassing the
+    -- Interaction-evaluation safety gate (Codex pharmacy-scaffold-rebuild
+    -- R7 HIGH closure 2026-05-12; tightened by R9 HIGH closure 2026-05-12).
+    -- The state machine enforces a transition flow (draft →
+    -- pending_interaction_check → engine writeback flips
+    -- interaction_signals_status to clean/caution/safety_hold →
+    -- pending_clinician_review → active), but a direct UPDATE bypassing the
     -- state machine could persist status='active' with the default
-    -- interaction_signals_status='pending'. That would make a prescription
-    -- look valid before the med-interaction check completed. Closes the
-    -- safety-check lifecycle at the durable boundary.
+    -- interaction_signals_status='pending' OR with an unresolved
+    -- 'safety_hold'. Either is a patient-safety failure:
+    --   - 'pending' means the engine never wrote back — the prescription
+    --     would look valid before the med-interaction check completed.
+    --   - 'safety_hold' means the engine flagged a concerning interaction
+    --     that has not been resolved — activating under a hold means
+    --     dispensing potentially-dangerous medication. The Med Interaction
+    --     Engine slice owns the override workflow (per Path 1 / ADR-001);
+    --     a successful override resolution flips the status to 'clean'
+    --     (or 'caution' with the override caveat captured). If the
+    --     override is denied, the medication request stays in
+    --     pending_clinician_review or moves to rejected — it MUST NOT
+    --     transition to active while the row still says safety_hold.
     --
     -- Active and post-active rows MUST have:
-    --   - interaction_signals_status ∈ {'clean', 'caution', 'safety_hold'}
-    --     (i.e., NOT 'pending')
+    --   - interaction_signals_status ∈ {'clean', 'caution'}
+    --     (NOT 'pending'; NOT 'safety_hold')
     --   - interaction_signals_evaluated_at populated (engine wrote back)
-    CONSTRAINT medication_requests_interaction_evaluated_when_active CHECK (
+    CONSTRAINT medication_requests_interaction_resolved_when_active CHECK (
         status NOT IN ('active', 'discontinued', 'superseded', 'expired')
         OR (
-            interaction_signals_status IN ('clean', 'caution', 'safety_hold')
+            interaction_signals_status IN ('clean', 'caution')
             AND interaction_signals_evaluated_at IS NOT NULL
         )
+    ),
+
+    -- Canonical MedicationRequestId shape enforced at the durable boundary
+    -- (Codex pharmacy-scaffold-rebuild R9 MEDIUM closure 2026-05-12). The
+    -- TypeScript constructor in src/lib/glossary.ts already validates this
+    -- pattern for application-layer writes, but a direct SQL path, seed,
+    -- backfill, or future repository bug could otherwise persist a noncanonical
+    -- 30-character id. Mirroring the validator at the DB layer makes the
+    -- canonical id shape a row-level invariant: id, supersedes_id, and
+    -- superseded_by_id are constrained to the mrx_<26-char Crockford
+    -- alphabet ULID> shape (self-FKs are nullable; the regex tolerates that).
+    --
+    -- Pattern: ^mrx_[0-7][0-9A-HJKMNPQRSTVWXYZ]{25}$
+    --   mrx_      — canonical TYPES v5.2 medication-request prefix
+    --   [0-7]     — first ULID body char (48-bit timestamp range constraint;
+    --               higher base32 chars would represent a timestamp > 2^48-1)
+    --   [Crockford alphabet]{25} — remaining 25 ULID body chars
+    CONSTRAINT medication_requests_id_canonical_format CHECK (
+        id ~ '^mrx_[0-7][0-9A-HJKMNPQRSTVWXYZ]{25}$'
+    ),
+    CONSTRAINT medication_requests_supersedes_id_canonical_format CHECK (
+        supersedes_id IS NULL
+        OR supersedes_id ~ '^mrx_[0-7][0-9A-HJKMNPQRSTVWXYZ]{25}$'
+    ),
+    CONSTRAINT medication_requests_superseded_by_id_canonical_format CHECK (
+        superseded_by_id IS NULL
+        OR superseded_by_id ~ '^mrx_[0-7][0-9A-HJKMNPQRSTVWXYZ]{25}$'
     )
 );
 
