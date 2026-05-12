@@ -582,6 +582,48 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
             `v5.3 §I-012 closure rule and AUTONOMY_LEVELS v5.2.`,
         );
       }
+
+      // Action-scoped actor_type validation (added v5.3 round 4 per Codex
+      // pharmacy-scaffold-rebuild R4 HIGH closure 2026-05-12). Without these
+      // checks, prescribing.protocol_authorization_granted could be emitted
+      // with actor_type='ai_workload' (making an AI workload appear to have
+      // supplied its own I-012 confirmation), and protocol_authorized_prescribing
+      // could be emitted with actor_type='clinician' (making protocol execution
+      // look clinician-executed). Both break post-incident audit reconstruction.
+      //
+      //   prescribing.protocol_authorization_granted: actor_type='clinician'
+      //     — this is the clinician confirmation event that authorizes the
+      //     protocol-engine route. The CLINICIAN is the actor; the protocol
+      //     engine identity is captured on the subsequent execution event.
+      //   protocol_authorized_prescribing / _refill_renewal /
+      //     _dispensing_release: actor_type='ai_workload' (or the legacy
+      //     'protocol_engine' alias only for pre-v1.10 backfill) — these
+      //     are the protocol-engine execution audits. The engine is the
+      //     executing actor authority; the accountable clinician is
+      //     captured in the payload's accountable_clinician_id field.
+      if (action === 'prescribing.protocol_authorization_granted') {
+        if (actor_type !== 'clinician') {
+          throw new Error(
+            `Action "${action}" MUST carry actor_type='clinician' (got "${actor_type}"). ` +
+              `This is the clinician confirmation event that anchors the I-012 protocol-` +
+              `authorized prescribing route; an AI workload cannot supply its own I-012 ` +
+              `confirmation. Per AUDIT_EVENTS v5.3 §I-012 closure rule + Codex pharmacy-` +
+              `scaffold-rebuild R4 HIGH closure 2026-05-12.`,
+          );
+        }
+      } else {
+        // protocol_authorized_prescribing / _refill_renewal / _dispensing_release
+        if (actor_type !== 'ai_workload' && actor_type !== 'protocol_engine') {
+          throw new Error(
+            `Action "${action}" MUST carry actor_type='ai_workload' (or legacy ` +
+              `'protocol_engine' for pre-v1.10 backfill records only); got "${actor_type}". ` +
+              `This is the protocol-engine execution audit; the accountable clinician ` +
+              `is recorded in the payload's accountable_clinician_id field. Per ` +
+              `AUDIT_EVENTS v5.3 §I-012 closure rule + Codex pharmacy-scaffold-rebuild R4 ` +
+              `HIGH closure 2026-05-12.`,
+          );
+        }
+      }
     }
   }
 
