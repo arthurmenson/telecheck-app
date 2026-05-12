@@ -1,16 +1,16 @@
 -- =============================================================================
--- File:    migrations/rollback/023_rollback.sql
--- Purpose: Rollback for 023_medication_requests.sql — drop the
+-- File:    migrations/rollback/025_rollback.sql
+-- Purpose: Rollback for 025_medication_requests.sql — drop the
 --          medication_requests table and all dependent objects (RLS
 --          policy + indexes; CHECK constraints + composite UNIQUE +
 --          composite FKs drop implicitly with DROP TABLE).
 --
 -- STATUS:  SPECULATIVE DRAFT pre-SI-001-ratification companion to
---          migrations/023_medication_requests.sql. Will be revised
+--          migrations/025_medication_requests.sql. Will be revised
 --          alongside the parent migration if SI-001 ratification
 --          adjusts the table.
 --
--- Spec:    Companion to migrations/023_medication_requests.sql per
+-- Spec:    Companion to migrations/025_medication_requests.sql per
 --          migrations/README.md "Every migration has a rollback companion."
 -- Warning: DESTRUCTIVE. Every medication_request row will be permanently
 --          lost. The append-only / supersession-chain audit trail
@@ -27,7 +27,19 @@
 -- =============================================================================
 
 -- Step 1: Drop RLS policy (must precede DROP TABLE).
-DROP POLICY IF EXISTS tenant_isolation ON medication_requests;
+-- v0.2 Codex Finding (MEDIUM) closure: `DROP POLICY IF EXISTS ... ON
+-- <table>` requires the target table to exist; IF EXISTS only guards the
+-- policy name. Without the to_regclass guard, a partial-apply state
+-- (where 025 failed to create the table — e.g., due to the previously-
+-- identified migration-ordering bug) leaves rollback unable to recover.
+-- Same pattern as the rollback/024 hardening.
+DO $$
+BEGIN
+    IF to_regclass('medication_requests') IS NOT NULL THEN
+        DROP POLICY IF EXISTS tenant_isolation ON medication_requests;
+    END IF;
+END;
+$$;
 
 -- Step 2: Drop indexes explicitly (also dropped implicitly with the
 --         table; explicit DROP IF EXISTS makes partial-rollback

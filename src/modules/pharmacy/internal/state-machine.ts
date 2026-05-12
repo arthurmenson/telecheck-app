@@ -235,9 +235,12 @@ function validateGuard(ctx: GuardContext): void {
       // structural floor.
       const g = ctx.guard;
       if (g.autonomy_level !== 'action_with_confirm') {
+        // TypeScript narrowing renders `g.autonomy_level` `never` after the
+        // equality check above; cast for the template-literal error message.
+        const observed = g.autonomy_level as unknown as string;
         throw new GuardNotSatisfiedError(
           ctx.event,
-          `autonomy_level must equal 'action_with_confirm' per I-012 closure rule; got '${g.autonomy_level}'`,
+          `autonomy_level must equal 'action_with_confirm' per I-012 closure rule; got '${observed}'`,
         );
       }
       if (g.confirming_actor_rbac_authorized !== true) {
@@ -322,8 +325,6 @@ export function validateTransition(
 /**
  * List the events permitted from a given status — for API hint surfaces.
  */
-export function permittedEventsFrom(
-  from: MedicationRequestStatus,
-): SupportedTransitionEvent[] {
+export function permittedEventsFrom(from: MedicationRequestStatus): SupportedTransitionEvent[] {
   return SUPPORTED_TRANSITIONS.filter((t) => t.from === from).map((t) => t.event);
 }

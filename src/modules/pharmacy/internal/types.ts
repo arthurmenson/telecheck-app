@@ -9,7 +9,7 @@
  *
  * Spec references:
  *   - SI-001 DRAFT §"Proposed CDM §4.16 MedicationRequest"
- *   - migrations/023_medication_requests.sql (the schema)
+ *   - migrations/025_medication_requests.sql (the schema)
  *   - State Machines v1.1 §19 DRAFT (status enum)
  *   - CDM v1.2 §3.5 (entity inventory)
  */

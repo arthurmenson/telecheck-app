@@ -15,7 +15,7 @@
  *     UPDATE that the I-003 hash-chain audit picks up
  *
  * Spec references:
- *   - migrations/023_medication_requests.sql
+ *   - migrations/025_medication_requests.sql
  *   - SI-001 DRAFT §"Proposed CDM §4.16"
  *   - PROJECT_CONVENTIONS r5 §1.1 (composite UNIQUE + composite FK)
  *   - I-023 / I-025 / I-027
@@ -31,7 +31,6 @@ import {
   asProductCatalogId,
   asProtocolId,
   type DiscontinuedReason,
-  type InteractionOverrideId,
   type InteractionSignalsStatus,
   type MedicationRequest,
   type MedicationRequestId,
@@ -121,8 +120,7 @@ function rowToMedicationRequest(row: MedicationRequestRow): MedicationRequest {
     autonomy_level: row.autonomy_level,
     protocol_id: row.protocol_id === null ? null : asProtocolId(row.protocol_id),
     protocol_version: row.protocol_version,
-    supersedes_id:
-      row.supersedes_id === null ? null : asMedicationRequestId(row.supersedes_id),
+    supersedes_id: row.supersedes_id === null ? null : asMedicationRequestId(row.supersedes_id),
     superseded_by_id:
       row.superseded_by_id === null ? null : asMedicationRequestId(row.superseded_by_id),
     country_of_care: row.country_of_care,
@@ -217,7 +215,7 @@ export async function createDraft(
       throw new Error('createDraft: INSERT returned no rows');
     }
     const mr = rowToMedicationRequest(row);
-    await txCallback(tx as DbTransaction, mr);
+    await txCallback(tx, mr);
     return mr;
   };
   if (externalTx !== undefined) return runFn(externalTx);
@@ -484,7 +482,7 @@ export async function recordSupersession(
     }
 
     const newMr = rowToMedicationRequest(newRow);
-    await txCallback(tx as DbTransaction, newMr);
+    await txCallback(tx, newMr);
     return newMr;
   };
   if (externalTx !== undefined) return runFn(externalTx);
