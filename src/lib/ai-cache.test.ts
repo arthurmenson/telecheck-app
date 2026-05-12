@@ -68,7 +68,7 @@ function makeInvocation(overrides: Partial<CacheableAIInvocation> = {}): Cacheab
         input_schema: { type: 'object', properties: { patient_id: { type: 'string' } } },
       },
     ],
-    historyTurns: [],
+    nonCachedHistoryTurns: [],
     turnInput: { content: 'When is my next refill?' },
     model: 'claude-sonnet-4-5-20250929',
     max_tokens: 1024,
@@ -142,14 +142,14 @@ describe('§1 CacheableAIInvocation', () => {
 
   it('§1c allows conversation history with the last turn as in-flight user input', () => {
     const invocation = makeInvocation({
-      historyTurns: [
+      nonCachedHistoryTurns: [
         { role: 'user', content: 'I have type 2 diabetes.' },
         { role: 'assistant', content: 'Thanks — I will keep that in mind.' },
       ],
       turnInput: { content: 'Can I take my medication_request with food?' },
     });
-    expect(invocation.historyTurns).toHaveLength(2);
-    expect(invocation.historyTurns[1]?.role).toBe('assistant');
+    expect(invocation.nonCachedHistoryTurns).toHaveLength(2);
+    expect(invocation.nonCachedHistoryTurns[1]?.role).toBe('assistant');
     expect(invocation.turnInput.content).toContain('food');
   });
 });
@@ -412,12 +412,93 @@ describe('§7 Cross-reference gap accommodation (ai-context.ts §11)', () => {
     expect(invocation.protocol_id).toBe('PROTOCOL-GLP1-v3');
   });
 
-  it('§7d model_version on AIInvocationResult matches the value supplied on the invocation', async () => {
-    const { sdk } = makeMockSdk(makeAnthropicResponse());
+  it('§7d model_version on AIInvocationResult sources from response.model (Codex HIGH closure)', async () => {
+    // Per Codex HIGH on PR #104: the returned model_version MUST be the
+    // provider-served `response.model`, not the caller-supplied invocation
+    // field. Mock response served sonnet; result is sonnet regardless of
+    // caller intent.
+    const { sdk } = makeMockSdk(makeAnthropicResponse({ model: 'claude-sonnet-4-5-20250929' }));
+    const { model_version: _drop, ...withoutVersion } = makeInvocation();
+    const result = await aiInvoke(withoutVersion, makeProviderCtx({}, sdk));
+    expect(result.model_version).toBe('claude-sonnet-4-5-20250929');
+  });
+
+  it('§7e ModelVersionMismatchError thrown when invocation.model_version disagrees with response.model', async () => {
+    // Per Codex HIGH closure: fail closed on mismatch so the caller re-
+    // asserts the audit envelope before retrying. Anthropic alias
+    // resolution or routing changes must surface to the caller; silent
+    // divergence in telemetry/audit is the v0.1 skeleton bug.
+    const { sdk } = makeMockSdk(makeAnthropicResponse({ model: 'claude-sonnet-4-5-20250929' }));
+    await expect(
+      aiInvoke(
+        makeInvocation({ model_version: 'claude-haiku-4-5-20250929' }),
+        makeProviderCtx({}, sdk),
+      ),
+    ).rejects.toThrowError(/ModelVersionMismatchError|disagrees with provider/);
+  });
+
+  it('§7f matching invocation.model_version + response.model returns the agreed-upon value', async () => {
+    // Happy-path: both sides agree → returns that value without error.
+    const { sdk } = makeMockSdk(makeAnthropicResponse({ model: 'claude-sonnet-4-5-20250929' }));
     const result = await aiInvoke(
-      makeInvocation({ model_version: 'claude-haiku-4-5-20250929' }),
+      makeInvocation({ model_version: 'claude-sonnet-4-5-20250929' }),
       makeProviderCtx({}, sdk),
     );
-    expect(result.model_version).toBe('claude-haiku-4-5-20250929');
+    expect(result.model_version).toBe('claude-sonnet-4-5-20250929');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §8 — PHI cache-boundary regression (Codex HIGH closure 2026-05-11)
+// ---------------------------------------------------------------------------
+
+describe('§8 PHI cache-boundary invariant', () => {
+  it('§8a nonCachedHistoryTurns are positioned AFTER cache_control breakpoints in the request', async () => {
+    // Per Codex HIGH on PR #104: history turns can carry PHI; they MUST
+    // appear after every cache_control breakpoint in the request so no
+    // PHI lands in a cached prefix. The cache_control blocks are on the
+    // system prompt + tool catalog; messages (history + current turn)
+    // are placed AFTER those by Anthropic API ordering. This test pins
+    // the invariant at the wrapper boundary.
+    const { sdk, createSpy } = makeMockSdk(makeAnthropicResponse());
+    const invocation = makeInvocation({
+      nonCachedHistoryTurns: [
+        { role: 'user', content: 'I take metformin 500mg twice daily for type 2 diabetes.' },
+        {
+          role: 'assistant',
+          content: 'Understood — let me look up your medication_request record.',
+        },
+      ],
+    });
+    await aiInvoke(invocation, makeProviderCtx({}, sdk));
+
+    expect(createSpy).toHaveBeenCalledOnce();
+    const params = createSpy.mock.calls[0]?.[0] as AnthropicMessagesCreateParams;
+
+    // System blocks carry cache_control.
+    const systemBlocksWithCache =
+      Array.isArray(params.system) && params.system.some((b) => 'cache_control' in b);
+    expect(systemBlocksWithCache).toBe(true);
+
+    // Tools carry cache_control.
+    const toolsWithCache =
+      Array.isArray(params.tools) && params.tools.some((t) => 'cache_control' in t);
+    expect(toolsWithCache).toBe(true);
+
+    // Messages (history + current turn) do NOT carry cache_control.
+    const messagesHaveNoCache = params.messages.every((m) => !('cache_control' in m));
+    expect(messagesHaveNoCache).toBe(true);
+
+    // The history turns appear in messages (separate from cached blocks).
+    expect(params.messages.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('§8b field is named `nonCachedHistoryTurns` (typed enforcement of the invariant)', () => {
+    // Pure type-level pin: the canonical field name makes the
+    // not-cached intent visible at the call site. v0.1 used `historyTurns`
+    // which Codex flagged as misleading. Renamed per the closure.
+    const invocation = makeInvocation();
+    expect(invocation).toHaveProperty('nonCachedHistoryTurns');
+    expect((invocation as unknown as { historyTurns?: unknown }).historyTurns).toBeUndefined();
   });
 });
