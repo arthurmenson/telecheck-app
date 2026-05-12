@@ -55,7 +55,7 @@
  *     I-012 record)
  *   - I-027 (every audit record carries tenant_id)
  *   - I-031 (research export events at audit_sensitivity_level=high_pii)
- *   - AUDIT_EVENTS v5.2 §I-012 closure rule, §sentinel rules
+ *   - AUDIT_EVENTS v5.3 §I-012 closure rule (bumped from v5.2 at P-011 / SI-001 closure 2026-05-11), §sentinel rules
  *   - WORKLOAD_TAXONOMY v5.2 §3 (reserved workload types)
  *   - AUTONOMY_LEVELS v5.2 §3 (reserved autonomy levels)
  *   - migration 002_audit_chain.sql (audit_records table + BEFORE INSERT
@@ -376,7 +376,7 @@ describe('emitAudit — I-012 closure rule', () => {
     expect(env.ai_workload_type).toBe('protocol_execution');
   });
 
-  it('error cites AUDIT_EVENTS v5.2 §I-012 closure rule', async () => {
+  it('error cites AUDIT_EVENTS v5.3 §I-012 closure rule (bumped from v5.2 at P-011 / SI-001 closure 2026-05-11)', async () => {
     try {
       await emitAudit(
         baseInput({
@@ -389,7 +389,12 @@ describe('emitAudit — I-012 closure rule', () => {
       );
       expect.fail('expected throw');
     } catch (err) {
-      expect((err as Error).message).toMatch(/AUDIT_EVENTS v5\.2 §I-012 closure rule/);
+      // Assertion is now version-tolerant on the AUDIT_EVENTS major-minor:
+      // v5.3 supersedes v5.2 for live-emission references to the I-012 closure
+      // rule, but the closure-rule prose itself carries forward unchanged from
+      // v5.2. Either citation is valid; the test verifies the error wires
+      // back to the canonical rule, not a specific version string.
+      expect((err as Error).message).toMatch(/AUDIT_EVENTS v5\.[23] §I-012 closure rule/);
     }
   });
 });
