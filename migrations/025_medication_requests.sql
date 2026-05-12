@@ -100,8 +100,13 @@
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS medication_requests (
-    -- Identity
-    id                                  VARCHAR(26) PRIMARY KEY,           -- ULID (§2 conventions)
+    -- Identity. Per the canonical MedicationRequestId contract in
+    -- src/lib/glossary.ts: `mrx_` prefix + 26-char Crockford-base32 ULID =
+    -- 30 chars total. VARCHAR(30) (not VARCHAR(26)) accommodates the
+    -- canonical mrx_<ULID> shape. supersedes_id + superseded_by_id are
+    -- self-FKs and share the same width. Codex pharmacy-scaffold-rebuild
+    -- R6 HIGH closure 2026-05-12.
+    id                                  VARCHAR(30) PRIMARY KEY,
     tenant_id                           VARCHAR(26) NOT NULL REFERENCES tenants(id),
 
     -- Patient anchor (composite FK enforces same-tenant binding per
@@ -162,8 +167,10 @@ CREATE TABLE IF NOT EXISTS medication_requests (
     -- status='discontinued' row with supersedes_id; the original flips to
     -- 'superseded' under hash-chain audit). Same discipline as consent_versions
     -- per Slice 3 PRD v1.0 §7.1.
-    supersedes_id                       VARCHAR(26),                       -- self-FK (composite); nullable
-    superseded_by_id                    VARCHAR(26),                       -- self-FK (composite); nullable
+    -- Self-FK width matches the id column: VARCHAR(30) for the canonical
+    -- mrx_<26-char ULID> shape (Codex R6 HIGH closure 2026-05-12).
+    supersedes_id                       VARCHAR(30),                       -- self-FK (composite); nullable
+    superseded_by_id                    VARCHAR(30),                       -- self-FK (composite); nullable
 
     -- CCR linkage (denormalized; matches Slice 4 country_of_care threading
     -- rule per Tenant Threading Addendum v1.0 §3.4)

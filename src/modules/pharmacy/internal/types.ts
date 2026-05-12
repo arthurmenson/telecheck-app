@@ -29,13 +29,18 @@
 // Branded ID types (CDM §3.5 entities #18-#22)
 // ---------------------------------------------------------------------------
 
-declare const _medicationRequestIdBrand: unique symbol;
-export type MedicationRequestId = string & {
-  readonly [_medicationRequestIdBrand]: 'MedicationRequestId';
-};
-export function asMedicationRequestId(s: string): MedicationRequestId {
-  return s as MedicationRequestId;
-}
+// MedicationRequestId is canonical in src/lib/glossary.ts with full
+// validation against the `mrx_<26-char Crockford-base32 ULID>` pattern
+// (per TYPES v5.2 ID conventions). The pharmacy module imports the
+// canonical brand + constructor (and re-exports both) so cross-module
+// callers get the same validated type and there is exactly one
+// constructor entry point. The bare unvalidated brand that lived here
+// in v0.1 + v0.2 was dropped per Codex pharmacy-scaffold-rebuild R6
+// HIGH closure 2026-05-12 — the local caster would have silently
+// persisted noncanonical IDs that bypass the glossary's mrx_-prefix
+// invariant.
+import { type MedicationRequestId, asMedicationRequestId } from '../../../lib/glossary.js';
+export { type MedicationRequestId, asMedicationRequestId };
 
 declare const _refillIdBrand: unique symbol;
 export type RefillId = string & { readonly [_refillIdBrand]: 'RefillId' };
