@@ -613,14 +613,28 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
         }
       } else {
         // protocol_authorized_prescribing / _refill_renewal / _dispensing_release
-        if (actor_type !== 'ai_workload' && actor_type !== 'protocol_engine') {
+        // — live emissions MUST use actor_type='ai_workload'. The legacy
+        // 'protocol_engine' alias is rejected in this path per Codex
+        // pharmacy-scaffold-rebuild R5 HIGH closure 2026-05-12 (R4 fix had a
+        // hole: emitAudit can't distinguish a live emission from a backfill
+        // import, so accepting 'protocol_engine' here would let a live
+        // emission slip through with the deprecated alias). Backfill imports
+        // for pre-v1.10 records — if they're ever needed — MUST go through a
+        // separate backfill-only API with an explicit `is_backfill: true`
+        // flag and a record-version cutoff. That backfill path is not built
+        // (and may never be needed if pre-v1.10 records aren't migrated);
+        // this comment names the constraint for any future backfill design.
+        if (actor_type !== 'ai_workload') {
           throw new Error(
-            `Action "${action}" MUST carry actor_type='ai_workload' (or legacy ` +
-              `'protocol_engine' for pre-v1.10 backfill records only); got "${actor_type}". ` +
+            `Action "${action}" MUST carry actor_type='ai_workload'; got "${actor_type}". ` +
               `This is the protocol-engine execution audit; the accountable clinician ` +
-              `is recorded in the payload's accountable_clinician_id field. Per ` +
-              `AUDIT_EVENTS v5.3 §I-012 closure rule + Codex pharmacy-scaffold-rebuild R4 ` +
-              `HIGH closure 2026-05-12.`,
+              `is recorded in the payload's accountable_clinician_id field. The legacy ` +
+              `'protocol_engine' actor_type is non-compliant per AUDIT_EVENTS v5.3 §I-012 ` +
+              `closure rule line 66 and MUST be mapped at emission time to ` +
+              `'ai_workload' (workload type 'protocol_execution'). Pre-v1.10 backfill ` +
+              `imports — if ever needed — require a separate backfill-only API path that ` +
+              `is not currently built. Per Codex pharmacy-scaffold-rebuild R5 HIGH ` +
+              `closure 2026-05-12.`,
           );
         }
       }
