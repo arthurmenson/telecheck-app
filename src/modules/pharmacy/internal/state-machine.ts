@@ -338,6 +338,21 @@ export interface I012GuardClinicianOnly {
   confirmation_event_audit_id: string;
 
   /**
+   * Clause 2 (bound-context attestations — added v0.3 per Codex
+   * pharmacy-scaffold-rebuild R3 HIGH closure 2026-05-12): the caller MUST
+   * attest the audit event referenced by `confirmation_event_audit_id` is
+   * bound to these facts. The state machine cross-checks these against the
+   * `pending_transition` argument to `validateTransition`; mismatches
+   * indicate a service-layer mistake (e.g., a stale retry token, a confused
+   * action_id, or a cross-tenant audit-id leak) and reject the transition
+   * with `audit_chain_confirmation_event_missing`.
+   */
+  attested_tenant_id: string;
+  attested_action_id: string;
+  attested_patient_account_id: string;
+  attested_actor_id: string;
+
+  /**
    * Clause 3: the confirming actor's RBAC role. The caller MUST have already
    * verified the role is authorized to sign for prescribing under RBAC v1.1.
    */
@@ -391,11 +406,61 @@ export interface I012GuardProtocolAuthorized {
   confirmation_event_action_id: string;
 
   /**
+   * Clause 2 (bound-context attestations — added v0.3 per Codex
+   * pharmacy-scaffold-rebuild R3 HIGH closure 2026-05-12): the caller MUST
+   * attest the audit event referenced by `confirmation_event_audit_id` is
+   * bound to these facts. The state machine cross-checks these against the
+   * `pending_transition` argument to `validateTransition`; mismatches
+   * indicate a service-layer mistake (e.g., a stale retry token, a confused
+   * action_id, a cross-tenant audit-id leak, or a wrong protocol_id /
+   * protocol_version pairing) and reject the transition with
+   * `audit_chain_confirmation_event_missing`.
+   *
+   * Protocol-route attestations include the protocol binding fields
+   * (protocol_id + protocol_version) because the upstream
+   * prescribing.protocol_authorization_granted event MUST have been scoped
+   * to the same protocol context as the row being transitioned. A mismatch
+   * means the clinician authorized a different protocol than the engine is
+   * about to execute.
+   */
+  attested_tenant_id: string;
+  attested_action_id: string;
+  attested_patient_account_id: string;
+  attested_actor_id: string;
+  attested_protocol_id: string;
+  attested_protocol_version: string;
+
+  /**
    * Clause 3: the confirming clinician's RBAC role. The clinician who emitted
    * the `prescribing.protocol_authorization_granted` event MUST have been
    * authorized to sign for prescribing under RBAC v1.1.
    */
   confirming_actor_rbac_authorized: true;
+}
+
+/**
+ * Pending transition context — the facts about the row being transitioned that
+ * the state machine cross-checks against the I-012 guard's bound-context
+ * attestations. The caller (service layer) MUST construct this from the actual
+ * MedicationRequest row data; the state machine cross-checks the guard's
+ * `attested_*` fields against these values and rejects with
+ * `audit_chain_confirmation_event_missing` on any mismatch.
+ *
+ * Added v0.3 per Codex pharmacy-scaffold-rebuild R3 HIGH closure 2026-05-12.
+ */
+export interface PendingTransitionContext {
+  /** The MedicationRequest row's tenant_id. */
+  tenant_id: string;
+  /** The canonical I-012 action_id for this prescribing decision. */
+  action_id: string;
+  /** The MedicationRequest row's patient_account_id. */
+  patient_account_id: string;
+  /** The actor performing the transition (clinician for both routes). */
+  actor_id: string;
+  /** The row's protocol_id — null on the clinician-only route. */
+  protocol_id: string | null;
+  /** The row's protocol_version — null on the clinician-only route. */
+  protocol_version: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -451,12 +516,21 @@ export type I012ViolatedClause =
  * Validate a MedicationRequest state transition.
  *
  * For I-012-gated events (`clinician_approve`, `protocol_authorized_prescribing`),
- * the caller MUST supply a fully-populated `I012GuardContext`. The state
- * machine evaluates all three clauses and throws `I012RejectError` if any
- * clause fails. The caller is responsible for emitting
- * `prescribing.execution_rejected` to the immutable audit chain per I-003.
+ * the caller MUST supply BOTH a fully-populated `I012GuardContext` AND a
+ * `PendingTransitionContext` describing the row being transitioned. The state
+ * machine:
+ *   1. Verifies the guard route matches the event.
+ *   2. Cross-checks the guard's `attested_*` bindings against the
+ *      `pending_transition` facts. Mismatches reject with
+ *      `audit_chain_confirmation_event_missing` (the bound confirmation
+ *      event doesn't match the pending transition's row).
+ *   3. Evaluates the I-012 three clauses per the route.
+ * Any clause failure throws `I012RejectError`. The caller is responsible for
+ * emitting `prescribing.execution_rejected` to the immutable audit chain per
+ * I-003.
  *
- * For non-I-012-gated events, the `i012_guard` argument MUST be undefined.
+ * For non-I-012-gated events, both `i012_guard` and `pending_transition` MUST
+ * be undefined.
  *
  * Returns the destination state on success.
  */
@@ -464,6 +538,7 @@ export function validateTransition(
   from: MedicationRequestStatus,
   event: TransitionEvent,
   i012_guard?: I012GuardContext,
+  pending_transition?: PendingTransitionContext,
 ): MedicationRequestStatus {
   const transition = TRANSITIONS.find((t) => t.from === from && t.event === event);
   if (!transition) {
@@ -471,27 +546,57 @@ export function validateTransition(
   }
 
   if (transition.i012_gated) {
-    if (!i012_guard) {
+    if (!i012_guard || !pending_transition) {
       throw new I012RejectError(event as I012GatedEvent, [
         'audit_chain_confirmation_event_missing',
         'confirming_actor_rbac_unauthorized',
       ]);
     }
-    // Cross-check: guard.route MUST match the event being attempted (catches
-    // service-layer mistakes where a clinician_approve guard is paired with a
-    // protocol_authorized_prescribing event, or vice versa).
+    // Cross-check 1: guard.route MUST match the event being attempted
+    // (catches service-layer mistakes where a clinician_approve guard is
+    // paired with a protocol_authorized_prescribing event, or vice versa).
     if (i012_guard.route !== event) {
       throw new I012RejectError(event as I012GatedEvent, [
         'audit_chain_confirmation_event_missing',
       ]);
     }
+    // Cross-check 2: the guard's attested bindings MUST match the pending
+    // transition's row facts. Mismatch = stale retry token, confused
+    // action_id, cross-tenant audit-id leak, or wrong protocol pairing.
+    if (
+      i012_guard.attested_tenant_id !== pending_transition.tenant_id ||
+      i012_guard.attested_action_id !== pending_transition.action_id ||
+      i012_guard.attested_patient_account_id !== pending_transition.patient_account_id ||
+      i012_guard.attested_actor_id !== pending_transition.actor_id
+    ) {
+      throw new I012RejectError(event, ['audit_chain_confirmation_event_missing']);
+    }
+    if (i012_guard.route === 'protocol_authorized_prescribing') {
+      if (
+        i012_guard.attested_protocol_id !== pending_transition.protocol_id ||
+        i012_guard.attested_protocol_version !== pending_transition.protocol_version
+      ) {
+        throw new I012RejectError(event, ['audit_chain_confirmation_event_missing']);
+      }
+    } else {
+      // Clinician-only route: pending_transition.protocol_id/version MUST be null
+      // (matches the row CHECK medication_requests_i012_protocol_binding_check
+      // tightened to iff in R2 — protocol metadata cannot exist on the
+      // clinician-only branch).
+      if (
+        pending_transition.protocol_id !== null ||
+        pending_transition.protocol_version !== null
+      ) {
+        throw new I012RejectError(event, ['audit_chain_confirmation_event_missing']);
+      }
+    }
     const violations = evaluateI012Clauses(event, i012_guard);
     if (violations.length > 0) {
       throw new I012RejectError(event, violations);
     }
-  } else if (i012_guard !== undefined) {
+  } else if (i012_guard !== undefined || pending_transition !== undefined) {
     throw new Error(
-      `Event '${event}' is not I-012-gated; do not pass an I012GuardContext`,
+      `Event '${event}' is not I-012-gated; do not pass an I012GuardContext or PendingTransitionContext`,
     );
   }
 

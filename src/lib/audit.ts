@@ -507,11 +507,39 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
           `Action "${action}" is not a rejection event.`,
       );
     }
-    // Sentinel `n/a` validation: only valid when no AI workload was upstream
+    // Sentinel `n/a` validation: only valid when no AI workload was upstream.
+    // Per AUDIT_EVENTS v5.3 §I-012 closure rule line 127 clinician-only
+    // carve-out, ai_workload_type and autonomy_level MUST travel together:
+    // either both 'n/a' (clinician-only, no upstream AI) or both canonical
+    // non-sentinel values. Asymmetric pairing (one 'n/a', one canonical) is
+    // a corrupt envelope.
     if (ai_workload_type === 'n/a' && isAIWorkload) {
       throw new Error(
         'Sentinel "n/a" for ai_workload_type is only valid for clinician-only approval records ' +
           'where no AI workload was upstream. actor_type=ai_workload contradicts this.',
+      );
+    }
+    if (autonomy_level === 'n/a' && isAIWorkload) {
+      throw new Error(
+        'Sentinel "n/a" for autonomy_level is only valid for clinician-only approval records ' +
+          'where no AI workload was upstream. actor_type=ai_workload contradicts this.',
+      );
+    }
+    // Symmetric n/a pairing: ai_workload_type=n/a iff autonomy_level=n/a
+    // (added v5.3 round 4 per Codex pharmacy-scaffold-rebuild R3 HIGH closure
+    // 2026-05-12). Mixed-pairing examples that previously slipped through:
+    //   - ai_workload_type='protocol_execution' + autonomy_level='n/a' on
+    //     prescribing.approved would have made an AI-attributed success
+    //     record look partially clinician-only.
+    //   - ai_workload_type='n/a' + autonomy_level='action_with_confirm' on
+    //     any I-012 action would have claimed no AI workload while still
+    //     asserting an AI-execution autonomy level.
+    if ((ai_workload_type === 'n/a') !== (autonomy_level === 'n/a')) {
+      throw new Error(
+        `Sentinel "n/a" must travel as a pair: ai_workload_type and autonomy_level ` +
+          `MUST both be "n/a" (clinician-only carve-out per AUDIT_EVENTS v5.3 §I-012 ` +
+          `closure rule line 127) or both be canonical non-sentinel values. Got ` +
+          `ai_workload_type="${ai_workload_type}", autonomy_level="${autonomy_level}".`,
       );
     }
     // Action-scoped `n/a` validation (added v5.3 under P-011 / SI-001 closure
