@@ -38,10 +38,20 @@
 --   suppression on the prior row would itself be an I-003 violation.
 --
 -- Out-of-scope for THIS migration (deferred):
---   - product_catalog table (CDM §4.9 — not yet authored in migrations)
 --   - interaction_overrides table (Med Interaction Engine slice)
 --   - refills, dispensings, shipments tables (Pharmacy + Refill follow-on)
 --   - protocols table (referenced by protocol_id; future entity)
+--
+-- v0.2 Codex Finding 1 closure (2026-05-11):
+--   v0.1 of this migration omitted the composite (tenant_id, product_catalog_id)
+--   FK because `product_catalog` did not yet exist in the migrations chain.
+--   Codex flagged this as HIGH severity on PR #95 — orphan or wrong-tenant
+--   catalog references in prescribing records undermine the snapshot-at-
+--   prescribe-time safety model. Migration 024 (PR #101 MERGED 2026-05-11)
+--   now provides the canonical `product_catalog` table per CDM v1.2 §4.9
+--   with a composite UNIQUE (tenant_id, id) defensively added per
+--   PROJECT_CONVENTIONS r5 §1.1 specifically to enable this FK. v0.2 of
+--   this migration establishes the composite FK from row 0.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -50,6 +60,7 @@
 --   003_rls_helpers.sql  applied (current_tenant_id())
 --   012_accounts.sql     applied (composite-FK target — accounts UNIQUE (tenant_id, account_id))
 --   020+021_async_consult applied (composite-FK target — consults UNIQUE (tenant_id, id))
+--   024_product_catalog  applied (composite-FK target — product_catalog UNIQUE (tenant_id, id))
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS medication_requests (
@@ -63,16 +74,10 @@ CREATE TABLE IF NOT EXISTS medication_requests (
     patient_account_id                  VARCHAR(26)  NOT NULL,
 
     -- Catalog anchor ---------------------------------------------------------
-    -- TODO(SI-001-ratification): FK target table `product_catalog` does NOT
-    -- yet exist in this codebase (CDM v1.2 §4.9 is inventory-only). The
-    -- composite FK
-    --     FOREIGN KEY (tenant_id, product_catalog_id) REFERENCES
-    --     product_catalog (tenant_id, id)
-    -- will be added in the follow-on migration that introduces
-    -- product_catalog. This DRAFT migration deliberately omits the FK
-    -- constraint so the column lands now without an unresolvable
-    -- target. Application-layer validation enforces non-orphan refs
-    -- until the FK is wired.
+    -- v0.2 Codex Finding 1 closure: composite FK target now exists via
+    -- migration 024 (product_catalog per CDM v1.2 §4.9; composite UNIQUE
+    -- on (tenant_id, id) per PROJECT_CONVENTIONS r5 §1.1). FK constraint
+    -- below in the constraints block.
     product_catalog_id                  VARCHAR(26)  NOT NULL,
 
     -- Clinical detail (snapshot-at-prescribe-time) ---------------------------
@@ -154,8 +159,13 @@ CREATE TABLE IF NOT EXISTS medication_requests (
         FOREIGN KEY (tenant_id, prescribing_consult_id)
         REFERENCES consults (tenant_id, id),
 
-    -- NOTE: product_catalog composite FK intentionally OMITTED; see TODO
-    -- above. To be added in the migration that introduces product_catalog.
+    -- Product catalog item must belong to the same tenant (composite FK).
+    -- v0.2 Codex Finding 1 closure: enabled by migration 024 product_catalog
+    -- + its composite UNIQUE (tenant_id, id). Closes orphan-/cross-tenant-
+    -- catalog-reference risk on snapshot-at-prescribe-time records.
+    CONSTRAINT medication_requests_tenant_product_fk
+        FOREIGN KEY (tenant_id, product_catalog_id)
+        REFERENCES product_catalog (tenant_id, id),
 
     -- Supersession-chain self-FKs (composite) -----------------------------
     CONSTRAINT medication_requests_supersedes_fk
