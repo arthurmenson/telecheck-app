@@ -444,8 +444,59 @@ CREATE TABLE IF NOT EXISTS medication_requests (
     CONSTRAINT medication_requests_superseded_by_id_canonical_format CHECK (
         superseded_by_id IS NULL
         OR superseded_by_id ~ '^mrx_[0-7][0-9A-HJKMNPQRSTVWXYZ]{25}$'
+    ),
+
+    -- Supersession-chain integrity (Codex pharmacy-scaffold-rebuild R11
+    -- HIGH closure 2026-05-12). The chain is documented as append-only +
+    -- linear, but the durable FK constraints alone don't enforce that. A
+    -- direct SQL path, retry bug, or partial-failure can otherwise persist
+    -- self-loops (A → A) or branching chains (A → B AND A → C). Downstream
+    -- refill/dispensing/subscription consumers that traverse the chain to
+    -- find the current prescription would then pick the wrong row, loop,
+    -- or double-process a replacement.
+
+    -- Anti-self-loop: a row cannot supersede itself in either direction.
+    CONSTRAINT medication_requests_supersedes_id_not_self CHECK (
+        supersedes_id IS NULL OR supersedes_id <> id
+    ),
+    CONSTRAINT medication_requests_superseded_by_id_not_self CHECK (
+        superseded_by_id IS NULL OR superseded_by_id <> id
+    ),
+
+    -- Status-dependent supersession pointers:
+    --   - `superseded_by_id` is set ONLY on rows whose status='superseded'
+    --     (the row that was replaced; the forward pointer points at its
+    --     replacement). On all other statuses superseded_by_id MUST be null.
+    --   - `supersedes_id` is set ONLY on rows that ARE the replacement (i.e.,
+    --     a new prescription that replaces an older one). The new replacement
+    --     row's status is typically 'active' (clinician_approve /
+    --     protocol_authorized_prescribing route via supersede_by_new_prescription
+    --     transition) or 'discontinued' (deliberate discontinuation that
+    --     creates a new discontinued row). Pre-active or 'rejected' rows
+    --     don't carry supersedes_id — they haven't replaced anything yet.
+    CONSTRAINT medication_requests_superseded_by_id_only_on_superseded CHECK (
+        superseded_by_id IS NULL OR status = 'superseded'
+    ),
+    CONSTRAINT medication_requests_supersedes_id_only_on_replacement CHECK (
+        supersedes_id IS NULL
+        OR status IN ('active', 'discontinued')
     )
 );
+
+-- Partial UNIQUE indexes preserving the linear-chain invariant. Each parent
+-- row in the chain is replaced by AT MOST one row (no branching). Each
+-- replacement row points back at AT MOST one parent. Without these, two
+-- separate replacement rows could claim to supersede the same original
+-- (A → B AND A → C), or one row could declare itself the successor of two
+-- different originals (B → A AND C → A) — both pathologies that break linear-
+-- chain traversal in refill/dispensing/subscription consumers. (Codex R11
+-- HIGH closure 2026-05-12.)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_medication_requests_supersedes_unique
+    ON medication_requests (tenant_id, supersedes_id)
+    WHERE supersedes_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_medication_requests_superseded_by_unique
+    ON medication_requests (tenant_id, superseded_by_id)
+    WHERE superseded_by_id IS NOT NULL;
 
 -- Indexes for tenant-scoped lookups + supersession-chain traversal
 CREATE INDEX IF NOT EXISTS idx_medication_requests_tenant_patient

@@ -35,6 +35,8 @@ BEGIN
 END;
 $$;
 
+DROP INDEX IF EXISTS uq_medication_requests_superseded_by_unique;
+DROP INDEX IF EXISTS uq_medication_requests_supersedes_unique;
 DROP INDEX IF EXISTS idx_medication_requests_supersession_chain;
 DROP INDEX IF EXISTS idx_medication_requests_tenant_status_active;
 DROP INDEX IF EXISTS idx_medication_requests_tenant_consult;
