@@ -60,7 +60,7 @@ import { describe, expect, it } from 'vitest';
 import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
-// The 23 tenant-scoped tables that MUST have RLS enabled + a tenant policy.
+// The 25 tenant-scoped tables that MUST have RLS enabled + a tenant policy.
 //
 // Initial inventory (21 tables): verified at the Sprint 6 PM kickoff via
 // `grep "CREATE POLICY.*ON " migrations/*.sql`.
@@ -69,6 +69,13 @@ import { getTestClient } from '../setup.ts';
 // from migration 020_async_consult.sql. Per the lockdown's design, intentional
 // schema additions UPDATE this list (and the count); unintentional changes
 // (drops, renames, missed RLS-attachment) trigger the §2 count drift test.
+//
+// Sprint 35 / TLC-055 addition (+1 table): `medication_requests` from
+// migration 025_medication_requests.sql per CDM v1.3 §4.16 (added at P-011 /
+// SI-001 closure 2026-05-11; spec corpus commit 879cd57). Path 1 shape — no
+// `interaction_override_id` column; integration with the Med Interaction
+// Engine slice is via the medication_request.interaction_safety_hold_triggered
+// domain event per ADR-001 clean module-boundary separation.
 //
 // If a future migration adds a tenant-scoped table, it MUST be added here
 // AND the migration MUST attach a tenant-isolation policy. The §2 count
@@ -95,6 +102,7 @@ const TENANT_SCOPED_TABLES = [
   'forms_template',
   'forms_variant',
   'idempotency_keys',
+  'medication_requests', // migration 025 — per CDM v1.3 §4.16 (P-011 / SI-001 closure 2026-05-11)
   'otp_challenges',
   'product_catalog', // migration 024 — per CDM v1.2 §4.9 ProductCatalog
   'sessions',
