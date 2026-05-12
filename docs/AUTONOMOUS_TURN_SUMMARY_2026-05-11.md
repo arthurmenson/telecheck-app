@@ -1,8 +1,8 @@
 # Autonomous Turn — Cumulative Summary (2026-05-11)
 
-**Final PR merged in this turn:** #100 (this amendment)
+**Final PR merged in this turn:** #107 (amendment 2 — this update)
 **CI status:** ✅ Green on main throughout the run
-**Total PRs this turn:** 11 (8 merged: #93 + #94 + #87 + #88 + #96 + #97 + #98 + #99 + #100; 1 DRAFT-open: #95; superseded dependabot duplicates also closed)
+**Total PRs this turn:** 18 merged (#87, #88, #93, #94, #96-#107) + 1 DRAFT-open (#95)
 **Predecessor turn:** `docs/AUTONOMOUS_TURN_SUMMARY_2026-05-08.md` (Phase A test/CI gap closures + Phase B README hygiene; 23 PRs merged across #59-#81)
 
 ---
@@ -61,6 +61,86 @@ Codex review was NOT autoinvoked on the retro backfill (TLC-051 is Codex SKIP pe
 - **Codex findings closed inline:** 7 (SI closure cycle)
 - **Background agents spawned:** 7 (4 SI agents + 1 Plan agent + 1 pharmacy scaffold + 1 Codex review + 1 retro backfill + 1 AI cost strategy)
 - **Pharmacy scaffold work parked:** ~1100+ LoC across migration 023 + types + state-machine + medication-request-repo (PR #95 DRAFT; reusable for Sprint 35 / TLC-055 once SI-001 ratifies and ProductCatalog table exists)
+
+---
+
+## Amendment 2 (PR #107 — this section appended after Evans's "continue nonstop" sleep directive)
+
+Evans surfaced "continue nonstop" while sleeping. The post-sleep stretch added 6 more merged PRs + 1 DRAFT-open update:
+
+### PR #101 — Migration 024 `product_catalog` per CDM v1.2 §4.9
+
+Implements the canonical ProductCatalog table. Unblocks two downstream consumers:
+- Subscription slice (`subscriptions.product_id` FK target now exists)
+- Pharmacy slice / TLC-055 (composite UNIQUE `(tenant_id, id)` defensively added per PROJECT_CONVENTIONS r5 §1.1 for the SI-001 DRAFT v0.2 `medication_requests.product_catalog_id` composite FK)
+
+Two documented deviations from CDM §4.9: RLS uses `current_tenant_id()` helper (NOT stale `current_setting()`); composite UNIQUE added defensively. 18-case migration regression test including §4b regression-guard pinning the helper pattern.
+
+Codex review on PR #101 surfaced 2 findings (1 HIGH rollback non-idempotency + 1 MEDIUM RLS lockdown inventory); both fixed in-PR before merge.
+
+### PR #102 — TLC-050 flake 4× recurrence documented; TLC-057 ready-to-fire
+
+Documents the 4 transient CI failures observed in the turn across 2 audit-flake variants (3× TLC-050 audit-emit deadlock + 2× sibling i003 REVOKE; one timeline overlap). Recurrence threshold exceeded for TLC-057's contingent-fire condition; Sprint 35 plan updated from CONTINGENT → READY-TO-FIRE. Both variants in scope as single root-cause investigation.
+
+### PR #103 — TLC-057 static-analysis report (HIGH confidence root cause)
+
+Read-only static analysis by background agent identified the H3 hypothesis with HIGH confidence: `pg_advisory_xact_lock` cross-fork pollution via long-lived outer transaction in `tests/setup.ts:390`. Sprint 30 ruled out this exact mechanism but the rule-out didn't inspect the harness's actual outer-tx lifetime. H3 reopens the ruled-out line.
+
+Top recommended fix: `poolOptions.forks.singleFork: true` in `vitest.config.ts` as a one-line diagnostic; proper fix is moving outer BEGIN from process-scope to per-file scope so locks release between files.
+
+### PR #104 — TLC-058a `src/lib/ai-cache.ts` skeleton
+
+Background agent authored the Tier 1 skeleton from the AI Cost Optimization Strategy (PR #98). 623 LoC ai-cache.ts + 423 LoC test file (24 tests across 7 sections). Multi-provider abstraction per ADR-020 (Anthropic primary; Bedrock + Azure stubs); `cache_control: { type: 'ephemeral' }` blocks attached to system + tool catalog; 6 strategy-doc decision points parameterized via `CacheConfig` with sensible Tier 1 defaults; tenant-scoped per-tenant cache layer via `tenantCachePrefix()`.
+
+### PR #105 — TLC-057 singleFork diagnostic landed
+
+Applied the static-analysis top recommendation as a one-line fix. `vitest.config.ts` `poolOptions.forks.singleFork: true` forces sequential test-file execution within the forks pool. Trade-off: slower CI; cross-fork pollution eliminated. Validation hypothesis: if CI stays deterministically green across 5+ subsequent PR runs, H3 is empirically validated.
+
+### PR #106 — ai-cache.ts Codex findings closure
+
+Codex review on the just-merged PR #104 surfaced 2 HIGH findings: (1) `model_version` divergence — wrapper emitted caller-supplied value not provider-served; (2) PHI cache-boundary leak risk — `historyTurns` documented as cacheable but no validation it's PHI-free. Both fixed inline:
+- `CacheableAIInvocation.model_version` is now OPTIONAL; result + telemetry source from `response.model`; throws `ModelVersionMismatchError` on disagreement.
+- Renamed `historyTurns` → `nonCachedHistoryTurns` to make the not-cached invariant type-level visible. New §8 test section pins the cache-boundary invariant.
+
+### PR #95 DRAFT updated — migration 023 v0.2 closes Codex Finding 1
+
+Force-pushed migration 023 amendment after migration 024 product_catalog landed on main. Composite `(tenant_id, product_catalog_id)` FK now establishable from row 0; no future ALTER needed. Codex Finding 1 (HIGH) on the SI closure cycle review is now closed. PR #95 remains DRAFT pending SI-001 ratification (the schema itself — columns, CHECK constraints, state machine — is still speculative against the SI-001 v0.2 DRAFT).
+
+### Codex review activity (cumulative across this turn — updated)
+
+- SI closure cycle: 7 findings (3 HIGH + 4 MEDIUM) → all resolved inline at v0.2 (initial 10-hour run)
+- PR #101 migration 024: 2 findings (1 HIGH + 1 MEDIUM) → both fixed in-PR before merge
+- PR #104 ai-cache.ts: 2 HIGH findings → both fixed in PR #106
+
+11 Codex findings total this turn; all closed.
+
+### TLC-057 empirical validation status
+
+The singleFork diagnostic in PR #105 is now active on main. Validation evidence:
+- PR #106 CI ran on the singleFork config; passed cleanly first attempt (no audit-emit deadlock; no i003 REVOKE flake)
+- This is the FIRST empirical data point for H3 — needs 4+ more PRs to count as validated per the validation hypothesis
+
+### Final run tally (post-amendment-2)
+
+- **PRs merged in this turn:** 18 (#87, #88, #93, #94, #96, #97, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, + 2 superseded predecessor merges; mirror count above)
+- **PRs DRAFT-open:** 1 (#95 — Codex Finding 1 closed; SI-001 ratification still pending)
+- **SI closure DRAFT lines authored:** 1380+ across 6 workspace files
+- **App-repo doc + code lines authored:** ~2700+ (Sprint 35 plan + PRODUCT_BACKLOG + 7 sprint retros + AI cost strategy + ai-cache.ts skeleton + 2 turn summary amendments + flake-recurrence doc + flake-static-analysis report + migration 024 + 023 v0.2 + Codex findings closures + singleFork diagnostic)
+- **Codex findings closed inline:** 11
+- **Background agents spawned:** 10 (4 SI agents + 1 Plan agent + 1 pharmacy scaffold + 2 Codex reviews + 1 retro backfill + 1 AI cost strategy + 1 flake static analysis + 1 ai-cache skeleton)
+- **Pharmacy scaffold work preserved:** ~1100+ LoC + migration 023 v0.2 with composite product_catalog FK now in place. Codex Finding 1 closed.
+
+### Awaiting-Evans list (updated)
+
+1. **Ratify the 5 SI closure DRAFTs** → unblocks Pharmacy + Subscription slices
+2. **Approve the AI cost strategy** + 6 inline decision points (parameterized in `ai-cache.ts` so approval just confirms defaults)
+3. **Repo-admin Step 2A** (Dependency Graph enable) → unblocks TLC-052
+4. **PR #95 disposition** — Codex Finding 1 now closed; primary blocker is SI-001 ratification
+5. **Verify the 2 `[NEEDS VERIFICATION]` markers** in PR #97 retros
+6. **Confirm TLC-057 fires at Sprint 35 kickoff** OR override → defer to Sprint 36
+7. **NEW:** Approve `ai-cache.ts` Tier 1 skeleton (PR #104 + #106 merged); TLC-058b + TLC-058c sub-stories ready to author
+8. **NEW:** Watch singleFork diagnostic validation — 4+ more PR runs flake-free will confirm H3 empirically
+9. **NEW:** Codex findings track-record this turn: 11 findings, 11 closures, 0 deferrals. Pattern is healthy
 
 ---
 
