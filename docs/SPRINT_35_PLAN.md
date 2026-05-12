@@ -219,13 +219,13 @@
 
 ---
 
-### TLC-057 — TLC-050 audit-emit flake recurrence investigation (CONTINGENT)
+### TLC-057 — TLC-050 audit-emit flake recurrence investigation — ✅ READY-TO-FIRE
 
-**Status:** todo (contingent — fires only if the flake recurs during Sprint 35 CI runs)
-**Sprint:** Sprint 35 (if recurs) / hold (if not)
+**Status:** ✅ **READY-TO-FIRE at Sprint 35 kickoff** — 4× recurrence across 2 flake-variants observed in the 2026-05-11 autonomous run (3× TLC-050 audit-emit deadlock at PRs #71/#81/#99 + 2× sibling i003 REVOKE flake at PR #82 merge / PR #101; one timeline overlap). Recurrence threshold exceeded — story fires automatically at Sprint 35 kickoff. See `docs/TLC-050-Audit-Emit-Platform-Genesis-Flake.md` §"2026-05-11 recurrence log" for full evidence + per-PR citations.
+**Sprint:** Sprint 35 (fires at kickoff; no waiting for additional recurrence)
 **Class:** "needs env EXECUTE" — root-cause investigation requires Postgres + ability to stress-test in CI (1.5× slack; 4 reserves)
-**Estimated commits:** 5-8 if it fires; 0 if it doesn't
-**Decision rule applied:** 1 (CI flake recurrence)
+**Estimated commits:** 5-8 (both flake variants in scope as a single investigation; hypothesis is they share a pg-test-setup race-condition root cause around schema_migrations replay + role REVOKE ordering)
+**Decision rule applied:** 1 (CI flake recurrence — threshold met)
 
 #### Acceptance criteria (only if fires)
 
