@@ -3,9 +3,51 @@
 **Filed:** 2026-05-06 (Sprint 28)
 **Severity:** Medium (intermittent — does not block when CI is retried)
 **Owner:** Unassigned
-**Status:** Defensive fix landed Sprint 30; root-cause investigation deferred pending recurrence
+**Status:** Defensive fix landed Sprint 30; **TLC-050 recurrence + sibling i003 REVOKE flake observed 2026-05-09 + 2026-05-11. TLC-057 ready-to-fire at Sprint 35 kickoff** — see "2026-05-11 recurrence log" section below.
 
 ---
+
+## 2026-05-11 recurrence log (autonomous run; 4× occurrences across 2 flake-variants)
+
+The 2026-05-11 autonomous turn surfaced 4 transient CI failures across the audit-related test surface. **All cleared on empty-commit re-trigger**, confirming flake-class behavior (not deterministic regressions). Per Sprint 35 plan TLC-057 acceptance criteria ("fires only if the flake recurs"), this recurrence pattern fires TLC-057 at Sprint 35 kickoff regardless of further recurrence.
+
+**Variant A — TLC-050 original** (`audit-emit.test.ts > emitAudit — hash chain envelope construction > platform-scope events`):
+
+```
+× emitAudit: durable INSERT failed for action "config_change_validated"
+  (tenant=Telecheck-US, audit_id=...): deadlock detected
+  — I-003 forbids suppression; the caller transaction MUST abort.
+```
+
+Occurrences this turn:
+- PR #71 (docs: add READMEs for consent/identity/tenant-config; 2026-05-08, prior turn)
+- PR #81 (turn summary amendment; 2026-05-08, prior turn)
+- PR #99 (Sprint 35 TLC-051 DONE amendment; 2026-05-11)
+
+**Variant B — i003 REVOKE check** (`tests/invariants/i003-audit-append-only.test.ts > I-003 — REVOKE: application role must not have UPDATE/DELETE on audit_records > should confirm UPDATE privilege is revoked from the application DB role`):
+
+```
+× should confirm UPDATE privilege is revoked from the application DB role
+  AssertionError: expected [ { privilege_type: 'UPDATE' } ] to have a length
+  of +0 but got 1
+```
+
+Occurrences this turn:
+- main CI after PR #82 merge (2026-05-09 02:39 UTC; ci/adopt-actions-checkout-setup-node-bumps merge commit run)
+- PR #101 (migration 024 product_catalog; 2026-05-11)
+
+**Hypothesis (not yet investigated):** both variants are pg-test-setup race conditions in `tests/setup.ts` migration apply + role grant/revoke ordering. The audit-emit deadlock at platform-genesis (Variant A) and the application-role REVOKE not-yet-applied (Variant B) share the same setup-timing dependency on the schema_migrations replay path.
+
+**Defensive fix at Sprint 30 (per "Sprint 30 update" section below)** addressed Variant A's symptom (unique tenant per platform-genesis test invocation) but did NOT close the underlying setup-race. Variant B has no defensive fix at all today.
+
+**TLC-057 acceptance at Sprint 35 kickoff (per `docs/SPRINT_35_PLAN.md` TLC-057):**
+- The 4× recurrence in the 2026-05-11 turn exceeds the "recurs during Sprint 35 CI runs" threshold by demonstrating a deterministic pattern (recurrence rate >1 per ~20 PR runs across the autonomous turn).
+- TLC-057 fires automatically at Sprint 35 kickoff; Scrum Master MUST author root-cause investigation against the §"Investigation steps when picked up" section below.
+- Both variants in scope for the investigation; treat as a single root cause until evidence proves otherwise.
+
+---
+
+## Sprint 30 update (2026-05-06)
 
 ## Sprint 30 update (2026-05-06)
 
