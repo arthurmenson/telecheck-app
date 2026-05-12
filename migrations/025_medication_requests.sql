@@ -347,6 +347,28 @@ CREATE TABLE IF NOT EXISTS medication_requests (
             prescribed_by_clinician_account_id IS NOT NULL
             AND prescribed_at IS NOT NULL
         )
+    ),
+
+    -- Interaction-evaluation completion gate (Codex pharmacy-scaffold-rebuild
+    -- R7 HIGH closure 2026-05-12). The state machine enforces this implicitly
+    -- via the transition flow (draft → pending_interaction_check → engine
+    -- writeback flips interaction_signals_status to clean/caution/safety_hold
+    -- → pending_clinician_review → active), but a direct UPDATE bypassing the
+    -- state machine could persist status='active' with the default
+    -- interaction_signals_status='pending'. That would make a prescription
+    -- look valid before the med-interaction check completed. Closes the
+    -- safety-check lifecycle at the durable boundary.
+    --
+    -- Active and post-active rows MUST have:
+    --   - interaction_signals_status ∈ {'clean', 'caution', 'safety_hold'}
+    --     (i.e., NOT 'pending')
+    --   - interaction_signals_evaluated_at populated (engine wrote back)
+    CONSTRAINT medication_requests_interaction_evaluated_when_active CHECK (
+        status NOT IN ('active', 'discontinued', 'superseded', 'expired')
+        OR (
+            interaction_signals_status IN ('clean', 'caution', 'safety_hold')
+            AND interaction_signals_evaluated_at IS NOT NULL
+        )
     )
 );
 
