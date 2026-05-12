@@ -29,7 +29,11 @@ export type RefillId = Brand<string, 'RefillId'>;
 export type DispensingId = Brand<string, 'DispensingId'>;
 export type ShipmentId = Brand<string, 'ShipmentId'>;
 export type ProductCatalogId = Brand<string, 'ProductCatalogId'>;
-export type InteractionOverrideId = Brand<string, 'InteractionOverrideId'>;
+// InteractionOverrideId branded type REMOVED per SI-001 v1.0 ratification
+// Path 1 (P-011). Med Interaction Engine slice owns its own InteractionOverrideId
+// type in src/modules/med-interaction/internal/types.ts; this module integrates
+// with that slice via the `medication_request.interaction_safety_hold_triggered`
+// domain event, not a hard FK pointer.
 export type ProtocolId = Brand<string, 'ProtocolId'>;
 
 export function asMedicationRequestId(raw: string): MedicationRequestId {
@@ -46,9 +50,6 @@ export function asShipmentId(raw: string): ShipmentId {
 }
 export function asProductCatalogId(raw: string): ProductCatalogId {
   return raw as ProductCatalogId;
-}
-export function asInteractionOverrideId(raw: string): InteractionOverrideId {
-  return raw as InteractionOverrideId;
 }
 export function asProtocolId(raw: string): ProtocolId {
   return raw as ProtocolId;
@@ -134,9 +135,11 @@ export interface MedicationRequest {
   prescribing_consult_id: string | null;
 
   // Safety integration
+  // (interaction_override_id REMOVED per SI-001 v1.0 ratification Path 1
+  //  P-011; Med Interaction Engine integrates via
+  //  `medication_request.interaction_safety_hold_triggered` domain event.)
   interaction_signals_evaluated_at: string | null;
   interaction_signals_status: InteractionSignalsStatus;
-  interaction_override_id: InteractionOverrideId | null;
 
   // I-012 envelope (both null or both set, per CHECK constraint)
   ai_workload_type: string | null;

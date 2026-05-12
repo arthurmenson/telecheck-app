@@ -38,7 +38,9 @@
 --   suppression on the prior row would itself be an I-003 violation.
 --
 -- Out-of-scope for THIS migration (deferred):
---   - interaction_overrides table (Med Interaction Engine slice)
+--   - interaction_overrides table (Med Interaction Engine slice; Path 1
+--     ratification 2026-05-11 means MedicationRequest does NOT carry an
+--     FK to it — domain-event integration only)
 --   - refills, dispensings, shipments tables (Pharmacy + Refill follow-on)
 --   - protocols table (referenced by protocol_id; future entity)
 --
@@ -126,12 +128,13 @@ CREATE TABLE IF NOT EXISTS medication_requests (
     -- Safety integration (Med Interaction Engine) ----------------------------
     interaction_signals_evaluated_at    TIMESTAMPTZ,
     interaction_signals_status          VARCHAR(20)  NOT NULL DEFAULT 'pending',
-    -- TODO(SI-001-ratification, Path 1 vs Path 2): the FK target table
-    -- `interaction_overrides` is owned by the Med Interaction Engine slice
-    -- and does not yet exist. Per the SI-001 DRAFT recommendation (Path 1),
-    -- this column may be STRUCK on ratification; held here as nullable to
-    -- mirror the DRAFT exactly. Application-layer validation only.
-    interaction_override_id             VARCHAR(26),
+    -- v1.0 RATIFICATION (Evans 2026-05-11; Promotion Ledger P-011 Path 1):
+    -- the `interaction_override_id` column was REMOVED from CDM §4.16 per
+    -- Path 1 of the SI-001 closure. The Med Interaction Engine slice owns
+    -- its own override workflow + table; MedicationRequest integrates via
+    -- the `medication_request.interaction_safety_hold_triggered` domain
+    -- event (DOMAIN_EVENTS v5.2 — also added at P-011). No FK pointer
+    -- here means cleaner module-boundary separation per ADR-001.
 
     -- I-012 reject-unless three-clause envelope ------------------------------
     ai_workload_type                    VARCHAR(40),

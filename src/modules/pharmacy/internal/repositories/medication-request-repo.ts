@@ -27,7 +27,7 @@ import type { TenantId } from '../../../../lib/glossary.js';
 import type { AccountId } from '../../../identity/internal/types.js';
 import {
   asMedicationRequestId,
-  asInteractionOverrideId,
+  // asInteractionOverrideId removed (SI-001 v1.0 Path 1 P-011 — column dropped)
   asProductCatalogId,
   asProtocolId,
   type DiscontinuedReason,
@@ -67,7 +67,7 @@ interface MedicationRequestRow {
   prescribing_consult_id: string | null;
   interaction_signals_evaluated_at: Date | string | null;
   interaction_signals_status: string;
-  interaction_override_id: string | null;
+  // interaction_override_id REMOVED per SI-001 v1.0 ratification (Path 1, P-011)
   ai_workload_type: string | null;
   autonomy_level: string | null;
   protocol_id: string | null;
@@ -112,10 +112,9 @@ function rowToMedicationRequest(row: MedicationRequestRow): MedicationRequest {
     prescribing_consult_id: row.prescribing_consult_id,
     interaction_signals_evaluated_at: tsToIsoNullable(row.interaction_signals_evaluated_at),
     interaction_signals_status: row.interaction_signals_status as InteractionSignalsStatus,
-    interaction_override_id:
-      row.interaction_override_id === null
-        ? null
-        : asInteractionOverrideId(row.interaction_override_id),
+    // interaction_override_id REMOVED per SI-001 v1.0 ratification (Path 1, P-011).
+    // Med Interaction Engine slice integrates via the
+    // `medication_request.interaction_safety_hold_triggered` domain event.
     ai_workload_type: row.ai_workload_type,
     autonomy_level: row.autonomy_level,
     protocol_id: row.protocol_id === null ? null : asProtocolId(row.protocol_id),
@@ -136,7 +135,7 @@ const COLUMNS = `
   status,
   prescribed_at, activated_at, discontinued_at, discontinued_reason, expires_at,
   prescribed_by_clinician_account_id, prescribing_consult_id,
-  interaction_signals_evaluated_at, interaction_signals_status, interaction_override_id,
+  interaction_signals_evaluated_at, interaction_signals_status,
   ai_workload_type, autonomy_level, protocol_id, protocol_version,
   supersedes_id, superseded_by_id,
   country_of_care, created_at, updated_at
