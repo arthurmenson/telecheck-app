@@ -285,11 +285,23 @@ const TRANSITIONS: readonly TransitionDef[] = [
  * AUDIT_ACTIONS.PRESCRIBING_EXECUTION_REJECTED) and reject the transition;
  * bare suppression is forbidden per I-003.
  *
+ * The guard is a DISCRIMINATED UNION keyed by `event` so the clinician-only
+ * route (`clinician_approve`) and the protocol-authorized route
+ * (`protocol_authorized_prescribing`) can each enforce the I-012 three-
+ * clause rule with route-appropriate envelope semantics — matching the
+ * migration 025 medication_requests_i012_envelope_active_check exactly.
+ *
  * Three clauses per Master PRD v1.10 §13.7 (single normative source of
  * truth; AUDIT_EVENTS v5.3 + State Machines v1.2 + AUTONOMY_LEVELS v5.2
  * mirror exactly):
- *   1. `autonomy_level == 'action_with_confirm'` (string equality; not
- *      membership in a set).
+ *   1. AI-participating execution attribution: `autonomy_level ==
+ *      'action_with_confirm'` (string equality; not membership in a set).
+ *      For the clinician-only route (no AI workload), this clause is
+ *      satisfied vacuously: the row carries no AI execution attribution
+ *      (both ai_workload_type and autonomy_level are null per the DB
+ *      CHECK (a) clause — the clinician-only path) and the audit-side
+ *      envelope uses the `'n/a'` sentinel per AUDIT_EVENTS v5.3 §I-012
+ *      closure rule line 127 clinician-confirmation carve-out.
  *   2. An explicit clinician confirmation event exists in the immutable
  *      audit chain scoped to this `action_id` prior to the transition.
  *      For the `clinician_approve` route, the confirmation event IS the
@@ -302,7 +314,50 @@ const TRANSITIONS: readonly TransitionDef[] = [
  *   3. The confirming actor's `actor_id` resolves to a role authorized to
  *      sign for the action class under RBAC v1.1 / I-012.
  */
-export interface I012GuardContext {
+export type I012GuardContext = I012GuardClinicianOnly | I012GuardProtocolAuthorized;
+
+/**
+ * Guard for the `clinician_approve` route — clinician is the executing actor;
+ * no AI workload attribution on the row.
+ *
+ * Row envelope (per migration 025 CHECK (a)): ai_workload_type=null AND
+ * autonomy_level=null. Audit envelope per AUDIT_EVENTS v5.3 §I-012 closure
+ * rule line 127: ai_workload_type='n/a' and autonomy_level='n/a' (the
+ * canonical sentinels for the clinician-only carve-out).
+ */
+export interface I012GuardClinicianOnly {
+  route: 'clinician_approve';
+
+  /**
+   * Clause 2: identifier of the confirmation event in the audit chain. For
+   * the clinician_approve route the confirmation event IS the
+   * `prescribing.approved` emission; the caller MUST have planned that
+   * emission as part of the transition (or for retry/idempotency cases,
+   * located the prior emission scoped to the same action_id).
+   */
+  confirmation_event_audit_id: string;
+
+  /**
+   * Clause 3: the confirming actor's RBAC role. The caller MUST have already
+   * verified the role is authorized to sign for prescribing under RBAC v1.1.
+   */
+  confirming_actor_rbac_authorized: true;
+}
+
+/**
+ * Guard for the `protocol_authorized_prescribing` route — Mode 2 protocol
+ * engine is the executing actor; clinician confirmation is the I-012
+ * anchor.
+ *
+ * Row envelope (per migration 025 CHECK (b)): ai_workload_type=
+ * 'protocol_execution' AND autonomy_level='action_with_confirm'. Audit
+ * envelope per AUDIT_EVENTS v5.3 §protocol_authorized_prescribing payload:
+ * actor_type='ai_workload', ai_workload_type='protocol_execution',
+ * autonomy_level='action_with_confirm'.
+ */
+export interface I012GuardProtocolAuthorized {
+  route: 'protocol_authorized_prescribing';
+
   /**
    * Clause 1: autonomy_level for the transition. MUST equal 'action_with_confirm'.
    * Reserved levels (action_with_audit_only, fully_autonomous) are rejected.
@@ -310,38 +365,35 @@ export interface I012GuardContext {
   autonomy_level: AutonomyLevel;
 
   /**
-   * The AI workload type for this prescribing decision, if AI-participating.
-   * Clinician-only path: pass `null` here AND null for autonomy_level (the
-   * `clinician_approve` route permits this).
-   *
-   * Protocol-authorized path: MUST be 'protocol_execution' per WORKLOAD_TAXONOMY
-   * v5.2 §2.2. The DB CHECK enforces this; the state machine cross-checks at
-   * the application layer for defense-in-depth.
+   * AI workload type — MUST be 'protocol_execution' per WORKLOAD_TAXONOMY
+   * v5.2 §2.2 for this route. conversational_assistant at action_with_confirm
+   * is impossible by taxonomy (the §2.1 autonomy_level_range cap on
+   * conversational_assistant is [advisory] only).
    */
-  ai_workload_type: AIWorkloadType | null;
+  ai_workload_type: AIWorkloadType;
 
   /**
-   * Clause 2: identifier of the confirmation event in the audit chain. The
-   * caller MUST have already located this event by `action_id` and verified
-   * its existence + immutability. The state machine cannot fetch the audit
-   * chain — that's the service layer's job.
+   * Clause 2: identifier of the prior `prescribing.protocol_authorization_granted`
+   * event in the immutable audit chain. The caller MUST have located this
+   * event by `action_id` (scoped to the same action_id as the upcoming
+   * `protocol_authorized_prescribing` success emission) and verified its
+   * existence + immutability.
    */
   confirmation_event_audit_id: string;
 
   /**
-   * Clause 2 (route discrimination): the canonical action ID of the
-   * confirmation event. For the `clinician_approve` route this is
-   * `prescribing.approved` (the success-audit-IS-the-confirmation pattern).
-   * For the `protocol_authorized_prescribing` route this is
-   * `prescribing.protocol_authorization_granted` (the new Category A
-   * confirmation action added at AUDIT_EVENTS v5.3).
+   * Clause 2 (action-ID anchor): the canonical action ID of the confirmation
+   * event. MUST equal `prescribing.protocol_authorization_granted` per
+   * AUDIT_EVENTS v5.3 §I-012 closure rule authoritative set amendment under
+   * P-011. Reusing `prescribing.approved` here is rejected — that action ID
+   * is the clinician-only route's terminal success audit.
    */
   confirmation_event_action_id: string;
 
   /**
-   * Clause 3: the confirming actor's RBAC role. The caller MUST have already
-   * verified the role is authorized to sign for this action class under
-   * RBAC v1.1 / I-012.
+   * Clause 3: the confirming clinician's RBAC role. The clinician who emitted
+   * the `prescribing.protocol_authorization_granted` event MUST have been
+   * authorized to sign for prescribing under RBAC v1.1.
    */
   confirming_actor_rbac_authorized: true;
 }
@@ -423,12 +475,19 @@ export function validateTransition(
       throw new I012RejectError(event as I012GatedEvent, [
         'audit_chain_confirmation_event_missing',
         'confirming_actor_rbac_unauthorized',
-        'autonomy_level_string_equality',
       ]);
     }
-    const violations = evaluateI012Clauses(event as I012GatedEvent, i012_guard);
+    // Cross-check: guard.route MUST match the event being attempted (catches
+    // service-layer mistakes where a clinician_approve guard is paired with a
+    // protocol_authorized_prescribing event, or vice versa).
+    if (i012_guard.route !== event) {
+      throw new I012RejectError(event as I012GatedEvent, [
+        'audit_chain_confirmation_event_missing',
+      ]);
+    }
+    const violations = evaluateI012Clauses(event, i012_guard);
     if (violations.length > 0) {
-      throw new I012RejectError(event as I012GatedEvent, violations);
+      throw new I012RejectError(event, violations);
     }
   } else if (i012_guard !== undefined) {
     throw new Error(
@@ -453,52 +512,71 @@ function evaluateI012Clauses(
 ): I012ViolatedClause[] {
   const violations: I012ViolatedClause[] = [];
 
-  // Clause 1: autonomy_level string equality. Reserved levels rejected here.
-  if (guard.autonomy_level !== 'action_with_confirm') {
-    // Reserved levels (action_with_audit_only, fully_autonomous) would
-    // appear in the AutonomyLevel union only after a successor ADR + an
-    // activation audit event. Today the canonical I-012-permitted level is
-    // action_with_confirm.
-    violations.push('autonomy_level_string_equality');
+  if (event === 'clinician_approve' && guard.route === 'clinician_approve') {
+    // Clinician-only route.
+    //
+    // Clause 1 (AI execution attribution): vacuously satisfied. The row
+    // envelope carries no AI execution attribution (DB CHECK (a):
+    // ai_workload_type=null AND autonomy_level=null); the AUDIT_EVENTS
+    // envelope uses the 'n/a' sentinel for ai_workload_type/autonomy_level
+    // per the v5.3 §I-012 closure rule line 127 clinician-confirmation
+    // carve-out. The state machine does not re-test clause 1 here because
+    // there is no autonomy_level value on the guard to test.
+    //
+    // Clause 2: confirmation event is the upcoming `prescribing.approved`
+    // emission; the caller MUST have planned (or already emitted, for
+    // retry/idempotency) that audit record scoped to the same action_id.
+    // We require a non-empty confirmation_event_audit_id as the caller's
+    // attestation that this slot is reserved.
+    if (!guard.confirmation_event_audit_id) {
+      violations.push('audit_chain_confirmation_event_missing');
+    }
+    // Clause 3: confirming actor RBAC-authorized.
+    if (guard.confirming_actor_rbac_authorized !== true) {
+      violations.push('confirming_actor_rbac_unauthorized');
+    }
+    return violations;
   }
 
-  // Clause 2: confirmation event present + scoped to same action_id.
-  // The state machine verifies the canonical action_id name matches the
-  // route; the caller verifies the event's existence in the audit chain.
-  const expectedConfirmationActionId =
-    event === 'clinician_approve'
-      ? AUDIT_ACTIONS.PRESCRIBING_APPROVED
-      : AUDIT_ACTIONS.PRESCRIBING_PROTOCOL_AUTHORIZATION_GRANTED;
-  if (guard.confirmation_event_action_id !== expectedConfirmationActionId) {
-    violations.push('audit_chain_confirmation_event_missing');
-  }
-  if (!guard.confirmation_event_audit_id) {
-    violations.push('audit_chain_confirmation_event_missing');
-  }
-
-  // Clause 3: confirming actor RBAC-authorized.
-  if (guard.confirming_actor_rbac_authorized !== true) {
-    violations.push('confirming_actor_rbac_unauthorized');
-  }
-
-  // Workload-route cross-check (defense-in-depth — the DB CHECK enforces
-  // this too via medication_requests_i012_envelope_active_check). For the
-  // protocol-authorized route the workload MUST be 'protocol_execution';
-  // for the clinician-only route the workload MUST be null (clinician acts
-  // without AI-execution attribution).
-  if (event === 'protocol_authorized_prescribing' && guard.ai_workload_type !== 'protocol_execution') {
-    violations.push('reserved_level_without_activation_audit_event');
-  }
-  if (event === 'clinician_approve' && guard.ai_workload_type !== null) {
-    // Mode 1 advisory contribution to a clinician-only prescribing decision
-    // is recorded on the AI session / consult transcript, NOT on the
-    // MedicationRequest execution envelope. WORKLOAD_TAXONOMY v5.2 §2.1
-    // caps conversational_assistant at autonomy_level_range=[advisory], so
-    // a 'conversational_assistant' workload at 'action_with_confirm' is
-    // taxonomically impossible.
-    violations.push('reserved_level_without_activation_audit_event');
+  if (event === 'protocol_authorized_prescribing' && guard.route === 'protocol_authorized_prescribing') {
+    // Protocol-authorized route.
+    //
+    // Clause 1: autonomy_level string equality. Reserved levels (advisory,
+    // suggestion) and any future reserved levels are rejected here. Only
+    // action_with_confirm permits I-012 execution per AUTONOMY_LEVELS v5.2.
+    if (guard.autonomy_level !== 'action_with_confirm') {
+      violations.push('autonomy_level_string_equality');
+    }
+    // Workload cross-check (defense-in-depth — the DB CHECK
+    // medication_requests_i012_envelope_active_check enforces this too).
+    // For the protocol-authorized route the workload MUST be
+    // 'protocol_execution' per WORKLOAD_TAXONOMY v5.2 §2.2.
+    if (guard.ai_workload_type !== 'protocol_execution') {
+      violations.push('reserved_level_without_activation_audit_event');
+    }
+    // Clause 2: the confirmation event MUST be
+    // prescribing.protocol_authorization_granted (the NEW Category A action
+    // added at AUDIT_EVENTS v5.3 under P-011) scoped to the same action_id.
+    if (
+      guard.confirmation_event_action_id !==
+      AUDIT_ACTIONS.PRESCRIBING_PROTOCOL_AUTHORIZATION_GRANTED
+    ) {
+      violations.push('audit_chain_confirmation_event_missing');
+    }
+    if (!guard.confirmation_event_audit_id) {
+      violations.push('audit_chain_confirmation_event_missing');
+    }
+    // Clause 3: confirming clinician RBAC-authorized.
+    if (guard.confirming_actor_rbac_authorized !== true) {
+      violations.push('confirming_actor_rbac_unauthorized');
+    }
+    return violations;
   }
 
+  // Guard/event mismatch — the discriminated union failed at runtime
+  // somehow. Treat as a confirmation-event-missing violation; the caller
+  // shouldn't have reached this branch.
+  violations.push('audit_chain_confirmation_event_missing');
   return violations;
 }
 

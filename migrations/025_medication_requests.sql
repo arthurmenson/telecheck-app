@@ -308,6 +308,25 @@ CREATE TABLE IF NOT EXISTS medication_requests (
     -- Country-of-care must be a valid ISO 3166-1 alpha-2 code
     CONSTRAINT medication_requests_country_valid CHECK (
         country_of_care ~ '^[A-Z]{2}$'
+    ),
+
+    -- Basic clinical-validity guards (cheap defense-in-depth; downstream
+    -- refill/dispensing/notification slices trust these). Negative dispense
+    -- quantities or refill counts indicate corrupt data; the column-level
+    -- comment said `0 .. N` but the type didn't enforce it.
+    CONSTRAINT medication_requests_quantity_positive CHECK (quantity > 0),
+    CONSTRAINT medication_requests_refills_nonnegative CHECK (refills_allowed >= 0),
+
+    -- Status-dependent lifecycle guards. Active and post-active rows MUST
+    -- carry a prescriber + a prescribed_at timestamp (the prescribing
+    -- decision is by definition made by a named clinician at a known time).
+    -- Draft / pending_* / rejected rows may have these unset.
+    CONSTRAINT medication_requests_prescriber_set_when_active CHECK (
+        status NOT IN ('active', 'discontinued', 'superseded', 'expired')
+        OR (
+            prescribed_by_clinician_account_id IS NOT NULL
+            AND prescribed_at IS NOT NULL
+        )
     )
 );
 
