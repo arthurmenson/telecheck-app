@@ -295,14 +295,27 @@ CREATE TABLE IF NOT EXISTS medication_requests (
          ))
     ),
 
-    -- Protocol-authorized path: when autonomy_level set, protocol_id +
-    -- protocol_version required. This catches Mode 2 protocol-authorized
-    -- prescribing rows that lack the protocol-binding evidence.
+    -- Protocol-binding mutual-exclusivity check per Codex
+    -- pharmacy-scaffold-rebuild round 2 MEDIUM closure 2026-05-12:
+    -- protocol_id and protocol_version MUST be present iff autonomy_level
+    -- is set. Without the iff requirement, a row could pass the clinician-
+    -- only branch (autonomy_level=null) while carrying protocol_id /
+    -- protocol_version metadata, creating a "looks protocol-bound but
+    -- isn't" record that downstream refill/dispensing/analytics code
+    -- could mis-classify. The iff form keeps the two routes (clinician-
+    -- only vs protocol-authorized) cleanly distinguishable in persisted
+    -- state.
+    --
+    --   autonomy_level IS NULL  ⟺  protocol_id IS NULL AND protocol_version IS NULL
+    --   autonomy_level = 'action_with_confirm'  ⟺  protocol_id + protocol_version set
     CONSTRAINT medication_requests_i012_protocol_binding_check CHECK (
-        autonomy_level IS NULL
-        OR (autonomy_level = 'action_with_confirm'
-            AND protocol_id IS NOT NULL
-            AND protocol_version IS NOT NULL)
+        (autonomy_level IS NULL
+         AND protocol_id IS NULL
+         AND protocol_version IS NULL)
+        OR
+        (autonomy_level = 'action_with_confirm'
+         AND protocol_id IS NOT NULL
+         AND protocol_version IS NOT NULL)
     ),
 
     -- Country-of-care must be a valid ISO 3166-1 alpha-2 code

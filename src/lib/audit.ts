@@ -514,6 +514,47 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
           'where no AI workload was upstream. actor_type=ai_workload contradicts this.',
       );
     }
+    // Action-scoped `n/a` validation (added v5.3 under P-011 / SI-001 closure
+    // 2026-05-11): the protocol-authorized prescribing route has upstream AI
+    // workload by definition (the protocol engine emits the recommendation
+    // that the clinician authorizes), so the route's audit events MUST carry
+    // ai_workload_type='protocol_execution' / autonomy_level='action_with_confirm'
+    // — NOT the clinician-only n/a sentinel. Otherwise post-incident audit
+    // reconstruction would mis-classify the prescribing decision as
+    // clinician-only when it was protocol-authorized.
+    const PROTOCOL_ROUTE_ACTIONS = new Set<AuditAction>([
+      'prescribing.protocol_authorization_granted',
+      'protocol_authorized_prescribing',
+      'protocol_authorized_refill_renewal',
+      'protocol_authorized_dispensing_release',
+    ]);
+    if (PROTOCOL_ROUTE_ACTIONS.has(action)) {
+      if (ai_workload_type === 'n/a' || autonomy_level === 'n/a') {
+        throw new Error(
+          `Sentinel "n/a" for ai_workload_type or autonomy_level is forbidden on ` +
+            `protocol-authorized prescribing route actions ("${action}"). These actions ` +
+            `have upstream AI workload by definition (Mode 2 protocol-engine route); the ` +
+            `envelope MUST carry ai_workload_type='protocol_execution' and ` +
+            `autonomy_level='action_with_confirm' per AUDIT_EVENTS v5.3 §I-012 closure rule. ` +
+            `The "n/a" sentinel is reserved for the clinician-only route (e.g., ` +
+            `prescribing.approved without upstream AI advice).`,
+        );
+      }
+      if (ai_workload_type !== 'protocol_execution') {
+        throw new Error(
+          `Protocol-authorized route action "${action}" MUST carry ` +
+            `ai_workload_type='protocol_execution' (got "${ai_workload_type}"). Per AUDIT_EVENTS ` +
+            `v5.3 §I-012 closure rule and WORKLOAD_TAXONOMY v5.2 §2.2.`,
+        );
+      }
+      if (autonomy_level !== 'action_with_confirm') {
+        throw new Error(
+          `Protocol-authorized route action "${action}" MUST carry ` +
+            `autonomy_level='action_with_confirm' (got "${autonomy_level}"). Per AUDIT_EVENTS ` +
+            `v5.3 §I-012 closure rule and AUTONOMY_LEVELS v5.2.`,
+        );
+      }
+    }
   }
 
   // Execution_rejected events: validate sentinel usage
