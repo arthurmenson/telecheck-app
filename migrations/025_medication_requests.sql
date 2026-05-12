@@ -302,25 +302,62 @@ CREATE TABLE IF NOT EXISTS medication_requests (
          ))
     ),
 
-    -- Protocol-binding mutual-exclusivity check per Codex
-    -- pharmacy-scaffold-rebuild round 2 MEDIUM closure 2026-05-12:
-    -- protocol_id and protocol_version MUST be present iff autonomy_level
-    -- is set. Without the iff requirement, a row could pass the clinician-
-    -- only branch (autonomy_level=null) while carrying protocol_id /
-    -- protocol_version metadata, creating a "looks protocol-bound but
-    -- isn't" record that downstream refill/dispensing/analytics code
-    -- could mis-classify. The iff form keeps the two routes (clinician-
-    -- only vs protocol-authorized) cleanly distinguishable in persisted
-    -- state.
+    -- Protocol-binding check — state-dependent (Codex
+    -- pharmacy-scaffold-rebuild R2 MEDIUM + R10 HIGH closure 2026-05-12).
+    -- Two distinct lifecycle phases need different protocol-binding semantics:
     --
-    --   autonomy_level IS NULL  ⟺  protocol_id IS NULL AND protocol_version IS NULL
-    --   autonomy_level = 'action_with_confirm'  ⟺  protocol_id + protocol_version set
+    --   PHASE 1 — Pre-active (draft / pending_interaction_check /
+    --     pending_clinician_review / rejected): ai_workload_type and
+    --     autonomy_level are required to be null per the envelope CHECK
+    --     (no AI execution attribution yet). The ROW already knows whether
+    --     it's intended for the protocol-authorized route or the clinician-
+    --     only route — that intent is captured by the presence/absence of
+    --     `protocol_id` + `protocol_version`. Both fields are either both
+    --     set (protocol-authorized intent) or both null (clinician-only
+    --     intent). This permits the state machine's protocol_authorized_
+    --     prescribing transition guard to cross-check the protocol binding
+    --     against the persisted pre-active row before activation.
+    --
+    --   PHASE 2 — Active / post-active (active / discontinued / superseded /
+    --     expired): autonomy_level is either null (clinician-only execution)
+    --     or 'action_with_confirm' (protocol-authorized execution). The
+    --     protocol-binding semantics tighten to mutual-exclusivity:
+    --       - clinician-only: autonomy_level=null AND protocol_id=null AND
+    --         protocol_version=null (no AI execution attribution; no
+    --         protocol binding).
+    --       - protocol-authorized: autonomy_level='action_with_confirm' AND
+    --         protocol_id NOT NULL AND protocol_version NOT NULL.
+    --     This keeps the two routes cleanly distinguishable in persisted
+    --     active state — downstream refill/dispensing/analytics consumers
+    --     can route on (autonomy_level, protocol_id) without ambiguity.
+    --
+    -- Defense-in-depth note: protocol_id + protocol_version are also
+    -- TOGETHER-OR-NEITHER at all lifecycle phases — one without the other
+    -- is always invalid (an orphaned protocol_id with no version, or a
+    -- version with no protocol identifier, is a corrupt row).
+    CONSTRAINT medication_requests_protocol_binding_pair_check CHECK (
+        (protocol_id IS NULL AND protocol_version IS NULL)
+        OR
+        (protocol_id IS NOT NULL AND protocol_version IS NOT NULL)
+    ),
     CONSTRAINT medication_requests_i012_protocol_binding_check CHECK (
-        (autonomy_level IS NULL
+        -- Pre-active phase: protocol metadata is optional (captures route
+        -- intent before activation); ai_workload_type/autonomy_level are
+        -- null per the envelope CHECK.
+        (status NOT IN ('active', 'discontinued', 'superseded', 'expired')
+         AND autonomy_level IS NULL)
+        OR
+        -- Active/post-active clinician-only: no AI execution, no protocol
+        -- binding.
+        (status IN ('active', 'discontinued', 'superseded', 'expired')
+         AND autonomy_level IS NULL
          AND protocol_id IS NULL
          AND protocol_version IS NULL)
         OR
-        (autonomy_level = 'action_with_confirm'
+        -- Active/post-active protocol-authorized: AI execution attributed,
+        -- protocol binding required.
+        (status IN ('active', 'discontinued', 'superseded', 'expired')
+         AND autonomy_level = 'action_with_confirm'
          AND protocol_id IS NOT NULL
          AND protocol_version IS NOT NULL)
     ),
