@@ -457,7 +457,7 @@ describe('pharmacy HTTP — Group B: GET /prescriptions/:id tenant-blind 404', (
 // ===========================================================================
 
 describe('pharmacy HTTP — Group C: list happy path', () => {
-  it('C1 returns 200 + multi-row list, most-recently-created first', async () => {
+  it('C1 returns 200 + multi-row list (both seeded rows present)', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
     const product = await seedProduct(US_CTX);
     const first = await seedMedicationRequest({
@@ -465,9 +465,6 @@ describe('pharmacy HTTP — Group C: list happy path', () => {
       patientAccountId: patient,
       productCatalogId: product,
     });
-    // Yield to the event loop so the second row's created_at strictly
-    // postdates the first — the repo orders by created_at DESC.
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
     const second = await seedMedicationRequest({
       ctx: US_CTX,
       patientAccountId: patient,
@@ -484,8 +481,18 @@ describe('pharmacy HTTP — Group C: list happy path', () => {
     expect(response.statusCode).toBe(200);
     const body = response.json<{ prescriptions: Array<{ id: string }> }>();
     expect(body.prescriptions).toHaveLength(2);
-    expect(body.prescriptions[0]?.id).toBe(second.id);
-    expect(body.prescriptions[1]?.id).toBe(first.id);
+    // Membership, not order: the test harness runs every test inside
+    // a long-running outer transaction with savepoint isolation
+    // (tests/setup.ts). PostgreSQL's NOW() returns the transaction
+    // START time, so both seedMedicationRequest INSERTs in the same
+    // savepoint share an identical created_at. The repo's `ORDER BY
+    // created_at DESC` thus has no deterministic tiebreaker between
+    // tied rows. Assert that both seeded rows are present; the
+    // "most-recently-created-first" ordering invariant is testable
+    // via the repo's pg-clock unit tests, not here.
+    const returnedIds = body.prescriptions.map((p) => p.id);
+    expect(returnedIds).toContain(first.id);
+    expect(returnedIds).toContain(second.id);
     expectNoTenantLeak(response);
   });
 
