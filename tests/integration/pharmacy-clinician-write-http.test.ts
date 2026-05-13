@@ -12,7 +12,7 @@
  * and remaining clinician transitions (decline / discontinue / supersede /
  * modify) land in subsequent pharmacy PRs.
  *
- * Coverage (6 groups, 16 cases):
+ * Coverage (6 groups, 17 cases):
  *
  *   Group A — Happy path: createDraft
  *     A1 clinician → 201 + draft view (status=draft, interaction=pending)
@@ -44,6 +44,9 @@
  *     F3 prescribing_consult_id belongs to a different patient → 400
  *     F4 non-existent and existing-clinician patient_account_id produce
  *        byte-identical 400 envelopes (R2 oracle closure)
+ *     F5 invalid product_catalog_id with nonexistent vs existing-patient
+ *        patient_account_id produce byte-identical 400 envelopes (R3
+ *        FK-error oracle closure)
  *
  * Spec references:
  *   - State Machines v1.2 §19 (submit_for_review: draft → pending_interaction_check)
@@ -829,6 +832,64 @@ describe('pharmacy clinician write — Group F: cross-row invariants', () => {
     // Generic message must be byte-identical between the two oracle
     // attacks. Request-id differs (per-request) so compare just the
     // message string.
+    expect(bBody.error.message).toBe(aBody.error.message);
+    expectNoTenantLeak(aResp);
+    expectNoTenantLeak(bResp);
+  });
+
+  it('F5 invalid product_catalog_id: nonexistent vs existing-patient patient_account_id → byte-identical 400 (R3 FK oracle closure)', async () => {
+    // Codex PR-119 R3 closure 2026-05-13: the FK-error code path
+    // (Postgres 23503 on a bad product_catalog_id) previously emitted
+    // a DIFFERENT envelope from the service-layer validation path.
+    // That gave an attacker a 2-payload oracle:
+    //   - Fixed bad product + nonexistent patient → validation 400
+    //     (collapsed message via MedicationRequestInputValidationError;
+    //     service rejected before reaching repo INSERT).
+    //   - Fixed bad product + existing-patient patient → FK 23503
+    //     (validation passed; insert failed on product FK; PREVIOUS
+    //     envelope had a different message → "patient exists" oracle).
+    // R3 fix re-throws 23503 as MedicationRequestInputValidationError
+    // so both responses are byte-identical.
+    const clinician = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    const existingPatient = await insertAccountOfType(US_CTX, 'patient', '+1');
+    const token = await mintTokenForRole(T_US, clinician, 'clinician');
+
+    // Constant: an invalid (never-seeded) product_catalog_id.
+    const badProductId = ulid();
+
+    // Attack A: nonexistent patient + same bad product (service
+    // validation fails BEFORE the FK check).
+    const aResp = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      payload: makeDraftBody({ patientId: ulid(), productId: badProductId }),
+    });
+
+    // Attack B: existing-patient + same bad product (service passes,
+    // FK fires on the product → previously different envelope).
+    const bResp = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      payload: makeDraftBody({ patientId: existingPatient, productId: badProductId }),
+    });
+
+    expect(aResp.statusCode).toBe(400);
+    expect(bResp.statusCode).toBe(400);
+    const aBody = aResp.json<{ error: { code: string; message: string } }>();
+    const bBody = bResp.json<{ error: { code: string; message: string } }>();
+    expect(aBody.error.code).toBe('internal.request.invalid');
+    expect(bBody.error.code).toBe(aBody.error.code);
+    // Byte-identical messages — no oracle.
     expect(bBody.error.message).toBe(aBody.error.message);
     expectNoTenantLeak(aResp);
     expectNoTenantLeak(bResp);

@@ -722,17 +722,33 @@ export async function createDraftHandler(
       return { status: 201, view: toPatientMedicationRequestView(created) };
     } catch (err) {
       // Map Postgres FK violations (cross-tenant patient/product/consult)
-      // to tenant-blind 400 per I-025. The FK error message intentionally
-      // does NOT echo the offending id so a cross-tenant probe can't
-      // distinguish "exists in other tenant" from "doesn't exist".
+      // to the SAME tenant-blind 400 envelope as MedicationRequest-
+      // InputValidationError (Codex PR-119 R3 MEDIUM closure 2026-05-13).
+      //
+      // R2 collapsed the validation-error message; this branch must also
+      // funnel through MedicationRequestInputValidationError so the
+      // PUBLIC response is byte-identical to the validation-error path.
+      // Otherwise an attacker can mount a 2-payload oracle:
+      //   1. Invalid product_catalog_id (constant) + nonexistent
+      //      patient_account_id → service validation 400 (collapsed
+      //      message; never reaches repo).
+      //   2. Same invalid product + EXISTING-patient patient_account_id
+      //      → validation passes, FK violation on product fires →
+      //      different message via httpErrors.badRequest.
+      // The diff reveals "patient_account_id exists vs doesn't" — the
+      // very oracle R2 closed for the direct validation path.
+      // Re-using the validation error class makes the public envelope
+      // identical across both branches.
       if (
         err instanceof Error &&
         'code' in err &&
         (err as Error & { code: string }).code === '23503'
       ) {
-        // 23503 = foreign_key_violation. Throw a service-mapper-friendly
-        // error so withIdempotentExecution rolls back + caches the 400.
-        throw req.server.httpErrors.badRequest(
+        // 23503 = foreign_key_violation. Re-throw as the validation
+        // error so mapWriteServiceError emits the collapsed envelope —
+        // same public response as the service-layer validation path,
+        // closing the FK-error oracle.
+        throw new medicationRequestService.MedicationRequestInputValidationError(
           'patient_account_id / product_catalog_id / prescribing_consult_id ' +
             'must reference rows in the same tenant.',
         );
