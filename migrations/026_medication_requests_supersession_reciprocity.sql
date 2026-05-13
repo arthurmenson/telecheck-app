@@ -125,6 +125,24 @@
 -- ---------------------------------------------------------------------------
 SET LOCAL search_path = pg_catalog, public;
 
+-- Acquire SHARE ROW EXCLUSIVE on medication_requests for the rest of
+-- the migration transaction. Without this, a concurrent writer can
+-- commit a malformed supersession edge AFTER the DO-block validation
+-- below passes but BEFORE the CREATE TRIGGER statement at the bottom
+-- takes effect. Triggers do not retroactively fire for already-
+-- committed rows, so that corrupt edge would survive the migration
+-- despite the apply-time validation guarantee. SHARE ROW EXCLUSIVE
+-- blocks INSERT / UPDATE / DELETE on the table (which all take ROW
+-- EXCLUSIVE, conflicting with SHARE ROW EXCLUSIVE) but allows
+-- concurrent SELECTs to proceed, and matches the lock level CREATE
+-- TRIGGER would acquire on its own — so reads are unimpacted and we
+-- pay no extra disruption beyond what the migration's final statement
+-- would require anyway. The lock releases at COMMIT, by which time
+-- the trigger is installed and protects against any further malformed
+-- writes. Codex R4 HIGH closure (online-migration concurrent-write
+-- race window).
+LOCK TABLE public.medication_requests IN SHARE ROW EXCLUSIVE MODE;
+
 DO $$
 DECLARE
     violation_count INTEGER := 0;
