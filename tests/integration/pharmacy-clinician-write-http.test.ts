@@ -12,7 +12,7 @@
  * and remaining clinician transitions (decline / discontinue / supersede /
  * modify) land in subsequent pharmacy PRs.
  *
- * Coverage (6 groups, 15 cases):
+ * Coverage (6 groups, 16 cases):
  *
  *   Group A — Happy path: createDraft
  *     A1 clinician → 201 + draft view (status=draft, interaction=pending)
@@ -42,6 +42,8 @@
  *     F1 country_of_care supplied in body → 400 (must be server-derived)
  *     F2 patient_account_id resolves to a clinician account → 400
  *     F3 prescribing_consult_id belongs to a different patient → 400
+ *     F4 non-existent and existing-clinician patient_account_id produce
+ *        byte-identical 400 envelopes (R2 oracle closure)
  *
  * Spec references:
  *   - State Machines v1.2 §19 (submit_for_review: draft → pending_interaction_check)
@@ -773,9 +775,62 @@ describe('pharmacy clinician write — Group F: cross-row invariants', () => {
     });
 
     expect(r.statusCode).toBe(400);
-    const body = r.json<{ error: { code: string; message: string } }>();
+    const body = r.json<{ error: { code: string } }>();
     expect(body.error.code).toBe('internal.request.invalid');
-    expect(body.error.message).toContain('prescribing_consult_id');
+    // The public message is intentionally generic (Codex PR-119 R2
+    // closure) so we don't assert on specific reason text here —
+    // F4 verifies the envelope shape is identical across cases.
     expectNoTenantLeak(r);
+  });
+
+  it('F4 nonexistent vs existing-clinician patient_account_id → byte-identical 400 envelopes (Codex R2 oracle closure)', async () => {
+    // The service distinguishes "no such account" vs "account exists
+    // but isn't a patient" internally (for ops/telemetry) but MUST
+    // NOT expose the difference publicly. Probing the difference
+    // would let a same-tenant clinician enumerate accountIds + types.
+    // This test mounts two attacks with the same shape and asserts
+    // the public envelopes are identical (code, message,
+    // status-code, no leakage).
+    const clinician = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    const otherClinician = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    const product = await seedProduct(US_CTX);
+    const token = await mintTokenForRole(T_US, clinician, 'clinician');
+
+    // Attack A: nonexistent patient_account_id (ULID never seeded).
+    const aResp = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      payload: makeDraftBody({ patientId: ulid(), productId: product }),
+    });
+
+    // Attack B: existing-clinician patient_account_id.
+    const bResp = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      payload: makeDraftBody({ patientId: otherClinician, productId: product }),
+    });
+
+    expect(aResp.statusCode).toBe(400);
+    expect(bResp.statusCode).toBe(400);
+    const aBody = aResp.json<{ error: { code: string; message: string } }>();
+    const bBody = bResp.json<{ error: { code: string; message: string } }>();
+    expect(aBody.error.code).toBe('internal.request.invalid');
+    expect(bBody.error.code).toBe(aBody.error.code);
+    // Generic message must be byte-identical between the two oracle
+    // attacks. Request-id differs (per-request) so compare just the
+    // message string.
+    expect(bBody.error.message).toBe(aBody.error.message);
+    expectNoTenantLeak(aResp);
+    expectNoTenantLeak(bResp);
   });
 });

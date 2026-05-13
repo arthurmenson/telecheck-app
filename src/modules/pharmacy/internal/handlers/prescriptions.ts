@@ -355,11 +355,28 @@ function mapWriteServiceError(err: unknown, reply: FastifyReply, reqId: string):
   }
   if (err instanceof medicationRequestService.MedicationRequestInputValidationError) {
     // Codex PR-119 R1 closure 2026-05-13: non-patient account_type as
-    // patient_account_id, or prescribing_consult_id whose consult
-    // belongs to a different patient. Both map to tenant-blind 400 —
-    // the message stays generic so a same-tenant attacker doesn't
-    // learn whether the offending id exists.
-    void reply.code(400).send(makeErrorEnvelope(reqId, 'internal.request.invalid', err.reason));
+    // patient_account_id, OR prescribing_consult_id whose consult
+    // belongs to a different patient, OR a non-existent
+    // patient_account_id. All map to tenant-blind 400 with an
+    // IDENTICAL public message (R2 closure 2026-05-13). The service
+    // raises distinct `err.reason` values for ops/telemetry, but
+    // echoing them publicly would let a same-tenant clinician probe
+    // account IDs and distinguish "no such account" from "account
+    // exists but isn't a patient" — an existence/type oracle that
+    // contradicts I-025. The specific reason stays in the Error
+    // object (visible in server-side stack traces / log middleware
+    // when one is wired); the public envelope is collapsed.
+    void reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          reqId,
+          'internal.request.invalid',
+          'Invalid medication_request input. Verify patient_account_id, ' +
+            'product_catalog_id, and prescribing_consult_id reference rows ' +
+            'in this tenant and match the canonical type/ownership constraints.',
+        ),
+      );
     return true;
   }
   if (err instanceof medicationRequestService.MedicationRequestStateConflictError) {
