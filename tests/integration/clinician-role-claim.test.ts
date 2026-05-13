@@ -35,6 +35,9 @@
  *     D6 clinician JWT → 403 on GET /v0/forms/submissions/:submissionId/snapshot (R3)
  *     D7 clinician JWT → 403 on GET /v0/forms/snapshots/:snapshotId (R3)
  *     D8 patient B → 404 on GET /v0/consent/delegations/:id/scopes for patient A's delegation (R4)
+ *     D9 patient B → 404 on POST /v0/consent/delegations/:id/accept (R5: ownership)
+ *     D10 patient B → 404 on POST /v0/consent/delegations/:id/revoke (R5)
+ *     D11 patient B → 404 on POST /v0/consent/delegations/:id/scopes/grant (R5)
  *
  * Spec references:
  *   - RBAC v1.1 §1.2 (Clinician role; tenant-scoped) + §6 (multi-tenant)
@@ -612,6 +615,137 @@ describe('clinician-role-claim — Group D: patient-only routes reject clinician
       expect(r.statusCode).toBe(403);
       const body = r.json<{ error: { code: string } }>();
       expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D9 patient B → 404 on POST /v0/consent/delegations/:id/accept for patient A delegation (R5)', async () => {
+    // Cross-patient acceptance attempt — patient B tries to accept a
+    // pending delegation between A (grantor) and C (delegate).
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+      const patientA = await insertAccount('patient');
+      const patientC = await insertAccount('patient');
+      const patientB = await insertAccount('patient');
+      const delegationId = ulid();
+      await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        await client.query(
+          `INSERT INTO delegations (
+              delegation_id, tenant_id, grantor_account_id, delegate_account_id,
+              relationship_type, status
+           ) VALUES ($1, $2, $3, $4, $5, $6)`,
+          [delegationId, T_US, patientA, patientC, 'spouse_partner', 'pending_acceptance'],
+        );
+      });
+      const sessionIdB = asSessionId(ulid());
+      const { accessToken: tokenB } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: patientB },
+        { session_id: sessionIdB, account_id: patientB },
+      );
+      const r = await app.inject({
+        method: 'POST',
+        url: `/v0/consent/delegations/${delegationId}/accept`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${tokenB}`,
+          'idempotency-key': ulid(),
+        },
+        payload: {},
+      });
+      expect(r.statusCode).toBe(404);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.resource.not_found');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D10 patient B → 404 on POST /v0/consent/delegations/:id/revoke for patient A delegation (R5)', async () => {
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+      const patientA = await insertAccount('patient');
+      const patientC = await insertAccount('patient');
+      const patientB = await insertAccount('patient');
+      const delegationId = ulid();
+      await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        await client.query(
+          `INSERT INTO delegations (
+              delegation_id, tenant_id, grantor_account_id, delegate_account_id,
+              relationship_type, status, accepted_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+          [delegationId, T_US, patientA, patientC, 'spouse_partner', 'active'],
+        );
+      });
+      const sessionIdB = asSessionId(ulid());
+      const { accessToken: tokenB } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: patientB },
+        { session_id: sessionIdB, account_id: patientB },
+      );
+      const r = await app.inject({
+        method: 'POST',
+        url: `/v0/consent/delegations/${delegationId}/revoke`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${tokenB}`,
+          'idempotency-key': ulid(),
+        },
+        payload: { reason: 'patient_initiated' },
+      });
+      expect(r.statusCode).toBe(404);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.resource.not_found');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D11 patient B → 404 on POST /v0/consent/delegations/:id/scopes (grant) for patient A delegation (R5)', async () => {
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+      const patientA = await insertAccount('patient');
+      const patientC = await insertAccount('patient');
+      const patientB = await insertAccount('patient');
+      const delegationId = ulid();
+      await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        await client.query(
+          `INSERT INTO delegations (
+              delegation_id, tenant_id, grantor_account_id, delegate_account_id,
+              relationship_type, status, accepted_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+          [delegationId, T_US, patientA, patientC, 'spouse_partner', 'active'],
+        );
+      });
+      const sessionIdB = asSessionId(ulid());
+      const { accessToken: tokenB } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: patientB },
+        { session_id: sessionIdB, account_id: patientB },
+      );
+      const r = await app.inject({
+        method: 'POST',
+        url: `/v0/consent/delegations/${delegationId}/scopes`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${tokenB}`,
+          'idempotency-key': ulid(),
+        },
+        payload: { scope: 'view_medications' },
+      });
+      expect(r.statusCode).toBe(404);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.resource.not_found');
     } finally {
       await app.close();
     }
