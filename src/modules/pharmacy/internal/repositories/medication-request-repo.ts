@@ -692,33 +692,80 @@ export async function transitionStatus(
       }
       const envelopeWorkload = input.activation_envelope?.ai_workload_type ?? null;
       const envelopeAutonomy = input.activation_envelope?.autonomy_level ?? null;
-      const result = await client.query<MedicationRequestRow>(
-        `UPDATE medication_requests
-            SET status = 'active',
-                prescribed_at = $1,
-                activated_at = $1,
-                prescribed_by_clinician_account_id = $2,
-                expires_at = $3,
-                ai_workload_type = $4,
-                autonomy_level = $5,
-                supersedes_id = $6,
-                updated_at = NOW()
-          WHERE id = $7
-            AND tenant_id = $8
-            AND status = $9
-          RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
-        [
-          input.prescribed_at,
-          input.prescribed_by_clinician_account_id,
-          input.expires_at ?? null,
-          envelopeWorkload,
-          envelopeAutonomy,
-          input.supersedes_id ?? null,
-          input.id,
-          input.tenant_id,
-          input.expected_from_status,
-        ],
-      );
+      // Activation back-pointer reciprocity (Codex TLC-055 PR A R4 HIGH
+      // closure 2026-05-13): when supersedes_id is non-null, the UPDATE
+      // ALSO requires the targeted old row to exist, be same-tenant,
+      // same-patient, and at status='active' AND have no existing
+      // superseded_by_id. Without this, activation could persist patient
+      // B's row pointing at patient A's row via supersedes_id, and the
+      // later markSuperseded reciprocity-check would return null but
+      // leave the corrupted back-pointer in place.
+      //
+      // Two SQL paths: with supersedes_id (EXISTS check) vs without
+      // (no extra predicate). Both keep the same SET clause.
+      const result =
+        input.supersedes_id !== null && input.supersedes_id !== undefined
+          ? await client.query<MedicationRequestRow>(
+              `UPDATE medication_requests AS new_row
+                  SET status = 'active',
+                      prescribed_at = $1,
+                      activated_at = $1,
+                      prescribed_by_clinician_account_id = $2,
+                      expires_at = $3,
+                      ai_workload_type = $4,
+                      autonomy_level = $5,
+                      supersedes_id = $6,
+                      updated_at = NOW()
+                WHERE new_row.id = $7
+                  AND new_row.tenant_id = $8
+                  AND new_row.status = $9
+                  AND EXISTS (
+                    SELECT 1 FROM medication_requests AS old_row
+                     WHERE old_row.id = $6
+                       AND old_row.tenant_id = $8
+                       AND old_row.status = 'active'
+                       AND old_row.patient_account_id = new_row.patient_account_id
+                       AND old_row.superseded_by_id IS NULL
+                  )
+                RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
+              [
+                input.prescribed_at,
+                input.prescribed_by_clinician_account_id,
+                input.expires_at ?? null,
+                envelopeWorkload,
+                envelopeAutonomy,
+                input.supersedes_id,
+                input.id,
+                input.tenant_id,
+                input.expected_from_status,
+              ],
+            )
+          : await client.query<MedicationRequestRow>(
+              `UPDATE medication_requests
+                  SET status = 'active',
+                      prescribed_at = $1,
+                      activated_at = $1,
+                      prescribed_by_clinician_account_id = $2,
+                      expires_at = $3,
+                      ai_workload_type = $4,
+                      autonomy_level = $5,
+                      supersedes_id = NULL,
+                      updated_at = NOW()
+                WHERE id = $6
+                  AND tenant_id = $7
+                  AND status = $8
+                RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
+              [
+                input.prescribed_at,
+                input.prescribed_by_clinician_account_id,
+                input.expires_at ?? null,
+                envelopeWorkload,
+                envelopeAutonomy,
+                input.id,
+                input.tenant_id,
+                input.expected_from_status,
+              ],
+            );
       if (result.rows.length === 0) return null;
       return rowToMedicationRequest(result.rows[0] as MedicationRequestRow);
     }

@@ -644,6 +644,54 @@ describe('medication-request-repo — §8.5 activation back-pointer (supersedes_
     // UPDATE statement includes supersedes_id column write
     expect(captured[0]?.text).toContain('supersedes_id = $6');
     expect(captured[0]?.values).toContain(ROW_ID);
+    // Activation back-pointer reciprocity (Codex R4 HIGH closure): the
+    // UPDATE also EXISTS-checks the old row is same-tenant, same-patient,
+    // active, and not already superseded.
+    expect(captured[0]?.text).toContain('EXISTS (');
+    expect(captured[0]?.text).toContain('FROM medication_requests AS old_row');
+    expect(captured[0]?.text).toContain("old_row.status = 'active'");
+    expect(captured[0]?.text).toContain('old_row.patient_account_id = new_row.patient_account_id');
+    expect(captured[0]?.text).toContain('old_row.superseded_by_id IS NULL');
+  });
+
+  it('§8.5b activation WITHOUT supersedes_id uses the simple UPDATE path (no EXISTS check)', async () => {
+    const guard: I012GuardContext = {
+      route: 'clinician_approve',
+      confirmation_event_audit_id: 'aud_01HCONFIRMATIONEVT0000000',
+      attested_tenant_id: TENANT,
+      attested_action_id: ROW_ID,
+      attested_patient_account_id: PATIENT,
+      attested_actor_id: CLINICIAN,
+      confirming_actor_rbac_authorized: true,
+    };
+    const pending: PendingTransitionContext = {
+      tenant_id: TENANT,
+      action_id: ROW_ID,
+      patient_account_id: PATIENT,
+      actor_id: CLINICIAN,
+      protocol_id: null,
+      protocol_version: null,
+    };
+    const { client, captured } = makeMockClient([
+      [buildRowFixture({ status: 'active', prescribed_by_clinician_account_id: CLINICIAN })],
+    ]);
+    await transitionStatus(
+      {
+        id: ROW_ID,
+        tenant_id: TENANT,
+        expected_from_status: 'pending_clinician_review',
+        to_status: 'active',
+        event: 'clinician_approve',
+        i012_guard: guard,
+        pending_transition: pending,
+        prescribed_by_clinician_account_id: CLINICIAN,
+        prescribed_at: new Date('2026-05-13T00:00:00.000Z'),
+      },
+      client,
+    );
+    // Simple UPDATE path: no EXISTS, supersedes_id = NULL explicitly
+    expect(captured[0]?.text).not.toContain('EXISTS (');
+    expect(captured[0]?.text).toContain('supersedes_id = NULL');
   });
 });
 
