@@ -39,6 +39,7 @@
  *     D10 patient B → 404 on POST /v0/consent/delegations/:id/revoke (R5)
  *     D11 patient B → 404 on POST /v0/consent/delegations/:id/scopes/grant (R5)
  *     D12 cross-parent revoke-scope: passing own delegation id + victim scope id → 404 (R6)
+ *     D13 clinician JWT → 403 on GET /v0/admin/tenant-brand (Codex R7: clinician blocked from admin)
  *
  * Spec references:
  *   - RBAC v1.1 §1.2 (Clinician role; tenant-scoped) + §6 (multi-tenant)
@@ -844,6 +845,52 @@ describe('clinician-role-claim — Group D: patient-only routes reject clinician
         return result.rows[0]?.revoked_at;
       });
       expect(stillActive ?? null).toBeNull();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D13 clinician JWT → 403 on GET /v0/admin/tenant-brand (Codex R7 HIGH closure)', async () => {
+    // The clinician JWT widening would otherwise let clinician
+    // accounts call admin read routes (tenant-brand, ccr-configs,
+    // adapter-configs, country-profiles). PR-118 closes the NEW
+    // attack surface introduced by clinician issuance via
+    // rejectClinicianOnAdminRoute. Patient-role on admin routes
+    // remains a pre-existing gap (tracked as a separate admin-role
+    // PR follow-on).
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      const clinicianId = await insertAccount('clinician');
+      const sessionId = asSessionId(ulid());
+      const { accessToken } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: clinicianId },
+        { session_id: sessionId, account_id: clinicianId },
+      );
+
+      // Spot-check one admin route per category covered by the gate.
+      const routes = [
+        '/v0/admin/country-profiles',
+        '/v0/admin/tenant-brand',
+        '/v0/admin/ccr-configs',
+        '/v0/admin/adapter-configs',
+      ];
+      for (const url of routes) {
+        const r = await app.inject({
+          method: 'GET',
+          url,
+          headers: {
+            host: 'heroshealth.com',
+            authorization: `Bearer ${accessToken}`,
+          },
+        });
+        expect(r.statusCode).toBe(403);
+        const body = r.json<{ error: { code: string } }>();
+        expect(body.error.code).toBe('internal.auth.insufficient_scope');
+      }
     } finally {
       await app.close();
     }

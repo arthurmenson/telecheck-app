@@ -237,3 +237,28 @@ export function requireClinicianActorContext(
   }
   return actor as ActorContext & { role: 'clinician' };
 }
+
+/**
+ * Reject CLINICIAN actors from admin routes (Codex PR-118 R7 HIGH closure
+ * 2026-05-13). The full admin-role mechanism (tenant_admin / platform_admin
+ * tokens) lands with a future Admin Backend slice; until then, admin
+ * routes accept any authenticated actor by historical convention — a
+ * pre-existing role-gap that exists on main. TLC-058 widens AccessTokenRole
+ * to include 'clinician', which would let clinician JWTs reach those
+ * admin routes too. This guard closes the NEW attack surface introduced
+ * by clinician JWT issuance: clinician → 403; patient still passes
+ * (pre-existing gap, tracked as a separate follow-on for the admin-role
+ * gate PR).
+ *
+ * The narrow scope is deliberate: this PR's mission is the clinician role
+ * mechanism. Closing the pre-existing patient gap on admin routes
+ * properly requires authoring the admin-role token + admin-role
+ * mapping in identity, which is its own PR.
+ */
+export function rejectClinicianOnAdminRoute(req: FastifyRequest): ActorContext {
+  const actor = requireActorContext(req);
+  if (actor.role === 'clinician') {
+    throw new UnauthorizedRoleError('patient', 'clinician');
+  }
+  return actor;
+}
