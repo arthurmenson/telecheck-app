@@ -123,6 +123,8 @@
 -- migration runner discipline); the validation sees ALL rows across ALL
 -- tenants.
 -- ---------------------------------------------------------------------------
+SET LOCAL search_path = pg_catalog, public;
+
 DO $$
 DECLARE
     violation_count INTEGER := 0;
@@ -144,8 +146,8 @@ BEGIN
                b.patient_account_id AS b_patient,
                b.status      AS b_status,
                b.supersedes_id      AS b_back
-          FROM medication_requests a
-          LEFT JOIN medication_requests b
+          FROM public.medication_requests a
+          LEFT JOIN public.medication_requests b
             ON b.id = a.superseded_by_id
          WHERE a.superseded_by_id IS NOT NULL
            AND (
@@ -184,8 +186,8 @@ BEGIN
                a.patient_account_id AS a_patient,
                a.status      AS a_status,
                a.superseded_by_id   AS a_forward
-          FROM medication_requests b
-          LEFT JOIN medication_requests a
+          FROM public.medication_requests b
+          LEFT JOIN public.medication_requests a
             ON a.id = b.supersedes_id
          WHERE b.supersedes_id IS NOT NULL
            AND (
@@ -218,13 +220,26 @@ BEGIN
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 -- ---------------------------------------------------------------------------
 -- Step 2 — Reciprocity-check function (row-scoped; no full-table scan).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION medication_requests_supersession_reciprocity_check()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+-- Lock search_path to a fixed two-element list (pg_catalog first for
+-- builtins, public for our schema). Without this, a session that sets
+-- search_path or creates a temp table named `medication_requests` could
+-- shadow the real `public.medication_requests` and make the trigger's
+-- re-fetch resolve to an empty table — the NOT FOUND branch would return
+-- silently and let the one-sided supersession state this migration is
+-- supposed to prevent slip past. Every table reference inside the
+-- function is ALSO schema-qualified as `public.medication_requests` as
+-- defense-in-depth so the function is robust even if the SET clause is
+-- stripped by a future edit. Codex R2 HIGH closure.
+SET search_path = pg_catalog, public
+AS $$
 DECLARE
     this_row       RECORD;
     referenced_row RECORD;
@@ -235,7 +250,7 @@ BEGIN
     -- re-fetch gives the final committed state.
     SELECT id, tenant_id, patient_account_id, status, supersedes_id, superseded_by_id
       INTO this_row
-      FROM medication_requests
+      FROM public.medication_requests
      WHERE id = NEW.id;
 
     IF NOT FOUND THEN
@@ -264,7 +279,7 @@ BEGIN
 
         SELECT id, tenant_id, patient_account_id, status, supersedes_id
           INTO referenced_row
-          FROM medication_requests
+          FROM public.medication_requests
          WHERE id = this_row.superseded_by_id;
 
         IF NOT FOUND THEN
@@ -320,7 +335,7 @@ BEGIN
     IF this_row.supersedes_id IS NOT NULL THEN
         SELECT id, tenant_id, patient_account_id, status, superseded_by_id
           INTO referenced_row
-          FROM medication_requests
+          FROM public.medication_requests
          WHERE id = this_row.supersedes_id;
 
         IF NOT FOUND THEN
@@ -369,7 +384,7 @@ BEGIN
 
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 -- ---------------------------------------------------------------------------
 -- Step 3 — Constraint trigger. DEFERRABLE INITIALLY DEFERRED so it fires

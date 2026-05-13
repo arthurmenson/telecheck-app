@@ -30,6 +30,7 @@
  *   §3 mismatched edge            — A.superseded_by=B but B.supersedes_id=C
  *   §4 cross-patient supersession — A.patient=P1, B.patient=P2 — fails
  *   §5 reverse-edge bad-status    — B.supersedes_id=A but A.status='active'
+ *   §6 search_path shadow-table   — TEMP TABLE attack does NOT bypass the trigger
  *
  * Same-tenant scope. Cross-tenant edges are already prevented at the FK
  * layer (composite FK on (tenant_id, supersedes_id) / (tenant_id,
@@ -449,6 +450,69 @@ describe('migration 026 — supersession reciprocity trigger', () => {
       // superseded_by_id=null') OR the status mismatch ('row B points
       // back at row A with status=active'). Both are acceptable —
       // both indicate the trigger caught the malformed edge.
+      expect(result).toMatch(/reciprocity violated/i);
+    });
+  });
+
+  it('§6 search_path shadow-table attack does NOT bypass the trigger', async () => {
+    // Codex R2 HIGH closure regression: the trigger function declares
+    // `SET search_path = pg_catalog, public` and schema-qualifies every
+    // `public.medication_requests` reference. If either guard were
+    // weakened, a session that creates a TEMP TABLE named
+    // `medication_requests` (which lives in pg_temp) and prepends pg_temp
+    // to its search_path could make the function's re-fetch resolve to
+    // the shadow table — returning NOT FOUND on a real corrupt row and
+    // letting a one-sided supersession edge silently commit.
+    //
+    // This test mounts that attack and asserts the trigger still
+    // rejects the malformed edge. If the test passes, the search_path
+    // lock + schema qualification are both effective; if it begins to
+    // fail (no error raised), one of those defenses regressed and an
+    // adversary with SQL access could bypass reciprocity enforcement.
+    const T = TENANT_US;
+
+    await withTenantContext(T, async () => {
+      const patient = await insertPatient(T);
+      const product = await insertProduct(T);
+
+      const client = getTestClient();
+
+      // Attempt the shadow-table attack: create an empty TEMP TABLE
+      // with the same name, then prepend pg_temp to search_path so
+      // unqualified lookups resolve to the empty shadow first.
+      await client.query(
+        'CREATE TEMP TABLE medication_requests (id VARCHAR(30) PRIMARY KEY) ON COMMIT DROP',
+      );
+      await client.query('SET LOCAL search_path = pg_temp, public');
+
+      // Construct a one-sided edge (same as §2). If the trigger's
+      // function-level search_path lock is in place, the SELECT inside
+      // the trigger resolves to public.medication_requests despite the
+      // session's pg_temp-first search_path, and the violation is
+      // caught. If the lock is missing, the SELECT resolves to the
+      // empty pg_temp shadow, returns NOT FOUND, and the trigger
+      // silently returns NULL — letting the bad edge commit.
+      const aId = mrxId();
+      const bId = mrxId();
+      await insertMedicationRequest({
+        id: aId,
+        tenant_id: T,
+        patient_account_id: patient,
+        product_catalog_id: product,
+        status: 'active',
+      });
+      await insertMedicationRequest({
+        id: bId,
+        tenant_id: T,
+        patient_account_id: patient,
+        product_catalog_id: product,
+        status: 'active',
+        supersedes_id: null,
+      });
+      await setForwardPointer(aId, bId);
+
+      const result = await forceConstraintCheck();
+      expect(result).not.toBeNull();
       expect(result).toMatch(/reciprocity violated/i);
     });
   });
