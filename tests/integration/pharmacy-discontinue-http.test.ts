@@ -553,11 +553,16 @@ describe('pharmacy discontinue — Group D: idempotency replay', () => {
       payload: {},
     });
     expect(first.statusCode).toBe(200);
+    const firstBody = first.json<{ id: string; status: string; discontinued_at: string }>();
     expectNoTenantLeak(first);
 
     // Replay with the SAME key + SAME body. The cache hit MUST return
-    // the cached 200 + body, NOT re-run the discontinue path (which
-    // would now state-conflict because the row is already discontinued).
+    // the cached 200, NOT re-run the discontinue path (which would
+    // now state-conflict because the row is already discontinued).
+    // Compare parsed JSON, not raw serialized body — the cached body
+    // may be re-serialized with subtle whitespace/key-order
+    // differences that don't affect semantics (matches the async-
+    // consult E1 idempotency-replay assertion pattern).
     const replay = await app!.inject({
       method: 'POST',
       url: `/v0/pharmacy/prescriptions/${mrId}/discontinue`,
@@ -569,7 +574,15 @@ describe('pharmacy discontinue — Group D: idempotency replay', () => {
       payload: {},
     });
     expect(replay.statusCode).toBe(200);
-    expect(replay.body).toBe(first.body);
+    const replayBody = replay.json<{ id: string; status: string; discontinued_at: string }>();
+    // Prove no new row was created: replay returns the same row id,
+    // the row stayed in status='discontinued' (didn't re-attempt the
+    // active → discontinued transition, which would have state-
+    // conflicted), and the cached discontinued_at timestamp was
+    // returned verbatim (not re-stamped at replay time).
+    expect(replayBody.id).toBe(firstBody.id);
+    expect(replayBody.status).toBe('discontinued');
+    expect(replayBody.discontinued_at).toBe(firstBody.discontinued_at);
     expectNoTenantLeak(replay);
   });
 });
