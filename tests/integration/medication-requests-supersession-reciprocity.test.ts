@@ -92,6 +92,14 @@ interface InsertMedicationRequestInput {
  */
 async function insertMedicationRequest(input: InsertMedicationRequestInput): Promise<void> {
   const client = getTestClient();
+  // Migration 025's medication_requests_interaction_resolved_when_active
+  // CHECK requires that status IN ('active', 'discontinued', 'superseded',
+  // 'expired') is paired with interaction_signals_status ∈ {'clean',
+  // 'caution'} AND interaction_signals_evaluated_at IS NOT NULL — the
+  // engine must have written back before activation. We're inserting
+  // active/post-active rows directly for trigger-test purposes, so
+  // populate both fields to satisfy the row-local CHECK.
+  const now = new Date().toISOString();
   await client.query(
     `INSERT INTO medication_requests (
         id, tenant_id,
@@ -100,7 +108,7 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
         dose_instructions, quantity, quantity_unit, refills_allowed,
         status,
         prescribed_at, activated_at,
-        interaction_signals_status,
+        interaction_signals_status, interaction_signals_evaluated_at,
         supersedes_id,
         country_of_care
      ) VALUES (
@@ -110,9 +118,9 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
         $8, $9, $10, $11,
         $12,
         $13, $14,
-        $15,
-        $16,
-        $17
+        $15, $16,
+        $17,
+        $18
      )`,
     [
       input.id,
@@ -127,9 +135,10 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
       'tablet',
       0,
       input.status,
-      new Date().toISOString(),
-      new Date().toISOString(),
+      now,
+      now,
       'clean',
+      now,
       input.supersedes_id ?? null,
       'US',
     ],
