@@ -12,7 +12,7 @@
  * and remaining clinician transitions (decline / discontinue / supersede /
  * modify) land in subsequent pharmacy PRs.
  *
- * Coverage (6 groups, 17 cases):
+ * Coverage (6 groups, 18 cases):
  *
  *   Group A — Happy path: createDraft
  *     A1 clinician → 201 + draft view (status=draft, interaction=pending)
@@ -47,6 +47,9 @@
  *     F5 invalid product_catalog_id with nonexistent vs existing-patient
  *        patient_account_id produce byte-identical 400 envelopes (R3
  *        FK-error oracle closure)
+ *     F6 overlength product_catalog_id with nonexistent vs existing-patient
+ *        patient_account_id produce byte-identical 400 envelopes (R4
+ *        truncation-error oracle closure)
  *
  * Spec references:
  *   - State Machines v1.2 §19 (submit_for_review: draft → pending_interaction_check)
@@ -890,6 +893,61 @@ describe('pharmacy clinician write — Group F: cross-row invariants', () => {
     expect(aBody.error.code).toBe('internal.request.invalid');
     expect(bBody.error.code).toBe(aBody.error.code);
     // Byte-identical messages — no oracle.
+    expect(bBody.error.message).toBe(aBody.error.message);
+    expectNoTenantLeak(aResp);
+    expectNoTenantLeak(bResp);
+  });
+
+  it('F6 overlength product_catalog_id: nonexistent vs existing-patient patient_account_id → byte-identical 400 (R4 truncation oracle closure)', async () => {
+    // Codex PR-119 R4 closure 2026-05-13: previously, an overlength
+    // product_catalog_id bypassed the FK violation (23503) and
+    // triggered Postgres 22001 string-data-right-truncation, which
+    // produced a different envelope class than the R3-collapsed
+    // generic envelope. That re-opened the patient_account_id
+    // existence oracle even after R3.
+    //
+    // Fix: body parser now requires every ID field to match the
+    // 26-char Crockford-base32 ULID shape. An overlength value
+    // fails AT THE PARSER with the same 400 envelope regardless of
+    // patient_account_id existence (parser fires before service /
+    // repo / DB). Both branches return the byte-identical
+    // body-validation message.
+    const clinician = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    const existingPatient = await insertAccountOfType(US_CTX, 'patient', '+1');
+    const token = await mintTokenForRole(T_US, clinician, 'clinician');
+
+    // Constant: a clearly-overlength product_catalog_id (50 chars).
+    // Fails the ULID-shape check at the body parser.
+    const overlengthProductId = '0'.repeat(50);
+
+    const aResp = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      payload: makeDraftBody({ patientId: ulid(), productId: overlengthProductId }),
+    });
+
+    const bResp = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      payload: makeDraftBody({ patientId: existingPatient, productId: overlengthProductId }),
+    });
+
+    expect(aResp.statusCode).toBe(400);
+    expect(bResp.statusCode).toBe(400);
+    const aBody = aResp.json<{ error: { code: string; message: string } }>();
+    const bBody = bResp.json<{ error: { code: string; message: string } }>();
+    expect(aBody.error.code).toBe('internal.request.invalid');
+    expect(bBody.error.code).toBe(aBody.error.code);
     expect(bBody.error.message).toBe(aBody.error.message);
     expectNoTenantLeak(aResp);
     expectNoTenantLeak(bResp);

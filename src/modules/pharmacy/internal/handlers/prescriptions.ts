@@ -577,6 +577,26 @@ function isPositiveInteger(v: unknown): v is number {
 }
 
 /**
+ * Canonical ULID shape: 26 chars from Crockford base32 (digits + A-Z
+ * minus I, L, O, U). Codex PR-119 R4 MEDIUM closure 2026-05-13:
+ * incoming IDs (patient_account_id, product_catalog_id,
+ * prescribing_consult_id) MUST be validated at the boundary so an
+ * overlength or malformed value cannot reach the DB and surface a
+ * different Postgres error class (e.g., 22001 string-data-right-
+ * truncation) than the FK-violation 23503 path. Different DB error
+ * classes produce different envelopes → account-existence oracle.
+ *
+ * The downstream branded types (asAccountId, asProductCatalogId,
+ * asDelegationId) currently use unchecked casts; this regex is the
+ * application-layer fail-fast gate that prevents oversize/malformed
+ * IDs from ever reaching the parameterized queries.
+ */
+const ULID_PATTERN = /^[0-9A-HJKMNPQRSTVWXYZ]{26}$/;
+function isUlidShape(v: unknown): v is string {
+  return typeof v === 'string' && ULID_PATTERN.test(v);
+}
+
+/**
  * Validate the POST /prescriptions body. Returns either an error
  * message OR a normalized CreateDraftAsClinicianInput. All optional
  * fields default to null. The shape mirrors CDM v1.3 §4.16
@@ -600,11 +620,24 @@ function parseCreateDraftBody(
   }
   const body = raw as CreateDraftBody;
 
-  if (!isString(body.patient_account_id)) {
-    return { ok: false, message: 'patient_account_id (non-empty string) is required.' };
+  // ID shape validation at the boundary (Codex PR-119 R4 MEDIUM
+  // closure 2026-05-13). Each ID must match the canonical 26-char
+  // Crockford-base32 ULID pattern so an overlength or malformed
+  // value never reaches the parameterized SQL (where a different
+  // Postgres error class — e.g., 22001 truncation — would otherwise
+  // produce a different envelope from the FK-violation 23503 path,
+  // recreating the account-existence oracle R3 was meant to close).
+  if (!isUlidShape(body.patient_account_id)) {
+    return {
+      ok: false,
+      message: 'patient_account_id (26-char Crockford-base32 ULID) is required.',
+    };
   }
-  if (!isString(body.product_catalog_id)) {
-    return { ok: false, message: 'product_catalog_id (non-empty string) is required.' };
+  if (!isUlidShape(body.product_catalog_id)) {
+    return {
+      ok: false,
+      message: 'product_catalog_id (26-char Crockford-base32 ULID) is required.',
+    };
   }
   if (!isString(body.medication_name)) {
     return { ok: false, message: 'medication_name (non-empty string) is required.' };
@@ -653,9 +686,12 @@ function parseCreateDraftBody(
   if (
     prescribingConsultId !== undefined &&
     prescribingConsultId !== null &&
-    !isString(prescribingConsultId)
+    !isUlidShape(prescribingConsultId)
   ) {
-    return { ok: false, message: 'prescribing_consult_id must be a string or null.' };
+    return {
+      ok: false,
+      message: 'prescribing_consult_id must be a 26-char Crockford-base32 ULID, null, or omitted.',
+    };
   }
 
   // protocol_id + protocol_version: BOTH or NEITHER (per migration 025
