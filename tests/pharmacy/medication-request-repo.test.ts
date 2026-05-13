@@ -371,6 +371,28 @@ describe('medication-request-repo — §5 validateTransition pre-check', () => {
     expect(captured[0]?.values?.[3]).toBe('draft');
   });
 
+  it('§5c2 rejects when caller-supplied to_status diverges from §19 canonical destination (anti-state-machine-bypass)', async () => {
+    // clinician_modify is VALID from pending_clinician_review (it
+    // reroutes back to pending_interaction_check). But if a caller
+    // pairs it with to_status='active' to try to dispatch the SQL
+    // through the activation branch, the validateTransition-return
+    // ≠ to_status check (Codex R2 HIGH closure) rejects it.
+    const { client, captured } = makeMockClient([]);
+    await expect(
+      transitionStatus(
+        {
+          id: ROW_ID,
+          tenant_id: TENANT,
+          expected_from_status: 'pending_clinician_review',
+          to_status: 'active', // ← wrong: clinician_modify produces pending_interaction_check
+          event: 'clinician_modify',
+        } as TransitionStatusInput,
+        client,
+      ),
+    ).rejects.toThrow(/does not match the canonical §19 destination/);
+    expect(captured).toHaveLength(0);
+  });
+
   it('§5d I-012 happy path: clinician_approve with bound guard fires the activation UPDATE', async () => {
     const guard: I012GuardContext = {
       route: 'clinician_approve',
@@ -544,7 +566,7 @@ describe('medication-request-repo — §8 markSuperseded', () => {
     expect(captured).toHaveLength(1);
     expect(captured[0]?.text).toContain("SET status = 'superseded'");
     expect(captured[0]?.text).toContain('superseded_by_id = $1');
-    expect(captured[0]?.text).toContain("AND status = 'active'");
+    expect(captured[0]?.text).toContain("AND old.status = 'active'");
   });
 
   it('§8c returns null when old row no longer active (caller handles conflict)', async () => {
@@ -554,6 +576,17 @@ describe('medication-request-repo — §8 markSuperseded', () => {
       client,
     );
     expect(result).toBeNull();
+  });
+
+  it('§8d UPDATE WHERE-clause includes EXISTS subquery requiring new row to be active + reciprocally-bound', async () => {
+    const { client, captured } = makeMockClient([[]]);
+    await markSuperseded({ tenant_id: TENANT, old_id: ROW_ID, new_id: ROW_ID_2 }, client);
+    const update = captured[0];
+    // The reciprocity-at-write-boundary check (Codex R2 HIGH closure)
+    expect(update?.text).toContain('EXISTS (');
+    expect(update?.text).toContain('FROM medication_requests AS new_row');
+    expect(update?.text).toContain("new_row.status = 'active'");
+    expect(update?.text).toContain('new_row.supersedes_id = $2');
   });
 });
 

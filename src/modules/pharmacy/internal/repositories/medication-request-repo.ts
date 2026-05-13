@@ -650,12 +650,31 @@ export async function transitionStatus(
   // 1. State-machine pre-check — throws InvalidTransitionError or
   // I012RejectError BEFORE the DB is touched. This is the application-layer
   // defense; the DB CHECKs are the durable boundary.
-  validateTransition(
+  //
+  // CRITICAL: capture validateTransition's return (the canonical §19
+  // destination state for `event` from `expected_from_status`) and reject
+  // when it ≠ caller's `to_status`. Without this check, a caller could
+  // supply event=clinician_modify (valid from pending_clinician_review)
+  // paired with to_status='active' (NOT what clinician_modify produces)
+  // and the UPDATE dispatch would go through the activation branch,
+  // landing the row at status=active without the I-012-gated
+  // clinician_approve or protocol_authorized_prescribing path. Codex
+  // TLC-055 PR A R2 HIGH closure 2026-05-13.
+  const validatedDestination = validateTransition(
     input.expected_from_status,
     input.event,
     input.i012_guard,
     input.pending_transition,
   );
+  if (validatedDestination !== input.to_status) {
+    throw new Error(
+      `transitionStatus: input.to_status (${input.to_status}) does not match the canonical ` +
+        `§19 destination for event '${input.event}' from '${input.expected_from_status}' ` +
+        `(canonical destination: ${validatedDestination}). Callers MUST supply the same ` +
+        'destination state that the state-machine transition produces; mismatches indicate ' +
+        'a service-layer bug or an attempt to bypass the state-machine semantics.',
+    );
+  }
 
   // 2. Optimistic-concurrency UPDATE with the right SET clause based on the
   // destination state.
@@ -855,14 +874,36 @@ export async function markSuperseded(
   }
   const runner = makeRunner<MedicationRequest | null>(input.tenant_id, externalTx);
   return runner(async (client) => {
+    // Reciprocity-at-the-write-boundary check (Codex TLC-055 PR A R2 HIGH
+    // closure 2026-05-13): the UPDATE only matches when the new
+    // replacement row ALREADY exists, is in the same tenant, is at
+    // status='active', AND already carries supersedes_id = old_id. This
+    // closes the gap that would otherwise let a caller mark A superseded
+    // by any unrelated row B (draft/rejected/different-patient) in the
+    // same tenant — TLC-055 PR B's deferrable CONSTRAINT TRIGGER will be
+    // the durable reciprocity enforcement; until that lands, this EXISTS
+    // subquery is the repo-layer guarantee.
+    //
+    // The composition order matters: the service layer MUST have
+    // activated the replacement (with supersedes_id=old_id supplied in
+    // transitionStatus's activation envelope) BEFORE calling
+    // markSuperseded; otherwise the EXISTS check fires and this returns
+    // null (the caller maps to a conflict-error response).
     const result = await client.query<MedicationRequestRow>(
-      `UPDATE medication_requests
+      `UPDATE medication_requests AS old
           SET status = 'superseded',
               superseded_by_id = $1,
               updated_at = NOW()
-        WHERE id = $2
-          AND tenant_id = $3
-          AND status = 'active'
+        WHERE old.id = $2
+          AND old.tenant_id = $3
+          AND old.status = 'active'
+          AND EXISTS (
+            SELECT 1 FROM medication_requests AS new_row
+             WHERE new_row.id = $1
+               AND new_row.tenant_id = $3
+               AND new_row.status = 'active'
+               AND new_row.supersedes_id = $2
+          )
         RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
       [input.new_id, input.old_id, input.tenant_id],
     );
