@@ -26,10 +26,12 @@
  *     C1 verifyAccessToken accepts role='clinician'
  *     C2 verifyAccessToken rejects forged role='admin' as invalid_payload
  *
- *   Group D — Patient-only routes reject clinician JWTs (Codex R1 HIGH closure)
+ *   Group D — Patient-only routes reject clinician JWTs (Codex R1 + R2 HIGH closures)
  *     D1 clinician JWT → 403 on POST /v0/async-consult
  *     D2 clinician JWT → 403 on GET /v0/pharmacy/prescriptions/:id
  *     D3 clinician JWT → 403 on POST /v0/pharmacy/prescriptions/:id/discontinue
+ *     D4 clinician JWT → 403 on POST /v0/forms/submissions (Codex R2 HIGH closure)
+ *     D5 clinician JWT → 403 on POST /v0/forms/resume (Codex R2 HIGH closure)
  *
  * Spec references:
  *   - RBAC v1.1 §1.2 (Clinician role; tenant-scoped) + §6 (multi-tenant)
@@ -387,6 +389,87 @@ describe('clinician-role-claim — Group D: patient-only routes reject clinician
           'idempotency-key': ulid(),
         },
         payload: {},
+      });
+
+      expect(r.statusCode).toBe(403);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D4 clinician JWT → 403 on POST /v0/forms/submissions (Codex R2 HIGH closure)', async () => {
+    // Forms-intake submissions.ts:resolvePatient previously trusted any
+    // actorContext as the patient anchor. R2 closure: requirePatient-
+    // ActorContext gate inside resolvePatient; clinician JWT must 403.
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      const clinicianId = await insertAccount('clinician');
+      const sessionId = asSessionId(ulid());
+      const { accessToken } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: clinicianId },
+        {
+          session_id: sessionId,
+          account_id: clinicianId,
+        },
+      );
+
+      const r = await app.inject({
+        method: 'POST',
+        url: '/v0/forms/submissions',
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${accessToken}`,
+          'idempotency-key': ulid(),
+        },
+        // Body shape is irrelevant — the role gate runs at resolvePatient
+        // BEFORE the body is validated. A clinician JWT must 403 here
+        // regardless of body content.
+        payload: { deployment_id: ulid(), responses: {} },
+      });
+
+      expect(r.statusCode).toBe(403);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D5 clinician JWT → 403 on POST /v0/forms/resume (Codex R2 HIGH closure)', async () => {
+    // resume.ts:resolveActorId previously trusted any actorContext.
+    // R2 closure: requirePatientActorContext gate; clinician 403.
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      const clinicianId = await insertAccount('clinician');
+      const sessionId = asSessionId(ulid());
+      const { accessToken } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: clinicianId },
+        {
+          session_id: sessionId,
+          account_id: clinicianId,
+        },
+      );
+
+      const r = await app.inject({
+        method: 'POST',
+        url: '/v0/forms/resume',
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${accessToken}`,
+          'idempotency-key': ulid(),
+          'x-patient-id': ulid(),
+        },
+        payload: { resumeToken: 'irrelevant-the-gate-fires-first' },
       });
 
       expect(r.statusCode).toBe(403);
