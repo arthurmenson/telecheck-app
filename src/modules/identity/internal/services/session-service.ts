@@ -240,6 +240,22 @@ export async function findSessionById(
 }
 
 /**
+ * Active-only variant of findSessionById — returns null if the session is
+ * revoked or expired. Used by PHI-handling route handlers to enforce
+ * session liveness on every request, defending against revoked-session-id
+ * tokens that still pass JWT signature/expiry. Codex PR-116 R1 HIGH
+ * closure: the auth hook is JWT-stateless by design so PHI handlers
+ * opt-in to liveness via this helper.
+ */
+export async function findActiveSessionById(
+  ctx: TenantContext,
+  sessionId: SessionId,
+  externalTx?: DbClient,
+): Promise<Session | null> {
+  return sessionRepo.findActiveSessionById(ctx.tenantId, sessionId, externalTx);
+}
+
+/**
  * Find an active session by refresh-token PLAINTEXT (the service layer
  * hashes here so callers pass the wire-shape value). Returns null on
  * miss / revoked / expired.

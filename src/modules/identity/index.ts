@@ -59,6 +59,7 @@ export {
   issueSession,
   revokeSession,
   findSessionById,
+  findActiveSessionById,
   findActiveSessionByRefreshToken,
   listActiveSessionsForAccount,
   toPatientSessionView,

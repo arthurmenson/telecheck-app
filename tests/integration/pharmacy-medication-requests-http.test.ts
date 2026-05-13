@@ -6,7 +6,7 @@
  * with Bearer JWT auth. Mirrors the established async-consult-http.test
  * structure (helpers, PHI-leak guard, tenant fixture pattern).
  *
- * Coverage (7 groups, 15 cases):
+ * Coverage (7 groups, 17 cases):
  *
  *   Group A — Happy path (GET /prescriptions/:id)
  *     A1 200 + PHI-safe view on a freshly-seeded medication_request
@@ -34,6 +34,8 @@
  *
  *   Group F — Auth failures
  *     F1 no Bearer JWT → 401
+ *     F1c revoked session → 401 (Codex R1 HIGH closure: session-liveness check)
+ *     F1d nonexistent session_id → 401 (Codex R1 HIGH closure)
  *
  *   Group G — PHI projection — global guard
  *     enforced at every assertion via expectNoTenantLeak()
@@ -56,7 +58,13 @@ import { issueAccessToken } from '../../src/lib/jwt.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
-import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
+import * as sessionRepo from '../../src/modules/identity/internal/repositories/session-repo.ts';
+import {
+  asAccountId,
+  asSessionId,
+  type AccountId,
+  type SessionId,
+} from '../../src/modules/identity/internal/types.ts';
 import * as medicationRequestRepo from '../../src/modules/pharmacy/internal/repositories/medication-request-repo.ts';
 import {
   asMedicationRequestId,
@@ -224,19 +232,65 @@ async function seedMedicationRequest(
 }
 
 // ---------------------------------------------------------------------------
-// Auth helper — mint a JWT bound to the given tenant + accountId
+// Auth helpers — seed a real session row, then mint a JWT bound to it
+//
+// PR C handlers enforce session liveness via `requireLiveSession()` (which
+// looks up sessions by session_id and rejects if revoked or expired).
+// Tests therefore MUST seed a real sessions row before minting a JWT so
+// the liveness lookup hits a live row. Synthetic session_ids would 401.
+//
+// The `mintToken` helper is async + auto-seeds a session row alongside
+// the JWT. Tests that want to exercise the revoked-session path call
+// `seedSession` directly and pass the returned sessionId to
+// `mintTokenForSession`.
 // ---------------------------------------------------------------------------
 
-function mintToken(tenantId: TenantId, accountId: AccountId): string {
+async function seedSession(tenantId: TenantId, accountId: AccountId): Promise<SessionId> {
+  const sessionId = asSessionId(ulid());
+  // A 64-char hex string satisfies the migration's CHECK constraint on
+  // refresh_token_hash without exercising the real refresh-token flow.
+  const refreshTokenHash = '0'.repeat(64);
+  await withTenantContext(tenantId, () =>
+    sessionRepo.createSession(
+      {
+        session_id: sessionId,
+        tenant_id: tenantId,
+        account_id: accountId,
+        refresh_token_hash: refreshTokenHash,
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      },
+      async () => {
+        /* test seeding doesn't need post-INSERT side effects */
+      },
+    ),
+  );
+  return sessionId;
+}
+
+function mintTokenForSession(
+  tenantId: TenantId,
+  accountId: AccountId,
+  sessionId: SessionId,
+): string {
   return issueAccessToken(
     {
       account_id: accountId,
       tenant_id: tenantId,
-      session_id: ulid(),
+      session_id: sessionId,
       country_of_care: tenantId === T_US ? 'US' : 'GH',
     },
     config.jwtSigningKey,
   );
+}
+
+/**
+ * Seed a session row + mint a JWT bound to it. Replaces the JWT-only
+ * helper from PR C v1; PR C v2 (Codex R1 closure) enforces session
+ * liveness so a synthetic session_id no longer authenticates.
+ */
+async function mintToken(tenantId: TenantId, accountId: AccountId): Promise<string> {
+  const sessionId = await seedSession(tenantId, accountId);
+  return mintTokenForSession(tenantId, accountId, sessionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +323,7 @@ describe('pharmacy HTTP — Group A: GET /prescriptions/:id happy path', () => {
       patientAccountId: patient,
       productCatalogId: product,
     });
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
 
     const response = await app!.inject({
       method: 'GET',
@@ -305,7 +359,7 @@ describe('pharmacy HTTP — Group A: GET /prescriptions/:id happy path', () => {
 describe('pharmacy HTTP — Group B: GET /prescriptions/:id tenant-blind 404', () => {
   it('B1 well-formed but non-existent id → 404 internal.resource.not_found', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
     const nonexistent = `mrx_${ulid()}`;
 
     const response = await app!.inject({
@@ -322,7 +376,7 @@ describe('pharmacy HTTP — Group B: GET /prescriptions/:id tenant-blind 404', (
 
   it('B2 malformed id → 404 (NOT 400; side-channel closure per I-025)', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
     // Not an mrx_<ULID> — fails canonical-id validation in the handler.
     // The handler MUST return 404 not 400 so the malformed case is
     // byte-identical to a tenant-blind not-found.
@@ -356,7 +410,7 @@ describe('pharmacy HTTP — Group B: GET /prescriptions/:id tenant-blind 404', (
 
     // US-authed patient (independent of the Ghana row).
     const usPatient = await seedAccountInTenant(US_CTX, '+1');
-    const usToken = mintToken(T_US, usPatient);
+    const usToken = await mintToken(T_US, usPatient);
 
     const response = await app!.inject({
       method: 'GET',
@@ -382,7 +436,7 @@ describe('pharmacy HTTP — Group B: GET /prescriptions/:id tenant-blind 404', (
       patientAccountId: patientA,
       productCatalogId: product,
     });
-    const tokenB = mintToken(T_US, patientB);
+    const tokenB = await mintToken(T_US, patientB);
 
     const response = await app!.inject({
       method: 'GET',
@@ -419,7 +473,7 @@ describe('pharmacy HTTP — Group C: list happy path', () => {
       productCatalogId: product,
     });
 
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
     const response = await app!.inject({
       method: 'GET',
       url: `/v0/pharmacy/patients/${patient}/prescriptions`,
@@ -436,7 +490,7 @@ describe('pharmacy HTTP — Group C: list happy path', () => {
 
   it('C2 empty list when patient has no medication_requests', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
 
     const response = await app!.inject({
       method: 'GET',
@@ -465,7 +519,7 @@ describe('pharmacy HTTP — Group D: list query validation', () => {
       productCatalogId: product,
     });
 
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
     const response = await app!.inject({
       method: 'GET',
       url: `/v0/pharmacy/patients/${patient}/prescriptions?status=draft`,
@@ -483,7 +537,7 @@ describe('pharmacy HTTP — Group D: list query validation', () => {
 
   it('D2 ?status=NOT_A_REAL_STATUS → 400 internal.request.invalid', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
 
     const response = await app!.inject({
       method: 'GET',
@@ -508,7 +562,7 @@ describe('pharmacy HTTP — Group D: list query validation', () => {
       });
     }
 
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
     const response = await app!.inject({
       method: 'GET',
       url: `/v0/pharmacy/patients/${patient}/prescriptions?limit=2`,
@@ -523,7 +577,7 @@ describe('pharmacy HTTP — Group D: list query validation', () => {
 
   it('D4 ?limit=99999 is accepted (repo clamps to 500; no 400)', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
 
     const response = await app!.inject({
       method: 'GET',
@@ -537,7 +591,7 @@ describe('pharmacy HTTP — Group D: list query validation', () => {
 
   it('D5 ?limit=abc → 400 internal.request.invalid', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
 
     const response = await app!.inject({
       method: 'GET',
@@ -553,7 +607,7 @@ describe('pharmacy HTTP — Group D: list query validation', () => {
 
   it('D6 ?limit=0 → 400 internal.request.invalid', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
-    const token = mintToken(T_US, patient);
+    const token = await mintToken(T_US, patient);
 
     const response = await app!.inject({
       method: 'GET',
@@ -576,7 +630,7 @@ describe('pharmacy HTTP — Group E: list cross-patient blind 404', () => {
   it('E1 GET /v0/pharmacy/patients/<other-account>/prescriptions → 404', async () => {
     const patientA = await seedAccountInTenant(US_CTX, '+1');
     const patientB = await seedAccountInTenant(US_CTX, '+1');
-    const tokenB = mintToken(T_US, patientB);
+    const tokenB = await mintToken(T_US, patientB);
 
     const response = await app!.inject({
       method: 'GET',
@@ -612,6 +666,54 @@ describe('pharmacy HTTP — Group F: auth failures', () => {
       method: 'GET',
       url: `/v0/pharmacy/patients/${ulid()}/prescriptions`,
       headers: { host: 'heroshealth.com' },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expectNoTenantLeak(response);
+  });
+
+  it('F1c valid JWT for a REVOKED session → 401 (Codex R1 HIGH closure)', async () => {
+    // Seed account + session, mint JWT bound to it, then REVOKE the
+    // session row before issuing the request. The JWT remains
+    // cryptographically valid (signature + expiry + tenant match all
+    // check), but the session-liveness lookup inside the handler
+    // resolves null because revoked_at is now set. By I-025 the
+    // three null causes (revoked / expired / nonexistent) collapse to
+    // a single 401 envelope.
+    const patient = await seedAccountInTenant(US_CTX, '+1');
+    const sessionId = await seedSession(T_US, patient);
+    const token = mintTokenForSession(T_US, patient, sessionId);
+    await withTenantContext(T_US, async () => {
+      const client = getTestClient();
+      await client.query(
+        `UPDATE sessions SET revoked_at = NOW(), revoked_reason = 'admin_revoked' WHERE session_id = $1`,
+        [sessionId],
+      );
+    });
+
+    const response = await app!.inject({
+      method: 'GET',
+      url: `/v0/pharmacy/prescriptions/mrx_${ulid()}`,
+      headers: { host: 'heroshealth.com', authorization: `Bearer ${token}` },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expectNoTenantLeak(response);
+  });
+
+  it('F1d valid JWT for a NONEXISTENT session_id → 401 (Codex R1 HIGH closure)', async () => {
+    // Mint a JWT that references a session_id with no corresponding
+    // row in the sessions table — simulates a fabricated session_id or
+    // a token outliving its session row's lifecycle. Liveness lookup
+    // returns null; handler 401s.
+    const patient = await seedAccountInTenant(US_CTX, '+1');
+    const fakeSessionId = asSessionId(ulid()); // not seeded
+    const token = mintTokenForSession(T_US, patient, fakeSessionId);
+
+    const response = await app!.inject({
+      method: 'GET',
+      url: `/v0/pharmacy/prescriptions/mrx_${ulid()}`,
+      headers: { host: 'heroshealth.com', authorization: `Bearer ${token}` },
     });
 
     expect(response.statusCode).toBe(401);

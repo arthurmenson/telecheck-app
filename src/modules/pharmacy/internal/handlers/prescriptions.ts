@@ -67,11 +67,54 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { requireActorContext } from '../../../../lib/auth-context.js';
+import { UnauthenticatedError, requireActorContext } from '../../../../lib/auth-context.js';
 import { GlossaryViolationError, asMedicationRequestId } from '../../../../lib/glossary.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
+import { asSessionId, findActiveSessionById } from '../../../identity/index.js';
 import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
 import type { MedicationRequest, MedicationRequestStatus } from '../types.js';
+
+// ---------------------------------------------------------------------------
+// Session-liveness guard (Codex PR-116 R1 HIGH closure)
+//
+// Closes a pre-existing platform gap surfaced by the new pharmacy PHI
+// read surface: `requireActorContext()` only validates JWT signature,
+// expiry, and tenant match — it does NOT check that the JWT's session_id
+// claim corresponds to a still-active session row. A token from a
+// revoked or deleted session, or any validly-signed token with a
+// fabricated session_id, would otherwise read patient medication_request
+// rows until JWT expiry (TTL-bounded ≠ immediate revocation).
+//
+// `requireLiveSession` is the per-handler defense-in-depth: it calls
+// `requireActorContext()`, then resolves the session via the identity
+// module's `findActiveSessionById` (filters revoked_at + expires_at at
+// the SQL layer). If the lookup returns null, throw
+// `UnauthenticatedError` so the error envelope plugin renders a
+// tenant-blind 401. By I-025 the three null causes (revoked / expired /
+// nonexistent) MUST collapse to a single envelope.
+//
+// Architectural note (intentional scope decision): the canonical fix is
+// to move the liveness check into `authContextPlugin` so EVERY handler
+// using `requireActorContext` benefits — but that is a cross-cutting
+// auth change affecting async-consult / consent / identity test
+// harnesses that mint synthetic JWTs without seeding session rows. PR C
+// closes the gap at the pharmacy-handler layer (the new PHI surface).
+// The platform-wide migration is a follow-on (tracked as the next
+// auth-context hardening pass).
+// ---------------------------------------------------------------------------
+
+async function requireLiveSession(req: FastifyRequest): Promise<{
+  ctx: ReturnType<typeof requireTenantContext>;
+  actor: ReturnType<typeof requireActorContext>;
+}> {
+  const ctx = requireTenantContext(req);
+  const actor = requireActorContext(req);
+  const live = await findActiveSessionById(ctx, asSessionId(actor.sessionId));
+  if (live === null) {
+    throw new UnauthenticatedError();
+  }
+  return { ctx, actor };
+}
 
 // ---------------------------------------------------------------------------
 // PHI-safe view: strip tenant_id per Master PRD §17 + Glossary v5.2 C3
@@ -190,8 +233,7 @@ export async function getMedicationRequestByIdHandler(
   req: FastifyRequest<{ Params: { id: string } }>,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const { ctx, actor } = await requireLiveSession(req);
 
   // Validate the id at the boundary. A malformed id MUST produce the
   // SAME 404 envelope as a well-formed-but-not-found id — otherwise an
@@ -240,8 +282,7 @@ export async function listMedicationRequestsForPatientHandler(
   req: FastifyRequest<{ Params: { patientId: string }; Querystring: ListQuery }>,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const { ctx, actor } = await requireLiveSession(req);
 
   // Authorization (patient-self-only at v1.0; widens when clinician role
   // lands). Cross-patient → 404 tenant-blind, identical envelope to

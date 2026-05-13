@@ -115,6 +115,55 @@ export async function findSessionById(
 }
 
 // ---------------------------------------------------------------------------
+// findActiveSessionById — session-liveness primitive for PHI handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the ACTIVE session by session_id. Returns null if no such session
+ * exists, is revoked, or is expired. Used by PHI-handling route handlers
+ * to enforce session liveness on every request (per-handler call AFTER
+ * `requireActorContext()` so a JWT for a revoked / fabricated session_id
+ * cannot read PHI until JWT expiry).
+ *
+ * Caller does not discriminate the three null causes — by I-025 a stale
+ * token failure must look the same as a never-existed token failure to
+ * the requester. The handler maps null → 401 unauthenticated.
+ *
+ * Spec references:
+ *   - Identity & Authentication Spec v1.0 §3.2 (session lifecycle:
+ *     revoked_at, expires_at)
+ *   - I-025 (tenant-blind / token-blind error envelopes — three null
+ *     causes collapse to a single 401)
+ *   - Codex PR-116 R1 HIGH closure (revoked-session bypass on the new
+ *     pharmacy PHI read surface)
+ */
+export async function findActiveSessionById(
+  tenantId: TenantId,
+  sessionId: SessionId,
+  externalTx?: DbClient,
+): Promise<Session | null> {
+  const runner = externalTx
+    ? (fn: (client: DbClient) => Promise<Session | null>) => fn(externalTx)
+    : (fn: (client: DbClient) => Promise<Session | null>) =>
+        withTenantBoundConnection(tenantId, fn);
+  return runner(async (client) => {
+    const result = await client.query<SessionRow>(
+      `SELECT ${SESSION_COLUMNS}
+         FROM sessions
+        WHERE tenant_id = $1
+          AND session_id = $2
+          AND revoked_at IS NULL
+          AND expires_at > NOW()`,
+      [tenantId, sessionId],
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    return rowToSession(row);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // findActiveSessionByRefreshHash — primary refresh-token verification path
 // ---------------------------------------------------------------------------
 
