@@ -67,7 +67,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { UnauthenticatedError, requireActorContext } from '../../../../lib/auth-context.js';
+import { UnauthenticatedError, requirePatientActorContext } from '../../../../lib/auth-context.js';
 import { GlossaryViolationError, asMedicationRequestId } from '../../../../lib/glossary.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -107,10 +107,15 @@ import type { MedicationRequest, MedicationRequestStatus } from '../types.js';
 
 async function requireLiveSession(req: FastifyRequest): Promise<{
   ctx: ReturnType<typeof requireTenantContext>;
-  actor: ReturnType<typeof requireActorContext>;
+  actor: ReturnType<typeof requirePatientActorContext>;
 }> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  // Patient-only at v1.0 PR C/D — every endpoint in this handler module
+  // anchors on the patient actor as the resource subject. PR E adds a
+  // sibling helper requireClinicianLiveSession for the clinician write
+  // surface; until then, a clinician JWT must NOT authenticate through
+  // this path (Codex PR-118 R1 HIGH closure 2026-05-13).
+  const actor = requirePatientActorContext(req);
   const live = await findActiveSessionById(ctx, asSessionId(actor.sessionId));
   if (live === null) {
     throw new UnauthenticatedError();

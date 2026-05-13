@@ -21,7 +21,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { requireActorContext } from '../../../../lib/auth-context.js';
+import { requirePatientActorContext } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -148,7 +148,7 @@ export async function inviteDelegateHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const body = (req.body ?? {}) as InviteBody;
 
   if (
@@ -204,7 +204,7 @@ async function transition<T>(
   toView: (v: T) => unknown,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
     const result = await fn(ctx, { actorId: actor.accountId }, tx);
     if (result === null) {
@@ -309,7 +309,7 @@ export async function listGrantedDelegationsHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const list = await delegationService.listActiveDelegationsForGrantor(
     ctx,
     actor.accountId as AccountId,
@@ -322,7 +322,7 @@ export async function listReceivedDelegationsHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const list = await delegationService.listActiveDelegationsForDelegate(
     ctx,
     actor.accountId as AccountId,
@@ -339,7 +339,7 @@ export async function grantScopeHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const id = (req.params as { id?: string }).id;
   const body = (req.body ?? {}) as GrantScopeBody;
   if (!isString(id) || !isString(body.scope) || !VALID_SCOPES.has(body.scope)) {
@@ -376,7 +376,7 @@ export async function revokeScopeHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const params = req.params as { id?: string; scopeId?: string };
   if (!isString(params.id) || !isString(params.scopeId)) {
     return reply.code(400).send({
@@ -416,7 +416,7 @@ export async function listScopesForDelegationHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  requireActorContext(req); // auth required even for list
+  requirePatientActorContext(req); // auth required even for list
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({

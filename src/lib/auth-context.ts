@@ -163,3 +163,77 @@ export function requireActorContext(req: FastifyRequest): ActorContext {
   }
   return req.actorContext;
 }
+
+// ---------------------------------------------------------------------------
+// Role-gated guards (TLC-058 / 2026-05-13)
+//
+// `requireActorContext()` returns ANY authenticated actor regardless of role.
+// Patient-only and clinician-only handlers MUST opt in to a typed role gate
+// so a clinician JWT can't drive patient-self-service routes (and vice
+// versa). Closes Codex PR-118 R1 HIGH: widening ActorContext.role to
+// include 'clinician' without role gates would let clinician accounts call
+// async-consult initiate / consent grant / pharmacy patient-self-discontinue
+// using their own clinician account_id as the patient anchor, creating
+// patient workflow data under a non-patient identity. Both new helpers
+// throw UnauthorizedRoleError → 403 on role mismatch (NOT 401 — auth IS
+// presented; the issue is the actor's role is wrong for this endpoint).
+//
+// Migration discipline: every existing patient-only handler should swap
+// `requireActorContext` for `requirePatientActorContext` so the role gate
+// is enforced at the SAME point where actor identity is asserted. PR-E
+// (pharmacy clinician writes) adds `requireClinicianActorContext` on its
+// new clinician-only handlers. Routes that legitimately accept multiple
+// roles (e.g., admin surfaces) stay on the generic `requireActorContext`
+// and bring their own per-route role logic.
+// ---------------------------------------------------------------------------
+
+export class UnauthorizedRoleError extends Error {
+  readonly statusCode = 403;
+  readonly code = 'internal.auth.insufficient_scope';
+  constructor(
+    public readonly required: 'patient' | 'clinician',
+    public readonly observed: 'patient' | 'clinician',
+  ) {
+    super(`This endpoint requires role=${required}; actor role=${observed}.`);
+    this.name = 'UnauthorizedRoleError';
+  }
+}
+
+/**
+ * Assert that the request carries an authenticated PATIENT actor.
+ * Returns a narrowed ActorContext typed as `role: 'patient'` so
+ * downstream handlers can use `actor.accountId` as the patient anchor
+ * with TypeScript-level confidence the actor IS a patient.
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'patient'
+ */
+export function requirePatientActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'patient' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'patient') {
+    throw new UnauthorizedRoleError('patient', actor.role);
+  }
+  return actor as ActorContext & { role: 'patient' };
+}
+
+/**
+ * Assert that the request carries an authenticated CLINICIAN actor.
+ * Mirror of requirePatientActorContext; lands ahead of TLC-055 PR E so
+ * the new clinician write handlers can adopt this pattern day-1.
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'clinician'
+ */
+export function requireClinicianActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'clinician' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'clinician') {
+    throw new UnauthorizedRoleError('clinician', actor.role);
+  }
+  return actor as ActorContext & { role: 'clinician' };
+}

@@ -45,7 +45,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { requireActorContext } from '../../../../lib/auth-context.js';
+import { requirePatientActorContext } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import type { AccountId } from '../../../identity/internal/types.js';
@@ -211,7 +211,7 @@ export async function initiateConsultHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const body = (req.body ?? {}) as InitiateBody;
 
   if (
@@ -264,7 +264,7 @@ export async function submitConsultHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const consultId = asConsultId(req.params.id);
   const body = (req.body ?? {}) as SubmitBody;
 
@@ -301,7 +301,7 @@ export async function abandonConsultHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const consultId = asConsultId(req.params.id);
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
@@ -324,7 +324,7 @@ export async function resumeConsultHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const consultId = asConsultId(req.params.id);
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
@@ -347,7 +347,7 @@ export async function patientRespondsConsultHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const consultId = asConsultId(req.params.id);
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
@@ -370,7 +370,7 @@ export async function listConsultEventsHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const consultId: ConsultId = asConsultId(req.params.id);
 
   // Service layer enforces patient ownership (Codex async-consult-r13

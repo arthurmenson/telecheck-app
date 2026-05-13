@@ -10,7 +10,7 @@
  *   4. verifyAccessToken accepts the canonical role values + rejects
  *      out-of-enum values at the JWT decode boundary.
  *
- * Coverage (3 groups, 7 cases):
+ * Coverage (4 groups, 10 cases):
  *
  *   Group A — account_type → role mapping at session issuance
  *     A1 account_type='clinician' → JWT carries role='clinician'
@@ -25,6 +25,11 @@
  *   Group C — JWT-layer role enum enforcement
  *     C1 verifyAccessToken accepts role='clinician'
  *     C2 verifyAccessToken rejects forged role='admin' as invalid_payload
+ *
+ *   Group D — Patient-only routes reject clinician JWTs (Codex R1 HIGH closure)
+ *     D1 clinician JWT → 403 on POST /v0/async-consult
+ *     D2 clinician JWT → 403 on GET /v0/pharmacy/prescriptions/:id
+ *     D3 clinician JWT → 403 on POST /v0/pharmacy/prescriptions/:id/discontinue
  *
  * Spec references:
  *   - RBAC v1.1 §1.2 (Clinician role; tenant-scoped) + §6 (multi-tenant)
@@ -266,5 +271,129 @@ describe('clinician-role-claim — Group C: verifyAccessToken role enum', () => 
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.reason).toBe('invalid_payload');
+  });
+});
+
+// ===========================================================================
+// Group D — Patient-role gates reject clinician JWTs (Codex R1 HIGH closure)
+//
+// Widening the role enum without role gates would let clinician accounts
+// drive patient-only workflows. The fix is `requirePatientActorContext()`
+// on every patient handler; these tests prove a clinician JWT cannot
+// reach patient-only routes via the auth path.
+// ===========================================================================
+
+describe('clinician-role-claim — Group D: patient-only routes reject clinician JWTs', () => {
+  it('D1 clinician JWT → 403 on POST /v0/async-consult (patient-initiate)', async () => {
+    // App fixture needed for HTTP-layer assertions. Lazy-import to keep
+    // the unit-style §A-C tests from spinning up the app when only the
+    // service-layer + DB layers are under test.
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      const clinicianId = await insertAccount('clinician');
+      const sessionId = asSessionId(ulid());
+      const { accessToken } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: clinicianId },
+        {
+          session_id: sessionId,
+          account_id: clinicianId,
+        },
+      );
+
+      const r = await app.inject({
+        method: 'POST',
+        url: '/v0/async-consult',
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${accessToken}`,
+          'idempotency-key': ulid(),
+        },
+        payload: {
+          account_id: clinicianId,
+          consult_type: 'general',
+          modality: 'async',
+        },
+      });
+
+      expect(r.statusCode).toBe(403);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D2 clinician JWT → 403 on GET /v0/pharmacy/prescriptions/:id (patient-self read)', async () => {
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      const clinicianId = await insertAccount('clinician');
+      const sessionId = asSessionId(ulid());
+      const { accessToken } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: clinicianId },
+        {
+          session_id: sessionId,
+          account_id: clinicianId,
+        },
+      );
+
+      const r = await app.inject({
+        method: 'GET',
+        url: `/v0/pharmacy/prescriptions/mrx_${ulid()}`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${accessToken}`,
+        },
+      });
+
+      expect(r.statusCode).toBe(403);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D3 clinician JWT → 403 on POST /v0/pharmacy/prescriptions/:id/discontinue (patient-self write)', async () => {
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      const clinicianId = await insertAccount('clinician');
+      const sessionId = asSessionId(ulid());
+      const { accessToken } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: clinicianId },
+        {
+          session_id: sessionId,
+          account_id: clinicianId,
+        },
+      );
+
+      const r = await app.inject({
+        method: 'POST',
+        url: `/v0/pharmacy/prescriptions/mrx_${ulid()}/discontinue`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${accessToken}`,
+          'idempotency-key': ulid(),
+        },
+        payload: {},
+      });
+
+      expect(r.statusCode).toBe(403);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
   });
 });
