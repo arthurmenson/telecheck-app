@@ -42,11 +42,17 @@
 
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withTransaction } from '../../../../lib/db.js';
+import { asMedicationRequestId } from '../../../../lib/glossary.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
-import { emitMedicationRequestDiscontinued } from '../../audit.js';
+import { ulid } from '../../../../lib/ulid.js';
+import {
+  emitMedicationRequestDiscontinued,
+  emitMedicationRequestDrafted,
+  emitMedicationRequestSubmittedForReview,
+} from '../../audit.js';
 import { emitMedicationRequestDiscontinued as emitMedicationRequestDiscontinuedDomainEvent } from '../../domain-events.js';
 import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
-import type { MedicationRequest, MedicationRequestId } from '../types.js';
+import type { MedicationRequest, MedicationRequestId, ProductCatalogId } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Error classes (mirror async-consult's typed error → HTTP mapping pattern)
@@ -202,6 +208,159 @@ export async function discontinueByPatient(
         actor_id: actor.accountId,
       },
     });
+
+    return updated;
+  }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
+// createDraftAsClinician — first PR E write operation
+//
+// Per State Machines v1.2 §19, the draft creation is clinician-origin
+// and NOT I-012-gated (the I-012 gate sits at the activation transitions
+// clinician_approve / protocol_authorized_prescribing). createDraft just
+// captures the prescriber's intended medication; the engine evaluation +
+// clinician approval cycle happens after submit_for_review.
+//
+// Composition (single transaction):
+//   1. Generate canonical MedicationRequestId (mrx_<ULID>).
+//   2. repo.createDraft inside the tx (composite FKs enforce same-tenant
+//      patient, consult, product_catalog at the durable boundary).
+//   3. emitAudit medication_request.drafted (Category A, actor_type=clinician).
+//
+// No domain event emitted at draft creation — DOMAIN_EVENTS v5.2 reserves
+// medication_request.approved.v1 for the activation handoff. Draft rows
+// are not yet authoritative for downstream subscribers.
+// ---------------------------------------------------------------------------
+
+export interface CreateDraftAsClinicianInput {
+  patient_account_id: string;
+  product_catalog_id: ProductCatalogId;
+  medication_name: string;
+  strength: string;
+  formulation: string;
+  dose_instructions: string;
+  quantity: number;
+  quantity_unit: string;
+  refills_allowed: number;
+  indication: string | null;
+  clinical_notes: string | null;
+  prescribing_consult_id: string | null;
+  country_of_care: string;
+  protocol_id: string | null;
+  protocol_version: string | null;
+}
+
+export async function createDraftAsClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  input: CreateDraftAsClinicianInput,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    const medicationRequestId = asMedicationRequestId(`mrx_${ulid()}`);
+
+    const created = await medicationRequestRepo.createDraft(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        patient_account_id: input.patient_account_id,
+        product_catalog_id: input.product_catalog_id,
+        medication_name: input.medication_name,
+        strength: input.strength,
+        formulation: input.formulation,
+        dose_instructions: input.dose_instructions,
+        quantity: input.quantity,
+        quantity_unit: input.quantity_unit,
+        refills_allowed: input.refills_allowed,
+        indication: input.indication,
+        clinical_notes: input.clinical_notes,
+        prescribing_consult_id: input.prescribing_consult_id,
+        country_of_care: input.country_of_care,
+        protocol_id: input.protocol_id,
+        protocol_version: input.protocol_version,
+      },
+      tx,
+    );
+
+    await emitMedicationRequestDrafted(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: input.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        detail: {},
+      },
+      tx,
+    );
+
+    return created;
+  }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
+// submitForReviewAsClinician — clinician advances draft → pending_interaction_check
+//
+// Per State Machines v1.2 §19, submit_for_review is clinician-origin and
+// NOT I-012-gated. The transition hands the draft off to the Med
+// Interaction Engine (which writes back via recordInteractionEvaluation
+// in PR F).
+//
+// Composition:
+//   1. Load by id; verify the row exists.
+//   2. Status precondition: must be 'draft'.
+//   3. repo.transitionStatus(draft → pending_interaction_check,
+//      event=submit_for_review). The repo's validateTransition fires
+//      first; the optimistic-concurrency WHERE filters concurrent writers.
+//   4. emitAudit medication_request.submitted_for_review.
+// ---------------------------------------------------------------------------
+
+export async function submitForReviewAsClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  medicationRequestId: MedicationRequestId,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    if (current === null) {
+      throw new MedicationRequestNotFoundError(medicationRequestId);
+    }
+    if (current.status !== 'draft') {
+      throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
+    }
+
+    const updated = await medicationRequestRepo.transitionStatus(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        expected_from_status: 'draft',
+        to_status: 'pending_interaction_check',
+        event: 'submit_for_review',
+      },
+      tx,
+    );
+    if (updated === null) {
+      // Concurrent writer raced the optimistic-concurrency UPDATE.
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    await emitMedicationRequestSubmittedForReview(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: current.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        detail: {},
+      },
+      tx,
+    );
 
     return updated;
   }, externalTx);
