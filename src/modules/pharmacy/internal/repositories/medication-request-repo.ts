@@ -889,6 +889,14 @@ export async function markSuperseded(
     // transitionStatus's activation envelope) BEFORE calling
     // markSuperseded; otherwise the EXISTS check fires and this returns
     // null (the caller maps to a conflict-error response).
+    // Same-patient binding (added Codex TLC-055 PR A R3 HIGH closure
+    // 2026-05-13): the EXISTS predicate also requires
+    // new_row.patient_account_id = old.patient_account_id. Without this,
+    // a service-layer mix-up could mark patient A's active prescription
+    // as superseded by patient B's active replacement (same tenant, same
+    // pointer shape, different patient). That would corrupt the
+    // medication chain and cross-link PHI in downstream subscription /
+    // notification / refill / audit consumers.
     const result = await client.query<MedicationRequestRow>(
       `UPDATE medication_requests AS old
           SET status = 'superseded',
@@ -903,6 +911,7 @@ export async function markSuperseded(
                AND new_row.tenant_id = $3
                AND new_row.status = 'active'
                AND new_row.supersedes_id = $2
+               AND new_row.patient_account_id = old.patient_account_id
           )
         RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
       [input.new_id, input.old_id, input.tenant_id],

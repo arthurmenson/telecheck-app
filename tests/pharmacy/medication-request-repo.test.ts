@@ -578,7 +578,7 @@ describe('medication-request-repo — §8 markSuperseded', () => {
     expect(result).toBeNull();
   });
 
-  it('§8d UPDATE WHERE-clause includes EXISTS subquery requiring new row to be active + reciprocally-bound', async () => {
+  it('§8d UPDATE WHERE-clause includes EXISTS subquery requiring new row to be active + reciprocally-bound + same-patient', async () => {
     const { client, captured } = makeMockClient([[]]);
     await markSuperseded({ tenant_id: TENANT, old_id: ROW_ID, new_id: ROW_ID_2 }, client);
     const update = captured[0];
@@ -587,6 +587,9 @@ describe('medication-request-repo — §8 markSuperseded', () => {
     expect(update?.text).toContain('FROM medication_requests AS new_row');
     expect(update?.text).toContain("new_row.status = 'active'");
     expect(update?.text).toContain('new_row.supersedes_id = $2');
+    // The same-patient binding (Codex R3 HIGH closure) — closes
+    // cross-patient supersession at the write boundary.
+    expect(update?.text).toContain('new_row.patient_account_id = old.patient_account_id');
   });
 });
 
