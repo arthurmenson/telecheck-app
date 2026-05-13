@@ -34,6 +34,7 @@
  *     D5 clinician JWT → 403 on POST /v0/forms/resume (Codex R2 HIGH closure)
  *     D6 clinician JWT → 403 on GET /v0/forms/submissions/:submissionId/snapshot (R3)
  *     D7 clinician JWT → 403 on GET /v0/forms/snapshots/:snapshotId (R3)
+ *     D8 patient B → 404 on GET /v0/consent/delegations/:id/scopes for patient A's delegation (R4)
  *
  * Spec references:
  *   - RBAC v1.1 §1.2 (Clinician role; tenant-scoped) + §6 (multi-tenant)
@@ -514,6 +515,69 @@ describe('clinician-role-claim — Group D: patient-only routes reject clinician
       expect(r.statusCode).toBe(403);
       const body = r.json<{ error: { code: string } }>();
       expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D8 patient B → 404 on GET /v0/consent/delegations/:id/scopes for patient A delegation (R4)', async () => {
+    // Codex R4 surfaced this beyond the role-gate sweep: even with
+    // requirePatientActorContext blocking clinicians, the handler
+    // listed scopes by tenant+delegation_id only — same-tenant
+    // patient B could enumerate patient A's delegation scopes. R4
+    // closure: ownership check (actor must be grantor or delegate).
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      // Patient A is grantor, patient C is delegate (the two parties
+      // bound to the delegation). Patient B is uninvolved.
+      const patientA = await insertAccount('patient');
+      const patientC = await insertAccount('patient');
+      const patientB = await insertAccount('patient');
+
+      // Seed an active delegation A → C directly (bypasses the
+      // invite/accept flow for fixture brevity).
+      const delegationId = ulid();
+      await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        await client.query(
+          `INSERT INTO delegations (
+              delegation_id, tenant_id, grantor_account_id, delegate_account_id,
+              relationship_type, status, accepted_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+          [delegationId, T_US, patientA, patientC, 'spouse_partner', 'active'],
+        );
+      });
+
+      // Mint a token for patient B (the uninvolved third party).
+      const sessionIdB = asSessionId(ulid());
+      const { accessToken: tokenB } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: patientB },
+        {
+          session_id: sessionIdB,
+          account_id: patientB,
+        },
+      );
+
+      // Patient B requests the scopes for patient A's delegation.
+      // Without the ownership check, this would return [] (empty
+      // array since no scopes are seeded); with R4 closure, it
+      // returns tenant-blind 404.
+      const r = await app.inject({
+        method: 'GET',
+        url: `/v0/consent/delegations/${delegationId}/scopes`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${tokenB}`,
+        },
+      });
+
+      expect(r.statusCode).toBe(404);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.resource.not_found');
     } finally {
       await app.close();
     }

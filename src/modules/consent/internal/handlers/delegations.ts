@@ -416,7 +416,7 @@ export async function listScopesForDelegationHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  requirePatientActorContext(req); // auth required even for list
+  const actor = requirePatientActorContext(req);
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({
@@ -428,6 +428,34 @@ export async function listScopesForDelegationHandler(
     });
   }
 
-  const list = await delegationService.listActiveScopesForDelegation(ctx, asDelegationId(id));
+  // Ownership check (Codex PR-118 R4 HIGH closure 2026-05-13). The
+  // role gate at requirePatientActorContext blocks clinician JWTs but
+  // does NOT prevent same-tenant patient B from reading patient A's
+  // delegation scopes by guessing or harvesting the delegation_id.
+  // Fix: load the delegation row and verify actor is the grantor OR
+  // delegate; mismatch → tenant-blind 404 per I-025 (collapsed with
+  // the not-found envelope so a same-tenant attacker cannot
+  // distinguish "exists but not yours" from "doesn't exist").
+  const delegationId = asDelegationId(id);
+  const delegation = await delegationService.findDelegationById(ctx, delegationId);
+  const tenantBlindNotFound = (): unknown =>
+    reply.code(404).send({
+      error: {
+        code: 'internal.resource.not_found',
+        message: 'Delegation not found.',
+        request_id: req.id,
+      },
+    });
+  if (delegation === null) {
+    return tenantBlindNotFound();
+  }
+  if (
+    delegation.grantor_account_id !== actor.accountId &&
+    delegation.delegate_account_id !== actor.accountId
+  ) {
+    return tenantBlindNotFound();
+  }
+
+  const list = await delegationService.listActiveScopesForDelegation(ctx, delegationId);
   return reply.code(200).send({ scopes: list.map(scopeToPatientView) });
 }
