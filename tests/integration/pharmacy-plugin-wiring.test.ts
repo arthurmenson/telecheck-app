@@ -1,23 +1,35 @@
 /**
  * pharmacy slice — plugin wiring smoke test.
  *
- * Sprint 1 / TLC-001 (Pharmacy module skeleton, blocked-aware).
+ * Sprint 1 / TLC-001 (Pharmacy module skeleton, blocked-aware) initially;
+ * updated Sprint 35 post-P-011 / SI-001 closure 2026-05-11.
  *
- * The full pharmacy slice is BLOCKED on SI-001 (MedicationRequest
- * schema gap). At v0.1 we ship the directory + plugin shell so that:
- *   1. The module boundary (per ADR-001) is established now
- *   2. App-level wiring (`src/app.ts`) is stable
- *   3. Cross-module callers can typed-import branded ID types ahead
- *      of full implementation
+ * SI-001 (MedicationRequest schema gap) is RATIFIED — CDM v1.3 §4.16 +
+ * State Machines v1.2 §19 + AUDIT_EVENTS v5.3 + DOMAIN_EVENTS v5.2
+ * in-place are canonical in the spec corpus (Promotion Ledger P-011;
+ * telecheckONE commit 879cd57). The pharmacy scaffold (migration 025 +
+ * branded ID types + I-012-gated state machine + audit emitter v5.3)
+ * landed via PR #110 (commit a8c9b99).
  *
- * This test asserts the only currently-mounted route returns the
- * documented BLOCKED state — so a premature production deploy
- * surfaces the BLOCKED status to operator monitoring rather than
- * masquerading as a working module.
+ * The HANDLER SURFACE is the remaining gap — tracked as Sprint 35-36 /
+ * TLC-055 (pharmacy slice handler implementation + repository layer +
+ * supersession reciprocity constraint trigger). Until TLC-055 lands:
+ *   - `/health` reports `phase: 'schema_ratified_handlers_pending'` +
+ *     `schema_ratified: true` + `handlers_wired: false` for operator
+ *     monitoring.
+ *   - `/ready` returns 503 with `pending: 'TLC-055'`. The Kubernetes/
+ *     load-balancer readiness probe keeps traffic away from the module's
+ *     real routes (which don't exist yet) so a premature production
+ *     deploy surfaces the pending status rather than masquerading as a
+ *     working module.
+ *
+ * This test asserts both endpoints carry the post-P-011 messaging.
  *
  * Spec references:
- *   - docs/SI-001-MedicationRequest-Schema-Gap.md
- *   - src/modules/pharmacy/README.md
+ *   - docs/SI-001-MedicationRequest-Schema-Gap.md (status: RATIFIED 2026-05-11)
+ *   - CDM v1.3 §4.16 (in telecheckONE; commit 879cd57)
+ *   - migrations/025_medication_requests.sql
+ *   - src/modules/pharmacy/routes.ts (v0.2)
  *   - ADR-001 (modular monolith)
  */
 
@@ -40,8 +52,8 @@ afterAll(async () => {
   }
 });
 
-describe('pharmacy slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/pharmacy/health returns 200 (liveness — module alive) with SI-001 metadata', async () => {
+describe('pharmacy slice — §1 plugin wiring (post-P-011 phase: schema_ratified_handlers_pending)', () => {
+  it('§1a GET /v0/pharmacy/health returns 200 (liveness) with schema_ratified=true + handlers_wired=false', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/pharmacy/health',
@@ -51,17 +63,24 @@ describe('pharmacy slice — §1 plugin wiring', () => {
     const body = r.json<{
       status: string;
       module: string;
-      blocked: string;
-      blocked_message: string;
+      phase: string;
+      schema_ratified: boolean;
+      schema_ratified_at: string;
+      schema_ratified_by: string;
+      handlers_wired: boolean;
+      handlers_wired_tracking: string;
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('pharmacy');
-    expect(body.blocked).toBe('SI-001');
-    expect(body.blocked_message).toContain('SI-001');
-    expect(body.blocked_message).toContain('MedicationRequest');
+    expect(body.phase).toBe('schema_ratified_handlers_pending');
+    expect(body.schema_ratified).toBe(true);
+    expect(body.schema_ratified_at).toBe('2026-05-11');
+    expect(body.schema_ratified_by).toBe('P-011');
+    expect(body.handlers_wired).toBe(false);
+    expect(body.handlers_wired_tracking).toBe('TLC-055');
   });
 
-  it('§1b GET /v0/pharmacy/ready returns 503 (not ready for traffic) while SI-001 open', async () => {
+  it('§1b GET /v0/pharmacy/ready returns 503 (not ready — handlers pending TLC-055)', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/pharmacy/ready',
@@ -71,12 +90,19 @@ describe('pharmacy slice — §1 plugin wiring', () => {
     const body = r.json<{
       status: string;
       module: string;
-      blocked: string;
-      blocked_message: string;
+      phase: string;
+      pending: string;
+      pending_message: string;
     }>();
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('pharmacy');
-    expect(body.blocked).toBe('SI-001');
-    expect(body.blocked_message).toContain('not ready to serve traffic');
+    expect(body.phase).toBe('schema_ratified_handlers_pending');
+    expect(body.pending).toBe('TLC-055');
+    expect(body.pending_message).toContain('not ready to serve traffic');
+    expect(body.pending_message).toContain('handler surface');
+    expect(body.pending_message).toContain('TLC-055');
+    // The post-P-011 message MUST NOT claim the schema is unresolved —
+    // SI-001 closed via P-011 on 2026-05-11; the gap is handler wiring.
+    expect(body.pending_message).not.toContain('schema not yet ratified');
   });
 });
