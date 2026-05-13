@@ -229,11 +229,18 @@ BEGIN
     END LOOP;
 
     IF violation_count > 0 THEN
+        -- NOTE: the format-string position in RAISE EXCEPTION must be a
+        -- single string literal (PL/pgSQL parser requirement). Adjacent
+        -- E-strings are concatenated by the parser at parse time;
+        -- runtime `||` concatenation is NOT permitted here. The
+        -- violation_sample substitution carries the newline-separated
+        -- lines built up in the FOR loops above.
         RAISE EXCEPTION
-            'migration 026 apply-time validation found % pre-existing supersession-reciprocity violation(s); '
-            'sample (first 3):' || E'\n' || '%' ||
-            'REPAIR THE VIOLATIONS BEFORE RE-APPLYING THIS MIGRATION. '
-            'Migration rolled back; trigger NOT installed.',
+            E'migration 026 apply-time validation found % pre-existing supersession-reciprocity violation(s); '
+            E'sample (first 3):\n'
+            E'%'
+            E'REPAIR THE VIOLATIONS BEFORE RE-APPLYING THIS MIGRATION. '
+            E'Migration rolled back; trigger NOT installed.',
             violation_count, violation_sample
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
