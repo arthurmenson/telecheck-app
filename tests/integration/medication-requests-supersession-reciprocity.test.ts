@@ -525,28 +525,19 @@ describe('migration 026 — supersession reciprocity trigger', () => {
     // adversary with SQL access could bypass reciprocity enforcement.
     const T = TENANT_US;
 
+    const client = getTestClient();
+
     await withTenantContext(T, async () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
       const clinician = await insertClinician(T);
 
-      const client = getTestClient();
-
-      // Attempt the shadow-table attack: create an empty TEMP TABLE
-      // with the same name, then prepend pg_temp to search_path so
-      // unqualified lookups resolve to the empty shadow first.
-      await client.query(
-        'CREATE TEMP TABLE medication_requests (id VARCHAR(30) PRIMARY KEY) ON COMMIT DROP',
-      );
-      await client.query('SET LOCAL search_path = pg_temp, public');
-
-      // Construct a one-sided edge (same as §2). If the trigger's
-      // function-level search_path lock is in place, the SELECT inside
-      // the trigger resolves to public.medication_requests despite the
-      // session's pg_temp-first search_path, and the violation is
-      // caught. If the lock is missing, the SELECT resolves to the
-      // empty pg_temp shadow, returns NOT FOUND, and the trigger
-      // silently returns NULL — letting the bad edge commit.
+      // Insert the one-sided edge FIRST while search_path still
+      // resolves to public.medication_requests — otherwise the test's
+      // own INSERTs would land in the empty shadow table. The
+      // deferred-trigger events queue at INSERT/UPDATE time but
+      // evaluate at SET CONSTRAINTS time (below), so the shadow needs
+      // to be in place only when the trigger fires.
       const aId = mrxId();
       const bId = mrxId();
       await insertMedicationRequest({
@@ -568,10 +559,27 @@ describe('migration 026 — supersession reciprocity trigger', () => {
       });
       await setForwardPointer(aId, bId);
 
-      const result = await forceConstraintCheck();
-      expect(result).not.toBeNull();
-      expect(result).toMatch(/reciprocity violated/i);
+      // NOW mount the shadow-table attack: create an empty TEMP TABLE
+      // with the same name and prepend pg_temp to search_path. The
+      // trigger's deferred events are queued; when SET CONSTRAINTS
+      // forces them to fire, the trigger function executes under its
+      // declared search_path = pg_catalog, public AND uses
+      // public.medication_requests schema-qualification — so the
+      // re-fetch should still find the real rows and raise.
+      await client.query(
+        'CREATE TEMP TABLE medication_requests (id VARCHAR(30) PRIMARY KEY) ON COMMIT DROP',
+      );
+      await client.query('SET LOCAL search_path = pg_temp, public');
     });
+
+    // forceConstraintCheck runs SET CONSTRAINTS ALL IMMEDIATE. If the
+    // trigger's function-level search_path lock or schema qualification
+    // regress, the re-fetch resolves to the empty pg_temp shadow,
+    // returns NOT FOUND, and the trigger silently returns NULL — the
+    // assertion below would then fail (no error raised).
+    const result = await forceConstraintCheck();
+    expect(result).not.toBeNull();
+    expect(result).toMatch(/reciprocity violated/i);
   });
 
   it('§7 RLS context switch before COMMIT does NOT bypass the trigger', async () => {
