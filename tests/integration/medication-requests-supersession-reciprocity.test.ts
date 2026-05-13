@@ -12,10 +12,22 @@
  * if any row violates reciprocity. This is the same evaluation Postgres
  * would run at COMMIT in production.
  *
+ * FK ORDERING: migration 025 declares the supersession self-FKs without
+ * DEFERRABLE, so they remain IMMEDIATE. SET CONSTRAINTS ALL DEFERRED
+ * cannot defer them. Tests must insert rows in an order the IMMEDIATE
+ * FKs accept:
+ *   1. INSERT A as status='active' with NULL forward pointer
+ *   2. INSERT B as status='active' with supersedes_id=A.id (B's FK to A
+ *      satisfied because A already exists)
+ *   3. UPDATE A SET status='superseded', superseded_by_id=B.id (A's FK
+ *      to B satisfied because B exists)
+ *   4. SET CONSTRAINTS ALL IMMEDIATE — forces the deferred reciprocity
+ *      trigger to evaluate at this point
+ *
  * Scenarios:
- *   §1 happy path                — reciprocal A↔B passes
- *   §2 one-sided forward         — A.superseded_by=B but B.supersedes_id=NULL
- *   §3 mismatched edge           — A.superseded_by=B but B.supersedes_id=C
+ *   §1 happy path                 — reciprocal A↔B passes
+ *   §2 one-sided forward          — A.superseded_by=B but B.supersedes_id=NULL
+ *   §3 mismatched edge            — A.superseded_by=B but B.supersedes_id=C
  *   §4 cross-patient supersession — A.patient=P1, B.patient=P2 — fails
  *   §5 reverse-edge bad-status    — B.supersedes_id=A but A.status='active'
  *
@@ -38,7 +50,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { ulid } from '../../src/lib/ulid.ts';
-import { TENANT_US, createTestUser, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
@@ -57,37 +69,27 @@ function mrxId(): string {
 }
 
 interface InsertMedicationRequestInput {
-  id?: string;
+  id: string;
   tenant_id: string;
   patient_account_id: string;
   product_catalog_id: string;
-  status:
-    | 'draft'
-    | 'pending_interaction_check'
-    | 'pending_clinician_review'
-    | 'active'
-    | 'discontinued'
-    | 'superseded'
-    | 'expired'
-    | 'rejected';
+  status: 'active' | 'superseded';
   supersedes_id?: string | null;
-  superseded_by_id?: string | null;
-  discontinued_reason?: string | null;
-  interaction_signals_status?: 'pending' | 'clean' | 'caution' | 'safety_hold';
 }
 
 /**
- * Insert a medication_request row. Defaults the snapshot/clinical columns
- * to canonical fixture values; the test only configures the fields the
- * supersession trigger cares about (id, tenant_id, patient_account_id,
- * status, supersedes_id, superseded_by_id).
+ * INSERT a medication_request row with status ∈ {'active', 'superseded'}.
+ * Defaults the snapshot/clinical columns to canonical fixture values.
+ * Used only as the FIRST step of a 2-row reciprocity scenario; the
+ * forward-pointer half of the edge is applied via a follow-up UPDATE
+ * (see setForwardPointer below) so the IMMEDIATE self-FK in migration
+ * 025 never sees a dangling reference.
  *
  * MUST be invoked inside a withTenantContext() block — RLS WITH CHECK
  * requires current_tenant_id() to match the row's tenant_id at INSERT.
  */
-async function insertMedicationRequest(input: InsertMedicationRequestInput): Promise<string> {
+async function insertMedicationRequest(input: InsertMedicationRequestInput): Promise<void> {
   const client = getTestClient();
-  const id = input.id ?? mrxId();
   await client.query(
     `INSERT INTO medication_requests (
         id, tenant_id,
@@ -96,10 +98,8 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
         dose_instructions, quantity, quantity_unit, refills_allowed,
         status,
         prescribed_at, activated_at,
-        prescribed_by_clinician_account_id,
         interaction_signals_status,
-        supersedes_id, superseded_by_id,
-        discontinued_reason, discontinued_at,
+        supersedes_id,
         country_of_care
      ) VALUES (
         $1, $2,
@@ -110,12 +110,10 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
         $13, $14,
         $15,
         $16,
-        $17, $18,
-        $19, $20,
-        $21
+        $17
      )`,
     [
-      id,
+      input.id,
       input.tenant_id,
       input.patient_account_id,
       input.product_catalog_id,
@@ -127,22 +125,34 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
       'tablet',
       0,
       input.status,
-      // Pre-active rows leave prescribed_at/activated_at NULL; post-draft
-      // rows get a timestamp so the row resembles a real activation.
-      input.status === 'draft' ? null : new Date().toISOString(),
-      input.status === 'draft' ? null : new Date().toISOString(),
-      // prescribed_by_clinician_account_id is nullable only when status='draft'.
-      // For test rows that need a clinician, supply one from the closure.
-      null,
-      input.interaction_signals_status ?? 'pending',
+      new Date().toISOString(),
+      new Date().toISOString(),
+      'clean',
       input.supersedes_id ?? null,
-      input.superseded_by_id ?? null,
-      input.discontinued_reason ?? (input.status === 'discontinued' ? 'clinical_decision' : null),
-      input.status === 'discontinued' ? new Date().toISOString() : null,
       'US',
     ],
   );
-  return id;
+}
+
+/**
+ * UPDATE a medication_request row to flip it into the 'superseded' state
+ * with a forward pointer. Migration 025's row-local CHECKs require the
+ * combination (status='superseded' AND superseded_by_id IS NOT NULL) or
+ * (status<>'superseded' AND superseded_by_id IS NULL); this helper sets
+ * both in one statement so the per-row CHECK is satisfied at the same
+ * instant the UPDATE lands.
+ */
+async function setForwardPointer(
+  id: string,
+  forwardId: string,
+  newStatus: 'superseded' = 'superseded',
+): Promise<void> {
+  await getTestClient().query(
+    `UPDATE medication_requests
+        SET status = $2, superseded_by_id = $3
+      WHERE id = $1`,
+    [id, newStatus, forwardId],
+  );
 }
 
 /**
@@ -227,9 +237,9 @@ async function insertProduct(tenantId: string): Promise<string> {
 
 /**
  * Force the DEFERRABLE INITIALLY DEFERRED reciprocity trigger to evaluate
- * NOW. Mirrors the COMMIT-time evaluation Postgres would do in production.
- * Returns the trigger error message if a violation was raised, or null on
- * pass.
+ * NOW. Mirrors the COMMIT-time evaluation Postgres would do in
+ * production. Returns the trigger error message if a violation was
+ * raised, or null on pass.
  */
 async function forceConstraintCheck(): Promise<string | null> {
   const client = getTestClient();
@@ -250,34 +260,25 @@ describe('migration 026 — supersession reciprocity trigger', () => {
     const T = TENANT_US;
 
     await withTenantContext(T, async () => {
-      // Establish a non-superuser clinician identity for the actor channel.
-      // Not directly referenced by the trigger, but documents the scenario.
-      await createTestUser(T, 'clinician');
-
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
 
-      // Build the canonical activation pair:
-      //   A — the original (status='superseded', superseded_by_id=B)
-      //   B — the replacement (status='active', supersedes_id=A)
-      // Both same tenant + same patient + status set consistently with
-      // the row-local CHECK constraints in migration 025.
+      // FK-safe insert order:
+      //   1. A as 'active' (no pointers)
+      //   2. B as 'active' with supersedes_id=A.id (FK to A satisfied)
+      //   3. UPDATE A to 'superseded' with superseded_by_id=B.id (FK to B satisfied)
+      // After step 3 both halves of the edge are reciprocal; the
+      // deferred trigger queued for B (step 2 INSERT) and A (step 3
+      // UPDATE) fires at SET CONSTRAINTS IMMEDIATE.
       const aId = mrxId();
       const bId = mrxId();
-
-      // Insert A initially as 'superseded' pointing forward at B. The
-      // composite self-FK requires B to exist first, so insert B first,
-      // then A — but A's status='superseded' requires superseded_by_id
-      // to be set per CHECK constraint
-      // `medication_requests_superseded_by_id_only_on_superseded`. Order:
-      //   1. INSERT B (status='active', supersedes_id=A) — FK to A needs A to exist.
-      //   2. INSERT A (status='superseded', superseded_by_id=B).
-      // Two FKs would create a chicken-and-egg. Resolution: use
-      // SET CONSTRAINTS ALL DEFERRED inside this test so the two
-      // self-FKs are also deferred — they evaluate at SET CONSTRAINTS
-      // ALL IMMEDIATE alongside the reciprocity trigger.
-      await getTestClient().query('SET CONSTRAINTS ALL DEFERRED');
-
+      await insertMedicationRequest({
+        id: aId,
+        tenant_id: T,
+        patient_account_id: patient,
+        product_catalog_id: product,
+        status: 'active',
+      });
       await insertMedicationRequest({
         id: bId,
         tenant_id: T,
@@ -285,17 +286,8 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         product_catalog_id: product,
         status: 'active',
         supersedes_id: aId,
-        interaction_signals_status: 'clean',
       });
-      await insertMedicationRequest({
-        id: aId,
-        tenant_id: T,
-        patient_account_id: patient,
-        product_catalog_id: product,
-        status: 'superseded',
-        superseded_by_id: bId,
-        interaction_signals_status: 'clean',
-      });
+      await setForwardPointer(aId, bId);
 
       const result = await forceConstraintCheck();
       expect(result).toBeNull();
@@ -309,66 +301,57 @@ describe('migration 026 — supersession reciprocity trigger', () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
 
+      // A and B both 'active'; B never points back at A. Then flip A
+      // to 'superseded' with forward pointer to B — but B's back
+      // pointer remains NULL. Reciprocity violated.
       const aId = mrxId();
       const bId = mrxId();
-
-      await getTestClient().query('SET CONSTRAINTS ALL DEFERRED');
-
-      // B exists but does NOT carry the matching back-pointer.
+      await insertMedicationRequest({
+        id: aId,
+        tenant_id: T,
+        patient_account_id: patient,
+        product_catalog_id: product,
+        status: 'active',
+      });
       await insertMedicationRequest({
         id: bId,
         tenant_id: T,
         patient_account_id: patient,
         product_catalog_id: product,
         status: 'active',
+        // B does NOT carry the matching back-pointer.
         supersedes_id: null,
-        interaction_signals_status: 'clean',
       });
-      // A points forward at B but B doesn't point back. One-sided edge.
-      await insertMedicationRequest({
-        id: aId,
-        tenant_id: T,
-        patient_account_id: patient,
-        product_catalog_id: product,
-        status: 'superseded',
-        superseded_by_id: bId,
-        interaction_signals_status: 'clean',
-      });
+      await setForwardPointer(aId, bId);
 
       const result = await forceConstraintCheck();
       expect(result).not.toBeNull();
       expect(result).toMatch(/reciprocity violated/i);
-      // Direction A's reciprocity check fires: row A has superseded_by=B but
-      // B.supersedes_id IS NULL, which IS DISTINCT FROM A's id.
+      // Direction A's reciprocity check fires: row A has superseded_by=B
+      // but B.supersedes_id IS NULL, which IS DISTINCT FROM A's id.
       expect(result).toMatch(/supersedes_id/);
     });
   });
 
-  it('§3 mismatched edge (A→B, B→C) fails at commit-time', async () => {
+  it('§3 mismatched edge (A→B, B.supersedes_id=C) fails at commit-time', async () => {
     const T = TENANT_US;
 
     await withTenantContext(T, async () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
 
+      // Insert C and B such that B points back at C (not at A). Then
+      // insert A pointing forward at B. A's forward edge to B is
+      // unreciprocated (B points back at C instead).
       const aId = mrxId();
       const bId = mrxId();
       const cId = mrxId();
-
-      await getTestClient().query('SET CONSTRAINTS ALL DEFERRED');
-
-      // C is a separate prior row — also 'superseded' so a back-pointer
-      // would be plausible. C.superseded_by points forward at B (for the
-      // sake of populating C's required forward pointer); B points back
-      // at C, not at A. Result: A's forward edge to B is unreciprocated.
       await insertMedicationRequest({
         id: cId,
         tenant_id: T,
         patient_account_id: patient,
         product_catalog_id: product,
-        status: 'superseded',
-        superseded_by_id: bId,
-        interaction_signals_status: 'clean',
+        status: 'active',
       });
       await insertMedicationRequest({
         id: bId,
@@ -377,17 +360,15 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         product_catalog_id: product,
         status: 'active',
         supersedes_id: cId,
-        interaction_signals_status: 'clean',
       });
       await insertMedicationRequest({
         id: aId,
         tenant_id: T,
         patient_account_id: patient,
         product_catalog_id: product,
-        status: 'superseded',
-        superseded_by_id: bId,
-        interaction_signals_status: 'clean',
+        status: 'active',
       });
+      await setForwardPointer(aId, bId);
 
       const result = await forceConstraintCheck();
       expect(result).not.toBeNull();
@@ -403,13 +384,18 @@ describe('migration 026 — supersession reciprocity trigger', () => {
       const p2 = await insertPatient(T);
       const product = await insertProduct(T);
 
+      // A anchors P1; B anchors P2 with supersedes_id=A — pointer-level
+      // reciprocity but mismatched patient. The trigger MUST reject
+      // the cross-patient edge.
       const aId = mrxId();
       const bId = mrxId();
-
-      await getTestClient().query('SET CONSTRAINTS ALL DEFERRED');
-
-      // A and B reciprocate at the pointer level but anchor different
-      // patients — the trigger MUST reject the cross-patient edge.
+      await insertMedicationRequest({
+        id: aId,
+        tenant_id: T,
+        patient_account_id: p1,
+        product_catalog_id: product,
+        status: 'active',
+      });
       await insertMedicationRequest({
         id: bId,
         tenant_id: T,
@@ -417,17 +403,8 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         product_catalog_id: product,
         status: 'active',
         supersedes_id: aId,
-        interaction_signals_status: 'clean',
       });
-      await insertMedicationRequest({
-        id: aId,
-        tenant_id: T,
-        patient_account_id: p1,
-        product_catalog_id: product,
-        status: 'superseded',
-        superseded_by_id: bId,
-        interaction_signals_status: 'clean',
-      });
+      await setForwardPointer(aId, bId);
 
       const result = await forceConstraintCheck();
       expect(result).not.toBeNull();
@@ -442,23 +419,18 @@ describe('migration 026 — supersession reciprocity trigger', () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
 
+      // A and B both 'active'; B carries supersedes_id=A. A's status
+      // never flips to 'superseded'. Direction B of the trigger
+      // requires the referenced row (A) to have status='superseded';
+      // A.status='active' violates that.
       const aId = mrxId();
       const bId = mrxId();
-
-      await getTestClient().query('SET CONSTRAINTS ALL DEFERRED');
-
-      // A is 'active' (NOT 'superseded') and carries no forward pointer.
-      // B is 'active' and points back at A via supersedes_id. Direction B
-      // of the trigger requires the referenced row (A) to have
-      // status='superseded' — A's status='active' violates that.
       await insertMedicationRequest({
         id: aId,
         tenant_id: T,
         patient_account_id: patient,
         product_catalog_id: product,
         status: 'active',
-        superseded_by_id: null,
-        interaction_signals_status: 'clean',
       });
       await insertMedicationRequest({
         id: bId,
@@ -467,17 +439,16 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         product_catalog_id: product,
         status: 'active',
         supersedes_id: aId,
-        interaction_signals_status: 'clean',
       });
 
       const result = await forceConstraintCheck();
       expect(result).not.toBeNull();
-      // Direction B fires first because A.superseded_by_id IS NULL means
-      // Direction A is a no-op for the A row. The error is either the
-      // reciprocity-pointer mismatch ("row B has supersedes_id=A but row
-      // A has superseded_by_id=null") OR the status mismatch ("row B
-      // points back at row A with status=active"). Both are acceptable
-      // — both indicate the trigger caught the malformed edge.
+      // Direction B fires: A.superseded_by_id IS NULL means Direction A
+      // is a no-op for A. The error is either the reciprocity-pointer
+      // mismatch ('row B has supersedes_id=A but row A has
+      // superseded_by_id=null') OR the status mismatch ('row B points
+      // back at row A with status=active'). Both are acceptable —
+      // both indicate the trigger caught the malformed edge.
       expect(result).toMatch(/reciprocity violated/i);
     });
   });
