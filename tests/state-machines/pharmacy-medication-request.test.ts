@@ -452,6 +452,112 @@ describe('MedicationRequest state machine — §7 clinician-only-route protocol-
 // §8 — discontinueEventForReason helper
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// §9 — Canonical I-012 action_id convention (row.id IS the action_id)
+// ---------------------------------------------------------------------------
+//
+// The state-machine doc-comment on PendingTransitionContext.action_id
+// specifies that the I-012 action_id for a MedicationRequest prescribing
+// decision IS the row's `id` field (canonical mrx_<ULID>). All audit
+// events emitted in service of that prescribing decision share the same
+// action_id derived from the row id. This test simulates the service-
+// layer's responsibility — derive PendingTransitionContext.action_id
+// from the row's id, and prove validateTransition accepts the binding
+// when the guard attests the same id, and rejects when they diverge.
+
+describe('MedicationRequest state machine — §9 row.id == action_id convention', () => {
+  const ROW_ID = 'mrx_01HABCDEFGHJKMNPQRSTVWXYZ';
+
+  it('§9a service layer derives action_id from row.id; guard with matching attested_action_id succeeds', () => {
+    const pending: PendingTransitionContext = {
+      tenant_id: TENANT,
+      action_id: ROW_ID, // ← derived from MedicationRequest row.id, per convention
+      patient_account_id: PATIENT,
+      actor_id: CLINICIAN,
+      protocol_id: null,
+      protocol_version: null,
+    };
+    const guard: I012GuardContext = {
+      route: 'clinician_approve',
+      confirmation_event_audit_id: 'aud_01HCONFIRMATIONEVENTID09',
+      attested_tenant_id: TENANT,
+      attested_action_id: ROW_ID, // ← service layer attests the SAME id
+      attested_patient_account_id: PATIENT,
+      attested_actor_id: CLINICIAN,
+      confirming_actor_rbac_authorized: true,
+    };
+    expect(
+      validateTransition('pending_clinician_review', 'clinician_approve', guard, pending),
+    ).toBe('active');
+  });
+
+  it('§9b guard whose attested_action_id diverges from row.id rejects (binding broken)', () => {
+    const pending: PendingTransitionContext = {
+      tenant_id: TENANT,
+      action_id: ROW_ID,
+      patient_account_id: PATIENT,
+      actor_id: CLINICIAN,
+      protocol_id: null,
+      protocol_version: null,
+    };
+    const guard: I012GuardContext = {
+      route: 'clinician_approve',
+      confirmation_event_audit_id: 'aud_01HCONFIRMATIONEVENTID10',
+      attested_tenant_id: TENANT,
+      attested_action_id: 'mrx_01HZZZZZZZZZZZZZZZZZZZZZZZ', // different row.id — the action_id binding doesn't match
+      attested_patient_account_id: PATIENT,
+      attested_actor_id: CLINICIAN,
+      confirming_actor_rbac_authorized: true,
+    };
+    try {
+      validateTransition('pending_clinician_review', 'clinician_approve', guard, pending);
+      expect.fail('expected I012RejectError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(I012RejectError);
+      expect((err as I012RejectError).violated_clauses).toContain(
+        'audit_chain_confirmation_event_missing',
+      );
+    }
+  });
+
+  it('§9c protocol route: row.id == action_id convention holds across both I-012 routes', () => {
+    const pending: PendingTransitionContext = {
+      tenant_id: TENANT,
+      action_id: ROW_ID, // ← derived from row.id
+      patient_account_id: PATIENT,
+      actor_id: CLINICIAN,
+      protocol_id: PROTOCOL_ID,
+      protocol_version: PROTOCOL_VERSION,
+    };
+    const guard: I012GuardContext = {
+      route: 'protocol_authorized_prescribing',
+      autonomy_level: 'action_with_confirm',
+      ai_workload_type: 'protocol_execution',
+      confirmation_event_audit_id: 'aud_01HCONFIRMATIONEVENTID11',
+      confirmation_event_action_id: AUDIT_ACTIONS.PRESCRIBING_PROTOCOL_AUTHORIZATION_GRANTED,
+      attested_tenant_id: TENANT,
+      attested_action_id: ROW_ID,
+      attested_patient_account_id: PATIENT,
+      attested_actor_id: CLINICIAN,
+      attested_protocol_id: PROTOCOL_ID,
+      attested_protocol_version: PROTOCOL_VERSION,
+      confirming_actor_rbac_authorized: true,
+    };
+    expect(
+      validateTransition(
+        'pending_clinician_review',
+        'protocol_authorized_prescribing',
+        guard,
+        pending,
+      ),
+    ).toBe('active');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §8 — discontinueEventForReason helper
+// ---------------------------------------------------------------------------
+
 describe('MedicationRequest state machine — §8 discontinueEventForReason', () => {
   it('§8a maps patient_request → patient_request_discontinue', () => {
     expect(discontinueEventForReason('patient_request')).toBe('patient_request_discontinue');

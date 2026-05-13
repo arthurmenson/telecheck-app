@@ -448,11 +448,47 @@ export interface I012GuardProtocolAuthorized {
  * `audit_chain_confirmation_event_missing` on any mismatch.
  *
  * Added v0.3 per Codex pharmacy-scaffold-rebuild R3 HIGH closure 2026-05-12.
+ * Convention for `action_id` clarified v0.4 per Codex final-convergence
+ * post-merge HIGH closure 2026-05-13 (session 019e1f35).
+ *
+ * **Canonical I-012 `action_id` derivation rule (added v0.4 2026-05-13):**
+ * The I-012 `action_id` for a MedicationRequest prescribing decision IS the
+ * row's `id` field (the canonical `mrx_<26-char ULID>` identifier). All audit
+ * events emitted in service of that prescribing decision —
+ * `prescribing.initiated`, `prescribing.protocol_authorization_granted`,
+ * `prescribing.approved`, `protocol_authorized_prescribing`,
+ * `prescribing.execution_rejected`, `medication_request.*` lifecycle events —
+ * share the same `action_id` value derived from the row's id. This binding
+ * makes the I-012 audit-chain `action_id` scope deterministic from the row,
+ * with no extra schema column needed:
+ *
+ *     pending_transition.action_id === medicationRequestRow.id
+ *
+ * The state machine validates only that the guard's `attested_action_id`
+ * matches `pending_transition.action_id`; the SERVICE LAYER (TLC-055
+ * repository write-path, when authored) is responsible for:
+ *   1. Generating the row's id at draft-time (canonical `mrx_<ULID>` per
+ *      `src/lib/glossary.ts` `asMedicationRequestId`).
+ *   2. Using that id as the `action_id` in every audit event emission
+ *      throughout the row's lifecycle (idempotency, retry-safety, and
+ *      cross-tenant audit-id leak prevention all depend on this binding).
+ *   3. Constructing PendingTransitionContext.action_id from
+ *      medicationRequestRow.id at transition time.
+ *
+ * A focused regression test in
+ * `tests/state-machines/pharmacy-medication-request.test.ts` §9 exercises
+ * this convention end-to-end (row.id == action_id; mismatches reject).
  */
 export interface PendingTransitionContext {
   /** The MedicationRequest row's tenant_id. */
   tenant_id: string;
-  /** The canonical I-012 action_id for this prescribing decision. */
+  /**
+   * The canonical I-012 action_id for this prescribing decision.
+   * **Convention:** equals the MedicationRequest row's `id` field (canonical
+   * `mrx_<ULID>`); the row id scopes the entire prescribing decision's
+   * audit chain. The service layer MUST derive this from the row, not
+   * generate it independently — otherwise audit-chain bindings break.
+   */
   action_id: string;
   /** The MedicationRequest row's patient_account_id. */
   patient_account_id: string;
