@@ -307,11 +307,21 @@ export async function grantScope(
 export async function revokeScope(
   ctx: TenantContext,
   actor: { actorId: string; grantorAccountId: AccountId },
+  delegationId: DelegationId,
   delegationScopeId: DelegationScopeId,
   externalTx?: DbTransaction,
 ): Promise<DelegationScopeRow | null> {
   const runFn = async (tx: DbClient): Promise<DelegationScopeRow | null> => {
-    const revoked = await delegationRepo.revokeDelegationScope(ctx.tenantId, delegationScopeId, tx);
+    // delegationId binds the mutation to the authorized parent so a
+    // mismatched scope_id (belonging to a different delegation in
+    // the same tenant) returns null — handler maps to tenant-blind
+    // 404 per I-025. Codex PR-118 R6 HIGH closure 2026-05-13.
+    const revoked = await delegationRepo.revokeDelegationScope(
+      ctx.tenantId,
+      delegationId,
+      delegationScopeId,
+      tx,
+    );
     if (revoked === null) return null;
     await emitDelegationScopeRevokedAudit(
       {

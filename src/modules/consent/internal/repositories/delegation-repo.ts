@@ -395,6 +395,7 @@ export async function listActiveScopesForDelegation(
 
 export async function revokeDelegationScope(
   tenantId: TenantId,
+  delegationId: DelegationId,
   delegationScopeId: DelegationScopeId,
   externalTx?: DbClient,
 ): Promise<DelegationScopeRow | null> {
@@ -403,14 +404,25 @@ export async function revokeDelegationScope(
     : (fn: (client: DbClient) => Promise<DelegationScopeRow | null>) =>
         withTenantBoundConnection(tenantId, fn);
   return runner(async (client) => {
+    // Bind the mutation to the authorized parent delegation (Codex
+    // PR-118 R6 HIGH closure 2026-05-13). Previous signature accepted
+    // only `delegation_scope_id`, which let a same-tenant attacker
+    // who owns delegation X pass their own X as the URL :id (passing
+    // the handler's ownership precheck) and a VICTIM's :scopeId from
+    // delegation Y — the UPDATE would land on the victim's scope.
+    // The AND delegation_id = $2 predicate makes the mutation atomic
+    // with the ownership check: a scope_id that doesn't belong to
+    // the passed delegation_id matches zero rows and the caller gets
+    // tenant-blind null → 404.
     const result = await client.query<ScopeRow>(
       `UPDATE delegation_scopes
           SET revoked_at = NOW()
         WHERE tenant_id = $1
-          AND delegation_scope_id = $2
+          AND delegation_id = $2
+          AND delegation_scope_id = $3
           AND revoked_at IS NULL
        RETURNING ${SCOPE_COLUMNS}`,
-      [tenantId, delegationScopeId],
+      [tenantId, delegationId, delegationScopeId],
     );
     if (result.rows.length === 0) return null;
     const row = result.rows[0];

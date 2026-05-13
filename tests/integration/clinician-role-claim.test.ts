@@ -38,6 +38,7 @@
  *     D9 patient B → 404 on POST /v0/consent/delegations/:id/accept (R5: ownership)
  *     D10 patient B → 404 on POST /v0/consent/delegations/:id/revoke (R5)
  *     D11 patient B → 404 on POST /v0/consent/delegations/:id/scopes/grant (R5)
+ *     D12 cross-parent revoke-scope: passing own delegation id + victim scope id → 404 (R6)
  *
  * Spec references:
  *   - RBAC v1.1 §1.2 (Clinician role; tenant-scoped) + §6 (multi-tenant)
@@ -746,6 +747,103 @@ describe('clinician-role-claim — Group D: patient-only routes reject clinician
       expect(r.statusCode).toBe(404);
       const body = r.json<{ error: { code: string } }>();
       expect(body.error.code).toBe('internal.resource.not_found');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D12 cross-parent revoke-scope: own delegation id + victim scope id → 404 + victim scope unchanged (R6)', async () => {
+    // Subtle attack uncovered by Codex R6: handler verified actor is
+    // grantor of the URL :id (delegation id), but the underlying
+    // UPDATE filtered ONLY by scope_id. So a patient who owns
+    // delegation X could pass their own X as :id (passes ownership)
+    // and a victim's :scopeId from delegation Y — and the UPDATE
+    // would still land on the victim's scope.
+    //
+    // Fix verified here: revokeDelegationScope now binds the UPDATE
+    // to (tenant_id, delegation_id, scope_id) so the mismatched pair
+    // matches zero rows and the caller gets 404. The victim's scope
+    // MUST remain active after the failed attempt.
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      // Victim setup: delegation Y owned by patient A → delegate C, with
+      // an active scope.
+      const patientA = await insertAccount('patient');
+      const patientC = await insertAccount('patient');
+      const victimDelegationId = ulid();
+      const victimScopeId = ulid();
+      await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        await client.query(
+          `INSERT INTO delegations (
+              delegation_id, tenant_id, grantor_account_id, delegate_account_id,
+              relationship_type, status, accepted_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+          [victimDelegationId, T_US, patientA, patientC, 'spouse_partner', 'active'],
+        );
+        await client.query(
+          `INSERT INTO delegation_scopes (
+              delegation_scope_id, tenant_id, delegation_id, scope, granted_at
+           ) VALUES ($1, $2, $3, $4, NOW())`,
+          [victimScopeId, T_US, victimDelegationId, 'view_medications'],
+        );
+      });
+
+      // Attacker setup: delegation X owned by patient B (the attacker)
+      // as grantor → patient D as delegate.
+      const patientB = await insertAccount('patient');
+      const patientD = await insertAccount('patient');
+      const attackerDelegationId = ulid();
+      await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        await client.query(
+          `INSERT INTO delegations (
+              delegation_id, tenant_id, grantor_account_id, delegate_account_id,
+              relationship_type, status, accepted_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+          [attackerDelegationId, T_US, patientB, patientD, 'spouse_partner', 'active'],
+        );
+      });
+
+      // Patient B's token (B is attacker; owns attackerDelegationId).
+      const sessionIdB = asSessionId(ulid());
+      const { accessToken: tokenB } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: patientB },
+        { session_id: sessionIdB, account_id: patientB },
+      );
+
+      // Attack: URL :id = attacker's delegation (passes ownership);
+      // URL :scopeId = victim's scope (from a different delegation).
+      const r = await app.inject({
+        method: 'DELETE',
+        url: `/v0/consent/delegations/${attackerDelegationId}/scopes/${victimScopeId}`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${tokenB}`,
+          'idempotency-key': ulid(),
+        },
+      });
+
+      // Expected: 404 (the UPDATE matches zero rows because the scope
+      // belongs to a different delegation_id).
+      expect(r.statusCode).toBe(404);
+
+      // Critical assertion: victim's scope MUST remain active. If the
+      // mutation had landed, revoked_at would be set. Read directly
+      // from the DB to bypass any handler-layer filtering.
+      const stillActive = await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        const result = await client.query<{ revoked_at: Date | null }>(
+          `SELECT revoked_at FROM delegation_scopes WHERE delegation_scope_id = $1`,
+          [victimScopeId],
+        );
+        return result.rows[0]?.revoked_at;
+      });
+      expect(stillActive ?? null).toBeNull();
     } finally {
       await app.close();
     }

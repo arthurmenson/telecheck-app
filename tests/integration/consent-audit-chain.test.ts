@@ -254,6 +254,7 @@ describe('consent slice — §1 I-003 audit-chain integrity', () => {
       delegationService.revokeScope(
         US_CTX,
         { actorId: 'op_audit_1b', grantorAccountId: grantor },
+        scope.delegation_id,
         scope.delegation_scope_id,
         getTestClient(),
       ),

@@ -469,6 +469,7 @@ export async function revokeScopeHandler(
     const revoked = await delegationService.revokeScope(
       ctx,
       { actorId: actor.accountId, grantorAccountId: actor.accountId as AccountId },
+      asDelegationId(params.id as string),
       asDelegationScopeId(params.scopeId as string),
       tx,
     );

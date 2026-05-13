@@ -412,6 +412,7 @@ describe('delegation-service §3 scope CRUD', () => {
       delegationService.revokeScope(
         US_CTX,
         { actorId: 'op_test_3b', grantorAccountId: grantor },
+        granted.delegation_id,
         granted.delegation_scope_id,
         getTestClient(),
       ),
@@ -435,6 +436,9 @@ describe('delegation-service §3 scope CRUD', () => {
       delegationService.revokeScope(
         US_CTX,
         { actorId: 'op_test_3c', grantorAccountId: grantor },
+        // Unknown delegation_id paired with unknown scope_id — both
+        // mismatch the UPDATE predicate, so null is returned.
+        asDelegationId(ulid()),
         asDelegationScopeId(ulid()),
         getTestClient(),
       ),
