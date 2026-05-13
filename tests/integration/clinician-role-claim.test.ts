@@ -743,7 +743,7 @@ describe('clinician-role-claim — Group D: patient-only routes reject clinician
           authorization: `Bearer ${tokenB}`,
           'idempotency-key': ulid(),
         },
-        payload: { scope: 'view_medications' },
+        payload: { scope: 'view_records' },
       });
       expect(r.statusCode).toBe(404);
       const body = r.json<{ error: { code: string } }>();
@@ -789,7 +789,7 @@ describe('clinician-role-claim — Group D: patient-only routes reject clinician
           `INSERT INTO delegation_scopes (
               delegation_scope_id, tenant_id, delegation_id, scope, granted_at
            ) VALUES ($1, $2, $3, $4, NOW())`,
-          [victimScopeId, T_US, victimDelegationId, 'view_medications'],
+          [victimScopeId, T_US, victimDelegationId, 'view_records'],
         );
       });
 

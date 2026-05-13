@@ -204,34 +204,34 @@ describe('delegation HTTP — §1 invite', () => {
 
 describe('delegation HTTP — §2 transitions', () => {
   it('§2a accept transitions pending → active', async () => {
-    const { accessToken } = await createPatientAndLogin();
-    const delegateId = await createPatient();
+    // Codex PR-118 R5 closure 2026-05-13: accept now requires the
+    // DELEGATE's JWT (ownership check). Mint two real OTP-flow tokens
+    // (grantor + delegate) and route each request through the
+    // appropriate actor.
+    const grantor = await createPatientAndLogin();
+    const delegate = await createPatientAndLogin();
 
     const inviteResponse = await app!.inject({
       method: 'POST',
       url: '/v0/consent/delegations',
       headers: {
         host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
+        authorization: `Bearer ${grantor.accessToken}`,
         'idempotency-key': ulid(),
       },
       payload: {
-        delegate_account_id: delegateId,
+        delegate_account_id: delegate.accountId,
         relationship_type: 'spouse_partner',
       },
     });
     const delegationId = inviteResponse.json<{ delegation_id: string }>().delegation_id;
 
-    // Note: in a fully-wired flow the DELEGATE accepts via their own
-    // JWT. At v1.0 with grantor-issued JWT we accept via the same
-    // token (auth cross-check is on the delegation row's tenant, not
-    // its actor identity yet). Future-state will require delegate's JWT.
     const accept = await app!.inject({
       method: 'POST',
       url: `/v0/consent/delegations/${delegationId}/accept`,
       headers: {
         host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
+        authorization: `Bearer ${delegate.accessToken}`,
         'idempotency-key': ulid(),
       },
     });
@@ -282,20 +282,20 @@ describe('delegation HTTP — §2 transitions', () => {
 
 describe('delegation HTTP — §3 list endpoints', () => {
   it('§3a /granted lists active outbound delegations', async () => {
-    const { accessToken } = await createPatientAndLogin();
-    const delegateId = await createPatient();
+    const grantor = await createPatientAndLogin();
+    const delegate = await createPatientAndLogin();
 
-    // Invite + accept
+    // Invite (grantor's JWT) + accept (delegate's JWT per R5 ownership).
     const invite = await app!.inject({
       method: 'POST',
       url: '/v0/consent/delegations',
       headers: {
         host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
+        authorization: `Bearer ${grantor.accessToken}`,
         'idempotency-key': ulid(),
       },
       payload: {
-        delegate_account_id: delegateId,
+        delegate_account_id: delegate.accountId,
         relationship_type: 'spouse_partner',
       },
     });
@@ -305,7 +305,7 @@ describe('delegation HTTP — §3 list endpoints', () => {
       url: `/v0/consent/delegations/${delegationId}/accept`,
       headers: {
         host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
+        authorization: `Bearer ${delegate.accessToken}`,
         'idempotency-key': ulid(),
       },
     });
@@ -313,7 +313,7 @@ describe('delegation HTTP — §3 list endpoints', () => {
     const list = await app!.inject({
       method: 'GET',
       url: '/v0/consent/delegations/granted',
-      headers: { host: 'localhost', authorization: `Bearer ${accessToken}` },
+      headers: { host: 'localhost', authorization: `Bearer ${grantor.accessToken}` },
     });
     expect(list.statusCode).toBe(200);
     const body = list.json<{ delegations: Array<{ delegation_id: string }> }>();

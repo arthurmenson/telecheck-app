@@ -145,16 +145,18 @@ async function inviteDelegation(
 
 describe('delegation HTTP coverage gaps — §1 decline', () => {
   it('§1a decline transitions pending → declined', async () => {
-    const { accessToken } = await createPatientAndLogin();
-    const delegateId = await createPatient();
-    const { delegationId } = await inviteDelegation(accessToken, delegateId);
+    // Codex PR-118 R5 closure 2026-05-13: decline now requires the
+    // DELEGATE's JWT (ownership check).
+    const grantor = await createPatientAndLogin();
+    const delegate = await createPatientAndLogin();
+    const { delegationId } = await inviteDelegation(grantor.accessToken, delegate.accountId);
 
     const decline = await app!.inject({
       method: 'POST',
       url: `/v0/consent/delegations/${delegationId}/decline`,
       headers: {
         host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
+        authorization: `Bearer ${delegate.accessToken}`,
         'idempotency-key': ulid(),
       },
     });
@@ -178,15 +180,14 @@ describe('delegation HTTP coverage gaps — §2 received list', () => {
 
     const { delegationId } = await inviteDelegation(grantorToken, delegateAccountId);
 
-    // Accept (using the grantor's token since v1.0 auth-cross-check is on
-    // tenant, not actor — this matches the same pattern delegation-http
-    // §2a relies on; future-state will require delegate's JWT).
+    // Accept (using the DELEGATE's token per Codex PR-118 R5 ownership
+    // closure 2026-05-13).
     await app!.inject({
       method: 'POST',
       url: `/v0/consent/delegations/${delegationId}/accept`,
       headers: {
         host: 'localhost',
-        authorization: `Bearer ${grantorToken}`,
+        authorization: `Bearer ${delegateToken}`,
         'idempotency-key': ulid(),
       },
     });
