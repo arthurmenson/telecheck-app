@@ -1,13 +1,24 @@
 /**
- * audit.ts — AUDIT_EVENTS v5.2 envelope emitter with hash chain.
+ * audit.ts — AUDIT_EVENTS v5.3 envelope emitter with hash chain.
+ *
+ * Version: bumped v5.2 → v5.3 at P-011 / SI-001 closure 2026-05-11. v5.3 adds
+ * 7 net-new Category A action IDs (6 `medication_request.*` lifecycle events +
+ * 1 `prescribing.protocol_authorization_granted` clinician confirmation event)
+ * and amends the §I-012 closure rule's authoritative I-012 action-class set to
+ * include `prescribing.protocol_authorization_granted`. Live emissions of the
+ * new I-012 confirmation action MUST resolve against v5.3 or later. Carry-
+ * forward prose from v5.2 is preserved unchanged.
  *
  * Purpose:
- *   Type-safe audit event emission per AUDIT_EVENTS v5.2. Enforces:
+ *   Type-safe audit event emission per AUDIT_EVENTS v5.3. Enforces:
  *     - Every record carries `tenant_id` (I-027)
  *     - Append-only semantics (I-003): throws on any attempt to suppress emission
- *     - SHA-256 hash chain per patient partition (AUDIT_EVENTS v5.2 §hash-chain)
+ *     - SHA-256 hash chain per patient partition (AUDIT_EVENTS v5.2 §hash-chain;
+ *       carried forward unchanged at v5.3)
  *     - `audit_sensitivity_level` required on every record (I-031)
  *     - `ai_workload_type` + `autonomy_level` rules per I-012 closure rule
+ *       (v5.3 amendment includes `prescribing.protocol_authorization_granted`
+ *       in the authoritative I-012 action-class set)
  *     - Sentinel values (`rejected_invalid_attempt`, `n/a`) validated against
  *       their permitted-use contexts
  *
@@ -15,10 +26,11 @@
  *   - I-003: audit trail is immutable and append-only; bare suppression is forbidden.
  *   - I-027: every audit record carries `tenant_id`.
  *   - I-031: research data export emits at `audit_sensitivity_level = high_pii`.
- *   - AUDIT_EVENTS v5.2:
- *       * Envelope schema (all required fields)
- *       * Hash chain construction (§hash-chain)
- *       * I-012 closure rule (required fields on I-012 action class records)
+ *   - AUDIT_EVENTS v5.3 (bumped from v5.2 at P-011 / SI-001 closure 2026-05-11):
+ *       * Envelope schema (all required fields; carries forward v5.2 unchanged)
+ *       * Hash chain construction (§hash-chain; carries forward v5.2 unchanged)
+ *       * I-012 closure rule with v5.3 amendment adding
+ *         prescribing.protocol_authorization_granted to the authoritative set
  *       * Sentinel `rejected_invalid_attempt` valid ONLY on `*.execution_rejected` events
  *       * Sentinel `n/a` valid ONLY on I-012 clinician-only approval records with no AI upstream
  *
@@ -61,6 +73,7 @@ type CategoryAAction =
   | 'prescribing.approved'
   | 'prescribing.declined'
   | 'prescribing.modified'
+  | 'prescribing.protocol_authorization_granted' // added v5.3 (P-011 / SI-001 closure 2026-05-11) — I-012 confirmation event for the protocol-authorized prescribing route
   | 'refill.approved'
   | 'refill.declined'
   | 'protocol_authorized_prescribing'
@@ -69,6 +82,13 @@ type CategoryAAction =
   | 'prescribing.execution_rejected' // added v5.2 — I-012 bare-suppression closure
   | 'refill.execution_rejected' // added v5.2 — I-012 bare-suppression closure
   | 'medication_order.execution_rejected' // added v5.2 — I-012 bare-suppression closure
+  // MedicationRequest lifecycle (added v5.3 under P-011 / SI-001 closure 2026-05-11)
+  | 'medication_request.drafted'
+  | 'medication_request.submitted_for_review'
+  | 'medication_request.interaction_evaluation_completed'
+  | 'medication_request.discontinued'
+  | 'medication_request.superseded'
+  | 'medication_request.expired'
   | 'interaction_signal_override'
   | 'herb_drug_signal_override'
   | 'dispensing_release'
@@ -155,14 +175,19 @@ export type AuditAction = CategoryAAction | CategoryBAction | CategoryCAction;
 export type AuditCategory = 'A' | 'B' | 'C';
 export type AuditSensitivityLevel = 'standard' | 'high_pii';
 
-// Authoritative I-012 action-class set per AUDIT_EVENTS v5.2 §I-012 closure rule.
-// This set is the single source of truth — do not re-declare in WORKLOAD_TAXONOMY,
-// AUTONOMY_LEVELS, STATE_MACHINES, or TYPES.
+// Authoritative I-012 action-class set per AUDIT_EVENTS v5.3 §I-012 closure rule
+// (bumped v5.2 → v5.3 at P-011 / SI-001 closure 2026-05-11; v5.3 amendment adds
+// `prescribing.protocol_authorization_granted` to the authoritative set and
+// broadens the future-extension carve-out to include `prescribing.*` confirmation
+// actions added by an I-012-amending SI promotion). This set is the single source
+// of truth — do not re-declare in WORKLOAD_TAXONOMY, AUTONOMY_LEVELS,
+// STATE_MACHINES, or TYPES.
 const I012_ACTION_CLASS_SET = new Set<AuditAction>([
   'prescribing.initiated',
   'prescribing.approved',
   'prescribing.declined',
   'prescribing.modified',
+  'prescribing.protocol_authorization_granted', // added v5.3 under P-011
   'refill.approved',
   'refill.declined',
   'protocol_authorized_prescribing',
@@ -459,14 +484,14 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
       throw new Error(
         `I-012 closure rule violation: ai_workload_type is required on action "${action}" ` +
           '(use "n/a" for clinician-only approvals with no AI workload upstream). ' +
-          'See AUDIT_EVENTS v5.2 §I-012 closure rule.',
+          'See AUDIT_EVENTS v5.3 §I-012 closure rule.',
       );
     }
     if (autonomy_level === null || autonomy_level === undefined) {
       throw new Error(
         `I-012 closure rule violation: autonomy_level is required on action "${action}" ` +
           '(use "n/a" for clinician-only approvals with no AI workload upstream). ' +
-          'See AUDIT_EVENTS v5.2 §I-012 closure rule.',
+          'See AUDIT_EVENTS v5.3 §I-012 closure rule.',
       );
     }
     // Sentinel `rejected_invalid_attempt` is NOT valid on successful execution records
@@ -482,12 +507,137 @@ function validateWorkloadFields(input: AuditEnvelopeInput): void {
           `Action "${action}" is not a rejection event.`,
       );
     }
-    // Sentinel `n/a` validation: only valid when no AI workload was upstream
+    // Sentinel `n/a` validation: only valid when no AI workload was upstream.
+    // Per AUDIT_EVENTS v5.3 §I-012 closure rule line 127 clinician-only
+    // carve-out, ai_workload_type and autonomy_level MUST travel together:
+    // either both 'n/a' (clinician-only, no upstream AI) or both canonical
+    // non-sentinel values. Asymmetric pairing (one 'n/a', one canonical) is
+    // a corrupt envelope.
     if (ai_workload_type === 'n/a' && isAIWorkload) {
       throw new Error(
         'Sentinel "n/a" for ai_workload_type is only valid for clinician-only approval records ' +
           'where no AI workload was upstream. actor_type=ai_workload contradicts this.',
       );
+    }
+    if (autonomy_level === 'n/a' && isAIWorkload) {
+      throw new Error(
+        'Sentinel "n/a" for autonomy_level is only valid for clinician-only approval records ' +
+          'where no AI workload was upstream. actor_type=ai_workload contradicts this.',
+      );
+    }
+    // Symmetric n/a pairing: ai_workload_type=n/a iff autonomy_level=n/a
+    // (added v5.3 round 4 per Codex pharmacy-scaffold-rebuild R3 HIGH closure
+    // 2026-05-12). Mixed-pairing examples that previously slipped through:
+    //   - ai_workload_type='protocol_execution' + autonomy_level='n/a' on
+    //     prescribing.approved would have made an AI-attributed success
+    //     record look partially clinician-only.
+    //   - ai_workload_type='n/a' + autonomy_level='action_with_confirm' on
+    //     any I-012 action would have claimed no AI workload while still
+    //     asserting an AI-execution autonomy level.
+    if ((ai_workload_type === 'n/a') !== (autonomy_level === 'n/a')) {
+      throw new Error(
+        `Sentinel "n/a" must travel as a pair: ai_workload_type and autonomy_level ` +
+          `MUST both be "n/a" (clinician-only carve-out per AUDIT_EVENTS v5.3 §I-012 ` +
+          `closure rule line 127) or both be canonical non-sentinel values. Got ` +
+          `ai_workload_type="${ai_workload_type}", autonomy_level="${autonomy_level}".`,
+      );
+    }
+    // Action-scoped `n/a` validation (added v5.3 under P-011 / SI-001 closure
+    // 2026-05-11): the protocol-authorized prescribing route has upstream AI
+    // workload by definition (the protocol engine emits the recommendation
+    // that the clinician authorizes), so the route's audit events MUST carry
+    // ai_workload_type='protocol_execution' / autonomy_level='action_with_confirm'
+    // — NOT the clinician-only n/a sentinel. Otherwise post-incident audit
+    // reconstruction would mis-classify the prescribing decision as
+    // clinician-only when it was protocol-authorized.
+    const PROTOCOL_ROUTE_ACTIONS = new Set<AuditAction>([
+      'prescribing.protocol_authorization_granted',
+      'protocol_authorized_prescribing',
+      'protocol_authorized_refill_renewal',
+      'protocol_authorized_dispensing_release',
+    ]);
+    if (PROTOCOL_ROUTE_ACTIONS.has(action)) {
+      if (ai_workload_type === 'n/a' || autonomy_level === 'n/a') {
+        throw new Error(
+          `Sentinel "n/a" for ai_workload_type or autonomy_level is forbidden on ` +
+            `protocol-authorized prescribing route actions ("${action}"). These actions ` +
+            `have upstream AI workload by definition (Mode 2 protocol-engine route); the ` +
+            `envelope MUST carry ai_workload_type='protocol_execution' and ` +
+            `autonomy_level='action_with_confirm' per AUDIT_EVENTS v5.3 §I-012 closure rule. ` +
+            `The "n/a" sentinel is reserved for the clinician-only route (e.g., ` +
+            `prescribing.approved without upstream AI advice).`,
+        );
+      }
+      if (ai_workload_type !== 'protocol_execution') {
+        throw new Error(
+          `Protocol-authorized route action "${action}" MUST carry ` +
+            `ai_workload_type='protocol_execution' (got "${ai_workload_type}"). Per AUDIT_EVENTS ` +
+            `v5.3 §I-012 closure rule and WORKLOAD_TAXONOMY v5.2 §2.2.`,
+        );
+      }
+      if (autonomy_level !== 'action_with_confirm') {
+        throw new Error(
+          `Protocol-authorized route action "${action}" MUST carry ` +
+            `autonomy_level='action_with_confirm' (got "${autonomy_level}"). Per AUDIT_EVENTS ` +
+            `v5.3 §I-012 closure rule and AUTONOMY_LEVELS v5.2.`,
+        );
+      }
+
+      // Action-scoped actor_type validation (added v5.3 round 4 per Codex
+      // pharmacy-scaffold-rebuild R4 HIGH closure 2026-05-12). Without these
+      // checks, prescribing.protocol_authorization_granted could be emitted
+      // with actor_type='ai_workload' (making an AI workload appear to have
+      // supplied its own I-012 confirmation), and protocol_authorized_prescribing
+      // could be emitted with actor_type='clinician' (making protocol execution
+      // look clinician-executed). Both break post-incident audit reconstruction.
+      //
+      //   prescribing.protocol_authorization_granted: actor_type='clinician'
+      //     — this is the clinician confirmation event that authorizes the
+      //     protocol-engine route. The CLINICIAN is the actor; the protocol
+      //     engine identity is captured on the subsequent execution event.
+      //   protocol_authorized_prescribing / _refill_renewal /
+      //     _dispensing_release: actor_type='ai_workload' (or the legacy
+      //     'protocol_engine' alias only for pre-v1.10 backfill) — these
+      //     are the protocol-engine execution audits. The engine is the
+      //     executing actor authority; the accountable clinician is
+      //     captured in the payload's accountable_clinician_id field.
+      if (action === 'prescribing.protocol_authorization_granted') {
+        if (actor_type !== 'clinician') {
+          throw new Error(
+            `Action "${action}" MUST carry actor_type='clinician' (got "${actor_type}"). ` +
+              `This is the clinician confirmation event that anchors the I-012 protocol-` +
+              `authorized prescribing route; an AI workload cannot supply its own I-012 ` +
+              `confirmation. Per AUDIT_EVENTS v5.3 §I-012 closure rule + Codex pharmacy-` +
+              `scaffold-rebuild R4 HIGH closure 2026-05-12.`,
+          );
+        }
+      } else {
+        // protocol_authorized_prescribing / _refill_renewal / _dispensing_release
+        // — live emissions MUST use actor_type='ai_workload'. The legacy
+        // 'protocol_engine' alias is rejected in this path per Codex
+        // pharmacy-scaffold-rebuild R5 HIGH closure 2026-05-12 (R4 fix had a
+        // hole: emitAudit can't distinguish a live emission from a backfill
+        // import, so accepting 'protocol_engine' here would let a live
+        // emission slip through with the deprecated alias). Backfill imports
+        // for pre-v1.10 records — if they're ever needed — MUST go through a
+        // separate backfill-only API with an explicit `is_backfill: true`
+        // flag and a record-version cutoff. That backfill path is not built
+        // (and may never be needed if pre-v1.10 records aren't migrated);
+        // this comment names the constraint for any future backfill design.
+        if (actor_type !== 'ai_workload') {
+          throw new Error(
+            `Action "${action}" MUST carry actor_type='ai_workload'; got "${actor_type}". ` +
+              `This is the protocol-engine execution audit; the accountable clinician ` +
+              `is recorded in the payload's accountable_clinician_id field. The legacy ` +
+              `'protocol_engine' actor_type is non-compliant per AUDIT_EVENTS v5.3 §I-012 ` +
+              `closure rule line 66 and MUST be mapped at emission time to ` +
+              `'ai_workload' (workload type 'protocol_execution'). Pre-v1.10 backfill ` +
+              `imports — if ever needed — require a separate backfill-only API path that ` +
+              `is not currently built. Per Codex pharmacy-scaffold-rebuild R5 HIGH ` +
+              `closure 2026-05-12.`,
+          );
+        }
+      }
     }
   }
 
