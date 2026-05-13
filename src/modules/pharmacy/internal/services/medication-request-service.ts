@@ -311,6 +311,30 @@ async function consultBelongsToPatient(
   return result.rows[0]?.patient_id === patientAccountId;
 }
 
+/**
+ * Verify the product_catalog row exists in this tenant. Codex PR-119
+ * R5 MEDIUM closure 2026-05-13: previously the service short-circuited
+ * on patient validation and let the product FK be discovered at INSERT
+ * time. A timing-side-channel attacker could distinguish nonexistent-
+ * patient (3 SELECTs, no INSERT) from existing-patient + bad-product
+ * (3 SELECTs + INSERT + FK rollback) even when public envelopes were
+ * byte-identical. Pre-validating the product in the service equalizes
+ * the SQL workload across both probe shapes.
+ */
+async function productCatalogExists(
+  tx: DbClient,
+  tenantId: string,
+  productCatalogId: string,
+): Promise<boolean> {
+  const result = await tx.query<{ id: string }>(
+    `SELECT id
+       FROM product_catalog
+      WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, productCatalogId],
+  );
+  return result.rows.length > 0;
+}
+
 export async function createDraftAsClinician(
   ctx: TenantContext,
   actor: { accountId: string },
@@ -320,39 +344,57 @@ export async function createDraftAsClinician(
   return withTransaction(async (tx) => {
     await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
 
-    // Validate patient_account_id refers to an account_type='patient'
-    // row in this tenant (Codex PR-119 R1 HIGH closure 2026-05-13).
-    // The durable FK only enforces same-tenant existence, not type;
-    // a clinician's account_id IS a valid FK target post-TLC-058 but
-    // creating a medication_request anchored to a non-patient would
-    // corrupt patient-indexed history.
+    // Validate all three foreign references BEFORE any state-mutating
+    // INSERT (Codex PR-119 R1 HIGH + R5 MEDIUM closures 2026-05-13).
+    // Run all SELECTs unconditionally so the SQL workload is identical
+    // regardless of which check ultimately fails — closes the timing-
+    // side-channel that distinguished nonexistent-patient from
+    // existing-patient+bad-product probes even when public envelopes
+    // were byte-identical.
+    //
+    // Invariants enforced here:
+    //   - patient_account_id: row exists in this tenant AND
+    //     account_type='patient' (R1: durable FK is type-agnostic
+    //     post-TLC-058; non-patient would corrupt patient-indexed
+    //     medication history).
+    //   - product_catalog_id: row exists in this tenant. Previously
+    //     deferred to FK 23503 at INSERT; pre-validating equalizes
+    //     SQL paths across probe shapes (R5).
+    //   - prescribing_consult_id (when set): consult row exists in
+    //     this tenant AND consult.patient_id === input.patient_account_id
+    //     (R1 MEDIUM: clinician tying a draft to another patient's
+    //     consult corrupts clinical provenance).
+    //
+    // Failure-mode design: each check produces a boolean. We
+    // accumulate without short-circuit, then throw a SINGLE generic
+    // MedicationRequestInputValidationError after the full validation
+    // pass — the public 400 envelope is collapsed at the handler so
+    // the err.reason here is internal-only.
     const patientAccount = await findAccountById(ctx, asAccountId(input.patient_account_id), tx);
-    if (patientAccount === null) {
-      throw new MedicationRequestInputValidationError(
-        'patient_account_id does not resolve to an account in this tenant.',
-      );
-    }
-    if (patientAccount.account_type !== 'patient') {
-      throw new MedicationRequestInputValidationError(
-        'patient_account_id must reference an account_type=patient account.',
-      );
-    }
+    const patientOk = patientAccount !== null && patientAccount.account_type === 'patient';
 
-    // Validate prescribing_consult_id (when provided) belongs to the
-    // same patient (Codex PR-119 R1 MEDIUM closure 2026-05-13).
+    const productOk = await productCatalogExists(tx, ctx.tenantId, input.product_catalog_id);
+
+    let consultOk = true;
     if (input.prescribing_consult_id !== null) {
-      const belongs = await consultBelongsToPatient(
+      consultOk = await consultBelongsToPatient(
         tx,
         ctx.tenantId,
         input.prescribing_consult_id,
         input.patient_account_id,
       );
-      if (!belongs) {
-        throw new MedicationRequestInputValidationError(
-          'prescribing_consult_id must reference a consult belonging to ' +
-            'the same patient as patient_account_id.',
-        );
-      }
+    }
+
+    if (!patientOk || !productOk || !consultOk) {
+      // Single generic reason — handler collapses to a public message.
+      // The server-side reason text is uniform across all failure
+      // permutations so even server logs / telemetry don't expose
+      // which specific check tripped (defense-in-depth above the
+      // public-envelope collapse).
+      throw new MedicationRequestInputValidationError(
+        'patient_account_id / product_catalog_id / prescribing_consult_id ' +
+          'failed tenant + type + ownership validation.',
+      );
     }
 
     const medicationRequestId = asMedicationRequestId(`mrx_${ulid()}`);
