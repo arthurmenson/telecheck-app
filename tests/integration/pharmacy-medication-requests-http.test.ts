@@ -36,6 +36,7 @@
  *     F1 no Bearer JWT → 401
  *     F1c revoked session → 401 (Codex R1 HIGH closure: session-liveness check)
  *     F1d nonexistent session_id → 401 (Codex R1 HIGH closure)
+ *     F1e session_id mismatched to JWT's account_id → 401 (Codex R2 HIGH closure: account binding)
  *
  *   Group G — PHI projection — global guard
  *     enforced at every assertion via expectNoTenantLeak()
@@ -699,6 +700,41 @@ describe('pharmacy HTTP — Group F: auth failures', () => {
 
     expect(response.statusCode).toBe(401);
     expectNoTenantLeak(response);
+  });
+
+  it('F1e valid JWT for a session belonging to ANOTHER same-tenant account → 401 (Codex R2 HIGH closure)', async () => {
+    // Account binding regression. Construct a token whose JWT claims
+    // pair patient B's account_id with patient A's still-live session_id.
+    // The liveness lookup will find an active session row (A's), but
+    // its account_id (A) does not match the JWT's account_id (B). The
+    // handler MUST reject with 401 — otherwise patient B would
+    // authorize reads against patient A's session, against the
+    // session-to-actor binding implied by Identity & Authentication
+    // Spec v1.0 §3.2.
+    const patientA = await seedAccountInTenant(US_CTX, '+1');
+    const sessionA = await seedSession(T_US, patientA);
+    const patientB = await seedAccountInTenant(US_CTX, '+1');
+    // Pair B's account_id with A's session_id in the JWT — only a
+    // server-side issuer bug would produce such a token in production,
+    // but defense-in-depth at the handler must catch it regardless.
+    const mismatchedToken = mintTokenForSession(T_US, patientB, sessionA);
+
+    const r1 = await app!.inject({
+      method: 'GET',
+      url: `/v0/pharmacy/prescriptions/mrx_${ulid()}`,
+      headers: { host: 'heroshealth.com', authorization: `Bearer ${mismatchedToken}` },
+    });
+    expect(r1.statusCode).toBe(401);
+    expectNoTenantLeak(r1);
+
+    // Same enforcement on the list endpoint.
+    const r2 = await app!.inject({
+      method: 'GET',
+      url: `/v0/pharmacy/patients/${patientB}/prescriptions`,
+      headers: { host: 'heroshealth.com', authorization: `Bearer ${mismatchedToken}` },
+    });
+    expect(r2.statusCode).toBe(401);
+    expectNoTenantLeak(r2);
   });
 
   it('F1d valid JWT for a NONEXISTENT session_id → 401 (Codex R1 HIGH closure)', async () => {

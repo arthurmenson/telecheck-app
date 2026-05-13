@@ -113,6 +113,16 @@ async function requireLiveSession(req: FastifyRequest): Promise<{
   if (live === null) {
     throw new UnauthenticatedError();
   }
+  // Account binding (Codex PR-116 R2 HIGH closure). A live session that
+  // doesn't belong to the JWT's account_id MUST NOT authorize reads as
+  // that account. Without this check, a future bug that desynchronizes
+  // account_id and session_id at token issuance time — or any flow that
+  // hands a token to the wrong account — could authorize cross-account
+  // reads against a same-tenant live session row. By I-025 this 401 is
+  // byte-identical to the missing/revoked/expired 401 above.
+  if (live.account_id !== actor.accountId) {
+    throw new UnauthenticatedError();
+  }
   return { ctx, actor };
 }
 
