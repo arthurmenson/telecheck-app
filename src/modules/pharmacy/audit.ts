@@ -556,7 +556,7 @@ export async function emitMedicationRequestExpired(
     buildEnvelope({
       ...args,
       actorType: 'system',
-      actorId: 'system:prescription-expiry-job',
+      actorId: 'system:medication-request-expiry-job',
       actorTenantId: null,
       action: AUDIT_ACTIONS.MEDICATION_REQUEST_EXPIRED,
       category: 'A',

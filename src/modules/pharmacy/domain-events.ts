@@ -211,7 +211,7 @@ export async function emitMedicationRequestExpired(
   tx: DbTransaction,
   args: MedicationRequestDomainEventCommon & {
     patientAccountId: string;
-    /** The prescription's validity-window-end timestamp. */
+    /** The medication_request's validity-window-end timestamp. */
     expiresAtWindowEnd: Date;
   },
 ): Promise<DomainEventEnvelope> {

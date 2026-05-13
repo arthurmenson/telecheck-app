@@ -542,7 +542,7 @@ export interface TransitionStatusInput {
   prescribed_by_clinician_account_id?: string;
   /** Required when `to_status='active'`. */
   prescribed_at?: Date;
-  /** Optional: prescription validity window end. */
+  /** Optional: medication_request validity window end. */
   expires_at?: Date | null;
   /**
    * Optional: supersedes_id back-pointer (the new row's link back at
@@ -801,7 +801,7 @@ export async function transitionStatus(
     // expire_at_window_end is window-bound: the UPDATE only matches when
     // expires_at IS NOT NULL AND expires_at <= NOW(). Without this guard
     // a scheduler bug, stale retry, or wrong id could terminally expire
-    // an active prescription whose window is still open, cutting off
+    // an active medication_request whose window is still open, cutting off
     // refill / dispensing / subscription flows early. Codex TLC-055 PR A
     // R5 HIGH closure 2026-05-13.
     if (input.event === 'expire_at_window_end') {
@@ -962,7 +962,7 @@ export async function markSuperseded(
     // Same-patient binding (added Codex TLC-055 PR A R3 HIGH closure
     // 2026-05-13): the EXISTS predicate also requires
     // new_row.patient_account_id = old.patient_account_id. Without this,
-    // a service-layer mix-up could mark patient A's active prescription
+    // a service-layer mix-up could mark patient A's active medication_request
     // as superseded by patient B's active replacement (same tenant, same
     // pointer shape, different patient). That would corrupt the
     // medication chain and cross-link PHI in downstream subscription /

@@ -211,10 +211,13 @@ describe('medication-request-repo — §2 createDraft', () => {
     expect(insert?.text).toContain('INSERT INTO medication_requests');
     expect(insert?.text).toMatch(/'draft'/);
     expect(insert?.text).toMatch(/'pending'/);
-    // No ai_workload_type / autonomy_level columns in the INSERT — they
-    // MUST stay null at status=draft per the envelope CHECK.
-    expect(insert?.text).not.toContain('ai_workload_type,');
-    expect(insert?.text).not.toContain('autonomy_level,');
+    // No ai_workload_type / autonomy_level columns in the INSERT column
+    // list — they MUST stay null at status=draft per the envelope CHECK.
+    // (The RETURNING clause includes every column from the row mapping,
+    // so check the column list BEFORE the VALUES keyword only.)
+    const insertColumnList = insert?.text.split('VALUES')[0] ?? '';
+    expect(insertColumnList).not.toContain('ai_workload_type');
+    expect(insertColumnList).not.toContain('autonomy_level');
   });
 
   it('§2b passes protocol_id + protocol_version as route-intent on the draft row', async () => {
