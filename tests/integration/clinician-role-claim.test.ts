@@ -32,6 +32,8 @@
  *     D3 clinician JWT → 403 on POST /v0/pharmacy/prescriptions/:id/discontinue
  *     D4 clinician JWT → 403 on POST /v0/forms/submissions (Codex R2 HIGH closure)
  *     D5 clinician JWT → 403 on POST /v0/forms/resume (Codex R2 HIGH closure)
+ *     D6 clinician JWT → 403 on GET /v0/forms/submissions/:submissionId/snapshot (R3)
+ *     D7 clinician JWT → 403 on GET /v0/forms/snapshots/:snapshotId (R3)
  *
  * Spec references:
  *   - RBAC v1.1 §1.2 (Clinician role; tenant-scoped) + §6 (multi-tenant)
@@ -470,6 +472,77 @@ describe('clinician-role-claim — Group D: patient-only routes reject clinician
           'x-patient-id': ulid(),
         },
         payload: { resumeToken: 'irrelevant-the-gate-fires-first' },
+      });
+
+      expect(r.statusCode).toBe(403);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D6 clinician JWT → 403 on GET /v0/forms/submissions/:submissionId/snapshot (Codex R3 HIGH closure)', async () => {
+    // Patient-facing snapshot read — file-level docstring on
+    // snapshots.ts says clinician case-review uses a different auth
+    // boundary. R3 closure: requirePatientActorContext gate.
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      const clinicianId = await insertAccount('clinician');
+      const sessionId = asSessionId(ulid());
+      const { accessToken } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: clinicianId },
+        {
+          session_id: sessionId,
+          account_id: clinicianId,
+        },
+      );
+
+      const r = await app.inject({
+        method: 'GET',
+        url: `/v0/forms/submissions/${ulid()}/snapshot`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${accessToken}`,
+        },
+      });
+
+      expect(r.statusCode).toBe(403);
+      const body = r.json<{ error: { code: string } }>();
+      expect(body.error.code).toBe('internal.auth.insufficient_scope');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('D7 clinician JWT → 403 on GET /v0/forms/snapshots/:snapshotId (Codex R3 HIGH closure)', async () => {
+    const { buildApp } = await import('../../src/app.ts');
+    const app = await buildApp({ logger: false });
+    try {
+      await app.ready();
+
+      const clinicianId = await insertAccount('clinician');
+      const sessionId = asSessionId(ulid());
+      const { accessToken } = await sessionService.issueSession(
+        US_CTX,
+        { actorId: clinicianId },
+        {
+          session_id: sessionId,
+          account_id: clinicianId,
+        },
+      );
+
+      const r = await app.inject({
+        method: 'GET',
+        url: `/v0/forms/snapshots/${ulid()}`,
+        headers: {
+          host: 'heroshealth.com',
+          authorization: `Bearer ${accessToken}`,
+        },
       });
 
       expect(r.statusCode).toBe(403);
