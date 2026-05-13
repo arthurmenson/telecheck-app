@@ -157,7 +157,8 @@ export const AUDIT_ACTIONS = {
   // MedicationRequest lifecycle events (added at AUDIT_EVENTS v5.3 under P-011)
   MEDICATION_REQUEST_DRAFTED: 'medication_request.drafted',
   MEDICATION_REQUEST_SUBMITTED_FOR_REVIEW: 'medication_request.submitted_for_review',
-  MEDICATION_REQUEST_INTERACTION_EVALUATION_COMPLETED: 'medication_request.interaction_evaluation_completed',
+  MEDICATION_REQUEST_INTERACTION_EVALUATION_COMPLETED:
+    'medication_request.interaction_evaluation_completed',
   MEDICATION_REQUEST_DISCONTINUED: 'medication_request.discontinued',
   MEDICATION_REQUEST_SUPERSEDED: 'medication_request.superseded',
   MEDICATION_REQUEST_EXPIRED: 'medication_request.expired',
@@ -493,7 +494,9 @@ export class I012RejectError extends Error {
     public readonly event: I012GatedEvent,
     public readonly violated_clauses: readonly I012ViolatedClause[],
   ) {
-    super(`I-012 reject-unless three-clause rule failed for ${event}: ${violated_clauses.join(', ')}`);
+    super(
+      `I-012 reject-unless three-clause rule failed for ${event}: ${violated_clauses.join(', ')}`,
+    );
     this.name = 'I012RejectError';
   }
 }
@@ -583,10 +586,7 @@ export function validateTransition(
       // (matches the row CHECK medication_requests_i012_protocol_binding_check
       // tightened to iff in R2 — protocol metadata cannot exist on the
       // clinician-only branch).
-      if (
-        pending_transition.protocol_id !== null ||
-        pending_transition.protocol_version !== null
-      ) {
+      if (pending_transition.protocol_id !== null || pending_transition.protocol_version !== null) {
         throw new I012RejectError(event, ['audit_chain_confirmation_event_missing']);
       }
     }
@@ -611,10 +611,7 @@ export function validateTransition(
  * Per AUDIT_EVENTS v5.3 §I-012 preservation rule (carries forward v5.2
  * line 78 prose plus P-011 amendment).
  */
-function evaluateI012Clauses(
-  event: I012GatedEvent,
-  guard: I012GuardContext,
-): I012ViolatedClause[] {
+function evaluateI012Clauses(event: I012GatedEvent, guard: I012GuardContext): I012ViolatedClause[] {
   const violations: I012ViolatedClause[] = [];
 
   if (event === 'clinician_approve' && guard.route === 'clinician_approve') {
@@ -643,7 +640,10 @@ function evaluateI012Clauses(
     return violations;
   }
 
-  if (event === 'protocol_authorized_prescribing' && guard.route === 'protocol_authorized_prescribing') {
+  if (
+    event === 'protocol_authorized_prescribing' &&
+    guard.route === 'protocol_authorized_prescribing'
+  ) {
     // Protocol-authorized route.
     //
     // Clause 1: autonomy_level string equality. Reserved levels (advisory,

@@ -115,11 +115,7 @@ export type MedicationRequestDiscontinuedReason =
  * `medication_request.interaction_safety_hold_triggered` when it flips to
  * 'safety_hold'.
  */
-export type InteractionSignalsStatus =
-  | 'pending'
-  | 'clean'
-  | 'caution'
-  | 'safety_hold';
+export type InteractionSignalsStatus = 'pending' | 'clean' | 'caution' | 'safety_hold';
 
 /**
  * Canonical AI workload types active at v1.0 per WORKLOAD_TAXONOMY v5.2
