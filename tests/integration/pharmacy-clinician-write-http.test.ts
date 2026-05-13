@@ -12,7 +12,7 @@
  * and remaining clinician transitions (decline / discontinue / supersede /
  * modify) land in subsequent pharmacy PRs.
  *
- * Coverage (5 groups, 12 cases):
+ * Coverage (6 groups, 15 cases):
  *
  *   Group A — Happy path: createDraft
  *     A1 clinician → 201 + draft view (status=draft, interaction=pending)
@@ -37,6 +37,11 @@
  *     E2 submit on already-submitted row → 409 state conflict
  *     E3 submit on nonexistent id → 404 tenant-blind
  *     E4 submit on malformed id → 404 (side-channel closure per I-025)
+ *
+ *   Group F — Cross-row invariants (Codex PR-119 R1 HIGH/MEDIUM closures)
+ *     F1 country_of_care supplied in body → 400 (must be server-derived)
+ *     F2 patient_account_id resolves to a clinician account → 400
+ *     F3 prescribing_consult_id belongs to a different patient → 400
  *
  * Spec references:
  *   - State Machines v1.2 §19 (submit_for_review: draft → pending_interaction_check)
@@ -216,13 +221,20 @@ async function mintTokenForRole(
   );
 }
 
-/** Minimal valid request body for createDraft. Test cases override fields. */
+/**
+ * Minimal valid request body for createDraft.
+ *
+ * NOTE: `country_of_care` is intentionally absent — Codex PR-119 R1
+ * HIGH closure 2026-05-13. The field is derived server-side from
+ * tenant context; passing it in the body returns 400.
+ */
 function makeDraftBody(overrides: {
   patientId: string;
   productId: string;
   quantity?: number;
   protocolId?: string | null;
   protocolVersion?: string | null;
+  prescribingConsultId?: string | null;
 }): Record<string, unknown> {
   return {
     patient_account_id: overrides.patientId,
@@ -234,10 +246,9 @@ function makeDraftBody(overrides: {
     quantity: overrides.quantity ?? 30,
     quantity_unit: 'tablet',
     refills_allowed: 0,
-    country_of_care: 'US',
     indication: null,
     clinical_notes: null,
-    prescribing_consult_id: null,
+    prescribing_consult_id: overrides.prescribingConsultId ?? null,
     protocol_id: overrides.protocolId ?? null,
     protocol_version: overrides.protocolVersion ?? null,
   };
@@ -657,6 +668,114 @@ describe('pharmacy clinician write — Group E: submit_for_review', () => {
     expect(r.statusCode).toBe(404);
     const body = r.json<{ error: { code: string } }>();
     expect(body.error.code).toBe('internal.resource.not_found');
+    expectNoTenantLeak(r);
+  });
+});
+
+// ===========================================================================
+// Group F — Cross-row invariants (Codex PR-119 R1 HIGH/MEDIUM closures)
+// ===========================================================================
+
+describe('pharmacy clinician write — Group F: cross-row invariants', () => {
+  it('F1 country_of_care in body → 400 (server-derived only)', async () => {
+    const clinician = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    const patient = await insertAccountOfType(US_CTX, 'patient', '+1');
+    const product = await seedProduct(US_CTX);
+    const token = await mintTokenForRole(T_US, clinician, 'clinician');
+
+    const bodyWithCountry = {
+      ...makeDraftBody({ patientId: patient, productId: product }),
+      // The attacker's payload — try to override CCR routing to Ghana
+      // on a US tenant.
+      country_of_care: 'GH',
+    };
+
+    const r = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      payload: bodyWithCountry,
+    });
+
+    expect(r.statusCode).toBe(400);
+    const body = r.json<{ error: { code: string; message: string } }>();
+    expect(body.error.code).toBe('internal.request.invalid');
+    expect(body.error.message).toContain('country_of_care');
+    expectNoTenantLeak(r);
+  });
+
+  it('F2 patient_account_id resolves to a clinician → 400', async () => {
+    const clinician1 = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    // Second clinician — used as the "patient_account_id" in the attack.
+    const clinician2 = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    const product = await seedProduct(US_CTX);
+    const token = await mintTokenForRole(T_US, clinician1, 'clinician');
+
+    const r = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      // Anchor the medication_request on a clinician account_id —
+      // must be rejected. The composite FK alone would accept this
+      // (FK targets accounts by composite (tenant_id, account_id),
+      // type-agnostic). The service-layer account_type check catches it.
+      payload: makeDraftBody({ patientId: clinician2, productId: product }),
+    });
+
+    expect(r.statusCode).toBe(400);
+    const body = r.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe('internal.request.invalid');
+    expectNoTenantLeak(r);
+  });
+
+  it('F3 prescribing_consult_id belongs to a different patient → 400', async () => {
+    const clinician = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    const patientA = await insertAccountOfType(US_CTX, 'patient', '+1');
+    const patientB = await insertAccountOfType(US_CTX, 'patient', '+1');
+    const product = await seedProduct(US_CTX);
+    const token = await mintTokenForRole(T_US, clinician, 'clinician');
+
+    // Seed a consult owned by patient B.
+    const consultIdB = ulid();
+    await withTenantContext(T_US, async () => {
+      const client = getTestClient();
+      await client.query(
+        `INSERT INTO consults (
+            id, tenant_id, patient_id, state, consult_type, modality, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())`,
+        [consultIdB, T_US, patientB, 'INITIATED', 'general', 'async'],
+      );
+    });
+
+    // Clinician tries to anchor a draft on patient A but tie it to
+    // patient B's consult — clinical-provenance corruption attempt.
+    const r = await app!.inject({
+      method: 'POST',
+      url: '/v0/pharmacy/prescriptions',
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': ulid(),
+      },
+      payload: makeDraftBody({
+        patientId: patientA,
+        productId: product,
+        prescribingConsultId: consultIdB,
+      }),
+    });
+
+    expect(r.statusCode).toBe(400);
+    const body = r.json<{ error: { code: string; message: string } }>();
+    expect(body.error.code).toBe('internal.request.invalid');
+    expect(body.error.message).toContain('prescribing_consult_id');
     expectNoTenantLeak(r);
   });
 });

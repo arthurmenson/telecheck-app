@@ -40,11 +40,12 @@
  *     (precedent for service-layer shape + error classes + ownership check)
  */
 
-import type { DbTransaction } from '../../../../lib/db.js';
+import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { asMedicationRequestId } from '../../../../lib/glossary.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
+import { asAccountId, findAccountById } from '../../../identity/index.js';
 import {
   emitMedicationRequestDiscontinued,
   emitMedicationRequestDrafted,
@@ -97,6 +98,30 @@ export class MedicationRequestStateConflictError extends Error {
       }).`,
     );
     this.name = 'MedicationRequestStateConflictError';
+  }
+}
+
+/**
+ * Body-level validation error — the request inputs are structurally
+ * valid (correct types, required fields present) but a cross-row
+ * invariant is violated. HTTP layer maps to 400 internal.request.invalid.
+ *
+ * Cases (Codex PR-119 R1 HIGH/MEDIUM closures 2026-05-13):
+ *   - patient_account_id resolves to a non-'patient' account (clinician
+ *     or delegate) in the same tenant. medication_requests anchors on
+ *     patient accounts only; the durable FK target accounts(tenant_id,
+ *     account_id) doesn't discriminate type, so the service must.
+ *   - prescribing_consult_id is set but the consult's patient_id ≠
+ *     input.patient_account_id (clinician tied draft to another
+ *     patient's consult — clinical-provenance corruption).
+ *
+ * The error message is intentionally generic — per I-025 a same-tenant
+ * attacker should not learn whether the offending id exists at all.
+ */
+export class MedicationRequestInputValidationError extends Error {
+  constructor(public readonly reason: string) {
+    super(`MedicationRequest input validation failed: ${reason}`);
+    this.name = 'MedicationRequestInputValidationError';
   }
 }
 
@@ -233,6 +258,14 @@ export async function discontinueByPatient(
 // are not yet authoritative for downstream subscribers.
 // ---------------------------------------------------------------------------
 
+/**
+ * createDraft request shape — clinician-supplied fields ONLY. Notably
+ * absent (Codex PR-119 R1 HIGH closure 2026-05-13):
+ *   - country_of_care: derived server-side from `ctx.countryOfCare`.
+ *     Accepting it from the client allowed a US-tenant clinician to
+ *     persist a row with `country_of_care: 'GH'` — misrouting CCR
+ *     resolution and creating audit/row metadata disagreement.
+ */
 export interface CreateDraftAsClinicianInput {
   patient_account_id: string;
   product_catalog_id: ProductCatalogId;
@@ -246,9 +279,36 @@ export interface CreateDraftAsClinicianInput {
   indication: string | null;
   clinical_notes: string | null;
   prescribing_consult_id: string | null;
-  country_of_care: string;
   protocol_id: string | null;
   protocol_version: string | null;
+}
+
+/**
+ * Verify the prescribing consult belongs to the same patient as the
+ * draft anchor. Closes Codex PR-119 R1 MEDIUM — clinician tying a
+ * draft to another patient's consult would corrupt clinical
+ * provenance. Returns true iff:
+ *   - consult exists in this tenant
+ *   - consult.patient_id === input patient_account_id
+ *
+ * Raw SQL because the cross-module surface (async-consult's
+ * findConsultById) is internal — exporting it from async-consult's
+ * public interface is a separate refactor.
+ */
+async function consultBelongsToPatient(
+  tx: DbClient,
+  tenantId: string,
+  consultId: string,
+  patientAccountId: string,
+): Promise<boolean> {
+  const result = await tx.query<{ patient_id: string }>(
+    `SELECT patient_id
+       FROM consults
+      WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, consultId],
+  );
+  if (result.rows.length === 0) return false;
+  return result.rows[0]?.patient_id === patientAccountId;
 }
 
 export async function createDraftAsClinician(
@@ -259,6 +319,41 @@ export async function createDraftAsClinician(
 ): Promise<MedicationRequest> {
   return withTransaction(async (tx) => {
     await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    // Validate patient_account_id refers to an account_type='patient'
+    // row in this tenant (Codex PR-119 R1 HIGH closure 2026-05-13).
+    // The durable FK only enforces same-tenant existence, not type;
+    // a clinician's account_id IS a valid FK target post-TLC-058 but
+    // creating a medication_request anchored to a non-patient would
+    // corrupt patient-indexed history.
+    const patientAccount = await findAccountById(ctx, asAccountId(input.patient_account_id), tx);
+    if (patientAccount === null) {
+      throw new MedicationRequestInputValidationError(
+        'patient_account_id does not resolve to an account in this tenant.',
+      );
+    }
+    if (patientAccount.account_type !== 'patient') {
+      throw new MedicationRequestInputValidationError(
+        'patient_account_id must reference an account_type=patient account.',
+      );
+    }
+
+    // Validate prescribing_consult_id (when provided) belongs to the
+    // same patient (Codex PR-119 R1 MEDIUM closure 2026-05-13).
+    if (input.prescribing_consult_id !== null) {
+      const belongs = await consultBelongsToPatient(
+        tx,
+        ctx.tenantId,
+        input.prescribing_consult_id,
+        input.patient_account_id,
+      );
+      if (!belongs) {
+        throw new MedicationRequestInputValidationError(
+          'prescribing_consult_id must reference a consult belonging to ' +
+            'the same patient as patient_account_id.',
+        );
+      }
+    }
 
     const medicationRequestId = asMedicationRequestId(`mrx_${ulid()}`);
 
@@ -278,7 +373,10 @@ export async function createDraftAsClinician(
         indication: input.indication,
         clinical_notes: input.clinical_notes,
         prescribing_consult_id: input.prescribing_consult_id,
-        country_of_care: input.country_of_care,
+        // country_of_care derived server-side from tenant context.
+        // Accepting it from the body would allow a US-tenant clinician
+        // to misroute CCR resolution by passing 'GH'.
+        country_of_care: ctx.countryOfCare,
         protocol_id: input.protocol_id,
         protocol_version: input.protocol_version,
       },

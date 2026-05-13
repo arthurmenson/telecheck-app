@@ -353,6 +353,15 @@ function mapWriteServiceError(err: unknown, reply: FastifyReply, reqId: string):
       .send(makeErrorEnvelope(reqId, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
     return true;
   }
+  if (err instanceof medicationRequestService.MedicationRequestInputValidationError) {
+    // Codex PR-119 R1 closure 2026-05-13: non-patient account_type as
+    // patient_account_id, or prescribing_consult_id whose consult
+    // belongs to a different patient. Both map to tenant-blind 400 —
+    // the message stays generic so a same-tenant attacker doesn't
+    // learn whether the offending id exists.
+    void reply.code(400).send(makeErrorEnvelope(reqId, 'internal.request.invalid', err.reason));
+    return true;
+  }
   if (err instanceof medicationRequestService.MedicationRequestStateConflictError) {
     void reply
       .code(409)
@@ -530,6 +539,9 @@ interface CreateDraftBody {
   indication?: unknown;
   clinical_notes?: unknown;
   prescribing_consult_id?: unknown;
+  // country_of_care: NOT accepted from body (Codex PR-119 R1 HIGH
+  // closure 2026-05-13). Derived server-side from ctx.countryOfCare.
+  // Any body field with this name is rejected at the validator.
   country_of_care?: unknown;
   protocol_id?: unknown;
   protocol_version?: unknown;
@@ -598,10 +610,16 @@ function parseCreateDraftBody(
   if (!isNonNegativeInteger(body.refills_allowed)) {
     return { ok: false, message: 'refills_allowed (non-negative integer) is required.' };
   }
-  if (!isString(body.country_of_care) || body.country_of_care.length !== 2) {
+  // country_of_care is server-derived from tenant context (Codex
+  // PR-119 R1 HIGH closure 2026-05-13). Reject any body value
+  // explicitly so callers fail loud rather than silently have their
+  // value ignored.
+  if (body.country_of_care !== undefined) {
     return {
       ok: false,
-      message: 'country_of_care (ISO 3166-1 alpha-2 string) is required.',
+      message:
+        'country_of_care must not be supplied in the request body — it is ' +
+        'derived server-side from the tenant context.',
     };
   }
 
@@ -656,7 +674,7 @@ function parseCreateDraftBody(
         prescribingConsultId === undefined || prescribingConsultId === null
           ? null
           : prescribingConsultId,
-      country_of_care: body.country_of_care,
+      // country_of_care derived server-side in service (R1 closure).
       protocol_id: protocolIdSet ? protocolId : null,
       protocol_version: protocolVersionSet ? protocolVersion : null,
     },
