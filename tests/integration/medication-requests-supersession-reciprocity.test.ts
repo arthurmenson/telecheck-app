@@ -74,6 +74,7 @@ interface InsertMedicationRequestInput {
   id: string;
   tenant_id: string;
   patient_account_id: string;
+  prescriber_account_id: string;
   product_catalog_id: string;
   status: 'active' | 'superseded';
   supersedes_id?: string | null;
@@ -108,6 +109,7 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
         dose_instructions, quantity, quantity_unit, refills_allowed,
         status,
         prescribed_at, activated_at,
+        prescribed_by_clinician_account_id,
         interaction_signals_status, interaction_signals_evaluated_at,
         supersedes_id,
         country_of_care
@@ -118,9 +120,10 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
         $8, $9, $10, $11,
         $12,
         $13, $14,
-        $15, $16,
-        $17,
-        $18
+        $15,
+        $16, $17,
+        $18,
+        $19
      )`,
     [
       input.id,
@@ -137,6 +140,7 @@ async function insertMedicationRequest(input: InsertMedicationRequestInput): Pro
       input.status,
       now,
       now,
+      input.prescriber_account_id,
       'clean',
       now,
       input.supersedes_id ?? null,
@@ -167,10 +171,18 @@ async function setForwardPointer(
 }
 
 /**
- * Insert a minimal patient account under the given tenant context. Returns
- * the account_id (ULID).
+ * Insert a minimal account under the given tenant context. Returns
+ * the account_id (ULID). account_type is caller-supplied — the
+ * reciprocity trigger doesn't care about type, but the
+ * medication_requests_prescriber_set_when_active CHECK requires a
+ * non-null clinician account_id when status is active or post-active,
+ * and the composite FK on (tenant_id, prescribed_by_clinician_account_id)
+ * requires that account row exists in the same tenant.
  */
-async function insertPatient(tenantId: string): Promise<string> {
+async function insertAccount(
+  tenantId: string,
+  accountType: 'patient' | 'clinician' = 'patient',
+): Promise<string> {
   const client = getTestClient();
   const accountId = ulid();
   await client.query(
@@ -189,18 +201,26 @@ async function insertPatient(tenantId: string): Promise<string> {
       uniquePhone(),
       null,
       'Test',
-      'Patient',
+      accountType === 'clinician' ? 'Clinician' : 'Patient',
       '1990-01-01',
       'prefer_not_to_say',
       null,
       'US',
       'US',
       'en-US',
-      'patient',
+      accountType,
       'active',
     ],
   );
   return accountId;
+}
+
+async function insertPatient(tenantId: string): Promise<string> {
+  return insertAccount(tenantId, 'patient');
+}
+
+async function insertClinician(tenantId: string): Promise<string> {
+  return insertAccount(tenantId, 'clinician');
 }
 
 /**
@@ -273,6 +293,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
     await withTenantContext(T, async () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
+      const clinician = await insertClinician(T);
 
       // FK-safe insert order:
       //   1. A as 'active' (no pointers)
@@ -287,6 +308,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: aId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
       });
@@ -294,6 +316,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: bId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
         supersedes_id: aId,
@@ -311,6 +334,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
     await withTenantContext(T, async () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
+      const clinician = await insertClinician(T);
 
       // A and B both 'active'; B never points back at A. Then flip A
       // to 'superseded' with forward pointer to B — but B's back
@@ -321,6 +345,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: aId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
       });
@@ -328,6 +353,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: bId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
         // B does NOT carry the matching back-pointer.
@@ -350,6 +376,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
     await withTenantContext(T, async () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
+      const clinician = await insertClinician(T);
 
       // Insert C and B such that B points back at C (not at A). Then
       // insert A pointing forward at B. A's forward edge to B is
@@ -361,6 +388,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: cId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
       });
@@ -368,6 +396,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: bId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
         supersedes_id: cId,
@@ -376,6 +405,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: aId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
       });
@@ -394,6 +424,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
       const p1 = await insertPatient(T);
       const p2 = await insertPatient(T);
       const product = await insertProduct(T);
+      const clinician = await insertClinician(T);
 
       // A anchors P1; B anchors P2 with supersedes_id=A — pointer-level
       // reciprocity but mismatched patient. The trigger MUST reject
@@ -404,6 +435,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: aId,
         tenant_id: T,
         patient_account_id: p1,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
       });
@@ -411,6 +443,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: bId,
         tenant_id: T,
         patient_account_id: p2,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
         supersedes_id: aId,
@@ -429,6 +462,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
     await withTenantContext(T, async () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
+      const clinician = await insertClinician(T);
 
       // A and B both 'active'; B carries supersedes_id=A. A's status
       // never flips to 'superseded'. Direction B of the trigger
@@ -440,6 +474,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: aId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
       });
@@ -447,6 +482,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: bId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
         supersedes_id: aId,
@@ -484,6 +520,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
     await withTenantContext(T, async () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
+      const clinician = await insertClinician(T);
 
       const client = getTestClient();
 
@@ -508,6 +545,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: aId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
       });
@@ -515,6 +553,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: bId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
         supersedes_id: null,
@@ -554,6 +593,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
     await withTenantContext(T, async () => {
       const patient = await insertPatient(T);
       const product = await insertProduct(T);
+      const clinician = await insertClinician(T);
 
       // Construct a one-sided edge under tenant US (same shape as §2).
       const aId = mrxId();
@@ -562,6 +602,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: aId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
       });
@@ -569,6 +610,7 @@ describe('migration 026 — supersession reciprocity trigger', () => {
         id: bId,
         tenant_id: T,
         patient_account_id: patient,
+        prescriber_account_id: clinician,
         product_catalog_id: product,
         status: 'active',
         supersedes_id: null,
