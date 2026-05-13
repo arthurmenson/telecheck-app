@@ -31,6 +31,7 @@
  *   §4 cross-patient supersession — A.patient=P1, B.patient=P2 — fails
  *   §5 reverse-edge bad-status    — B.supersedes_id=A but A.status='active'
  *   §6 search_path shadow-table   — TEMP TABLE attack does NOT bypass the trigger
+ *   §7 RLS-context-switch attack  — switching tenant binding before COMMIT does NOT bypass
  *
  * Same-tenant scope. Cross-tenant edges are already prevented at the FK
  * layer (composite FK on (tenant_id, supersedes_id) / (tenant_id,
@@ -51,7 +52,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { ulid } from '../../src/lib/ulid.ts';
-import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
@@ -515,5 +516,65 @@ describe('migration 026 — supersession reciprocity trigger', () => {
       expect(result).not.toBeNull();
       expect(result).toMatch(/reciprocity violated/i);
     });
+  });
+
+  it('§7 RLS context switch before COMMIT does NOT bypass the trigger', async () => {
+    // Codex R3 HIGH closure regression: a SECURITY INVOKER trigger
+    // function evaluates its re-fetch under the calling session's RLS
+    // context. An adversary with SQL access could:
+    //   1. set_tenant_context('Telecheck-US')
+    //   2. INSERT a malformed one-sided supersession edge in tenant US
+    //   3. set_tenant_context('Telecheck-Ghana') BEFORE SET CONSTRAINTS
+    //      IMMEDIATE / COMMIT
+    //   4. trigger fires, re-fetches by NEW.id under the Ghana RLS
+    //      filter, sees zero rows (US row is RLS-invisible), hits the
+    //      NOT FOUND branch, returns silently — letting the bad edge
+    //      commit.
+    //
+    // Fix: trigger function is SECURITY DEFINER, owned by the
+    // migration-applying role (superuser / BYPASSRLS). The re-fetch
+    // bypasses FORCE RLS and sees the real row regardless of caller
+    // tenant binding.
+    //
+    // This test mounts that attack and asserts the trigger still
+    // raises. If SECURITY DEFINER regresses to SECURITY INVOKER, this
+    // test starts failing.
+    const T = TENANT_US;
+    const client = getTestClient();
+
+    await withTenantContext(T, async () => {
+      const patient = await insertPatient(T);
+      const product = await insertProduct(T);
+
+      // Construct a one-sided edge under tenant US (same shape as §2).
+      const aId = mrxId();
+      const bId = mrxId();
+      await insertMedicationRequest({
+        id: aId,
+        tenant_id: T,
+        patient_account_id: patient,
+        product_catalog_id: product,
+        status: 'active',
+      });
+      await insertMedicationRequest({
+        id: bId,
+        tenant_id: T,
+        patient_account_id: patient,
+        product_catalog_id: product,
+        status: 'active',
+        supersedes_id: null,
+      });
+      await setForwardPointer(aId, bId);
+
+      // Switch the session's tenant binding to Ghana BEFORE forcing
+      // the deferred trigger to fire. The US rows are now RLS-invisible
+      // to the SECURITY INVOKER lookup path; SECURITY DEFINER is the
+      // mechanism that lets the trigger still see them.
+      await client.query('SELECT set_tenant_context($1)', [TENANT_GHANA]);
+    });
+
+    const result = await forceConstraintCheck();
+    expect(result).not.toBeNull();
+    expect(result).toMatch(/reciprocity violated/i);
   });
 });

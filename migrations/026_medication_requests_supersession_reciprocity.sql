@@ -228,16 +228,35 @@ $$;
 CREATE OR REPLACE FUNCTION medication_requests_supersession_reciprocity_check()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+-- SECURITY DEFINER is required (Codex R3 HIGH closure). The trigger is
+-- enforcing a cross-row durable invariant, NOT a per-session access
+-- control. With the default SECURITY INVOKER, the trigger's re-fetch
+-- runs under the calling session's RLS context. An adversary with
+-- SQL access could:
+--   1. set_tenant_context('Telecheck-US') and INSERT a malformed
+--      one-sided supersession row in tenant US
+--   2. set_tenant_context('Telecheck-Ghana') before SET CONSTRAINTS
+--      IMMEDIATE / COMMIT
+--   3. trigger fires, re-fetches by NEW.id under Ghana RLS context,
+--      sees zero rows (US row is RLS-invisible), hits the NOT FOUND
+--      branch, returns silently — letting the malformed edge commit.
+-- SECURITY DEFINER makes the function execute with the privileges of
+-- the function OWNER (the migration-applying role — superuser in CI and
+-- prod, BYPASSRLS in both). Superuser/BYPASSRLS roles bypass FORCE RLS
+-- so the re-fetch sees the real row regardless of caller tenant binding.
+-- The function only performs parameterized SELECT on the canonical
+-- table and RAISE EXCEPTION on violation — no dynamic SQL, no caller-
+-- supplied tables, no privilege exposure beyond what the trigger needs.
+SECURITY DEFINER
 -- Lock search_path to a fixed two-element list (pg_catalog first for
--- builtins, public for our schema). Without this, a session that sets
--- search_path or creates a temp table named `medication_requests` could
--- shadow the real `public.medication_requests` and make the trigger's
--- re-fetch resolve to an empty table — the NOT FOUND branch would return
--- silently and let the one-sided supersession state this migration is
--- supposed to prevent slip past. Every table reference inside the
--- function is ALSO schema-qualified as `public.medication_requests` as
--- defense-in-depth so the function is robust even if the SET clause is
--- stripped by a future edit. Codex R2 HIGH closure.
+-- builtins, public for our schema). Required for SECURITY DEFINER
+-- functions per Postgres SECURITY DEFINER hardening guidance: without
+-- this, the elevated execution context could be redirected to a
+-- shadow table the caller created in pg_temp. Every table reference
+-- inside the function is ALSO schema-qualified as
+-- `public.medication_requests` as defense-in-depth so the function is
+-- robust even if the SET clause is stripped by a future edit. Codex
+-- R2 HIGH closure.
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
