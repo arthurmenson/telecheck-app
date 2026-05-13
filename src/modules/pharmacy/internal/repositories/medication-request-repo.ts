@@ -798,6 +798,29 @@ export async function transitionStatus(
       return rowToMedicationRequest(result.rows[0] as MedicationRequestRow);
     }
 
+    // expire_at_window_end is window-bound: the UPDATE only matches when
+    // expires_at IS NOT NULL AND expires_at <= NOW(). Without this guard
+    // a scheduler bug, stale retry, or wrong id could terminally expire
+    // an active prescription whose window is still open, cutting off
+    // refill / dispensing / subscription flows early. Codex TLC-055 PR A
+    // R5 HIGH closure 2026-05-13.
+    if (input.event === 'expire_at_window_end') {
+      const result = await client.query<MedicationRequestRow>(
+        `UPDATE medication_requests
+            SET status = $1,
+                updated_at = NOW()
+          WHERE id = $2
+            AND tenant_id = $3
+            AND status = $4
+            AND expires_at IS NOT NULL
+            AND expires_at <= NOW()
+          RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
+        [input.to_status, input.id, input.tenant_id, input.expected_from_status],
+      );
+      if (result.rows.length === 0) return null;
+      return rowToMedicationRequest(result.rows[0] as MedicationRequestRow);
+    }
+
     // clinician_modify resets the interaction evaluation atomically with
     // the status transition (Codex TLC-055 PR A R1 HIGH closure
     // 2026-05-13). The modify event reroutes the row back to

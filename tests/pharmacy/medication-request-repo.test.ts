@@ -802,6 +802,40 @@ describe('medication-request-repo — §8.7 row-binding defense', () => {
 // §9 — externalTx path: does NOT call withTenantBoundConnection
 // ---------------------------------------------------------------------------
 
+describe('medication-request-repo — §8.8 expire_at_window_end bounds (Codex R5 HIGH closure)', () => {
+  it('§8.8a expire UPDATE WHERE-clause requires expires_at IS NOT NULL AND <= NOW()', async () => {
+    const { client, captured } = makeMockClient([[buildRowFixture({ status: 'expired' })]]);
+    await transitionStatus(
+      {
+        id: ROW_ID,
+        tenant_id: TENANT,
+        expected_from_status: 'active',
+        to_status: 'expired',
+        event: 'expire_at_window_end',
+      },
+      client,
+    );
+    const update = captured[0];
+    expect(update?.text).toContain('expires_at IS NOT NULL');
+    expect(update?.text).toContain('expires_at <= NOW()');
+  });
+
+  it('§8.8b expire returns null when WHERE-clause matches no rows (window not yet elapsed)', async () => {
+    const { client } = makeMockClient([[]]);
+    const result = await transitionStatus(
+      {
+        id: ROW_ID,
+        tenant_id: TENANT,
+        expected_from_status: 'active',
+        to_status: 'expired',
+        event: 'expire_at_window_end',
+      },
+      client,
+    );
+    expect(result).toBeNull();
+  });
+});
+
 describe('medication-request-repo — §9 externalTx routing', () => {
   it('§9a passing externalTx skips withTenantBoundConnection (the caller owns the tenant context)', async () => {
     const wtbcSpy = vi.spyOn(dbModule, 'withTenantBoundConnection');
