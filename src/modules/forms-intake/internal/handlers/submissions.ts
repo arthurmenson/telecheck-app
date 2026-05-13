@@ -19,6 +19,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { requirePatientActorContext } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import {
@@ -86,10 +87,18 @@ function resolvePatient(req: FastifyRequest): { patientId: PatientId; delegateId
   // Tier 1: req.actorContext (JWT-resolved). The patient's account_id
   // IS the patient_id at v1.0 (Account = Patient per CDM §3.2;
   // separate Patient entity is deferred per Identity Spec §1.X).
+  //
+  // Role-gated (Codex PR-118 R2 HIGH closure 2026-05-13): a clinician
+  // JWT must NOT pass through this resolver as the patient anchor —
+  // doing so would create patient submission data under a non-patient
+  // accountId. requirePatientActorContext throws UnauthorizedRoleError
+  // (→ 403) on role mismatch, identical envelope shape to every other
+  // role-gated route.
   if (req.actorContext !== undefined) {
+    const patientActor = requirePatientActorContext(req);
     return {
-      patientId: req.actorContext.accountId,
-      delegateId: req.actorContext.delegateId,
+      patientId: patientActor.accountId,
+      delegateId: patientActor.delegateId,
     };
   }
 

@@ -33,14 +33,34 @@ import type { TenantId } from './glossary.js';
 // ---------------------------------------------------------------------------
 
 /**
+/**
+ * Canonical access-token role enum. The set of role names the JWT layer
+ * accepts. v1.0: patient + clinician (TLC-058 / PR for migration 027
+ * 2026-05-13). Additional roles (pharmacist, operator, admin, research
+ * data steward) land with their respective slices.
+ *
+ * The verify path validates incoming `claims.role` against this set and
+ * rejects with reason='invalid_payload' on any unknown value — defense
+ * against a future bug in the issuer that mints out-of-enum roles.
+ */
+export type AccessTokenRole = 'patient' | 'clinician';
+
+const VALID_ACCESS_TOKEN_ROLES: ReadonlySet<AccessTokenRole> = new Set<AccessTokenRole>([
+  'patient',
+  'clinician',
+]);
+
+/**
  * Access token claims per Identity Spec §3.3. Fields:
- *   - sub         : account_id (subject; the patient's account)
+ *   - sub         : account_id (subject; the actor's account)
  *   - tenant_id   : operating-tenant identifier ('Telecheck-{Country}')
  *   - session_id  : the server-side session row binding this token
- *   - role        : 'patient' (v1.0; expanded when clinician/operator
- *                   slices land)
+ *   - role        : 'patient' | 'clinician' (TLC-058 widened from
+ *                   'patient'-only). Future v1.x adds pharmacist,
+ *                   operator, admin, research_data_steward.
  *   - country_of_care: ISO 3166-1 alpha-2 (drives CCR resolution)
- *   - delegate_id : non-null when the patient is acting as a delegate
+ *   - delegate_id : non-null when a patient is acting as a delegate
+ *                   (does NOT apply to clinician role)
  *   - iat         : issued-at (seconds since epoch)
  *   - exp         : expires-at (seconds since epoch; iat + ACCESS_TTL_SEC)
  */
@@ -48,7 +68,7 @@ export interface AccessTokenClaims {
   sub: string;
   tenant_id: TenantId;
   session_id: string;
-  role: 'patient';
+  role: AccessTokenRole;
   country_of_care: 'US' | 'GH';
   delegate_id?: string | null;
   iat: number;
@@ -92,23 +112,46 @@ export interface IssueAccessTokenInput {
   account_id: string;
   tenant_id: TenantId;
   session_id: string;
+  /**
+   * The actor's role for this session. Required at v1.0 — the lib does
+   * NOT default to 'patient' so callers can't accidentally widen
+   * patient JWTs to carry a stale-default 'patient' label when issuing
+   * a clinician session. The session-service `issueSession` resolves
+   * this from `accounts.account_type` at session creation time so the
+   * mapping is centralized at one site (TLC-058 / 2026-05-13).
+   */
+  role: AccessTokenRole;
   country_of_care: 'US' | 'GH';
   delegate_id?: string | null;
 }
 
 /**
  * Issue a fresh JWT access token. The caller (typically the login-verify
- * handler) MUST persist the session row server-side BEFORE calling this
- * — the JWT references session_id by claim, and the verify path will
- * validate that the session is still active.
+ * handler via session-service.issueSession) MUST:
+ *   1. Persist the session row server-side BEFORE calling this — the
+ *      JWT references session_id by claim, and the verify path will
+ *      validate that the session is still active.
+ *   2. Pass the canonical role for the actor (resolved from
+ *      accounts.account_type by the session-service; this lib never
+ *      defaults).
  */
 export function issueAccessToken(input: IssueAccessTokenInput, signingKey: string): string {
+  // Defense-in-depth on the issuer side. The type system already
+  // restricts callers to the AccessTokenRole enum, but the runtime
+  // check catches any `as` cast that crept past static analysis.
+  if (!VALID_ACCESS_TOKEN_ROLES.has(input.role)) {
+    throw new Error(
+      `issueAccessToken: role ${String(input.role)} is not a valid AccessTokenRole. ` +
+        'Valid values: patient | clinician. Update VALID_ACCESS_TOKEN_ROLES + the ' +
+        'AccessTokenRole union when widening (RBAC v1.1 §1.2).',
+    );
+  }
   const now = Math.floor(Date.now() / 1000);
   const claims: AccessTokenClaims = {
     sub: input.account_id,
     tenant_id: input.tenant_id,
     session_id: input.session_id,
-    role: 'patient',
+    role: input.role,
     country_of_care: input.country_of_care,
     iat: now,
     exp: now + ACCESS_TOKEN_TTL_SECONDS,
@@ -200,6 +243,16 @@ export function verifyAccessToken(token: string, signingKey: string): VerifyAcce
     typeof claims.exp !== 'number' ||
     typeof claims.iat !== 'number'
   ) {
+    return { ok: false, reason: 'invalid_payload' };
+  }
+
+  // Role enum validation (TLC-058 / 2026-05-13). Reject any role
+  // outside the canonical AccessTokenRole set so a buggy or
+  // compromised issuer can't mint tokens with arbitrary role strings
+  // that downstream RBAC checks would have to enumerate defensively.
+  // Failure maps to invalid_payload so the JWT verify hook treats it
+  // as a malformed token (caller stays unauthenticated, 401).
+  if (typeof claims.role !== 'string' || !VALID_ACCESS_TOKEN_ROLES.has(claims.role)) {
     return { ok: false, reason: 'invalid_payload' };
   }
 

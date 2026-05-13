@@ -26,7 +26,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { requireActorContext } from '../../../../lib/auth-context.js';
+import { rejectClinicianOnAdminRoute } from '../../../../lib/auth-context.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import {
   listAdapterConfigsForTenant,
@@ -78,7 +78,7 @@ export async function listCountryProfilesHandler(
 ): Promise<unknown> {
   // Auth required per Tier 1; we don't gate by tenant since
   // country_profiles is platform-level (no RLS).
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   const profiles = await listCountryProfiles();
   return reply.code(200).send({ country_profiles: profiles });
 }
@@ -92,7 +92,7 @@ export async function getTenantBrandHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   const brand = await findTenantBrand(ctx.tenantId);
   if (brand === null) {
     return reply.code(404).send({
@@ -115,7 +115,7 @@ export async function listCcrConfigsHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   const configs = await listCcrConfigsForTenant(ctx.tenantId);
   return reply.code(200).send({ ccr_configs: configs });
 }
@@ -129,7 +129,7 @@ export async function listAdapterConfigsHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   const configs = await listAdapterConfigsForTenant(ctx.tenantId);
   // Redact the JSONB payload (per ADR-024 — secrets stay opaque to admin
   // UI at v0.1; full decryption lands with Admin Backend slice).

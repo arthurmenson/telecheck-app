@@ -54,7 +54,7 @@ export function asDeviceId(raw: string): DeviceId {
 // ---------------------------------------------------------------------------
 
 export type AccountStatus = 'pending_verification' | 'active' | 'suspended' | 'archived';
-export type AccountType = 'patient' | 'delegate';
+export type AccountType = 'patient' | 'delegate' | 'clinician';
 export type AccountGender = 'female' | 'male' | 'non_binary' | 'prefer_not_to_say';
 
 export interface Account {

@@ -278,6 +278,7 @@ function mintTokenForSession(
       account_id: accountId,
       tenant_id: tenantId,
       session_id: sessionId,
+      role: 'patient',
       country_of_care: tenantId === T_US ? 'US' : 'GH',
     },
     config.jwtSigningKey,

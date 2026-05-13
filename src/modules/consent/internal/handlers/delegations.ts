@@ -21,7 +21,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { requireActorContext } from '../../../../lib/auth-context.js';
+import { requirePatientActorContext } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -148,7 +148,7 @@ export async function inviteDelegateHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const body = (req.body ?? {}) as InviteBody;
 
   if (
@@ -204,7 +204,7 @@ async function transition<T>(
   toView: (v: T) => unknown,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
     const result = await fn(ctx, { actorId: actor.accountId }, tx);
     if (result === null) {
@@ -226,10 +226,52 @@ async function transition<T>(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Delegation ownership precondition (Codex PR-118 R5 HIGH closure)
+//
+// Pre-existing pattern in this slice: the transition handlers (accept /
+// decline / revoke) and scope mutators (grant / revoke scope) authorized
+// solely by `tenant_id + delegation_id` at the repo predicate level. The
+// patient role gate (added in R1) confirms the caller is a patient but
+// does NOT verify the caller owns the delegation. A same-tenant patient
+// who can guess or harvest a delegation_id could therefore accept,
+// decline, revoke, or alter scopes on a delegation they have no part in.
+// Fix: every mutating handler now loads the delegation first via
+// `findDelegationById` and verifies the caller's accountId matches the
+// expected role (grantor for revoke + scope mutations; delegate for
+// accept / decline). Mismatches collapse to a tenant-blind 404 per I-025.
+// ---------------------------------------------------------------------------
+
+async function assertOwnership(
+  ctx: ReturnType<typeof requireTenantContext>,
+  delegationId: ReturnType<typeof asDelegationId>,
+  actorAccountId: string,
+  expected: 'grantor' | 'delegate',
+): Promise<boolean> {
+  const delegation = await delegationService.findDelegationById(ctx, delegationId);
+  if (delegation === null) return false;
+  if (expected === 'grantor') {
+    return delegation.grantor_account_id === actorAccountId;
+  }
+  return delegation.delegate_account_id === actorAccountId;
+}
+
+function tenantBlindDelegationNotFound(req: FastifyRequest, reply: FastifyReply): unknown {
+  return reply.code(404).send({
+    error: {
+      code: 'internal.resource.not_found',
+      message: 'Delegation not found.',
+      request_id: req.id,
+    },
+  });
+}
+
 export async function acceptDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  const ctx = requireTenantContext(req);
+  const actor = requirePatientActorContext(req);
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({
@@ -240,10 +282,15 @@ export async function acceptDelegationHandler(
       },
     });
   }
+  // Ownership: only the delegate may accept the invitation.
+  if (!(await assertOwnership(ctx, asDelegationId(id), actor.accountId, 'delegate'))) {
+    return tenantBlindDelegationNotFound(req, reply);
+  }
   return transition(
     req,
     reply,
-    (ctx, actor, tx) => delegationService.acceptDelegation(ctx, actor, asDelegationId(id), tx),
+    (innerCtx, innerActor, tx) =>
+      delegationService.acceptDelegation(innerCtx, innerActor, asDelegationId(id), tx),
     delegationToPatientView,
   );
 }
@@ -252,6 +299,8 @@ export async function declineDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  const ctx = requireTenantContext(req);
+  const actor = requirePatientActorContext(req);
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({
@@ -262,10 +311,15 @@ export async function declineDelegationHandler(
       },
     });
   }
+  // Ownership: only the delegate may decline the invitation.
+  if (!(await assertOwnership(ctx, asDelegationId(id), actor.accountId, 'delegate'))) {
+    return tenantBlindDelegationNotFound(req, reply);
+  }
   return transition(
     req,
     reply,
-    (ctx, actor, tx) => delegationService.declineDelegation(ctx, actor, asDelegationId(id), tx),
+    (innerCtx, innerActor, tx) =>
+      delegationService.declineDelegation(innerCtx, innerActor, asDelegationId(id), tx),
     delegationToPatientView,
   );
 }
@@ -274,6 +328,8 @@ export async function revokeDelegationHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
+  const ctx = requireTenantContext(req);
+  const actor = requirePatientActorContext(req);
   const id = (req.params as { id?: string }).id;
   const body = (req.body ?? {}) as RevokeBody;
   if (!isString(id) || !isString(body.reason) || !VALID_REVOKE_REASONS.has(body.reason)) {
@@ -285,13 +341,19 @@ export async function revokeDelegationHandler(
       },
     });
   }
+  // Ownership: only the grantor may revoke. Delegate-initiated revoke
+  // is not modeled at v1.0 (when it lands, the body would discriminate
+  // the actor role and this check widens).
+  if (!(await assertOwnership(ctx, asDelegationId(id), actor.accountId, 'grantor'))) {
+    return tenantBlindDelegationNotFound(req, reply);
+  }
   return transition(
     req,
     reply,
-    (ctx, actor, tx) =>
+    (innerCtx, innerActor, tx) =>
       delegationService.revokeDelegation(
-        ctx,
-        actor,
+        innerCtx,
+        innerActor,
         asDelegationId(id),
         body.reason as DelegationRevocationReason,
         tx,
@@ -309,7 +371,7 @@ export async function listGrantedDelegationsHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const list = await delegationService.listActiveDelegationsForGrantor(
     ctx,
     actor.accountId as AccountId,
@@ -322,7 +384,7 @@ export async function listReceivedDelegationsHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const list = await delegationService.listActiveDelegationsForDelegate(
     ctx,
     actor.accountId as AccountId,
@@ -339,7 +401,7 @@ export async function grantScopeHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const id = (req.params as { id?: string }).id;
   const body = (req.body ?? {}) as GrantScopeBody;
   if (!isString(id) || !isString(body.scope) || !VALID_SCOPES.has(body.scope)) {
@@ -350,6 +412,12 @@ export async function grantScopeHandler(
         request_id: req.id,
       },
     });
+  }
+
+  // Ownership: only the grantor of the parent delegation may add scopes.
+  // Codex PR-118 R5 HIGH closure 2026-05-13.
+  if (!(await assertOwnership(ctx, asDelegationId(id), actor.accountId, 'grantor'))) {
+    return tenantBlindDelegationNotFound(req, reply);
   }
 
   const grantInput: delegationService.GrantScopeInput = {
@@ -376,7 +444,7 @@ export async function revokeScopeHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const params = req.params as { id?: string; scopeId?: string };
   if (!isString(params.id) || !isString(params.scopeId)) {
     return reply.code(400).send({
@@ -388,10 +456,20 @@ export async function revokeScopeHandler(
     });
   }
 
+  // Ownership: only the grantor of the parent delegation may revoke
+  // its scopes. The :id path param carries the parent delegation_id —
+  // verify grantor match. If a scope is requested via :scopeId but
+  // doesn't belong to the :id delegation, the service-layer
+  // mismatch surfaces as a 404. Codex PR-118 R5 HIGH closure 2026-05-13.
+  if (!(await assertOwnership(ctx, asDelegationId(params.id), actor.accountId, 'grantor'))) {
+    return tenantBlindDelegationNotFound(req, reply);
+  }
+
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
     const revoked = await delegationService.revokeScope(
       ctx,
       { actorId: actor.accountId, grantorAccountId: actor.accountId as AccountId },
+      asDelegationId(params.id as string),
       asDelegationScopeId(params.scopeId as string),
       tx,
     );
@@ -416,7 +494,7 @@ export async function listScopesForDelegationHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  requireActorContext(req); // auth required even for list
+  const actor = requirePatientActorContext(req);
   const id = (req.params as { id?: string }).id;
   if (!isString(id)) {
     return reply.code(400).send({
@@ -428,6 +506,34 @@ export async function listScopesForDelegationHandler(
     });
   }
 
-  const list = await delegationService.listActiveScopesForDelegation(ctx, asDelegationId(id));
+  // Ownership check (Codex PR-118 R4 HIGH closure 2026-05-13). The
+  // role gate at requirePatientActorContext blocks clinician JWTs but
+  // does NOT prevent same-tenant patient B from reading patient A's
+  // delegation scopes by guessing or harvesting the delegation_id.
+  // Fix: load the delegation row and verify actor is the grantor OR
+  // delegate; mismatch → tenant-blind 404 per I-025 (collapsed with
+  // the not-found envelope so a same-tenant attacker cannot
+  // distinguish "exists but not yours" from "doesn't exist").
+  const delegationId = asDelegationId(id);
+  const delegation = await delegationService.findDelegationById(ctx, delegationId);
+  const tenantBlindNotFound = (): unknown =>
+    reply.code(404).send({
+      error: {
+        code: 'internal.resource.not_found',
+        message: 'Delegation not found.',
+        request_id: req.id,
+      },
+    });
+  if (delegation === null) {
+    return tenantBlindNotFound();
+  }
+  if (
+    delegation.grantor_account_id !== actor.accountId &&
+    delegation.delegate_account_id !== actor.accountId
+  ) {
+    return tenantBlindNotFound();
+  }
+
+  const list = await delegationService.listActiveScopesForDelegation(ctx, delegationId);
   return reply.code(200).send({ scopes: list.map(scopeToPatientView) });
 }

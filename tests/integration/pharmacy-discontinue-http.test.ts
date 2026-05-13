@@ -296,6 +296,7 @@ async function mintToken(tenantId: TenantId, accountId: AccountId): Promise<stri
       account_id: accountId,
       tenant_id: tenantId,
       session_id: sessionId,
+      role: 'patient',
       country_of_care: tenantId === T_US ? 'US' : 'GH',
     },
     config.jwtSigningKey,

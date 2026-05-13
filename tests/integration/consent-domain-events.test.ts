@@ -334,6 +334,7 @@ describe('consent slice — §1 domain-event emission', () => {
       delegationService.revokeScope(
         US_CTX,
         { actorId: 'op_evt_1g', grantorAccountId: grantor },
+        granted.delegation_id,
         granted.delegation_scope_id,
         getTestClient(),
       ),

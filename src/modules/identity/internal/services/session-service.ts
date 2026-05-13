@@ -15,12 +15,52 @@ import crypto from 'node:crypto';
 
 import { config } from '../../../../lib/config.js';
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
-import { issueAccessToken } from '../../../../lib/jwt.js';
+import { type AccessTokenRole, issueAccessToken } from '../../../../lib/jwt.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { emitSessionIssuedAudit, emitSessionRevokedAudit } from '../../audit.js';
 import { emitSessionIssuedDomainEvent, emitSessionRevokedDomainEvent } from '../../events.js';
+import * as accountRepo from '../repositories/account-repo.js';
 import * as sessionRepo from '../repositories/session-repo.js';
-import type { AccountId, DeviceId, Session, SessionId, SessionRevocationReason } from '../types.js';
+import type {
+  AccountId,
+  AccountType,
+  DeviceId,
+  Session,
+  SessionId,
+  SessionRevocationReason,
+} from '../types.js';
+
+// ---------------------------------------------------------------------------
+// account_type → session role mapping (TLC-058 / 2026-05-13)
+//
+// Centralizes the single source of truth for "what role does this account
+// log in as?". `issueSession` calls this with the resolved account_type
+// when issuing the JWT — no caller passes a role directly, so a future
+// account_type addition only needs to update this map.
+//
+// Mapping rationale (per RBAC v1.1):
+//   - 'patient'   → 'patient' session
+//   - 'clinician' → 'clinician' session
+//   - 'delegate'  → 'patient' session (delegates use the patient session
+//                   role; the delegate_id claim distinguishes them. The
+//                   delegate's PRIMARY surface authority is still the
+//                   patient's account they're acting on behalf of.)
+//
+// When the pharmacist / operator / admin / research-data-steward roles
+// land, both this map and the AccessTokenRole enum need to widen in
+// the same PR.
+// ---------------------------------------------------------------------------
+
+function sessionRoleForAccountType(accountType: AccountType): AccessTokenRole {
+  switch (accountType) {
+    case 'patient':
+      return 'patient';
+    case 'clinician':
+      return 'clinician';
+    case 'delegate':
+      return 'patient';
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Refresh-token discipline
@@ -117,9 +157,27 @@ export async function issueSession(
   if (input.ip_address !== undefined) repoInput.ip_address = input.ip_address;
   if (input.user_agent !== undefined) repoInput.user_agent = input.user_agent;
 
+  let resolvedRole: AccessTokenRole | null = null;
   const session = await sessionRepo.createSession(
     repoInput,
     async (tx, persisted) => {
+      // Resolve the role for this session from the persisted account's
+      // account_type. Lookup happens INSIDE the same transaction as the
+      // sessions INSERT so the role is consistent with the account at
+      // session-issuance time (TLC-058 / 2026-05-13). The account MUST
+      // exist (it was just referenced by the sessions FK), but null-
+      // guard defensively so a missing row throws a typed error rather
+      // than producing a malformed JWT later.
+      const account = await accountRepo.findAccountById(ctx.tenantId, persisted.account_id, tx);
+      if (account === null) {
+        throw new Error(
+          `issueSession: account ${String(persisted.account_id)} not found in tenant ` +
+            `${String(ctx.tenantId)} immediately after session INSERT — FK constraint ` +
+            'would have failed earlier. This is a programming error; investigate.',
+        );
+      }
+      resolvedRole = sessionRoleForAccountType(account.account_type);
+
       await emitSessionIssuedAudit(
         {
           tenantId: ctx.tenantId,
@@ -142,15 +200,27 @@ export async function issueSession(
     externalTx,
   );
 
-  // Issue the JWT access token using the persisted session_id. The
-  // signing key is platform-wide (production fail-closed gated in
-  // config.ts) — same key signs across all tenants; tenant_id is a
-  // claim INSIDE the JWT, not part of the signing input.
+  if (resolvedRole === null) {
+    // Defensive: the txCallback always sets resolvedRole, but a future
+    // refactor could regress this contract; fail loud rather than mint
+    // a malformed JWT.
+    throw new Error(
+      'issueSession: resolvedRole was not set after createSession completed. ' +
+        'This is a programming error; the txCallback must populate resolvedRole.',
+    );
+  }
+
+  // Issue the JWT access token using the persisted session_id + the
+  // role resolved from accounts.account_type. The signing key is
+  // platform-wide (production fail-closed gated in config.ts) — same
+  // key signs across all tenants; tenant_id is a claim INSIDE the JWT,
+  // not part of the signing input.
   const accessToken = issueAccessToken(
     {
       account_id: session.account_id,
       tenant_id: session.tenant_id,
       session_id: session.session_id,
+      role: resolvedRole,
       country_of_care: ctx.countryOfCare,
     },
     config.jwtSigningKey,

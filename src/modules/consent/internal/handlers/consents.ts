@@ -32,7 +32,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { requireActorContext } from '../../../../lib/auth-context.js';
+import { requirePatientActorContext } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import type { AccountId } from '../../../identity/internal/types.js';
@@ -124,7 +124,7 @@ export async function grantConsentHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const body = (req.body ?? {}) as GrantBody;
 
   if (
@@ -172,7 +172,7 @@ export async function revokeConsentHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
   const body = (req.body ?? {}) as RevokeBody;
 
   if (
@@ -234,7 +234,7 @@ export async function getMyConsentHistoryHandler(
   reply: FastifyReply,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
-  const actor = requireActorContext(req);
+  const actor = requirePatientActorContext(req);
 
   const history = await consentService.listConsentHistory(ctx, actor.accountId as AccountId);
   return reply.code(200).send({

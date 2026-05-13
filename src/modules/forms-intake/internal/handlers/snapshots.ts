@@ -20,6 +20,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { requirePatientActorContext } from '../../../../lib/auth-context.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import {
   type PatientFormSnapshotView,
@@ -41,8 +42,17 @@ import type { PatientId } from '../types.js';
 function resolvePatientId(req: FastifyRequest): PatientId {
   // Tier 1: JWT actor (preferred). Patient's account_id IS the
   // patient_id at v1.0 (Account = Patient per CDM §3.2).
+  //
+  // Role-gated (Codex PR-118 R3 HIGH closure 2026-05-13): snapshot
+  // reads here are PATIENT-facing — the file-level docstring states
+  // clinician case-review surfaces have their own auth boundary +
+  // dedicated service entry points. A clinician JWT must NOT pass
+  // through this resolver as the patient anchor: doing so could
+  // expose a clinician-anchored snapshot (legacy or corrupted) on a
+  // patient surface, and at minimum violates the role boundary.
   if (req.actorContext !== undefined) {
-    return req.actorContext.accountId;
+    const patientActor = requirePatientActorContext(req);
+    return patientActor.accountId;
   }
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';

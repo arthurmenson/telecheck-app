@@ -142,6 +142,7 @@ function mintToken(accountId: AccountId): string {
       account_id: accountId,
       tenant_id: T_US,
       session_id: ulid(),
+      role: 'patient',
       country_of_care: 'US',
     },
     config.jwtSigningKey,

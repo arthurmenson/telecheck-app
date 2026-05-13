@@ -34,7 +34,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { requireActorContext } from '../../../../lib/auth-context.js';
+import { rejectClinicianOnAdminRoute } from '../../../../lib/auth-context.js';
 
 const ADMIN_WRITE_BLOCKED_MSG =
   'Admin Backend slice v1.1 is not yet implemented in this environment. ' +
@@ -52,7 +52,7 @@ export async function patchTenantBrandHandler(
 ): Promise<unknown> {
   // JWT-auth still required BEFORE the 503 — matches read-handler posture
   // so unauthenticated probes can't enumerate the mutation surface.
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
 
@@ -64,7 +64,7 @@ export async function patchCcrConfigHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
 
@@ -76,7 +76,7 @@ export async function createAdapterConfigHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
 
@@ -88,7 +88,7 @@ export async function patchAdapterConfigHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
 
@@ -100,7 +100,7 @@ export async function deleteAdapterConfigHandler(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<unknown> {
-  requireActorContext(req);
+  rejectClinicianOnAdminRoute(req);
   throw req.server.httpErrors.serviceUnavailable(ADMIN_WRITE_BLOCKED_MSG);
 }
 

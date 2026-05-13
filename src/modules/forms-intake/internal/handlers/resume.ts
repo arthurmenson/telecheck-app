@@ -19,6 +19,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { requirePatientActorContext } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ResumeSubmissionRequestSchema } from '../../schemas.js';
@@ -96,8 +97,17 @@ function resolveResumeOwnership(req: FastifyRequest): {
  */
 function resolveActorId(req: FastifyRequest): string {
   // Tier 1 JWT (preferred via authContextPlugin); Tier 2 header shim.
+  //
+  // Role-gated (Codex PR-118 R2 HIGH closure 2026-05-13): the resume
+  // flow is patient-only — a clinician JWT must NOT drive a resume.
+  // requirePatientActorContext throws UnauthorizedRoleError (→ 403) on
+  // role mismatch BEFORE this function returns a clinician's accountId
+  // as actor_id (which would corrupt the audit chain attribution and
+  // potentially restore a patient's paused submission under a non-
+  // patient identity).
   if (req.actorContext !== undefined) {
-    return req.actorContext.accountId;
+    const patientActor = requirePatientActorContext(req);
+    return patientActor.accountId;
   }
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
