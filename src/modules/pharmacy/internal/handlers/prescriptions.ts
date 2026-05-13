@@ -67,13 +67,18 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { UnauthenticatedError, requirePatientActorContext } from '../../../../lib/auth-context.js';
+import {
+  UnauthenticatedError,
+  requireClinicianActorContext,
+  requirePatientActorContext,
+} from '../../../../lib/auth-context.js';
 import { GlossaryViolationError, asMedicationRequestId } from '../../../../lib/glossary.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { asSessionId, findActiveSessionById } from '../../../identity/index.js';
 import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
 import * as medicationRequestService from '../services/medication-request-service.js';
+import { asProductCatalogId } from '../types.js';
 import type { MedicationRequest, MedicationRequestStatus } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -348,6 +353,32 @@ function mapWriteServiceError(err: unknown, reply: FastifyReply, reqId: string):
       .send(makeErrorEnvelope(reqId, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
     return true;
   }
+  if (err instanceof medicationRequestService.MedicationRequestInputValidationError) {
+    // Codex PR-119 R1 closure 2026-05-13: non-patient account_type as
+    // patient_account_id, OR prescribing_consult_id whose consult
+    // belongs to a different patient, OR a non-existent
+    // patient_account_id. All map to tenant-blind 400 with an
+    // IDENTICAL public message (R2 closure 2026-05-13). The service
+    // raises distinct `err.reason` values for ops/telemetry, but
+    // echoing them publicly would let a same-tenant clinician probe
+    // account IDs and distinguish "no such account" from "account
+    // exists but isn't a patient" — an existence/type oracle that
+    // contradicts I-025. The specific reason stays in the Error
+    // object (visible in server-side stack traces / log middleware
+    // when one is wired); the public envelope is collapsed.
+    void reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          reqId,
+          'internal.request.invalid',
+          'Invalid medication_request input. Verify patient_account_id, ' +
+            'product_catalog_id, and prescribing_consult_id reference rows ' +
+            'in this tenant and match the canonical type/ownership constraints.',
+        ),
+      );
+    return true;
+  }
   if (err instanceof medicationRequestService.MedicationRequestStateConflictError) {
     void reply
       .code(409)
@@ -466,6 +497,347 @@ export async function discontinueMedicationRequestHandler(
 
   return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
     const updated = await medicationRequestService.discontinueByPatient(
+      ctx,
+      { accountId: actor.accountId },
+      id,
+      tx,
+    );
+    return { status: 200, view: toPatientMedicationRequestView(updated) };
+  });
+}
+
+// ===========================================================================
+// Clinician write surface (TLC-055 PR E 2026-05-13)
+// ===========================================================================
+
+/**
+ * Clinician-side liveness guard. Mirror of requireLiveSession but
+ * binds the actor's role to 'clinician' instead of 'patient'.
+ * Composes the four defensive layers established in PR C/D:
+ *
+ *   1. requireTenantContext — tenant resolved from Host header
+ *   2. requireClinicianActorContext — JWT carries role='clinician'
+ *   3. findActiveSessionById — sessions row exists + not revoked +
+ *      not expired (closes the revoked-session bypass)
+ *   4. session.account_id === actor.accountId — JWT account binds to
+ *      a session owned by the same account (closes the cross-account
+ *      session reuse bypass)
+ */
+async function requireClinicianLiveSession(req: FastifyRequest): Promise<{
+  ctx: ReturnType<typeof requireTenantContext>;
+  actor: ReturnType<typeof requireClinicianActorContext>;
+}> {
+  const ctx = requireTenantContext(req);
+  const actor = requireClinicianActorContext(req);
+  const live = await findActiveSessionById(ctx, asSessionId(actor.sessionId));
+  if (live === null) {
+    throw new UnauthenticatedError();
+  }
+  if (live.account_id !== actor.accountId) {
+    throw new UnauthenticatedError();
+  }
+  return { ctx, actor };
+}
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions — clinician creates a draft
+// ---------------------------------------------------------------------------
+
+interface CreateDraftBody {
+  patient_account_id?: unknown;
+  product_catalog_id?: unknown;
+  medication_name?: unknown;
+  strength?: unknown;
+  formulation?: unknown;
+  dose_instructions?: unknown;
+  quantity?: unknown;
+  quantity_unit?: unknown;
+  refills_allowed?: unknown;
+  indication?: unknown;
+  clinical_notes?: unknown;
+  prescribing_consult_id?: unknown;
+  // country_of_care: NOT accepted from body (Codex PR-119 R1 HIGH
+  // closure 2026-05-13). Derived server-side from ctx.countryOfCare.
+  // Any body field with this name is rejected at the validator.
+  country_of_care?: unknown;
+  protocol_id?: unknown;
+  protocol_version?: unknown;
+}
+
+function isString(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0;
+}
+
+function isNonNegativeInteger(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+}
+
+function isPositiveInteger(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v > 0;
+}
+
+/**
+ * Canonical ULID shape: 26 chars from Crockford base32 (digits + A-Z
+ * minus I, L, O, U). Codex PR-119 R4 MEDIUM closure 2026-05-13:
+ * incoming IDs (patient_account_id, product_catalog_id,
+ * prescribing_consult_id) MUST be validated at the boundary so an
+ * overlength or malformed value cannot reach the DB and surface a
+ * different Postgres error class (e.g., 22001 string-data-right-
+ * truncation) than the FK-violation 23503 path. Different DB error
+ * classes produce different envelopes → account-existence oracle.
+ *
+ * The downstream branded types (asAccountId, asProductCatalogId,
+ * asDelegationId) currently use unchecked casts; this regex is the
+ * application-layer fail-fast gate that prevents oversize/malformed
+ * IDs from ever reaching the parameterized queries.
+ */
+const ULID_PATTERN = /^[0-9A-HJKMNPQRSTVWXYZ]{26}$/;
+function isUlidShape(v: unknown): v is string {
+  return typeof v === 'string' && ULID_PATTERN.test(v);
+}
+
+/**
+ * Validate the POST /prescriptions body. Returns either an error
+ * message OR a normalized CreateDraftAsClinicianInput. All optional
+ * fields default to null. The shape mirrors CDM v1.3 §4.16
+ * MedicationRequest constructor inputs.
+ *
+ * The composite-FK (tenant, patient_account_id), (tenant,
+ * product_catalog_id), (tenant, prescribing_consult_id) enforces
+ * cross-tenant + non-existence at the DB durable boundary, surfaced
+ * to the handler as a Postgres FK violation that maps to 400 (handler
+ * catches PostgresError below). I-025 tenant-blindness is preserved
+ * because the FK error message doesn't disclose existence in other
+ * tenants — only that the FK target wasn't found in THIS tenant.
+ */
+function parseCreateDraftBody(
+  raw: unknown,
+):
+  | { ok: true; value: medicationRequestService.CreateDraftAsClinicianInput }
+  | { ok: false; message: string } {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, message: 'Request body must be a JSON object.' };
+  }
+  const body = raw as CreateDraftBody;
+
+  // ID shape validation at the boundary (Codex PR-119 R4 MEDIUM
+  // closure 2026-05-13). Each ID must match the canonical 26-char
+  // Crockford-base32 ULID pattern so an overlength or malformed
+  // value never reaches the parameterized SQL (where a different
+  // Postgres error class — e.g., 22001 truncation — would otherwise
+  // produce a different envelope from the FK-violation 23503 path,
+  // recreating the account-existence oracle R3 was meant to close).
+  if (!isUlidShape(body.patient_account_id)) {
+    return {
+      ok: false,
+      message: 'patient_account_id (26-char Crockford-base32 ULID) is required.',
+    };
+  }
+  if (!isUlidShape(body.product_catalog_id)) {
+    return {
+      ok: false,
+      message: 'product_catalog_id (26-char Crockford-base32 ULID) is required.',
+    };
+  }
+  if (!isString(body.medication_name)) {
+    return { ok: false, message: 'medication_name (non-empty string) is required.' };
+  }
+  if (!isString(body.strength)) {
+    return { ok: false, message: 'strength (non-empty string) is required.' };
+  }
+  if (!isString(body.formulation)) {
+    return { ok: false, message: 'formulation (non-empty string) is required.' };
+  }
+  if (!isString(body.dose_instructions)) {
+    return { ok: false, message: 'dose_instructions (non-empty string) is required.' };
+  }
+  if (!isPositiveInteger(body.quantity)) {
+    return { ok: false, message: 'quantity (positive integer) is required.' };
+  }
+  if (!isString(body.quantity_unit)) {
+    return { ok: false, message: 'quantity_unit (non-empty string) is required.' };
+  }
+  if (!isNonNegativeInteger(body.refills_allowed)) {
+    return { ok: false, message: 'refills_allowed (non-negative integer) is required.' };
+  }
+  // country_of_care is server-derived from tenant context (Codex
+  // PR-119 R1 HIGH closure 2026-05-13). Reject any body value
+  // explicitly so callers fail loud rather than silently have their
+  // value ignored.
+  if (body.country_of_care !== undefined) {
+    return {
+      ok: false,
+      message:
+        'country_of_care must not be supplied in the request body — it is ' +
+        'derived server-side from the tenant context.',
+    };
+  }
+
+  // Optional fields. Reject null AND "wrong type"; accept undefined.
+  const indication = body.indication;
+  if (indication !== undefined && indication !== null && !isString(indication)) {
+    return { ok: false, message: 'indication must be a string or null.' };
+  }
+  const clinicalNotes = body.clinical_notes;
+  if (clinicalNotes !== undefined && clinicalNotes !== null && !isString(clinicalNotes)) {
+    return { ok: false, message: 'clinical_notes must be a string or null.' };
+  }
+  const prescribingConsultId = body.prescribing_consult_id;
+  if (
+    prescribingConsultId !== undefined &&
+    prescribingConsultId !== null &&
+    !isUlidShape(prescribingConsultId)
+  ) {
+    return {
+      ok: false,
+      message: 'prescribing_consult_id must be a 26-char Crockford-base32 ULID, null, or omitted.',
+    };
+  }
+
+  // protocol_id + protocol_version: BOTH or NEITHER (per migration 025
+  // medication_requests_protocol_binding_check pre-active clause).
+  const protocolId = body.protocol_id;
+  const protocolVersion = body.protocol_version;
+  const protocolIdSet = isString(protocolId);
+  const protocolVersionSet = isString(protocolVersion);
+  if (protocolIdSet !== protocolVersionSet) {
+    return {
+      ok: false,
+      message:
+        'protocol_id and protocol_version must be set together or both omitted ' +
+        '(per medication_requests protocol-binding CHECK for draft rows).',
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      patient_account_id: body.patient_account_id,
+      product_catalog_id: asProductCatalogId(body.product_catalog_id),
+      medication_name: body.medication_name,
+      strength: body.strength,
+      formulation: body.formulation,
+      dose_instructions: body.dose_instructions,
+      quantity: body.quantity,
+      quantity_unit: body.quantity_unit,
+      refills_allowed: body.refills_allowed,
+      indication: indication === undefined || indication === null ? null : indication,
+      clinical_notes: clinicalNotes === undefined || clinicalNotes === null ? null : clinicalNotes,
+      prescribing_consult_id:
+        prescribingConsultId === undefined || prescribingConsultId === null
+          ? null
+          : prescribingConsultId,
+      // country_of_care derived server-side in service (R1 closure).
+      protocol_id: protocolIdSet ? protocolId : null,
+      protocol_version: protocolVersionSet ? protocolVersion : null,
+    },
+  };
+}
+
+export async function createDraftHandler(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireClinicianLiveSession(req);
+
+  const parsed = parseCreateDraftBody(req.body);
+  if (!parsed.ok) {
+    return reply
+      .code(400)
+      .send(makeErrorEnvelope(req.id, 'internal.request.invalid', parsed.message));
+  }
+
+  return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+    try {
+      const created = await medicationRequestService.createDraftAsClinician(
+        ctx,
+        { accountId: actor.accountId },
+        parsed.value,
+        tx,
+      );
+      return { status: 201, view: toPatientMedicationRequestView(created) };
+    } catch (err) {
+      // Map Postgres FK violations (cross-tenant patient/product/consult)
+      // to the SAME tenant-blind 400 envelope as MedicationRequest-
+      // InputValidationError (Codex PR-119 R3 MEDIUM closure 2026-05-13).
+      //
+      // R2 collapsed the validation-error message; this branch must also
+      // funnel through MedicationRequestInputValidationError so the
+      // PUBLIC response is byte-identical to the validation-error path.
+      // Otherwise an attacker can mount a 2-payload oracle:
+      //   1. Invalid product_catalog_id (constant) + nonexistent
+      //      patient_account_id → service validation 400 (collapsed
+      //      message; never reaches repo).
+      //   2. Same invalid product + EXISTING-patient patient_account_id
+      //      → validation passes, FK violation on product fires →
+      //      different message via httpErrors.badRequest.
+      // The diff reveals "patient_account_id exists vs doesn't" — the
+      // very oracle R2 closed for the direct validation path.
+      // Re-using the validation error class makes the public envelope
+      // identical across both branches.
+      if (
+        err instanceof Error &&
+        'code' in err &&
+        (err as Error & { code: string }).code === '23503'
+      ) {
+        // 23503 = foreign_key_violation. Re-throw as the validation
+        // error so mapWriteServiceError emits the collapsed envelope —
+        // same public response as the service-layer validation path,
+        // closing the FK-error oracle.
+        throw new medicationRequestService.MedicationRequestInputValidationError(
+          'patient_account_id / product_catalog_id / prescribing_consult_id ' +
+            'must reference rows in the same tenant.',
+        );
+      }
+      throw err;
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions/:id/submit — clinician submits for review
+// ---------------------------------------------------------------------------
+
+export async function submitForReviewHandler(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireClinicianLiveSession(req);
+
+  // Reject non-empty body so a clinician can't slip in additional
+  // fields. The submit transition takes no body input.
+  if (
+    req.body !== undefined &&
+    req.body !== null &&
+    (typeof req.body !== 'object' ||
+      Array.isArray(req.body) ||
+      Object.keys(req.body as Record<string, unknown>).length > 0)
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Submit accepts no body — the state transition takes no parameters.',
+        ),
+      );
+  }
+
+  let id;
+  try {
+    id = asMedicationRequestId(req.params.id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+    const updated = await medicationRequestService.submitForReviewAsClinician(
       ctx,
       { accountId: actor.accountId },
       id,

@@ -37,9 +37,11 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import {
+  createDraftHandler,
   discontinueMedicationRequestHandler,
   getMedicationRequestByIdHandler,
   listMedicationRequestsForPatientHandler,
+  submitForReviewHandler,
 } from './internal/handlers/prescriptions.js';
 
 export const registerPharmacyRoutes: FastifyPluginAsync = async (
@@ -118,4 +120,14 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   // approve / decline / supersede) land in TLC-055 PR E once the
   // identity slice ships the clinician role claim.
   app.post('/prescriptions/:id/discontinue', discontinueMedicationRequestHandler);
+
+  // Clinician-origin write surface (PR E — TLC-055 PR E 2026-05-13).
+  // requireClinicianActorContext (from TLC-058 / migration 027) gates
+  // these routes. v1.0 scope: createDraft + submit_for_review only —
+  // neither is I-012-gated. The I-012-gated activation transitions
+  // (clinician_approve, protocol_authorized_prescribing), plus
+  // clinician_discontinue / supersede / clinician_modify, land in
+  // subsequent pharmacy PRs (E.2/F/G).
+  app.post('/prescriptions', createDraftHandler);
+  app.post('/prescriptions/:id/submit', submitForReviewHandler);
 };

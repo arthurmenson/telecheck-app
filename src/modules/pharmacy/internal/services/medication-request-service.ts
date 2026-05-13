@@ -40,13 +40,20 @@
  *     (precedent for service-layer shape + error classes + ownership check)
  */
 
-import type { DbTransaction } from '../../../../lib/db.js';
+import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import { withTransaction } from '../../../../lib/db.js';
+import { asMedicationRequestId } from '../../../../lib/glossary.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
-import { emitMedicationRequestDiscontinued } from '../../audit.js';
+import { ulid } from '../../../../lib/ulid.js';
+import { asAccountId, findAccountById } from '../../../identity/index.js';
+import {
+  emitMedicationRequestDiscontinued,
+  emitMedicationRequestDrafted,
+  emitMedicationRequestSubmittedForReview,
+} from '../../audit.js';
 import { emitMedicationRequestDiscontinued as emitMedicationRequestDiscontinuedDomainEvent } from '../../domain-events.js';
 import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
-import type { MedicationRequest, MedicationRequestId } from '../types.js';
+import type { MedicationRequest, MedicationRequestId, ProductCatalogId } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Error classes (mirror async-consult's typed error → HTTP mapping pattern)
@@ -91,6 +98,30 @@ export class MedicationRequestStateConflictError extends Error {
       }).`,
     );
     this.name = 'MedicationRequestStateConflictError';
+  }
+}
+
+/**
+ * Body-level validation error — the request inputs are structurally
+ * valid (correct types, required fields present) but a cross-row
+ * invariant is violated. HTTP layer maps to 400 internal.request.invalid.
+ *
+ * Cases (Codex PR-119 R1 HIGH/MEDIUM closures 2026-05-13):
+ *   - patient_account_id resolves to a non-'patient' account (clinician
+ *     or delegate) in the same tenant. medication_requests anchors on
+ *     patient accounts only; the durable FK target accounts(tenant_id,
+ *     account_id) doesn't discriminate type, so the service must.
+ *   - prescribing_consult_id is set but the consult's patient_id ≠
+ *     input.patient_account_id (clinician tied draft to another
+ *     patient's consult — clinical-provenance corruption).
+ *
+ * The error message is intentionally generic — per I-025 a same-tenant
+ * attacker should not learn whether the offending id exists at all.
+ */
+export class MedicationRequestInputValidationError extends Error {
+  constructor(public readonly reason: string) {
+    super(`MedicationRequest input validation failed: ${reason}`);
+    this.name = 'MedicationRequestInputValidationError';
   }
 }
 
@@ -202,6 +233,274 @@ export async function discontinueByPatient(
         actor_id: actor.accountId,
       },
     });
+
+    return updated;
+  }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
+// createDraftAsClinician — first PR E write operation
+//
+// Per State Machines v1.2 §19, the draft creation is clinician-origin
+// and NOT I-012-gated (the I-012 gate sits at the activation transitions
+// clinician_approve / protocol_authorized_prescribing). createDraft just
+// captures the prescriber's intended medication; the engine evaluation +
+// clinician approval cycle happens after submit_for_review.
+//
+// Composition (single transaction):
+//   1. Generate canonical MedicationRequestId (mrx_<ULID>).
+//   2. repo.createDraft inside the tx (composite FKs enforce same-tenant
+//      patient, consult, product_catalog at the durable boundary).
+//   3. emitAudit medication_request.drafted (Category A, actor_type=clinician).
+//
+// No domain event emitted at draft creation — DOMAIN_EVENTS v5.2 reserves
+// medication_request.approved.v1 for the activation handoff. Draft rows
+// are not yet authoritative for downstream subscribers.
+// ---------------------------------------------------------------------------
+
+/**
+ * createDraft request shape — clinician-supplied fields ONLY. Notably
+ * absent (Codex PR-119 R1 HIGH closure 2026-05-13):
+ *   - country_of_care: derived server-side from `ctx.countryOfCare`.
+ *     Accepting it from the client allowed a US-tenant clinician to
+ *     persist a row with `country_of_care: 'GH'` — misrouting CCR
+ *     resolution and creating audit/row metadata disagreement.
+ */
+export interface CreateDraftAsClinicianInput {
+  patient_account_id: string;
+  product_catalog_id: ProductCatalogId;
+  medication_name: string;
+  strength: string;
+  formulation: string;
+  dose_instructions: string;
+  quantity: number;
+  quantity_unit: string;
+  refills_allowed: number;
+  indication: string | null;
+  clinical_notes: string | null;
+  prescribing_consult_id: string | null;
+  protocol_id: string | null;
+  protocol_version: string | null;
+}
+
+/**
+ * Verify the prescribing consult belongs to the same patient as the
+ * draft anchor. Closes Codex PR-119 R1 MEDIUM — clinician tying a
+ * draft to another patient's consult would corrupt clinical
+ * provenance. Returns true iff:
+ *   - consult exists in this tenant
+ *   - consult.patient_id === input patient_account_id
+ *
+ * Raw SQL because the cross-module surface (async-consult's
+ * findConsultById) is internal — exporting it from async-consult's
+ * public interface is a separate refactor.
+ */
+async function consultBelongsToPatient(
+  tx: DbClient,
+  tenantId: string,
+  consultId: string,
+  patientAccountId: string,
+): Promise<boolean> {
+  const result = await tx.query<{ patient_id: string }>(
+    `SELECT patient_id
+       FROM consults
+      WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, consultId],
+  );
+  if (result.rows.length === 0) return false;
+  return result.rows[0]?.patient_id === patientAccountId;
+}
+
+/**
+ * Verify the product_catalog row exists in this tenant. Codex PR-119
+ * R5 MEDIUM closure 2026-05-13: previously the service short-circuited
+ * on patient validation and let the product FK be discovered at INSERT
+ * time. A timing-side-channel attacker could distinguish nonexistent-
+ * patient (3 SELECTs, no INSERT) from existing-patient + bad-product
+ * (3 SELECTs + INSERT + FK rollback) even when public envelopes were
+ * byte-identical. Pre-validating the product in the service equalizes
+ * the SQL workload across both probe shapes.
+ */
+async function productCatalogExists(
+  tx: DbClient,
+  tenantId: string,
+  productCatalogId: string,
+): Promise<boolean> {
+  const result = await tx.query<{ id: string }>(
+    `SELECT id
+       FROM product_catalog
+      WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, productCatalogId],
+  );
+  return result.rows.length > 0;
+}
+
+export async function createDraftAsClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  input: CreateDraftAsClinicianInput,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    // Validate all three foreign references BEFORE any state-mutating
+    // INSERT (Codex PR-119 R1 HIGH + R5 MEDIUM closures 2026-05-13).
+    // Run all SELECTs unconditionally so the SQL workload is identical
+    // regardless of which check ultimately fails — closes the timing-
+    // side-channel that distinguished nonexistent-patient from
+    // existing-patient+bad-product probes even when public envelopes
+    // were byte-identical.
+    //
+    // Invariants enforced here:
+    //   - patient_account_id: row exists in this tenant AND
+    //     account_type='patient' (R1: durable FK is type-agnostic
+    //     post-TLC-058; non-patient would corrupt patient-indexed
+    //     medication history).
+    //   - product_catalog_id: row exists in this tenant. Previously
+    //     deferred to FK 23503 at INSERT; pre-validating equalizes
+    //     SQL paths across probe shapes (R5).
+    //   - prescribing_consult_id (when set): consult row exists in
+    //     this tenant AND consult.patient_id === input.patient_account_id
+    //     (R1 MEDIUM: clinician tying a draft to another patient's
+    //     consult corrupts clinical provenance).
+    //
+    // Failure-mode design: each check produces a boolean. We
+    // accumulate without short-circuit, then throw a SINGLE generic
+    // MedicationRequestInputValidationError after the full validation
+    // pass — the public 400 envelope is collapsed at the handler so
+    // the err.reason here is internal-only.
+    const patientAccount = await findAccountById(ctx, asAccountId(input.patient_account_id), tx);
+    const patientOk = patientAccount !== null && patientAccount.account_type === 'patient';
+
+    const productOk = await productCatalogExists(tx, ctx.tenantId, input.product_catalog_id);
+
+    let consultOk = true;
+    if (input.prescribing_consult_id !== null) {
+      consultOk = await consultBelongsToPatient(
+        tx,
+        ctx.tenantId,
+        input.prescribing_consult_id,
+        input.patient_account_id,
+      );
+    }
+
+    if (!patientOk || !productOk || !consultOk) {
+      // Single generic reason — handler collapses to a public message.
+      // The server-side reason text is uniform across all failure
+      // permutations so even server logs / telemetry don't expose
+      // which specific check tripped (defense-in-depth above the
+      // public-envelope collapse).
+      throw new MedicationRequestInputValidationError(
+        'patient_account_id / product_catalog_id / prescribing_consult_id ' +
+          'failed tenant + type + ownership validation.',
+      );
+    }
+
+    const medicationRequestId = asMedicationRequestId(`mrx_${ulid()}`);
+
+    const created = await medicationRequestRepo.createDraft(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        patient_account_id: input.patient_account_id,
+        product_catalog_id: input.product_catalog_id,
+        medication_name: input.medication_name,
+        strength: input.strength,
+        formulation: input.formulation,
+        dose_instructions: input.dose_instructions,
+        quantity: input.quantity,
+        quantity_unit: input.quantity_unit,
+        refills_allowed: input.refills_allowed,
+        indication: input.indication,
+        clinical_notes: input.clinical_notes,
+        prescribing_consult_id: input.prescribing_consult_id,
+        // country_of_care derived server-side from tenant context.
+        // Accepting it from the body would allow a US-tenant clinician
+        // to misroute CCR resolution by passing 'GH'.
+        country_of_care: ctx.countryOfCare,
+        protocol_id: input.protocol_id,
+        protocol_version: input.protocol_version,
+      },
+      tx,
+    );
+
+    await emitMedicationRequestDrafted(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: input.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        detail: {},
+      },
+      tx,
+    );
+
+    return created;
+  }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
+// submitForReviewAsClinician — clinician advances draft → pending_interaction_check
+//
+// Per State Machines v1.2 §19, submit_for_review is clinician-origin and
+// NOT I-012-gated. The transition hands the draft off to the Med
+// Interaction Engine (which writes back via recordInteractionEvaluation
+// in PR F).
+//
+// Composition:
+//   1. Load by id; verify the row exists.
+//   2. Status precondition: must be 'draft'.
+//   3. repo.transitionStatus(draft → pending_interaction_check,
+//      event=submit_for_review). The repo's validateTransition fires
+//      first; the optimistic-concurrency WHERE filters concurrent writers.
+//   4. emitAudit medication_request.submitted_for_review.
+// ---------------------------------------------------------------------------
+
+export async function submitForReviewAsClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  medicationRequestId: MedicationRequestId,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    if (current === null) {
+      throw new MedicationRequestNotFoundError(medicationRequestId);
+    }
+    if (current.status !== 'draft') {
+      throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
+    }
+
+    const updated = await medicationRequestRepo.transitionStatus(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        expected_from_status: 'draft',
+        to_status: 'pending_interaction_check',
+        event: 'submit_for_review',
+      },
+      tx,
+    );
+    if (updated === null) {
+      // Concurrent writer raced the optimistic-concurrency UPDATE.
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    await emitMedicationRequestSubmittedForReview(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: current.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        detail: {},
+      },
+      tx,
+    );
 
     return updated;
   }, externalTx);
