@@ -38,11 +38,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { ulid } from '../../src/lib/ulid.ts';
-import {
-  TENANT_US,
-  createTestUser,
-  withTenantContext,
-} from '../helpers/tenant-fixtures.ts';
+import { TENANT_US, createTestUser, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
@@ -89,9 +85,7 @@ interface InsertMedicationRequestInput {
  * MUST be invoked inside a withTenantContext() block — RLS WITH CHECK
  * requires current_tenant_id() to match the row's tenant_id at INSERT.
  */
-async function insertMedicationRequest(
-  input: InsertMedicationRequestInput,
-): Promise<string> {
+async function insertMedicationRequest(input: InsertMedicationRequestInput): Promise<string> {
   const client = getTestClient();
   const id = input.id ?? mrxId();
   await client.query(
@@ -143,8 +137,7 @@ async function insertMedicationRequest(
       input.interaction_signals_status ?? 'pending',
       input.supersedes_id ?? null,
       input.superseded_by_id ?? null,
-      input.discontinued_reason ??
-        (input.status === 'discontinued' ? 'clinical_decision' : null),
+      input.discontinued_reason ?? (input.status === 'discontinued' ? 'clinical_decision' : null),
       input.status === 'discontinued' ? new Date().toISOString() : null,
       'US',
     ],
