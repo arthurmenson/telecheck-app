@@ -1,11 +1,15 @@
-# SI-001 — MedicationRequest schema gap (CDM v1.2)
+# SI-001 — MedicationRequest schema gap (CDM v1.2 → v1.3)
 
 **Raised by:** Engineering (autonomous turn 2026-05-04)
-**Date:** 2026-05-04
+**Date raised:** 2026-05-04
 **Severity:** high
-**Status:** Open — awaiting product/engineering-lead resolution
-**Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md`
-**Target slice PRD:** `Telecheck_Pharmacy_Refill_Slice_PRD_v2_1.md`
+**Status:** **CLOSED 2026-05-11 — RATIFIED via Promotion Ledger entry P-011** (spec corpus commit `879cd57` in `arthurmenson/telecheckONE`). The first 2026-05-11 ratification attempt (the original PR #95 + PR #108 sequence) was reverted via PR #109 after Codex returned a withdraw-ratification verdict with 5 findings; the same-day re-ratification closed those 5 findings plus 15 more across 11 rounds of pre-ratification Codex convergence, plus 22 propagation findings across 11 rounds of post-merge convergence. Pharmacy + Refill v2.1 scaffold landed in this repo on `feat/slice-4-pharmacy-scaffold-rebuild-p011` (the PR #95 / PR #108 successor PR); 12 additional rounds of pre-PR Codex convergence closed 15 scaffold-side findings + 1 deferred-to-write-path with TLC-055 acceptance criterion (supersession reciprocity constraint trigger).
+**Target spec doc (ratified):** `Telecheck_Canonical_Data_Model_v1_3.md` (headers govern; on-disk filename retains the `v1_2.md` legacy pattern per v1.10 cycle convention)
+**Target slice PRD:** `Telecheck_Pharmacy_Refill_Slice_PRD_v2_1.md` (canonical references CDM v1.3 §4.16 + State Machines v1.2 §19 post-P-011)
+**Promotion Ledger:** P-011 (2026-05-11; content-change promotion bumping Registry v2.10 → v2.11)
+**Spec corpus refs (in telecheckONE):** `55d9c20` (workstream artifacts including the SI-001 v0.13 RATIFIED DRAFT) + `879cd57` (P-011 promotion landing the 11 bundle-file changes)
+**Path 1 ratified:** No `interaction_override_id` column. Med Interaction Engine integration via the `medication_request.interaction_safety_hold_triggered` domain event with clean module-boundary separation per ADR-001.
+**New I-012 confirmation action:** `prescribing.protocol_authorization_granted` (added at AUDIT_EVENTS v5.3 under P-011) — the canonical clinician confirmation prerequisite for the `protocol_authorized_prescribing` execution route.
 
 ---
 
