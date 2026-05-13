@@ -69,9 +69,11 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { UnauthenticatedError, requireActorContext } from '../../../../lib/auth-context.js';
 import { GlossaryViolationError, asMedicationRequestId } from '../../../../lib/glossary.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { asSessionId, findActiveSessionById } from '../../../identity/index.js';
 import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
+import * as medicationRequestService from '../services/medication-request-service.js';
 import type { MedicationRequest, MedicationRequestStatus } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -322,4 +324,111 @@ export async function listMedicationRequestsForPatientHandler(
   );
 
   return reply.code(200).send({ prescriptions: rows.map(toPatientMedicationRequestView) });
+}
+
+// ---------------------------------------------------------------------------
+// Service-error mapper for write paths (TLC-055 PR D)
+//
+// Translates the service-layer typed errors into the canonical
+// ERROR_MODEL v5.1 envelope. Per I-025, NotFoundError covers both
+// "doesn't exist" AND "cross-patient ownership" — they collapse to
+// `internal.resource.not_found` 404 so a same-tenant attacker cannot
+// distinguish the two.
+// ---------------------------------------------------------------------------
+
+function mapWriteServiceError(err: unknown, reply: FastifyReply, reqId: string): boolean {
+  if (err instanceof medicationRequestService.MedicationRequestNotFoundError) {
+    void reply
+      .code(404)
+      .send(makeErrorEnvelope(reqId, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    return true;
+  }
+  if (err instanceof medicationRequestService.MedicationRequestStateConflictError) {
+    void reply
+      .code(409)
+      .send(
+        makeErrorEnvelope(
+          reqId,
+          'internal.resource.conflict',
+          'Medication request state conflict.',
+        ),
+      );
+    return true;
+  }
+  // State-machine InvalidTransitionError + UnsupportedTransitionError
+  // bubble out of validateTransition when a caller drives an event the
+  // current state doesn't accept. Tenant-blind 409 is the correct
+  // semantic — same shape as state-conflict-error above. Mirrors the
+  // async-consult handler mapping (consults.ts:160-168).
+  if (
+    err instanceof Error &&
+    (err.name === 'InvalidTransitionError' || err.name === 'UnsupportedTransitionError')
+  ) {
+    void reply
+      .code(409)
+      .send(
+        makeErrorEnvelope(
+          reqId,
+          'internal.resource.conflict',
+          'Medication request state conflict.',
+        ),
+      );
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions/:id/discontinue
+// ---------------------------------------------------------------------------
+
+/**
+ * Patient-initiated discontinuation of a medication_request the patient
+ * owns. Body is empty — the discontinued_reason is forced to
+ * 'patient_request' because the actor IS the patient (per the
+ * patient_request_discontinue transition in State Machines v1.2 §19).
+ * If a future PR widens this to accept clinician_discontinue or
+ * adverse_event_discontinue, the body schema gets a `reason` field then.
+ *
+ * - 200 + PHI-safe view of the discontinued row on success.
+ * - 404 (tenant-blind) on not-found / cross-tenant / cross-patient /
+ *   malformed id (collapsed envelope per I-025).
+ * - 409 on state-conflict (row not in 'active', concurrent writer
+ *   raced the optimistic-concurrency UPDATE, or state machine rejected
+ *   the transition).
+ * - 401 on missing JWT / dead session / mismatched account binding
+ *   (via requireLiveSession).
+ *
+ * Idempotency-Key REQUIRED per IDEMPOTENCY v5.1 — every state-mutating
+ * pharmacy write goes through `withIdempotentExecution`.
+ */
+export async function discontinueMedicationRequestHandler(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireLiveSession(req);
+
+  // Validate id at the boundary. Malformed → 404 tenant-blind (same
+  // side-channel reasoning as the GET handler).
+  let id;
+  try {
+    id = asMedicationRequestId(req.params.id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+    const updated = await medicationRequestService.discontinueByPatient(
+      ctx,
+      { accountId: actor.accountId },
+      id,
+      tx,
+    );
+    return { status: 200, view: toPatientMedicationRequestView(updated) };
+  });
 }
