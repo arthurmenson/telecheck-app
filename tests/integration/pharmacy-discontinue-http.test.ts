@@ -5,7 +5,7 @@
  * Endpoint under test:
  *   POST /v0/pharmacy/prescriptions/:id/discontinue
  *
- * Coverage (6 groups, 10 cases):
+ * Coverage (6 groups, 11 cases):
  *
  *   Group A — Happy path
  *     A1 patient discontinues own active medication_request → 200 +
@@ -23,12 +23,17 @@
  *
  *   Group D — Idempotency (IDEMPOTENCY v5.1)
  *     D1 same key + same body → cached 200 replay
- *     D2 same key + different body → 409 body_mismatch
+ *     (body-mismatch test removed: discontinue accepts no body at all,
+ *      so the body-mismatch path isn't reachable through this endpoint.)
  *
  *   Group E — Auth
  *     E1 no Bearer JWT → 401
  *
- *   Group F — PHI projection (global guard, applied to every response)
+ *   Group F — Body validation (Codex PR-117 R1 HIGH closure)
+ *     F1 non-empty body (e.g., {"reason": "adverse_event"}) → 400
+ *     F2 array body → 400
+ *
+ *   (Global PHI-leak guard applied to every response body)
  *
  * Spec references:
  *   - src/modules/pharmacy/internal/handlers/prescriptions.ts (discontinue handler)
@@ -567,8 +572,21 @@ describe('pharmacy discontinue — Group D: idempotency replay', () => {
     expect(replay.body).toBe(first.body);
     expectNoTenantLeak(replay);
   });
+});
 
-  it('D2 same key + different body → 409 body_mismatch', async () => {
+// ===========================================================================
+// Group F — Body validation (Codex PR-117 R1 HIGH closure)
+//
+// The discontinue endpoint forces discontinued_reason='patient_request'
+// server-side because that's the only patient-origin discontinue
+// transition at v1.0. A patient POSTing arbitrary content (e.g., to
+// flag adverse_event) must be rejected loud — silently dropping the
+// safety signal AND emitting a misleading audit/domain-event payload
+// would be a patient-safety surface failure.
+// ===========================================================================
+
+describe('pharmacy discontinue — Group F: body validation', () => {
+  it('F1 non-empty body with arbitrary fields → 400 internal.request.invalid', async () => {
     const patient = await seedAccountInTenant(US_CTX, '+1');
     const product = await seedProduct(US_CTX);
     const mrId = await seedMedicationRequest({
@@ -578,37 +596,56 @@ describe('pharmacy discontinue — Group D: idempotency replay', () => {
       status: 'active',
     });
     const token = await mintToken(T_US, patient);
-    const key = ulid();
 
-    const first = await app!.inject({
+    // Patient attempts to flag adverse event by sending a body field.
+    // Endpoint MUST reject loud rather than silently coerce to
+    // patient_request — otherwise the audit chain miscodes the
+    // patient's safety signal.
+    const response = await app!.inject({
       method: 'POST',
       url: `/v0/pharmacy/prescriptions/${mrId}/discontinue`,
       headers: {
         host: 'heroshealth.com',
         authorization: `Bearer ${token}`,
-        'idempotency-key': key,
+        'idempotency-key': ulid(),
       },
-      payload: {},
+      payload: { reason: 'adverse_event' },
     });
-    expect(first.statusCode).toBe(200);
 
-    // Replay with the SAME key but a different body — cache 4-tuple
-    // mismatch per IDEMPOTENCY v5.1 §1. Handler returns 409
-    // internal.idempotency.body_mismatch.
-    const replay = await app!.inject({
+    expect(response.statusCode).toBe(400);
+    const body = response.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe('internal.request.invalid');
+    expectNoTenantLeak(response);
+  });
+
+  it('F2 array body → 400 internal.request.invalid', async () => {
+    // Defense against `payload: ['a', 'b']` being typed as object by
+    // typeof — the guard explicitly rejects arrays.
+    const patient = await seedAccountInTenant(US_CTX, '+1');
+    const product = await seedProduct(US_CTX);
+    const mrId = await seedMedicationRequest({
+      ctx: US_CTX,
+      patientAccountId: patient,
+      productCatalogId: product,
+      status: 'active',
+    });
+    const token = await mintToken(T_US, patient);
+
+    const response = await app!.inject({
       method: 'POST',
       url: `/v0/pharmacy/prescriptions/${mrId}/discontinue`,
       headers: {
         host: 'heroshealth.com',
         authorization: `Bearer ${token}`,
-        'idempotency-key': key,
+        'idempotency-key': ulid(),
       },
-      payload: { spurious: 'field' },
+      payload: ['something'],
     });
-    expect(replay.statusCode).toBe(409);
-    const body = replay.json<{ error: { code: string } }>();
-    expect(body.error.code).toBe('internal.idempotency.body_mismatch');
-    expectNoTenantLeak(replay);
+
+    expect(response.statusCode).toBe(400);
+    const body = response.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe('internal.request.invalid');
+    expectNoTenantLeak(response);
   });
 });
 

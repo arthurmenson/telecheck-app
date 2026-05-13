@@ -408,6 +408,43 @@ export async function discontinueMedicationRequestHandler(
 ): Promise<unknown> {
   const { ctx, actor } = await requireLiveSession(req);
 
+  // Body validation (Codex PR-117 R1 HIGH closure). The endpoint
+  // forces `discontinued_reason='patient_request'` and event=
+  // 'patient_request_discontinue' server-side because that is the
+  // only patient-origin discontinue transition at v1.0. A patient
+  // POSTing `{ "reason": "adverse_event" }` to express a safety
+  // concern would otherwise be silently terminal-discontinued as
+  // patient_request — dropping the safety signal AND emitting a
+  // misleading audit/domain-event payload (the patient INTENDED to
+  // flag an adverse event; the audit chain would record routine
+  // patient request). Reject any non-empty body so the patient
+  // surface fails loud instead of quietly miscoding the reason.
+  //
+  // Accepted: missing body, null, `{}`. Anything else → 400
+  // internal.request.invalid. The reasons enum is server-controlled
+  // for patient-origin writes; if a future PR adds patient
+  // adverse-event reporting, model `reason` explicitly then.
+  if (
+    req.body !== undefined &&
+    req.body !== null &&
+    (typeof req.body !== 'object' ||
+      Array.isArray(req.body) ||
+      Object.keys(req.body as Record<string, unknown>).length > 0)
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Discontinue accepts no body. Patient-origin discontinuation forces ' +
+            "discontinued_reason='patient_request' server-side; to flag an " +
+            'adverse event or different reason, use a route that models that ' +
+            'reason explicitly (not yet exposed).',
+        ),
+      );
+  }
+
   // Validate id at the boundary. Malformed → 404 tenant-blind (same
   // side-channel reasoning as the GET handler).
   let id;
