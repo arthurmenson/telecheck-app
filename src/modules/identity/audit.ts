@@ -151,7 +151,7 @@ export async function emitAccountCreatedAudit(
     actorId: string;
     countryOfCare: string;
     phoneE164: string; // recorded in detail for audit trail; PHI but not at high_pii level
-    accountType: 'patient' | 'delegate';
+    accountType: 'patient' | 'delegate' | 'clinician';
   },
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {

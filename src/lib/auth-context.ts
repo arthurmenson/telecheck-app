@@ -50,8 +50,17 @@ export interface ActorContext {
   sessionId: string;
   /** Tenant ID from the token (matches request's tenant context). */
   tenantId: TenantId;
-  /** Patient role at v1.0 (clinician/operator/admin land in later slices). */
-  role: 'patient';
+  /**
+   * Actor role at v1.0: patient | clinician. Operator / admin / research-
+   * data-steward / etc. land with their respective slices (RBAC v1.1).
+   * Widened from 'patient'-only at TLC-058 / 2026-05-13 to unblock the
+   * pharmacy clinician-write surface (TLC-055 PR E onward). The
+   * authContextPlugin populates this from the verified JWT's role claim;
+   * the JWT verify path rejects any out-of-enum value, so a handler
+   * receiving an actorContext can trust that role is one of the
+   * canonical AccessTokenRole values.
+   */
+  role: 'patient' | 'clinician';
   /** Country of care from token. */
   countryOfCare: 'US' | 'GH';
   /** Delegate context when the patient is acting as a delegate. */

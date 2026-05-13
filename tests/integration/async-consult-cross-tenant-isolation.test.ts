@@ -110,6 +110,7 @@ function mintTokenForAccount(tenantId: TenantId, accountId: AccountId): string {
       account_id: accountId,
       tenant_id: tenantId,
       session_id: ulid(),
+      role: 'patient',
       country_of_care: tenantId === T_US ? 'US' : 'GH',
     },
     config.jwtSigningKey,

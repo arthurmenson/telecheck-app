@@ -34,11 +34,14 @@ import { issueAccessToken, verifyAccessToken, type AccessTokenClaims } from './j
 const SIGNING_KEY = 'unit-test-jwt-signing-key-for-jwt.test.ts-32+chars';
 const TENANT: TenantId = asTenantId('Telecheck-US');
 
-function makeInput(overrides: Partial<{ delegate_id: string | null }> = {}) {
+function makeInput(
+  overrides: Partial<{ delegate_id: string | null; role: 'patient' | 'clinician' }> = {},
+) {
   return {
     account_id: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     tenant_id: TENANT,
     session_id: '01ARZ3NDEKTSV4RRFFQ69G5SES',
+    role: 'patient' as 'patient' | 'clinician',
     country_of_care: 'US' as const,
     ...overrides,
   };
@@ -262,6 +265,72 @@ describe('verifyAccessToken — boundary cases', () => {
     const sig = crypto.createHmac('sha256', SIGNING_KEY).update(signingInput).digest('base64url');
     const tampered = `${signingInput}.${sig}`;
     const result = verifyAccessToken(tampered, SIGNING_KEY);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('invalid_payload');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §6 — role enum (TLC-058 / 2026-05-13)
+// ---------------------------------------------------------------------------
+
+describe('issueAccessToken + verifyAccessToken — role enum', () => {
+  it('§6a clinician role round-trip', () => {
+    const token = issueAccessToken(makeInput({ role: 'clinician' }), SIGNING_KEY);
+    const result = verifyAccessToken(token, SIGNING_KEY);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.claims.role).toBe('clinician');
+  });
+
+  it('§6b patient role round-trip', () => {
+    const token = issueAccessToken(makeInput({ role: 'patient' }), SIGNING_KEY);
+    const result = verifyAccessToken(token, SIGNING_KEY);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.claims.role).toBe('patient');
+  });
+
+  it('§6c issueAccessToken throws on out-of-enum role (defense against `as` cast)', () => {
+    // Cast through unknown to bypass static type check — simulates a
+    // future `as AccessTokenRole` that escapes a typo.
+    const badInput = { ...makeInput(), role: 'pharmacist' as unknown as 'patient' };
+    expect(() => issueAccessToken(badInput, SIGNING_KEY)).toThrow(/not a valid AccessTokenRole/);
+  });
+
+  it('§6d verifyAccessToken rejects forged token with role=admin → invalid_payload', () => {
+    // Construct a properly-signed token whose payload claims role=admin
+    // (NOT in the enum). The signature is valid (re-computed by the
+    // attacker for this payload) so the only thing that catches it is
+    // the role-enum check.
+    const segments = issueAccessToken(makeInput(), SIGNING_KEY).split('.');
+    const payload = JSON.parse(Buffer.from(segments[1]!, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    payload.role = 'admin';
+    const tamperedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signingInput = `${segments[0]}.${tamperedPayload}`;
+    const sig = crypto.createHmac('sha256', SIGNING_KEY).update(signingInput).digest('base64url');
+    const forged = `${signingInput}.${sig}`;
+    const result = verifyAccessToken(forged, SIGNING_KEY);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('invalid_payload');
+  });
+
+  it('§6e verifyAccessToken rejects forged token with role missing → invalid_payload', () => {
+    const segments = issueAccessToken(makeInput(), SIGNING_KEY).split('.');
+    const payload = JSON.parse(
+      Buffer.from(segments[1]!, 'base64url').toString('utf8'),
+    ) as Partial<AccessTokenClaims>;
+    delete payload.role;
+    const tamperedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signingInput = `${segments[0]}.${tamperedPayload}`;
+    const sig = crypto.createHmac('sha256', SIGNING_KEY).update(signingInput).digest('base64url');
+    const forged = `${signingInput}.${sig}`;
+    const result = verifyAccessToken(forged, SIGNING_KEY);
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.reason).toBe('invalid_payload');
