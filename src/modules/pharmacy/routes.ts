@@ -37,6 +37,7 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import {
+  discontinueMedicationRequestHandler,
   getMedicationRequestByIdHandler,
   listMedicationRequestsForPatientHandler,
 } from './internal/handlers/prescriptions.js';
@@ -50,15 +51,18 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'pharmacy',
-    phase: 'schema_ratified_read_surface_wired_writes_pending',
+    phase: 'schema_ratified_read_surface_wired_patient_write_wired_clinician_writes_pending',
     schema_ratified: true,
     schema_ratified_at: '2026-05-11',
     schema_ratified_by: 'P-011',
     read_surface_wired: true,
     read_surface_wired_at: '2026-05-13',
     read_surface_wired_by: 'TLC-055 PR C',
+    patient_write_surface_wired: true,
+    patient_write_surface_wired_at: '2026-05-13',
+    patient_write_surface_wired_by: 'TLC-055 PR D',
     handlers_wired: false,
-    handlers_wired_tracking: 'TLC-055 PR D',
+    handlers_wired_tracking: 'TLC-055 PR E (clinician role + clinician writes)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -75,18 +79,21 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'pharmacy',
-      phase: 'schema_ratified_read_surface_wired_writes_pending',
-      pending: 'TLC-055 PR D',
+      phase: 'schema_ratified_read_surface_wired_patient_write_wired_clinician_writes_pending',
+      pending: 'TLC-055 PR E (clinician role + clinician writes)',
       pending_message:
         'Module is not yet fully ready to serve traffic — read surface is wired ' +
-        '(GET /prescriptions/:id, GET /patients/:patientId/prescriptions) but the ' +
-        'write surface (POST /prescriptions/draft, POST /:id/submit, ' +
-        'POST /:id/transitions, POST /:id/supersede) is pending TLC-055 PR D. ' +
-        'Schema is ratified per P-011 / SI-001 closure 2026-05-11; the supersession ' +
-        'reciprocity constraint trigger landed at PR #115 (TLC-055 PR B). Per the ' +
+        '(GET /prescriptions/:id, GET /patients/:patientId/prescriptions, PR C) ' +
+        'AND the patient-origin write surface is wired (POST /prescriptions/:id/' +
+        'discontinue with patient_request_discontinue, PR D 2026-05-13), but the ' +
+        'clinician-origin write surface (POST /prescriptions/draft, POST /:id/' +
+        'submit, POST /:id/approve, POST /:id/decline, POST /:id/supersede) is ' +
+        'pending TLC-055 PR E — the v1.0 JWT only carries role: patient, so the ' +
+        'clinician write handlers wait for the identity slice to ship the ' +
+        'clinician role claim. Schema is ratified per P-011 / SI-001 closure ' +
+        '2026-05-11; supersession reciprocity trigger landed PR #115. Per the ' +
         'async-consult readiness-flip precedent, /ready flips to 200 only when ' +
-        'the slice is fully production-ready (every endpoint wired, including ' +
-        'audit emission + domain events + idempotency on the write path).',
+        'the slice is fully production-ready (every endpoint wired).',
     });
   });
 
@@ -96,12 +103,19 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   app.get('/prescriptions/:id', getMedicationRequestByIdHandler);
   app.get('/patients/:patientId/prescriptions', listMedicationRequestsForPatientHandler);
 
-  // Write surface (POST /prescriptions/draft, POST /:id/submit,
-  // POST /:id/transitions, POST /:id/supersede) lands at TLC-055 PR D
-  // when the service-layer abstraction is authored — service-layer
-  // composition of audit emission + domain events + idempotency is the
-  // gap that distinguishes a real write surface from a thin wrapper
-  // over the repo. PR D's scope: pharmacy/internal/services/, error
-  // classes, idempotency wiring, audit + domain-event emission per
-  // AUDIT_EVENTS v5.3 + DOMAIN_EVENTS v5.2.
+  // Patient-origin write surface (PR D — TLC-055 PR D 2026-05-13).
+  // Service-layer composition lives in
+  // pharmacy/internal/services/medication-request-service.ts; the
+  // handler wraps it with withIdempotentExecution for IDEMPOTENCY v5.1
+  // replay semantics. Audit + domain-event emission happen inside the
+  // service-layer transaction so a failure rolls back the entire patient
+  // action atomically.
+  //
+  // ONLY patient-origin writes are exposed at PR D — patient_request_-
+  // discontinue is the single transition State Machines v1.2 §19
+  // permits the patient role to drive (v1.0 JWT only carries
+  // role: 'patient'). Clinician-origin writes (createDraft / submit /
+  // approve / decline / supersede) land in TLC-055 PR E once the
+  // identity slice ships the clinician role claim.
+  app.post('/prescriptions/:id/discontinue', discontinueMedicationRequestHandler);
 };
