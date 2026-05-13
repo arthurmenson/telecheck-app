@@ -344,7 +344,7 @@ describe('pharmacy clinician write — Group A: createDraft happy path', () => {
         `SELECT action, actor_type, actor_id, resource_id, category
            FROM audit_records
           WHERE tenant_id = $1 AND resource_id = $2
-          ORDER BY emitted_at`,
+          ORDER BY recorded_at`,
         [T_US, body.id],
       );
       return result.rows;
