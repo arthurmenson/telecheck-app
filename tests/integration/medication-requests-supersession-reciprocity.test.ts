@@ -172,17 +172,22 @@ async function setForwardPointer(
 
 /**
  * Insert a minimal account under the given tenant context. Returns
- * the account_id (ULID). account_type is caller-supplied — the
- * reciprocity trigger doesn't care about type, but the
- * medication_requests_prescriber_set_when_active CHECK requires a
- * non-null clinician account_id when status is active or post-active,
- * and the composite FK on (tenant_id, prescribed_by_clinician_account_id)
- * requires that account row exists in the same tenant.
+ * the account_id (ULID).
+ *
+ * Note on account_type: migration 012's accounts_account_type_check
+ * limits account_type to 'patient' | 'delegate' at v1.0 — clinicians
+ * live elsewhere in the data model (not yet wired into this repo's
+ * accounts table at the moment). The medication_requests CHECK
+ * constraints + composite FK on
+ * (tenant_id, prescribed_by_clinician_account_id) reference accounts
+ * by (tenant_id, account_id) and do NOT enforce account_type, so we
+ * can satisfy the FK + the prescriber_set_when_active CHECK by
+ * reusing a 'patient'-typed account as the prescriber. The reciprocity
+ * trigger under test doesn't care about account_type either. The
+ * semantic mixup is bounded to fixtures here; production prescriber
+ * accounts come from the (future) clinicians table.
  */
-async function insertAccount(
-  tenantId: string,
-  accountType: 'patient' | 'clinician' = 'patient',
-): Promise<string> {
+async function insertAccount(tenantId: string): Promise<string> {
   const client = getTestClient();
   const accountId = ulid();
   await client.query(
@@ -201,14 +206,14 @@ async function insertAccount(
       uniquePhone(),
       null,
       'Test',
-      accountType === 'clinician' ? 'Clinician' : 'Patient',
+      'Account',
       '1990-01-01',
       'prefer_not_to_say',
       null,
       'US',
       'US',
       'en-US',
-      accountType,
+      'patient',
       'active',
     ],
   );
@@ -216,11 +221,14 @@ async function insertAccount(
 }
 
 async function insertPatient(tenantId: string): Promise<string> {
-  return insertAccount(tenantId, 'patient');
+  return insertAccount(tenantId);
 }
 
 async function insertClinician(tenantId: string): Promise<string> {
-  return insertAccount(tenantId, 'clinician');
+  // See the account_type note on insertAccount: clinicians are not yet
+  // wired into the accounts table at v1.0, so a 'patient'-typed account
+  // stands in as the prescriber FK target for fixtures.
+  return insertAccount(tenantId);
 }
 
 /**
