@@ -35,8 +35,8 @@ import {
   createDraft,
   findById,
   listForPatient,
+  markSuperseded,
   recordInteractionEvaluation,
-  supersedeWithNewPrescription,
   transitionStatus,
 } from '../../src/modules/pharmacy/internal/repositories/medication-request-repo.ts';
 import {
@@ -519,86 +519,198 @@ describe('medication-request-repo — §7 discontinuation input validation', () 
 // §8 — supersedeWithNewPrescription
 // ---------------------------------------------------------------------------
 
-describe('medication-request-repo — §8 supersedeWithNewPrescription', () => {
-  const baseDraft: CreateDraftInput = {
-    id: ROW_ID_2,
-    tenant_id: TENANT,
-    patient_account_id: PATIENT,
-    product_catalog_id: PRODUCT,
-    medication_name: 'Semaglutide',
-    strength: '0.5mg/ml',
-    formulation: 'injection',
-    dose_instructions: 'Inject weekly',
-    quantity: 4,
-    quantity_unit: 'ml',
-    refills_allowed: 3,
-    indication: null,
-    clinical_notes: null,
-    prescribing_consult_id: 'cns_01HCONSULTID000000000000',
-    protocol_id: null,
-    protocol_version: null,
-    country_of_care: 'US',
-  };
-
-  it('§8a anti-self-loop: rejects when new_draft.id === old_id', async () => {
+describe('medication-request-repo — §8 markSuperseded', () => {
+  it('§8a anti-self-loop: rejects when new_id === old_id', async () => {
     const { client } = makeMockClient([]);
     await expect(
-      supersedeWithNewPrescription(
-        { tenant_id: TENANT, old_id: ROW_ID, new_draft: { ...baseDraft, id: ROW_ID } },
-        client,
-      ),
+      markSuperseded({ tenant_id: TENANT, old_id: ROW_ID, new_id: ROW_ID }, client),
     ).rejects.toThrow(/MUST differ from old_id/);
   });
 
-  it('§8b rejects tenant mismatch between old row and new draft', async () => {
-    const { client } = makeMockClient([]);
-    await expect(
-      supersedeWithNewPrescription(
-        {
-          tenant_id: TENANT,
-          old_id: ROW_ID,
-          new_draft: { ...baseDraft, tenant_id: 'Telecheck-Ghana' },
-        },
-        client,
-      ),
-    ).rejects.toThrow(/tenant_id mismatch/);
-  });
-
-  it('§8c happy path: 2-row tx — INSERT new draft + UPDATE old → superseded', async () => {
-    const newDraftRow = buildRowFixture({
-      id: ROW_ID_2,
-      supersedes_id: ROW_ID,
-    });
+  it('§8b happy path: UPDATE old row active → superseded + superseded_by_id=new_id', async () => {
     const supersededOldRow = buildRowFixture({
       id: ROW_ID,
       status: 'superseded',
       superseded_by_id: ROW_ID_2,
     });
-    const { client, captured } = makeMockClient([[newDraftRow], [supersededOldRow]]);
-    const result = await supersedeWithNewPrescription(
-      { tenant_id: TENANT, old_id: ROW_ID, new_draft: baseDraft },
+    const { client, captured } = makeMockClient([[supersededOldRow]]);
+    const result = await markSuperseded(
+      { tenant_id: TENANT, old_id: ROW_ID, new_id: ROW_ID_2 },
       client,
     );
-    expect(result.replacement.id).toBe(ROW_ID_2);
-    expect(result.replacement.supersedes_id).toBe(ROW_ID);
-    expect(result.superseded.id).toBe(ROW_ID);
-    expect(result.superseded.status).toBe('superseded');
-    expect(result.superseded.superseded_by_id).toBe(ROW_ID_2);
-    expect(captured).toHaveLength(2);
-    expect(captured[0]?.text).toContain('INSERT INTO medication_requests');
-    expect(captured[1]?.text).toContain("SET status = 'superseded'");
+    expect(result?.id).toBe(ROW_ID);
+    expect(result?.status).toBe('superseded');
+    expect(result?.superseded_by_id).toBe(ROW_ID_2);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.text).toContain("SET status = 'superseded'");
+    expect(captured[0]?.text).toContain('superseded_by_id = $1');
+    expect(captured[0]?.text).toContain("AND status = 'active'");
   });
 
-  it('§8d throws (caller transaction rolls back) when old row no longer active', async () => {
-    const newDraftRow = buildRowFixture({ id: ROW_ID_2, supersedes_id: ROW_ID });
-    // UPDATE returns zero rows → throws so caller transaction aborts atomically
-    const { client } = makeMockClient([[newDraftRow], []]);
+  it('§8c returns null when old row no longer active (caller handles conflict)', async () => {
+    const { client } = makeMockClient([[]]);
+    const result = await markSuperseded(
+      { tenant_id: TENANT, old_id: ROW_ID, new_id: ROW_ID_2 },
+      client,
+    );
+    expect(result).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §8.5 — Activation with supersedes_id (the new row's back-pointer at
+//        activation; per the split-write design after Codex R1 closure)
+// ---------------------------------------------------------------------------
+
+describe('medication-request-repo — §8.5 activation back-pointer (supersedes_id at active)', () => {
+  it('§8.5a transitionStatus to_status=active writes supersedes_id when supplied', async () => {
+    const guard: I012GuardContext = {
+      route: 'clinician_approve',
+      confirmation_event_audit_id: 'aud_01HCONFIRMATIONEVT0000000',
+      attested_tenant_id: TENANT,
+      attested_action_id: ROW_ID_2,
+      attested_patient_account_id: PATIENT,
+      attested_actor_id: CLINICIAN,
+      confirming_actor_rbac_authorized: true,
+    };
+    const pending: PendingTransitionContext = {
+      tenant_id: TENANT,
+      action_id: ROW_ID_2,
+      patient_account_id: PATIENT,
+      actor_id: CLINICIAN,
+      protocol_id: null,
+      protocol_version: null,
+    };
+    const { client, captured } = makeMockClient([
+      [
+        buildRowFixture({
+          id: ROW_ID_2,
+          status: 'active',
+          supersedes_id: ROW_ID,
+        }),
+      ],
+    ]);
+    await transitionStatus(
+      {
+        id: ROW_ID_2,
+        tenant_id: TENANT,
+        expected_from_status: 'pending_clinician_review',
+        to_status: 'active',
+        event: 'clinician_approve',
+        i012_guard: guard,
+        pending_transition: pending,
+        prescribed_by_clinician_account_id: CLINICIAN,
+        prescribed_at: new Date('2026-05-13T00:00:00.000Z'),
+        supersedes_id: ROW_ID,
+      },
+      client,
+    );
+    // UPDATE statement includes supersedes_id column write
+    expect(captured[0]?.text).toContain('supersedes_id = $6');
+    expect(captured[0]?.values).toContain(ROW_ID);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §8.6 — clinician_modify resets interaction evaluation state
+// ---------------------------------------------------------------------------
+
+describe('medication-request-repo — §8.6 clinician_modify resets interaction state', () => {
+  it('§8.6a clinician_modify UPDATEs status + interaction_signals_status=pending + cleared evaluated_at', async () => {
+    const { client, captured } = makeMockClient([
+      [
+        buildRowFixture({
+          status: 'pending_interaction_check',
+          interaction_signals_status: 'pending',
+          interaction_signals_evaluated_at: null,
+        }),
+      ],
+    ]);
+    await transitionStatus(
+      {
+        id: ROW_ID,
+        tenant_id: TENANT,
+        expected_from_status: 'pending_clinician_review',
+        to_status: 'pending_interaction_check',
+        event: 'clinician_modify',
+      },
+      client,
+    );
+    const update = captured[0];
+    expect(update?.text).toContain("interaction_signals_status = 'pending'");
+    expect(update?.text).toContain('interaction_signals_evaluated_at = NULL');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §8.7 — Row-binding defense-in-depth (action_id and tenant_id must match)
+// ---------------------------------------------------------------------------
+
+describe('medication-request-repo — §8.7 row-binding defense', () => {
+  const guard: I012GuardContext = {
+    route: 'clinician_approve',
+    confirmation_event_audit_id: 'aud_01HCONFIRMATIONEVT0000000',
+    attested_tenant_id: TENANT,
+    attested_action_id: ROW_ID,
+    attested_patient_account_id: PATIENT,
+    attested_actor_id: CLINICIAN,
+    confirming_actor_rbac_authorized: true,
+  };
+
+  it('§8.7a rejects pending_transition.action_id != input.id (service-layer mix-up)', async () => {
+    const pending: PendingTransitionContext = {
+      tenant_id: TENANT,
+      action_id: ROW_ID_2, // ← belongs to a different row
+      patient_account_id: PATIENT,
+      actor_id: CLINICIAN,
+      protocol_id: null,
+      protocol_version: null,
+    };
+    const { client } = makeMockClient([]);
     await expect(
-      supersedeWithNewPrescription(
-        { tenant_id: TENANT, old_id: ROW_ID, new_draft: baseDraft },
+      transitionStatus(
+        {
+          id: ROW_ID,
+          tenant_id: TENANT,
+          expected_from_status: 'pending_clinician_review',
+          to_status: 'active',
+          event: 'clinician_approve',
+          i012_guard: guard,
+          pending_transition: pending,
+          prescribed_by_clinician_account_id: CLINICIAN,
+          prescribed_at: new Date(),
+        },
         client,
       ),
-    ).rejects.toThrow(/no longer at status='active'/);
+    ).rejects.toThrow(/does not match input.id/);
+  });
+
+  it('§8.7b rejects pending_transition.tenant_id != input.tenant_id (cross-tenant guard)', async () => {
+    const pending: PendingTransitionContext = {
+      tenant_id: 'Telecheck-Ghana', // ← different tenant
+      action_id: ROW_ID,
+      patient_account_id: PATIENT,
+      actor_id: CLINICIAN,
+      protocol_id: null,
+      protocol_version: null,
+    };
+    const { client } = makeMockClient([]);
+    await expect(
+      transitionStatus(
+        {
+          id: ROW_ID,
+          tenant_id: TENANT,
+          expected_from_status: 'pending_clinician_review',
+          to_status: 'active',
+          event: 'clinician_approve',
+          i012_guard: guard,
+          pending_transition: pending,
+          prescribed_by_clinician_account_id: CLINICIAN,
+          prescribed_at: new Date(),
+        },
+        client,
+      ),
+    ).rejects.toThrow(/Cross-tenant guard binding is forbidden/);
   });
 });
 

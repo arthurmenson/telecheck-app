@@ -545,6 +545,23 @@ export interface TransitionStatusInput {
   /** Optional: prescription validity window end. */
   expires_at?: Date | null;
   /**
+   * Optional: supersedes_id back-pointer (the new row's link back at
+   * the row it replaces). Only valid when `to_status='active'` per the
+   * migration 025 `medication_requests_supersedes_id_only_on_replacement`
+   * CHECK — the back-pointer is established as part of the new row's
+   * activation, NOT at draft time. Service layer (TLC-055 PR C) is
+   * responsible for the full supersession composition:
+   *   1. createDraft(new_draft) — no supersedes_id yet (CHECK forbids
+   *      it on draft rows).
+   *   2. recordInteractionEvaluation + advance through lifecycle.
+   *   3. transitionStatus(new_id, to_status='active',
+   *      supersedes_id=old_id, ...) — back-pointer established here.
+   *   4. markSuperseded(old_id, new_id) — forward pointer established
+   *      on the old row.
+   * Added 2026-05-13 per Codex TLC-055 PR A R1 HIGH closure.
+   */
+  supersedes_id?: MedicationRequestId | null;
+  /**
    * Required when `to_status='discontinued'` (any of the three discontinue
    * events). Must match one of the canonical reasons per the
    * `medication_requests_discontinued_reason_valid` CHECK.
@@ -560,6 +577,16 @@ export interface TransitionStatusInput {
  * BEFORE issuing the UPDATE so I-012 + bound-context cross-checks fire
  * at the application layer; throws on rejection so the caller's
  * transaction aborts and the row stays unchanged.
+ *
+ * **Defense-in-depth row-binding check (added Codex TLC-055 PR A R1
+ * MEDIUM closure 2026-05-13):** before delegating to validateTransition,
+ * this function cross-checks `pending_transition.action_id === input.id`
+ * and `pending_transition.tenant_id === input.tenant_id`. The
+ * state-machine §9 convention says the canonical I-012 action_id IS the
+ * row's id, so a guard whose attested context binds to a DIFFERENT row
+ * means a service-layer mix-up (validated audit evidence for row B
+ * applied to row A). Without this check, the durable UPDATE could land
+ * with a guard from a different row.
  *
  * The UPDATE is optimistic-concurrency-guarded
  * (`WHERE status = expected_from_status`); when concurrent writers race,
@@ -598,6 +625,28 @@ export async function transitionStatus(
   input: TransitionStatusInput,
   externalTx?: DbClient,
 ): Promise<MedicationRequest | null> {
+  // 0. Defense-in-depth row-binding check (Codex TLC-055 PR A R1 MEDIUM
+  // closure 2026-05-13): per the state-machine §9 row.id == action_id
+  // convention, the guard's pending_transition MUST bind to the row this
+  // function is about to update. Otherwise a service-layer mix-up could
+  // validate audit evidence for row B and apply the UPDATE to row A.
+  if (input.pending_transition !== undefined) {
+    if (input.pending_transition.action_id !== (input.id as string)) {
+      throw new Error(
+        `transitionStatus: pending_transition.action_id (${input.pending_transition.action_id}) ` +
+          `does not match input.id (${input.id}). Per the state-machine §9 row.id == ` +
+          'action_id convention, the guard MUST bind to the row being updated.',
+      );
+    }
+    if (input.pending_transition.tenant_id !== input.tenant_id) {
+      throw new Error(
+        `transitionStatus: pending_transition.tenant_id (${input.pending_transition.tenant_id}) ` +
+          `does not match input.tenant_id (${input.tenant_id}). Cross-tenant guard ` +
+          'binding is forbidden per I-023 + I-027.',
+      );
+    }
+  }
+
   // 1. State-machine pre-check — throws InvalidTransitionError or
   // I012RejectError BEFORE the DB is touched. This is the application-layer
   // defense; the DB CHECKs are the durable boundary.
@@ -633,10 +682,11 @@ export async function transitionStatus(
                 expires_at = $3,
                 ai_workload_type = $4,
                 autonomy_level = $5,
+                supersedes_id = $6,
                 updated_at = NOW()
-          WHERE id = $6
-            AND tenant_id = $7
-            AND status = $8
+          WHERE id = $7
+            AND tenant_id = $8
+            AND status = $9
           RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
         [
           input.prescribed_at,
@@ -644,6 +694,7 @@ export async function transitionStatus(
           input.expires_at ?? null,
           envelopeWorkload,
           envelopeAutonomy,
+          input.supersedes_id ?? null,
           input.id,
           input.tenant_id,
           input.expected_from_status,
@@ -681,8 +732,38 @@ export async function transitionStatus(
       return rowToMedicationRequest(result.rows[0] as MedicationRequestRow);
     }
 
+    // clinician_modify resets the interaction evaluation atomically with
+    // the status transition (Codex TLC-055 PR A R1 HIGH closure
+    // 2026-05-13). The modify event reroutes the row back to
+    // pending_interaction_check; if the prior engine writeback's
+    // interaction_signals_status (clean / caution / safety_hold) carried
+    // over, `recordInteractionEvaluation` would refuse to re-write (its
+    // precondition is `interaction_signals_status = 'pending'`) AND the
+    // stale evaluation could later satisfy the active-row CHECK during
+    // activation. Resetting both fields in the same UPDATE closes that
+    // safety gap. The DB CHECK
+    // `medication_requests_interaction_resolved_when_active` enforces at
+    // the durable boundary; this app-layer reset prevents the engine
+    // writeback from being silently skipped.
+    if (input.event === 'clinician_modify') {
+      const result = await client.query<MedicationRequestRow>(
+        `UPDATE medication_requests
+            SET status = $1,
+                interaction_signals_status = 'pending',
+                interaction_signals_evaluated_at = NULL,
+                updated_at = NOW()
+          WHERE id = $2
+            AND tenant_id = $3
+            AND status = $4
+          RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
+        [input.to_status, input.id, input.tenant_id, input.expected_from_status],
+      );
+      if (result.rows.length === 0) return null;
+      return rowToMedicationRequest(result.rows[0] as MedicationRequestRow);
+    }
+
     // Generic transition path (no extra column writes): submit_for_review,
-    // engine_clean, engine_safety_hold, clinician_decline, clinician_modify,
+    // engine_clean, engine_safety_hold, clinician_decline,
     // expire_at_window_end.
     const result = await client.query<MedicationRequestRow>(
       `UPDATE medication_requests
@@ -700,136 +781,81 @@ export async function transitionStatus(
 }
 
 // ---------------------------------------------------------------------------
-// UPDATE+INSERT — supersedeWithNewPrescription (transactional 2-row write)
+// UPDATE — markSuperseded (the supersession write path, scoped to the OLD row)
 // ---------------------------------------------------------------------------
 
-export interface SupersedeInput {
+export interface MarkSupersededInput {
   tenant_id: string;
   /** The currently-active row that will be marked superseded. */
   old_id: MedicationRequestId;
-  /** The new replacement row (must be valid CreateDraftInput; status will
-   *  be created at 'draft' here and the caller is expected to advance it
-   *  through the normal lifecycle afterward). */
-  new_draft: CreateDraftInput;
-}
-
-export interface SupersedeResult {
-  /** The original row, now at status='superseded' with `superseded_by_id`
-   *  set to the new row's id. */
-  superseded: MedicationRequest;
-  /** The newly-inserted draft row, with `supersedes_id` set to the
-   *  original's id. */
-  replacement: MedicationRequest;
+  /** The id of the new replacement row. The new row MUST already exist
+   *  in the same tenant (typically authored via createDraft + advanced
+   *  through the lifecycle to active by the time this function is
+   *  called); the supersession back-pointer (new.supersedes_id = old_id)
+   *  is established as part of the new row's own activation transition,
+   *  NOT here. */
+  new_id: MedicationRequestId;
 }
 
 /**
- * Supersede an active MedicationRequest with a new draft replacement.
+ * Mark an active MedicationRequest as superseded. This is the OLD row's
+ * side of the supersession write: flips its status to 'superseded' and
+ * sets `superseded_by_id` pointing forward at the new replacement.
  *
- * This is a two-row transactional write:
- *   1. INSERT the new draft (status='draft') with `supersedes_id = old_id`.
- *   2. UPDATE the old row: status='active' → 'superseded', superseded_by_id
- *      = new_id.
- * Both writes MUST happen in the same transaction. If either fails, both
- * roll back (the partial-failure pathologies the supersession-chain
- * integrity invariants are designed to prevent).
+ * Per migration 025 (post-Codex TLC-055 PR A R1 HIGH closure 2026-05-13)
+ * the supersession write is split into the OLD-row side (this function)
+ * and the NEW-row side (the new row carries `supersedes_id` only after
+ * its own activation, when status=active satisfies the
+ * `medication_requests_supersedes_id_only_on_replacement` CHECK). The
+ * service layer (TLC-055 PR C) is responsible for composing the full
+ * supersession flow:
+ *   1. createDraft(new_draft) — new row at status=draft, no supersedes_id
+ *   2. recordInteractionEvaluation + transitionStatus through the new
+ *      row's normal lifecycle to active. At activation,
+ *      transitionStatus's activation-envelope can ALSO set
+ *      `supersedes_id` to old_id (the back-pointer satisfies the CHECK
+ *      because the new row is now active).
+ *   3. markSuperseded(old_id, new_id) — this function: old row at
+ *      active → superseded, superseded_by_id = new_id (the forward
+ *      pointer satisfies the
+ *      `medication_requests_superseded_by_id_only_on_superseded` CHECK
+ *      because the row's status flips to 'superseded' in the same
+ *      UPDATE).
  *
- * Optimistic concurrency: the UPDATE of the old row requires
- * `status='active'` — if the old row is no longer active (e.g., concurrent
- * discontinuation), the UPDATE matches zero rows and this function throws.
- * The new INSERT will then ROLLBACK with the caller's transaction.
+ * Optimistic concurrency: the UPDATE requires `status='active'` — if
+ * the old row is no longer active (e.g., concurrent discontinuation),
+ * the UPDATE matches zero rows and this function returns null. The
+ * caller (service layer) maps null to a conflict error.
  *
  * The DB CHECKs from migration 025 enforce:
- *   - Anti-self-loop: new_id MUST NOT equal old_id
- *   - Partial UNIQUE: the same old row CANNOT be superseded twice
- *   - Partial UNIQUE: the same new row CANNOT supersede twice
- *   - Status-dependent pointers: superseded_by_id only valid when
- *     status='superseded'; supersedes_id only valid when status IN
- *     ('active', 'discontinued')
+ *   - Anti-self-loop: new_id MUST NOT equal old_id (the CHECK
+ *     `medication_requests_superseded_by_id_not_self` fires)
+ *   - Partial UNIQUE: the same new row CANNOT be claimed as the
+ *     replacement of two different originals
+ *   - Status-dependent pointers: superseded_by_id is only valid when
+ *     this row's status is 'superseded' — that's why the UPDATE flips
+ *     status AND sets superseded_by_id in the same SET clause
  *
- * NOT YET ENFORCED at the durable boundary: chain reciprocity (A→B AND
- * B.supersedes=A). The TLC-055 PR B deferrable constraint trigger closes
- * that gap. Until then, the same-transaction write semantics here are
- * the runtime guarantee.
- *
- * If you need to supersede a discontinued row (the patient comes back and
- * starts a new prescription that explicitly chains back to a prior
- * discontinued one), that's a separate flow — use createDraft + set
- * supersedes_id on the new draft, but don't UPDATE the discontinued row.
+ * NOT YET ENFORCED at the durable boundary: chain reciprocity (old's
+ * superseded_by_id MUST equal new's id AND new's supersedes_id MUST
+ * equal old's id). The TLC-055 PR B deferrable CONSTRAINT TRIGGER
+ * closes that gap; until then, the same-transaction write semantics
+ * here + the service-layer composition above are the runtime
+ * guarantee.
  */
-export async function supersedeWithNewPrescription(
-  input: SupersedeInput,
+export async function markSuperseded(
+  input: MarkSupersededInput,
   externalTx?: DbClient,
-): Promise<SupersedeResult> {
-  if (input.old_id === input.new_draft.id) {
+): Promise<MedicationRequest | null> {
+  if (input.old_id === input.new_id) {
     throw new Error(
-      'supersedeWithNewPrescription: new_draft.id MUST differ from old_id (anti-self-loop)',
+      'markSuperseded: new_id MUST differ from old_id (anti-self-loop; ' +
+        'migration 025 medication_requests_superseded_by_id_not_self CHECK)',
     );
   }
-  if (input.tenant_id !== input.new_draft.tenant_id) {
-    throw new Error(
-      'supersedeWithNewPrescription: tenant_id mismatch between old row and new draft',
-    );
-  }
-
-  const runner = makeRunner<SupersedeResult>(input.tenant_id, externalTx);
+  const runner = makeRunner<MedicationRequest | null>(input.tenant_id, externalTx);
   return runner(async (client) => {
-    // Step 1: INSERT the new draft with supersedes_id = old_id.
-    const newRowInsert = await client.query<MedicationRequestRow>(
-      `INSERT INTO medication_requests (
-         id, tenant_id,
-         patient_account_id, product_catalog_id,
-         medication_name, strength, formulation,
-         dose_instructions, quantity, quantity_unit, refills_allowed,
-         indication, clinical_notes,
-         status,
-         prescribing_consult_id,
-         interaction_signals_status,
-         protocol_id, protocol_version,
-         supersedes_id,
-         country_of_care
-       ) VALUES (
-         $1, $2,
-         $3, $4,
-         $5, $6, $7,
-         $8, $9, $10, $11,
-         $12, $13,
-         'draft',
-         $14,
-         'pending',
-         $15, $16,
-         $17,
-         $18
-       )
-       RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
-      [
-        input.new_draft.id,
-        input.new_draft.tenant_id,
-        input.new_draft.patient_account_id,
-        input.new_draft.product_catalog_id,
-        input.new_draft.medication_name,
-        input.new_draft.strength,
-        input.new_draft.formulation,
-        input.new_draft.dose_instructions,
-        input.new_draft.quantity,
-        input.new_draft.quantity_unit,
-        input.new_draft.refills_allowed,
-        input.new_draft.indication,
-        input.new_draft.clinical_notes,
-        input.new_draft.prescribing_consult_id,
-        input.new_draft.protocol_id,
-        input.new_draft.protocol_version,
-        input.old_id,
-        input.new_draft.country_of_care,
-      ],
-    );
-    const newRow = newRowInsert.rows[0];
-    if (newRow === undefined) {
-      throw new Error('supersedeWithNewPrescription: INSERT of new draft returned no row');
-    }
-
-    // Step 2: UPDATE the old row: active → superseded + set superseded_by_id.
-    // Optimistic concurrency on status='active'.
-    const oldRowUpdate = await client.query<MedicationRequestRow>(
+    const result = await client.query<MedicationRequestRow>(
       `UPDATE medication_requests
           SET status = 'superseded',
               superseded_by_id = $1,
@@ -838,28 +864,11 @@ export async function supersedeWithNewPrescription(
           AND tenant_id = $3
           AND status = 'active'
         RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
-      [input.new_draft.id, input.old_id, input.tenant_id],
+      [input.new_id, input.old_id, input.tenant_id],
     );
-    if (oldRowUpdate.rows.length === 0) {
-      // The old row is no longer active. Throw so the caller's transaction
-      // ROLLBACKS — undoing the new draft INSERT atomically. The supersession
-      // chain integrity invariants from migration 025 PR #110 R11 also
-      // protect this: even if the throw is swallowed, the partial UNIQUE
-      // indexes would prevent a second supersession attempt against the same
-      // old_id later.
-      throw new Error(
-        `supersedeWithNewPrescription: old row (${input.old_id}) is no longer at status='active'; ` +
-          'no row updated. Caller transaction MUST roll back.',
-      );
-    }
-    const oldRow = oldRowUpdate.rows[0];
-    if (oldRow === undefined) {
-      throw new Error('supersedeWithNewPrescription: UPDATE of old row returned no row');
-    }
-
-    return {
-      superseded: rowToMedicationRequest(oldRow),
-      replacement: rowToMedicationRequest(newRow),
-    };
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    return rowToMedicationRequest(row);
   });
 }
