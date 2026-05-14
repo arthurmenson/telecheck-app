@@ -295,24 +295,29 @@ describe('runCrisisGate — positive detection path', () => {
   });
 });
 
-describe('runCrisisGate — required-field shape validation (Codex PR F R13 HIGH closure)', () => {
-  // Per Codex PR F R13 HIGH closure 2026-05-13: emitAudit rejects
-  // empty target_patient_id / resource_id / actor_id and rejects
-  // non-2-char country_of_care. The gate validates these up front
-  // so an upstream mapping bug surfaces as a wiring_error (with the
-  // audit fallback path) rather than crashing the emit and
-  // silently losing the I-019 Category A row.
-  type Field = 'aiActorId' | 'patientId' | 'resourceId' | 'countryOfCare' | 'tenantId';
-  const invalidByField: Array<[Field, unknown, RegExp]> = [
-    ['aiActorId', '', /aiActorId must be a non-empty string/],
-    ['patientId', '', /patientId must be a non-empty string/],
-    ['resourceId', '', /resourceId must be a non-empty string/],
-    ['countryOfCare', 'USA', /countryOfCare must be a 2-char/],
-    ['countryOfCare', '', /countryOfCare must be a 2-char/],
-    ['countryOfCare', 'us', /countryOfCare must be a 2-char/],
+describe('runCrisisGate — required-field shape validation (Codex PR F R13 + R15 HIGH closures)', () => {
+  // Per Codex PR F R15 HIGH closure 2026-05-13: when required text
+  // fields are malformed, the gate substitutes audit-emit-safe
+  // placeholders (aiActorId / patientId / resourceId →
+  // `__wiring_error_fallback__`; countryOfCare → 'XX' ISO-3166
+  // reserved) so the Category A audit STILL lands. The wiring_error
+  // is recorded in detail for triage. Tenant_id has no safe
+  // fallback — the audit cannot emit; gate short-circuits to
+  // audit_emitted=false + ops log.
+  type Field = 'aiActorId' | 'patientId' | 'resourceId' | 'countryOfCare';
+  const FALLBACK_PLACEHOLDER = '__wiring_error_fallback__';
+  const invalidByField: Array<[Field, unknown, RegExp, string]> = [
+    ['aiActorId', '', /aiActorId must be a non-empty string/, FALLBACK_PLACEHOLDER],
+    // patientId/resourceId: the audit substitutes the placeholder so
+    // we query by THAT, not by the empty original.
+    ['patientId', '', /patientId must be a non-empty string/, FALLBACK_PLACEHOLDER],
+    ['resourceId', '', /resourceId must be a non-empty string/, FALLBACK_PLACEHOLDER],
+    ['countryOfCare', 'USA', /countryOfCare must be a 2-char/, FALLBACK_PLACEHOLDER],
+    ['countryOfCare', '', /countryOfCare must be a 2-char/, FALLBACK_PLACEHOLDER],
+    ['countryOfCare', 'us', /countryOfCare must be a 2-char/, FALLBACK_PLACEHOLDER],
   ];
   for (const [field, badValue, expectedMessage] of invalidByField) {
-    it(`invalid ctx.${field}=${JSON.stringify(badValue)} surfaces wiring_error (audit still attempts to land)`, async () => {
+    it(`invalid ctx.${field}=${JSON.stringify(badValue)} — audit STILL lands via fallback placeholder`, async () => {
       const ctx = {
         ...baseCtx(),
         [field]: badValue,
@@ -320,17 +325,57 @@ describe('runCrisisGate — required-field shape validation (Codex PR F R13 HIGH
       const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
       expect(r.kind).toBe('crisis');
       if (r.kind === 'crisis') {
-        // The wiring error is captured. Whether the audit actually
-        // lands depends on whether the malformed field is one the
-        // emitter validates row-level (e.g., countryOfCare is a NOT
-        // NULL+length-2 column check — emit will still fail). We
-        // assert audit_error captures the wiring error in both
-        // cases; the I-019 audit-or-log invariant is satisfied either
-        // way (the fallback log fires on the failure branch).
+        expect(r.audit_emitted).toBe(true); // landed on fallback path
         expect(r.audit_error?.message).toMatch(expectedMessage);
       }
+
+      // Audit row lands under the SUBSTITUTED resource_id when
+      // resourceId was the malformed field; otherwise under the
+      // original ctx.resourceId. Query both candidates.
+      const queryResourceId = field === 'resourceId' ? FALLBACK_PLACEHOLDER : ctx.resourceId;
+      await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        const rows = await client.query<{ payload: Record<string, unknown> }>(
+          `SELECT payload FROM audit_records
+            WHERE tenant_id = $1 AND resource_id = $2 AND action = 'crisis_detection_trigger'`,
+          [T_US, queryResourceId],
+        );
+        expect(rows.rows.length).toBe(1);
+        const wiring = rows.rows[0]!.payload['wiring_error'] as
+          | { name: string; message: string }
+          | undefined;
+        expect(wiring).toBeDefined();
+        expect(wiring!.message).toMatch(expectedMessage);
+      });
     });
   }
+
+  it('invalid ctx.tenantId — audit CANNOT emit (no safe fallback); audit_emitted=false', async () => {
+    // tenant_id has no safe fallback — emitting under an arbitrary
+    // tenant could leak across RLS scopes. The gate short-circuits
+    // to audit_emitted=false + R11 error log. Patient still gets
+    // the crisis sentinel.
+    const ctx = {
+      ...baseCtx(),
+      tenantId: '' as unknown as ReturnType<typeof asTenantId>,
+    } as Parameters<typeof runCrisisGate>[0];
+    const errSpy = vi.spyOn(logger, 'error');
+    try {
+      const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
+      expect(r.kind).toBe('crisis');
+      if (r.kind === 'crisis') {
+        expect(r.audit_emitted).toBe(false);
+        expect(r.audit_error?.message).toMatch(/tenantId must be a non-empty string/);
+      }
+      const failCall = errSpy.mock.calls.find((args) => {
+        const obj = args[0] as Record<string, unknown> | undefined;
+        return obj?.['event'] === 'crisis_audit_emission_failed';
+      });
+      expect(failCall).toBeDefined();
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
 });
 
 describe('runCrisisGate — PHI-leak protection on validation failures (Codex PR F R14 HIGH closure)', () => {

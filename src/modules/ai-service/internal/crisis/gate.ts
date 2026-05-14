@@ -82,47 +82,95 @@ function errToShape(err: unknown): { name: string; message: string } {
 }
 
 /** Pre-emit shape check for the required text fields the audit
- *  envelope rejects (Codex PR F R13 HIGH closure 2026-05-13). Returns
- *  a wiringError on the first malformed field; emitter still receives
- *  whatever the caller supplied (the fallback path is purely a triage
- *  marker — if the audit truly fails because the fields are empty,
- *  the FLOOR-020 catch fires and the audit_error path takes over). */
+ *  envelope rejects (Codex PR F R13 + R15 HIGH closures 2026-05-13).
+ *  Returns audit-emit-safe field values PLUS a wiringError when any
+ *  field is malformed. Fallback values:
+ *    - tenantId: NO safe fallback (would mis-route the audit's RLS
+ *      scope). If invalid, returns `{ tenantInvalid: true }` so the
+ *      caller can short-circuit to audit_emitted=false + ops log
+ *      without attempting an emit that would land cross-tenant.
+ *    - aiActorId / patientId / resourceId: substituted with a
+ *      `__wiring_error_fallback__` placeholder. The audit row lands;
+ *      the `wiring_error` field in detail captures the failure
+ *      class. Compliance/triage gets a durable row.
+ *    - countryOfCare: substituted with 'XX' (ISO-3166 user-assigned
+ *      reserved code). Audits with country_of_care='XX' are easy to
+ *      filter as wiring-error fallbacks during compliance review.
+ *  Per Codex PR F R15 HIGH closure 2026-05-13 — fixes the R13 gap
+ *  where wiringError was captured but the original malformed values
+ *  still reached emitAudit and caused the row to be rejected. */
 function sanitizeWiringFields(ctx: CrisisGateContext): {
+  tenantInvalid: boolean;
+  fields: {
+    aiActorId: string;
+    patientId: string;
+    resourceId: string;
+    countryOfCare: string;
+  };
   wiringError?: { name: string; message: string };
 } {
-  const checks: Array<[string, unknown]> = [
-    ['tenantId', ctx.tenantId],
-    ['aiActorId', ctx.aiActorId],
-    ['patientId', ctx.patientId],
-    ['resourceId', ctx.resourceId],
-  ];
-  for (const [name, value] of checks) {
-    if (typeof value !== 'string' || value.length === 0) {
-      // Per Codex PR F R14 HIGH closure pattern: never echo
-      // potentially-account-linked values into the audit detail.
-      // Report shape metadata only.
-      return {
-        wiringError: {
-          name: 'Error',
-          message:
-            `runCrisisGate: ctx.${name} must be a non-empty string. ` +
-            `Got type=${typeof value}, length=${typeof value === 'string' ? value.length : 'n/a'}.`,
-        },
-      };
-    }
-  }
-  if (typeof ctx.countryOfCare !== 'string' || !/^[A-Z]{2}$/.test(ctx.countryOfCare)) {
-    const len = typeof ctx.countryOfCare === 'string' ? ctx.countryOfCare.length : -1;
+  const FALLBACK_PLACEHOLDER = '__wiring_error_fallback__';
+  const FALLBACK_COUNTRY = 'XX'; // ISO-3166 reserved/user-assigned
+  // tenantId — no safe substitution.
+  if (typeof ctx.tenantId !== 'string' || ctx.tenantId.length === 0) {
     return {
+      tenantInvalid: true,
+      fields: {
+        aiActorId: FALLBACK_PLACEHOLDER,
+        patientId: FALLBACK_PLACEHOLDER,
+        resourceId: FALLBACK_PLACEHOLDER,
+        countryOfCare: FALLBACK_COUNTRY,
+      },
       wiringError: {
         name: 'Error',
         message:
-          `runCrisisGate: ctx.countryOfCare must be a 2-char ISO-3166 alpha-2 code. ` +
-          `Got type=${typeof ctx.countryOfCare}, length=${len}.`,
+          `runCrisisGate: ctx.tenantId must be a non-empty string. ` +
+          `Got type=${typeof ctx.tenantId}, length=${
+            typeof ctx.tenantId === 'string' ? ctx.tenantId.length : 'n/a'
+          }. No safe tenant fallback exists; audit cannot emit.`,
       },
     };
   }
-  return {};
+
+  const sanitizeField = (name: string, value: unknown): [string, string | undefined] => {
+    if (typeof value === 'string' && value.length > 0) {
+      return [value, undefined];
+    }
+    const msg =
+      `runCrisisGate: ctx.${name} must be a non-empty string. ` +
+      `Got type=${typeof value}, length=${typeof value === 'string' ? value.length : 'n/a'}.`;
+    return [FALLBACK_PLACEHOLDER, msg];
+  };
+
+  let wiringError: { name: string; message: string } | undefined;
+  const setErr = (msg: string | undefined) => {
+    if (wiringError === undefined && msg !== undefined) {
+      wiringError = { name: 'Error', message: msg };
+    }
+  };
+
+  const [aiActorId, e1] = sanitizeField('aiActorId', ctx.aiActorId);
+  setErr(e1);
+  const [patientId, e2] = sanitizeField('patientId', ctx.patientId);
+  setErr(e2);
+  const [resourceId, e3] = sanitizeField('resourceId', ctx.resourceId);
+  setErr(e3);
+
+  let countryOfCare = ctx.countryOfCare;
+  if (typeof ctx.countryOfCare !== 'string' || !/^[A-Z]{2}$/.test(ctx.countryOfCare)) {
+    const len = typeof ctx.countryOfCare === 'string' ? ctx.countryOfCare.length : -1;
+    setErr(
+      `runCrisisGate: ctx.countryOfCare must be a 2-char ISO-3166 alpha-2 code. ` +
+        `Got type=${typeof ctx.countryOfCare}, length=${len}.`,
+    );
+    countryOfCare = FALLBACK_COUNTRY;
+  }
+
+  return {
+    tenantInvalid: false,
+    fields: { aiActorId, patientId, resourceId, countryOfCare },
+    ...(wiringError !== undefined ? { wiringError } : {}),
+  };
 }
 
 export type CrisisGateOutcome =
@@ -382,6 +430,37 @@ export async function runCrisisGate(
     wiringError = sanitizedCtx.wiringError;
   }
 
+  // Per Codex PR F R15 HIGH closure 2026-05-13: if tenantId itself
+  // is invalid, there is no safe tenant scope to emit the audit
+  // under. Short-circuit to `audit_emitted: false` + R11 error log
+  // immediately rather than risking a cross-tenant or RLS-violation
+  // emit. The patient still gets the crisis sentinel for safety.
+  if (sanitizedCtx.tenantInvalid) {
+    logger.error(
+      {
+        event: 'crisis_audit_emission_failed',
+        tenant_id: ctx.tenantId,
+        resource_type: ctx.resourceType,
+        resource_id: ctx.resourceId,
+        ai_actor_id: ctx.aiActorId,
+        detection_source: detectionSource,
+        crisis_type: outcome.crisisType,
+        audit_error_name: sanitizedCtx.wiringError!.name,
+        audit_error_message: sanitizedCtx.wiringError!.message,
+      },
+      'I-019 crisis_detection_trigger audit COULD NOT EMIT because ctx.tenantId ' +
+        'is invalid — no safe tenant scope exists. Crisis-resource response was ' +
+        'still surfaced to the patient. Triage immediately.',
+    );
+    return {
+      kind: 'crisis',
+      crisis_type: outcome.crisisType,
+      detection_source: detectionSource,
+      audit_emitted: false,
+      ...(sanitizedCtx.wiringError !== undefined ? { audit_error: sanitizedCtx.wiringError } : {}),
+    };
+  }
+
   // Per FLOOR-020 crisis-write exception: if the audit emission
   // fails at the INFRASTRUCTURE level (DB error, etc.), the caller
   // still proceeds with the crisis-resource response. We capture
@@ -421,13 +500,20 @@ export async function runCrisisGate(
       await emitAICrisisDetectionTrigger(
         {
           tenantId: ctx.tenantId,
-          actorId: ctx.aiActorId,
-          countryOfCare: ctx.countryOfCare,
-          targetPatientId: ctx.patientId,
+          // Per Codex PR F R15 HIGH closure 2026-05-13: when wiringError
+          // is set, route through sanitized fields so emitAudit
+          // doesn't reject the row at the schema layer. The actual
+          // malformed values are NOT preserved in the audit (raw values
+          // could carry account-linked data or PHI per R14); the
+          // `wiring_error` field in detail flags the audit row as a
+          // wiring-error-fallback for triage.
+          actorId: sanitizedCtx.fields.aiActorId,
+          countryOfCare: sanitizedCtx.fields.countryOfCare,
+          targetPatientId: sanitizedCtx.fields.patientId,
           detectionSource,
           crisisType: outcome.crisisType,
           resourceType: ctx.resourceType,
-          resourceId: ctx.resourceId,
+          resourceId: sanitizedCtx.fields.resourceId,
           // Per Codex PR F R9 HIGH closure 2026-05-13:
           // `response_provided` is a DELIVERY-OBSERVATION. The gate
           // runs BEFORE the response, so it cannot observe whether
