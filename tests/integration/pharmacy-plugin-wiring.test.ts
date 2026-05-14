@@ -81,17 +81,22 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
       engine_writeback_wired: boolean;
       engine_writeback_wired_at: string;
       engine_writeback_wired_by: string;
+      supersession_wired: boolean;
+      supersession_wired_at: string;
+      supersession_wired_by: string;
+      handlers_wired_at: string;
+      handlers_wired_by: string;
       handlers_wired: boolean;
       handlers_wired_tracking: string;
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('pharmacy');
-    // Post-PR-I phase label: schema ratified + read + patient-write +
-    // clinician write surface partial (createDraft/submit/discontinue/
-    // approve/decline) + engine writeback landed (service-callable, no
-    // HTTP); supersession still pending TLC-055 PR J.
+    // Post-PR-J: read + patient + clinician (createDraft/submit/
+    // discontinue/approve/decline/supersede) + engine writeback all
+    // wired. /ready stays 503 because clinician_modify is still
+    // unimplemented per Codex PR J R1 HIGH closure.
     expect(body.phase).toBe(
-      'schema_ratified_read_and_write_wired_clinician_decisions_and_engine_writeback_landed_supersession_pending',
+      'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
     );
     expect(body.schema_ratified).toBe(true);
     expect(body.schema_ratified_at).toBe('2026-05-11');
@@ -104,7 +109,7 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     expect(body.patient_write_surface_wired_by).toBe('TLC-055 PR D');
     expect(body.clinician_write_surface_partial).toBe(true);
     expect(body.clinician_write_surface_partial_by).toBe(
-      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline)',
+      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline) + PR J (supersede)',
     );
     expect(body.i012_first_gated_activation_wired).toBe(true);
     expect(body.i012_first_gated_activation_wired_by).toBe('TLC-055 PR G (clinician_approve)');
@@ -113,11 +118,13 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     expect(body.engine_writeback_wired_by).toBe(
       'TLC-055 PR I (service-callable; no HTTP surface at v1.0)',
     );
+    expect(body.supersession_wired).toBe(true);
+    expect(body.supersession_wired_by).toBe('TLC-055 PR J');
     expect(body.handlers_wired).toBe(false);
-    expect(body.handlers_wired_tracking).toBe('TLC-055 PR J (supersession write-path)');
+    expect(body.handlers_wired_tracking).toBe('TLC-055 PR K (clinician_modify re-route)');
   });
 
-  it('§1b GET /v0/pharmacy/ready returns 503 (supersession still pending TLC-055 PR J)', async () => {
+  it('§1b GET /v0/pharmacy/ready returns 503 (clinician_modify still pending TLC-055 PR K)', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/pharmacy/ready',
@@ -134,19 +141,12 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('pharmacy');
     expect(body.phase).toBe(
-      'schema_ratified_read_and_write_wired_clinician_decisions_and_engine_writeback_landed_supersession_pending',
+      'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
     );
-    expect(body.pending).toBe('TLC-055 PR J (supersession write-path)');
-    // The PR-I message acknowledges the slice now serves reads, patient
-    // discontinue, clinician createDraft/submit/discontinue/approve/
-    // decline, AND engine writeback (service-callable). Readiness still
-    // 503 — flips to 200 only when supersession lands.
+    expect(body.pending).toBe('TLC-055 PR K (clinician_modify re-route)');
     expect(body.pending_message).toContain('not yet fully ready');
-    expect(body.pending_message).toContain('engine writeback');
-    expect(body.pending_message).toContain('TLC-055 PR J');
-    // The post-P-011 message MUST NOT claim the schema is unresolved —
-    // SI-001 closed via P-011 on 2026-05-11; the gap is now decline +
-    // supersession.
+    expect(body.pending_message).toContain('clinician_modify');
+    expect(body.pending_message).toContain('TLC-055 PR K');
     expect(body.pending_message).not.toContain('schema not yet ratified');
   });
 });

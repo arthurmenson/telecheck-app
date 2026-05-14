@@ -53,6 +53,7 @@ import {
   emitMedicationRequestDrafted,
   emitMedicationRequestInteractionEvaluationCompleted,
   emitMedicationRequestSubmittedForReview,
+  emitMedicationRequestSuperseded,
   emitPrescribingApproved,
   emitPrescribingDeclined,
   emitPrescribingExecutionRejected,
@@ -61,6 +62,7 @@ import {
   emitMedicationRequestApproved,
   emitMedicationRequestDiscontinued as emitMedicationRequestDiscontinuedDomainEvent,
   emitMedicationRequestInteractionSafetyHoldTriggered,
+  emitMedicationRequestSuperseded as emitMedicationRequestSupersededDomainEvent,
 } from '../../domain-events.js';
 import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
 import { I012RejectError } from '../state-machine.js';
@@ -1156,6 +1158,259 @@ export async function evaluateInteractionsAsEngine(
         knowledgeBaseVersion: evaluation.knowledgeBaseVersion,
       });
     }
+
+    return updated;
+  }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
+// supersedeByClinician — PR J supersession write-path
+//
+// State Machines v1.2 §19:
+//
+//   active --[supersede_by_new_prescription]--> superseded (terminal-ish)
+//
+// The supersession workflow is a TWO-ROW write paired with a clinician_
+// approve transition on a NEW pending_clinician_review row:
+//
+//   1. Load BOTH rows.
+//      - newMrId must be at status='pending_clinician_review'
+//      - oldMrId must be at status='active'
+//      - Both must belong to the same tenant (RLS + explicit predicate)
+//        AND the same patient (defense-in-depth; the markSuperseded SQL
+//        also enforces this).
+//      - Anti-self-loop: newMrId !== oldMrId.
+//
+//   2. Emit prescribing.approved (the I-012 confirmation event for the
+//      clinician_approve route on the new row).
+//
+//   3. transitionStatus on the new row: pending_clinician_review →
+//      active via clinician_approve, threading supersedes_id = oldMrId
+//      into the activation envelope. Migration 025 CHECK
+//      medication_requests_supersedes_id_only_on_replacement permits
+//      supersedes_id at status='active' only.
+//
+//   4. markSuperseded(old_id, new_id): old row status → superseded,
+//      superseded_by_id = new_id. The repo function's EXISTS predicate
+//      (see medication-request-repo.ts L946+) requires the new row to
+//      already be active AND already carry supersedes_id = old_id AND
+//      have the same patient — which step 3 has established. The
+//      migration 026 deferred CONSTRAINT TRIGGER validates reciprocity
+//      at commit time as a durable safety net.
+//
+//   5. Emit medication_request.approved.v1 with approval_pathway=
+//      'clinician_reviewed' (the NEW row got activated).
+//
+//   6. Emit medication_request.superseded audit + medication_request.
+//      superseded.v1 domain event (the OLD row's transition).
+//
+// I-012 reject-unless three-clause rule applies to the clinician_approve
+// transition on the new row — same as the non-supersession path. The
+// I012RejectError handling delegates to the existing handler-level
+// post-rollback emission via emitApprovalI012RejectionAudit (PR G); this
+// service throws unchanged and the handler catches it.
+//
+// supersessionReason is a free-text rationale (audit + domain event
+// detail). At v1.0 we don't enumerate canonical reasons — clinical
+// judgment is varied; an enum sweep can land if downstream consumers
+// need it.
+// ---------------------------------------------------------------------------
+
+export async function supersedeByClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  newMedicationRequestId: MedicationRequestId,
+  oldMedicationRequestId: MedicationRequestId,
+  supersessionReason: string,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  if (newMedicationRequestId === oldMedicationRequestId) {
+    throw new MedicationRequestInputValidationError(
+      'supersession self-loop: new and old medication_request ids must differ',
+    );
+  }
+
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    // Step 1: load both rows (tenant-scoped via RLS + explicit predicate).
+    const newRow = await medicationRequestRepo.findById(ctx.tenantId, newMedicationRequestId, tx);
+    if (newRow === null) {
+      throw new MedicationRequestNotFoundError(newMedicationRequestId);
+    }
+    if (newRow.status !== 'pending_clinician_review') {
+      throw new MedicationRequestStateConflictError(newMedicationRequestId, newRow.status);
+    }
+
+    const oldRow = await medicationRequestRepo.findById(ctx.tenantId, oldMedicationRequestId, tx);
+    if (oldRow === null) {
+      // Tenant-blind: a same-tenant clinician fishing for ids gets the
+      // same envelope whether the id is unknown or in another tenant.
+      throw new MedicationRequestNotFoundError(oldMedicationRequestId);
+    }
+    if (oldRow.status !== 'active') {
+      throw new MedicationRequestStateConflictError(oldMedicationRequestId, oldRow.status);
+    }
+    // Same-patient guard (defense-in-depth; markSuperseded's SQL EXISTS
+    // predicate also enforces this at the durable boundary). I-025
+    // collapse: an attacker who learned a same-tenant patient B's row id
+    // and tries to supersede with patient A's row gets the same 404 as
+    // not-found.
+    if (oldRow.patient_account_id !== newRow.patient_account_id) {
+      throw new MedicationRequestNotFoundError(oldMedicationRequestId);
+    }
+
+    const prescribedAt = new Date();
+
+    // Step 2: emit prescribing.approved (I-012 confirmation event for
+    // the clinician_approve transition on the new row).
+    const approvedAudit = await emitPrescribingApproved(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: newRow.patient_account_id,
+        medicationRequestId: newMedicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        detail: { supersedes_id: oldMedicationRequestId },
+      },
+      tx,
+    );
+
+    // Step 3: activate the new row WITH supersedes_id threaded into the
+    // activation envelope. I-012 guard mirrors the non-supersession
+    // approveAsClinician path. I012RejectError bubbles to the handler
+    // for post-rollback rejection emission (Codex PR G R1/R2/R3 closures).
+    let updated: MedicationRequest | null;
+    try {
+      updated = await medicationRequestRepo.transitionStatus(
+        {
+          id: newMedicationRequestId,
+          tenant_id: ctx.tenantId,
+          expected_from_status: 'pending_clinician_review',
+          to_status: 'active',
+          event: 'clinician_approve',
+          prescribed_by_clinician_account_id: actor.accountId,
+          prescribed_at: prescribedAt,
+          supersedes_id: oldMedicationRequestId,
+          pending_transition: {
+            tenant_id: ctx.tenantId,
+            action_id: newMedicationRequestId,
+            patient_account_id: newRow.patient_account_id,
+            actor_id: actor.accountId,
+            protocol_id: null,
+            protocol_version: null,
+          },
+          i012_guard: {
+            route: 'clinician_approve',
+            confirmation_event_audit_id: approvedAudit.audit_id,
+            attested_tenant_id: ctx.tenantId,
+            attested_action_id: newMedicationRequestId,
+            attested_patient_account_id: newRow.patient_account_id,
+            attested_actor_id: actor.accountId,
+            confirming_actor_rbac_authorized: true,
+          },
+        },
+        tx,
+      );
+    } catch (err) {
+      // Codex PR J R2 MEDIUM closure 2026-05-13: two concurrent
+      // supersessions targeting the SAME old row both try to set their
+      // respective new rows' supersedes_id = old.id. Migration 025's
+      // partial UNIQUE `uq_medication_requests_supersedes_unique` on
+      // (tenant_id, supersedes_id) WHERE supersedes_id IS NOT NULL
+      // fires on the second insert → Postgres SQLSTATE 23505. Without
+      // this catch, the error bubbles as a 500. Map to the canonical
+      // state-conflict path so the loser of the race gets 409 (the
+      // winner gets 200; never a 500).
+      if (
+        err instanceof Error &&
+        'code' in err &&
+        (err as Error & { code: string }).code === '23505' &&
+        'constraint' in err &&
+        (err as Error & { constraint?: string }).constraint ===
+          'uq_medication_requests_supersedes_unique'
+      ) {
+        throw new MedicationRequestStateConflictError(newMedicationRequestId, null);
+      }
+      throw err;
+    }
+    if (updated === null) {
+      throw new MedicationRequestStateConflictError(newMedicationRequestId, null);
+    }
+
+    // Step 4: mark old row superseded. The repo's EXISTS predicate
+    // requires the new row to be active + already carry supersedes_id =
+    // oldMrId + same patient — all satisfied by step 3.
+    const supersededOld = await medicationRequestRepo.markSuperseded(
+      {
+        tenant_id: ctx.tenantId,
+        old_id: oldMedicationRequestId,
+        new_id: newMedicationRequestId,
+      },
+      tx,
+    );
+    if (supersededOld === null) {
+      // Concurrent writer raced — e.g., the old row was discontinued
+      // between step 1's load and step 4's UPDATE.
+      throw new MedicationRequestStateConflictError(oldMedicationRequestId, null);
+    }
+
+    // Step 5: medication_request.approved.v1 domain event (new row).
+    await emitMedicationRequestApproved(tx, {
+      tenantId: ctx.tenantId,
+      medicationRequestId: newMedicationRequestId,
+      occurredAt: prescribedAt,
+      patientAccountId: newRow.patient_account_id,
+      approvalPathway: 'clinician_reviewed',
+      prescriberAccountId: actor.accountId,
+      productCatalogId: newRow.product_catalog_id,
+      medication: {
+        code: newRow.product_catalog_id,
+        name: newRow.medication_name,
+        strength: newRow.strength,
+        formulation: newRow.formulation,
+      },
+      dosing: {
+        instructions: newRow.dose_instructions,
+        quantity: newRow.quantity,
+        quantity_unit: newRow.quantity_unit,
+        refills_allowed: newRow.refills_allowed,
+      },
+      interactionSignals: [],
+      overrides: [],
+      protocolId: null,
+      protocolVersion: null,
+      aiWorkloadType: null,
+      autonomyLevel: null,
+    });
+
+    // Step 6: medication_request.superseded audit (Category A) + .v1
+    // domain event (old row's transition). The audit envelope's
+    // medicationRequestId IS the OLD row (the aggregate that
+    // transitioned to 'superseded').
+    await emitMedicationRequestSuperseded(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: newRow.patient_account_id,
+        medicationRequestId: oldMedicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        newMedicationRequestId,
+        supersessionReason,
+        detail: {},
+      },
+      tx,
+    );
+
+    await emitMedicationRequestSupersededDomainEvent(tx, {
+      tenantId: ctx.tenantId,
+      medicationRequestId: oldMedicationRequestId,
+      occurredAt: prescribedAt,
+      oldMedicationRequestId,
+      newMedicationRequestId,
+      patientAccountId: newRow.patient_account_id,
+      supersessionReason,
+    });
 
     return updated;
   }, externalTx);
