@@ -103,6 +103,47 @@ export function asGuardrailTemplateId(s: string): GuardrailTemplateId {
 
 // Row-shape interfaces (ChatSession, ChatMessage, AIExecution,
 // GuardrailTemplate) land when the conversation surface and template
-// repo are authored in PR B / PR E respectively. The PR A skeleton
-// deliberately does NOT declare row shapes; that's schema authoring,
-// which waits on slice work.
+// repo are authored in PR D / PR E respectively. The PR A scaffold +
+// PR B type contract deliberately do NOT declare row shapes; that's
+// schema authoring, which waits on slice work.
+
+// ---------------------------------------------------------------------------
+// Mode 1 chat response wire contract (PR B type-only at this stage).
+//
+// The HTTP handler that returns this view is intentionally NOT mounted
+// at PR B (Codex PR B R1 CRITICAL + R2 CRITICAL closures): a live
+// /v0/ai/chat surface that accepts patient free-text input has to run
+// I-019 crisis detection on every message AND emit the FLOOR-020
+// audit record for every response. Both land in PR D (real provider)
+// + PR E (guardrails) + PR F (crisis detection). Until then the
+// route is unregistered.
+//
+// The type contract is exported now so frontend / mobile clients can
+// integrate against the stable wire shape ahead of the handler. When
+// PRs D/E/F land, the route is registered + this exact shape is what
+// the 200 response carries.
+//
+// Per AI_LAYERING v5.2 §6 (FLOOR-020) audit-envelope fields, the
+// patient-visible response carries source_type + ai_mode +
+// ai_workload_type + autonomy_level + guardrail_template_id +
+// model_version + escalation_triggered + crisis_detected +
+// response_text. The audit envelope ALSO carries input/output
+// summaries that don't surface to the patient.
+// ---------------------------------------------------------------------------
+
+export interface Mode1ChatResponseView {
+  ai_chat_session_id: AIChatSessionId;
+  message_id: string;
+  source_type: 'ai';
+  /** Canonical AI_LAYERING §6 audit-envelope mode discriminator.
+   *  Surfaced in the response so frontends can branch on a single
+   *  field without re-deriving from ai_workload_type. */
+  ai_mode: 'mode_1';
+  ai_workload_type: 'conversational_assistant';
+  autonomy_level: 'advisory';
+  guardrail_template_id: 'conservative_default';
+  model_version: string;
+  escalation_triggered: boolean;
+  crisis_detected: boolean;
+  response_text: string;
+}

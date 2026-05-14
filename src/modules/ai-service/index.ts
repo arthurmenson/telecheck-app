@@ -50,12 +50,19 @@
 // hygiene, not schema. Downstream slices that hold typed references
 // (e.g., an audit emitter that captures AIChatSessionId or
 // AIWorkflowExecutionId) can compile clean against these before the
-// row shapes land in PR B+.
+// row shapes land in PR D+.
 export type {
   AIChatSessionId,
   AIWorkflowExecutionId,
   GuardrailTemplateId,
 } from './internal/types.js';
+
+// Mode 1 chat response wire contract — PR B type-only export. The
+// handler is intentionally NOT mounted until PR F lands crisis
+// detection (FLOOR-009 / I-019). Frontends integrate against this
+// shape now so when PRs D/E/F merge, the 200-response wire shape is
+// already a known contract.
+export type { Mode1ChatResponseView } from './internal/types.js';
 
 export {
   asAIChatSessionId,
