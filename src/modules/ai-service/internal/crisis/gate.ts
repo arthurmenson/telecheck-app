@@ -81,6 +81,15 @@ function errToShape(err: unknown): { name: string; message: string } {
   return { name: 'unknown', message: String(err) };
 }
 
+/** Return a shape-only representation of a tenant_id for log fields
+ *  on the tenant-invalid path. The raw value is potentially
+ *  untrusted (could be empty / non-string / PHI-shaped); shape-only
+ *  reporting closes the log-side PHI-leak window per Codex PR F R16
+ *  HIGH closure 2026-05-13. */
+function tenantIdShape(value: unknown): string {
+  return `type=${typeof value}, length=${typeof value === 'string' ? value.length : 'n/a'}`;
+}
+
 /** Pre-emit shape check for the required text fields the audit
  *  envelope rejects (Codex PR F R13 + R15 HIGH closures 2026-05-13).
  *  Returns audit-emit-safe field values PLUS a wiringError when any
@@ -436,13 +445,20 @@ export async function runCrisisGate(
   // immediately rather than risking a cross-tenant or RLS-violation
   // emit. The patient still gets the crisis sentinel for safety.
   if (sanitizedCtx.tenantInvalid) {
+    // Per Codex PR F R16 HIGH closure 2026-05-13: log payload fields
+    // MUST route through sanitizedCtx so untrusted caller-supplied
+    // values can't leak PHI into the production log stream. The audit
+    // row (when it lands) already uses sanitized values; the log
+    // matches that contract.
     logger.error(
       {
         event: 'crisis_audit_emission_failed',
-        tenant_id: ctx.tenantId,
+        // tenant_id is sanitized to a shape-only token; the raw
+        // (potentially-PHI) value never reaches the log.
+        tenant_id_shape: tenantIdShape(ctx.tenantId),
         resource_type: ctx.resourceType,
-        resource_id: ctx.resourceId,
-        ai_actor_id: ctx.aiActorId,
+        resource_id: sanitizedCtx.fields.resourceId,
+        ai_actor_id: sanitizedCtx.fields.aiActorId,
         detection_source: detectionSource,
         crisis_type: outcome.crisisType,
         audit_error_name: sanitizedCtx.wiringError!.name,
@@ -548,13 +564,16 @@ export async function runCrisisGate(
     // closure 2026-05-13.
     if (wiringError !== undefined) {
       auditError = wiringError;
+      // Per Codex PR F R16 HIGH closure 2026-05-13: log fields route
+      // through sanitizedCtx so PHI in caller-supplied identifiers
+      // cannot leak into the production log stream.
       logger.error(
         {
           event: 'crisis_audit_emitted_on_wiring_fallback',
           tenant_id: ctx.tenantId,
           resource_type: ctx.resourceType,
-          resource_id: ctx.resourceId,
-          ai_actor_id: ctx.aiActorId,
+          resource_id: sanitizedCtx.fields.resourceId,
+          ai_actor_id: sanitizedCtx.fields.aiActorId,
           detection_source: detectionSource,
           crisis_type: outcome.crisisType,
           wiring_error_name: wiringError.name,
@@ -584,13 +603,16 @@ export async function runCrisisGate(
     // returned flag. Includes tenant + resource + source + crisis-
     // type metadata for triage. Crisis text content is NOT logged
     // (same PHI guarantee as the audit detail).
+    // Per Codex PR F R16 HIGH closure 2026-05-13: sanitized log
+    // fields to prevent PHI in caller-supplied identifiers from
+    // leaking into the production log stream.
     logger.error(
       {
         event: 'crisis_audit_emission_failed',
         tenant_id: ctx.tenantId,
         resource_type: ctx.resourceType,
-        resource_id: ctx.resourceId,
-        ai_actor_id: ctx.aiActorId,
+        resource_id: sanitizedCtx.fields.resourceId,
+        ai_actor_id: sanitizedCtx.fields.aiActorId,
         detection_source: detectionSource,
         crisis_type: outcome.crisisType,
         audit_error_name: auditError.name,
