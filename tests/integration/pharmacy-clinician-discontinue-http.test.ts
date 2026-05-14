@@ -39,6 +39,11 @@
  *     E1 already-discontinued row → 409 state conflict
  *     E2 draft row → 409 (not active)
  *
+ *   Group F — Idempotency replay defense
+ *     F1 first request 200; revoke session; replay same key+body → 401
+ *        (proves liveness check runs BEFORE idempotency cache lookup so a
+ *        cached PHI response cannot be served to a revoked session)
+ *
  * Spec references:
  *   - State Machines v1.2 §19 (clinician_discontinue, adverse_event_discontinue)
  *   - CDM v1.3 §4.16 (discontinued_reason enum)
@@ -657,5 +662,90 @@ describe('pharmacy clinician discontinue — Group E: state machine', () => {
     const body = r.json<{ error: { code: string } }>();
     expect(body.error.code).toBe('internal.resource.conflict');
     expectNoTenantLeak(r);
+  });
+});
+
+// ===========================================================================
+// Group F — Idempotency replay defense
+// ===========================================================================
+//
+// Codex R1 (PR F adversarial review) raised the hypothetical: could a
+// replay of the same Idempotency-Key + body return the cached 200 PHI
+// response AFTER the clinician session has been revoked? The handler
+// wires `requireClinicianLiveSession` BEFORE `withIdempotentExecution`
+// (handlers/prescriptions.ts L882 → L948), so the live-session check
+// runs on every request including replays. This group locks that order
+// in as a regression guard: after a successful 200, revoke the session
+// and replay — the second request must 401, not return cached PHI.
+
+describe('pharmacy clinician discontinue — Group F: idempotency replay defense', () => {
+  it('F1 revoke session after 200 → same-key replay returns 401, never cached 200', async () => {
+    const clinician = await insertAccountOfType(US_CTX, 'clinician', '+1');
+    const patient = await insertAccountOfType(US_CTX, 'patient', '+1');
+    const product = await seedProduct(US_CTX);
+    const mrId = await seedMedicationRequest({
+      ctx: US_CTX,
+      patientAccountId: patient,
+      productCatalogId: product,
+      status: 'active',
+    });
+
+    // Inline the mintTokenForRole expansion so we capture the sessionId
+    // (mintTokenForRole hides it). We need it to call revokeSession.
+    const sessionId = await seedSession(T_US, clinician);
+    const token = issueAccessToken(
+      {
+        account_id: clinician,
+        tenant_id: T_US,
+        session_id: sessionId,
+        role: 'clinician',
+        country_of_care: 'US',
+      },
+      config.jwtSigningKey,
+    );
+
+    const idempotencyKey = ulid();
+    const payload = { reason: 'clinical_decision' as const };
+
+    // First request: live session, expect 200.
+    const r1 = await app!.inject({
+      method: 'POST',
+      url: `/v0/pharmacy/prescriptions/${mrId}/clinician-discontinue`,
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': idempotencyKey,
+      },
+      payload,
+    });
+    expect(r1.statusCode).toBe(200);
+
+    // Revoke the session out-of-band (admin_revoked simulates an
+    // emergency revocation while the access token is still in its TTL).
+    await withTenantContext(T_US, () =>
+      sessionRepo.revokeSession(T_US, sessionId, 'admin_revoked'),
+    );
+
+    // Replay same key + same body. JWT is still byte-identical and
+    // unexpired, but the underlying session is no longer live.
+    // requireClinicianLiveSession must reject BEFORE the idempotency
+    // fast-path serves the cached 200 PHI response.
+    const r2 = await app!.inject({
+      method: 'POST',
+      url: `/v0/pharmacy/prescriptions/${mrId}/clinician-discontinue`,
+      headers: {
+        host: 'heroshealth.com',
+        authorization: `Bearer ${token}`,
+        'idempotency-key': idempotencyKey,
+      },
+      payload,
+    });
+    expect(r2.statusCode).toBe(401);
+    expectNoTenantLeak(r2);
+    // Strong assertion: replay body must NOT contain the PHI-bearing
+    // fields a cached 200 would carry (medication_request_id, status,
+    // etc.). The 401 envelope is auth-error-only.
+    expect(r2.body).not.toContain('discontinued');
+    expect(r2.body).not.toContain('medication_request_id');
   });
 });
