@@ -362,7 +362,7 @@ describe('engine writeback — Group B: engine_safety_hold', () => {
         event_type: string;
         payload: Record<string, unknown>;
       }>(
-        `SELECT event_type, payload FROM domain_events
+        `SELECT event_type, payload FROM domain_events_outbox
           WHERE tenant_id = $1
             AND aggregate_id = $2
             AND event_type = 'medication_request.interaction_safety_hold_triggered.v1'`,
