@@ -98,19 +98,27 @@ function sanitizeWiringFields(ctx: CrisisGateContext): {
   ];
   for (const [name, value] of checks) {
     if (typeof value !== 'string' || value.length === 0) {
+      // Per Codex PR F R14 HIGH closure pattern: never echo
+      // potentially-account-linked values into the audit detail.
+      // Report shape metadata only.
       return {
         wiringError: {
           name: 'Error',
-          message: `runCrisisGate: ctx.${name} must be a non-empty string. Got: ${JSON.stringify(value)}`,
+          message:
+            `runCrisisGate: ctx.${name} must be a non-empty string. ` +
+            `Got type=${typeof value}, length=${typeof value === 'string' ? value.length : 'n/a'}.`,
         },
       };
     }
   }
   if (typeof ctx.countryOfCare !== 'string' || !/^[A-Z]{2}$/.test(ctx.countryOfCare)) {
+    const len = typeof ctx.countryOfCare === 'string' ? ctx.countryOfCare.length : -1;
     return {
       wiringError: {
         name: 'Error',
-        message: `runCrisisGate: ctx.countryOfCare must be a 2-char ISO-3166 alpha-2 code. Got: ${JSON.stringify(ctx.countryOfCare)}`,
+        message:
+          `runCrisisGate: ctx.countryOfCare must be a 2-char ISO-3166 alpha-2 code. ` +
+          `Got type=${typeof ctx.countryOfCare}, length=${len}.`,
       },
     };
   }
@@ -336,13 +344,26 @@ export async function runCrisisGate(
     ctx.auditDedupeDiscriminator !== undefined &&
     !AUDIT_DEDUPE_DISCRIMINATOR_RE.test(ctx.auditDedupeDiscriminator)
   ) {
+    // Per Codex PR F R14 HIGH closure 2026-05-13: NEVER echo the
+    // rejected discriminator value into the audit detail OR log
+    // payload. If a future caller mistakenly passes PHI as the
+    // discriminator, this validator catches the misuse — but raw
+    // PHI must not enter the append-only audit chain or the log
+    // stream. Report only the non-sensitive shape metadata (length
+    // + a boolean for whether the value contains characters
+    // outside the allowed set) for triage.
+    const value = ctx.auditDedupeDiscriminator;
+    const len = typeof value === 'string' ? value.length : -1;
+    const hasIllegalChars = typeof value === 'string' && !/^[A-Za-z0-9_.-]*$/.test(value);
     wiringError = {
       name: 'Error',
       message:
         `runCrisisGate: auditDedupeDiscriminator must match ` +
         `${AUDIT_DEDUPE_DISCRIMINATOR_RE.source} (1..64 chars from ` +
-        `[A-Za-z0-9_.-]; no colons, whitespace, or PHI). Got: ` +
-        `${JSON.stringify(ctx.auditDedupeDiscriminator)}`,
+        `[A-Za-z0-9_.-]; no colons, whitespace, or PHI). ` +
+        `Rejected: length=${len}, has_illegal_chars=${hasIllegalChars}. ` +
+        `(Raw value omitted from this message to prevent PHI leak into ` +
+        `the audit chain or log stream.)`,
     };
   }
 

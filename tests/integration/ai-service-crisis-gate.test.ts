@@ -333,6 +333,73 @@ describe('runCrisisGate — required-field shape validation (Codex PR F R13 HIGH
   }
 });
 
+describe('runCrisisGate — PHI-leak protection on validation failures (Codex PR F R14 HIGH closure)', () => {
+  it('rejected auditDedupeDiscriminator value is NOT echoed into audit detail or log', async () => {
+    // Per Codex PR F R14 HIGH closure 2026-05-13: if a caller
+    // accidentally passes PHI as the discriminator (e.g., a raw
+    // note segment), the validator must reject — but the rejected
+    // value MUST NOT enter the append-only audit chain or the
+    // production log stream. The error message reports shape
+    // metadata only (length + has_illegal_chars).
+    const phiLikeDiscriminator = 'patient John Doe SSN 123-45-6789 reports suicidal ideation';
+    const ctx = {
+      ...baseCtx({ resourceId: `aiwfe_${ulid()}` }),
+      aiActorId: 'system:ai_mode_2_case_prep',
+      resourceType: 'ai_workflow_execution' as const,
+      idempotencyCtx: {
+        tenantId: T_US,
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/case-prep',
+        actorId: 'clinician_xyz',
+        bodyHash: 'g'.repeat(64),
+      },
+      auditDedupeDiscriminator: phiLikeDiscriminator,
+    };
+
+    const errSpy = vi.spyOn(logger, 'error');
+    try {
+      const r = await runCrisisGate(
+        ctx,
+        'patient reports persistent suicidal ideation',
+        'ai_case_prep_input',
+      );
+      expect(r.kind).toBe('crisis');
+
+      // The returned audit_error message MUST NOT contain the raw
+      // PHI-like discriminator. It must contain the shape metadata.
+      if (r.kind === 'crisis') {
+        expect(r.audit_error?.message).not.toContain('John Doe');
+        expect(r.audit_error?.message).not.toContain('123-45-6789');
+        expect(r.audit_error?.message).toMatch(/length=\d+/);
+        expect(r.audit_error?.message).toMatch(/has_illegal_chars=true/);
+      }
+
+      // The audit payload's wiring_error MUST NOT contain the raw value.
+      await withTenantContext(T_US, async () => {
+        const client = getTestClient();
+        const rows = await client.query<{ payload: Record<string, unknown> }>(
+          `SELECT payload FROM audit_records
+            WHERE tenant_id = $1 AND resource_id = $2 AND action = 'crisis_detection_trigger'`,
+          [T_US, ctx.resourceId],
+        );
+        if (rows.rows.length > 0) {
+          const payloadStr = JSON.stringify(rows.rows[0]!.payload);
+          expect(payloadStr).not.toContain('John Doe');
+          expect(payloadStr).not.toContain('123-45-6789');
+        }
+      });
+
+      // The log payload MUST NOT contain the raw value either.
+      const allErrorCalls = errSpy.mock.calls;
+      const logStr = JSON.stringify(allErrorCalls);
+      expect(logStr).not.toContain('John Doe');
+      expect(logStr).not.toContain('123-45-6789');
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+});
+
 describe('runCrisisGate — operational signaling (Codex PR F R11 + R12 HIGH closures)', () => {
   it('wiring-error fallback emits crisis_audit_emitted_on_wiring_fallback error log', async () => {
     // Per Codex PR F R12 HIGH closure 2026-05-13: a positive
