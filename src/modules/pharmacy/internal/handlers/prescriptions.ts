@@ -1149,3 +1149,142 @@ export async function approveMedicationRequestHandler(
     throw err;
   }
 }
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions/:id/decline
+//
+// Clinician-only NON-I-012-gated transition per State Machines v1.2 §19:
+//
+//   pending_clinician_review --[clinician_decline]--> rejected (terminal)
+//
+// Body: { reason_code: ..., reason_text?: string, recommended_action?: string }
+//
+// reason_code enum (canonical at v1.0):
+//   'unsafe'                    - patient safety concern
+//   'inappropriate_indication'  - wrong medication for the indication
+//   'insufficient_information'  - need more clinical data before deciding
+//   'other'                     - free-text reason_text recommended
+//
+// Returns:
+//   - 200 + PHI-safe view (status=rejected).
+//   - 400 on missing/invalid reason_code, or unexpected body fields.
+//   - 401 on missing JWT / dead session / mismatched account binding.
+//   - 403 on patient-role JWT.
+//   - 404 on not-found / cross-tenant / malformed id (I-025 collapsed).
+//   - 409 on row not in pending_clinician_review.
+//
+// Idempotency-Key REQUIRED per IDEMPOTENCY v5.1.
+// ---------------------------------------------------------------------------
+
+const VALID_DECLINE_REASON_CODES = new Set<string>([
+  'unsafe',
+  'inappropriate_indication',
+  'insufficient_information',
+  'other',
+]);
+
+interface ClinicianDeclineBody {
+  reason_code?: unknown;
+  reason_text?: unknown;
+  recommended_action?: unknown;
+}
+
+export async function declineMedicationRequestHandler(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireClinicianLiveSession(req);
+
+  const body = (req.body ?? {}) as ClinicianDeclineBody;
+  if (typeof req.body !== 'object' || req.body === null || Array.isArray(req.body)) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Body must be a JSON object with a `reason_code` field.',
+        ),
+      );
+  }
+  if (typeof body.reason_code !== 'string' || !VALID_DECLINE_REASON_CODES.has(body.reason_code)) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'reason_code must be one of: unsafe | inappropriate_indication | insufficient_information | other.',
+        ),
+      );
+  }
+  // Optional fields must be strings if present.
+  if (
+    body.reason_text !== undefined &&
+    body.reason_text !== null &&
+    typeof body.reason_text !== 'string'
+  ) {
+    return reply
+      .code(400)
+      .send(makeErrorEnvelope(req.id, 'internal.request.invalid', 'reason_text must be a string.'));
+  }
+  if (
+    body.recommended_action !== undefined &&
+    body.recommended_action !== null &&
+    typeof body.recommended_action !== 'string'
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'recommended_action must be a string.',
+        ),
+      );
+  }
+  const allowedKeys = new Set(['reason_code', 'reason_text', 'recommended_action']);
+  const extraKeys = Object.keys(body).filter((k) => !allowedKeys.has(k));
+  if (extraKeys.length > 0) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          `Unexpected body field(s): ${extraKeys.join(', ')}.`,
+        ),
+      );
+  }
+
+  let id;
+  try {
+    id = asMedicationRequestId(req.params.id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+    const updated = await medicationRequestService.declineByClinician(
+      ctx,
+      { accountId: actor.accountId },
+      id,
+      {
+        reasonCode: body.reason_code as
+          | 'unsafe'
+          | 'inappropriate_indication'
+          | 'insufficient_information'
+          | 'other',
+        reasonText: (body.reason_text as string | null | undefined) ?? null,
+        recommendedAction: (body.recommended_action as string | null | undefined) ?? null,
+      },
+      tx,
+    );
+    return { status: 200, view: toPatientMedicationRequestView(updated) };
+  });
+}

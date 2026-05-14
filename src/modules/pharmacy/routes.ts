@@ -40,6 +40,7 @@ import {
   approveMedicationRequestHandler,
   clinicianDiscontinueMedicationRequestHandler,
   createDraftHandler,
+  declineMedicationRequestHandler,
   discontinueMedicationRequestHandler,
   getMedicationRequestByIdHandler,
   listMedicationRequestsForPatientHandler,
@@ -56,7 +57,7 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     status: 'ok',
     module: 'pharmacy',
     phase:
-      'schema_ratified_read_and_write_wired_clinician_approve_landed_decline_and_supersede_pending',
+      'schema_ratified_read_and_write_wired_clinician_approve_and_decline_landed_supersede_and_engine_writeback_pending',
     schema_ratified: true,
     schema_ratified_at: '2026-05-11',
     schema_ratified_by: 'P-011',
@@ -69,11 +70,11 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     clinician_write_surface_partial: true,
     clinician_write_surface_partial_at: '2026-05-13',
     clinician_write_surface_partial_by:
-      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve)',
+      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline)',
     i012_first_gated_activation_wired: true,
     i012_first_gated_activation_wired_by: 'TLC-055 PR G (clinician_approve)',
     handlers_wired: false,
-    handlers_wired_tracking: 'TLC-055 PR H (decline + supersede + engine writeback)',
+    handlers_wired_tracking: 'TLC-055 PR I (supersession + engine writeback)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -91,22 +92,23 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
       status: 'not_ready',
       module: 'pharmacy',
       phase:
-        'schema_ratified_read_and_write_wired_clinician_approve_landed_decline_and_supersede_pending',
-      pending: 'TLC-055 PR H (clinician_decline + supersede + engine writeback)',
+        'schema_ratified_read_and_write_wired_clinician_approve_and_decline_landed_supersede_and_engine_writeback_pending',
+      pending: 'TLC-055 PR I (supersession + engine writeback)',
       pending_message:
         'Module is not yet fully ready to serve traffic — read surface (PR C), ' +
         'patient-origin write surface (PR D), clinician createDraft + submit ' +
-        '(PR E), clinician_discontinue + adverse_event_discontinue (PR F), and ' +
-        'the first I-012-gated activation clinician_approve (PR G 2026-05-13) ' +
-        'are all wired. Still pending TLC-055 PR H: clinician_decline ' +
-        '(pending_clinician_review → rejected; not I-012-gated), supersession ' +
-        'write-path (active → superseded paired with new draft → active, uses ' +
-        'migration 026 deferred trigger), and engine writeback (Med Interaction ' +
-        'Engine flips pending_interaction_check → pending_clinician_review). ' +
-        'Mode 2 protocol_authorized_prescribing route is intentionally NOT ' +
-        'exposed at v1.0 — it ships with the protocol engine slice. Per the ' +
-        'async-consult readiness-flip precedent, /ready flips to 200 only when ' +
-        'the slice is fully production-ready (every documented endpoint wired).',
+        '(PR E), clinician_discontinue + adverse_event_discontinue (PR F), the ' +
+        'first I-012-gated activation clinician_approve (PR G), and ' +
+        'clinician_decline (PR H 2026-05-13) are all wired. Still pending ' +
+        'TLC-055 PR I: supersession write-path (active → superseded paired ' +
+        'with new draft → active, uses migration 026 deferred trigger) AND ' +
+        'engine writeback (Med Interaction Engine flips ' +
+        'pending_interaction_check → pending_clinician_review). Mode 2 ' +
+        'protocol_authorized_prescribing route is intentionally NOT exposed ' +
+        'at v1.0 — it ships with the protocol engine slice. Per the ' +
+        'async-consult readiness-flip precedent, /ready flips to 200 only ' +
+        'when the slice is fully production-ready (every documented endpoint ' +
+        'wired).',
     });
   });
 
@@ -158,4 +160,10 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   // protocol_authorized_prescribing route is NOT exposed here; it lands
   // when the protocol engine slice ships.
   app.post('/prescriptions/:id/approve', approveMedicationRequestHandler);
+  // Clinician decline (TLC-055 PR H — 2026-05-13). NOT I-012-gated; a
+  // clinician's deliberate refusal is the opposite of an execution.
+  // Body: { reason_code, reason_text?, recommended_action? }. Drives
+  // pending_clinician_review → rejected (terminal); emits
+  // prescribing.declined Category A audit.
+  app.post('/prescriptions/:id/decline', declineMedicationRequestHandler);
 };

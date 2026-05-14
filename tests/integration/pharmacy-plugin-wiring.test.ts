@@ -83,12 +83,12 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('pharmacy');
-    // Post-PR-G phase label: schema ratified + read + patient-write +
+    // Post-PR-H phase label: schema ratified + read + patient-write +
     // clinician write surface partial (createDraft/submit/discontinue/
-    // approve landed); clinician_decline + supersession + engine
-    // writeback still pending TLC-055 PR H.
+    // approve/decline landed); supersession + engine writeback still
+    // pending TLC-055 PR I.
     expect(body.phase).toBe(
-      'schema_ratified_read_and_write_wired_clinician_approve_landed_decline_and_supersede_pending',
+      'schema_ratified_read_and_write_wired_clinician_approve_and_decline_landed_supersede_and_engine_writeback_pending',
     );
     expect(body.schema_ratified).toBe(true);
     expect(body.schema_ratified_at).toBe('2026-05-11');
@@ -101,17 +101,15 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     expect(body.patient_write_surface_wired_by).toBe('TLC-055 PR D');
     expect(body.clinician_write_surface_partial).toBe(true);
     expect(body.clinician_write_surface_partial_by).toBe(
-      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve)',
+      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline)',
     );
     expect(body.i012_first_gated_activation_wired).toBe(true);
     expect(body.i012_first_gated_activation_wired_by).toBe('TLC-055 PR G (clinician_approve)');
     expect(body.handlers_wired).toBe(false);
-    expect(body.handlers_wired_tracking).toBe(
-      'TLC-055 PR H (decline + supersede + engine writeback)',
-    );
+    expect(body.handlers_wired_tracking).toBe('TLC-055 PR I (supersession + engine writeback)');
   });
 
-  it('§1b GET /v0/pharmacy/ready returns 503 (clinician_decline + supersede + engine writeback still pending TLC-055 PR H)', async () => {
+  it('§1b GET /v0/pharmacy/ready returns 503 (supersession + engine writeback still pending TLC-055 PR I)', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/pharmacy/ready',
@@ -128,18 +126,16 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('pharmacy');
     expect(body.phase).toBe(
-      'schema_ratified_read_and_write_wired_clinician_approve_landed_decline_and_supersede_pending',
+      'schema_ratified_read_and_write_wired_clinician_approve_and_decline_landed_supersede_and_engine_writeback_pending',
     );
-    expect(body.pending).toBe('TLC-055 PR H (clinician_decline + supersede + engine writeback)');
-    // The PR-G message acknowledges the slice now serves reads, patient
-    // discontinue, clinician createDraft/submit/discontinue, AND the
-    // first I-012-gated activation (clinician_approve). Readiness still
-    // 503 per the async-consult precedent — flips to 200 only when the
-    // slice is FULLY ready (clinician_decline + supersession + engine
-    // writeback still pending).
+    expect(body.pending).toBe('TLC-055 PR I (supersession + engine writeback)');
+    // The PR-H message acknowledges the slice now serves reads, patient
+    // discontinue, clinician createDraft/submit/discontinue/approve/
+    // decline. Readiness still 503 per the async-consult precedent —
+    // flips to 200 only when supersession + engine writeback land.
     expect(body.pending_message).toContain('not yet fully ready');
-    expect(body.pending_message).toContain('clinician_approve');
-    expect(body.pending_message).toContain('TLC-055 PR H');
+    expect(body.pending_message).toContain('clinician_decline');
+    expect(body.pending_message).toContain('TLC-055 PR I');
     // The post-P-011 message MUST NOT claim the schema is unresolved —
     // SI-001 closed via P-011 on 2026-05-11; the gap is now decline +
     // supersession.

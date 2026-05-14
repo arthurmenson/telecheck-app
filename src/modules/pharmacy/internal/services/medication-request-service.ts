@@ -53,6 +53,7 @@ import {
   emitMedicationRequestDrafted,
   emitMedicationRequestSubmittedForReview,
   emitPrescribingApproved,
+  emitPrescribingDeclined,
   emitPrescribingExecutionRejected,
 } from '../../audit.js';
 import {
@@ -921,4 +922,94 @@ export async function emitApprovalI012RejectionAudit(
       return { status: 409, body: rejectionEnvelope };
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// declineByClinician — PR H clinician_decline write operation
+//
+// State Machines v1.2 §19:
+//
+//   pending_clinician_review --[clinician_decline]--> rejected (terminal)
+//
+// NOT I-012-gated: a clinician's deliberate refusal is the OPPOSITE of an
+// execution. The audit envelope uses the clinician-only workload+autonomy
+// 'n/a' sentinels (mirrors prescribing.declined emitter — actor_type=
+// 'clinician'; not an I-012 rejection).
+//
+// No domain event at v1.0: `rejected` is terminal with no current
+// downstream subscribers (Subscription / Notification cascade only fires
+// on `medication_request.approved.v1` and `.discontinued.v1`). A
+// future medication_request.declined.v1 can be added when a consumer
+// (e.g., a clinician dashboard surface that tracks decline rates) lands.
+// ---------------------------------------------------------------------------
+
+export interface ClinicianDeclineInput {
+  /** Canonical reason code — narrow enum per slice convention. */
+  reasonCode: 'unsafe' | 'inappropriate_indication' | 'insufficient_information' | 'other';
+  /** Optional free-text rationale (audit detail; not patient-facing). */
+  reasonText: string | null;
+  /** Optional recommended-action hint (e.g., 'request_more_history'). */
+  recommendedAction: string | null;
+}
+
+export async function declineByClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  medicationRequestId: MedicationRequestId,
+  input: ClinicianDeclineInput,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    // Step 1: load (tenant-scoped via RLS + explicit predicate).
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    if (current === null) {
+      throw new MedicationRequestNotFoundError(medicationRequestId);
+    }
+
+    // Step 2: state precondition — only pending_clinician_review rows
+    // are declinable. State Machines v1.2 §19 admits no other source
+    // state for clinician_decline.
+    if (current.status !== 'pending_clinician_review') {
+      throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
+    }
+
+    // Step 3: transition pending_clinician_review → rejected (terminal).
+    // clinician_decline is NOT I-012-gated, so no I012GuardContext +
+    // PendingTransitionContext. validateTransition (inside
+    // transitionStatus) enforces from/event validity only.
+    const updated = await medicationRequestRepo.transitionStatus(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        expected_from_status: 'pending_clinician_review',
+        to_status: 'rejected',
+        event: 'clinician_decline',
+      },
+      tx,
+    );
+    if (updated === null) {
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    // Step 4: audit (I-003 append-only). action_id is the row's id per
+    // §9 convention.
+    await emitPrescribingDeclined(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: current.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        reasonCode: input.reasonCode,
+        reasonText: input.reasonText,
+        recommendedAction: input.recommendedAction,
+        detail: {},
+      },
+      tx,
+    );
+
+    return updated;
+  }, externalTx);
 }
