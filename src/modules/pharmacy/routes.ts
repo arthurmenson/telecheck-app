@@ -37,6 +37,7 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import {
+  clinicianDiscontinueMedicationRequestHandler,
   createDraftHandler,
   discontinueMedicationRequestHandler,
   getMedicationRequestByIdHandler,
@@ -130,4 +131,12 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   // subsequent pharmacy PRs (E.2/F/G).
   app.post('/prescriptions', createDraftHandler);
   app.post('/prescriptions/:id/submit', submitForReviewHandler);
+  // Clinician-side discontinue (TLC-055 PR F — 2026-05-13). Companion
+  // to the patient-side /:id/discontinue from PR D. Body discriminator
+  // `reason` selects clinician_discontinue vs adverse_event_discontinue
+  // state-machine event.
+  app.post(
+    '/prescriptions/:id/clinician-discontinue',
+    clinicianDiscontinueMedicationRequestHandler,
+  );
 };

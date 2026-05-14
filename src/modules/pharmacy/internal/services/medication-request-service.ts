@@ -505,3 +505,117 @@ export async function submitForReviewAsClinician(
     return updated;
   }, externalTx);
 }
+
+// ---------------------------------------------------------------------------
+// discontinueByClinician — PR F write operation
+//
+// Per State Machines v1.2 §19, two non-I-012-gated transitions move an
+// active medication_request → discontinued at clinician request:
+//
+//   - clinician_discontinue       (discontinued_reason='clinical_decision')
+//   - adverse_event_discontinue   (discontinued_reason='adverse_event')
+//
+// The clinician-discontinue surface is the symmetric counterpart to PR D's
+// patient-self-discontinue. Differences:
+//
+//   - Actor: clinician role (not patient). The handler gates on
+//     requireClinicianLiveSession.
+//   - No cross-patient ownership check at v1.0 — a clinician at the
+//     tenant has full Rx-management authority over any active
+//     medication_request in their tenant per RBAC v1.1 §1.2. Future
+//     RBAC narrowing (per-assignment access) ships with the RBAC slice,
+//     not pharmacy.
+//   - Reason is caller-supplied (clinical_decision OR adverse_event),
+//     unlike PR D which forces patient_request server-side.
+//   - Audit actor_type='clinician' (PR D used 'patient').
+//
+// I-012 NOT applicable — neither transition involves AI execution
+// authority. The activation envelope (ai_workload_type, autonomy_level)
+// stays whatever the row carried at activation.
+// ---------------------------------------------------------------------------
+
+export type ClinicianDiscontinueReason = 'clinical_decision' | 'adverse_event';
+
+function reasonToEvent(
+  reason: ClinicianDiscontinueReason,
+): 'clinician_discontinue' | 'adverse_event_discontinue' {
+  return reason === 'adverse_event' ? 'adverse_event_discontinue' : 'clinician_discontinue';
+}
+
+export async function discontinueByClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  medicationRequestId: MedicationRequestId,
+  reason: ClinicianDiscontinueReason,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    // Step 1: load by id (tenant-scoped via RLS + explicit predicate).
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    if (current === null) {
+      throw new MedicationRequestNotFoundError(medicationRequestId);
+    }
+
+    // Step 2: status precondition — only 'active' rows discontinue.
+    if (current.status !== 'active') {
+      throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
+    }
+
+    const discontinuedAt = new Date();
+    const event = reasonToEvent(reason);
+
+    // Step 3: transitionStatus with optimistic-concurrency guard.
+    // validateTransition fires inside the repo BEFORE the UPDATE.
+    const updated = await medicationRequestRepo.transitionStatus(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        expected_from_status: 'active',
+        to_status: 'discontinued',
+        event,
+        discontinued_reason: reason,
+        discontinued_at: discontinuedAt,
+      },
+      tx,
+    );
+    if (updated === null) {
+      // Concurrent writer raced; row's status changed between step 2
+      // and step 3 (e.g., patient self-discontinued first).
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    // Step 4: audit (I-003 append-only). action_id is the row's id per
+    // the state-machine §9 convention.
+    await emitMedicationRequestDiscontinued(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: current.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        actorType: 'clinician',
+        actorId: actor.accountId,
+        discontinuedReason: reason,
+        detail: {},
+      },
+      tx,
+    );
+
+    // Step 5: domain event (DOMAIN_EVENTS v5.2). partition_key is the
+    // tenant-scoped composite tenant_id:aggregate_id.
+    await emitMedicationRequestDiscontinuedDomainEvent(tx, {
+      tenantId: ctx.tenantId,
+      medicationRequestId,
+      occurredAt: discontinuedAt,
+      patientAccountId: current.patient_account_id,
+      discontinuedReason: reason,
+      discontinuedByActor: {
+        actor_type: 'clinician',
+        actor_id: actor.accountId,
+      },
+    });
+
+    return updated;
+  }, externalTx);
+}
