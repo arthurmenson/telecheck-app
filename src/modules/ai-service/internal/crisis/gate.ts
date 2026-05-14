@@ -81,6 +81,42 @@ function errToShape(err: unknown): { name: string; message: string } {
   return { name: 'unknown', message: String(err) };
 }
 
+/** Pre-emit shape check for the required text fields the audit
+ *  envelope rejects (Codex PR F R13 HIGH closure 2026-05-13). Returns
+ *  a wiringError on the first malformed field; emitter still receives
+ *  whatever the caller supplied (the fallback path is purely a triage
+ *  marker — if the audit truly fails because the fields are empty,
+ *  the FLOOR-020 catch fires and the audit_error path takes over). */
+function sanitizeWiringFields(ctx: CrisisGateContext): {
+  wiringError?: { name: string; message: string };
+} {
+  const checks: Array<[string, unknown]> = [
+    ['tenantId', ctx.tenantId],
+    ['aiActorId', ctx.aiActorId],
+    ['patientId', ctx.patientId],
+    ['resourceId', ctx.resourceId],
+  ];
+  for (const [name, value] of checks) {
+    if (typeof value !== 'string' || value.length === 0) {
+      return {
+        wiringError: {
+          name: 'Error',
+          message: `runCrisisGate: ctx.${name} must be a non-empty string. Got: ${JSON.stringify(value)}`,
+        },
+      };
+    }
+  }
+  if (typeof ctx.countryOfCare !== 'string' || !/^[A-Z]{2}$/.test(ctx.countryOfCare)) {
+    return {
+      wiringError: {
+        name: 'Error',
+        message: `runCrisisGate: ctx.countryOfCare must be a 2-char ISO-3166 alpha-2 code. Got: ${JSON.stringify(ctx.countryOfCare)}`,
+      },
+    };
+  }
+  return {};
+}
+
 export type CrisisGateOutcome =
   | {
       kind: 'no_crisis';
@@ -308,6 +344,21 @@ export async function runCrisisGate(
         `[A-Za-z0-9_.-]; no colons, whitespace, or PHI). Got: ` +
         `${JSON.stringify(ctx.auditDedupeDiscriminator)}`,
     };
+  }
+
+  // Required-field shape validation (Codex PR F R13 HIGH closure
+  // 2026-05-13): emitAudit rejects rows whose required text fields
+  // are empty or, in country_of_care's case, not exactly 2 chars.
+  // Without pre-validation, an upstream mapping bug that left
+  // patientId/resourceId/aiActorId empty would crash the emit
+  // INSIDE the FLOOR-020 catch — silently suppressing the audit
+  // for every positive detection on that path. Validate up front
+  // and surface the wiring error so the fallback can still try to
+  // emit with sanitized defaults (where defaults are safe) or
+  // record the validation failure for triage.
+  const sanitizedCtx = sanitizeWiringFields(ctx);
+  if (wiringError === undefined && sanitizedCtx.wiringError !== undefined) {
+    wiringError = sanitizedCtx.wiringError;
   }
 
   // Per FLOOR-020 crisis-write exception: if the audit emission

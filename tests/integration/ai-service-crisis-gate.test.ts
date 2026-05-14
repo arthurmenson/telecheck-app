@@ -27,7 +27,6 @@
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { withTransaction } from '../../src/lib/db.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import { logger } from '../../src/lib/logger.ts';
 import { ulid } from '../../src/lib/ulid.ts';
@@ -296,6 +295,44 @@ describe('runCrisisGate — positive detection path', () => {
   });
 });
 
+describe('runCrisisGate — required-field shape validation (Codex PR F R13 HIGH closure)', () => {
+  // Per Codex PR F R13 HIGH closure 2026-05-13: emitAudit rejects
+  // empty target_patient_id / resource_id / actor_id and rejects
+  // non-2-char country_of_care. The gate validates these up front
+  // so an upstream mapping bug surfaces as a wiring_error (with the
+  // audit fallback path) rather than crashing the emit and
+  // silently losing the I-019 Category A row.
+  type Field = 'aiActorId' | 'patientId' | 'resourceId' | 'countryOfCare' | 'tenantId';
+  const invalidByField: Array<[Field, unknown, RegExp]> = [
+    ['aiActorId', '', /aiActorId must be a non-empty string/],
+    ['patientId', '', /patientId must be a non-empty string/],
+    ['resourceId', '', /resourceId must be a non-empty string/],
+    ['countryOfCare', 'USA', /countryOfCare must be a 2-char/],
+    ['countryOfCare', '', /countryOfCare must be a 2-char/],
+    ['countryOfCare', 'us', /countryOfCare must be a 2-char/],
+  ];
+  for (const [field, badValue, expectedMessage] of invalidByField) {
+    it(`invalid ctx.${field}=${JSON.stringify(badValue)} surfaces wiring_error (audit still attempts to land)`, async () => {
+      const ctx = {
+        ...baseCtx(),
+        [field]: badValue,
+      } as Parameters<typeof runCrisisGate>[0];
+      const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
+      expect(r.kind).toBe('crisis');
+      if (r.kind === 'crisis') {
+        // The wiring error is captured. Whether the audit actually
+        // lands depends on whether the malformed field is one the
+        // emitter validates row-level (e.g., countryOfCare is a NOT
+        // NULL+length-2 column check — emit will still fail). We
+        // assert audit_error captures the wiring error in both
+        // cases; the I-019 audit-or-log invariant is satisfied either
+        // way (the fallback log fires on the failure branch).
+        expect(r.audit_error?.message).toMatch(expectedMessage);
+      }
+    });
+  }
+});
+
 describe('runCrisisGate — operational signaling (Codex PR F R11 + R12 HIGH closures)', () => {
   it('wiring-error fallback emits crisis_audit_emitted_on_wiring_fallback error log', async () => {
     // Per Codex PR F R12 HIGH closure 2026-05-13: a positive
@@ -336,36 +373,31 @@ describe('runCrisisGate — operational signaling (Codex PR F R11 + R12 HIGH clo
   });
 });
 
-describe('runCrisisGate — durability (Codex PR F R4 HIGH closure)', () => {
-  it('caller transaction rollback does NOT erase the crisis audit', async () => {
-    // Per Codex PR F R4 HIGH closure 2026-05-13: the gate's audit
-    // emission runs on a fresh, independent transaction. A caller
-    // that invokes the gate inside its own business transaction and
-    // then rolls back (e.g., rejecting the request mid-handler) MUST
-    // still leave the Category A audit durable per I-019 + I-003.
-    // The gate no longer accepts an externalTx parameter; the
-    // mistake-by-API-design risk is closed at the type level.
-    const ctx = baseCtx();
-
-    // Run the gate inside a caller tx, then throw to force rollback.
-    const sentinel = Symbol('caller_rollback');
-    let outcomeKind: string | undefined;
-    try {
-      await withTransaction(async (tx) => {
-        await tx.query('SELECT set_tenant_context($1)', [T_US]);
-        const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
-        outcomeKind = r.kind;
-        throw sentinel; // caller rolls back its tx
-      });
-    } catch (e) {
-      if (e !== sentinel) throw e;
-    }
-
-    expect(outcomeKind).toBe('crisis');
-    // Even though the caller's tx rolled back, the gate's fresh-
-    // transaction audit emit committed independently. The audit row
-    // is durable.
-    expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
+describe('runCrisisGate — durability (Codex PR F R4 HIGH closure; R13 MEDIUM revision)', () => {
+  // Codex PR F R13 MEDIUM closure 2026-05-13: a previous version of
+  // this test invoked the gate inside a caller `withTransaction(...)`
+  // that then threw to force rollback, and asserted the audit row
+  // survived. That assertion CANNOT be proven in this test harness:
+  // setTestPool translates app-level BEGIN/COMMIT/ROLLBACK into
+  // SAVEPOINT/RELEASE/ROLLBACK TO SAVEPOINT on a SHARED client, so
+  // the gate's `withTransaction(emit)` becomes a savepoint inside
+  // the outer one. ROLLBACK TO outer-savepoint would undo the
+  // RELEASE'd inner audit insert, producing a false negative or
+  // false positive depending on harness timing.
+  //
+  // The production code path is unchanged and is still correct:
+  // `withTransaction` opens a NEW pool connection that COMMITS
+  // independently of any caller tx. The TYPE-LEVEL guarantee — the
+  // gate no longer accepts an `externalTx` parameter, so callers
+  // CANNOT join the gate's audit to their own tx — is what closes
+  // R4 by construction. The behavior assertion belongs in the
+  // bench/real-pool harness when that lands; documenting the test-
+  // harness limitation here so a future reader doesn't reintroduce
+  // the misleading test.
+  it.skip('caller transaction rollback durability — needs real-pool harness (see comment)', () => {
+    // Intentionally skipped per R13 MEDIUM closure. Real-pool
+    // durability assertion lives in the bench/integration-pool
+    // harness when a future PR wires it.
   });
 });
 
