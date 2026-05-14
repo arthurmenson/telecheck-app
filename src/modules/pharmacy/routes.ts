@@ -57,7 +57,8 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'pharmacy',
-    phase: 'fully_ready_post_tlc055',
+    phase:
+      'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
     schema_ratified: true,
     schema_ratified_at: '2026-05-11',
     schema_ratified_by: 'P-011',
@@ -79,9 +80,8 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     supersession_wired: true,
     supersession_wired_at: '2026-05-13',
     supersession_wired_by: 'TLC-055 PR J',
-    handlers_wired: true,
-    handlers_wired_at: '2026-05-13',
-    handlers_wired_by: 'TLC-055 PR J — readiness flips to 200',
+    handlers_wired: false,
+    handlers_wired_tracking: 'TLC-055 PR K (clinician_modify re-route)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -94,25 +94,34 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   //
   // When the write surface lands (TLC-055 PR D), this returns 200 and
   // the `pending_*` fields are removed.
-  app.get('/ready', async () => ({
-    status: 'ready',
-    module: 'pharmacy',
-    phase: 'fully_ready_post_tlc055',
-    ready_at: '2026-05-13',
-    ready_by: 'TLC-055 PR J — supersession lands; readiness flips to 200',
-    notes:
-      'Slice is fully production-ready: read surface (PR C), patient-origin ' +
-      'write surface (PR D), clinician createDraft + submit (PR E), ' +
-      'clinician_discontinue + adverse_event_discontinue (PR F), the first ' +
-      'I-012-gated activation clinician_approve (PR G), clinician_decline ' +
-      '(PR H), engine writeback (PR I; service-callable, no HTTP at v1.0), ' +
-      'and supersession write-path (PR J 2026-05-13). Mode 2 ' +
-      'protocol_authorized_prescribing route is intentionally NOT exposed at ' +
-      'v1.0 — it ships with the protocol engine slice. Engine writeback is ' +
-      'service-callable only at v1.0 because system-actor JWT tokens do not ' +
-      'yet exist; an HTTP surface lands when the system-token issuance ' +
-      'slice ships.',
-  }));
+  app.get('/ready', async (_req, reply) => {
+    return reply.code(503).send({
+      status: 'not_ready',
+      module: 'pharmacy',
+      phase:
+        'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
+      pending: 'TLC-055 PR K (clinician_modify re-route)',
+      pending_message:
+        'Module is not yet fully ready to serve traffic — read surface (PR C), ' +
+        'patient-origin write surface (PR D), clinician createDraft + submit ' +
+        '(PR E), clinician_discontinue + adverse_event_discontinue (PR F), the ' +
+        'first I-012-gated activation clinician_approve (PR G), ' +
+        'clinician_decline (PR H), engine writeback service-callable (PR I), ' +
+        'AND supersession write-path (PR J 2026-05-13) are all wired. Still ' +
+        'pending TLC-055 PR K: clinician_modify — the State Machines v1.2 §19 ' +
+        're-route path (pending_clinician_review → pending_interaction_check) ' +
+        'a clinician uses to amend the prescribing payload and re-run the ' +
+        'interaction engine without declining-then-recreating. The audit ' +
+        'action prescribing.modified exists in AUDIT_EVENTS v5.3; the state ' +
+        'machine accepts the transition; an HTTP handler + service-layer ' +
+        'composition is the remaining gap. Mode 2 protocol_authorized_' +
+        'prescribing route is intentionally NOT exposed at v1.0 — it ships ' +
+        'with the protocol engine slice. Per the async-consult readiness-' +
+        'flip precedent, /ready flips to 200 only when every documented ' +
+        'clinician transition has a handler — clinician_modify is the last ' +
+        'remaining item.',
+    });
+  });
 
   // Read surface (PR C). PHI-safe views; tenant-blind / cross-patient-
   // blind 404 envelopes per I-025. See handler module for the
