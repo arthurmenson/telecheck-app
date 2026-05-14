@@ -138,8 +138,17 @@ export interface GuardrailTemplate {
  * The complete platform floor — every FLOOR rule under §4 of
  * AI_LAYERING v5.2. Used by the deploy-time validator + runtime
  * enforcer to assert every template inherits the full set.
+ *
+ * RUNTIME-FROZEN per Codex PR E R1 HIGH-2 closure 2026-05-14:
+ * TypeScript's `readonly` / `ReadonlyArray` are STRUCTURAL — the
+ * compiler enforces no-mutation but the runtime array is still
+ * mutable through type-assertion escape hatches (e.g.,
+ * `(PLATFORM_FLOOR_RULES as PlatformFloorRule[]).push(...)`).
+ * Object.freeze locks the array at runtime so a malicious or
+ * accidental mutation throws in strict mode + silently fails in
+ * sloppy mode rather than corrupting the safety rollback target.
  */
-export const PLATFORM_FLOOR_RULES: ReadonlyArray<PlatformFloorRule> = [
+export const PLATFORM_FLOOR_RULES: ReadonlyArray<PlatformFloorRule> = Object.freeze([
   'FLOOR_007_no_ai_identity_concealment',
   'FLOOR_008_no_named_clinician_impersonation',
   'FLOOR_009_no_harmful_instructions',
@@ -147,7 +156,7 @@ export const PLATFORM_FLOOR_RULES: ReadonlyArray<PlatformFloorRule> = [
   'FLOOR_011_no_definitive_diagnosis_without_clinician_review',
   'FLOOR_012_no_bypass_of_service_gates',
   'FLOOR_013_no_bypass_of_mandatory_escalation',
-] as const;
+] as const);
 
 // Re-export GuardrailTemplateId + asGuardrailTemplateId from the
 // branded-IDs module for callers that import from this file

@@ -35,7 +35,40 @@ import { asGuardrailTemplateId } from '../types.js';
 
 import { type GuardrailTemplate, PLATFORM_FLOOR_RULES } from './types.js';
 
-export const CONSERVATIVE_DEFAULT_TEMPLATE: GuardrailTemplate = {
+/**
+ * Deep-freeze helper. Object.freeze is shallow — a frozen object's
+ * nested arrays + objects remain mutable. Walk the structure once
+ * at module init and freeze every level so the rollback target is
+ * runtime-immutable per AI-GUARD-003.
+ *
+ * Codex PR E R1 HIGH-1 closure 2026-05-14.
+ */
+function deepFreeze<T>(obj: T): T {
+  if (obj !== null && typeof obj === 'object') {
+    for (const key of Object.getOwnPropertyNames(obj)) {
+      const value = (obj as Record<string, unknown>)[key];
+      if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+        deepFreeze(value);
+      }
+    }
+    Object.freeze(obj);
+  }
+  return obj;
+}
+
+/**
+ * The hardcoded Conservative Default template. Deep-frozen at module
+ * init so:
+ *   - Direct property assignment (`tpl.version = '2.0'`) throws in
+ *     strict mode + silently fails in sloppy mode.
+ *   - Array pushes (`tpl.scope.general_education_topics.push(...)`)
+ *     are blocked at every nesting level.
+ *   - The `platform_floor_inherited` array is a FROZEN COPY of
+ *     PLATFORM_FLOOR_RULES (not the same reference) so mutation of
+ *     PLATFORM_FLOOR_RULES (if it were possible — it's also frozen,
+ *     defense in depth) cannot propagate to Conservative Default.
+ */
+export const CONSERVATIVE_DEFAULT_TEMPLATE: GuardrailTemplate = deepFreeze({
   id: asGuardrailTemplateId('gtpl_conservative_default_v1_0'),
   name: 'conservative_default',
   version: '1.0',
@@ -46,7 +79,9 @@ export const CONSERVATIVE_DEFAULT_TEMPLATE: GuardrailTemplate = {
     'and symptom discussion. No diagnosis (FLOOR-011), no dosing outside ' +
     'authenticated care relationship (FLOOR-010). Crisis detection (FLOOR-009 + ' +
     'I-019) runs independent of template configuration.',
-  platform_floor_inherited: PLATFORM_FLOOR_RULES,
+  // Frozen COPY of PLATFORM_FLOOR_RULES so the two structures are
+  // independent at runtime. PR E R1 HIGH-2 defense-in-depth.
+  platform_floor_inherited: [...PLATFORM_FLOOR_RULES],
   scope: {
     general_education_topics: [
       'general_health_education',
@@ -84,4 +119,4 @@ export const CONSERVATIVE_DEFAULT_TEMPLATE: GuardrailTemplate = {
     escalate_off_protocol_medications: [],
   },
   immutable: true,
-};
+});

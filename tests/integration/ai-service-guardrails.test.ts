@@ -31,6 +31,7 @@ import {
   CONSERVATIVE_DEFAULT_TEMPLATE,
   type GuardrailTemplate,
   PLATFORM_FLOOR_RULES,
+  type PlatformFloorRule,
   getActiveGuardrailTemplate,
   getEmergencyRollbackTemplate,
   getTemplateByName,
@@ -66,6 +67,72 @@ describe('Conservative Default — AI-GUARD-003 immutable contract', () => {
 
   it('has no program-specific topics (Conservative Default is the FLOOR template; programs ADD on top)', () => {
     expect(CONSERVATIVE_DEFAULT_TEMPLATE.scope.program_specific_topics).toEqual([]);
+  });
+
+  // Codex PR E R1 HIGH closures — TypeScript's `readonly` is
+  // structural; the runtime singleton MUST be deep-frozen so a
+  // mutation attempt fails-loud (strict mode) or fails-silent
+  // (sloppy mode) rather than corrupting the safety rollback target.
+  it('AI-GUARD-003: top-level fields are runtime-frozen — direct property assignment fails', () => {
+    expect(Object.isFrozen(CONSERVATIVE_DEFAULT_TEMPLATE)).toBe(true);
+    // In strict mode (vitest/Node default for ESM), assignment to a
+    // frozen property throws TypeError.
+    expect(() => {
+      (CONSERVATIVE_DEFAULT_TEMPLATE as { version: string }).version = '2.0';
+    }).toThrow(TypeError);
+    // Value did NOT change.
+    expect(CONSERVATIVE_DEFAULT_TEMPLATE.version).toBe('1.0');
+  });
+
+  it('AI-GUARD-003: nested scope arrays are runtime-frozen — push fails', () => {
+    expect(Object.isFrozen(CONSERVATIVE_DEFAULT_TEMPLATE.scope)).toBe(true);
+    expect(Object.isFrozen(CONSERVATIVE_DEFAULT_TEMPLATE.scope.general_education_topics)).toBe(
+      true,
+    );
+    expect(() => {
+      (CONSERVATIVE_DEFAULT_TEMPLATE.scope.general_education_topics as string[]).push(
+        'malicious_topic',
+      );
+    }).toThrow(TypeError);
+    expect(CONSERVATIVE_DEFAULT_TEMPLATE.scope.general_education_topics).not.toContain(
+      'malicious_topic',
+    );
+  });
+
+  it('AI-GUARD-003: nested escalation arrays are runtime-frozen — push fails', () => {
+    expect(Object.isFrozen(CONSERVATIVE_DEFAULT_TEMPLATE.escalation)).toBe(true);
+    expect(Object.isFrozen(CONSERVATIVE_DEFAULT_TEMPLATE.escalation.escalate_on_topics)).toBe(true);
+    expect(() => {
+      (CONSERVATIVE_DEFAULT_TEMPLATE.escalation.escalate_on_topics as string[]).push(
+        'malicious_escalation',
+      );
+    }).toThrow(TypeError);
+  });
+
+  it('AI-GUARD-003: platform_floor_inherited is FROZEN AND a separate reference from PLATFORM_FLOOR_RULES (HIGH-2 defense-in-depth)', () => {
+    expect(Object.isFrozen(CONSERVATIVE_DEFAULT_TEMPLATE.platform_floor_inherited)).toBe(true);
+    // The template's array is a COPY of PLATFORM_FLOOR_RULES, not
+    // the same reference. Mutating PLATFORM_FLOOR_RULES (which is
+    // also frozen — but in case it weren't) would not propagate.
+    expect(CONSERVATIVE_DEFAULT_TEMPLATE.platform_floor_inherited).not.toBe(PLATFORM_FLOOR_RULES);
+    // Both still have equivalent content.
+    expect(CONSERVATIVE_DEFAULT_TEMPLATE.platform_floor_inherited).toEqual([
+      ...PLATFORM_FLOOR_RULES,
+    ]);
+  });
+
+  it('AI-GUARD-002 defense-in-depth: PLATFORM_FLOOR_RULES itself is runtime-frozen', () => {
+    expect(Object.isFrozen(PLATFORM_FLOOR_RULES)).toBe(true);
+    expect(() => {
+      (PLATFORM_FLOOR_RULES as PlatformFloorRule[]).push(
+        'FLOOR_999_imaginary' as PlatformFloorRule,
+      );
+    }).toThrow(TypeError);
+    expect(() => {
+      (PLATFORM_FLOOR_RULES as PlatformFloorRule[]).pop();
+    }).toThrow(TypeError);
+    // Length unchanged.
+    expect(PLATFORM_FLOOR_RULES.length).toBe(7);
   });
 });
 
