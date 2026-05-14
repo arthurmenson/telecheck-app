@@ -254,7 +254,7 @@ async function countRejectionAudits(mrId: MedicationRequestId): Promise<number> 
       `SELECT COUNT(*)::text AS n FROM audit_records
         WHERE tenant_id = $1
           AND action = 'prescribing.execution_rejected'
-          AND detail->>'medication_request_id' = $2`,
+          AND payload->>'medication_request_id' = $2`,
       [T_US, mrId],
     );
     return Number.parseInt(res.rows[0]!.n, 10);
