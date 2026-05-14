@@ -373,6 +373,51 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     expect(await countCrisisAudits(ctx.resourceId)).toBe(2); // unchanged
   });
 
+  it('same Idempotency-Key + same detectionSource across DIFFERENT resources emits per-resource audit', async () => {
+    // Per Codex PR F R5 HIGH closure 2026-05-13: a handler that
+    // scans multiple resource aggregates inside a single idempotent
+    // request (e.g., batch case-prep over several consults) MUST
+    // emit one audit per resource. The dedupe identity includes
+    // resourceId in the auditAction discriminator so two distinct
+    // resources can't collide on the same marker.
+    const baseIdempotency = {
+      tenantId: T_US,
+      idempotencyKey: ulid(),
+      endpoint: 'POST /v0/ai/case-prep-batch',
+      actorId: 'clinician_xyz',
+      bodyHash: 'b'.repeat(64),
+    };
+    const ctx1 = {
+      ...baseCtx({ resourceId: `aiwfe_${ulid()}` }),
+      aiActorId: 'system:ai_mode_2_case_prep',
+      resourceType: 'ai_workflow_execution' as const,
+      idempotencyCtx: baseIdempotency,
+    };
+    const r1 = await runCrisisGate(
+      ctx1,
+      'patient reports persistent suicidal ideation',
+      'ai_case_prep_input',
+    );
+    expect(r1.kind).toBe('crisis');
+    expect(await countCrisisAudits(ctx1.resourceId)).toBe(1);
+
+    // Different resource_id, same Idempotency-Key + same source —
+    // MUST emit a fresh audit (not silently dedupe).
+    const ctx2 = {
+      ...baseCtx({ resourceId: `aiwfe_${ulid()}` }),
+      aiActorId: 'system:ai_mode_2_case_prep',
+      resourceType: 'ai_workflow_execution' as const,
+      idempotencyCtx: baseIdempotency,
+    };
+    const r2 = await runCrisisGate(
+      ctx2,
+      'patient reports persistent suicidal ideation',
+      'ai_case_prep_input',
+    );
+    expect(r2.kind).toBe('crisis');
+    expect(await countCrisisAudits(ctx2.resourceId)).toBe(1);
+  });
+
   it('idempotencyCtx.tenantId !== ctx.tenantId throws loud (no cross-tenant marker)', async () => {
     // Per Codex PR F R3 HIGH closure 2026-05-13: a caller wiring bug
     // that supplied an idempotencyCtx scoped to a different tenant

@@ -76,6 +76,12 @@ export type CrisisGateOutcome =
        *  resource response per the FLOOR-020 crisis-write
        *  exception). */
       audit_emitted: boolean;
+      /** Structured failure diagnostics when `audit_emitted === false`.
+       *  Surfaces the underlying error class + message so the caller
+       *  can log + ops-alert with actionable triage data instead of a
+       *  bare boolean. Always undefined when `audit_emitted === true`.
+       *  Per Codex PR F R5 MEDIUM closure 2026-05-13. */
+      audit_error?: { name: string; message: string };
     };
 
 export interface CrisisGateContext {
@@ -235,6 +241,7 @@ export async function runCrisisGate(
   // response. We capture the failure on the returned outcome so
   // the caller can fire an ops alert.
   let auditEmitted = true;
+  let auditError: { name: string; message: string } | undefined;
   try {
     const emit = async (tx: DbTransaction) => {
       await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
@@ -254,11 +261,15 @@ export async function runCrisisGate(
         // silently suppressed by the input-side marker, violating
         // I-019's "emit on every positive detection" contract.
         //
-        // We embed `detectionSource` in the auditAction discriminator
-        // passed to the dedupe helper. The actual audit row's `action`
-        // column still carries the canonical
-        // `crisis_detection_trigger`; only the SHA-256 dedupe-key
-        // material differs. Per Codex PR F R2 HIGH closure 2026-05-13.
+        // We embed `detectionSource` AND the surface aggregate's
+        // `resourceId` in the auditAction discriminator passed to the
+        // dedupe helper. The actual audit row's `action` column still
+        // carries the canonical `crisis_detection_trigger`; only the
+        // SHA-256 dedupe-key material differs. Per Codex PR F R2
+        // HIGH closure 2026-05-13 (detectionSource) + R5 HIGH closure
+        // 2026-05-13 (resourceId — covers handlers that scan multiple
+        // resources in a single idempotent request, e.g., batch
+        // case-prep over several consults).
         const claimed = await claimAuditDedupeSlot(tx, {
           // Use ctx.tenantId (the gate's authoritative tenant) per
           // Codex PR F R3 HIGH closure. The equality guard above
@@ -268,7 +279,7 @@ export async function runCrisisGate(
           endpoint: ctx.idempotencyCtx.endpoint,
           actorId: ctx.idempotencyCtx.actorId,
           bodyHash: ctx.idempotencyCtx.bodyHash,
-          auditAction: `crisis_detection_trigger:${detectionSource}`,
+          auditAction: `crisis_detection_trigger:${detectionSource}:${ctx.resourceId}`,
         });
         if (!claimed) {
           // Prior attempt already emitted this exact audit on this
@@ -299,12 +310,20 @@ export async function runCrisisGate(
     // caller-side rollback cannot erase the Category A audit row.
     // Per Codex PR F R4 HIGH closure 2026-05-13.
     await withTransaction(emit);
-  } catch {
+  } catch (err) {
     // Per FLOOR-020 crisis-write exception, swallow the audit
     // failure and proceed with crisis-resource surfacing. The
     // gate's caller decides whether to ops-alert from the
-    // `audit_emitted: false` signal.
+    // `audit_emitted: false` signal. Per Codex PR F R5 MEDIUM
+    // closure 2026-05-13: capture the underlying error class +
+    // message into `audit_error` so the caller's ops-alert path
+    // gets actionable triage data instead of a bare boolean.
     auditEmitted = false;
+    if (err instanceof Error) {
+      auditError = { name: err.name, message: err.message };
+    } else {
+      auditError = { name: 'unknown', message: String(err) };
+    }
   }
 
   return {
@@ -312,5 +331,6 @@ export async function runCrisisGate(
     crisis_type: outcome.crisisType,
     detection_source: detectionSource,
     audit_emitted: auditEmitted,
+    ...(auditError !== undefined ? { audit_error: auditError } : {}),
   };
 }
