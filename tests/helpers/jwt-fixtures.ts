@@ -21,12 +21,51 @@
  *     from `.env.test` / fallback). Minting directly produces a valid
  *     JWT identical in shape to the login-issued one.
  *
+ * ## Trust-boundary note (Codex PR #133 R1 HIGH discussion 2026-05-14)
+ *
+ * This helper mints tokens with a SYNTHETIC `session_id` (a fresh ULID
+ * by default) WITHOUT seeding a row in the `sessions` table or
+ * confirming the `account_id` exists in the `accounts` table. This is
+ * an intentional parity with the current production
+ * `authContextPlugin` behavior:
+ *
+ *   - **Production verification path** (`src/lib/auth-context.ts`)
+ *     verifies the JWT signature + expiry + tenant_id-claim-vs-
+ *     request-tenant match. It does NOT consult the sessions table on
+ *     every request (by design — the JWT itself is the per-request
+ *     cache; session liveness is enforced by the 15-minute JWT TTL +
+ *     the login-flow's session creation).
+ *   - Therefore a JWT signed with the canonical key + correct tenant
+ *     match + non-expired exp will authenticate in production even if
+ *     the underlying session row has been deleted post-issuance.
+ *   - This helper produces tokens with identical semantic shape to
+ *     production-issued tokens. The synthetic `session_id` is
+ *     indistinguishable from a production-issued one as far as the
+ *     verification hook is concerned.
+ *
+ * **When this matters / when this helper needs to evolve:** if a
+ * future PR adds session-liveness checking (e.g., a denylist of
+ * revoked sessions consulted on every auth hook invocation, or a
+ * direct sessions-table lookup), this helper will need a DB-backed
+ * companion that seeds a `sessions` row before minting. Until then,
+ * tests using this helper exercise the same trust boundary as
+ * production.
+ *
+ * **Canonical end-to-end coverage:** `tests/integration/identity-jwt-
+ * end-to-end.test.ts` exercises the full OTP → login → JWT → forms-
+ * intake-call path. That test is the proof-of-correctness for the
+ * end-to-end auth flow; all other tests are surface-focused and use
+ * this helper for token-shape parity without paying the OTP-flow cost
+ * per case.
+ *
  * Spec references:
  *   - Identity & Authentication Spec v1.0 §3.3 (token claims)
  *   - I-023 (tenant_id is a JWT claim; verified against request tenant ctx)
  *   - I-025 (tenant-blind 401 envelope)
  *   - src/lib/jwt.ts (issueAccessToken — the production issuance path)
  *   - src/lib/auth-context.ts (authContextPlugin — the verification hook)
+ *   - tests/integration/identity-jwt-end-to-end.test.ts (canonical
+ *     end-to-end coverage via real OTP / login flow)
  */
 
 import { config } from '../../src/lib/config.js';
