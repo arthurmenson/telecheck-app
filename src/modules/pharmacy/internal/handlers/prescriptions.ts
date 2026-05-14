@@ -1288,3 +1288,202 @@ export async function declineMedicationRequestHandler(
     return { status: 200, view: toPatientMedicationRequestView(updated) };
   });
 }
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions/:id/supersede
+//
+// Clinician supersession route per State Machines v1.2 §19. Activates THIS
+// row (the new replacement) AND marks the supplied OLD row as superseded
+// in one transaction. I-012 reject-unless three-clause rule applies to the
+// clinician_approve transition on the new row (same as the standalone
+// /approve route).
+//
+// Body: {
+//   supersedes_medication_request_id: <mrx ULID of the active row to replace>,
+//   supersession_reason: <free-text rationale>
+// }
+//
+// Returns:
+//   - 200 + PHI-safe view of the NEW activated row.
+//   - 400 on missing/invalid body fields (incl. anti-self-loop —
+//     :id === supersedes_medication_request_id).
+//   - 401 on missing JWT / dead session.
+//   - 403 on patient-role JWT.
+//   - 404 on either id not found / cross-tenant / malformed / wrong
+//     patient (I-025 collapsed).
+//   - 409 on either row in the wrong state (new not pending_clinician_
+//     review, old not active, concurrent writer raced).
+//   - 500 on I-012 rejection anchor-missing (per PR G's
+//     ApprovalI012RejectionAuditAnchorMissingError; closes the
+//     bare-suppression-forbidden invariant for the rejection path).
+//
+// Idempotency-Key REQUIRED per IDEMPOTENCY v5.1. The I-012 rejection
+// path uses the same handler-level post-rollback emitter pattern as
+// /approve (emitApprovalI012RejectionAudit).
+// ---------------------------------------------------------------------------
+
+interface SupersedeBody {
+  supersedes_medication_request_id?: unknown;
+  supersession_reason?: unknown;
+}
+
+export async function supersedeMedicationRequestHandler(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireClinicianLiveSession(req);
+
+  const body = (req.body ?? {}) as SupersedeBody;
+  if (typeof req.body !== 'object' || req.body === null || Array.isArray(req.body)) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Body must be a JSON object with supersedes_medication_request_id + supersession_reason.',
+        ),
+      );
+  }
+  if (
+    typeof body.supersedes_medication_request_id !== 'string' ||
+    body.supersedes_medication_request_id.length === 0
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'supersedes_medication_request_id is required.',
+        ),
+      );
+  }
+  if (typeof body.supersession_reason !== 'string' || body.supersession_reason.length === 0) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(req.id, 'internal.request.invalid', 'supersession_reason is required.'),
+      );
+  }
+  const allowedKeys = new Set(['supersedes_medication_request_id', 'supersession_reason']);
+  const extraKeys = Object.keys(body).filter((k) => !allowedKeys.has(k));
+  if (extraKeys.length > 0) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          `Unexpected body field(s): ${extraKeys.join(', ')}.`,
+        ),
+      );
+  }
+
+  let newId;
+  try {
+    newId = asMedicationRequestId(req.params.id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  let oldId;
+  try {
+    oldId = asMedicationRequestId(body.supersedes_medication_request_id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      // Malformed old id → tenant-blind 404 (same side-channel closure
+      // as the standalone resource-not-found cases).
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  const idempotencyCtxForRejection = buildIdempotencyCtx(req);
+
+  try {
+    return await withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+      const updated = await medicationRequestService.supersedeByClinician(
+        ctx,
+        { accountId: actor.accountId },
+        newId,
+        oldId,
+        body.supersession_reason as string,
+        tx,
+      );
+      return { status: 200, view: toPatientMedicationRequestView(updated) };
+    });
+  } catch (err) {
+    // I-012 reject-unless violation on the new row's clinician_approve
+    // transition. Same post-rollback rejection-audit pattern as the
+    // standalone /approve handler (Codex PR G R1/R2/R3 closures): emit
+    // prescribing.execution_rejected in a fresh tx with idempotency-
+    // cache write so retries replay the 409; fail-closed 500 on
+    // anchor-missing.
+    if (err instanceof Error && err.name === 'I012RejectError') {
+      const violatedClauses = ((err as Error & { violated_clauses?: readonly string[] })
+        .violated_clauses ?? []) as Parameters<
+        typeof medicationRequestService.emitApprovalI012RejectionAudit
+      >[3];
+      const rejectionEnvelope = makeErrorEnvelope(
+        req.id,
+        'internal.resource.conflict',
+        'Medication request state conflict.',
+      );
+      try {
+        const payload = await medicationRequestService.emitApprovalI012RejectionAudit(
+          ctx,
+          { accountId: actor.accountId },
+          newId,
+          violatedClauses,
+          idempotencyCtxForRejection,
+          rejectionEnvelope,
+        );
+        return reply.code(payload.status).send(payload.body);
+      } catch (auditErr) {
+        if (
+          auditErr instanceof Error &&
+          auditErr.name === 'ApprovalI012RejectionAuditAnchorMissingError'
+        ) {
+          return reply
+            .code(500)
+            .send(
+              makeErrorEnvelope(
+                req.id,
+                'internal.server_error',
+                'An internal error occurred while processing the request.',
+              ),
+            );
+        }
+        if (auditErr instanceof IdempotencyReplayError) {
+          return reply.code(auditErr.cachedStatus).send(auditErr.cachedBody);
+        }
+        if (auditErr instanceof IdempotencyInFlightError) {
+          return reply
+            .code(409)
+            .send(makeErrorEnvelope(req.id, 'internal.idempotency.in_flight', auditErr.hint));
+        }
+        if (auditErr instanceof IdempotencyBodyMismatchError) {
+          return reply
+            .code(409)
+            .send(
+              makeErrorEnvelope(
+                req.id,
+                'internal.idempotency.body_mismatch',
+                'Idempotency key already used with a different request body.',
+              ),
+            );
+        }
+        throw auditErr;
+      }
+    }
+    throw err;
+  }
+}
