@@ -32,6 +32,8 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { chatMode1Handler } from './internal/handlers/chat.js';
+
 export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
@@ -41,14 +43,16 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'ai-service',
-    phase: 'scaffold_pr_a',
+    phase: 'mode_1_chat_stub_pr_b',
     workload_types_at_v1: ['conversational_assistant', 'protocol_execution'],
     workload_types_reserved: ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'],
     autonomy_levels_at_v1: ['advisory', 'suggestion', 'action_with_confirm'],
     autonomy_levels_reserved: ['action_with_audit_only', 'fully_autonomous'],
+    mode_1_chat_stub_wired: true,
+    mode_1_chat_stub_wired_by: 'TLC-AI PR B (stub envelope only; no real LLM call yet)',
     handlers_wired: false,
     handlers_wired_tracking:
-      'PR B (Mode 1 chat stub) + PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
+      'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -66,9 +70,9 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'ai-service',
-      phase: 'scaffold_pr_a',
+      phase: 'mode_1_chat_stub_pr_b',
       pending:
-        'PR B (Mode 1 chat stub) + PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
+        'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
       pending_message:
         'Module is not yet ready to serve traffic — only the scaffold + branded ID types ' +
         '(AIChatSessionId / AIWorkflowExecutionId / GuardrailTemplateId) are wired at PR A. ' +
@@ -86,9 +90,15 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     });
   });
 
-  // Real routes (POST /v0/ai/chat, POST /v0/ai/case-prep, GET
-  // /v0/ai/guardrail-templates/:id, etc.) land in subsequent PRs. The
-  // handler surface is intentionally absent here so that any premature
-  // wiring breaks at typecheck time rather than reaching production
-  // half-built.
+  // Mode 1 conversational assistant — STUB (PR B). Returns a canned
+  // envelope shaped per AI_LAYERING v5.2 §6 (FLOOR-020). No real LLM
+  // call, no per-response audit emission yet — both land in PR D /
+  // PR E + PR F. The route exists so frontends can integrate against
+  // the stable wire shape.
+  app.post('/chat', chatMode1Handler);
+
+  // Mode 2 case-prep (POST /v0/ai/case-prep) lands in PR C. Real
+  // Anthropic provider integration lands in PR D. Guardrail-template
+  // repo + Conservative Default enforcement lands in PR E. Crisis-
+  // detection scaffold (FLOOR-009 / I-019) lands in PR F.
 };
