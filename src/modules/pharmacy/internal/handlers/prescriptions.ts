@@ -1487,3 +1487,235 @@ export async function supersedeMedicationRequestHandler(
     throw err;
   }
 }
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions/:id/modify (TLC-055 PR K)
+//
+// Clinician re-route per State Machines v1.2 §19:
+//   pending_clinician_review --[clinician_modify]--> pending_interaction_check
+//
+// NOT I-012-gated. Clinician amends the prescribing payload and the
+// row re-enters the engine evaluation queue (signals_status atomically
+// reset to 'pending' by the repo's clinician_modify carve-out).
+//
+// Body: { modification_reason (required), dose_instructions?,
+//         quantity?, quantity_unit?, refills_allowed?,
+//         clinical_notes?, indication? }
+//
+// At least ONE field delta is required (a no-op transition wastes
+// engine work and audit-chain weight).
+// ---------------------------------------------------------------------------
+
+interface ClinicianModifyBody {
+  modification_reason?: unknown;
+  dose_instructions?: unknown;
+  quantity?: unknown;
+  quantity_unit?: unknown;
+  refills_allowed?: unknown;
+  clinical_notes?: unknown;
+  indication?: unknown;
+}
+
+const MODIFY_ALLOWED_KEYS = new Set([
+  'modification_reason',
+  'dose_instructions',
+  'quantity',
+  'quantity_unit',
+  'refills_allowed',
+  'clinical_notes',
+  'indication',
+]);
+
+const MODIFY_DELTA_KEYS: ReadonlyArray<keyof ClinicianModifyBody> = [
+  'dose_instructions',
+  'quantity',
+  'quantity_unit',
+  'refills_allowed',
+  'clinical_notes',
+  'indication',
+];
+
+export async function modifyMedicationRequestHandler(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireClinicianLiveSession(req);
+
+  const body = (req.body ?? {}) as ClinicianModifyBody;
+  if (typeof req.body !== 'object' || req.body === null || Array.isArray(req.body)) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Body must be a JSON object with modification_reason and at least one modifiable field.',
+        ),
+      );
+  }
+
+  if (typeof body.modification_reason !== 'string' || body.modification_reason.length === 0) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(req.id, 'internal.request.invalid', 'modification_reason is required.'),
+      );
+  }
+  // Non-empty enforcement: empty string would persist a blank
+  // prescribing instruction back through the engine and could later
+  // activate as a medication request with unusable clinical directions
+  // (Codex PR K R1 HIGH closure 2026-05-13). Matches createDraft (PR E)
+  // which also requires non-empty for these clinically-critical fields.
+  if (
+    body.dose_instructions !== undefined &&
+    (typeof body.dose_instructions !== 'string' || body.dose_instructions.length === 0)
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'dose_instructions must be a non-empty string.',
+        ),
+      );
+  }
+  if (
+    body.quantity !== undefined &&
+    (typeof body.quantity !== 'number' || !Number.isInteger(body.quantity) || body.quantity < 1)
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'quantity must be a positive integer.',
+        ),
+      );
+  }
+  if (
+    body.quantity_unit !== undefined &&
+    (typeof body.quantity_unit !== 'string' || body.quantity_unit.length === 0)
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'quantity_unit must be a non-empty string.',
+        ),
+      );
+  }
+  if (
+    body.refills_allowed !== undefined &&
+    (typeof body.refills_allowed !== 'number' ||
+      !Number.isInteger(body.refills_allowed) ||
+      body.refills_allowed < 0)
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'refills_allowed must be a non-negative integer.',
+        ),
+      );
+  }
+  if (
+    body.clinical_notes !== undefined &&
+    body.clinical_notes !== null &&
+    typeof body.clinical_notes !== 'string'
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'clinical_notes must be a string or null.',
+        ),
+      );
+  }
+  if (
+    body.indication !== undefined &&
+    body.indication !== null &&
+    typeof body.indication !== 'string'
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'indication must be a string or null.',
+        ),
+      );
+  }
+
+  const extraKeys = Object.keys(body).filter((k) => !MODIFY_ALLOWED_KEYS.has(k));
+  if (extraKeys.length > 0) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          `Unexpected body field(s): ${extraKeys.join(', ')}.`,
+        ),
+      );
+  }
+
+  const hasAnyDelta = MODIFY_DELTA_KEYS.some((k) => body[k] !== undefined);
+  if (!hasAnyDelta) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'At least one modifiable field (dose_instructions, quantity, quantity_unit, ' +
+            'refills_allowed, clinical_notes, indication) must be supplied.',
+        ),
+      );
+  }
+
+  let id;
+  try {
+    id = asMedicationRequestId(req.params.id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+    const updated = await medicationRequestService.modifyByClinician(
+      ctx,
+      { accountId: actor.accountId },
+      id,
+      {
+        modificationReason: body.modification_reason as string,
+        ...(body.dose_instructions !== undefined && {
+          doseInstructions: body.dose_instructions as string,
+        }),
+        ...(body.quantity !== undefined && { quantity: body.quantity as number }),
+        ...(body.quantity_unit !== undefined && { quantityUnit: body.quantity_unit as string }),
+        ...(body.refills_allowed !== undefined && {
+          refillsAllowed: body.refills_allowed as number,
+        }),
+        ...(body.clinical_notes !== undefined && {
+          clinicalNotes: body.clinical_notes as string | null,
+        }),
+        ...(body.indication !== undefined && { indication: body.indication as string | null }),
+      },
+      tx,
+    );
+    return { status: 200, view: toPatientMedicationRequestView(updated) };
+  });
+}

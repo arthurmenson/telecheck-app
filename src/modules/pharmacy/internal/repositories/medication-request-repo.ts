@@ -992,3 +992,101 @@ export async function markSuperseded(
     return rowToMedicationRequest(row);
   });
 }
+
+// ---------------------------------------------------------------------------
+// UPDATE — modifyPrescribingPayloadAtPendingClinicianReview (TLC-055 PR K)
+//
+// State Machines v1.2 §19 clinician_modify is a re-route: the clinician
+// amends the prescribing payload (typically dosing fields) and the row
+// transitions back to pending_interaction_check for engine re-evaluation.
+// This function performs the payload UPDATE; the caller (service layer)
+// pairs it with `transitionStatus(event='clinician_modify')` which
+// handles the status flip + atomic interaction_signals_status reset.
+//
+// Modifiable at v1.0:
+//   - dose_instructions, quantity, quantity_unit, refills_allowed
+//   - clinical_notes, indication
+//
+// NOT modifiable (clinical safety + identity):
+//   - medication_name, strength, formulation, product_catalog_id
+//     (changing these means a NEW prescription, not a modify; the
+//     clinician should decline + recreate)
+//   - patient_account_id, prescribing_consult_id (provenance)
+//   - status, prescribed_at, activated_at, supersedes_id,
+//     superseded_by_id, interaction_signals_status, etc. (state-
+//     machine + system fields)
+//
+// Optimistic concurrency: requires status='pending_clinician_review'.
+// Returns null if the row isn't in that state (caller maps to conflict).
+// ---------------------------------------------------------------------------
+
+export interface ModifyPrescribingPayloadInput {
+  id: MedicationRequestId;
+  tenant_id: string;
+  /** New dose instructions; omit to keep current. */
+  dose_instructions?: string;
+  /** New quantity; omit to keep current. */
+  quantity?: number;
+  /** New quantity_unit; omit to keep current. */
+  quantity_unit?: string;
+  /** New refills_allowed; omit to keep current. */
+  refills_allowed?: number;
+  /** New clinical_notes; pass null to clear. Omit to keep current. */
+  clinical_notes?: string | null;
+  /** New indication; pass null to clear. Omit to keep current. */
+  indication?: string | null;
+}
+
+export async function modifyPrescribingPayloadAtPendingClinicianReview(
+  input: ModifyPrescribingPayloadInput,
+  externalTx?: DbClient,
+): Promise<MedicationRequest | null> {
+  const setClauses: string[] = ['updated_at = NOW()'];
+  const params: unknown[] = [];
+  let paramIdx = 1;
+  if (input.dose_instructions !== undefined) {
+    setClauses.push(`dose_instructions = $${paramIdx++}`);
+    params.push(input.dose_instructions);
+  }
+  if (input.quantity !== undefined) {
+    setClauses.push(`quantity = $${paramIdx++}`);
+    params.push(input.quantity);
+  }
+  if (input.quantity_unit !== undefined) {
+    setClauses.push(`quantity_unit = $${paramIdx++}`);
+    params.push(input.quantity_unit);
+  }
+  if (input.refills_allowed !== undefined) {
+    setClauses.push(`refills_allowed = $${paramIdx++}`);
+    params.push(input.refills_allowed);
+  }
+  if (input.clinical_notes !== undefined) {
+    setClauses.push(`clinical_notes = $${paramIdx++}`);
+    params.push(input.clinical_notes);
+  }
+  if (input.indication !== undefined) {
+    setClauses.push(`indication = $${paramIdx++}`);
+    params.push(input.indication);
+  }
+
+  const idParam = paramIdx++;
+  const tenantParam = paramIdx++;
+  params.push(input.id, input.tenant_id);
+
+  const runner = makeRunner<MedicationRequest | null>(input.tenant_id, externalTx);
+  return runner(async (client) => {
+    const result = await client.query<MedicationRequestRow>(
+      `UPDATE medication_requests
+          SET ${setClauses.join(', ')}
+        WHERE id = $${idParam}
+          AND tenant_id = $${tenantParam}
+          AND status = 'pending_clinician_review'
+        RETURNING ${MEDICATION_REQUEST_COLUMNS}`,
+      params,
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    return rowToMedicationRequest(row);
+  });
+}

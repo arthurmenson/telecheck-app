@@ -57,6 +57,7 @@ import {
   emitPrescribingApproved,
   emitPrescribingDeclined,
   emitPrescribingExecutionRejected,
+  emitPrescribingModified,
 } from '../../audit.js';
 import {
   emitMedicationRequestApproved,
@@ -1411,6 +1412,112 @@ export async function supersedeByClinician(
       patientAccountId: newRow.patient_account_id,
       supersessionReason,
     });
+
+    return updated;
+  }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
+// modifyByClinician — PR K clinician_modify re-route
+//
+// State Machines v1.2 §19:
+//
+//   pending_clinician_review --[clinician_modify]--> pending_interaction_check
+//
+// NOT I-012-gated. The clinician amends the prescribing payload (dose,
+// quantity, refills, clinical_notes, indication) and the row re-enters
+// the engine evaluation queue. transitionStatus handles the
+// interaction_signals_status reset to 'pending' atomically with the
+// status flip (per repo clinician_modify carve-out) so the engine
+// writeback (PR I) can re-evaluate without a stale signals blocker.
+// ---------------------------------------------------------------------------
+
+export interface ClinicianModifyInput {
+  modificationReason: string;
+  doseInstructions?: string;
+  quantity?: number;
+  quantityUnit?: string;
+  refillsAllowed?: number;
+  clinicalNotes?: string | null;
+  indication?: string | null;
+}
+
+export async function modifyByClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  medicationRequestId: MedicationRequestId,
+  input: ClinicianModifyInput,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    if (current === null) {
+      throw new MedicationRequestNotFoundError(medicationRequestId);
+    }
+    if (current.status !== 'pending_clinician_review') {
+      throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
+    }
+
+    const modified = await medicationRequestRepo.modifyPrescribingPayloadAtPendingClinicianReview(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        ...(input.doseInstructions !== undefined && {
+          dose_instructions: input.doseInstructions,
+        }),
+        ...(input.quantity !== undefined && { quantity: input.quantity }),
+        ...(input.quantityUnit !== undefined && { quantity_unit: input.quantityUnit }),
+        ...(input.refillsAllowed !== undefined && { refills_allowed: input.refillsAllowed }),
+        ...(input.clinicalNotes !== undefined && { clinical_notes: input.clinicalNotes }),
+        ...(input.indication !== undefined && { indication: input.indication }),
+      },
+      tx,
+    );
+    if (modified === null) {
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    const updated = await medicationRequestRepo.transitionStatus(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        expected_from_status: 'pending_clinician_review',
+        to_status: 'pending_interaction_check',
+        event: 'clinician_modify',
+      },
+      tx,
+    );
+    if (updated === null) {
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    await emitPrescribingModified(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: current.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        modificationReason: input.modificationReason,
+        originalDose: current.dose_instructions,
+        modifiedDose: updated.dose_instructions,
+        detail: {
+          original_quantity: current.quantity,
+          modified_quantity: updated.quantity,
+          original_quantity_unit: current.quantity_unit,
+          modified_quantity_unit: updated.quantity_unit,
+          original_refills_allowed: current.refills_allowed,
+          modified_refills_allowed: updated.refills_allowed,
+          original_clinical_notes: current.clinical_notes,
+          modified_clinical_notes: updated.clinical_notes,
+          original_indication: current.indication,
+          modified_indication: updated.indication,
+        },
+      },
+      tx,
+    );
 
     return updated;
   }, externalTx);
