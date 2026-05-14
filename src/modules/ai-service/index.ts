@@ -87,6 +87,26 @@ export {
 // from a single boundary.
 export type { AIWorkloadType, AutonomyLevel } from './internal/types.js';
 
+// LLM provider abstraction per ADR-020 — PR D ships the interface +
+// NullLLMProvider + registry stub. Real adapters (Anthropic primary,
+// Bedrock + Azure OpenAI for resilience) land when secrets
+// management is resolved. Re-exports from internal/providers so
+// downstream consumers (handlers in PR D+, audit emitters, tests)
+// import from the module boundary, not internals.
+export type {
+  LLMProvider,
+  LLMProviderName,
+  LLMMessage,
+  LLMCompletionRequest,
+  LLMCompletionResult,
+} from './internal/providers/types.js';
+export {
+  LLMProviderUnavailableError,
+  LLMRequestValidationError,
+} from './internal/providers/types.js';
+export { NullLLMProvider } from './internal/providers/null-provider.js';
+export { resolveProvider } from './internal/providers/registry.js';
+
 // Fastify plugin for app.ts wiring. Currently exposes only `/health`
 // (200) + `/ready` (503). Real handlers land in subsequent PRs.
 export { aiServicePlugin } from './plugin.js';

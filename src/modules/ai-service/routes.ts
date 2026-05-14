@@ -41,7 +41,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'ai-service',
-    phase: 'type_contracts_published_pr_c',
+    phase: 'provider_abstraction_published_pr_d',
     workload_types_at_v1: ['conversational_assistant', 'protocol_execution'],
     workload_types_reserved: ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'],
     autonomy_levels_at_v1: ['advisory', 'suggestion', 'action_with_confirm'],
@@ -52,6 +52,9 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     mode_2_case_prep_wire_contract_published: true,
     mode_2_case_prep_wire_contract_published_by:
       'TLC-AI PR C (Mode2CasePrepResponseView exported from module index; HTTP handler deliberately NOT mounted — same I-019 + FLOOR-020 gating as Mode 1, plus dependency on the protocol-engine integration that drives the I-012 reject-unless three-clause rule at the downstream prescribing boundary per State Machines v1.2 §19 §19.X)',
+    provider_abstraction_published: true,
+    provider_abstraction_published_by:
+      'TLC-AI PR D (LLMProvider interface + NullLLMProvider + resolveProvider registry exported; per ADR-020 the v1.0 registry routes every active workload to NullLLMProvider — real Anthropic/Bedrock/Azure adapters land when secrets management is resolved)',
     handlers_wired: false,
     handlers_wired_tracking:
       'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
@@ -72,7 +75,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'ai-service',
-      phase: 'type_contracts_published_pr_c',
+      phase: 'provider_abstraction_published_pr_d',
       pending:
         'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
       pending_message:
