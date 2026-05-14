@@ -26,6 +26,7 @@ import { authContextPlugin } from './lib/auth-context.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
+import { aiServicePlugin } from './modules/ai-service/index.js';
 import { asyncConsultPlugin } from './modules/async-consult/index.js';
 import { consentPlugin } from './modules/consent/plugin.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
@@ -186,6 +187,23 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // Platform-floor hard rule: the interaction engine runs BEFORE clinician
   // commits a prescription (Master PRD v1.10 §7).
   await app.register(medInteractionPlugin);
+
+  // AI Service Slice — routes mounted under /v0/ai.
+  // SCAFFOLD ONLY at PR A: only /health (200) + /ready (503) are
+  // mounted. Subsequent PRs land:
+  //   - PR B: Mode 1 /chat stub (conversational_assistant workload)
+  //   - PR C: Mode 2 /case-prep stub (protocol_execution workload)
+  //   - PR D: real Anthropic provider integration (ADR-020
+  //     multi-provider abstraction; Bedrock + Azure OpenAI resilience)
+  //   - PR E: guardrail-template repo + Conservative Default
+  //     enforcement (AI-GUARD-001..005)
+  //   - PR F: crisis-detection scaffold (FLOOR-009 / I-019; runs
+  //     independent of guardrails per FLOOR-013)
+  // Per AI_LAYERING v5.2 §10 supersession scope statement, v1.0 admits
+  // exactly two active workload types (conversational_assistant +
+  // protocol_execution); reserved types require successor ADR +
+  // activation audit event per ADR-029.
+  await app.register(aiServicePlugin);
 
   // Subscription — routes mounted under /v0/subscription.
   // SKELETON ONLY at v0.1: only /health (200) + /ready (503) are mounted;
