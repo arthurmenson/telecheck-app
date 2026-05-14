@@ -1561,14 +1561,22 @@ export async function modifyMedicationRequestHandler(
         makeErrorEnvelope(req.id, 'internal.request.invalid', 'modification_reason is required.'),
       );
   }
-  if (body.dose_instructions !== undefined && typeof body.dose_instructions !== 'string') {
+  // Non-empty enforcement: empty string would persist a blank
+  // prescribing instruction back through the engine and could later
+  // activate as a medication request with unusable clinical directions
+  // (Codex PR K R1 HIGH closure 2026-05-13). Matches createDraft (PR E)
+  // which also requires non-empty for these clinically-critical fields.
+  if (
+    body.dose_instructions !== undefined &&
+    (typeof body.dose_instructions !== 'string' || body.dose_instructions.length === 0)
+  ) {
     return reply
       .code(400)
       .send(
         makeErrorEnvelope(
           req.id,
           'internal.request.invalid',
-          'dose_instructions must be a string.',
+          'dose_instructions must be a non-empty string.',
         ),
       );
   }
@@ -1586,11 +1594,18 @@ export async function modifyMedicationRequestHandler(
         ),
       );
   }
-  if (body.quantity_unit !== undefined && typeof body.quantity_unit !== 'string') {
+  if (
+    body.quantity_unit !== undefined &&
+    (typeof body.quantity_unit !== 'string' || body.quantity_unit.length === 0)
+  ) {
     return reply
       .code(400)
       .send(
-        makeErrorEnvelope(req.id, 'internal.request.invalid', 'quantity_unit must be a string.'),
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'quantity_unit must be a non-empty string.',
+        ),
       );
   }
   if (
