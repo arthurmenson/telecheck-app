@@ -396,6 +396,8 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
       aiActorId: 'system:ai_mode_2_case_prep',
       resourceType: 'ai_workflow_execution' as const,
       idempotencyCtx: baseIdempotency,
+      // R7: case-prep + idempotency requires discriminator.
+      auditDedupeDiscriminator: 'chief_complaint',
     };
     const r1 = await runCrisisGate(
       ctx1,
@@ -412,6 +414,7 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
       aiActorId: 'system:ai_mode_2_case_prep',
       resourceType: 'ai_workflow_execution' as const,
       idempotencyCtx: baseIdempotency,
+      auditDedupeDiscriminator: 'chief_complaint',
     };
     const r2 = await runCrisisGate(
       ctx2,
@@ -420,6 +423,51 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     );
     expect(r2.kind).toBe('crisis');
     expect(await countCrisisAudits(ctx2.resourceId)).toBe(1);
+  });
+
+  it('case-prep + idempotencyCtx WITHOUT auditDedupeDiscriminator throws (fail-closed)', async () => {
+    // Per Codex PR F R7 HIGH closure 2026-05-13: case-prep sources
+    // scan multiple segments per consult. Without a per-segment
+    // discriminator the dedupe key would silently suppress later
+    // positive scans. Make this fail-closed at the API surface
+    // rather than relying on every caller to remember a doc-only
+    // rule.
+    const ctxCasePrep = {
+      ...baseCtx({ resourceId: `aiwfe_${ulid()}` }),
+      aiActorId: 'system:ai_mode_2_case_prep',
+      resourceType: 'ai_workflow_execution' as const,
+      idempotencyCtx: {
+        tenantId: T_US,
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/case-prep',
+        actorId: 'clinician_xyz',
+        bodyHash: 'd'.repeat(64),
+      },
+      // NO auditDedupeDiscriminator — must throw.
+    };
+    await expect(
+      runCrisisGate(
+        ctxCasePrep,
+        'patient reports persistent suicidal ideation',
+        'ai_case_prep_input',
+      ),
+    ).rejects.toThrow(/auditDedupeDiscriminator is required for case-prep/);
+    expect(await countCrisisAudits(ctxCasePrep.resourceId)).toBe(0);
+
+    // Mode 1 chat WITHOUT discriminator + idempotencyCtx is fine —
+    // chat is single-scan per source per request by design.
+    const ctxChat = {
+      ...baseCtx(),
+      idempotencyCtx: {
+        tenantId: T_US,
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/chat',
+        actorId: 'patient_abc',
+        bodyHash: 'e'.repeat(64),
+      },
+    };
+    const r = await runCrisisGate(ctxChat, "i don't want to live anymore", 'ai_chat_input');
+    expect(r.kind).toBe('crisis');
   });
 
   it('multi-segment scan of the SAME resource emits per-segment via auditDedupeDiscriminator', async () => {

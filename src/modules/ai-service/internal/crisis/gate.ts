@@ -249,6 +249,31 @@ export async function runCrisisGate(
     );
   }
 
+  // Case-prep multi-segment guard: Mode 2 case-prep handlers are
+  // documented to scan multiple segments of the same consult (e.g.,
+  // chief_complaint + history_of_present_illness + review_of_systems)
+  // for the same source. Without a per-segment discriminator the
+  // dedupe key would collapse those segments and silently suppress
+  // the second-and-later positive audits. Make this fail-closed:
+  // when an idempotencyCtx is supplied for a case-prep source, the
+  // caller MUST also supply `auditDedupeDiscriminator`. Mode 1 chat
+  // sources are exempt — they're single-scan per source per request
+  // by design (one user message, one AI response). Per Codex PR F
+  // R7 HIGH closure 2026-05-13.
+  if (
+    ctx.idempotencyCtx !== undefined &&
+    (detectionSource === 'ai_case_prep_input' || detectionSource === 'ai_case_prep_output') &&
+    ctx.auditDedupeDiscriminator === undefined
+  ) {
+    throw new Error(
+      `runCrisisGate: auditDedupeDiscriminator is required for case-prep ` +
+        `(detectionSource=${detectionSource}) when idempotencyCtx is supplied. ` +
+        `Case-prep handlers scan multiple segments per consult; without a per-` +
+        `segment discriminator the dedupe marker would silently suppress later ` +
+        `positive detections. Supply a non-PHI segment id (e.g., a field name).`,
+    );
+  }
+
   // Positive detection — emit the canonical Category A audit.
   // Per FLOOR-020 crisis-write exception: if the audit emission
   // fails, the caller still proceeds with the crisis-resource
