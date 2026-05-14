@@ -3,7 +3,7 @@
 **Raised by:** Engineering (autonomous turn 2026-05-14)
 **Date raised:** 2026-05-14
 **Severity:** high
-**Status:** **OPEN — v0.3 DRAFT** (Codex R2 HIGH ×1 closed: Dispensing↔Shipment §5 fulfillment-state ownership handoff; pre-ratification gate continues)
+**Status:** **OPEN — v0.4 DRAFT** (Codex R3 HIGH ×2 + MEDIUM ×1 closed: Shipment enum completeness, XOR NULL contradiction, EXPIRED enum gap; pre-ratification gate continues)
 **Target spec doc (proposed):** `Telecheck_Canonical_Data_Model_v1_2.md` (headers will govern v1.4; on-disk filename retains the `v1_2.md` legacy pattern per v1.10 cycle convention)
 **Target slice PRD:** `Telecheck_Pharmacy_Refill_Slice_PRD_v2_1.md` (canonical references §4.17 + §4.18 + §4.19 post-promotion)
 **Companion SIs:** SI-001 (MedicationRequest schema gap — CLOSED 2026-05-11 via P-011) — same pattern, expanded scope
@@ -108,7 +108,7 @@ Author CDM v1.4 §4.17 Refill + §4.18 Dispensing + §4.19 Shipment with at mini
 - **Source link:** `medication_request_id` (FK medication_requests, NOT NULL) — the canonical authorization source.
 - **Subscription link:** `subscription_id` (FK subscriptions, nullable) — set when refill was auto-initiated by subscription engine per §9.1.
 - **Initiation:** `initiated_by` enum (`patient`, `subscription_engine`, `ai_mode_1`, `delegate`, `clinician`) — matches Slice PRD §9.1 five initiation paths.
-- **Lifecycle:** `state` enum matching State Machines v1.1 §2 (REQUESTED, VERIFYING, ELIGIBLE, INELIGIBLE, CHECKING, REVIEWED, CLINICIAN_REVIEW, PROTOCOL_EVALUATION, APPROVED, DECLINED, FULFILLING, READY, DELIVERING, PICKUP_AVAILABLE, DELIVERED, PICKED_UP, COMPLETED, DELIVERY_FAILED, EXCEPTION, ESCALATED, SAFETY_HOLD, CANCELLED).
+- **Lifecycle:** `state` enum matching State Machines v1.1 §2 plus the SI-007 v0.4 additions per Codex R3 MEDIUM closure: `REQUESTED, VERIFYING, ELIGIBLE, INELIGIBLE, CHECKING, REVIEWED, CLINICIAN_REVIEW, PROTOCOL_EVALUATION, APPROVED, DECLINED, FULFILLING, READY, DELIVERING, PICKUP_AVAILABLE, DELIVERED, PICKED_UP, COMPLETED, DELIVERY_FAILED, EXCEPTION, ESCALATED, SAFETY_HOLD, CANCELLED, **EXPIRED**`. The `EXPIRED` state captures the case where an APPROVED refill aged past its dispatch SLA (or a PICKUP_AVAILABLE Shipment expired and the parent Refill needs a terminal sink that distinguishes "delivered" from "abandoned"). Transitions to EXPIRED documented in the allowed-transition table below; emits `refill.expired` audit + `refill.cancelled` domain event (or a dedicated `refill.expired` — TBD at pre-ratification).
 - **Decision authorship:** `decided_by_clinician_account_id` (FK accounts, nullable — populated on CLINICIAN_REVIEW path), `protocol_id` + `protocol_version` (nullable — populated on PROTOCOL_EVALUATION path).
 - **Decision pathway:** `decision_pathway` enum (`clinician_reviewed`, `protocol_authorized`, `bridge_supply_consent_revocation`) — discriminator for the audit envelope's I-012 evidence rule (matches MedicationRequest §4.16 `approval_pathway` convention).
 - **Safety integration:** `interaction_signals_evaluated_at`, `interaction_signals_status` (enum: `clean`, `caution`, `safety_hold`). Path 1 integration: no `interaction_override_id` column; integration via `refill.interaction_safety_hold_triggered` domain event per ADR-001 module-boundary separation (mirrors MedicationRequest §4.16 Path 1 ratified at P-011).
@@ -123,7 +123,7 @@ Author CDM v1.4 §4.17 Refill + §4.18 Dispensing + §4.19 Shipment with at mini
 #### §4.18 Dispensing (entity #20)
 
 - **Identity:** `id` (ULID), `tenant_id` (FK tenants).
-- **Source link (AUTHORITATIVE per Codex R1 HIGH closure):** `refill_id` (FK refills, NOT NULL) OR `medication_request_id` (FK medication_requests, NOT NULL) — but exactly one must be set (CHECK XOR constraint; precedent: Pharmacy Fulfillment §5 entity "linked to Refill or Prescription"). The Dispensing row is the **single source of truth** for the Refill ↔ Dispensing relationship; Refill does not carry the reciprocal FK. Indexed `UNIQUE (tenant_id, refill_id) WHERE refill_id IS NOT NULL` (partial unique index) prevents duplicate dispensings per refill; matching `UNIQUE (tenant_id, medication_request_id) WHERE medication_request_id IS NOT NULL` for the direct-prescription path.
+- **Source link (AUTHORITATIVE per Codex R1 HIGH closure):** `refill_id` (FK refills, **nullable**) AND `medication_request_id` (FK medication_requests, **nullable**), with a CHECK constraint enforcing exactly one non-null: `CHECK ((refill_id IS NOT NULL)::int + (medication_request_id IS NOT NULL)::int = 1)`. Per Codex R3 HIGH closure 2026-05-14, both columns must be defined as nullable at the column level because the XOR constraint can only be satisfied if exactly one is NULL — making both NOT NULL at the column level would contradict the XOR rule (v0.2's wording was internally inconsistent on this). Precedent: Pharmacy Fulfillment §5 entity "linked to Refill or Prescription". The Dispensing row is the **single source of truth** for the Refill ↔ Dispensing relationship; Refill does not carry the reciprocal FK. Indexed `UNIQUE (tenant_id, refill_id) WHERE refill_id IS NOT NULL` (partial unique index) prevents duplicate dispensings per refill; matching `UNIQUE (tenant_id, medication_request_id) WHERE medication_request_id IS NOT NULL` for the direct-prescription path.
 - **Idempotency on creation:** Refill FULFILLING → Dispensing creation is one of the **state-changing handlers** that MUST go through the reserve-then-execute idempotency pattern (PROJECT_CONVENTIONS r5 §3.7-§3.9 + `withIdempotency` + `withIdempotentExecution`). A retry under the same Idempotency-Key after a partial failure (Dispensing row committed, Refill state transition not yet applied) recovers idempotently: the second attempt's reserve hits the existing row and returns the prior outcome; the partial unique index above prevents a duplicate Dispensing for the same Refill.
 - **Pharmacy partner:** `pharmacy_adapter_id` (FK adapter_configs, NOT NULL) — which PharmacyProvider (Truepill, MedSupply, etc.) per Slice PRD §6.
 - **Pharmacy actor:** `pharmacist_account_id` (FK accounts, nullable — set on RELEASE_CHECK), `pharmacist_release_check_passed_at` (timestamp).
@@ -138,9 +138,10 @@ Author CDM v1.4 §4.17 Refill + §4.18 Dispensing + §4.19 Shipment with at mini
 
 - **Identity:** `id` (ULID), `tenant_id` (FK tenants).
 - **Source link (AUTHORITATIVE per Codex R1 HIGH closure):** `dispensing_id` (FK dispensings, NOT NULL) — child holds the link; Dispensing does NOT carry a reciprocal `shipment_id` FK. Indexed `UNIQUE (tenant_id, dispensing_id)` enforces one-shipment-per-dispensing. Reserve-then-execute idempotency on Shipment creation (Dispensing RELEASE_CHECK → Shipment) per the same pattern documented for Dispensing creation above.
+- **Carrier link (NULLABLE per Codex R3 HIGH closure):** `carrier_id` (FK adapter_configs, **nullable** — see §4.19 CHECK constraints: required when `delivery_preference = 'delivery'`, must be NULL when `delivery_preference = 'pickup'`).
 - **Carrier:** `carrier_id` (FK adapter_configs — which last-mile carrier per Slice PRD §12.1).
 - **Tracking:** `carrier_tracking_number` (nullable text), `carrier_tracking_url` (nullable text).
-- **Lifecycle:** `state` enum matching State Machines v1.1 §5 fulfillment suffix (DISPATCHED, IN_TRANSIT, DELIVERED, DELIVERY_FAILED, PICKUP_AVAILABLE, PICKED_UP, PICKUP_EXPIRED).
+- **Lifecycle:** `state` enum matching State Machines v1.1 §5 fulfillment suffix plus the SI-007 v0.3 handoff-rule addition per Codex R3 HIGH closure 2026-05-14: `DISPATCHED, IN_TRANSIT, DELIVERED, DELIVERY_FAILED, PICKUP_AVAILABLE, PICKED_UP, PICKUP_EXPIRED, **CANCELLED_BEFORE_DISPATCH**`. The `CANCELLED_BEFORE_DISPATCH` state captures the cancellation-race scenario where a cancellation arrives between Dispensing.RELEASED and Shipment.DISPATCHED (per the handoff rule below); the Shipment row is created in this state directly rather than mutating the Dispensing's append-only RELEASED state. Terminal (business-final) state; emits `shipment.cancelled_before_dispatch` Category A audit + `shipment.cancelled_before_dispatch` domain event (TBD enum naming at pre-ratification).
 - **Delivery preference:** `delivery_preference` enum (`delivery`, `pickup`) — denormalized from parent Refill for cleaner querying.
 - **Delivery confirmation:** `delivered_at` (timestamp), `delivery_proof_type` enum (`signature`, `photo`, `gps_geofence`, `acknowledged_receipt`), `delivery_proof_artifact_id` (nullable FK to attachments).
 - **Failure tracking:** `delivery_failed_reason` enum nullable (`incorrect_address`, `no_one_to_receive`, `damaged`, `lost`, `recipient_refused`).
@@ -150,11 +151,12 @@ Author CDM v1.4 §4.17 Refill + §4.18 Dispensing + §4.19 Shipment with at mini
 #### CHECK constraints (cross-entity invariants)
 
 - `refills.subscription_id IS NOT NULL` ⟹ `refills.medication_request_id` references a `subscription_id` matching this refill's `subscription_id` (via subscription's `medication_request_id` FK). Database-enforced via trigger; precedent = MedicationRequest §4.16 supersession reciprocity trigger from P-011.
-- `dispensings.refill_id IS NULL XOR dispensings.medication_request_id IS NULL` — exactly one source link must be set.
+- `CHECK ((dispensings.refill_id IS NOT NULL)::int + (dispensings.medication_request_id IS NOT NULL)::int = 1)` — exactly one source link must be set. Per Codex R3 HIGH closure 2026-05-14: both columns are individually nullable at the column level (NOT NULL at the column level would contradict the XOR rule).
 - `dispensings` partial UNIQUE: `(tenant_id, refill_id) WHERE refill_id IS NOT NULL` AND `(tenant_id, medication_request_id) WHERE medication_request_id IS NOT NULL` — one dispensing per upstream source.
 - `shipments` UNIQUE: `(tenant_id, dispensing_id)` — one shipment per dispensing.
 - `shipments.delivery_preference = 'pickup'` ⟹ `pickup_location_id IS NOT NULL` AND `carrier_id IS NULL`.
 - `shipments.delivery_preference = 'delivery'` ⟹ `carrier_id IS NOT NULL` AND `pickup_location_id IS NULL`.
+- Per Codex R3 HIGH closure 2026-05-14: both `shipments.carrier_id` and `shipments.pickup_location_id` are nullable at the column level; the two CHECK constraints above enforce mode-specific NOT-NULL per the `delivery_preference` value. NOT NULL at the column level would contradict the mode-specific rule (either column would always have to be NULL in the other mode).
 - `refills.is_bridge_supply = TRUE` ⟹ `refills.bridge_supply_reason IS NOT NULL`.
 - Composite UNIQUE `(tenant_id, id)` on all three tables — tenant-scoping per ADR-023 + PROJECT_CONVENTIONS r5 §1.1.
 
@@ -162,35 +164,37 @@ Author CDM v1.4 §4.17 Refill + §4.18 Dispensing + §4.19 Shipment with at mini
 
 Per Codex R1's recommendation to define an explicit allowed-transition table for terminal states **before** ratification. Mirrors State Machines v1.1 §2 Transition details (line 124-147), with the append-only column added:
 
-| From                             | Event                    | To                                      | Append-only at destination?                                              |
-| -------------------------------- | ------------------------ | --------------------------------------- | ------------------------------------------------------------------------ |
-| REQUESTED                        | verify                   | VERIFYING                               | no                                                                       |
-| VERIFYING                        | checks_pass              | ELIGIBLE                                | no                                                                       |
-| VERIFYING                        | checks_fail              | INELIGIBLE                              | **YES — business-final**                                                 |
-| ELIGIBLE                         | run_engine               | CHECKING                                | no                                                                       |
-| CHECKING                         | signals_produced         | REVIEWED                                | no                                                                       |
-| REVIEWED                         | route_clinician          | CLINICIAN_REVIEW                        | no                                                                       |
-| REVIEWED                         | route_protocol           | PROTOCOL_EVALUATION                     | no                                                                       |
-| CLINICIAN_REVIEW                 | approve                  | APPROVED                                | no                                                                       |
-| CLINICIAN_REVIEW                 | approve_modified         | APPROVED                                | no                                                                       |
-| CLINICIAN_REVIEW                 | decline                  | DECLINED                                | **YES — business-final**                                                 |
-| PROTOCOL_EVALUATION              | all_pass                 | APPROVED                                | no                                                                       |
-| PROTOCOL_EVALUATION              | any_fail                 | CLINICIAN_REVIEW                        | no                                                                       |
-| APPROVED                         | transmit                 | FULFILLING                              | no                                                                       |
-| FULFILLING                       | fulfill_ok               | READY                                   | no                                                                       |
-| FULFILLING                       | exception                | EXCEPTION                               | no                                                                       |
-| EXCEPTION                        | escalate                 | ESCALATED                               | no                                                                       |
-| ESCALATED                        | resolve                  | FULFILLING                              | no                                                                       |
-| READY                            | dispatch                 | DELIVERING                              | no                                                                       |
-| READY                            | pickup_ready             | PICKUP_AVAILABLE                        | no                                                                       |
-| DELIVERING                       | delivered                | DELIVERED                               | no (NOT terminal — must reach COMPLETED via `complete`)                  |
-| DELIVERING                       | delivery_fail            | DELIVERY_FAILED                         | no                                                                       |
-| DELIVERY_FAILED                  | revert_pickup            | PICKUP_AVAILABLE                        | no                                                                       |
-| DELIVERED                        | complete                 | COMPLETED                               | **YES — business-final**                                                 |
-| PICKUP_AVAILABLE                 | picked_up                | COMPLETED                               | **YES — business-final**                                                 |
-| any                              | cancel                   | CANCELLED                               | **YES — business-final** (per consent-revocation + patient-cancel paths) |
-| ELIGIBLE / CHECKING / FULFILLING | safety_hold              | SAFETY_HOLD                             | no (recoverable via ADR-008 bridge supply → APPROVED)                    |
-| SAFETY_HOLD                      | bridge_supply_authorized | APPROVED (with `is_bridge_supply=TRUE`) | no                                                                       |
+| From                             | Event                    | To                                      | Append-only at destination?                                                                             |
+| -------------------------------- | ------------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| REQUESTED                        | verify                   | VERIFYING                               | no                                                                                                      |
+| VERIFYING                        | checks_pass              | ELIGIBLE                                | no                                                                                                      |
+| VERIFYING                        | checks_fail              | INELIGIBLE                              | **YES — business-final**                                                                                |
+| ELIGIBLE                         | run_engine               | CHECKING                                | no                                                                                                      |
+| CHECKING                         | signals_produced         | REVIEWED                                | no                                                                                                      |
+| REVIEWED                         | route_clinician          | CLINICIAN_REVIEW                        | no                                                                                                      |
+| REVIEWED                         | route_protocol           | PROTOCOL_EVALUATION                     | no                                                                                                      |
+| CLINICIAN_REVIEW                 | approve                  | APPROVED                                | no                                                                                                      |
+| CLINICIAN_REVIEW                 | approve_modified         | APPROVED                                | no                                                                                                      |
+| CLINICIAN_REVIEW                 | decline                  | DECLINED                                | **YES — business-final**                                                                                |
+| PROTOCOL_EVALUATION              | all_pass                 | APPROVED                                | no                                                                                                      |
+| PROTOCOL_EVALUATION              | any_fail                 | CLINICIAN_REVIEW                        | no                                                                                                      |
+| APPROVED                         | transmit                 | FULFILLING                              | no                                                                                                      |
+| FULFILLING                       | fulfill_ok               | READY                                   | no                                                                                                      |
+| FULFILLING                       | exception                | EXCEPTION                               | no                                                                                                      |
+| EXCEPTION                        | escalate                 | ESCALATED                               | no                                                                                                      |
+| ESCALATED                        | resolve                  | FULFILLING                              | no                                                                                                      |
+| READY                            | dispatch                 | DELIVERING                              | no                                                                                                      |
+| READY                            | pickup_ready             | PICKUP_AVAILABLE                        | no                                                                                                      |
+| DELIVERING                       | delivered                | DELIVERED                               | no (NOT terminal — must reach COMPLETED via `complete`)                                                 |
+| DELIVERING                       | delivery_fail            | DELIVERY_FAILED                         | no                                                                                                      |
+| DELIVERY_FAILED                  | revert_pickup            | PICKUP_AVAILABLE                        | no                                                                                                      |
+| DELIVERED                        | complete                 | COMPLETED                               | **YES — business-final**                                                                                |
+| PICKUP_AVAILABLE                 | picked_up                | COMPLETED                               | **YES — business-final**                                                                                |
+| any                              | cancel                   | CANCELLED                               | **YES — business-final** (per consent-revocation + patient-cancel paths)                                |
+| ELIGIBLE / CHECKING / FULFILLING | safety_hold              | SAFETY_HOLD                             | no (recoverable via ADR-008 bridge supply → APPROVED)                                                   |
+| SAFETY_HOLD                      | bridge_supply_authorized | APPROVED (with `is_bridge_supply=TRUE`) | no                                                                                                      |
+| APPROVED / FULFILLING / READY    | dispatch_sla_expired     | EXPIRED                                 | **YES — business-final** (per Codex R3 MEDIUM closure 2026-05-14)                                       |
+| PICKUP_AVAILABLE                 | pickup_expires           | EXPIRED                                 | **YES — business-final** (per Codex R3 MEDIUM closure; Shipment.PICKUP_EXPIRED triggers Refill.EXPIRED) |
 
 #### Dispensing ↔ Shipment §5 fulfillment-state ownership (Codex R2 HIGH closure 2026-05-14)
 
@@ -357,4 +361,8 @@ The autonomous-turn discipline preserved from SI-001: **never author canonical s
   2. **Circular FK ambiguity:** v0.1 proposed bidirectional FKs (`refills.dispensing_id` + `dispensings.refill_id`) without specifying authoritative direction, creating partial-failure recovery issues. v0.2 makes the **child-holds-link** direction authoritative (`dispensings.refill_id`, `shipments.dispensing_id`), removes the reciprocal FKs from Refill/Dispensing, adds partial UNIQUE indexes for one-child-per-parent enforcement, and documents reserve-then-execute idempotency on creation.
 - **v0.3 — 2026-05-14** — Codex R2 HIGH ×1 closed:
   - **Dispensing schema dropped canonical §5 states (DISPATCHED → IN_TRANSIT → DELIVERED → COMPLETED).** v0.2's Dispensing enum stopped at RELEASED + exception/held/escalated; the §5 lifecycle continued through DISPATCHED → IN_TRANSIT → DELIVERED → COMPLETED but no entity owned those states. v0.3 adds an explicit **Dispensing ↔ Shipment §5 fulfillment-state ownership** section that: defines an ownership boundary (Dispensing owns QUEUED→RELEASED; Shipment owns DISPATCHED→DELIVERED/PICKED_UP/PICKUP_EXPIRED); enumerates both state enums in full; documents the **handoff rule** at RELEASED (Shipment row creation, idempotency, recovery, append-only-on-RELEASED, cancellation-race handling); consolidates the cross-entity append-only set across all three entities.
-- **Next:** v0.4 after Codex R3 review; iterate to convergence per the SI-001 trajectory pattern (R1 → R10 was SI-001's path).
+- **v0.4 — 2026-05-14** — Codex R3 HIGH ×2 + MEDIUM ×1 closed:
+  1. **HIGH — Shipment enum omitted CANCELLED_BEFORE_DISPATCH** (which the v0.3 handoff rule referenced). v0.4 adds it to the §4.19 Shipment enum with terminal semantics + audit/domain emission planning.
+  2. **HIGH — NOT NULL contradicted XOR.** v0.2 had `dispensings.refill_id NOT NULL OR medication_request_id NOT NULL` with a XOR constraint — both can't be NOT NULL at the column level if one must be NULL. Same contradiction for `shipments.carrier_id` (NOT NULL by column-level reading but required to be NULL in pickup mode). v0.4 makes both nullable at the column level + uses CHECK constraints to enforce the per-mode NOT-NULL rule.
+  3. **MEDIUM — Refill enum missing EXPIRED** while append-only set listed EXPIRED. v0.4 adds EXPIRED to the Refill enum + two transitions (`dispatch_sla_expired` from APPROVED/FULFILLING/READY; `pickup_expires` from PICKUP_AVAILABLE on Shipment.PICKUP_EXPIRED cascade) + business-final + audit/domain emission planning.
+- **Next:** v0.5 after Codex R4 review; iterate to convergence per the SI-001 trajectory pattern (R1 → R10 was SI-001's path).
