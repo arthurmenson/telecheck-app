@@ -44,6 +44,7 @@ import {
   discontinueMedicationRequestHandler,
   getMedicationRequestByIdHandler,
   listMedicationRequestsForPatientHandler,
+  modifyMedicationRequestHandler,
   submitForReviewHandler,
   supersedeMedicationRequestHandler,
 } from './internal/handlers/prescriptions.js';
@@ -57,7 +58,7 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'pharmacy',
-    phase: 'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
+    phase: 'fully_ready_post_tlc055',
     schema_ratified: true,
     schema_ratified_at: '2026-05-11',
     schema_ratified_by: 'P-011',
@@ -67,10 +68,10 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     patient_write_surface_wired: true,
     patient_write_surface_wired_at: '2026-05-13',
     patient_write_surface_wired_by: 'TLC-055 PR D',
-    clinician_write_surface_partial: true,
-    clinician_write_surface_partial_at: '2026-05-13',
-    clinician_write_surface_partial_by:
-      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline) + PR J (supersede)',
+    clinician_write_surface_complete: true,
+    clinician_write_surface_complete_at: '2026-05-13',
+    clinician_write_surface_complete_by:
+      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline) + PR J (supersede) + PR K (modify)',
     i012_first_gated_activation_wired: true,
     i012_first_gated_activation_wired_by: 'TLC-055 PR G (clinician_approve)',
     engine_writeback_wired: true,
@@ -79,8 +80,12 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     supersession_wired: true,
     supersession_wired_at: '2026-05-13',
     supersession_wired_by: 'TLC-055 PR J',
-    handlers_wired: false,
-    handlers_wired_tracking: 'TLC-055 PR K (clinician_modify re-route)',
+    clinician_modify_wired: true,
+    clinician_modify_wired_at: '2026-05-13',
+    clinician_modify_wired_by: 'TLC-055 PR K',
+    handlers_wired: true,
+    handlers_wired_at: '2026-05-13',
+    handlers_wired_by: 'TLC-055 PR K — slice complete; /ready flips to 200',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -93,33 +98,25 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   //
   // When the write surface lands (TLC-055 PR D), this returns 200 and
   // the `pending_*` fields are removed.
-  app.get('/ready', async (_req, reply) => {
-    return reply.code(503).send({
-      status: 'not_ready',
-      module: 'pharmacy',
-      phase: 'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
-      pending: 'TLC-055 PR K (clinician_modify re-route)',
-      pending_message:
-        'Module is not yet fully ready to serve traffic — read surface (PR C), ' +
-        'patient-origin write surface (PR D), clinician createDraft + submit ' +
-        '(PR E), clinician_discontinue + adverse_event_discontinue (PR F), the ' +
-        'first I-012-gated activation clinician_approve (PR G), ' +
-        'clinician_decline (PR H), engine writeback service-callable (PR I), ' +
-        'AND supersession write-path (PR J 2026-05-13) are all wired. Still ' +
-        'pending TLC-055 PR K: clinician_modify — the State Machines v1.2 §19 ' +
-        're-route path (pending_clinician_review → pending_interaction_check) ' +
-        'a clinician uses to amend the prescribing payload and re-run the ' +
-        'interaction engine without declining-then-recreating. The audit ' +
-        'action prescribing.modified exists in AUDIT_EVENTS v5.3; the state ' +
-        'machine accepts the transition; an HTTP handler + service-layer ' +
-        'composition is the remaining gap. Mode 2 protocol_authorized_' +
-        'prescribing route is intentionally NOT exposed at v1.0 — it ships ' +
-        'with the protocol engine slice. Per the async-consult readiness-' +
-        'flip precedent, /ready flips to 200 only when every documented ' +
-        'clinician transition has a handler — clinician_modify is the last ' +
-        'remaining item.',
-    });
-  });
+  app.get('/ready', async () => ({
+    status: 'ready',
+    module: 'pharmacy',
+    phase: 'fully_ready_post_tlc055',
+    ready_at: '2026-05-13',
+    ready_by: 'TLC-055 PR K — clinician_modify lands; slice complete',
+    notes:
+      'Slice is fully production-ready. Every clinician transition from ' +
+      'State Machines v1.2 §19 has an HTTP handler: createDraft + submit ' +
+      '(PR E), clinician_discontinue + adverse_event_discontinue (PR F), ' +
+      'clinician_approve (PR G; first I-012-gated activation), ' +
+      'clinician_decline (PR H), supersede_by_new_prescription via the ' +
+      'paired clinician_approve route (PR J), and clinician_modify (PR K ' +
+      '2026-05-13). Engine writeback (PR I) is service-callable only at ' +
+      'v1.0 — system-actor JWT tokens do not yet exist; an HTTP surface ' +
+      'lands when the system-token issuance slice ships. Mode 2 ' +
+      'protocol_authorized_prescribing route is intentionally NOT exposed ' +
+      'at v1.0 — it ships with the protocol engine slice.',
+  }));
 
   // Read surface (PR C). PHI-safe views; tenant-blind / cross-patient-
   // blind 404 envelopes per I-025. See handler module for the
@@ -181,4 +178,11 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   // transition; migration 026's deferred CONSTRAINT TRIGGER validates
   // reciprocity at commit time.
   app.post('/prescriptions/:id/supersede', supersedeMedicationRequestHandler);
+  // Clinician modify re-route (TLC-055 PR K — 2026-05-13). NOT
+  // I-012-gated; clinician amends prescribing payload and the row
+  // re-enters the engine evaluation queue. transitionStatus's
+  // clinician_modify carve-out atomically resets
+  // interaction_signals_status='pending' so the engine writeback
+  // (PR I) can re-evaluate.
+  app.post('/prescriptions/:id/modify', modifyMedicationRequestHandler);
 };

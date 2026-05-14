@@ -73,9 +73,6 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
       patient_write_surface_wired: boolean;
       patient_write_surface_wired_at: string;
       patient_write_surface_wired_by: string;
-      clinician_write_surface_partial: boolean;
-      clinician_write_surface_partial_at: string;
-      clinician_write_surface_partial_by: string;
       i012_first_gated_activation_wired: boolean;
       i012_first_gated_activation_wired_by: string;
       engine_writeback_wired: boolean;
@@ -84,20 +81,22 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
       supersession_wired: boolean;
       supersession_wired_at: string;
       supersession_wired_by: string;
+      clinician_modify_wired: boolean;
+      clinician_modify_wired_at: string;
+      clinician_modify_wired_by: string;
       handlers_wired_at: string;
       handlers_wired_by: string;
+      clinician_write_surface_complete: boolean;
+      clinician_write_surface_complete_at: string;
+      clinician_write_surface_complete_by: string;
       handlers_wired: boolean;
       handlers_wired_tracking: string;
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('pharmacy');
-    // Post-PR-J: read + patient + clinician (createDraft/submit/
-    // discontinue/approve/decline/supersede) + engine writeback all
-    // wired. /ready stays 503 because clinician_modify is still
-    // unimplemented per Codex PR J R1 HIGH closure.
-    expect(body.phase).toBe(
-      'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
-    );
+    // Post-PR-K: slice is fully production-ready. Every clinician
+    // transition from State Machines v1.2 §19 has an HTTP handler.
+    expect(body.phase).toBe('fully_ready_post_tlc055');
     expect(body.schema_ratified).toBe(true);
     expect(body.schema_ratified_at).toBe('2026-05-11');
     expect(body.schema_ratified_by).toBe('P-011');
@@ -107,9 +106,9 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     expect(body.patient_write_surface_wired).toBe(true);
     expect(body.patient_write_surface_wired_at).toBe('2026-05-13');
     expect(body.patient_write_surface_wired_by).toBe('TLC-055 PR D');
-    expect(body.clinician_write_surface_partial).toBe(true);
-    expect(body.clinician_write_surface_partial_by).toBe(
-      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline) + PR J (supersede)',
+    expect(body.clinician_write_surface_complete).toBe(true);
+    expect(body.clinician_write_surface_complete_by).toBe(
+      'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline) + PR J (supersede) + PR K (modify)',
     );
     expect(body.i012_first_gated_activation_wired).toBe(true);
     expect(body.i012_first_gated_activation_wired_by).toBe('TLC-055 PR G (clinician_approve)');
@@ -120,33 +119,33 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     );
     expect(body.supersession_wired).toBe(true);
     expect(body.supersession_wired_by).toBe('TLC-055 PR J');
-    expect(body.handlers_wired).toBe(false);
-    expect(body.handlers_wired_tracking).toBe('TLC-055 PR K (clinician_modify re-route)');
+    expect(body.clinician_modify_wired).toBe(true);
+    expect(body.clinician_modify_wired_by).toBe('TLC-055 PR K');
+    expect(body.handlers_wired).toBe(true);
+    expect(body.handlers_wired_by).toBe('TLC-055 PR K — slice complete; /ready flips to 200');
   });
 
-  it('§1b GET /v0/pharmacy/ready returns 503 (clinician_modify still pending TLC-055 PR K)', async () => {
+  it('§1b GET /v0/pharmacy/ready returns 200 (slice fully production-ready post-TLC-055 PR K)', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/pharmacy/ready',
       headers: { host: 'localhost' },
     });
-    expect(r.statusCode).toBe(503);
+    expect(r.statusCode).toBe(200);
     const body = r.json<{
       status: string;
       module: string;
       phase: string;
-      pending: string;
-      pending_message: string;
+      ready_at: string;
+      ready_by: string;
+      notes: string;
     }>();
-    expect(body.status).toBe('not_ready');
+    expect(body.status).toBe('ready');
     expect(body.module).toBe('pharmacy');
-    expect(body.phase).toBe(
-      'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
-    );
-    expect(body.pending).toBe('TLC-055 PR K (clinician_modify re-route)');
-    expect(body.pending_message).toContain('not yet fully ready');
-    expect(body.pending_message).toContain('clinician_modify');
-    expect(body.pending_message).toContain('TLC-055 PR K');
-    expect(body.pending_message).not.toContain('schema not yet ratified');
+    expect(body.phase).toBe('fully_ready_post_tlc055');
+    expect(body.ready_by).toContain('TLC-055 PR K');
+    expect(body.notes).toContain('fully production-ready');
+    expect(body.notes).toContain('clinician_modify');
+    expect(body.notes).not.toContain('schema not yet ratified');
   });
 });
