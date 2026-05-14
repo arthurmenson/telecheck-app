@@ -1,0 +1,134 @@
+/**
+ * ai-service/internal/crisis/audit.ts — emit
+ * `crisis_detection_trigger` Category A audit for AI surfaces per
+ * AUDIT_EVENTS v5.3 + AI_LAYERING v5.2 §6.
+ *
+ * The forms-intake module has its own emitter wrapping the same
+ * canonical action ID; AI-service surfaces use this one because the
+ * `actor_type` differs (`ai_workload` here vs `patient` there) and
+ * the `detection_source` enum value differs (`ai_chat_input` /
+ * `ai_chat_output` / `ai_case_prep_input` vs `form_response`).
+ *
+ * Per I-019 + FLOOR-009: this audit MUST emit on EVERY positive
+ * detection. Bare suppression is forbidden per I-003. Per
+ * AI_LAYERING v5.2 §6 the AI response is still delivered if audit
+ * write fails during a crisis response (safety trumps audit
+ * completeness for crisis); the caller catches the audit error,
+ * logs it, fires an ops alert, and proceeds with the crisis-resource
+ * surface. Audit is written when the system recovers.
+ *
+ * Spec references:
+ *   - AI_LAYERING v5.2 §4 FLOOR-009 (crisis detection platform-floor)
+ *   - AI_LAYERING v5.2 §6 (FLOOR-020 audit envelope; crisis-write
+ *     exception)
+ *   - AUDIT_EVENTS v5.3 §Category A `crisis_detection_trigger`
+ *     (actor_type ai_mode_1 / system; detail: patient_id, crisis_type,
+ *     detection_source, response_provided, escalation_destination)
+ *   - I-019 (always-on; cannot be configured away)
+ *   - I-003 (audit append-only; bare suppression forbidden)
+ *   - src/lib/crisis-detection.ts (the canonical keyword-stub
+ *     detector; clinical-grade NLP classifier required before
+ *     patient-facing deployment per file-level open-question)
+ */
+
+import type { AuditDbClient, AuditEnvelope, AuditEnvelopeInput } from '../../../../lib/audit.js';
+import { emitAudit } from '../../../../lib/audit.js';
+import { asTenantId } from '../../../../lib/glossary.js';
+
+/**
+ * The canonical AI-side detection sources. Distinct from the
+ * forms-intake `form_response` source so audit queries can filter
+ * AI-surface detections from form-surface detections.
+ */
+export type AICrisisDetectionSource =
+  /** Patient's INPUT message to Mode 1 chat (scanned before any
+   *  AI processing). */
+  | 'ai_chat_input'
+  /** Mode 1 chat AI OUTPUT (scanned post-generation, before
+   *  surfacing to the patient — defense-in-depth on the AI's own
+   *  response text). */
+  | 'ai_chat_output'
+  /** Mode 2 case-prep input (clinician-supplied patient notes
+   *  scanned for crisis text before AI summarization). */
+  | 'ai_case_prep_input'
+  /** Mode 2 case-prep AI output (scanned before surfacing to the
+   *  reviewing clinician). */
+  | 'ai_case_prep_output';
+
+export async function emitAICrisisDetectionTrigger(
+  args: {
+    tenantId: string;
+    /** The AI workload's system actor id (e.g.,
+     *  'system:ai_mode_1', 'system:ai_mode_2_case_prep'). */
+    actorId: string;
+    countryOfCare: string;
+    targetPatientId: string;
+    detectionSource: AICrisisDetectionSource;
+    /** Crisis-type classification per src/lib/crisis-detection.ts. */
+    crisisType: string;
+    /** The AI surface aggregate the text came from. For Mode 1 the
+     *  ai_chat_session_id; for Mode 2 the consult_id. */
+    resourceType: 'ai_chat_session' | 'ai_workflow_execution';
+    resourceId: string;
+    /** Whether the surface DID surface crisis resources to the
+     *  patient (true on the canonical detection-fires path; false
+     *  only when the surface failed to deliver — recorded for ops
+     *  visibility). */
+    responseProvided: boolean;
+    /** Crisis escalation destination per the tenant's CCR + the
+     *  detected crisis type. Null when the destination cannot be
+     *  resolved (the audit still fires; the caller's error path
+     *  + ops alert handle the resolution miss). */
+    escalationDestination: string | null;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const input: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: asTenantId(args.tenantId),
+    // Per AUDIT_EVENTS v5.3 + v5.2 §2 actor-type addition: new
+    // v1.10+ AI emissions use `ai_workload` (the canonical name);
+    // the legacy `ai_mode_1` alias is preserved for backward-compat
+    // reads only.
+    actor_type: 'ai_workload',
+    actor_id: args.actorId,
+    actor_tenant_id: null,
+    target_patient_id: args.targetPatientId,
+    delegate_context: null,
+    action: 'crisis_detection_trigger',
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: args.resourceType,
+    resource_id: args.resourceId,
+    detail: {
+      detection_source: args.detectionSource,
+      crisis_type: args.crisisType,
+      response_provided: args.responseProvided,
+      escalation_destination: args.escalationDestination,
+      // PHI: the text content itself is NOT captured. The audit
+      // chain records that a detection fired (per I-019) without
+      // duplicating PHI text into a second store.
+    },
+    engine_versions: null,
+    // Crisis detection is platform-floor — runs across every AI
+    // surface regardless of guardrail / mode / autonomy. ai_workload
+    // emissions populate the workload + autonomy envelope per
+    // FLOOR-020.
+    ai_workload_type: 'conversational_assistant',
+    autonomy_level: 'advisory',
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(input, tx);
+}

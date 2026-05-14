@@ -64,7 +64,7 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('guardrail_templates_wired_pr_e');
+    expect(body.phase).toBe('crisis_gate_wired_pr_f');
     // Per AI_LAYERING v5.2 §10.2 + WORKLOAD_TAXONOMY v5.2 §2, the v1.0
     // active workload types are exactly `conversational_assistant` +
     // `protocol_execution`. Reserved types must be enumerated so a
@@ -101,7 +101,7 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     }>();
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('guardrail_templates_wired_pr_e');
+    expect(body.phase).toBe('crisis_gate_wired_pr_f');
     expect(body.pending).toContain('PR C');
     expect(body.pending_message).toContain('not yet ready');
     expect(body.pending_message).toContain('conversational_assistant');

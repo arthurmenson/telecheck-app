@@ -153,6 +153,20 @@ export {
   validatePlatformFloorCompliance,
 } from './internal/guardrails/registry.js';
 
+// Crisis-detection integration per AI_LAYERING v5.2 §4 (FLOOR-009 +
+// FLOOR-013) + I-019 (platform-floor; always-on). PR F ships the
+// `runCrisisGate` helper that every future AI surface (Mode 1
+// chat, Mode 2 case-prep) calls as its FIRST step (before any LLM
+// provider invocation) and again on AI output (defense-in-depth on
+// the AI's own response text). The gate wraps the platform-
+// singleton `crisisDetector` from src/lib/crisis-detection.ts +
+// emits the canonical `crisis_detection_trigger` Category A audit
+// per AUDIT_EVENTS v5.3 on positive detection.
+export type { AICrisisDetectionSource } from './internal/crisis/audit.js';
+export { emitAICrisisDetectionTrigger } from './internal/crisis/audit.js';
+export type { CrisisGateContext, CrisisGateOutcome } from './internal/crisis/gate.js';
+export { runCrisisGate } from './internal/crisis/gate.js';
+
 // Fastify plugin for app.ts wiring. Currently exposes only `/health`
 // (200) + `/ready` (503). Real handlers land in subsequent PRs.
 export { aiServicePlugin } from './plugin.js';
