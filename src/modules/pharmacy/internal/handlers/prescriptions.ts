@@ -1032,24 +1032,6 @@ export async function approveMedicationRequestHandler(
     throw err;
   }
 
-  // Capture the row's patient_account_id BEFORE the writing tx so the
-  // I-012 rejection audit (if it fires) can populate its envelope after
-  // the outer tx has rolled back. The audit-emission cannot rely on a
-  // post-rollback re-fetch of the row because the row was never
-  // mutated; we just need a value that was true at request-arrival
-  // time. The lookup itself runs outside any externalTx so it doesn't
-  // hold the hash-chain advisory lock.
-  let rowPatientAccountId: string | null = null;
-  try {
-    rowPatientAccountId = await medicationRequestService.lookupPatientAccountIdForApprove(ctx, id);
-  } catch {
-    // The lookup is best-effort for the rejection-audit envelope; if it
-    // fails (e.g., row vanished mid-request), we fall back to a sentinel
-    // in the emitter. The main approval path below performs its own
-    // lookup inside the writing tx and will surface the canonical
-    // not-found / state-conflict response.
-  }
-
   try {
     return await withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
       const updated = await medicationRequestService.approveAsClinician(
@@ -1063,28 +1045,46 @@ export async function approveMedicationRequestHandler(
   } catch (err) {
     // I-012 reject-unless violation. The writing tx (inside
     // withIdempotentExecution) has rolled back; the audit hash-chain
-    // advisory lock is released. Emit prescribing.execution_rejected in
-    // a fresh tx per AUDIT_EVENTS v5.3 §I-012 reject-unless
+    // advisory lock is released. Emit prescribing.execution_rejected
+    // in a fresh tx per AUDIT_EVENTS v5.3 §I-012 reject-unless
     // rejection-audit-event rule; bare suppression forbidden per I-003.
+    //
+    // The helper resolves the row's patient_account_id INTERNALLY (in
+    // the same fresh tx as the emission) so there is no caller-supplied
+    // path that could skip the audit. If the post-rollback lookup
+    // returns null the helper throws
+    // ApprovalI012RejectionAuditAnchorMissingError — fail closed by
+    // surfacing 500 rather than the canonical 409, so ops sees the
+    // anomaly. The 500 envelope is generic and does not leak guard
+    // internals (Codex PR G R2 HIGH closure 2026-05-13).
     if (err instanceof Error && err.name === 'I012RejectError') {
       const violatedClauses = ((err as Error & { violated_clauses?: readonly string[] })
         .violated_clauses ?? []) as Parameters<
         typeof medicationRequestService.emitApprovalI012RejectionAudit
-      >[4];
-      // Skip the rejection emission only when we couldn't determine the
-      // patient_account_id. This is a degenerate case (row vanished
-      // between body-validation and approve attempt) where the row
-      // doesn't exist anyway; the I-012 rejection cannot reference a
-      // patient that doesn't exist. The fall-through 409 is still
-      // returned so the client gets a deterministic response.
-      if (rowPatientAccountId !== null) {
+      >[3];
+      try {
         await medicationRequestService.emitApprovalI012RejectionAudit(
           ctx,
           { accountId: actor.accountId },
           id,
-          rowPatientAccountId,
           violatedClauses,
         );
+      } catch (auditErr) {
+        if (
+          auditErr instanceof Error &&
+          auditErr.name === 'ApprovalI012RejectionAuditAnchorMissingError'
+        ) {
+          return reply
+            .code(500)
+            .send(
+              makeErrorEnvelope(
+                req.id,
+                'internal.server_error',
+                'An internal error occurred while processing the request.',
+              ),
+            );
+        }
+        throw auditErr;
       }
       return reply
         .code(409)

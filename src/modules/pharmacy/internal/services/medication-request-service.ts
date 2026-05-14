@@ -808,23 +808,29 @@ export async function approveAsClinician(
 }
 
 /**
- * Best-effort lookup of the row's `patient_account_id` for the approve
- * handler's I-012 rejection-audit envelope. Runs OUTSIDE any externalTx
- * (opens its own short read-only tx) so it does not hold the audit
- * hash-chain advisory lock — that's the lock the rejection-audit
- * emission needs to acquire after the writing tx rolls back. Returns
- * null when the row doesn't exist; the handler falls through to its
- * canonical not-found / state-conflict response.
+ * Operational error: an `I012RejectError` reached the handler but the
+ * post-rollback row lookup that anchors the rejection audit returned
+ * null. Per Codex PR G R2 HIGH closure 2026-05-13 this MUST surface as
+ * an operational failure rather than silently emit a bare 409 without
+ * the canonical I-012 rejection audit (I-003 bare-suppression
+ * forbidden + I-012 rejection-audit-event rule).
+ *
+ * Realistic failure mode: an out-of-band tenant-context mismatch
+ * between request arrival and post-rollback lookup, OR a row deletion
+ * that should not happen at v1.0 (medication_requests has no DELETE
+ * path). The handler logs and returns 500 so ops surface the anomaly.
  */
-export async function lookupPatientAccountIdForApprove(
-  ctx: TenantContext,
-  medicationRequestId: MedicationRequestId,
-): Promise<string | null> {
-  return withTransaction(async (tx) => {
-    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
-    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
-    return current === null ? null : current.patient_account_id;
-  });
+export class ApprovalI012RejectionAuditAnchorMissingError extends Error {
+  constructor(public readonly medicationRequestId: MedicationRequestId) {
+    super(
+      `Cannot anchor I-012 rejection audit for ${medicationRequestId}: ` +
+        'post-rollback patient lookup returned null. The row vanished ' +
+        'between writing-tx rollback and rejection-audit emission, OR ' +
+        'the tenant context drifted. Audit-chain integrity requires ' +
+        'fail-closed semantics on this path.',
+    );
+    this.name = 'ApprovalI012RejectionAuditAnchorMissingError';
+  }
 }
 
 /**
@@ -832,30 +838,41 @@ export async function lookupPatientAccountIdForApprove(
  * that failed the I-012 reject-unless three-clause rule. MUST be called
  * by the HTTP handler AFTER `withIdempotentExecution` has returned (the
  * outer writing tx has rolled back; the audit-chain advisory lock has
- * been released). Opens its own fresh transaction. Per I-003, bare
- * suppression of the rejection emission is forbidden — the handler MUST
- * call this whenever it observes an `I012RejectError` from
- * `approveAsClinician`.
+ * been released).
  *
- * `patientAccountId` is the row's `patient_account_id` resolved by the
- * handler before the writing-tx call (or from a fresh repo lookup if
- * the handler didn't capture it). The audit envelope's
- * ai_workload_type / autonomy_level populate as 'n/a' per the
- * clinician-only route's canonical sentinels.
+ * Resolves the row's `patient_account_id` INTERNALLY in the same fresh
+ * tx as the rejection emission so there is no caller-supplied
+ * patient-id path the handler could accidentally skip (Codex PR G R2
+ * HIGH closure 2026-05-13: the prior caller-supplied design allowed a
+ * pre-lookup-null branch to silently bypass the emission, violating
+ * I-003 bare-suppression-forbidden + I-012 rejection-audit-event rule).
+ * If the post-rollback lookup returns null, throws
+ * `ApprovalI012RejectionAuditAnchorMissingError` — the handler MUST
+ * surface this as 500 rather than the canonical 409 so ops sees the
+ * anomaly.
+ *
+ * Workload/autonomy envelope: 'n/a'/'n/a' per the clinician-only route.
  */
 export async function emitApprovalI012RejectionAudit(
   ctx: TenantContext,
   actor: { accountId: string },
   medicationRequestId: MedicationRequestId,
-  patientAccountId: string,
   violatedClauses: I012RejectError['violated_clauses'],
 ): Promise<void> {
   await withTransaction(async (rejTx) => {
     await rejTx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+    const current = await medicationRequestRepo.findById(
+      ctx.tenantId,
+      medicationRequestId,
+      rejTx,
+    );
+    if (current === null) {
+      throw new ApprovalI012RejectionAuditAnchorMissingError(medicationRequestId);
+    }
     await emitPrescribingExecutionRejected(
       {
         tenantId: ctx.tenantId,
-        patientAccountId,
+        patientAccountId: current.patient_account_id,
         medicationRequestId,
         countryOfCare: ctx.countryOfCare,
         attemptedActorType: 'clinician',
