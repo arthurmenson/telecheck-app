@@ -60,6 +60,28 @@ export type LLMProviderName =
   | 'null'; // SENTINEL — used for tests + the unconfigured-default
 
 /**
+ * Active LLM workload types — the narrowed subset of `AIWorkloadType`
+ * that the LLM provider boundary admits as request inputs. Codex
+ * PR D R1 HIGH closure 2026-05-14: typing
+ * `LLMCompletionRequest.workload_type` as the full `AIWorkloadType`
+ * union let reserved values (`autonomous_agent`,
+ * `multi_agent_supervisor`, `tool_using_agent`) and sentinel values
+ * (`rejected_invalid_attempt`, `n/a`, `null`) flow into provider
+ * adapters at compile time. Narrowing to the v1.0 active subset
+ * means a caller that constructs a request with a reserved /
+ * sentinel value fails-compile, not fails-runtime.
+ *
+ * Per ADR-029 §6, reserved workload activation requires successor
+ * ADR + activation audit event (two-condition AND). When a future
+ * ADR activates a reserved type, that type joins this union via a
+ * source-edit + new audit emission — fail-loud and reviewable.
+ */
+export type ActiveLLMWorkloadType = Extract<
+  AIWorkloadType,
+  'conversational_assistant' | 'protocol_execution'
+>;
+
+/**
  * A single message in an LLM conversation. Aligns with the Anthropic
  * messages API shape; other providers map to/from this in their
  * adapter.
@@ -72,9 +94,12 @@ export interface LLMMessage {
 export interface LLMCompletionRequest {
   /**
    * The workload context — the registry resolves provider selection
-   * from this + per-route configuration.
+   * from this + per-route configuration. Narrowed to v1.0 active
+   * workload types so reserved / sentinel values fail-compile at
+   * the request construction site rather than fail-runtime inside
+   * an adapter (Codex PR D R1 HIGH closure 2026-05-14).
    */
-  workload_type: AIWorkloadType;
+  workload_type: ActiveLLMWorkloadType;
   /** Conversation turns to feed the provider. */
   messages: ReadonlyArray<LLMMessage>;
   /**
@@ -176,5 +201,69 @@ export class LLMRequestValidationError extends Error {
   ) {
     super(`LLM provider ${provider_name} rejected request: ${reason}`);
     this.name = 'LLMRequestValidationError';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BaseLLMProvider — runtime-enforced fail-soft boundary
+// ---------------------------------------------------------------------------
+
+/**
+ * Abstract base every concrete provider extends. Codex PR D R1 HIGH
+ * closure 2026-05-14: the original interface DOCUMENTED that adapters
+ * should throw LLMProviderUnavailableError on failure, but didn't
+ * ENFORCE it. A future Anthropic adapter that throws a raw NetworkError
+ * (or SDK-specific error class) would bypass the AI-RESIL-001 path
+ * silently — patient-facing UI would render a generic 500 instead of
+ * the documented "AI assistant temporarily unavailable" envelope.
+ *
+ * The base wraps subclass-defined `_sendCompletion` + `_healthcheck`
+ * methods in try/catch that:
+ *   - Preserves `LLMRequestValidationError` (caller maps to 4xx;
+ *     not a fail-soft case — the request itself is malformed).
+ *   - Preserves `LLMProviderUnavailableError` (already in the
+ *     documented fail-soft shape).
+ *   - Wraps EVERY OTHER error as `LLMProviderUnavailableError` with
+ *     the original error message in the cause_summary. The audit
+ *     attribution + UI fail-soft path stays consistent regardless
+ *     of which adapter surfaces the underlying failure.
+ *
+ * Subclasses implement `_sendCompletion` + `_healthcheck` (not the
+ * public methods); the base owns the wrapping. Tests against the
+ * base + a fake-throwing-adapter prove the wrap fires.
+ */
+export abstract class BaseLLMProvider implements LLMProvider {
+  abstract readonly name: LLMProviderName;
+
+  protected abstract _sendCompletion(request: LLMCompletionRequest): Promise<LLMCompletionResult>;
+
+  protected abstract _healthcheck(): Promise<{ healthy: boolean; reason?: string }>;
+
+  async sendCompletion(request: LLMCompletionRequest): Promise<LLMCompletionResult> {
+    try {
+      return await this._sendCompletion(request);
+    } catch (err) {
+      if (err instanceof LLMRequestValidationError) throw err;
+      if (err instanceof LLMProviderUnavailableError) throw err;
+      throw new LLMProviderUnavailableError(
+        this.name,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  async healthcheck(): Promise<{ healthy: boolean; reason?: string }> {
+    try {
+      return await this._healthcheck();
+    } catch (err) {
+      // Healthcheck failures degrade to unhealthy + the error
+      // message — never throw. AI-RESIL-002 expects the operator
+      // dashboard to be able to call healthcheck unconditionally
+      // without try/catch.
+      return {
+        healthy: false,
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 }

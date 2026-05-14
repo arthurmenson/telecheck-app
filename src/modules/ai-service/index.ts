@@ -88,12 +88,26 @@ export {
 export type { AIWorkloadType, AutonomyLevel } from './internal/types.js';
 
 // LLM provider abstraction per ADR-020 — PR D ships the interface +
-// NullLLMProvider + registry stub. Real adapters (Anthropic primary,
-// Bedrock + Azure OpenAI for resilience) land when secrets
-// management is resolved. Re-exports from internal/providers so
-// downstream consumers (handlers in PR D+, audit emitters, tests)
-// import from the module boundary, not internals.
+// BaseLLMProvider + NullLLMProvider + registry stub. Real adapters
+// (Anthropic primary, Bedrock + Azure OpenAI for resilience) land
+// when secrets management is resolved. Re-exports from
+// internal/providers so downstream consumers (handlers in PR E+,
+// audit emitters, tests) import from the module boundary, not
+// internals.
+//
+// `ActiveLLMWorkloadType` is the narrowed AIWorkloadType subset that
+// the LLM provider boundary admits as request inputs at v1.0
+// (`conversational_assistant` + `protocol_execution`). Reserved /
+// sentinel values fail-compile when passed as a request workload_type
+// per Codex PR D R1 HIGH-2 closure.
+//
+// `BaseLLMProvider` is the abstract base every concrete adapter
+// extends — its public methods wrap subclass-defined _sendCompletion
+// / _healthcheck in fail-soft try/catch that normalizes unknown
+// errors to LLMProviderUnavailableError per Codex PR D R1 HIGH-1
+// closure.
 export type {
+  ActiveLLMWorkloadType,
   LLMProvider,
   LLMProviderName,
   LLMMessage,
@@ -101,6 +115,7 @@ export type {
   LLMCompletionResult,
 } from './internal/providers/types.js';
 export {
+  BaseLLMProvider,
   LLMProviderUnavailableError,
   LLMRequestValidationError,
 } from './internal/providers/types.js';

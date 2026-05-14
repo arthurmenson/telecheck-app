@@ -29,16 +29,20 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { AIWorkloadType } from '../../src/lib/audit.ts';
 import {
+  type ActiveLLMWorkloadType,
+  BaseLLMProvider,
+  type LLMCompletionRequest,
+  type LLMCompletionResult,
   LLMProviderUnavailableError,
+  LLMRequestValidationError,
   NullLLMProvider,
   resolveProvider,
 } from '../../src/modules/ai-service/index.ts';
 
 const TENANT_ID_STUB = 'Telecheck-US';
 
-function aRequest(workload_type: AIWorkloadType) {
+function aRequest(workload_type: ActiveLLMWorkloadType): LLMCompletionRequest {
   return {
     workload_type,
     messages: [{ role: 'user' as const, content: 'hi' }],
@@ -110,6 +114,90 @@ describe('resolveProvider — PR D registry routes', () => {
 
   it('null workload type throws — has no provider mapping', () => {
     expect(() => resolveProvider(null)).toThrow(/sentinel\/null/);
+  });
+});
+
+describe('BaseLLMProvider fail-soft wrap — Codex PR D R1 HIGH closure', () => {
+  // A fake adapter that throws an arbitrary error from
+  // _sendCompletion. The base's wrap MUST normalize it to
+  // LLMProviderUnavailableError so the AI-RESIL-001 fail-soft path
+  // is the only thing the caller ever sees on adapter failure.
+  class FakeThrowingProvider extends BaseLLMProvider {
+    readonly name = 'null' as const; // borrow the sentinel for tests
+    constructor(private readonly thrown: unknown) {
+      super();
+    }
+    // eslint-disable-next-line @typescript-eslint/require-await
+    protected override async _sendCompletion(
+      _request: LLMCompletionRequest,
+    ): Promise<LLMCompletionResult> {
+      throw this.thrown;
+    }
+    // eslint-disable-next-line @typescript-eslint/require-await
+    protected override async _healthcheck(): Promise<{ healthy: boolean; reason?: string }> {
+      throw this.thrown;
+    }
+  }
+
+  it('raw Error from _sendCompletion → wrapped as LLMProviderUnavailableError', async () => {
+    const provider = new FakeThrowingProvider(new Error('NetworkError: ECONNRESET'));
+    let thrown: unknown = null;
+    try {
+      await provider.sendCompletion(aRequest('conversational_assistant'));
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(LLMProviderUnavailableError);
+    if (thrown instanceof LLMProviderUnavailableError) {
+      expect(thrown.cause_summary).toContain('ECONNRESET');
+    }
+  });
+
+  it('non-Error throw (string) from _sendCompletion → wrapped as LLMProviderUnavailableError', async () => {
+    const provider = new FakeThrowingProvider('something weird happened');
+    let thrown: unknown = null;
+    try {
+      await provider.sendCompletion(aRequest('protocol_execution'));
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(LLMProviderUnavailableError);
+    if (thrown instanceof LLMProviderUnavailableError) {
+      expect(thrown.cause_summary).toContain('something weird happened');
+    }
+  });
+
+  it('LLMRequestValidationError from _sendCompletion → preserved (NOT wrapped — caller maps to 4xx)', async () => {
+    const validationErr = new LLMRequestValidationError('null', 'context window exceeded');
+    const provider = new FakeThrowingProvider(validationErr);
+    let thrown: unknown = null;
+    try {
+      await provider.sendCompletion(aRequest('conversational_assistant'));
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBe(validationErr); // exact same instance, not wrapped
+  });
+
+  it('LLMProviderUnavailableError from _sendCompletion → preserved (already in canonical shape)', async () => {
+    const unavailableErr = new LLMProviderUnavailableError('null', 'pre-wrapped');
+    const provider = new FakeThrowingProvider(unavailableErr);
+    let thrown: unknown = null;
+    try {
+      await provider.sendCompletion(aRequest('conversational_assistant'));
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBe(unavailableErr); // exact same instance, not re-wrapped
+  });
+
+  it('raw throw from _healthcheck → returns { healthy:false, reason } (NEVER throws)', async () => {
+    // Per AI-RESIL-002, the operator dashboard expects to call
+    // healthcheck without try/catch.
+    const provider = new FakeThrowingProvider(new Error('healthcheck blew up'));
+    const result = await provider.healthcheck();
+    expect(result.healthy).toBe(false);
+    expect(result.reason).toContain('healthcheck blew up');
   });
 });
 

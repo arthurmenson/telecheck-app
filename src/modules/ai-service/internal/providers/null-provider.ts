@@ -26,14 +26,16 @@
  *   - AI_LAYERING v5.2 §7 (AI-RESIL-001/002)
  */
 
-import type { LLMCompletionRequest, LLMCompletionResult, LLMProvider } from './types.js';
-import { LLMProviderUnavailableError } from './types.js';
+import type { LLMCompletionRequest, LLMCompletionResult } from './types.js';
+import { BaseLLMProvider, LLMProviderUnavailableError } from './types.js';
 
-export class NullLLMProvider implements LLMProvider {
+export class NullLLMProvider extends BaseLLMProvider {
   readonly name = 'null' as const;
 
   // eslint-disable-next-line @typescript-eslint/require-await
-  async sendCompletion(_request: LLMCompletionRequest): Promise<LLMCompletionResult> {
+  protected override async _sendCompletion(
+    _request: LLMCompletionRequest,
+  ): Promise<LLMCompletionResult> {
     throw new LLMProviderUnavailableError(
       'null',
       'No LLM provider configured. Configure an adapter (Anthropic / Bedrock / Azure OpenAI) per ADR-020 ' +
@@ -43,7 +45,7 @@ export class NullLLMProvider implements LLMProvider {
   }
 
   // eslint-disable-next-line @typescript-eslint/require-await
-  async healthcheck(): Promise<{ healthy: boolean; reason?: string }> {
+  protected override async _healthcheck(): Promise<{ healthy: boolean; reason?: string }> {
     return {
       healthy: false,
       reason: 'No LLM provider configured (NullLLMProvider in use). See ADR-020.',
