@@ -295,6 +295,50 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
   });
 
+  it('input + output scans within the SAME request both emit (dedupe discriminates by detectionSource)', async () => {
+    // Per Codex PR F R2 HIGH closure 2026-05-13: the gate is called
+    // TWICE per request — once on patient/clinician input BEFORE
+    // the LLM call (ai_chat_input or ai_case_prep_input), once on
+    // AI output BEFORE surfacing (ai_chat_output or
+    // ai_case_prep_output) — both under the SAME Idempotency-Key.
+    // If the dedupe key didn't include detectionSource, the output-
+    // side emission would be silently suppressed by the input-side
+    // marker, violating I-019's "emit on every positive detection"
+    // contract.
+    const ctx = {
+      ...baseCtx(),
+      idempotencyCtx: {
+        tenantId: T_US,
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/chat',
+        actorId: 'patient_abc',
+        bodyHash: 'a'.repeat(64),
+      },
+    };
+
+    // Patient input trips crisis.
+    const r1 = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
+    expect(r1.kind).toBe('crisis');
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
+
+    // AI output ALSO trips crisis (defense-in-depth scan). Same
+    // resource_id, same idempotency context — but different
+    // detectionSource. Must emit a SECOND audit.
+    const r2 = await runCrisisGate(
+      ctx,
+      'i am sorry to hear you are thinking about hurting yourself',
+      'ai_chat_output',
+    );
+    expect(r2.kind).toBe('crisis');
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(2);
+
+    // But a retry of the input-side scan (same detectionSource +
+    // same idempotencyCtx) MUST still dedupe.
+    const r3 = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
+    expect(r3.kind).toBe('crisis');
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(2); // unchanged
+  });
+
   it('retry under DIFFERENT idempotency-key emits a fresh audit (dedupe scoped per key)', async () => {
     const baseCtxShared = baseCtx();
     const ctx1 = {

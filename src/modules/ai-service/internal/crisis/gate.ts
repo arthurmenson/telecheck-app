@@ -224,13 +224,27 @@ export async function runCrisisGate(
       // false — we skip the emit (the audit is already durable
       // from the first attempt). Per Codex PR F R1 HIGH closure.
       if (ctx.idempotencyCtx !== undefined) {
+        // Dedupe identity MUST discriminate between the input-side and
+        // output-side scans within a single request (the gate is
+        // documented to run twice — once on patient/clinician input
+        // BEFORE the LLM call, once on AI output BEFORE surfacing —
+        // both under the same Idempotency-Key). Without a per-emission
+        // discriminator, an output-side positive detection would be
+        // silently suppressed by the input-side marker, violating
+        // I-019's "emit on every positive detection" contract.
+        //
+        // We embed `detectionSource` in the auditAction discriminator
+        // passed to the dedupe helper. The actual audit row's `action`
+        // column still carries the canonical
+        // `crisis_detection_trigger`; only the SHA-256 dedupe-key
+        // material differs. Per Codex PR F R2 HIGH closure 2026-05-13.
         const claimed = await claimAuditDedupeSlot(tx, {
           tenantId: ctx.idempotencyCtx.tenantId,
           idempotencyKey: ctx.idempotencyCtx.idempotencyKey,
           endpoint: ctx.idempotencyCtx.endpoint,
           actorId: ctx.idempotencyCtx.actorId,
           bodyHash: ctx.idempotencyCtx.bodyHash,
-          auditAction: 'crisis_detection_trigger',
+          auditAction: `crisis_detection_trigger:${detectionSource}`,
         });
         if (!claimed) {
           // Prior attempt already emitted this exact audit on this
