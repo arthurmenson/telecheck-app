@@ -3,7 +3,7 @@
 **Raised by:** Engineering (autonomous turn 2026-05-14)
 **Date raised:** 2026-05-14
 **Severity:** high
-**Status:** **OPEN — v0.2 DRAFT** (Codex R1 HIGH ×2 closed; pre-ratification gate continues)
+**Status:** **OPEN — v0.3 DRAFT** (Codex R2 HIGH ×1 closed: Dispensing↔Shipment §5 fulfillment-state ownership handoff; pre-ratification gate continues)
 **Target spec doc (proposed):** `Telecheck_Canonical_Data_Model_v1_2.md` (headers will govern v1.4; on-disk filename retains the `v1_2.md` legacy pattern per v1.10 cycle convention)
 **Target slice PRD:** `Telecheck_Pharmacy_Refill_Slice_PRD_v2_1.md` (canonical references §4.17 + §4.18 + §4.19 post-promotion)
 **Companion SIs:** SI-001 (MedicationRequest schema gap — CLOSED 2026-05-11 via P-011) — same pattern, expanded scope
@@ -192,6 +192,61 @@ Per Codex R1's recommendation to define an explicit allowed-transition table for
 | ELIGIBLE / CHECKING / FULFILLING | safety_hold              | SAFETY_HOLD                             | no (recoverable via ADR-008 bridge supply → APPROVED)                    |
 | SAFETY_HOLD                      | bridge_supply_authorized | APPROVED (with `is_bridge_supply=TRUE`) | no                                                                       |
 
+#### Dispensing ↔ Shipment §5 fulfillment-state ownership (Codex R2 HIGH closure 2026-05-14)
+
+State Machines v1.1 §5 (Pharmacy Fulfillment) spans `QUEUED → CLAIMED → FULFILLING → RELEASE_CHECK → RELEASED → DISPATCHED → IN_TRANSIT → DELIVERED → COMPLETED`. v0.2 of this SI proposed Dispensing's `state` enum stopping at `{QUEUED, CLAIMED, FULFILLING, RELEASE_CHECK, RELEASED, EXCEPTION, HELD, ESCALATED}` without addressing the post-RELEASED tail. Per Codex R2 HIGH closure, the resolution is an **explicit handoff** at RELEASED:
+
+**Ownership boundary:** Dispensing owns the **pharmacist-side fulfillment** lifecycle (QUEUED through RELEASED, with exception/held/escalated as in-band recovery states). Shipment owns the **carrier-side delivery** lifecycle (DISPATCHED through DELIVERED/PICKED_UP). The two are linked authoritatively via `shipments.dispensing_id` (per the v0.2 child-holds-link decision).
+
+**Dispensing state enum (post-handoff):**
+
+| State         | Meaning                                                                           | Next                                                                             |
+| ------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| QUEUED        | Pharmacist queue; awaiting claim                                                  | CLAIMED on `claim`                                                               |
+| CLAIMED       | Pharmacist accepted                                                               | FULFILLING on `start_fulfillment`                                                |
+| FULFILLING    | Pick, label, package                                                              | RELEASE_CHECK on `fulfill_complete`                                              |
+| RELEASE_CHECK | Pharmacist release check                                                          | RELEASED on `release_pass`                                                       |
+| RELEASED      | Pharmacist released; ready for handoff to Shipment                                | **(terminal-from-Dispensing perspective)** — Shipment row creation triggers next |
+| EXCEPTION     | Stock-out / substitution / cold-chain / counterfeit flag                          | HELD on `hold`                                                                   |
+| HELD          | Awaiting decision                                                                 | ESCALATED on `escalate`                                                          |
+| ESCALATED     | Clinician/pharmacist review                                                       | FULFILLING on `resolve` (re-enter)                                               |
+| CANCELLED     | Dispensing cancelled before RELEASED (consent revocation, refill cancelled, etc.) | **(business-final)**                                                             |
+
+**Handoff rule (Dispensing RELEASED → Shipment row creation):**
+
+1. **Trigger:** A successful Dispensing.released event MUST create exactly one Shipment row scoped to that Dispensing.
+2. **Authoritative link direction (per v0.2):** `shipments.dispensing_id` (Shipment row holds the FK; Dispensing does not carry `shipment_id`).
+3. **Idempotency:** The Shipment creation runs through the reserve-then-execute pattern (PROJECT_CONVENTIONS r5 §3.7-§3.9 + `withIdempotency` + `withIdempotentExecution`). The partial UNIQUE `shipments (tenant_id, dispensing_id)` per §4.19 ensures one Shipment per Dispensing across retries.
+4. **Recovery (Dispensing RELEASED but no Shipment yet):** A repair job (or the next pharmacy-portal request hitting the same Dispensing) detects the gap via `WHERE dispensings.state = 'RELEASED' AND NOT EXISTS (SELECT 1 FROM shipments WHERE shipments.dispensing_id = dispensings.id)` and creates the missing Shipment row (idempotent by the partial UNIQUE).
+5. **Append-only-on-RELEASED:** Once a Dispensing reaches RELEASED, the row is append-only (no further UPDATEs). Any subsequent state-machine progress is recorded on the Shipment row.
+6. **Cancellation race:** If a patient/clinician cancellation arrives between Dispensing.RELEASED and Shipment.DISPATCHED, the cancellation creates a Shipment row in `CANCELLED_BEFORE_DISPATCH` state (terminal) rather than mutating the Dispensing. This preserves the append-only-on-RELEASED invariant.
+
+**Shipment state enum (post-handoff):**
+
+| State                     | Meaning                                                                                  | Next                                                                                                                                               |
+| ------------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| DISPATCHED                | Carrier picked up from pharmacy (delivery mode) OR pickup ready at counter (pickup mode) | IN_TRANSIT on `in_transit_update` (delivery only) OR PICKUP_AVAILABLE (pickup mode immediately)                                                    |
+| IN_TRANSIT                | Carrier scan event                                                                       | DELIVERED on `delivered` OR DELIVERY_FAILED on `delivery_fail`                                                                                     |
+| DELIVERED                 | Proof of delivery received                                                               | (Refill row transitions to DELIVERED on this Shipment's `delivered` event; Refill transitions to COMPLETED on its own `complete` event after this) |
+| DELIVERY_FAILED           | Delivery unsuccessful                                                                    | PICKUP_AVAILABLE on `revert_pickup` per State Machines v1.1 §2                                                                                     |
+| PICKUP_AVAILABLE          | Pickup mode: ready at counter (initial) OR fallback after delivery failure               | PICKED_UP on `picked_up` OR PICKUP_EXPIRED on `pickup_expires`                                                                                     |
+| PICKED_UP                 | Patient collected                                                                        | (Refill row transitions to PICKED_UP on this Shipment's event; Refill transitions to COMPLETED on its own `complete` event after this)             |
+| PICKUP_EXPIRED            | Pickup window expired without collection                                                 | **(business-final)**                                                                                                                               |
+| CANCELLED_BEFORE_DISPATCH | Cancellation race per #6 above                                                           | **(business-final)**                                                                                                                               |
+
+**Cross-entity append-only set (consolidated):**
+
+- **Refill business-final:** `{COMPLETED, INELIGIBLE, DECLINED, CANCELLED, EXPIRED}`
+- **Dispensing business-final + append-only at RELEASED:** `{RELEASED, CANCELLED}` (the §5 progress after RELEASED is recorded on Shipment per the handoff rule)
+- **Shipment business-final:** `{DELIVERED, PICKED_UP, PICKUP_EXPIRED, CANCELLED_BEFORE_DISPATCH}` (terminal on this Shipment; the parent Refill still needs `complete` to reach its own business-final COMPLETED)
+
+**Why this design:**
+
+- **Single canonical state machine across the boundary.** The §5 lifecycle is preserved end-to-end; it's just owned by two tables. Dispensing carries QUEUED→RELEASED; Shipment carries DISPATCHED→DELIVERED/PICKED_UP/PICKUP_EXPIRED.
+- **Append-only-on-RELEASED for Dispensing.** Once the pharmacist releases, the Dispensing row's lifecycle is complete. Subsequent state changes (carrier scans, delivery confirmation, pickup, etc.) are Shipment events, not Dispensing UPDATEs. This eliminates the partial-failure window where a Shipment is created but the Dispensing state hasn't been UPDATEd to a downstream state — there IS no downstream Dispensing state to UPDATE.
+- **Idempotent handoff.** Reserve-then-execute + partial UNIQUE ensures one Shipment per Dispensing. Recovery via the existence-check WHERE clause is straightforward and idempotent.
+- **Refill's view stays simple.** The Refill row's `state` enum still drives the overall lifecycle from the patient's perspective. Refill's `DELIVERED` / `PICKED_UP` / `COMPLETED` events are triggered by the corresponding Shipment row events (cross-table state coordination, not cross-table state UPDATEs).
+
 **Append-only-state set: `{COMPLETED, INELIGIBLE, DECLINED, CANCELLED, EXPIRED}`.** Rows in these states cannot be UPDATEd; subsequent corrections require a fresh Refill row (or, for amendment-class corrections, a fresh MedicationRequest superseding the original, which itself triggers a fresh Refill cycle). `DELIVERED` and `PICKUP_AVAILABLE` are NOT append-only — they MUST transition to `COMPLETED` to finalize the lifecycle.
 
 (Note: the append-only invariant is enforced at the repository layer via `UPDATE ... WHERE state NOT IN (<append_only_set>)` guards, mirroring the MedicationRequest §4.16 supersession-reciprocity trigger pattern. The state machine itself uses state-transition guards in the service layer per the existing TLC-055 pharmacy state-machine.ts implementation precedent.)
@@ -300,4 +355,6 @@ The autonomous-turn discipline preserved from SI-001: **never author canonical s
 - **v0.2 — 2026-05-14** — Codex R1 HIGH ×2 closed:
   1. **Terminal-state contradiction:** v0.1 listed DELIVERED as append-only terminal, which would have created a state-machine dead-end (DELIVERED must transition to COMPLETED via `complete`). v0.2 narrows the append-only set to `{COMPLETED, INELIGIBLE, DECLINED, CANCELLED, EXPIRED}` and adds an explicit allowed-transition table per Codex's recommendation.
   2. **Circular FK ambiguity:** v0.1 proposed bidirectional FKs (`refills.dispensing_id` + `dispensings.refill_id`) without specifying authoritative direction, creating partial-failure recovery issues. v0.2 makes the **child-holds-link** direction authoritative (`dispensings.refill_id`, `shipments.dispensing_id`), removes the reciprocal FKs from Refill/Dispensing, adds partial UNIQUE indexes for one-child-per-parent enforcement, and documents reserve-then-execute idempotency on creation.
-- **Next:** v0.3 after Codex R2 review; iterate to convergence per the SI-001 trajectory pattern (R1 → R10 was SI-001's path).
+- **v0.3 — 2026-05-14** — Codex R2 HIGH ×1 closed:
+  - **Dispensing schema dropped canonical §5 states (DISPATCHED → IN_TRANSIT → DELIVERED → COMPLETED).** v0.2's Dispensing enum stopped at RELEASED + exception/held/escalated; the §5 lifecycle continued through DISPATCHED → IN_TRANSIT → DELIVERED → COMPLETED but no entity owned those states. v0.3 adds an explicit **Dispensing ↔ Shipment §5 fulfillment-state ownership** section that: defines an ownership boundary (Dispensing owns QUEUED→RELEASED; Shipment owns DISPATCHED→DELIVERED/PICKED_UP/PICKUP_EXPIRED); enumerates both state enums in full; documents the **handoff rule** at RELEASED (Shipment row creation, idempotency, recovery, append-only-on-RELEASED, cancellation-race handling); consolidates the cross-entity append-only set across all three entities.
+- **Next:** v0.4 after Codex R3 review; iterate to convergence per the SI-001 trajectory pattern (R1 → R10 was SI-001's path).
