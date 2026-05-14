@@ -370,6 +370,11 @@ describe('engine writeback — Group B: engine_safety_hold', () => {
       );
       expect(eventRows.rows.length).toBe(1);
       expect(eventRows.rows[0]!.payload.interaction_signals_status).toBe('safety_hold');
+      // PR I R1 HIGH closure: prescriber_id is null on pre-active rows
+      // per migration 025 CHECK clause (a) which forces
+      // prescribed_by_clinician_account_id = NULL until activation. The
+      // payload must surface that honestly, not paper it over with ''.
+      expect(eventRows.rows[0]!.payload.prescriber_id).toBeNull();
     });
   });
 });

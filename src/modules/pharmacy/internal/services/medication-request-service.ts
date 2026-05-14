@@ -1137,12 +1137,20 @@ export async function evaluateInteractionsAsEngine(
     );
 
     if (evaluation.signalsStatus === 'safety_hold') {
+      // prescribed_by_clinician_account_id is NULL on pre-active rows
+      // per migration 025 CHECK clause (a); pass it through unchanged.
+      // The domain event payload's prescriber_id is nullable per
+      // emitMedicationRequestInteractionSafetyHoldTriggered's contract
+      // — the Med Interaction Engine slice's override workflow handles
+      // the null by routing to whichever clinician picks up the row at
+      // pending_clinician_review (Codex PR I R1 HIGH closure
+      // 2026-05-13).
       await emitMedicationRequestInteractionSafetyHoldTriggered(tx, {
         tenantId: ctx.tenantId,
         medicationRequestId,
         occurredAt: evaluatedAt,
         patientAccountId: current.patient_account_id,
-        prescriberAccountId: current.prescribed_by_clinician_account_id ?? '',
+        prescriberAccountId: current.prescribed_by_clinician_account_id,
         interactionSignals: evaluation.interactionSignals,
         engineVersion: evaluation.engineVersion,
         knowledgeBaseVersion: evaluation.knowledgeBaseVersion,
