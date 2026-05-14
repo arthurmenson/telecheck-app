@@ -27,6 +27,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { withTransaction } from '../../src/lib/db.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import { type AICrisisDetectionSource, runCrisisGate } from '../../src/modules/ai-service/index.ts';
@@ -263,6 +264,39 @@ describe('runCrisisGate — positive detection path', () => {
       runCrisisGate(ctx2, "i don't want to live anymore", 'ai_chat_input'),
     ).rejects.toThrow(/Refusing to emit a mislabeled FLOOR-020 envelope/);
     expect(await countCrisisAudits(ctx2.resourceId)).toBe(0);
+  });
+});
+
+describe('runCrisisGate — durability (Codex PR F R4 HIGH closure)', () => {
+  it('caller transaction rollback does NOT erase the crisis audit', async () => {
+    // Per Codex PR F R4 HIGH closure 2026-05-13: the gate's audit
+    // emission runs on a fresh, independent transaction. A caller
+    // that invokes the gate inside its own business transaction and
+    // then rolls back (e.g., rejecting the request mid-handler) MUST
+    // still leave the Category A audit durable per I-019 + I-003.
+    // The gate no longer accepts an externalTx parameter; the
+    // mistake-by-API-design risk is closed at the type level.
+    const ctx = baseCtx();
+
+    // Run the gate inside a caller tx, then throw to force rollback.
+    const sentinel = Symbol('caller_rollback');
+    let outcomeKind: string | undefined;
+    try {
+      await withTransaction(async (tx) => {
+        await tx.query('SELECT set_tenant_context($1)', [T_US]);
+        const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
+        outcomeKind = r.kind;
+        throw sentinel; // caller rolls back its tx
+      });
+    } catch (e) {
+      if (e !== sentinel) throw e;
+    }
+
+    expect(outcomeKind).toBe('crisis');
+    // Even though the caller's tx rolled back, the gate's fresh-
+    // transaction audit emit committed independently. The audit row
+    // is durable.
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
   });
 });
 

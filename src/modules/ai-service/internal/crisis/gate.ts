@@ -159,13 +159,15 @@ function deriveAuditEnvelope(
  * path; emits exactly one audit row + returns `{ kind: 'crisis' }`
  * on the positive path.
  *
- * The audit emission runs inside a fresh transaction by default so
- * a positive detection persists even if the caller's outer
- * transaction is going to roll back (rejecting the request).
- * Optionally accepts an `externalTx` for callers that want the
- * audit committed with their own writing transaction (e.g., a
- * future surface that wants to atomically record both the
- * detection AND a state change).
+ * The audit emission ALWAYS runs inside a fresh transaction (via
+ * `withTransaction`) so a positive detection persists even if the
+ * caller's outer transaction rolls back. Per Codex PR F R4 HIGH
+ * closure 2026-05-13: the gate does NOT accept an `externalTx`
+ * parameter. Joining the audit emission to a caller-owned tx would
+ * let the caller's rollback erase the mandatory Category A audit
+ * record, violating I-003 + I-019. Forms-intake's runCrisisGate
+ * removed the same parameter for the same reason; this gate matches
+ * that contract.
  *
  * **Idempotency dedupe (Codex PR F R1 HIGH closure 2026-05-13):**
  * When `ctx.idempotencyCtx` is supplied (the canonical caller
@@ -187,7 +189,6 @@ export async function runCrisisGate(
   ctx: CrisisGateContext,
   text: string,
   detectionSource: AICrisisDetectionSource,
-  externalTx?: DbTransaction,
 ): Promise<CrisisGateOutcome> {
   // crisisDetector.detect's source parameter is its narrow enum
   // (`ai_chat` | `community_post` | `form_response` | `messaging` |
@@ -294,11 +295,10 @@ export async function runCrisisGate(
         tx,
       );
     };
-    if (externalTx !== undefined) {
-      await emit(externalTx);
-    } else {
-      await withTransaction(emit);
-    }
+    // ALWAYS a fresh transaction — never join the caller's tx, so a
+    // caller-side rollback cannot erase the Category A audit row.
+    // Per Codex PR F R4 HIGH closure 2026-05-13.
+    await withTransaction(emit);
   } catch {
     // Per FLOOR-020 crisis-write exception, swallow the audit
     // failure and proceed with crisis-resource surfacing. The
