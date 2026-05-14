@@ -243,7 +243,25 @@ export async function emitMedicationRequestInteractionSafetyHoldTriggered(
   tx: DbTransaction,
   args: MedicationRequestDomainEventCommon & {
     patientAccountId: string;
-    prescriberAccountId: string;
+    /**
+     * The clinician who will be reviewing / has been reviewing the
+     * prescription. NULL when the engine evaluates the row before any
+     * clinician has been assigned as the prescriber — at v1.0 this is
+     * always the case because migration 025 CHECK clause (a) requires
+     * `prescribed_by_clinician_account_id IS NULL` on every pre-active
+     * state (draft, pending_interaction_check, pending_clinician_review,
+     * rejected). The Med Interaction Engine slice's override-workflow
+     * subscriber MUST handle null by routing to whichever clinician
+     * picks up the row at pending_clinician_review (or to a triage
+     * queue).
+     *
+     * (Codex PR I R1 HIGH closure 2026-05-13: prior shape declared
+     * `prescriberAccountId: string` and the service defaulted null to
+     * '', which both lied about the field's actual semantics and
+     * published an empty string the subscriber would have to special-
+     * case downstream. Widening the contract here is the honest fix.)
+     */
+    prescriberAccountId: string | null;
     interactionSignals: Array<{
       signal_id: string;
       severity: string;

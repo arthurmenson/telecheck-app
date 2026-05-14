@@ -51,6 +51,7 @@ import { asAccountId, findAccountById } from '../../../identity/index.js';
 import {
   emitMedicationRequestDiscontinued,
   emitMedicationRequestDrafted,
+  emitMedicationRequestInteractionEvaluationCompleted,
   emitMedicationRequestSubmittedForReview,
   emitPrescribingApproved,
   emitPrescribingDeclined,
@@ -59,6 +60,7 @@ import {
 import {
   emitMedicationRequestApproved,
   emitMedicationRequestDiscontinued as emitMedicationRequestDiscontinuedDomainEvent,
+  emitMedicationRequestInteractionSafetyHoldTriggered,
 } from '../../domain-events.js';
 import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
 import { I012RejectError } from '../state-machine.js';
@@ -1009,6 +1011,151 @@ export async function declineByClinician(
       },
       tx,
     );
+
+    return updated;
+  }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
+// evaluateInteractionsAsEngine — PR I engine writeback (NO HTTP at v1.0)
+//
+// State Machines v1.2 §19 admits two engine-driven transitions out of
+// pending_interaction_check:
+//
+//   pending_interaction_check --[engine_clean]-->        pending_clinician_review
+//   pending_interaction_check --[engine_safety_hold]-->  pending_clinician_review
+//                                                        (with safety_hold flag)
+//
+// Composition (all in one tx):
+//   1. Load row (tenant-scoped). Must be at pending_interaction_check
+//      with interaction_signals_status='pending'.
+//   2. recordInteractionEvaluation — writes back signals_status +
+//      evaluated_at (one-shot per row per migration 025 invariants;
+//      the WHERE clause filters already-completed evaluations).
+//   3. transitionStatus → pending_clinician_review via engine_clean
+//      (signals=clean|caution) or engine_safety_hold (signals=
+//      safety_hold).
+//   4. Emit medication_request.interaction_evaluation_completed
+//      (Category A; actor_type='system'; aiWorkloadType/autonomyLevel
+//      null per the deterministic-rules-engine carve-out — the
+//      interaction engine is rule-driven at v1.0, not an AI workload).
+//   5. If safety_hold: emit
+//      medication_request.interaction_safety_hold_triggered.v1 so
+//      the Med Interaction Engine slice's override workflow can
+//      subscribe (Path 1 integration ratified at SI-001).
+//
+// Scope at PR I: SERVICE-CALLABLE ONLY (no HTTP). The Med Interaction
+// Engine module invokes this directly. A signed system-actor HTTP
+// token does not exist at v1.0; an HTTP surface lands in a follow-on
+// PR when the system-token issuance lands.
+// ---------------------------------------------------------------------------
+
+export interface InteractionEvaluationInput {
+  /** Signals the engine produced. Empty array on a clean evaluation. */
+  interactionSignals: Array<{
+    signal_id: string;
+    severity: string;
+    check_class: string;
+  }>;
+  /**
+   * Engine decision on the overall row outcome:
+   *   - 'clean'        no interactions of concern
+   *   - 'caution'      noteworthy but not blocking (clinician informed)
+   *   - 'safety_hold'  blocking; clinician override required
+   * Drives the state-machine event:
+   *   - clean / caution → engine_clean
+   *   - safety_hold      → engine_safety_hold
+   */
+  signalsStatus: 'clean' | 'caution' | 'safety_hold';
+  knowledgeBaseVersion: string;
+  engineVersion: string;
+}
+
+export async function evaluateInteractionsAsEngine(
+  ctx: TenantContext,
+  medicationRequestId: MedicationRequestId,
+  evaluation: InteractionEvaluationInput,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    if (current === null) {
+      throw new MedicationRequestNotFoundError(medicationRequestId);
+    }
+    if (
+      current.status !== 'pending_interaction_check' ||
+      current.interaction_signals_status !== 'pending'
+    ) {
+      throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
+    }
+
+    const evaluatedAt = new Date();
+    const event: 'engine_clean' | 'engine_safety_hold' =
+      evaluation.signalsStatus === 'safety_hold' ? 'engine_safety_hold' : 'engine_clean';
+
+    const writeback = await medicationRequestRepo.recordInteractionEvaluation(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        interaction_signals_status: evaluation.signalsStatus,
+        interaction_signals_evaluated_at: evaluatedAt,
+      },
+      tx,
+    );
+    if (writeback === null) {
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    const updated = await medicationRequestRepo.transitionStatus(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        expected_from_status: 'pending_interaction_check',
+        to_status: 'pending_clinician_review',
+        event,
+      },
+      tx,
+    );
+    if (updated === null) {
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    await emitMedicationRequestInteractionEvaluationCompleted(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: current.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        interactionSignalsStatus: evaluation.signalsStatus,
+        engineVersion: evaluation.engineVersion,
+        knowledgeBaseVersion: evaluation.knowledgeBaseVersion,
+        detail: { interaction_signals: evaluation.interactionSignals },
+      },
+      tx,
+    );
+
+    if (evaluation.signalsStatus === 'safety_hold') {
+      // prescribed_by_clinician_account_id is NULL on pre-active rows
+      // per migration 025 CHECK clause (a); pass it through unchanged.
+      // The domain event payload's prescriber_id is nullable per
+      // emitMedicationRequestInteractionSafetyHoldTriggered's contract
+      // — the Med Interaction Engine slice's override workflow handles
+      // the null by routing to whichever clinician picks up the row at
+      // pending_clinician_review (Codex PR I R1 HIGH closure
+      // 2026-05-13).
+      await emitMedicationRequestInteractionSafetyHoldTriggered(tx, {
+        tenantId: ctx.tenantId,
+        medicationRequestId,
+        occurredAt: evaluatedAt,
+        patientAccountId: current.patient_account_id,
+        prescriberAccountId: current.prescribed_by_clinician_account_id,
+        interactionSignals: evaluation.interactionSignals,
+        engineVersion: evaluation.engineVersion,
+        knowledgeBaseVersion: evaluation.knowledgeBaseVersion,
+      });
+    }
 
     return updated;
   }, externalTx);
