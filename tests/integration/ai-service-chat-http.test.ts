@@ -163,8 +163,13 @@ async function mintTokenForRole(
 // Group A — Happy path
 // ===========================================================================
 
-describe('ai-service Mode 1 chat — Group A: happy path', () => {
-  it('A1 patient JWT + { message } → 200 + canonical FLOOR-020-shaped envelope', async () => {
+describe('ai-service Mode 1 chat — Group A: valid input → 503 informational envelope (PR B)', () => {
+  // Per Codex PR B R1 CRITICAL + HIGH closures 2026-05-14, the route
+  // returns 503 (not a Mode1ChatResponseView) until crisis detection
+  // (PR F) + per-response audit (PR E/F) + real LLM provider (PR D)
+  // all land. Auth + body validation precede the 503, so a happy-path
+  // request lands in the 503 envelope after the gates pass.
+  it('A1 patient JWT + { message } → 503 with route-registered informational envelope', async () => {
     const patient = await insertAccountOfType(US_CTX, 'patient');
     const token = await mintTokenForRole(T_US, patient, 'patient');
 
@@ -177,37 +182,35 @@ describe('ai-service Mode 1 chat — Group A: happy path', () => {
       },
       payload: { message: 'What does my latest lab result mean?' },
     });
-    expect(r.statusCode).toBe(200);
+    expect(r.statusCode).toBe(503);
     const body = r.json<{
-      ai_chat_session_id: string;
-      message_id: string;
-      source_type: string;
-      ai_workload_type: string;
-      autonomy_level: string;
-      guardrail_template_id: string;
-      model_version: string;
-      escalation_triggered: boolean;
-      crisis_detected: boolean;
-      response_text: string;
-      stub_marker: string;
+      status: string;
+      module: string;
+      surface: string;
+      phase: string;
+      pending_message: string;
     }>();
-    expect(body.ai_chat_session_id.startsWith('aics_')).toBe(true);
-    expect(body.message_id.startsWith('aimsg_')).toBe(true);
-    expect(body.source_type).toBe('ai');
-    expect(body.ai_workload_type).toBe('conversational_assistant');
-    expect(body.autonomy_level).toBe('advisory');
-    expect(body.guardrail_template_id).toBe('conservative_default');
-    expect(body.model_version).toBe('stub-v0');
-    expect(body.escalation_triggered).toBe(false);
-    expect(body.crisis_detected).toBe(false);
-    expect(body.response_text.length).toBeGreaterThan(0);
-    expect(body.stub_marker).toBe('pr_b_stub_v0');
+    expect(body.status).toBe('not_ready');
+    expect(body.module).toBe('ai-service');
+    expect(body.surface).toBe('mode_1_chat');
+    expect(body.phase).toBe('route_registered_503_pr_b');
+    expect(body.pending_message).toContain('crisis detection');
+    expect(body.pending_message).toContain('FLOOR-009');
+    expect(body.pending_message).toContain('I-019');
+    expect(body.pending_message).toContain('per-response audit');
+    expect(body.pending_message).toContain('Anthropic');
+    // The 503 envelope intentionally does NOT carry a
+    // Mode1ChatResponseView — emitting one would imply an AI
+    // response was generated, violating the platform-floor stance.
+    expect(body).not.toHaveProperty('source_type');
+    expect(body).not.toHaveProperty('response_text');
+    expect(body).not.toHaveProperty('ai_chat_session_id');
   });
 
-  it('A2 patient JWT + { message, session_id } → echoes the supplied session_id', async () => {
+  it('A2 patient JWT + { message, session_id } → 503 (session_id not validated or echoed)', async () => {
     const patient = await insertAccountOfType(US_CTX, 'patient');
     const token = await mintTokenForRole(T_US, patient, 'patient');
-    const sessionId = `aics_${ulid()}`;
+    const clientSessionId = `aics_${ulid()}`;
 
     const r = await app!.inject({
       method: 'POST',
@@ -216,10 +219,15 @@ describe('ai-service Mode 1 chat — Group A: happy path', () => {
         host: 'heroshealth.com',
         authorization: `Bearer ${token}`,
       },
-      payload: { message: 'Follow-up question', session_id: sessionId },
+      payload: { message: 'Follow-up question', session_id: clientSessionId },
     });
-    expect(r.statusCode).toBe(200);
-    expect(r.json<{ ai_chat_session_id: string }>().ai_chat_session_id).toBe(sessionId);
+    expect(r.statusCode).toBe(503);
+    const body = r.json<Record<string, unknown>>();
+    // Codex PR B R1 MEDIUM-2 closure: client-supplied session_id
+    // must NOT be echoed back without tenant/patient validation.
+    // The 503 envelope avoids this entirely by not carrying any
+    // chat session field.
+    expect(body['ai_chat_session_id']).toBeUndefined();
   });
 });
 
@@ -304,14 +312,20 @@ describe('ai-service Mode 1 chat — Group C: body validation', () => {
 // Group D — Platform-floor wire-shape assertions
 // ===========================================================================
 
-describe('ai-service Mode 1 chat — Group D: platform-floor wire shape', () => {
-  it('D1 stub response always carries source_type=ai + conversational_assistant + advisory (FLOOR-007 + Mode 1 ceiling)', async () => {
+describe('ai-service Mode 1 chat — Group D: platform-floor compliance at 503', () => {
+  it('D1 NO AI-labeled response is ever emitted from the route at PR B (CRITICAL + HIGH closures)', async () => {
     const patient = await insertAccountOfType(US_CTX, 'patient');
     const token = await mintTokenForRole(T_US, patient, 'patient');
 
-    // Hit the endpoint a few times — the canonical envelope fields
-    // must NEVER drift to anything outside the Mode 1 cap, even on
-    // different inputs.
+    // The route MUST never emit a Mode1ChatResponseView-shaped 200
+    // at PR B because (a) no I-019 crisis detector has run on the
+    // patient's input yet (FLOOR-009 + FLOOR-013 + I-019) and (b)
+    // no durable audit record would land for the response (FLOOR-
+    // 020). Codex PR B R1 CRITICAL + HIGH closures 2026-05-14.
+    //
+    // Repeat the request with different inputs to make a "the route
+    // accidentally emitted an AI response on input X" regression
+    // visible immediately.
     const messages = ['short', 'a longer question', 'a final probe'];
     for (const m of messages) {
       const r = await app!.inject({
@@ -320,23 +334,20 @@ describe('ai-service Mode 1 chat — Group D: platform-floor wire shape', () => 
         headers: { host: 'heroshealth.com', authorization: `Bearer ${token}` },
         payload: { message: m },
       });
-      expect(r.statusCode).toBe(200);
-      const body = r.json<{
-        source_type: string;
-        ai_workload_type: string;
-        autonomy_level: string;
-        guardrail_template_id: string;
-      }>();
-      // FLOOR-007: no concealment of AI identity.
-      expect(body.source_type).toBe('ai');
-      // ADR-029 + WORKLOAD_TAXONOMY v5.2 §2: Mode 1 is exactly
-      // `conversational_assistant`.
-      expect(body.ai_workload_type).toBe('conversational_assistant');
-      // AUTONOMY_LEVELS v5.2 + AI-ARCH-001 + I-012: Mode 1 cannot
-      // exceed 'advisory'.
-      expect(body.autonomy_level).toBe('advisory');
-      // AI-GUARD-003: Conservative Default is immutable.
-      expect(body.guardrail_template_id).toBe('conservative_default');
+      expect(r.statusCode).toBe(503);
+      const body = r.json<Record<string, unknown>>();
+      // FLOOR-007: no concealment of AI identity. The 503 path
+      // intentionally avoids this concern by not carrying a
+      // source_type field at all — there is no AI response.
+      expect(body['source_type']).toBeUndefined();
+      // No response_text means no AI-authored content reaches the
+      // patient.
+      expect(body['response_text']).toBeUndefined();
+      // No model_version means no provider attribution leaks.
+      expect(body['model_version']).toBeUndefined();
+      // No escalation/crisis fields means no false "we checked" claim.
+      expect(body['crisis_detected']).toBeUndefined();
+      expect(body['escalation_triggered']).toBeUndefined();
     }
   });
 });

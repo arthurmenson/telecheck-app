@@ -69,9 +69,8 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { UnauthenticatedError, requirePatientActorContext } from '../../../../lib/auth-context.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { ulid } from '../../../../lib/ulid.js';
 import { asSessionId, findActiveSessionById } from '../../../identity/index.js';
-import { asAIChatSessionId, type AIChatSessionId } from '../types.js';
+import type { AIChatSessionId } from '../types.js';
 
 const MAX_MESSAGE_LENGTH = 8_000; // safe ceiling; real provider may cap lower
 
@@ -117,14 +116,24 @@ async function requirePatientLiveSession(req: FastifyRequest): Promise<{
 }
 
 /**
- * The canonical Mode 1 response envelope shape. Stable contract so
- * frontends can integrate against this even before the real LLM
- * lands.
+ * The canonical Mode 1 response envelope shape — exported for client
+ * integration even though the handler is feature-gated to 503 at PR B.
+ *
+ * PR B route + body-validation wiring is forward-compatible: when PRs
+ * D/E/F land (Anthropic provider + guardrail templates + crisis
+ * detection), the only change in this handler is replacing the 503
+ * with a Mode1ChatResponseView-shaped 200.
  */
 export interface Mode1ChatResponseView {
   ai_chat_session_id: AIChatSessionId;
   message_id: string;
   source_type: 'ai';
+  /** Canonical AI_LAYERING mode discriminator (Codex PR B R1 MEDIUM
+   *  closure 2026-05-14). Surfaces the legacy `mode_1 / mode_2 /
+   *  scribe / interpretation / food_scan` enum from AI_LAYERING v5.2
+   *  §6 audit envelope so frontends can discriminate UI states
+   *  without re-derivating from `ai_workload_type`. */
+  ai_mode: 'mode_1';
   ai_workload_type: 'conversational_assistant';
   autonomy_level: 'advisory';
   guardrail_template_id: 'conservative_default';
@@ -132,11 +141,6 @@ export interface Mode1ChatResponseView {
   escalation_triggered: boolean;
   crisis_detected: boolean;
   response_text: string;
-  // Phase marker so clients can detect they're talking to the stub
-  // and surface an appropriate UI state if desired (e.g., "AI is in
-  // limited mode"). PR D removes this field once the real provider
-  // lands.
-  stub_marker: 'pr_b_stub_v0';
 }
 
 export async function chatMode1Handler(req: FastifyRequest, reply: FastifyReply): Promise<unknown> {
@@ -208,38 +212,52 @@ export async function chatMode1Handler(req: FastifyRequest, reply: FastifyReply)
       );
   }
 
-  // ---- Session id resolution ----
-  // PR B doesn't persist sessions; if the client sent one, echo it
-  // back (so multi-turn UIs preserve their state across the stub).
-  // If they didn't, synthesize a fresh ULID. PR C / persistence-PR
-  // adds validation: (tenant_id, ai_chat_session_id) authorization
-  // pair per AI_LAYERING v5.2 §9; cross-tenant or cross-patient
-  // session ids collapse to 404 per I-025.
-  const ai_chat_session_id =
-    typeof body.session_id === 'string'
-      ? asAIChatSessionId(body.session_id)
-      : asAIChatSessionId(`aics_${ulid()}`);
-
-  // ---- Stub response ----
-  // Per FLOOR-007: every AI response carries source_type='ai'.
-  // Per FLOOR-010/011: no specific dosing advice, no diagnostic
-  // claims. The stub response is intentionally a no-op acknowledgment
-  // so it can't violate these floors at PR B even by accident.
-  const view: Mode1ChatResponseView = {
-    ai_chat_session_id,
-    message_id: `aimsg_${ulid()}`,
-    source_type: 'ai',
-    ai_workload_type: 'conversational_assistant',
-    autonomy_level: 'advisory',
-    guardrail_template_id: 'conservative_default',
-    model_version: 'stub-v0',
-    escalation_triggered: false,
-    crisis_detected: false,
-    response_text:
-      'AI assistant is in limited preview. The full conversational ' +
-      'surface lands in a subsequent release. For urgent clinical ' +
-      'questions, please contact your clinician.',
-    stub_marker: 'pr_b_stub_v0',
-  };
-  return reply.code(200).send(view);
+  // PR B intentionally returns 503 after validation succeeds, per
+  // Codex PR B R1 CRITICAL + HIGH closures 2026-05-14:
+  //
+  //   CRITICAL — Returning a live AI-labeled 200 response without
+  //              running I-019 crisis detection on the patient's
+  //              input violates the platform floor (FLOOR-009 +
+  //              FLOOR-013). The detector lands in PR F; until then
+  //              the route MUST NOT emit any AI response, even a
+  //              canned one.
+  //
+  //   HIGH     — Emitting an AI-labeled 200 without a durable audit
+  //              record violates FLOOR-020 (every AI-generated
+  //              response produces an audit record). The audit
+  //              boundary lands in PR E/F or via an AUDIT_EVENTS
+  //              spec amendment that names the per-response Mode 1
+  //              action.
+  //
+  // The route exists + body validation runs so that:
+  //   - When PRs D/E/F land, this handler swaps the 503 below for a
+  //     Mode1ChatResponseView-shaped 200 with the crisis-detection
+  //     gate + real provider call + audit emission. The validation
+  //     code above doesn't change.
+  //   - Clients integrate against the Mode1ChatResponseView TYPE
+  //     contract (exported from the module) without waiting for the
+  //     handler to go live.
+  //   - The auth + body-validation surface is exercised end-to-end
+  //     in tests, locking in regression coverage for the platform
+  //     floor / tenant-blind 404 boundaries before the live surface
+  //     ships.
+  //
+  // The 503 envelope is intentionally informational; it does NOT
+  // carry a Mode1ChatResponseView. Returning a Mode1ChatResponseView-
+  // shaped error would imply an AI response was generated, which
+  // contradicts the platform-floor stance.
+  return reply.code(503).send({
+    status: 'not_ready',
+    module: 'ai-service',
+    surface: 'mode_1_chat',
+    phase: 'route_registered_503_pr_b',
+    pending_message:
+      'AI assistant is not yet ready to serve traffic — Mode 1 chat ' +
+      'requires crisis detection (FLOOR-009 / I-019 platform-floor; PR F), ' +
+      'per-response audit emission (FLOOR-020; PR E/F or AUDIT_EVENTS ' +
+      'spec amendment), and real Anthropic provider integration (ADR-020; ' +
+      'PR D). PR B registers the route + body-validation surface for ' +
+      'forward-compatibility. The Mode1ChatResponseView type contract is ' +
+      'exported from the ai-service module for client integration.',
+  });
 }

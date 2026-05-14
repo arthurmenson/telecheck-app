@@ -43,13 +43,14 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'ai-service',
-    phase: 'mode_1_chat_stub_pr_b',
+    phase: 'mode_1_chat_route_registered_503_pr_b',
     workload_types_at_v1: ['conversational_assistant', 'protocol_execution'],
     workload_types_reserved: ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'],
     autonomy_levels_at_v1: ['advisory', 'suggestion', 'action_with_confirm'],
     autonomy_levels_reserved: ['action_with_audit_only', 'fully_autonomous'],
-    mode_1_chat_stub_wired: true,
-    mode_1_chat_stub_wired_by: 'TLC-AI PR B (stub envelope only; no real LLM call yet)',
+    mode_1_chat_route_wired: true,
+    mode_1_chat_route_wired_by:
+      'TLC-AI PR B (POST /v0/ai/chat returns 503; crisis detection + per-response audit + real provider required before 200 — PR D/E/F)',
     handlers_wired: false,
     handlers_wired_tracking:
       'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
@@ -70,7 +71,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'ai-service',
-      phase: 'mode_1_chat_stub_pr_b',
+      phase: 'mode_1_chat_route_registered_503_pr_b',
       pending:
         'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
       pending_message:
