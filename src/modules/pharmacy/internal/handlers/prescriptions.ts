@@ -73,6 +73,12 @@ import {
   requirePatientActorContext,
 } from '../../../../lib/auth-context.js';
 import { GlossaryViolationError, asMedicationRequestId } from '../../../../lib/glossary.js';
+import {
+  IdempotencyBodyMismatchError,
+  IdempotencyInFlightError,
+  IdempotencyReplayError,
+  buildIdempotencyCtx,
+} from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { asSessionId, findActiveSessionById } from '../../../identity/index.js';
@@ -1032,6 +1038,16 @@ export async function approveMedicationRequestHandler(
     throw err;
   }
 
+  // Build the idempotency ctx ahead of the writing tx so the post-
+  // rollback rejection emitter (if I-012 fires) can stamp a completed
+  // idempotency_keys row keyed by the same 4-tuple, making retries
+  // replay the cached 409 instead of re-emitting the rejection audit
+  // (Codex PR G R3 HIGH closure 2026-05-13). The Idempotency-Key
+  // header presence is guaranteed at this point — the global
+  // idempotency preHandler returns 400 if it's missing, so the request
+  // never reaches this handler without one.
+  const idempotencyCtxForRejection = buildIdempotencyCtx(req);
+
   try {
     return await withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
       const updated = await medicationRequestService.approveAsClinician(
@@ -1046,34 +1062,49 @@ export async function approveMedicationRequestHandler(
     // I-012 reject-unless violation. The writing tx (inside
     // withIdempotentExecution) has rolled back; the audit hash-chain
     // advisory lock is released. Emit prescribing.execution_rejected
-    // in a fresh tx per AUDIT_EVENTS v5.3 §I-012 reject-unless
-    // rejection-audit-event rule; bare suppression forbidden per I-003.
+    // in a fresh tx AND atomically write a completed idempotency_keys
+    // row so retries replay (per AUDIT_EVENTS v5.3 §I-012 reject-
+    // unless rejection-audit-event rule + IDEMPOTENCY v5.1; bare
+    // suppression forbidden per I-003).
     //
     // The helper resolves the row's patient_account_id INTERNALLY (in
-    // the same fresh tx as the emission) so there is no caller-supplied
-    // path that could skip the audit. If the post-rollback lookup
-    // returns null the helper throws
-    // ApprovalI012RejectionAuditAnchorMissingError — fail closed by
-    // surfacing 500 rather than the canonical 409, so ops sees the
-    // anomaly. The 500 envelope is generic and does not leak guard
-    // internals (Codex PR G R2 HIGH closure 2026-05-13).
+    // the same fresh tx as the emission) so there is no caller-
+    // supplied path that could skip the audit. It also wraps the
+    // emission in `withIdempotency` so the rejection-emission
+    // operation is itself idempotent: the next retry with the same
+    // key + body hits the cached 409 via withIdempotency's replay
+    // semantics inside the regular withIdempotentExecution path.
     if (err instanceof Error && err.name === 'I012RejectError') {
       const violatedClauses = ((err as Error & { violated_clauses?: readonly string[] })
         .violated_clauses ?? []) as Parameters<
         typeof medicationRequestService.emitApprovalI012RejectionAudit
       >[3];
+      const rejectionEnvelope = makeErrorEnvelope(
+        req.id,
+        'internal.resource.conflict',
+        'Medication request state conflict.',
+      );
       try {
-        await medicationRequestService.emitApprovalI012RejectionAudit(
+        const payload = await medicationRequestService.emitApprovalI012RejectionAudit(
           ctx,
           { accountId: actor.accountId },
           id,
           violatedClauses,
+          idempotencyCtxForRejection,
+          rejectionEnvelope,
         );
+        return reply.code(payload.status).send(payload.body);
       } catch (auditErr) {
         if (
           auditErr instanceof Error &&
           auditErr.name === 'ApprovalI012RejectionAuditAnchorMissingError'
         ) {
+          // Fail closed. The row vanished or tenant context drifted
+          // between writing-tx rollback and rejection-audit emission;
+          // we cannot anchor the canonical I-012 audit, and returning
+          // 409 here would suppress the emission silently in violation
+          // of I-003 + I-012. Surface 500 with a generic envelope so
+          // ops sees the anomaly.
           return reply
             .code(500)
             .send(
@@ -1084,17 +1115,36 @@ export async function approveMedicationRequestHandler(
               ),
             );
         }
+        // Concurrent retry already completed the rejection emission
+        // (cache row exists). Replay the cached body verbatim per
+        // IDEMPOTENCY v5.1.
+        if (auditErr instanceof IdempotencyReplayError) {
+          return reply.code(auditErr.cachedStatus).send(auditErr.cachedBody);
+        }
+        // Concurrent retry is mid-emission (reservation row is
+        // 'pending'). Return the canonical in-flight 409 so the
+        // client backs off.
+        if (auditErr instanceof IdempotencyInFlightError) {
+          return reply
+            .code(409)
+            .send(makeErrorEnvelope(req.id, 'internal.idempotency.in_flight', auditErr.hint));
+        }
+        // Body hash mismatch: a retry presented a DIFFERENT body
+        // under the same Idempotency-Key. Per IDEMPOTENCY v5.1 this
+        // is a contract violation.
+        if (auditErr instanceof IdempotencyBodyMismatchError) {
+          return reply
+            .code(409)
+            .send(
+              makeErrorEnvelope(
+                req.id,
+                'internal.idempotency.body_mismatch',
+                'Idempotency key already used with a different request body.',
+              ),
+            );
+        }
         throw auditErr;
       }
-      return reply
-        .code(409)
-        .send(
-          makeErrorEnvelope(
-            req.id,
-            'internal.resource.conflict',
-            'Medication request state conflict.',
-          ),
-        );
     }
     throw err;
   }

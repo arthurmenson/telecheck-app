@@ -43,6 +43,8 @@
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { asMedicationRequestId } from '../../../../lib/glossary.js';
+import type { IdempotencyCtx } from '../../../../lib/idempotency.js';
+import { withIdempotency } from '../../../../lib/idempotency.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import { asAccountId, findAccountById } from '../../../identity/index.js';
@@ -835,56 +837,88 @@ export class ApprovalI012RejectionAuditAnchorMissingError extends Error {
 
 /**
  * Emit `prescribing.execution_rejected` for a clinician_approve attempt
- * that failed the I-012 reject-unless three-clause rule. MUST be called
- * by the HTTP handler AFTER `withIdempotentExecution` has returned (the
- * outer writing tx has rolled back; the audit-chain advisory lock has
- * been released).
+ * that failed the I-012 reject-unless three-clause rule, AND atomically
+ * persist a completed `idempotency_keys` row keyed by the request's
+ * Idempotency-Key 4-tuple so future retries with the same key + body
+ * replay the 409 instead of re-emitting the rejection audit.
  *
- * Resolves the row's `patient_account_id` INTERNALLY in the same fresh
- * tx as the rejection emission so there is no caller-supplied
- * patient-id path the handler could accidentally skip (Codex PR G R2
- * HIGH closure 2026-05-13: the prior caller-supplied design allowed a
- * pre-lookup-null branch to silently bypass the emission, violating
- * I-003 bare-suppression-forbidden + I-012 rejection-audit-event rule).
- * If the post-rollback lookup returns null, throws
- * `ApprovalI012RejectionAuditAnchorMissingError` — the handler MUST
- * surface this as 500 rather than the canonical 409 so ops sees the
- * anomaly.
+ * MUST be called by the HTTP handler AFTER `withIdempotentExecution`
+ * has returned (the outer writing tx has rolled back; the audit-chain
+ * advisory lock has been released).
+ *
+ * Design (post-Codex PR G R3 HIGH closure 2026-05-13):
+ *
+ *   1. Open a fresh tx (the outer writing tx has rolled back; the
+ *      advisory lock per (tenant_id, patient_id) is released).
+ *   2. Call `withIdempotency` inside the fresh tx. The body callback:
+ *      - Resolves the row's patient_account_id from a fresh repo
+ *        lookup (no caller-supplied path; eliminates the
+ *        bare-suppression bypass closed in R2).
+ *      - Throws ApprovalI012RejectionAuditAnchorMissingError if the
+ *        row is gone (operational anomaly; handler maps to 500).
+ *      - Emits prescribing.execution_rejected (Category A; clinician
+ *        carve-out workload+autonomy 'n/a').
+ *      - Returns `{ status: 409, body: rejectionEnvelope }`. This
+ *        body is what `withIdempotency` writes to the idempotency
+ *        cache, so the next replay with the same key + body gets
+ *        replied verbatim from the cache (no re-emission).
+ *   3. Returns `{ status, body }` to the handler so it can `reply`.
+ *
+ * Concurrent-retry semantics:
+ *   - If the original failed request's idempotency reservation was
+ *     rolled back along with its writing tx, this fresh call reserves
+ *     anew + completes — the canonical happy-path-of-the-failure.
+ *   - If a concurrent retry races us, `withIdempotency` throws
+ *     `IdempotencyReplayError` (other tx already completed) or
+ *     `IdempotencyInFlightError` (other tx is mid-emission); the
+ *     handler maps both to a cached-or-409 reply. The audit emits at
+ *     most once per (tenant, key, endpoint, actor) 4-tuple.
  *
  * Workload/autonomy envelope: 'n/a'/'n/a' per the clinician-only route.
+ *
+ * `rejectionEnvelope` is the response body the handler intends to send
+ * on a successful audit emission (a `makeErrorEnvelope`-shaped
+ * conflict). Caching the envelope means retries get a byte-identical
+ * replay including the original request_id — by IDEMPOTENCY v5.1
+ * design.
  */
 export async function emitApprovalI012RejectionAudit(
   ctx: TenantContext,
   actor: { accountId: string },
   medicationRequestId: MedicationRequestId,
   violatedClauses: I012RejectError['violated_clauses'],
-): Promise<void> {
-  await withTransaction(async (rejTx) => {
+  idempotencyCtx: IdempotencyCtx,
+  rejectionEnvelope: unknown,
+): Promise<{ status: number; body: unknown }> {
+  return withTransaction(async (rejTx) => {
     await rejTx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
-    const current = await medicationRequestRepo.findById(
-      ctx.tenantId,
-      medicationRequestId,
-      rejTx,
-    );
-    if (current === null) {
-      throw new ApprovalI012RejectionAuditAnchorMissingError(medicationRequestId);
-    }
-    await emitPrescribingExecutionRejected(
-      {
-        tenantId: ctx.tenantId,
-        patientAccountId: current.patient_account_id,
+    return withIdempotency(rejTx, idempotencyCtx, async () => {
+      const current = await medicationRequestRepo.findById(
+        ctx.tenantId,
         medicationRequestId,
-        countryOfCare: ctx.countryOfCare,
-        attemptedActorType: 'clinician',
-        attemptedActorId: actor.accountId,
-        attemptedAiWorkloadType: 'n/a',
-        attemptedAutonomyLevel: 'n/a',
-        violatedClauses,
-        confirmationEventState: 'absent',
-        rbacRoleCheckResult: 'authorized',
-        detail: {},
-      },
-      rejTx,
-    );
+        rejTx,
+      );
+      if (current === null) {
+        throw new ApprovalI012RejectionAuditAnchorMissingError(medicationRequestId);
+      }
+      await emitPrescribingExecutionRejected(
+        {
+          tenantId: ctx.tenantId,
+          patientAccountId: current.patient_account_id,
+          medicationRequestId,
+          countryOfCare: ctx.countryOfCare,
+          attemptedActorType: 'clinician',
+          attemptedActorId: actor.accountId,
+          attemptedAiWorkloadType: 'n/a',
+          attemptedAutonomyLevel: 'n/a',
+          violatedClauses,
+          confirmationEventState: 'absent',
+          rbacRoleCheckResult: 'authorized',
+          detail: {},
+        },
+        rejTx,
+      );
+      return { status: 409, body: rejectionEnvelope };
+    });
   });
 }
