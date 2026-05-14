@@ -25,10 +25,11 @@
  *   - AUDIT_EVENTS v5.3 §Category A `crisis_detection_trigger`
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { withTransaction } from '../../src/lib/db.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
+import { logger } from '../../src/lib/logger.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import { type AICrisisDetectionSource, runCrisisGate } from '../../src/modules/ai-service/index.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
@@ -277,6 +278,47 @@ describe('runCrisisGate — positive detection path', () => {
       expect(r2.audit_error?.message).toMatch(/Refusing to emit a mislabeled FLOOR-020 envelope/);
     }
     expect(await countCrisisAudits(ctx2.resourceId)).toBe(0);
+  });
+});
+
+describe('runCrisisGate — operational signaling (Codex PR F R11 HIGH closure)', () => {
+  it('audit-emission failure emits an unavoidable error-level log line for ops alerting', async () => {
+    // Per Codex PR F R11 HIGH closure 2026-05-13: when the audit
+    // emission fails (either runtime infrastructure OR caller-
+    // wiring validation), the gate emits an `event:
+    // 'crisis_audit_emission_failed'` error-level log so
+    // PagerDuty / log-based alerting fires regardless of whether
+    // the caller checks `audit_emitted`. The patient still gets
+    // the crisis-resource sentinel (safety contract preserved).
+    const errSpy = vi.spyOn(logger, 'error');
+    try {
+      // Trigger a wiring-error path (mismatched detectionSource +
+      // resourceType per R1) so the audit emission inside the
+      // safety envelope fails.
+      const ctx = baseCtx(); // ai_chat_session
+      const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_case_prep_input');
+      expect(r.kind).toBe('crisis');
+      if (r.kind === 'crisis') {
+        expect(r.audit_emitted).toBe(false);
+      }
+
+      // The log MUST have fired with the canonical shape.
+      const errorCall = errSpy.mock.calls.find((args) => {
+        const obj = args[0] as Record<string, unknown> | undefined;
+        return obj?.['event'] === 'crisis_audit_emission_failed';
+      });
+      expect(errorCall).toBeDefined();
+      const obj = errorCall![0] as Record<string, unknown>;
+      expect(obj['tenant_id']).toBe(T_US);
+      expect(obj['resource_id']).toBe(ctx.resourceId);
+      expect(obj['detection_source']).toBe('ai_case_prep_input');
+      expect(typeof obj['audit_error_message']).toBe('string');
+      // PHI: crisis text must NOT appear in the log payload.
+      const logStr = JSON.stringify(errorCall);
+      expect(logStr).not.toContain("don't want to live");
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 });
 

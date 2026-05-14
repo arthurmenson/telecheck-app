@@ -55,6 +55,7 @@ import { crisisDetector } from '../../../../lib/crisis-detection.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withTransaction } from '../../../../lib/db.js';
 import type { IdempotencyCtx } from '../../../../lib/idempotency.js';
+import { logger } from '../../../../lib/logger.js';
 
 import {
   type AICrisisAuditEnvelope,
@@ -406,6 +407,30 @@ export async function runCrisisGate(
     } else {
       auditError = { name: 'unknown', message: String(err) };
     }
+    // Per Codex PR F R11 HIGH closure 2026-05-13: do not rely on
+    // the caller noticing `audit_emitted: false`. Emit an
+    // unavoidable operational signal via the production logger
+    // (error-level) so PagerDuty / alerting pipelines fire on the
+    // log stream regardless of what the caller does with the
+    // returned flag. Includes tenant + resource + source + crisis-
+    // type metadata for triage. Crisis text content is NOT logged
+    // (same PHI guarantee as the audit detail).
+    logger.error(
+      {
+        event: 'crisis_audit_emission_failed',
+        tenant_id: ctx.tenantId,
+        resource_type: ctx.resourceType,
+        resource_id: ctx.resourceId,
+        ai_actor_id: ctx.aiActorId,
+        detection_source: detectionSource,
+        crisis_type: outcome.crisisType,
+        audit_error_name: auditError.name,
+        audit_error_message: auditError.message,
+      },
+      'I-019 crisis_detection_trigger audit emission failed; crisis-resource ' +
+        'response was still surfaced to the patient per FLOOR-020 crisis-write ' +
+        'exception. Triage immediately.',
+    );
   }
 
   return {
