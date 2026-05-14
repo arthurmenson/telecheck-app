@@ -160,10 +160,14 @@ describe('runCrisisGate — positive detection path', () => {
         [T_US, ctx.resourceId],
       );
       expect(rows.rows[0]!.payload['detection_source']).toBe('ai_chat_output');
-      // Per FLOOR-020 + I-019, the response_provided flag captures
-      // whether the surface delivered crisis resources — the
-      // canonical-path value is true.
-      expect(rows.rows[0]!.payload['response_provided']).toBe(true);
+      // Per Codex PR F R6 HIGH closure 2026-05-13: the gate emits
+      // `response_provided: false` because at gate time the response
+      // has not yet been delivered. The caller is on the hook to emit
+      // a follow-up delivery-outcome audit if crisis resources actually
+      // reach the patient. Hard-coding `true` here would create a
+      // durable record claiming delivery occurred when the handler
+      // may still crash before serializing the response.
+      expect(rows.rows[0]!.payload['response_provided']).toBe(false);
       // PHI: the text content itself is NOT captured in the audit
       // detail. Verify that the input text doesn't leak.
       const payloadStr = JSON.stringify(rows.rows[0]!.payload);
@@ -416,6 +420,59 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     );
     expect(r2.kind).toBe('crisis');
     expect(await countCrisisAudits(ctx2.resourceId)).toBe(1);
+  });
+
+  it('multi-segment scan of the SAME resource emits per-segment via auditDedupeDiscriminator', async () => {
+    // Per Codex PR F R6 HIGH closure 2026-05-13: a handler that scans
+    // multiple segments of the same resource for the same source
+    // within one idempotent request (e.g., case-prep over
+    // chief_complaint + history_of_present_illness + review_of_systems
+    // separately on the same consult) MUST emit one audit per
+    // segment. The caller-supplied `auditDedupeDiscriminator` (a
+    // non-PHI segment id) extends the dedupe key so each segment
+    // claims its own marker.
+    const shared = baseCtx({ resourceId: `aiwfe_${ulid()}` });
+    const idempotency = {
+      tenantId: T_US,
+      idempotencyKey: ulid(),
+      endpoint: 'POST /v0/ai/case-prep',
+      actorId: 'clinician_xyz',
+      bodyHash: 'c'.repeat(64),
+    };
+    const baseCaseCtx = {
+      ...shared,
+      aiActorId: 'system:ai_mode_2_case_prep',
+      resourceType: 'ai_workflow_execution' as const,
+      idempotencyCtx: idempotency,
+    };
+
+    // Segment 1: chief_complaint
+    const r1 = await runCrisisGate(
+      { ...baseCaseCtx, auditDedupeDiscriminator: 'chief_complaint' },
+      'patient reports persistent suicidal ideation',
+      'ai_case_prep_input',
+    );
+    expect(r1.kind).toBe('crisis');
+    expect(await countCrisisAudits(shared.resourceId)).toBe(1);
+
+    // Segment 2: history_of_present_illness — same resource, same
+    // source, same idempotency, DIFFERENT discriminator → fresh audit.
+    const r2 = await runCrisisGate(
+      { ...baseCaseCtx, auditDedupeDiscriminator: 'history_of_present_illness' },
+      'patient describes thoughts of self-harm over the past week',
+      'ai_case_prep_input',
+    );
+    expect(r2.kind).toBe('crisis');
+    expect(await countCrisisAudits(shared.resourceId)).toBe(2);
+
+    // Retry of segment 1 (same discriminator) → still deduped.
+    const r3 = await runCrisisGate(
+      { ...baseCaseCtx, auditDedupeDiscriminator: 'chief_complaint' },
+      'patient reports persistent suicidal ideation',
+      'ai_case_prep_input',
+    );
+    expect(r3.kind).toBe('crisis');
+    expect(await countCrisisAudits(shared.resourceId)).toBe(2); // unchanged
   });
 
   it('idempotencyCtx.tenantId !== ctx.tenantId throws loud (no cross-tenant marker)', async () => {

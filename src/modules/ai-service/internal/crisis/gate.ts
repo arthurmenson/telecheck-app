@@ -112,6 +112,20 @@ export interface CrisisGateContext {
    *  2026-05-13 — same pattern as forms-intake's submission-service
    *  runCrisisGate (Sprint 34 / SI-006). */
   idempotencyCtx?: IdempotencyCtx;
+  /** Caller-supplied non-PHI discriminator for multi-scan dedupe
+   *  cases. The dedupe key already includes detectionSource + the
+   *  surface resourceId, which handles the typical input-vs-output
+   *  and multi-resource flows. But a handler that scans MULTIPLE
+   *  segments of the same resource for the same source within ONE
+   *  idempotent request (e.g., a case-prep handler that runs the
+   *  gate over chief_complaint, history_of_present_illness, and
+   *  review_of_systems separately for the same consult) MUST pass a
+   *  stable per-segment id (e.g., `'chief_complaint'`) here so each
+   *  positive scan emits its own audit. Reusing the same value on a
+   *  retry preserves dedupe semantics. MUST NOT contain PHI; use
+   *  field names, slot ids, or hashes — not text content. Per Codex
+   *  PR F R6 HIGH closure 2026-05-13. */
+  auditDedupeDiscriminator?: string;
 }
 
 /**
@@ -279,7 +293,9 @@ export async function runCrisisGate(
           endpoint: ctx.idempotencyCtx.endpoint,
           actorId: ctx.idempotencyCtx.actorId,
           bodyHash: ctx.idempotencyCtx.bodyHash,
-          auditAction: `crisis_detection_trigger:${detectionSource}:${ctx.resourceId}`,
+          auditAction:
+            `crisis_detection_trigger:${detectionSource}:${ctx.resourceId}` +
+            (ctx.auditDedupeDiscriminator !== undefined ? `:${ctx.auditDedupeDiscriminator}` : ''),
         });
         if (!claimed) {
           // Prior attempt already emitted this exact audit on this
@@ -299,7 +315,19 @@ export async function runCrisisGate(
           crisisType: outcome.crisisType,
           resourceType: ctx.resourceType,
           resourceId: ctx.resourceId,
-          responseProvided: true, // canonical path: caller WILL surface crisis resources
+          // Per Codex PR F R6 HIGH closure 2026-05-13: response_provided
+          // is `false` on the detection-trigger audit. The gate runs
+          // BEFORE the response, so it cannot observe whether crisis
+          // resources were actually delivered to the patient. Hard-
+          // coding `true` here would create a durable record claiming
+          // delivery occurred when the handler may still crash before
+          // serializing the response — exactly the failure path this
+          // field exists to expose. Caller is on the hook to emit a
+          // follow-up delivery-outcome audit if/when the crisis-
+          // resource envelope successfully reaches the patient. Matches
+          // forms-intake's runCrisisGate emit (which omits the field
+          // entirely; AI-side keeps it for ops-query parity).
+          responseProvided: false,
           escalationDestination: ctx.escalationDestination,
           auditEnvelope,
         },
