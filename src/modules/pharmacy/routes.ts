@@ -57,8 +57,7 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'pharmacy',
-    phase:
-      'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
+    phase: 'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
     schema_ratified: true,
     schema_ratified_at: '2026-05-11',
     schema_ratified_by: 'P-011',
@@ -98,8 +97,7 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'pharmacy',
-      phase:
-        'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
+      phase: 'schema_ratified_read_and_write_wired_supersession_landed_clinician_modify_pending',
       pending: 'TLC-055 PR K (clinician_modify re-route)',
       pending_message:
         'Module is not yet fully ready to serve traffic — read surface (PR C), ' +

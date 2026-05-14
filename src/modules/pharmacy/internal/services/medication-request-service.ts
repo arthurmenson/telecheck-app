@@ -1280,36 +1280,60 @@ export async function supersedeByClinician(
     // activation envelope. I-012 guard mirrors the non-supersession
     // approveAsClinician path. I012RejectError bubbles to the handler
     // for post-rollback rejection emission (Codex PR G R1/R2/R3 closures).
-    const updated = await medicationRequestRepo.transitionStatus(
-      {
-        id: newMedicationRequestId,
-        tenant_id: ctx.tenantId,
-        expected_from_status: 'pending_clinician_review',
-        to_status: 'active',
-        event: 'clinician_approve',
-        prescribed_by_clinician_account_id: actor.accountId,
-        prescribed_at: prescribedAt,
-        supersedes_id: oldMedicationRequestId,
-        pending_transition: {
+    let updated: MedicationRequest | null;
+    try {
+      updated = await medicationRequestRepo.transitionStatus(
+        {
+          id: newMedicationRequestId,
           tenant_id: ctx.tenantId,
-          action_id: newMedicationRequestId,
-          patient_account_id: newRow.patient_account_id,
-          actor_id: actor.accountId,
-          protocol_id: null,
-          protocol_version: null,
+          expected_from_status: 'pending_clinician_review',
+          to_status: 'active',
+          event: 'clinician_approve',
+          prescribed_by_clinician_account_id: actor.accountId,
+          prescribed_at: prescribedAt,
+          supersedes_id: oldMedicationRequestId,
+          pending_transition: {
+            tenant_id: ctx.tenantId,
+            action_id: newMedicationRequestId,
+            patient_account_id: newRow.patient_account_id,
+            actor_id: actor.accountId,
+            protocol_id: null,
+            protocol_version: null,
+          },
+          i012_guard: {
+            route: 'clinician_approve',
+            confirmation_event_audit_id: approvedAudit.audit_id,
+            attested_tenant_id: ctx.tenantId,
+            attested_action_id: newMedicationRequestId,
+            attested_patient_account_id: newRow.patient_account_id,
+            attested_actor_id: actor.accountId,
+            confirming_actor_rbac_authorized: true,
+          },
         },
-        i012_guard: {
-          route: 'clinician_approve',
-          confirmation_event_audit_id: approvedAudit.audit_id,
-          attested_tenant_id: ctx.tenantId,
-          attested_action_id: newMedicationRequestId,
-          attested_patient_account_id: newRow.patient_account_id,
-          attested_actor_id: actor.accountId,
-          confirming_actor_rbac_authorized: true,
-        },
-      },
-      tx,
-    );
+        tx,
+      );
+    } catch (err) {
+      // Codex PR J R2 MEDIUM closure 2026-05-13: two concurrent
+      // supersessions targeting the SAME old row both try to set their
+      // respective new rows' supersedes_id = old.id. Migration 025's
+      // partial UNIQUE `uq_medication_requests_supersedes_unique` on
+      // (tenant_id, supersedes_id) WHERE supersedes_id IS NOT NULL
+      // fires on the second insert → Postgres SQLSTATE 23505. Without
+      // this catch, the error bubbles as a 500. Map to the canonical
+      // state-conflict path so the loser of the race gets 409 (the
+      // winner gets 200; never a 500).
+      if (
+        err instanceof Error &&
+        'code' in err &&
+        (err as Error & { code: string }).code === '23505' &&
+        'constraint' in err &&
+        (err as Error & { constraint?: string }).constraint ===
+          'uq_medication_requests_supersedes_unique'
+      ) {
+        throw new MedicationRequestStateConflictError(newMedicationRequestId, null);
+      }
+      throw err;
+    }
     if (updated === null) {
       throw new MedicationRequestStateConflictError(newMedicationRequestId, null);
     }
