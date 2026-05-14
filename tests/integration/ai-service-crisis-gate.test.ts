@@ -523,6 +523,43 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     expect(await countCrisisAudits(shared.resourceId)).toBe(2); // unchanged
   });
 
+  it('rejects invalid auditDedupeDiscriminator (empty / whitespace / colons / too long)', async () => {
+    // Per Codex PR F R8 HIGH closure 2026-05-13: discriminator must
+    // match /^[A-Za-z0-9_.-]{1,64}$/. Empty / whitespace / colon-
+    // bearing values could either match the no-discriminator case
+    // OR collide via colon-concatenation in the dedupe key.
+    const ctxFor = (discriminator: string) => ({
+      ...baseCtx({ resourceId: `aiwfe_${ulid()}` }),
+      aiActorId: 'system:ai_mode_2_case_prep',
+      resourceType: 'ai_workflow_execution' as const,
+      idempotencyCtx: {
+        tenantId: T_US,
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/case-prep',
+        actorId: 'clinician_xyz',
+        bodyHash: 'f'.repeat(64),
+      },
+      auditDedupeDiscriminator: discriminator,
+    });
+
+    const invalid = [
+      '', // empty
+      '   ', // whitespace
+      'has spaces', // space
+      'colon:value', // colon (would split the auditAction)
+      'a'.repeat(65), // too long
+      'bad/char', // slash
+      'tab\there', // tab
+    ];
+    for (const v of invalid) {
+      const ctx = ctxFor(v);
+      await expect(
+        runCrisisGate(ctx, 'patient reports persistent suicidal ideation', 'ai_case_prep_input'),
+      ).rejects.toThrow(/auditDedupeDiscriminator must match/);
+      expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
+    }
+  });
+
   it('idempotencyCtx.tenantId !== ctx.tenantId throws loud (no cross-tenant marker)', async () => {
     // Per Codex PR F R3 HIGH closure 2026-05-13: a caller wiring bug
     // that supplied an idempotencyCtx scoped to a different tenant

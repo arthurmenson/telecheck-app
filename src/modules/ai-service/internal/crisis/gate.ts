@@ -62,6 +62,15 @@ import {
   emitAICrisisDetectionTrigger,
 } from './audit.js';
 
+/**
+ * Tight character-set constraint for `auditDedupeDiscriminator`.
+ * Rejects empty strings, whitespace, colons (the dedupe-key
+ * delimiter), and PHI-shaped content. Allowed: 1..64 chars of
+ * [A-Za-z0-9_.-] — enough for field names, slot ids, and short
+ * hashes. Per Codex PR F R8 HIGH closure 2026-05-13.
+ */
+const AUDIT_DEDUPE_DISCRIMINATOR_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
 export type CrisisGateOutcome =
   | {
       kind: 'no_crisis';
@@ -272,6 +281,23 @@ export async function runCrisisGate(
         `segment discriminator the dedupe marker would silently suppress later ` +
         `positive detections. Supply a non-PHI segment id (e.g., a field name).`,
     );
+  }
+
+  // Discriminator shape validation: empty string, whitespace, or
+  // delimiter-bearing values would either match the no-discriminator
+  // case OR collide across distinct segments via the colon-
+  // concatenation in the dedupe key. Constrain to a tight character
+  // set so multi-segment dedupe semantics are guaranteed. Per Codex
+  // PR F R8 HIGH closure 2026-05-13.
+  if (ctx.auditDedupeDiscriminator !== undefined) {
+    if (!AUDIT_DEDUPE_DISCRIMINATOR_RE.test(ctx.auditDedupeDiscriminator)) {
+      throw new Error(
+        `runCrisisGate: auditDedupeDiscriminator must match ` +
+          `${AUDIT_DEDUPE_DISCRIMINATOR_RE.source} (1..64 chars from ` +
+          `[A-Za-z0-9_.-]; no colons, whitespace, or PHI). Got: ` +
+          `${JSON.stringify(ctx.auditDedupeDiscriminator)}`,
+      );
+    }
   }
 
   // Positive detection — emit the canonical Category A audit.
