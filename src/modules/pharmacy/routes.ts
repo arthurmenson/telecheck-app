@@ -98,15 +98,15 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
         'patient-origin write surface (PR D), clinician createDraft + submit ' +
         '(PR E), clinician_discontinue + adverse_event_discontinue (PR F), and ' +
         'the first I-012-gated activation clinician_approve (PR G 2026-05-13) ' +
-        'are all wired. Still pending: clinician_decline (pending_clinician_review ' +
-        '→ rejected; not I-012-gated), supersession write-path (active → ' +
-        'superseded paired with new draft → active, uses migration 026 deferred ' +
-        'trigger), and engine writeback (Med Interaction Engine flips ' +
-        'pending_interaction_check → pending_clinician_review). Mode 2 ' +
-        'protocol_authorized_prescribing route is intentionally NOT exposed at ' +
-        'v1.0 — it ships with the protocol engine slice. Per the async-consult ' +
-        'readiness-flip precedent, /ready flips to 200 only when the slice is ' +
-        'fully production-ready (every documented endpoint wired).',
+        'are all wired. Still pending TLC-055 PR H: clinician_decline ' +
+        '(pending_clinician_review → rejected; not I-012-gated), supersession ' +
+        'write-path (active → superseded paired with new draft → active, uses ' +
+        'migration 026 deferred trigger), and engine writeback (Med Interaction ' +
+        'Engine flips pending_interaction_check → pending_clinician_review). ' +
+        'Mode 2 protocol_authorized_prescribing route is intentionally NOT ' +
+        'exposed at v1.0 — it ships with the protocol engine slice. Per the ' +
+        'async-consult readiness-flip precedent, /ready flips to 200 only when ' +
+        'the slice is fully production-ready (every documented endpoint wired).',
     });
   });
 

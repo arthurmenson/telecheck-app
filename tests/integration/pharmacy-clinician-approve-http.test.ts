@@ -412,7 +412,7 @@ describe('pharmacy clinician approve — Group A: happy path', () => {
                 autonomy_level, category
            FROM audit_records
           WHERE tenant_id = $1
-            AND payload->>'medication_request_id' = $2
+            AND resource_id = $2
             AND action = 'prescribing.approved'`,
         [T_US, mrId],
       );
