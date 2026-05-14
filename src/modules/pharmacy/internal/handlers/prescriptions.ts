@@ -411,26 +411,14 @@ function mapWriteServiceError(err: unknown, reply: FastifyReply, reqId: string):
       );
     return true;
   }
-  // I012RejectError bubbles out of the approveAsClinician service when
-  // any of I-012's three reject-unless clauses fails. The audit chain
-  // already captured the precise violated_clauses via
-  // prescribing.execution_rejected; the public envelope collapses to a
-  // generic conflict to avoid leaking guard internals. For the v1.0
-  // clinician-only path this branch is defense-in-depth — every guard
-  // field is service-controlled — but it satisfies the I-012
-  // bare-suppression-forbidden rule (I-003).
-  if (err instanceof Error && err.name === 'I012RejectError') {
-    void reply
-      .code(409)
-      .send(
-        makeErrorEnvelope(
-          reqId,
-          'internal.resource.conflict',
-          'Medication request state conflict.',
-        ),
-      );
-    return true;
-  }
+  // I012RejectError is intentionally NOT mapped here. The approve
+  // handler catches it explicitly AFTER `withIdempotentExecution`
+  // returns so the rejection audit can emit in a fresh tx without
+  // deadlocking on the outer writing tx's audit hash-chain advisory
+  // lock (Codex PR G R1 HIGH closure 2026-05-13). Allowing it to
+  // propagate here would emit the 409 envelope BEFORE the rejection
+  // audit lands, defeating the I-003 / I-012 bare-suppression-forbidden
+  // rule.
   return false;
 }
 
@@ -1044,13 +1032,70 @@ export async function approveMedicationRequestHandler(
     throw err;
   }
 
-  return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
-    const updated = await medicationRequestService.approveAsClinician(
-      ctx,
-      { accountId: actor.accountId },
-      id,
-      tx,
-    );
-    return { status: 200, view: toPatientMedicationRequestView(updated) };
-  });
+  // Capture the row's patient_account_id BEFORE the writing tx so the
+  // I-012 rejection audit (if it fires) can populate its envelope after
+  // the outer tx has rolled back. The audit-emission cannot rely on a
+  // post-rollback re-fetch of the row because the row was never
+  // mutated; we just need a value that was true at request-arrival
+  // time. The lookup itself runs outside any externalTx so it doesn't
+  // hold the hash-chain advisory lock.
+  let rowPatientAccountId: string | null = null;
+  try {
+    rowPatientAccountId = await medicationRequestService.lookupPatientAccountIdForApprove(ctx, id);
+  } catch {
+    // The lookup is best-effort for the rejection-audit envelope; if it
+    // fails (e.g., row vanished mid-request), we fall back to a sentinel
+    // in the emitter. The main approval path below performs its own
+    // lookup inside the writing tx and will surface the canonical
+    // not-found / state-conflict response.
+  }
+
+  try {
+    return await withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+      const updated = await medicationRequestService.approveAsClinician(
+        ctx,
+        { accountId: actor.accountId },
+        id,
+        tx,
+      );
+      return { status: 200, view: toPatientMedicationRequestView(updated) };
+    });
+  } catch (err) {
+    // I-012 reject-unless violation. The writing tx (inside
+    // withIdempotentExecution) has rolled back; the audit hash-chain
+    // advisory lock is released. Emit prescribing.execution_rejected in
+    // a fresh tx per AUDIT_EVENTS v5.3 §I-012 reject-unless
+    // rejection-audit-event rule; bare suppression forbidden per I-003.
+    if (err instanceof Error && err.name === 'I012RejectError') {
+      const violatedClauses = ((err as Error & { violated_clauses?: readonly string[] })
+        .violated_clauses ?? []) as Parameters<
+        typeof medicationRequestService.emitApprovalI012RejectionAudit
+      >[4];
+      // Skip the rejection emission only when we couldn't determine the
+      // patient_account_id. This is a degenerate case (row vanished
+      // between body-validation and approve attempt) where the row
+      // doesn't exist anyway; the I-012 rejection cannot reference a
+      // patient that doesn't exist. The fall-through 409 is still
+      // returned so the client gets a deterministic response.
+      if (rowPatientAccountId !== null) {
+        await medicationRequestService.emitApprovalI012RejectionAudit(
+          ctx,
+          { accountId: actor.accountId },
+          id,
+          rowPatientAccountId,
+          violatedClauses,
+        );
+      }
+      return reply
+        .code(409)
+        .send(
+          makeErrorEnvelope(
+            req.id,
+            'internal.resource.conflict',
+            'Medication request state conflict.',
+          ),
+        );
+    }
+    throw err;
+  }
 }

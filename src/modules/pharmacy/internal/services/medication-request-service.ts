@@ -668,164 +668,206 @@ export async function approveAsClinician(
   medicationRequestId: MedicationRequestId,
   externalTx?: DbTransaction,
 ): Promise<MedicationRequest> {
-  // Stash the row's patient_account_id outside the writing tx so the
-  // I-012 rejection audit (if it fires) can populate the envelope after
-  // the outer tx rolled back.
-  let patientAccountIdForRejectionAudit: string | null = null;
+  // Note on the I-012 rejection path (Codex PR G R1 HIGH closure
+  // 2026-05-13): the I012RejectError that may bubble out of
+  // transitionStatus → validateTransition is NOT caught here. An earlier
+  // draft emitted prescribing.execution_rejected from a nested
+  // withTransaction inside this catch block, but when the service is
+  // called with an externalTx (the idempotency wrapper's outer tx), the
+  // outer tx is still open at catch time — the audit hash-chain
+  // pg_advisory_xact_lock per (tenant_id, patient_id) partition is still
+  // held by the prescribing.approved insert emitted in step 3. The fresh
+  // rejection-audit tx tries to acquire the same lock and blocks behind
+  // a tx that can only release the lock by returning, which is exactly
+  // what the catch block is preventing — a self-block until the
+  // statement_timeout fires.
+  //
+  // Correct discipline: the handler's `emitApprovalI012RejectionAudit`
+  // wrapper runs the rejection emission AFTER `withIdempotentExecution`
+  // has returned (the outer tx has rolled back, the lock has been
+  // released). The service surfaces I012RejectError unchanged; the
+  // handler catches it post-rollback, emits the rejection audit in a
+  // clean fresh tx, and returns 409. Bare suppression is still
+  // forbidden per I-003 — the rejection emission is mandatory on every
+  // I012RejectError path that reaches the handler.
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
 
-  try {
-    return await withTransaction(async (tx) => {
-      await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
-
-      // Step 1: load by id (tenant-scoped via RLS + explicit predicate).
-      const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
-      if (current === null) {
-        throw new MedicationRequestNotFoundError(medicationRequestId);
-      }
-      patientAccountIdForRejectionAudit = current.patient_account_id;
-
-      // Step 2: status precondition — only 'pending_clinician_review'
-      // rows are approvable. State Machines v1.2 §19 admits no other
-      // source state for clinician_approve.
-      if (current.status !== 'pending_clinician_review') {
-        throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
-      }
-
-      const prescribedAt = new Date();
-
-      // Step 3: emit prescribing.approved FIRST (the I-012 confirmation
-      // event for the clinician_approve route per the §19 §19.X
-      // discrimination: "the confirmation event IS the prescribing.approved
-      // emission itself"). action_id == medicationRequestId per the
-      // state-machine §9 convention. Workload/autonomy envelope: 'n/a'/'n/a'
-      // (clinician-only carve-out; no upstream AI workload contributed).
-      const approvedAudit = await emitPrescribingApproved(
-        {
-          tenantId: ctx.tenantId,
-          patientAccountId: current.patient_account_id,
-          medicationRequestId,
-          countryOfCare: ctx.countryOfCare,
-          clinicianAccountId: actor.accountId,
-          detail: {},
-        },
-        tx,
-      );
-
-      // Step 4: transitionStatus with the I-012 guard threading the
-      // just-emitted audit's id. validateTransition (inside transitionStatus)
-      // cross-checks the attested context against the pending_transition
-      // and throws I012RejectError on any clause failure.
-      const updated = await medicationRequestRepo.transitionStatus(
-        {
-          id: medicationRequestId,
-          tenant_id: ctx.tenantId,
-          expected_from_status: 'pending_clinician_review',
-          to_status: 'active',
-          event: 'clinician_approve',
-          prescribed_by_clinician_account_id: actor.accountId,
-          prescribed_at: prescribedAt,
-          // activation_envelope intentionally undefined for the
-          // clinician-only route per migration 025 CHECK (a) — row
-          // ai_workload_type / autonomy_level stay null.
-          pending_transition: {
-            tenant_id: ctx.tenantId,
-            action_id: medicationRequestId,
-            patient_account_id: current.patient_account_id,
-            actor_id: actor.accountId,
-            protocol_id: null,
-            protocol_version: null,
-          },
-          i012_guard: {
-            route: 'clinician_approve',
-            confirmation_event_audit_id: approvedAudit.audit_id,
-            attested_tenant_id: ctx.tenantId,
-            attested_action_id: medicationRequestId,
-            attested_patient_account_id: current.patient_account_id,
-            attested_actor_id: actor.accountId,
-            confirming_actor_rbac_authorized: true,
-          },
-        },
-        tx,
-      );
-      if (updated === null) {
-        // Concurrent writer raced the optimistic-concurrency UPDATE
-        // (e.g., another clinician approved this row between step 2
-        // and step 4, or the row was patient-discontinued).
-        throw new MedicationRequestStateConflictError(medicationRequestId, null);
-      }
-
-      // Step 5: domain event medication_request.approved.v1 with
-      // approval_pathway='clinician_reviewed'. Carries the prescribing
-      // snapshot the downstream consumers need (Subscription binds new
-      // active rows; Notification dispatches patient + clinician alerts).
-      await emitMedicationRequestApproved(tx, {
-        tenantId: ctx.tenantId,
-        medicationRequestId,
-        occurredAt: prescribedAt,
-        patientAccountId: current.patient_account_id,
-        approvalPathway: 'clinician_reviewed',
-        prescriberAccountId: actor.accountId,
-        productCatalogId: current.product_catalog_id,
-        medication: {
-          code: current.product_catalog_id,
-          name: current.medication_name,
-          strength: current.strength,
-          formulation: current.formulation,
-        },
-        dosing: {
-          instructions: current.dose_instructions,
-          quantity: current.quantity,
-          quantity_unit: current.quantity_unit,
-          refills_allowed: current.refills_allowed,
-        },
-        interactionSignals: [],
-        overrides: [],
-        protocolId: null,
-        protocolVersion: null,
-        aiWorkloadType: null,
-        autonomyLevel: null,
-      });
-
-      return updated;
-    }, externalTx);
-  } catch (err) {
-    if (err instanceof I012RejectError) {
-      // I-012 rejection: per AUDIT_EVENTS v5.3 §I-012 reject-unless
-      // rejection-audit-event rule, emit prescribing.execution_rejected.
-      // The outer tx rolled back the prescribing.approved insert; emit
-      // the rejection in a fresh tx so it persists. Bare suppression is
-      // forbidden per I-003.
-      //
-      // For the v1.0 clinician-only path this branch is defense-in-depth
-      // — the I-012 guard fields are all derived from values the handler
-      // controls (row.patient_account_id, ctx.tenantId, actor.accountId,
-      // medicationRequestId, the just-emitted audit_id), so the only
-      // realistic failure mode is a service-layer bug. The branch still
-      // satisfies the invariant in case of cosmic-ray-level surprises.
-      if (patientAccountIdForRejectionAudit !== null) {
-        await withTransaction(async (rejTx) => {
-          await rejTx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
-          await emitPrescribingExecutionRejected(
-            {
-              tenantId: ctx.tenantId,
-              patientAccountId: patientAccountIdForRejectionAudit as string,
-              medicationRequestId,
-              countryOfCare: ctx.countryOfCare,
-              attemptedActorType: 'clinician',
-              attemptedActorId: actor.accountId,
-              attemptedAiWorkloadType: 'n/a',
-              attemptedAutonomyLevel: 'n/a',
-              violatedClauses: err.violated_clauses,
-              confirmationEventState: 'absent',
-              rbacRoleCheckResult: 'authorized',
-              detail: {},
-            },
-            rejTx,
-          );
-        });
-      }
-      throw err;
+    // Step 1: load by id (tenant-scoped via RLS + explicit predicate).
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    if (current === null) {
+      throw new MedicationRequestNotFoundError(medicationRequestId);
     }
-    throw err;
-  }
+
+    // Step 2: status precondition — only 'pending_clinician_review'
+    // rows are approvable. State Machines v1.2 §19 admits no other
+    // source state for clinician_approve.
+    if (current.status !== 'pending_clinician_review') {
+      throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
+    }
+
+    const prescribedAt = new Date();
+
+    // Step 3: emit prescribing.approved FIRST (the I-012 confirmation
+    // event for the clinician_approve route per the §19 §19.X
+    // discrimination: "the confirmation event IS the prescribing.approved
+    // emission itself"). action_id == medicationRequestId per the
+    // state-machine §9 convention. Workload/autonomy envelope: 'n/a'/'n/a'
+    // (clinician-only carve-out; no upstream AI workload contributed).
+    const approvedAudit = await emitPrescribingApproved(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: current.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        detail: {},
+      },
+      tx,
+    );
+
+    // Step 4: transitionStatus with the I-012 guard threading the
+    // just-emitted audit's id. validateTransition (inside transitionStatus)
+    // cross-checks the attested context against the pending_transition
+    // and throws I012RejectError on any clause failure. I012RejectError
+    // is intentionally NOT caught here (see top-of-function note) — it
+    // bubbles to the handler.
+    const updated = await medicationRequestRepo.transitionStatus(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        expected_from_status: 'pending_clinician_review',
+        to_status: 'active',
+        event: 'clinician_approve',
+        prescribed_by_clinician_account_id: actor.accountId,
+        prescribed_at: prescribedAt,
+        // activation_envelope intentionally undefined for the
+        // clinician-only route per migration 025 CHECK (a) — row
+        // ai_workload_type / autonomy_level stay null.
+        pending_transition: {
+          tenant_id: ctx.tenantId,
+          action_id: medicationRequestId,
+          patient_account_id: current.patient_account_id,
+          actor_id: actor.accountId,
+          protocol_id: null,
+          protocol_version: null,
+        },
+        i012_guard: {
+          route: 'clinician_approve',
+          confirmation_event_audit_id: approvedAudit.audit_id,
+          attested_tenant_id: ctx.tenantId,
+          attested_action_id: medicationRequestId,
+          attested_patient_account_id: current.patient_account_id,
+          attested_actor_id: actor.accountId,
+          confirming_actor_rbac_authorized: true,
+        },
+      },
+      tx,
+    );
+    if (updated === null) {
+      // Concurrent writer raced the optimistic-concurrency UPDATE
+      // (e.g., another clinician approved this row between step 2
+      // and step 4, or the row was patient-discontinued).
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    // Step 5: domain event medication_request.approved.v1 with
+    // approval_pathway='clinician_reviewed'. Carries the prescribing
+    // snapshot the downstream consumers need (Subscription binds new
+    // active rows; Notification dispatches patient + clinician alerts).
+    await emitMedicationRequestApproved(tx, {
+      tenantId: ctx.tenantId,
+      medicationRequestId,
+      occurredAt: prescribedAt,
+      patientAccountId: current.patient_account_id,
+      approvalPathway: 'clinician_reviewed',
+      prescriberAccountId: actor.accountId,
+      productCatalogId: current.product_catalog_id,
+      medication: {
+        code: current.product_catalog_id,
+        name: current.medication_name,
+        strength: current.strength,
+        formulation: current.formulation,
+      },
+      dosing: {
+        instructions: current.dose_instructions,
+        quantity: current.quantity,
+        quantity_unit: current.quantity_unit,
+        refills_allowed: current.refills_allowed,
+      },
+      interactionSignals: [],
+      overrides: [],
+      protocolId: null,
+      protocolVersion: null,
+      aiWorkloadType: null,
+      autonomyLevel: null,
+    });
+
+    return updated;
+  }, externalTx);
+}
+
+/**
+ * Best-effort lookup of the row's `patient_account_id` for the approve
+ * handler's I-012 rejection-audit envelope. Runs OUTSIDE any externalTx
+ * (opens its own short read-only tx) so it does not hold the audit
+ * hash-chain advisory lock — that's the lock the rejection-audit
+ * emission needs to acquire after the writing tx rolls back. Returns
+ * null when the row doesn't exist; the handler falls through to its
+ * canonical not-found / state-conflict response.
+ */
+export async function lookupPatientAccountIdForApprove(
+  ctx: TenantContext,
+  medicationRequestId: MedicationRequestId,
+): Promise<string | null> {
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    return current === null ? null : current.patient_account_id;
+  });
+}
+
+/**
+ * Emit `prescribing.execution_rejected` for a clinician_approve attempt
+ * that failed the I-012 reject-unless three-clause rule. MUST be called
+ * by the HTTP handler AFTER `withIdempotentExecution` has returned (the
+ * outer writing tx has rolled back; the audit-chain advisory lock has
+ * been released). Opens its own fresh transaction. Per I-003, bare
+ * suppression of the rejection emission is forbidden — the handler MUST
+ * call this whenever it observes an `I012RejectError` from
+ * `approveAsClinician`.
+ *
+ * `patientAccountId` is the row's `patient_account_id` resolved by the
+ * handler before the writing-tx call (or from a fresh repo lookup if
+ * the handler didn't capture it). The audit envelope's
+ * ai_workload_type / autonomy_level populate as 'n/a' per the
+ * clinician-only route's canonical sentinels.
+ */
+export async function emitApprovalI012RejectionAudit(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  medicationRequestId: MedicationRequestId,
+  patientAccountId: string,
+  violatedClauses: I012RejectError['violated_clauses'],
+): Promise<void> {
+  await withTransaction(async (rejTx) => {
+    await rejTx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+    await emitPrescribingExecutionRejected(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        attemptedActorType: 'clinician',
+        attemptedActorId: actor.accountId,
+        attemptedAiWorkloadType: 'n/a',
+        attemptedAutonomyLevel: 'n/a',
+        violatedClauses,
+        confirmationEventState: 'absent',
+        rbacRoleCheckResult: 'authorized',
+        detail: {},
+      },
+      rejTx,
+    );
+  });
 }
