@@ -134,6 +134,11 @@ export function asGuardrailTemplateId(s: string): GuardrailTemplateId {
 export interface Mode1ChatResponseView {
   ai_chat_session_id: AIChatSessionId;
   message_id: string;
+  /** Per AI_LAYERING v5.2 §6 (FLOOR-020) audit-envelope: patient_id
+   *  is a required field on every AI audit record. The wire response
+   *  carries it as well so the clinician-side audit-correlation
+   *  surface can reconstruct the chain without a second lookup. */
+  patient_id: string;
   source_type: 'ai';
   /** Canonical AI_LAYERING §6 audit-envelope mode discriminator.
    *  Surfaced in the response so frontends can branch on a single
@@ -142,8 +147,109 @@ export interface Mode1ChatResponseView {
   ai_workload_type: 'conversational_assistant';
   autonomy_level: 'advisory';
   guardrail_template_id: 'conservative_default';
-  model_version: string;
+  /** Per AI_LAYERING v5.2 §3 AI-GUARD-001: the guardrail template
+   *  version is logged on every response. Required field. */
+  guardrail_version: string;
+  /** Canonical audit-envelope field name `ai_model_version` (not
+   *  the shorter `model_version`) per AI_LAYERING v5.2 §6. Codex
+   *  PR C R1 HIGH closure 2026-05-14: wire-shape field names match
+   *  the canonical audit envelope so a clinician-side audit query
+   *  can correlate response ↔ audit row by attribute name. */
+  ai_model_version: string;
   escalation_triggered: boolean;
   crisis_detected: boolean;
   response_text: string;
+}
+
+// ---------------------------------------------------------------------------
+// Mode 2 case-prep response wire contract (PR C type-only at this stage).
+//
+// As with Mode 1 (PR B), the HTTP handler that returns this view is NOT
+// mounted at PR C. Mode 2 is protocol-execution: it prepares a clinical
+// case for clinician review per AI Clinical Assistant Slice PRD v1.0
+// §4.2. The clinician then approves/declines/modifies — the AI does
+// NOT prescribe. Per AI-ARCH-002 + I-012, Mode 2 auto-approve requires
+// 90-day track record + zero safety-critical disagreements + Clinical
+// Governance Lead sign-off + a formal ADR. At v1.0 every Mode 2 case
+// is physician-reviewed.
+//
+// The route is gated for the same reasons as Mode 1:
+//   - I-019: crisis detection runs on all conversation surfaces;
+//     case-prep inputs that include patient-reported symptoms can
+//     contain crisis text that must trigger the platform-floor
+//     detector + audit + escalation before any AI output is emitted
+//   - FLOOR-020: per-response audit emission boundary not yet
+//     established; AUDIT_EVENTS v5.3 enumerates Mode 2 success audits
+//     (`protocol_authorized_prescribing`,
+//     `prescribing.protocol_authorization_granted`) for the I-012
+//     pathway, but the canonical case-prep emission action ID is
+//     pending spec clarification
+//   - The case-prep recommendation feeds into the clinician's
+//     downstream decision; the path from "AI prepared a case" →
+//     "clinician approved a prescription" → "protocol-authorized
+//     prescribing" is bound by the I-012 reject-unless three-clause
+//     rule (per State Machines v1.2 §19 §19.X), and the case-prep
+//     side of that audit chain must land alongside the protocol
+//     engine integration
+//
+// Frontend / clinician-console integration: import the TYPE now;
+// the route comes online when PR D (provider) + PR E (guardrails) +
+// PR F (crisis detection) land + the protocol engine slice ships
+// alongside (deferred at v1.0 per pharmacy slice closure).
+//
+// Per AI_LAYERING v5.2 §2 (Mode 2 audit fields), the case-prep
+// envelope carries: consult_id, patient_id, protocol_id,
+// protocol_version, ai_model_version, recommendation, confidence,
+// concern_flags. Physician agreement is captured separately at
+// clinician decision time (AI-AGR-001) — NOT in this response.
+// ---------------------------------------------------------------------------
+
+export interface Mode2CasePrepResponseView {
+  ai_workflow_execution_id: AIWorkflowExecutionId;
+  /** The async-consult or other clinical anchor this case-prep
+   *  attaches to. Discriminator for the audit chain — Mode 2 audit
+   *  records carry consult_id, not session_id (Mode 1 uses
+   *  session_id). */
+  consult_id: string;
+  /** Required per AI_LAYERING v5.2 §6 audit envelope. */
+  patient_id: string;
+  source_type: 'ai';
+  /** Canonical AI_LAYERING §6 audit-envelope mode discriminator. */
+  ai_mode: 'mode_2';
+  ai_workload_type: 'protocol_execution';
+  /** Mode 2 ceiling per ADR-005 + I-012. Auto-approve (the reserved
+   *  `action_with_audit_only` / `fully_autonomous` levels) requires
+   *  successor ADR + activation audit event per ADR-029. */
+  autonomy_level: 'action_with_confirm';
+  /** Protocol that governed the case preparation (per Master PRD
+   *  §13.1 protocolized clinical autonomy). NEVER null at v1.0 —
+   *  Mode 2 always runs within a named protocol context. */
+  protocol_id: string;
+  protocol_version: string;
+  /** Canonical audit-envelope field name `ai_model_version` per
+   *  AI_LAYERING v5.2 §2 Mode 2 audit fields + §6 FLOOR-020. Codex
+   *  PR C R1 HIGH closure 2026-05-14. */
+  ai_model_version: string;
+  /** Canonical AI_LAYERING v5.2 §2 audit field name `recommendation`
+   *  (not the more-descriptive `recommendation_summary`) so the
+   *  wire shape and audit envelope share attribute names for
+   *  clinician-side audit-correlation. Codex PR C R1 HIGH closure. */
+  recommendation: string;
+  /** Self-reported confidence band (`low` | `medium` | `high`) per
+   *  AI_LAYERING v5.2 §2 Mode 2 audit fields. */
+  confidence: 'low' | 'medium' | 'high';
+  /** Concern flags the AI surfaced (e.g., interaction signals,
+   *  protocol-eligibility edges). Empty array if none. */
+  concern_flags: ReadonlyArray<string>;
+  /** Crisis-detection outcome (FLOOR-009 / I-019). FALSE when no
+   *  crisis indicators detected in case-prep inputs. */
+  crisis_detected: boolean;
+  /** Escalation outcome (FLOOR-013). FALSE when no escalation
+   *  conditions triggered. */
+  escalation_triggered: boolean;
+  // physician_agreement is NOT on the response — per AI-AGR-001 it's
+  // captured at clinician decision time on a separate audit event
+  // (`physician_agreement_recorded` or equivalent), not at AI
+  // response time. Including it here would conflate the AI's
+  // recommendation with the human's decision.
 }

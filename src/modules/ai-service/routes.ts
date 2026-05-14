@@ -41,7 +41,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'ai-service',
-    phase: 'type_contract_published_pr_b',
+    phase: 'type_contracts_published_pr_c',
     workload_types_at_v1: ['conversational_assistant', 'protocol_execution'],
     workload_types_reserved: ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'],
     autonomy_levels_at_v1: ['advisory', 'suggestion', 'action_with_confirm'],
@@ -49,6 +49,9 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     mode_1_chat_wire_contract_published: true,
     mode_1_chat_wire_contract_published_by:
       'TLC-AI PR B (Mode1ChatResponseView exported from module index; HTTP handler deliberately NOT mounted — requires I-019 crisis-detection wire-in + FLOOR-020 audit emission before /v0/ai/chat goes live; lands in PRs D + E + F)',
+    mode_2_case_prep_wire_contract_published: true,
+    mode_2_case_prep_wire_contract_published_by:
+      'TLC-AI PR C (Mode2CasePrepResponseView exported from module index; HTTP handler deliberately NOT mounted — same I-019 + FLOOR-020 gating as Mode 1, plus dependency on the protocol-engine integration that drives the I-012 reject-unless three-clause rule at the downstream prescribing boundary per State Machines v1.2 §19 §19.X)',
     handlers_wired: false,
     handlers_wired_tracking:
       'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
@@ -69,7 +72,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'ai-service',
-      phase: 'type_contract_published_pr_b',
+      phase: 'type_contracts_published_pr_c',
       pending:
         'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
       pending_message:

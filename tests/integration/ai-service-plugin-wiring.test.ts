@@ -64,7 +64,7 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('type_contract_published_pr_b');
+    expect(body.phase).toBe('type_contracts_published_pr_c');
     // Per AI_LAYERING v5.2 §10.2 + WORKLOAD_TAXONOMY v5.2 §2, the v1.0
     // active workload types are exactly `conversational_assistant` +
     // `protocol_execution`. Reserved types must be enumerated so a
@@ -101,7 +101,7 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     }>();
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('type_contract_published_pr_b');
+    expect(body.phase).toBe('type_contracts_published_pr_c');
     expect(body.pending).toContain('PR C');
     expect(body.pending_message).toContain('not yet ready');
     expect(body.pending_message).toContain('conversational_assistant');
@@ -142,7 +142,7 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     expect(readyUnknown.statusCode).toBe(503);
   });
 
-  it('§1d POST /v0/ai/chat is NOT mounted at PR B — Fastify returns 404 (Codex PR B R2 CRITICAL closure)', async () => {
+  it('§1d POST /v0/ai/chat is NOT mounted at PR B/C — Fastify returns 404 (Codex PR B R2 CRITICAL closure)', async () => {
     // Per Codex PR B R2 CRITICAL closure 2026-05-14, the Mode 1 chat
     // route is deliberately NOT registered until PR F lands the
     // I-019 crisis-detection wire-in + the FLOOR-020 audit-emission
@@ -163,6 +163,29 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
       url: '/v0/ai/chat',
       headers: { host: 'heroshealth.com', 'idempotency-key': ulid() },
       payload: { message: 'hi' },
+    });
+    expect(r.statusCode).toBe(404);
+  });
+
+  it('§1e POST /v0/ai/case-prep is NOT mounted at PR C — Fastify returns 404', async () => {
+    // Per Codex PR B R2 CRITICAL closure 2026-05-14 (applied to Mode 2
+    // by analogy at PR C), the Mode 2 case-prep route is deliberately
+    // NOT registered. Mode 2 inputs (clinician-supplied symptoms,
+    // patient notes) may contain crisis text that must trip the
+    // I-019 platform-floor detector + audit + escalation. The route
+    // is gated until PR F lands crisis detection AND the protocol-
+    // engine integration ships (the I-012 reject-unless three-clause
+    // rule at the downstream prescribing boundary per State Machines
+    // v1.2 §19 §19.X depends on it).
+    //
+    // Same Idempotency-Key trick as §1d so the route-not-found 404
+    // surfaces instead of being shadowed by the idempotency-plugin's
+    // missing-key 400.
+    const r = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/case-prep',
+      headers: { host: 'heroshealth.com', 'idempotency-key': ulid() },
+      payload: { consult_id: 'aiwfe_stub', protocol_id: 'p_stub' },
     });
     expect(r.statusCode).toBe(404);
   });

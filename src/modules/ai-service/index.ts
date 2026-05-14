@@ -64,6 +64,16 @@ export type {
 // already a known contract.
 export type { Mode1ChatResponseView } from './internal/types.js';
 
+// Mode 2 case-prep response wire contract — PR C type-only export.
+// Same gating posture as Mode 1: the route is NOT mounted until
+// crisis detection (PR F), per-response audit (PR E/F), real
+// provider (PR D), and the protocol-engine integration (which
+// drives the I-012 reject-unless three-clause rule at the
+// downstream prescribing boundary per State Machines v1.2 §19 §19.X)
+// are all in place. Clinician-console integration imports the type
+// now; the route comes online with PR F + the protocol engine slice.
+export type { Mode2CasePrepResponseView } from './internal/types.js';
+
 export {
   asAIChatSessionId,
   asAIWorkflowExecutionId,
