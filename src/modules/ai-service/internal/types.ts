@@ -134,6 +134,11 @@ export function asGuardrailTemplateId(s: string): GuardrailTemplateId {
 export interface Mode1ChatResponseView {
   ai_chat_session_id: AIChatSessionId;
   message_id: string;
+  /** Per AI_LAYERING v5.2 §6 (FLOOR-020) audit-envelope: patient_id
+   *  is a required field on every AI audit record. The wire response
+   *  carries it as well so the clinician-side audit-correlation
+   *  surface can reconstruct the chain without a second lookup. */
+  patient_id: string;
   source_type: 'ai';
   /** Canonical AI_LAYERING §6 audit-envelope mode discriminator.
    *  Surfaced in the response so frontends can branch on a single
@@ -142,7 +147,15 @@ export interface Mode1ChatResponseView {
   ai_workload_type: 'conversational_assistant';
   autonomy_level: 'advisory';
   guardrail_template_id: 'conservative_default';
-  model_version: string;
+  /** Per AI_LAYERING v5.2 §3 AI-GUARD-001: the guardrail template
+   *  version is logged on every response. Required field. */
+  guardrail_version: string;
+  /** Canonical audit-envelope field name `ai_model_version` (not
+   *  the shorter `model_version`) per AI_LAYERING v5.2 §6. Codex
+   *  PR C R1 HIGH closure 2026-05-14: wire-shape field names match
+   *  the canonical audit envelope so a clinician-side audit query
+   *  can correlate response ↔ audit row by attribute name. */
+  ai_model_version: string;
   escalation_triggered: boolean;
   crisis_detected: boolean;
   response_text: string;
@@ -198,6 +211,8 @@ export interface Mode2CasePrepResponseView {
    *  records carry consult_id, not session_id (Mode 1 uses
    *  session_id). */
   consult_id: string;
+  /** Required per AI_LAYERING v5.2 §6 audit envelope. */
+  patient_id: string;
   source_type: 'ai';
   /** Canonical AI_LAYERING §6 audit-envelope mode discriminator. */
   ai_mode: 'mode_2';
@@ -211,9 +226,15 @@ export interface Mode2CasePrepResponseView {
    *  Mode 2 always runs within a named protocol context. */
   protocol_id: string;
   protocol_version: string;
-  model_version: string;
-  /** AI's clinical summary for the reviewing clinician. */
-  recommendation_summary: string;
+  /** Canonical audit-envelope field name `ai_model_version` per
+   *  AI_LAYERING v5.2 §2 Mode 2 audit fields + §6 FLOOR-020. Codex
+   *  PR C R1 HIGH closure 2026-05-14. */
+  ai_model_version: string;
+  /** Canonical AI_LAYERING v5.2 §2 audit field name `recommendation`
+   *  (not the more-descriptive `recommendation_summary`) so the
+   *  wire shape and audit envelope share attribute names for
+   *  clinician-side audit-correlation. Codex PR C R1 HIGH closure. */
+  recommendation: string;
   /** Self-reported confidence band (`low` | `medium` | `high`) per
    *  AI_LAYERING v5.2 §2 Mode 2 audit fields. */
   confidence: 'low' | 'medium' | 'high';
@@ -226,4 +247,9 @@ export interface Mode2CasePrepResponseView {
   /** Escalation outcome (FLOOR-013). FALSE when no escalation
    *  conditions triggered. */
   escalation_triggered: boolean;
+  // physician_agreement is NOT on the response — per AI-AGR-001 it's
+  // captured at clinician decision time on a separate audit event
+  // (`physician_agreement_recorded` or equivalent), not at AI
+  // response time. Including it here would conflate the AI's
+  // recommendation with the human's decision.
 }
