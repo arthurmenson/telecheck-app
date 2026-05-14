@@ -88,10 +88,16 @@ export async function emitAICrisisDetectionTrigger(
     resourceType: 'ai_chat_session' | 'ai_workflow_execution';
     resourceId: string;
     /** Whether the surface DID surface crisis resources to the
-     *  patient (true on the canonical detection-fires path; false
-     *  only when the surface failed to deliver — recorded for ops
-     *  visibility). */
-    responseProvided: boolean;
+     *  patient. This is a DELIVERY-OBSERVATION, not a gate-time
+     *  prediction (per Codex PR F R9 HIGH closure 2026-05-13).
+     *  The gate emits with `null` because at gate-emission time
+     *  the response has not yet been delivered; a follow-up
+     *  delivery-outcome audit, emitted by the handler after the
+     *  crisis-resource envelope reaches the patient, is the
+     *  correct place for `true`/`false`. Callers that bypass the
+     *  gate (direct service emissions) and DO observe delivery
+     *  may pass the boolean directly. */
+    responseProvided: boolean | null;
     /** Crisis escalation destination per the tenant's CCR + the
      *  detected crisis type. Null when the destination cannot be
      *  resolved (the audit still fires; the caller's error path

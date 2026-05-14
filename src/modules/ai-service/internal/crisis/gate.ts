@@ -366,19 +366,17 @@ export async function runCrisisGate(
           crisisType: outcome.crisisType,
           resourceType: ctx.resourceType,
           resourceId: ctx.resourceId,
-          // Per Codex PR F R6 HIGH closure 2026-05-13: response_provided
-          // is `false` on the detection-trigger audit. The gate runs
-          // BEFORE the response, so it cannot observe whether crisis
-          // resources were actually delivered to the patient. Hard-
-          // coding `true` here would create a durable record claiming
-          // delivery occurred when the handler may still crash before
-          // serializing the response — exactly the failure path this
-          // field exists to expose. Caller is on the hook to emit a
-          // follow-up delivery-outcome audit if/when the crisis-
-          // resource envelope successfully reaches the patient. Matches
-          // forms-intake's runCrisisGate emit (which omits the field
-          // entirely; AI-side keeps it for ops-query parity).
-          responseProvided: false,
+          // Per Codex PR F R9 HIGH closure 2026-05-13:
+          // `response_provided` is a DELIVERY-OBSERVATION. The gate
+          // runs BEFORE the response, so it cannot observe whether
+          // crisis resources were actually delivered. R6 hard-coded
+          // `false` to remove the lie of `true`, but R9 noted that
+          // `false` is just as wrong: successful crisis-resource
+          // deliveries would all show as failures. The honest value
+          // at gate-emission time is `null` — meaning "unobserved,
+          // pending follow-up delivery audit emitted by the handler
+          // after the crisis-resource envelope reaches the patient."
+          responseProvided: null,
           escalationDestination: ctx.escalationDestination,
           auditEnvelope,
         },

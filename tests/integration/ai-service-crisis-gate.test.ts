@@ -160,14 +160,14 @@ describe('runCrisisGate — positive detection path', () => {
         [T_US, ctx.resourceId],
       );
       expect(rows.rows[0]!.payload['detection_source']).toBe('ai_chat_output');
-      // Per Codex PR F R6 HIGH closure 2026-05-13: the gate emits
-      // `response_provided: false` because at gate time the response
-      // has not yet been delivered. The caller is on the hook to emit
-      // a follow-up delivery-outcome audit if crisis resources actually
-      // reach the patient. Hard-coding `true` here would create a
-      // durable record claiming delivery occurred when the handler
-      // may still crash before serializing the response.
-      expect(rows.rows[0]!.payload['response_provided']).toBe(false);
+      // Per Codex PR F R9 HIGH closure 2026-05-13: the gate emits
+      // `response_provided: null` (unobserved) because at gate time
+      // the response has not been delivered. R6 used `false`, but
+      // that's just as wrong as the original `true` — successful
+      // deliveries would all show as failures. `null` signals
+      // "pending follow-up delivery audit emitted by the handler
+      // after the crisis-resource envelope reaches the patient."
+      expect(rows.rows[0]!.payload['response_provided']).toBeNull();
       // PHI: the text content itself is NOT captured in the audit
       // detail. Verify that the input text doesn't leak.
       const payloadStr = JSON.stringify(rows.rows[0]!.payload);
