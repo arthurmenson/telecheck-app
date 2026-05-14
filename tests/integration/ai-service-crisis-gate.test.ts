@@ -632,7 +632,7 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     // detectionSource. Must emit a SECOND audit.
     const r2 = await runCrisisGate(
       ctx,
-      'i am sorry to hear you are thinking about hurting yourself',
+      'i am sorry to hear you are having suicidal thoughts',
       'ai_chat_output',
     );
     expect(r2.kind).toBe('crisis');
