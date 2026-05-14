@@ -208,6 +208,26 @@ export async function runCrisisGate(
   // mismatch rather than producing a mislabeled audit row.
   const auditEnvelope = deriveAuditEnvelope(ctx.resourceType, detectionSource);
 
+  // Tenant equality guard: the gate's tenant_id is the authoritative
+  // tenant for both the audit row AND the dedupe marker. A caller
+  // wiring bug that passed an idempotencyCtx scoped to a different
+  // tenant would create or conflict on a marker under tenant B while
+  // the audit IS emitted under tenant A — or, worse, would short-
+  // circuit on tenant B's prior marker and return `audit_emitted:
+  // true` with no audit row for tenant A at all. The check runs
+  // BEFORE the try/catch envelope so the throw propagates as a
+  // programmer-error signal — distinct from the FLOOR-020 crisis-
+  // write exception which is reserved for runtime audit-write
+  // infrastructure failures. Per Codex PR F R3 HIGH closure
+  // 2026-05-13.
+  if (ctx.idempotencyCtx !== undefined && ctx.idempotencyCtx.tenantId !== ctx.tenantId) {
+    throw new Error(
+      `runCrisisGate: idempotencyCtx.tenantId=${ctx.idempotencyCtx.tenantId} ` +
+        `must equal ctx.tenantId=${ctx.tenantId}. Refusing to claim a dedupe ` +
+        `marker under a different tenant than the audit row.`,
+    );
+  }
+
   // Positive detection — emit the canonical Category A audit.
   // Per FLOOR-020 crisis-write exception: if the audit emission
   // fails, the caller still proceeds with the crisis-resource
@@ -239,7 +259,10 @@ export async function runCrisisGate(
         // `crisis_detection_trigger`; only the SHA-256 dedupe-key
         // material differs. Per Codex PR F R2 HIGH closure 2026-05-13.
         const claimed = await claimAuditDedupeSlot(tx, {
-          tenantId: ctx.idempotencyCtx.tenantId,
+          // Use ctx.tenantId (the gate's authoritative tenant) per
+          // Codex PR F R3 HIGH closure. The equality guard above
+          // ensures these match when idempotencyCtx is supplied.
+          tenantId: ctx.tenantId,
           idempotencyKey: ctx.idempotencyCtx.idempotencyKey,
           endpoint: ctx.idempotencyCtx.endpoint,
           actorId: ctx.idempotencyCtx.actorId,

@@ -339,6 +339,31 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     expect(await countCrisisAudits(ctx.resourceId)).toBe(2); // unchanged
   });
 
+  it('idempotencyCtx.tenantId !== ctx.tenantId throws loud (no cross-tenant marker)', async () => {
+    // Per Codex PR F R3 HIGH closure 2026-05-13: a caller wiring bug
+    // that supplied an idempotencyCtx scoped to a different tenant
+    // than the gate's ctx.tenantId could create or conflict on a
+    // marker under tenant B while the audit row is supposed to land
+    // under tenant A — or short-circuit on tenant B's marker and
+    // return `audit_emitted: true` with NO audit row for tenant A.
+    // The gate refuses to proceed.
+    const ctx = {
+      ...baseCtx(), // tenantId = T_US
+      idempotencyCtx: {
+        tenantId: 'Telecheck-Ghana', // WRONG tenant
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/chat',
+        actorId: 'patient_abc',
+        bodyHash: 'a'.repeat(64),
+      },
+    };
+    await expect(
+      runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input'),
+    ).rejects.toThrow(/must equal ctx.tenantId/);
+    // No audit row was emitted under either tenant.
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
+  });
+
   it('retry under DIFFERENT idempotency-key emits a fresh audit (dedupe scoped per key)', async () => {
     const baseCtxShared = baseCtx();
     const ctx1 = {
