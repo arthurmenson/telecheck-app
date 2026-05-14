@@ -147,3 +147,83 @@ export interface Mode1ChatResponseView {
   crisis_detected: boolean;
   response_text: string;
 }
+
+// ---------------------------------------------------------------------------
+// Mode 2 case-prep response wire contract (PR C type-only at this stage).
+//
+// As with Mode 1 (PR B), the HTTP handler that returns this view is NOT
+// mounted at PR C. Mode 2 is protocol-execution: it prepares a clinical
+// case for clinician review per AI Clinical Assistant Slice PRD v1.0
+// §4.2. The clinician then approves/declines/modifies — the AI does
+// NOT prescribe. Per AI-ARCH-002 + I-012, Mode 2 auto-approve requires
+// 90-day track record + zero safety-critical disagreements + Clinical
+// Governance Lead sign-off + a formal ADR. At v1.0 every Mode 2 case
+// is physician-reviewed.
+//
+// The route is gated for the same reasons as Mode 1:
+//   - I-019: crisis detection runs on all conversation surfaces;
+//     case-prep inputs that include patient-reported symptoms can
+//     contain crisis text that must trigger the platform-floor
+//     detector + audit + escalation before any AI output is emitted
+//   - FLOOR-020: per-response audit emission boundary not yet
+//     established; AUDIT_EVENTS v5.3 enumerates Mode 2 success audits
+//     (`protocol_authorized_prescribing`,
+//     `prescribing.protocol_authorization_granted`) for the I-012
+//     pathway, but the canonical case-prep emission action ID is
+//     pending spec clarification
+//   - The case-prep recommendation feeds into the clinician's
+//     downstream decision; the path from "AI prepared a case" →
+//     "clinician approved a prescription" → "protocol-authorized
+//     prescribing" is bound by the I-012 reject-unless three-clause
+//     rule (per State Machines v1.2 §19 §19.X), and the case-prep
+//     side of that audit chain must land alongside the protocol
+//     engine integration
+//
+// Frontend / clinician-console integration: import the TYPE now;
+// the route comes online when PR D (provider) + PR E (guardrails) +
+// PR F (crisis detection) land + the protocol engine slice ships
+// alongside (deferred at v1.0 per pharmacy slice closure).
+//
+// Per AI_LAYERING v5.2 §2 (Mode 2 audit fields), the case-prep
+// envelope carries: consult_id, patient_id, protocol_id,
+// protocol_version, ai_model_version, recommendation, confidence,
+// concern_flags. Physician agreement is captured separately at
+// clinician decision time (AI-AGR-001) — NOT in this response.
+// ---------------------------------------------------------------------------
+
+export interface Mode2CasePrepResponseView {
+  ai_workflow_execution_id: AIWorkflowExecutionId;
+  /** The async-consult or other clinical anchor this case-prep
+   *  attaches to. Discriminator for the audit chain — Mode 2 audit
+   *  records carry consult_id, not session_id (Mode 1 uses
+   *  session_id). */
+  consult_id: string;
+  source_type: 'ai';
+  /** Canonical AI_LAYERING §6 audit-envelope mode discriminator. */
+  ai_mode: 'mode_2';
+  ai_workload_type: 'protocol_execution';
+  /** Mode 2 ceiling per ADR-005 + I-012. Auto-approve (the reserved
+   *  `action_with_audit_only` / `fully_autonomous` levels) requires
+   *  successor ADR + activation audit event per ADR-029. */
+  autonomy_level: 'action_with_confirm';
+  /** Protocol that governed the case preparation (per Master PRD
+   *  §13.1 protocolized clinical autonomy). NEVER null at v1.0 —
+   *  Mode 2 always runs within a named protocol context. */
+  protocol_id: string;
+  protocol_version: string;
+  model_version: string;
+  /** AI's clinical summary for the reviewing clinician. */
+  recommendation_summary: string;
+  /** Self-reported confidence band (`low` | `medium` | `high`) per
+   *  AI_LAYERING v5.2 §2 Mode 2 audit fields. */
+  confidence: 'low' | 'medium' | 'high';
+  /** Concern flags the AI surfaced (e.g., interaction signals,
+   *  protocol-eligibility edges). Empty array if none. */
+  concern_flags: ReadonlyArray<string>;
+  /** Crisis-detection outcome (FLOOR-009 / I-019). FALSE when no
+   *  crisis indicators detected in case-prep inputs. */
+  crisis_detected: boolean;
+  /** Escalation outcome (FLOOR-013). FALSE when no escalation
+   *  conditions triggered. */
+  escalation_triggered: boolean;
+}
