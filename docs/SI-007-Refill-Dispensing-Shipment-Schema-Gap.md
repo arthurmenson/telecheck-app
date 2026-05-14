@@ -3,7 +3,7 @@
 **Raised by:** Engineering (autonomous turn 2026-05-14)
 **Date raised:** 2026-05-14
 **Severity:** high
-**Status:** **OPEN — v0.18 DRAFT** (Codex R17 HIGH ×1 closed: stale `shipment.dispatched` removed (same class of dup-naming bug as R16 just at a different transition); -1 net audit; pre-ratification gate continues. Trajectory at R17. SI-007 exceeds the SI-001 round-count baseline by 6 rounds; convergence will be called when Codex returns a non-needs-attention verdict OR after the next 2 rounds if findings remain doc-polish-only.)
+**Status:** **OPEN — v0.19 DRAFT** (Codex R18 HIGH ×1 closed: tenant-scoped composite FK invariant made explicit for every cross-table relationship per ADR-023 + PROJECT_CONVENTIONS r5 §1.1; pre-ratification gate continues. Trajectory at R18.)
 **Target spec doc (proposed):** `Telecheck_Canonical_Data_Model_v1_2.md` (headers will govern v1.4; on-disk filename retains the `v1_2.md` legacy pattern per v1.10 cycle convention)
 **Target slice PRD:** `Telecheck_Pharmacy_Refill_Slice_PRD_v2_1.md` (canonical references §4.17 + §4.18 + §4.19 post-promotion)
 **Companion SIs:** SI-001 (MedicationRequest schema gap — CLOSED 2026-05-11 via P-011) — same pattern, expanded scope
@@ -308,6 +308,31 @@ State Machines v1.1 §5 (Pharmacy Fulfillment) spans `QUEUED → CLAIMED → FUL
 
 All three tables: canonical `current_tenant_id()` helper-based RLS per CDM v1.3 §4.16 pattern. No special carve-outs.
 
+#### Tenant-scoped composite FKs (v0.19 per Codex R18 HIGH closure 2026-05-14)
+
+**INVARIANT:** Every foreign-key relationship between tenant-owned entities in this SI MUST use composite `(tenant_id, *_id) REFERENCES <table>(tenant_id, id)` semantics. Plain single-column FKs are FORBIDDEN for tenant-owned references. Rationale: RLS + app-layer filtering enforce tenant isolation on the CHILD table, but a single-column FK lets a child row in tenant A reference a parent row id from tenant B. Composite FKs make tenant-mismatched references impossible at the DDL layer. Per ADR-023 multi-tenancy + PROJECT_CONVENTIONS r5 §1.1 + I-023..I-027.
+
+Authoritative composite FK list for §4.17 / §4.18 / §4.19:
+
+| Source table.column(s)                                 | Target table.column(s)                                                                      |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `refills (tenant_id, medication_request_id)`           | `medication_requests (tenant_id, id)`                                                       |
+| `refills (tenant_id, subscription_id)`                 | `subscriptions (tenant_id, id)` (nullable)                                                  |
+| `refills (tenant_id, patient_account_id)`              | `accounts (tenant_id, id)`                                                                  |
+| `refills (tenant_id, decided_by_clinician_account_id)` | `accounts (tenant_id, id)` (nullable)                                                       |
+| `dispensings (tenant_id, refill_id)`                   | `refills (tenant_id, id)` (nullable per XOR)                                                |
+| `dispensings (tenant_id, medication_request_id)`       | `medication_requests (tenant_id, id)` (nullable per XOR)                                    |
+| `dispensings (tenant_id, pharmacy_adapter_id)`         | `adapter_configs (tenant_id, id)`                                                           |
+| `dispensings (tenant_id, pharmacist_account_id)`       | `accounts (tenant_id, id)` (nullable)                                                       |
+| `dispensings (tenant_id, compounding_lab_id)`          | `adapter_configs (tenant_id, id)` (nullable)                                                |
+| `shipments (tenant_id, dispensing_id)`                 | `dispensings (tenant_id, id)`                                                               |
+| `shipments (tenant_id, carrier_id)`                    | `adapter_configs (tenant_id, id)` (nullable; required when delivery_preference='delivery')  |
+| `shipments (tenant_id, pickup_location_id)`            | `pharmacy_locations (tenant_id, id)` (nullable; required when delivery_preference='pickup') |
+
+All target tables must carry the matching `UNIQUE (tenant_id, id)` constraint (already required by PROJECT_CONVENTIONS r5 §1.1). The MedicationRequest §4.16 row added by P-011 has this constraint; subscription / account / adapter_configs / pharmacy_locations need verification — flagged at the pre-ratification gate.
+
+**Cross-tenant attack vector closed:** without composite FKs, an admin-tool bug or a malicious service-level call could create a `dispensings` row in tenant A with `refill_id` pointing at tenant B's refill. RLS would let tenant A users see only their own dispensing row, but background jobs / cross-tenant queries could chain through the FK to reach tenant B's data. Composite FKs make the cross-tenant reference structurally impossible.
+
 #### Add the corresponding spec-corpus entries
 
 - **State Machines v1.1 — keep §2 + §5 as canonical state machine sources.** SI-007 is a schema gap, not a state-machine gap; no §20/§21 needed.
@@ -458,4 +483,9 @@ The autonomous-turn discipline preserved from SI-001: **never author canonical s
   - **HIGH — Stale `shipment.dispatched` audit ID conflicted with `shipment.pickup_from_pharmacy`.** Same class of dup-naming bug as R16 just at a different transition. The coordination table + DOMAIN_EVENTS list both used `shipment.pickup_from_pharmacy` for the PENDING_CARRIER_PICKUP → DISPATCHED transition; the AUDIT_EVENTS list still had both `shipment.pickup_from_pharmacy` AND `shipment.dispatched`.
   - Fix: Removed `shipment.dispatched` from the AUDIT_EVENTS list. Shipment audit count: 11 → 10. Total AUDIT_EVENTS net-new: 39 → 38. Required-product table + Promotion Ledger entry block updated in lockstep.
   - Pattern note: R16 + R17 form a pair — both are "fix one canonical-name collision at a critical transition." Successive Codex rounds are finding the same class of bug at different transitions. Convergence indicator: when Codex stops finding cross-table naming collisions and shifts to pure doc polish OR returns a non-needs-attention verdict.
-- **Next:** v0.19 after Codex R18 review. SI-007 trajectory at R17. Convergence call will be made when Codex returns a non-`needs-attention` verdict OR when 3 consecutive rounds produce only doc-polish-class findings (no architectural concerns).
+- **v0.19 — 2026-05-14** — Codex R18 HIGH ×1 closed:
+  - **HIGH — Plain (single-column) FKs left a cross-tenant attack vector.** The schema bullets defined FKs like `refills.medication_request_id (FK medication_requests)` without specifying composite `(tenant_id, *_id)` tenant-scoping. RLS + app-layer filtering enforce tenant isolation on the CHILD table, but a single-column FK lets a child row in tenant A reference a parent row id from tenant B (admin-tool bug, malicious service-level call). Background jobs / cross-tenant queries could chain through the FK to reach tenant B's data.
+  - Fix: Added explicit **tenant-scoped composite FK invariant** section (§4.18 RLS-adjacent) listing every FK relationship in §4.17/§4.18/§4.19 with its required composite shape (`(tenant_id, *_id) REFERENCES <table>(tenant_id, id)`). 12 composite FKs enumerated. Plain single-column FKs FORBIDDEN for tenant-owned references. Pre-ratification flag: verify that `subscriptions`, `accounts`, `adapter_configs`, `pharmacy_locations` all carry the matching `UNIQUE (tenant_id, id)` target constraint (PROJECT_CONVENTIONS r5 §1.1 requires; MedicationRequest §4.16 already has post-P-011).
+  - Codex finding-class shift: R16/R17 were canonical-name dup; R18 is a new class (cross-tenant attack vector via plain FKs). The asymptote pattern hasn't yet hit: each round is finding a real, distinct issue. SI-007's wider surface (3 entities + 2 cross-entity handoffs + tenant-scoped FK fan-out) compared to SI-001 (1 entity) explains the longer trajectory.
+- **Convergence call posture:** R19+ rounds will be continued if findings remain substantive (architectural / contract / invariant class). Convergence is called when Codex either (a) returns a non-`needs-attention` verdict, OR (b) produces 3 consecutive rounds of doc-polish-only findings.
+- **Next:** v0.20 after Codex R19 review.
