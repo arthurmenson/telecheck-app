@@ -41,14 +41,17 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'ai-service',
-    phase: 'scaffold_pr_a',
+    phase: 'type_contract_published_pr_b',
     workload_types_at_v1: ['conversational_assistant', 'protocol_execution'],
     workload_types_reserved: ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'],
     autonomy_levels_at_v1: ['advisory', 'suggestion', 'action_with_confirm'],
     autonomy_levels_reserved: ['action_with_audit_only', 'fully_autonomous'],
+    mode_1_chat_wire_contract_published: true,
+    mode_1_chat_wire_contract_published_by:
+      'TLC-AI PR B (Mode1ChatResponseView exported from module index; HTTP handler deliberately NOT mounted — requires I-019 crisis-detection wire-in + FLOOR-020 audit emission before /v0/ai/chat goes live; lands in PRs D + E + F)',
     handlers_wired: false,
     handlers_wired_tracking:
-      'PR B (Mode 1 chat stub) + PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
+      'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -66,9 +69,9 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'ai-service',
-      phase: 'scaffold_pr_a',
+      phase: 'type_contract_published_pr_b',
       pending:
-        'PR B (Mode 1 chat stub) + PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
+        'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
       pending_message:
         'Module is not yet ready to serve traffic — only the scaffold + branded ID types ' +
         '(AIChatSessionId / AIWorkflowExecutionId / GuardrailTemplateId) are wired at PR A. ' +
@@ -86,9 +89,28 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     });
   });
 
-  // Real routes (POST /v0/ai/chat, POST /v0/ai/case-prep, GET
-  // /v0/ai/guardrail-templates/:id, etc.) land in subsequent PRs. The
-  // handler surface is intentionally absent here so that any premature
-  // wiring breaks at typecheck time rather than reaching production
-  // half-built.
+  // Mode 1 conversational assistant — DELIBERATELY NOT MOUNTED at PR B
+  // (Codex PR B R2 CRITICAL closure 2026-05-14). A live /v0/ai/chat
+  // surface that accepts patient free-text input MUST run I-019
+  // crisis detection on every message AND emit the FLOOR-020 audit
+  // record for every response. Both land later:
+  //   - PR D: real Anthropic provider integration (ADR-020
+  //     multi-provider)
+  //   - PR E: guardrail-template repo + Conservative Default
+  //     enforcement (AI-GUARD-003)
+  //   - PR F: crisis-detection wire-in to the chat surface (lib/
+  //     crisis-detection.ts exists; this PR doesn't wire it because
+  //     the platform-floor integration requires the audit-emission
+  //     boundary + escalation pathway which the audit-event spec
+  //     amendment must name first)
+  //
+  // The Mode1ChatResponseView wire contract IS exported from the
+  // module's public interface (see index.ts) so frontends can
+  // integrate against the response shape ahead of the handler.
+  //
+  // Mode 2 case-prep (POST /v0/ai/case-prep) lands in PR C with the
+  // same gating posture: route not mounted until I-012 audit-chain
+  // + protocol confirmation are wired (the surface inherits the
+  // clinician_approve I-012 reject-unless contract from State
+  // Machines v1.2 §19 §19.X).
 };

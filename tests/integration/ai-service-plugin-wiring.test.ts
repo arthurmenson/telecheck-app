@@ -27,6 +27,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
+import { ulid } from '../../src/lib/ulid.ts';
 
 let app: FastifyInstance | null = null;
 
@@ -63,7 +64,7 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('scaffold_pr_a');
+    expect(body.phase).toBe('type_contract_published_pr_b');
     // Per AI_LAYERING v5.2 §10.2 + WORKLOAD_TAXONOMY v5.2 §2, the v1.0
     // active workload types are exactly `conversational_assistant` +
     // `protocol_execution`. Reserved types must be enumerated so a
@@ -80,7 +81,7 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     expect(body.autonomy_levels_at_v1).toEqual(['advisory', 'suggestion', 'action_with_confirm']);
     expect(body.autonomy_levels_reserved).toEqual(['action_with_audit_only', 'fully_autonomous']);
     expect(body.handlers_wired).toBe(false);
-    expect(body.handlers_wired_tracking).toContain('PR B');
+    expect(body.handlers_wired_tracking).toContain('PR C');
     expect(body.handlers_wired_tracking).toContain('PR F');
   });
 
@@ -100,8 +101,8 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     }>();
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('scaffold_pr_a');
-    expect(body.pending).toContain('PR B');
+    expect(body.phase).toBe('type_contract_published_pr_b');
+    expect(body.pending).toContain('PR C');
     expect(body.pending_message).toContain('not yet ready');
     expect(body.pending_message).toContain('conversational_assistant');
     expect(body.pending_message).toContain('protocol_execution');
@@ -139,5 +140,30 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
       headers: { host: 'unknown.example.test' },
     });
     expect(readyUnknown.statusCode).toBe(503);
+  });
+
+  it('§1d POST /v0/ai/chat is NOT mounted at PR B — Fastify returns 404 (Codex PR B R2 CRITICAL closure)', async () => {
+    // Per Codex PR B R2 CRITICAL closure 2026-05-14, the Mode 1 chat
+    // route is deliberately NOT registered until PR F lands the
+    // I-019 crisis-detection wire-in + the FLOOR-020 audit-emission
+    // boundary. Even validating a body MUST NOT happen before
+    // crisis detection runs on the input — by not mounting the
+    // route at all, we close that risk by construction. Locking
+    // this in: a future PR that accidentally mounts /chat without
+    // PR F's gating will trip this test and fail loud.
+    //
+    // We MUST supply an Idempotency-Key header because the global
+    // idempotency-plugin preHandler returns 400
+    // `internal.idempotency.missing_key` on every state-changing
+    // POST before route resolution fires. Sending a valid key lets
+    // the request reach route-matching, which then returns 404 for
+    // the unregistered path.
+    const r = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: { host: 'heroshealth.com', 'idempotency-key': ulid() },
+      payload: { message: 'hi' },
+    });
+    expect(r.statusCode).toBe(404);
   });
 });
