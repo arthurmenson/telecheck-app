@@ -73,6 +73,12 @@ import {
   requirePatientActorContext,
 } from '../../../../lib/auth-context.js';
 import { GlossaryViolationError, asMedicationRequestId } from '../../../../lib/glossary.js';
+import {
+  IdempotencyBodyMismatchError,
+  IdempotencyInFlightError,
+  IdempotencyReplayError,
+  buildIdempotencyCtx,
+} from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { asSessionId, findActiveSessionById } from '../../../identity/index.js';
@@ -411,6 +417,14 @@ function mapWriteServiceError(err: unknown, reply: FastifyReply, reqId: string):
       );
     return true;
   }
+  // I012RejectError is intentionally NOT mapped here. The approve
+  // handler catches it explicitly AFTER `withIdempotentExecution`
+  // returns so the rejection audit can emit in a fresh tx without
+  // deadlocking on the outer writing tx's audit hash-chain advisory
+  // lock (Codex PR G R1 HIGH closure 2026-05-13). Allowing it to
+  // propagate here would emit the 409 envelope BEFORE the rejection
+  // audit lands, defeating the I-003 / I-012 bare-suppression-forbidden
+  // rule.
   return false;
 }
 
@@ -955,4 +969,183 @@ export async function clinicianDiscontinueMedicationRequestHandler(
     );
     return { status: 200, view: toPatientMedicationRequestView(updated) };
   });
+}
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions/:id/approve
+//
+// Clinician-only I-012-gated activation per State Machines v1.2 §19:
+//
+//   pending_clinician_review --[clinician_approve]--> active
+//
+// Body is empty — the approval transition takes no parameters. The body
+// parser rejects unexpected fields explicitly so a clinician can't
+// smuggle in an override of the server-derived prescribed_at or
+// approval_pathway.
+//
+// Returns:
+//   - 200 + PHI-safe view (status=active, prescribed_at set,
+//     prescribed_by_clinician_account_id set).
+//   - 400 on non-empty / non-object body.
+//   - 401 on missing JWT / dead session / mismatched account binding.
+//   - 403 on patient-role JWT.
+//   - 404 on not-found / cross-tenant / malformed id (I-025 collapsed).
+//   - 409 on row not in 'pending_clinician_review' OR concurrent writer
+//     raced OR I-012 reject-unless violation (the latter is service-
+//     layer-bug defense-in-depth; v1.0 clinician-only fields are all
+//     service-controlled).
+//
+// Idempotency-Key REQUIRED per IDEMPOTENCY v5.1. The handler-owned
+// idempotency check sits AFTER requireClinicianLiveSession, so a
+// revoked-session replay 401s before any cached PHI can be served
+// (platform fix landed alongside TLC-055 PR F).
+// ---------------------------------------------------------------------------
+
+export async function approveMedicationRequestHandler(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireClinicianLiveSession(req);
+
+  // Reject non-empty body. The approve transition takes no parameters.
+  if (
+    req.body !== undefined &&
+    req.body !== null &&
+    (typeof req.body !== 'object' ||
+      Array.isArray(req.body) ||
+      Object.keys(req.body as Record<string, unknown>).length > 0)
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Approve accepts no body — the state transition takes no parameters.',
+        ),
+      );
+  }
+
+  let id;
+  try {
+    id = asMedicationRequestId(req.params.id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  // Build the idempotency ctx ahead of the writing tx so the post-
+  // rollback rejection emitter (if I-012 fires) can stamp a completed
+  // idempotency_keys row keyed by the same 4-tuple, making retries
+  // replay the cached 409 instead of re-emitting the rejection audit
+  // (Codex PR G R3 HIGH closure 2026-05-13). The Idempotency-Key
+  // header presence is guaranteed at this point — the global
+  // idempotency preHandler returns 400 if it's missing, so the request
+  // never reaches this handler without one.
+  const idempotencyCtxForRejection = buildIdempotencyCtx(req);
+
+  try {
+    return await withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+      const updated = await medicationRequestService.approveAsClinician(
+        ctx,
+        { accountId: actor.accountId },
+        id,
+        tx,
+      );
+      return { status: 200, view: toPatientMedicationRequestView(updated) };
+    });
+  } catch (err) {
+    // I-012 reject-unless violation. The writing tx (inside
+    // withIdempotentExecution) has rolled back; the audit hash-chain
+    // advisory lock is released. Emit prescribing.execution_rejected
+    // in a fresh tx AND atomically write a completed idempotency_keys
+    // row so retries replay (per AUDIT_EVENTS v5.3 §I-012 reject-
+    // unless rejection-audit-event rule + IDEMPOTENCY v5.1; bare
+    // suppression forbidden per I-003).
+    //
+    // The helper resolves the row's patient_account_id INTERNALLY (in
+    // the same fresh tx as the emission) so there is no caller-
+    // supplied path that could skip the audit. It also wraps the
+    // emission in `withIdempotency` so the rejection-emission
+    // operation is itself idempotent: the next retry with the same
+    // key + body hits the cached 409 via withIdempotency's replay
+    // semantics inside the regular withIdempotentExecution path.
+    if (err instanceof Error && err.name === 'I012RejectError') {
+      const violatedClauses = ((err as Error & { violated_clauses?: readonly string[] })
+        .violated_clauses ?? []) as Parameters<
+        typeof medicationRequestService.emitApprovalI012RejectionAudit
+      >[3];
+      const rejectionEnvelope = makeErrorEnvelope(
+        req.id,
+        'internal.resource.conflict',
+        'Medication request state conflict.',
+      );
+      try {
+        const payload = await medicationRequestService.emitApprovalI012RejectionAudit(
+          ctx,
+          { accountId: actor.accountId },
+          id,
+          violatedClauses,
+          idempotencyCtxForRejection,
+          rejectionEnvelope,
+        );
+        return reply.code(payload.status).send(payload.body);
+      } catch (auditErr) {
+        if (
+          auditErr instanceof Error &&
+          auditErr.name === 'ApprovalI012RejectionAuditAnchorMissingError'
+        ) {
+          // Fail closed. The row vanished or tenant context drifted
+          // between writing-tx rollback and rejection-audit emission;
+          // we cannot anchor the canonical I-012 audit, and returning
+          // 409 here would suppress the emission silently in violation
+          // of I-003 + I-012. Surface 500 with a generic envelope so
+          // ops sees the anomaly.
+          return reply
+            .code(500)
+            .send(
+              makeErrorEnvelope(
+                req.id,
+                'internal.server_error',
+                'An internal error occurred while processing the request.',
+              ),
+            );
+        }
+        // Concurrent retry already completed the rejection emission
+        // (cache row exists). Replay the cached body verbatim per
+        // IDEMPOTENCY v5.1.
+        if (auditErr instanceof IdempotencyReplayError) {
+          return reply.code(auditErr.cachedStatus).send(auditErr.cachedBody);
+        }
+        // Concurrent retry is mid-emission (reservation row is
+        // 'pending'). Return the canonical in-flight 409 so the
+        // client backs off.
+        if (auditErr instanceof IdempotencyInFlightError) {
+          return reply
+            .code(409)
+            .send(makeErrorEnvelope(req.id, 'internal.idempotency.in_flight', auditErr.hint));
+        }
+        // Body hash mismatch: a retry presented a DIFFERENT body
+        // under the same Idempotency-Key. Per IDEMPOTENCY v5.1 this
+        // is a contract violation.
+        if (auditErr instanceof IdempotencyBodyMismatchError) {
+          return reply
+            .code(409)
+            .send(
+              makeErrorEnvelope(
+                req.id,
+                'internal.idempotency.body_mismatch',
+                'Idempotency key already used with a different request body.',
+              ),
+            );
+        }
+        throw auditErr;
+      }
+    }
+    throw err;
+  }
 }

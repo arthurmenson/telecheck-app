@@ -43,6 +43,8 @@
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { asMedicationRequestId } from '../../../../lib/glossary.js';
+import type { IdempotencyCtx } from '../../../../lib/idempotency.js';
+import { withIdempotency } from '../../../../lib/idempotency.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import { asAccountId, findAccountById } from '../../../identity/index.js';
@@ -50,9 +52,15 @@ import {
   emitMedicationRequestDiscontinued,
   emitMedicationRequestDrafted,
   emitMedicationRequestSubmittedForReview,
+  emitPrescribingApproved,
+  emitPrescribingExecutionRejected,
 } from '../../audit.js';
-import { emitMedicationRequestDiscontinued as emitMedicationRequestDiscontinuedDomainEvent } from '../../domain-events.js';
+import {
+  emitMedicationRequestApproved,
+  emitMedicationRequestDiscontinued as emitMedicationRequestDiscontinuedDomainEvent,
+} from '../../domain-events.js';
 import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
+import { I012RejectError } from '../state-machine.js';
 import type { MedicationRequest, MedicationRequestId, ProductCatalogId } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -618,4 +626,299 @@ export async function discontinueByClinician(
 
     return updated;
   }, externalTx);
+}
+
+// ---------------------------------------------------------------------------
+// approveAsClinician — PR G I-012-gated activation
+//
+// Per State Machines v1.2 §19, the clinician-only route into `active`:
+//
+//   pending_clinician_review --[clinician_approve]--> active
+//
+// This is the first I-012-gated transition in the pharmacy slice. I-012's
+// reject-unless three-clause rule applies (per Master PRD v1.10 §13.7;
+// AUDIT_EVENTS v5.3 §I-012 preservation rule; State Machines v1.2 §19):
+//
+//   (1) AI-participating execution attribution: vacuously satisfied for
+//       the clinician-only route — row envelope ai_workload_type=null AND
+//       autonomy_level=null per migration 025 CHECK clause (a); audit
+//       envelope uses the canonical 'n/a' sentinel per AUDIT_EVENTS v5.3
+//       §I-012 closure rule line 127 clinician-confirmation carve-out.
+//   (2) Audit-chain confirmation event scoped to action_id: the
+//       prescribing.approved emission IS the confirmation event for the
+//       clinician_approve route (the clinician is the executing actor;
+//       no prior separate event needed). We emit it FIRST inside the same
+//       transaction, then thread its audit_id into the I012GuardContext.
+//   (3) RBAC-authorized confirming actor: enforced upstream by
+//       requireClinicianLiveSession in the handler (tenant context +
+//       clinician role + live session + clinician account binding).
+//
+// On I012RejectError: per I-003 audit append-only + the I-012
+// rejection-audit-event rule, prescribing.execution_rejected MUST be
+// emitted. The outer write transaction has already rolled back (taking
+// the prescribing.approved insert with it), so the rejection audit
+// emits in a SEPARATE follow-up transaction so it persists.
+//
+// Domain event medication_request.approved.v1 carries
+// approval_pathway='clinician_reviewed' to discriminate from the Mode 2
+// protocol-authorized route.
+// ---------------------------------------------------------------------------
+
+export async function approveAsClinician(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  medicationRequestId: MedicationRequestId,
+  externalTx?: DbTransaction,
+): Promise<MedicationRequest> {
+  // Note on the I-012 rejection path (Codex PR G R1 HIGH closure
+  // 2026-05-13): the I012RejectError that may bubble out of
+  // transitionStatus → validateTransition is NOT caught here. An earlier
+  // draft emitted prescribing.execution_rejected from a nested
+  // withTransaction inside this catch block, but when the service is
+  // called with an externalTx (the idempotency wrapper's outer tx), the
+  // outer tx is still open at catch time — the audit hash-chain
+  // pg_advisory_xact_lock per (tenant_id, patient_id) partition is still
+  // held by the prescribing.approved insert emitted in step 3. The fresh
+  // rejection-audit tx tries to acquire the same lock and blocks behind
+  // a tx that can only release the lock by returning, which is exactly
+  // what the catch block is preventing — a self-block until the
+  // statement_timeout fires.
+  //
+  // Correct discipline: the handler's `emitApprovalI012RejectionAudit`
+  // wrapper runs the rejection emission AFTER `withIdempotentExecution`
+  // has returned (the outer tx has rolled back, the lock has been
+  // released). The service surfaces I012RejectError unchanged; the
+  // handler catches it post-rollback, emits the rejection audit in a
+  // clean fresh tx, and returns 409. Bare suppression is still
+  // forbidden per I-003 — the rejection emission is mandatory on every
+  // I012RejectError path that reaches the handler.
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+
+    // Step 1: load by id (tenant-scoped via RLS + explicit predicate).
+    const current = await medicationRequestRepo.findById(ctx.tenantId, medicationRequestId, tx);
+    if (current === null) {
+      throw new MedicationRequestNotFoundError(medicationRequestId);
+    }
+
+    // Step 2: status precondition — only 'pending_clinician_review'
+    // rows are approvable. State Machines v1.2 §19 admits no other
+    // source state for clinician_approve.
+    if (current.status !== 'pending_clinician_review') {
+      throw new MedicationRequestStateConflictError(medicationRequestId, current.status);
+    }
+
+    const prescribedAt = new Date();
+
+    // Step 3: emit prescribing.approved FIRST (the I-012 confirmation
+    // event for the clinician_approve route per the §19 §19.X
+    // discrimination: "the confirmation event IS the prescribing.approved
+    // emission itself"). action_id == medicationRequestId per the
+    // state-machine §9 convention. Workload/autonomy envelope: 'n/a'/'n/a'
+    // (clinician-only carve-out; no upstream AI workload contributed).
+    const approvedAudit = await emitPrescribingApproved(
+      {
+        tenantId: ctx.tenantId,
+        patientAccountId: current.patient_account_id,
+        medicationRequestId,
+        countryOfCare: ctx.countryOfCare,
+        clinicianAccountId: actor.accountId,
+        detail: {},
+      },
+      tx,
+    );
+
+    // Step 4: transitionStatus with the I-012 guard threading the
+    // just-emitted audit's id. validateTransition (inside transitionStatus)
+    // cross-checks the attested context against the pending_transition
+    // and throws I012RejectError on any clause failure. I012RejectError
+    // is intentionally NOT caught here (see top-of-function note) — it
+    // bubbles to the handler.
+    const updated = await medicationRequestRepo.transitionStatus(
+      {
+        id: medicationRequestId,
+        tenant_id: ctx.tenantId,
+        expected_from_status: 'pending_clinician_review',
+        to_status: 'active',
+        event: 'clinician_approve',
+        prescribed_by_clinician_account_id: actor.accountId,
+        prescribed_at: prescribedAt,
+        // activation_envelope intentionally undefined for the
+        // clinician-only route per migration 025 CHECK (a) — row
+        // ai_workload_type / autonomy_level stay null.
+        pending_transition: {
+          tenant_id: ctx.tenantId,
+          action_id: medicationRequestId,
+          patient_account_id: current.patient_account_id,
+          actor_id: actor.accountId,
+          protocol_id: null,
+          protocol_version: null,
+        },
+        i012_guard: {
+          route: 'clinician_approve',
+          confirmation_event_audit_id: approvedAudit.audit_id,
+          attested_tenant_id: ctx.tenantId,
+          attested_action_id: medicationRequestId,
+          attested_patient_account_id: current.patient_account_id,
+          attested_actor_id: actor.accountId,
+          confirming_actor_rbac_authorized: true,
+        },
+      },
+      tx,
+    );
+    if (updated === null) {
+      // Concurrent writer raced the optimistic-concurrency UPDATE
+      // (e.g., another clinician approved this row between step 2
+      // and step 4, or the row was patient-discontinued).
+      throw new MedicationRequestStateConflictError(medicationRequestId, null);
+    }
+
+    // Step 5: domain event medication_request.approved.v1 with
+    // approval_pathway='clinician_reviewed'. Carries the prescribing
+    // snapshot the downstream consumers need (Subscription binds new
+    // active rows; Notification dispatches patient + clinician alerts).
+    await emitMedicationRequestApproved(tx, {
+      tenantId: ctx.tenantId,
+      medicationRequestId,
+      occurredAt: prescribedAt,
+      patientAccountId: current.patient_account_id,
+      approvalPathway: 'clinician_reviewed',
+      prescriberAccountId: actor.accountId,
+      productCatalogId: current.product_catalog_id,
+      medication: {
+        code: current.product_catalog_id,
+        name: current.medication_name,
+        strength: current.strength,
+        formulation: current.formulation,
+      },
+      dosing: {
+        instructions: current.dose_instructions,
+        quantity: current.quantity,
+        quantity_unit: current.quantity_unit,
+        refills_allowed: current.refills_allowed,
+      },
+      interactionSignals: [],
+      overrides: [],
+      protocolId: null,
+      protocolVersion: null,
+      aiWorkloadType: null,
+      autonomyLevel: null,
+    });
+
+    return updated;
+  }, externalTx);
+}
+
+/**
+ * Operational error: an `I012RejectError` reached the handler but the
+ * post-rollback row lookup that anchors the rejection audit returned
+ * null. Per Codex PR G R2 HIGH closure 2026-05-13 this MUST surface as
+ * an operational failure rather than silently emit a bare 409 without
+ * the canonical I-012 rejection audit (I-003 bare-suppression
+ * forbidden + I-012 rejection-audit-event rule).
+ *
+ * Realistic failure mode: an out-of-band tenant-context mismatch
+ * between request arrival and post-rollback lookup, OR a row deletion
+ * that should not happen at v1.0 (medication_requests has no DELETE
+ * path). The handler logs and returns 500 so ops surface the anomaly.
+ */
+export class ApprovalI012RejectionAuditAnchorMissingError extends Error {
+  constructor(public readonly medicationRequestId: MedicationRequestId) {
+    super(
+      `Cannot anchor I-012 rejection audit for ${medicationRequestId}: ` +
+        'post-rollback patient lookup returned null. The row vanished ' +
+        'between writing-tx rollback and rejection-audit emission, OR ' +
+        'the tenant context drifted. Audit-chain integrity requires ' +
+        'fail-closed semantics on this path.',
+    );
+    this.name = 'ApprovalI012RejectionAuditAnchorMissingError';
+  }
+}
+
+/**
+ * Emit `prescribing.execution_rejected` for a clinician_approve attempt
+ * that failed the I-012 reject-unless three-clause rule, AND atomically
+ * persist a completed `idempotency_keys` row keyed by the request's
+ * Idempotency-Key 4-tuple so future retries with the same key + body
+ * replay the 409 instead of re-emitting the rejection audit.
+ *
+ * MUST be called by the HTTP handler AFTER `withIdempotentExecution`
+ * has returned (the outer writing tx has rolled back; the audit-chain
+ * advisory lock has been released).
+ *
+ * Design (post-Codex PR G R3 HIGH closure 2026-05-13):
+ *
+ *   1. Open a fresh tx (the outer writing tx has rolled back; the
+ *      advisory lock per (tenant_id, patient_id) is released).
+ *   2. Call `withIdempotency` inside the fresh tx. The body callback:
+ *      - Resolves the row's patient_account_id from a fresh repo
+ *        lookup (no caller-supplied path; eliminates the
+ *        bare-suppression bypass closed in R2).
+ *      - Throws ApprovalI012RejectionAuditAnchorMissingError if the
+ *        row is gone (operational anomaly; handler maps to 500).
+ *      - Emits prescribing.execution_rejected (Category A; clinician
+ *        carve-out workload+autonomy 'n/a').
+ *      - Returns `{ status: 409, body: rejectionEnvelope }`. This
+ *        body is what `withIdempotency` writes to the idempotency
+ *        cache, so the next replay with the same key + body gets
+ *        replied verbatim from the cache (no re-emission).
+ *   3. Returns `{ status, body }` to the handler so it can `reply`.
+ *
+ * Concurrent-retry semantics:
+ *   - If the original failed request's idempotency reservation was
+ *     rolled back along with its writing tx, this fresh call reserves
+ *     anew + completes — the canonical happy-path-of-the-failure.
+ *   - If a concurrent retry races us, `withIdempotency` throws
+ *     `IdempotencyReplayError` (other tx already completed) or
+ *     `IdempotencyInFlightError` (other tx is mid-emission); the
+ *     handler maps both to a cached-or-409 reply. The audit emits at
+ *     most once per (tenant, key, endpoint, actor) 4-tuple.
+ *
+ * Workload/autonomy envelope: 'n/a'/'n/a' per the clinician-only route.
+ *
+ * `rejectionEnvelope` is the response body the handler intends to send
+ * on a successful audit emission (a `makeErrorEnvelope`-shaped
+ * conflict). Caching the envelope means retries get a byte-identical
+ * replay including the original request_id — by IDEMPOTENCY v5.1
+ * design.
+ */
+export async function emitApprovalI012RejectionAudit(
+  ctx: TenantContext,
+  actor: { accountId: string },
+  medicationRequestId: MedicationRequestId,
+  violatedClauses: I012RejectError['violated_clauses'],
+  idempotencyCtx: IdempotencyCtx,
+  rejectionEnvelope: unknown,
+): Promise<{ status: number; body: unknown }> {
+  return withTransaction(async (rejTx) => {
+    await rejTx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+    return withIdempotency(rejTx, idempotencyCtx, async () => {
+      const current = await medicationRequestRepo.findById(
+        ctx.tenantId,
+        medicationRequestId,
+        rejTx,
+      );
+      if (current === null) {
+        throw new ApprovalI012RejectionAuditAnchorMissingError(medicationRequestId);
+      }
+      await emitPrescribingExecutionRejected(
+        {
+          tenantId: ctx.tenantId,
+          patientAccountId: current.patient_account_id,
+          medicationRequestId,
+          countryOfCare: ctx.countryOfCare,
+          attemptedActorType: 'clinician',
+          attemptedActorId: actor.accountId,
+          attemptedAiWorkloadType: 'n/a',
+          attemptedAutonomyLevel: 'n/a',
+          violatedClauses,
+          confirmationEventState: 'absent',
+          rbacRoleCheckResult: 'authorized',
+          detail: {},
+        },
+        rejTx,
+      );
+      return { status: 409, body: rejectionEnvelope };
+    });
+  });
 }
