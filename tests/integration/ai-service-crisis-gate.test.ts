@@ -248,22 +248,37 @@ describe('runCrisisGate — positive detection path', () => {
     });
   });
 
-  it('(resourceType, detectionSource) mismatch — safety sentinel still returns, audit fails open with audit_error', async () => {
-    // Per Codex PR F R10 HIGH closure 2026-05-13: a caller wiring
-    // bug (Mode 1 chat aggregate with a Mode 2 case-prep source, or
-    // vice versa) is a programmer error — but on a real positive
-    // crisis detection, the gate's contract is "always return the
-    // crisis sentinel so the caller surfaces resources." The
-    // wiring bug surfaces via `audit_emitted=false` + `audit_error`,
-    // NOT by denying the patient the crisis-resource response.
+  it('(resourceType, detectionSource) mismatch — audit STILL emits on the wiring-error fallback path', async () => {
+    // Per Codex PR F R12 HIGH closure 2026-05-13: even on a caller
+    // wiring bug, the mandatory Category A audit MUST land. The
+    // gate falls through to a conservative-default envelope and
+    // records the wiring error in audit detail. `audit_emitted`
+    // remains `true` (the row is durable); `audit_error` is set so
+    // the caller still gets diagnostics for ops triage.
     const ctx = baseCtx(); // resourceType=ai_chat_session
     const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_case_prep_input');
     expect(r.kind).toBe('crisis');
     if (r.kind === 'crisis') {
-      expect(r.audit_emitted).toBe(false);
+      expect(r.audit_emitted).toBe(true);
       expect(r.audit_error?.message).toMatch(/Refusing to emit a mislabeled FLOOR-020 envelope/);
     }
-    expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
+    // Audit DID land on the fallback path.
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
+
+    // Verify the audit detail carries the wiring_error marker.
+    await withTenantContext(T_US, async () => {
+      const client = getTestClient();
+      const rows = await client.query<{ payload: Record<string, unknown> }>(
+        `SELECT payload FROM audit_records
+          WHERE tenant_id = $1 AND resource_id = $2 AND action = 'crisis_detection_trigger'`,
+        [T_US, ctx.resourceId],
+      );
+      const wiring = rows.rows[0]!.payload['wiring_error'] as
+        | { name: string; message: string }
+        | undefined;
+      expect(wiring).toBeDefined();
+      expect(wiring!.message).toMatch(/Refusing to emit a mislabeled FLOOR-020 envelope/);
+    });
 
     // Reverse direction: Mode 2 aggregate with Mode 1 source.
     const ctx2 = {
@@ -274,47 +289,46 @@ describe('runCrisisGate — positive detection path', () => {
     const r2 = await runCrisisGate(ctx2, "i don't want to live anymore", 'ai_chat_input');
     expect(r2.kind).toBe('crisis');
     if (r2.kind === 'crisis') {
-      expect(r2.audit_emitted).toBe(false);
+      expect(r2.audit_emitted).toBe(true);
       expect(r2.audit_error?.message).toMatch(/Refusing to emit a mislabeled FLOOR-020 envelope/);
     }
-    expect(await countCrisisAudits(ctx2.resourceId)).toBe(0);
+    expect(await countCrisisAudits(ctx2.resourceId)).toBe(1);
   });
 });
 
-describe('runCrisisGate — operational signaling (Codex PR F R11 HIGH closure)', () => {
-  it('audit-emission failure emits an unavoidable error-level log line for ops alerting', async () => {
-    // Per Codex PR F R11 HIGH closure 2026-05-13: when the audit
-    // emission fails (either runtime infrastructure OR caller-
-    // wiring validation), the gate emits an `event:
-    // 'crisis_audit_emission_failed'` error-level log so
-    // PagerDuty / log-based alerting fires regardless of whether
-    // the caller checks `audit_emitted`. The patient still gets
-    // the crisis-resource sentinel (safety contract preserved).
+describe('runCrisisGate — operational signaling (Codex PR F R11 + R12 HIGH closures)', () => {
+  it('wiring-error fallback emits crisis_audit_emitted_on_wiring_fallback error log', async () => {
+    // Per Codex PR F R12 HIGH closure 2026-05-13: a positive
+    // detection on a caller-wiring-error path STILL emits the
+    // mandatory Category A audit (on the fallback path) AND fires
+    // an error-level log so ops triage doesn't depend on the
+    // caller noticing `audit_error`. R11's earlier
+    // `crisis_audit_emission_failed` event still fires when the
+    // audit emission ITSELF fails (DB error, etc.); R12 separates
+    // wiring errors (audit lands, log says "on fallback") from
+    // infrastructure errors (audit missing, log says "emission
+    // failed").
     const errSpy = vi.spyOn(logger, 'error');
     try {
-      // Trigger a wiring-error path (mismatched detectionSource +
-      // resourceType per R1) so the audit emission inside the
-      // safety envelope fails.
       const ctx = baseCtx(); // ai_chat_session
       const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_case_prep_input');
       expect(r.kind).toBe('crisis');
       if (r.kind === 'crisis') {
-        expect(r.audit_emitted).toBe(false);
+        expect(r.audit_emitted).toBe(true); // emitted on fallback path
       }
 
-      // The log MUST have fired with the canonical shape.
-      const errorCall = errSpy.mock.calls.find((args) => {
+      const fallbackCall = errSpy.mock.calls.find((args) => {
         const obj = args[0] as Record<string, unknown> | undefined;
-        return obj?.['event'] === 'crisis_audit_emission_failed';
+        return obj?.['event'] === 'crisis_audit_emitted_on_wiring_fallback';
       });
-      expect(errorCall).toBeDefined();
-      const obj = errorCall![0] as Record<string, unknown>;
+      expect(fallbackCall).toBeDefined();
+      const obj = fallbackCall![0] as Record<string, unknown>;
       expect(obj['tenant_id']).toBe(T_US);
       expect(obj['resource_id']).toBe(ctx.resourceId);
       expect(obj['detection_source']).toBe('ai_case_prep_input');
-      expect(typeof obj['audit_error_message']).toBe('string');
+      expect(typeof obj['wiring_error_message']).toBe('string');
       // PHI: crisis text must NOT appear in the log payload.
-      const logStr = JSON.stringify(errorCall);
+      const logStr = JSON.stringify(fallbackCall);
       expect(logStr).not.toContain("don't want to live");
     } finally {
       errSpy.mockRestore();
@@ -501,17 +515,17 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
       'patient reports persistent suicidal ideation',
       'ai_case_prep_input',
     );
-    // Per Codex PR F R10 HIGH closure: safety sentinel ALWAYS
-    // returns on positive detection. Wiring bugs surface via
-    // audit_emitted=false + audit_error, NOT by throwing.
+    // Per Codex PR F R12 HIGH closure: audit STILL emits on the
+    // wiring-error fallback path so I-019 holds. audit_error
+    // surfaces the validation message for ops triage.
     expect(rFail.kind).toBe('crisis');
     if (rFail.kind === 'crisis') {
-      expect(rFail.audit_emitted).toBe(false);
+      expect(rFail.audit_emitted).toBe(true);
       expect(rFail.audit_error?.message).toMatch(
         /auditDedupeDiscriminator is required for case-prep/,
       );
     }
-    expect(await countCrisisAudits(ctxCasePrep.resourceId)).toBe(0);
+    expect(await countCrisisAudits(ctxCasePrep.resourceId)).toBe(1);
 
     // Mode 1 chat WITHOUT discriminator + idempotencyCtx is fine —
     // chat is single-scan per source per request by design.
@@ -617,24 +631,26 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
         'patient reports persistent suicidal ideation',
         'ai_case_prep_input',
       );
-      // Per Codex PR F R10 HIGH closure: safety sentinel ALWAYS
-      // returns; validation errors surface via audit_error.
+      // Per Codex PR F R12 HIGH closure: audit STILL emits on the
+      // fallback path. audit_error surfaces the validation message
+      // for ops triage.
       expect(r.kind).toBe('crisis');
       if (r.kind === 'crisis') {
-        expect(r.audit_emitted).toBe(false);
+        expect(r.audit_emitted).toBe(true);
         expect(r.audit_error?.message).toMatch(/auditDedupeDiscriminator must match/);
       }
-      expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
+      expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
     }
   });
 
-  it('idempotencyCtx.tenantId !== ctx.tenantId — safety sentinel returns, audit_error captures the tenant mismatch', async () => {
-    // Per Codex PR F R3 HIGH closure 2026-05-13 + R10 HIGH closure:
-    // a caller wiring bug that supplied an idempotencyCtx scoped to
-    // a different tenant is a programmer error. The safety sentinel
-    // still returns on positive detection (so the patient gets the
-    // crisis-resource response), but `audit_emitted=false` +
-    // `audit_error` surfaces the wiring bug for ops review.
+  it('idempotencyCtx.tenantId !== ctx.tenantId — audit STILL emits on fallback path, under the gate tenant', async () => {
+    // Per Codex PR F R3 + R12 HIGH closures 2026-05-13: a caller
+    // wiring bug that supplied an idempotencyCtx scoped to a
+    // different tenant doesn't skip the audit — it just disables
+    // dedupe (the marker can't safely be claimed under the wrong
+    // tenant) and records the wiring error in audit detail. The
+    // audit row lands under ctx.tenantId (the gate's authoritative
+    // tenant), so cross-tenant data never leaks.
     const ctx = {
       ...baseCtx(), // tenantId = T_US
       idempotencyCtx: {
@@ -648,11 +664,13 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
     expect(r.kind).toBe('crisis');
     if (r.kind === 'crisis') {
-      expect(r.audit_emitted).toBe(false);
+      expect(r.audit_emitted).toBe(true);
       expect(r.audit_error?.message).toMatch(/must equal ctx.tenantId/);
     }
-    // No audit row was emitted under either tenant.
-    expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
+    // Audit DID emit under T_US (the gate's tenantId, NOT the bad
+    // idempotencyCtx tenant). countCrisisAudits queries T_US so
+    // this confirms the audit landed under the right tenant.
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
   });
 
   it('retry under DIFFERENT idempotency-key emits a fresh audit (dedupe scoped per key)', async () => {

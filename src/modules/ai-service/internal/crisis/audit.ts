@@ -107,6 +107,16 @@ export async function emitAICrisisDetectionTrigger(
      *  2026-05-13 — gate derives from `resourceType` to keep Mode 1
      *  vs Mode 2 emissions correctly classified. */
     auditEnvelope: AICrisisAuditEnvelope;
+    /** Wiring-error metadata for fallback emit path (Codex PR F R12
+     *  HIGH closure 2026-05-13). When validation fails (tenant
+     *  mismatch, missing discriminator, malformed discriminator,
+     *  resourceType/detectionSource pair mismatch), the gate STILL
+     *  emits the Category A audit on a best-effort path with a
+     *  conservative fallback envelope + this marker in detail so
+     *  the wiring bug is visible in the durable audit chain (not
+     *  just the log stream). Always undefined on the canonical
+     *  (no-wiring-error) path. */
+    wiringError?: { name: string; message: string };
   },
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
@@ -135,6 +145,14 @@ export async function emitAICrisisDetectionTrigger(
       // PHI: the text content itself is NOT captured. The audit
       // chain records that a detection fired (per I-019) without
       // duplicating PHI text into a second store.
+      ...(args.wiringError !== undefined
+        ? {
+            wiring_error: {
+              name: args.wiringError.name,
+              message: args.wiringError.message,
+            },
+          }
+        : {}),
     },
     engine_versions: null,
     // Crisis detection is platform-floor — runs across every AI
