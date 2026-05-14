@@ -846,3 +846,113 @@ export async function submitForReviewHandler(
     return { status: 200, view: toPatientMedicationRequestView(updated) };
   });
 }
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions/:id/clinician-discontinue
+//
+// Clinician-side counterpart to PR D's patient-self discontinue.
+// Body: { reason: 'clinical_decision' | 'adverse_event' }
+//
+//   - 200 + PHI-safe view (status=discontinued, discontinued_reason set).
+//   - 400 on missing/invalid reason field.
+//   - 401 on missing JWT / dead session / mismatched account binding.
+//   - 403 on patient-role JWT.
+//   - 404 on not-found / cross-tenant / malformed id.
+//   - 409 on row not in 'active' (or concurrent writer raced).
+//
+// No cross-patient ownership check at v1.0 — RBAC v1.1 §1.2 grants
+// clinicians at the tenant broad Rx-management authority. Future
+// per-assignment RBAC narrowing ships with the RBAC slice.
+// ---------------------------------------------------------------------------
+
+const VALID_CLINICIAN_DISCONTINUE_REASONS =
+  new Set<medicationRequestService.ClinicianDiscontinueReason>([
+    'clinical_decision',
+    'adverse_event',
+  ]);
+
+interface ClinicianDiscontinueBody {
+  reason?: unknown;
+}
+
+export async function clinicianDiscontinueMedicationRequestHandler(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireClinicianLiveSession(req);
+
+  // Body validation: requires { reason: 'clinical_decision' | 'adverse_event' }.
+  // No other fields permitted — extra fields are rejected loud (mirrors
+  // PR D's no-body discipline; here the only legitimate field is the
+  // reason discriminator).
+  const body = (req.body ?? {}) as ClinicianDiscontinueBody;
+  if (typeof req.body !== 'object' || req.body === null || Array.isArray(req.body)) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Body must be a JSON object with a `reason` field.',
+        ),
+      );
+  }
+  if (
+    typeof body.reason !== 'string' ||
+    !VALID_CLINICIAN_DISCONTINUE_REASONS.has(
+      body.reason as medicationRequestService.ClinicianDiscontinueReason,
+    )
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'reason must be one of: clinical_decision | adverse_event.',
+        ),
+      );
+  }
+  // Reject extra body fields so a clinician can't slip in unmodeled
+  // attributes (e.g., a `discontinued_at` override that bypasses the
+  // server-derived timestamp).
+  const allowedKeys = new Set(['reason']);
+  const extraKeys = Object.keys(body).filter((k) => !allowedKeys.has(k));
+  if (extraKeys.length > 0) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          `Unexpected body field(s): ${extraKeys.join(', ')}. Only \`reason\` is accepted.`,
+        ),
+      );
+  }
+  const reason = body.reason as medicationRequestService.ClinicianDiscontinueReason;
+
+  // Validate id at the boundary. Malformed → 404 tenant-blind (same
+  // side-channel reasoning as the other handlers).
+  let id;
+  try {
+    id = asMedicationRequestId(req.params.id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+    const updated = await medicationRequestService.discontinueByClinician(
+      ctx,
+      { accountId: actor.accountId },
+      id,
+      reason,
+      tx,
+    );
+    return { status: 200, view: toPatientMedicationRequestView(updated) };
+  });
+}
