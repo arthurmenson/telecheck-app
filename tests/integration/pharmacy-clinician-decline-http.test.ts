@@ -376,10 +376,16 @@ describe('pharmacy clinician decline — Group A: happy path', () => {
         [T_US, mrId],
       );
       expect(rows.rows.length).toBe(1);
-      const detail = (rows.rows[0]!.payload as { detail: Record<string, unknown> }).detail;
-      expect(detail.reason_code).toBe('inappropriate_indication');
-      expect(detail.reason_text).toBe('BMI below program threshold for GLP-1 therapy.');
-      expect(detail.recommended_action).toBe('request_more_history');
+      // The `payload` JSONB column is the audit envelope's `detail`
+      // field directly (per lib/audit.ts L881 `JSON.stringify(envelope.detail)`),
+      // NOT a nested { detail: {...} } wrapper. The emitter spreads
+      // args.detail (caller-supplied; {} here) and then adds the
+      // decline-specific fields, so the persisted payload looks like:
+      //   { reason_code, reason_text, recommended_action }
+      const payload = rows.rows[0]!.payload;
+      expect(payload.reason_code).toBe('inappropriate_indication');
+      expect(payload.reason_text).toBe('BMI below program threshold for GLP-1 therapy.');
+      expect(payload.recommended_action).toBe('request_more_history');
     });
   });
 });
