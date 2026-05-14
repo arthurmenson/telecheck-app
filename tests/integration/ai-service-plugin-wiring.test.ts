@@ -109,4 +109,35 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     // pending_message must not claim otherwise.
     expect(body.pending_message).not.toContain('schema not yet ratified');
   });
+
+  it('§1c probes are tenant-blind — /health + /ready resolve without a Host header (allowlisted)', async () => {
+    // Codex PR-A R1 MEDIUM closure 2026-05-14: probes must be in the
+    // tenantContextPlugin allowlist so a Kubernetes / load-balancer
+    // probe with no Host (or an unresolvable Host) gets the documented
+    // 200 / 503 instead of a tenant-resolution error. Mirrors the
+    // pharmacy + med-interaction precedent.
+    const health = await app!.inject({ method: 'GET', url: '/v0/ai/health' });
+    expect(health.statusCode).toBe(200);
+    expect(health.json<{ module: string }>().module).toBe('ai-service');
+
+    const ready = await app!.inject({ method: 'GET', url: '/v0/ai/ready' });
+    expect(ready.statusCode).toBe(503);
+    expect(ready.json<{ module: string }>().module).toBe('ai-service');
+
+    // Also exercise the unresolvable-Host case: a Host that isn't a
+    // tenant consumer DBA should still pass through to the documented
+    // probe response, not a tenant-not-found error.
+    const healthUnknown = await app!.inject({
+      method: 'GET',
+      url: '/v0/ai/health',
+      headers: { host: 'unknown.example.test' },
+    });
+    expect(healthUnknown.statusCode).toBe(200);
+    const readyUnknown = await app!.inject({
+      method: 'GET',
+      url: '/v0/ai/ready',
+      headers: { host: 'unknown.example.test' },
+    });
+    expect(readyUnknown.statusCode).toBe(503);
+  });
 });
