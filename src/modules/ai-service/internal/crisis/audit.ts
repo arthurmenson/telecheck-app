@@ -55,6 +55,23 @@ export type AICrisisDetectionSource =
    *  reviewing clinician). */
   | 'ai_case_prep_output';
 
+/**
+ * The (workload_type, autonomy_level) pair that the FLOOR-020 audit
+ * envelope MUST carry for this emission. Derived by the gate from
+ * `resourceType` (and validated against it) — Mode 1 chat surfaces use
+ * `conversational_assistant` + `advisory`; Mode 2 case-prep / protocol-
+ * execution surfaces use `protocol_execution` + `action_with_confirm`.
+ *
+ * Surfaced as an explicit input on the emitter (rather than hard-coded)
+ * per Codex PR F R1 HIGH closure 2026-05-13: a single hard-coded pair
+ * mislabeled every Mode 2 case-prep detection as Mode 1 workload,
+ * breaking audit-filter queries, I-012 correlation, and safety
+ * reporting for protocol_execution incidents.
+ */
+export type AICrisisAuditEnvelope =
+  | { workloadType: 'conversational_assistant'; autonomyLevel: 'advisory' }
+  | { workloadType: 'protocol_execution'; autonomyLevel: 'action_with_confirm' };
+
 export async function emitAICrisisDetectionTrigger(
   args: {
     tenantId: string;
@@ -80,6 +97,10 @@ export async function emitAICrisisDetectionTrigger(
      *  resolved (the audit still fires; the caller's error path
      *  + ops alert handle the resolution miss). */
     escalationDestination: string | null;
+    /** FLOOR-020 audit envelope per Codex PR F R1 HIGH closure
+     *  2026-05-13 — gate derives from `resourceType` to keep Mode 1
+     *  vs Mode 2 emissions correctly classified. */
+    auditEnvelope: AICrisisAuditEnvelope;
   },
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
@@ -113,9 +134,12 @@ export async function emitAICrisisDetectionTrigger(
     // Crisis detection is platform-floor — runs across every AI
     // surface regardless of guardrail / mode / autonomy. ai_workload
     // emissions populate the workload + autonomy envelope per
-    // FLOOR-020.
-    ai_workload_type: 'conversational_assistant',
-    autonomy_level: 'advisory',
+    // FLOOR-020. The pair is derived by the gate from `resourceType`
+    // (Mode 1 → conversational_assistant + advisory; Mode 2 →
+    // protocol_execution + action_with_confirm). Per Codex PR F R1
+    // HIGH closure 2026-05-13.
+    ai_workload_type: args.auditEnvelope.workloadType,
+    autonomy_level: args.auditEnvelope.autonomyLevel,
     agent_id: null,
     agent_version: null,
     tool_call_id: null,

@@ -170,7 +170,14 @@ describe('runCrisisGate — positive detection path', () => {
     });
   });
 
-  it('Mode 2 case-prep input + output sources both honored', async () => {
+  it('Mode 2 case-prep input + output emit with protocol_execution workload (NOT conversational_assistant)', async () => {
+    // Per Codex PR F R1 HIGH closure 2026-05-13: the FLOOR-020
+    // (workload_type, autonomy_level) envelope MUST be derived from
+    // the resourceType, not hard-coded. Mode 2 case-prep surfaces
+    // are `protocol_execution` + `action_with_confirm`; a regression
+    // that re-hard-codes `conversational_assistant` + `advisory`
+    // for every detection would break audit-filter queries,
+    // I-012 correlation, and Mode 2 safety reporting.
     const ctx1 = {
       ...baseCtx({ resourceId: `aiwfe_${ulid()}` }),
       aiActorId: 'system:ai_mode_2_case_prep',
@@ -187,6 +194,22 @@ describe('runCrisisGate — positive detection path', () => {
     }
     expect(await countCrisisAudits(ctx1.resourceId)).toBe(1);
 
+    // Assert FLOOR-020 envelope on the audit row itself.
+    await withTenantContext(T_US, async () => {
+      const client = getTestClient();
+      const rows = await client.query<{
+        ai_workload_type: string;
+        autonomy_level: string;
+      }>(
+        `SELECT ai_workload_type, autonomy_level
+           FROM audit_records
+          WHERE tenant_id = $1 AND resource_id = $2 AND action = 'crisis_detection_trigger'`,
+        [T_US, ctx1.resourceId],
+      );
+      expect(rows.rows[0]!.ai_workload_type).toBe('protocol_execution');
+      expect(rows.rows[0]!.autonomy_level).toBe('action_with_confirm');
+    });
+
     const ctx2 = {
       ...baseCtx({ resourceId: `aiwfe_${ulid()}` }),
       aiActorId: 'system:ai_mode_2_case_prep',
@@ -202,5 +225,106 @@ describe('runCrisisGate — positive detection path', () => {
       expect(r2.detection_source).toBe('ai_case_prep_output');
     }
     expect(await countCrisisAudits(ctx2.resourceId)).toBe(1);
+
+    await withTenantContext(T_US, async () => {
+      const client = getTestClient();
+      const rows = await client.query<{
+        ai_workload_type: string;
+        autonomy_level: string;
+      }>(
+        `SELECT ai_workload_type, autonomy_level
+           FROM audit_records
+          WHERE tenant_id = $1 AND resource_id = $2 AND action = 'crisis_detection_trigger'`,
+        [T_US, ctx2.resourceId],
+      );
+      expect(rows.rows[0]!.ai_workload_type).toBe('protocol_execution');
+      expect(rows.rows[0]!.autonomy_level).toBe('action_with_confirm');
+    });
+  });
+
+  it('(resourceType, detectionSource) mismatch throws loud (no mislabeled emit)', async () => {
+    // Mode 1 chat aggregate with a Mode 2 case-prep source is a
+    // programmer error — the gate refuses to emit a mislabeled
+    // FLOOR-020 envelope. Per Codex PR F R1 HIGH closure.
+    const ctx = baseCtx(); // resourceType=ai_chat_session
+    await expect(
+      runCrisisGate(ctx, "i don't want to live anymore", 'ai_case_prep_input'),
+    ).rejects.toThrow(/Refusing to emit a mislabeled FLOOR-020 envelope/);
+    // And no audit row was written.
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
+
+    // Reverse direction: Mode 2 aggregate with Mode 1 source.
+    const ctx2 = {
+      ...baseCtx({ resourceId: `aiwfe_${ulid()}` }),
+      aiActorId: 'system:ai_mode_2_case_prep',
+      resourceType: 'ai_workflow_execution' as const,
+    };
+    await expect(
+      runCrisisGate(ctx2, "i don't want to live anymore", 'ai_chat_input'),
+    ).rejects.toThrow(/Refusing to emit a mislabeled FLOOR-020 envelope/);
+    expect(await countCrisisAudits(ctx2.resourceId)).toBe(0);
+  });
+});
+
+describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', () => {
+  it('retry under same idempotencyCtx after positive detection does NOT emit a second audit', async () => {
+    // Sprint 34 / SI-006 audit-dedupe pattern: if the caller passes
+    // an idempotencyCtx, a retry under the same Idempotency-Key +
+    // body + endpoint + actor 5-tuple claims the same dedupe
+    // marker, hits ON CONFLICT DO NOTHING, and skips the second
+    // emit. The audit is durable from the first attempt; the second
+    // call still returns the crisis sentinel (audit_emitted=true)
+    // because the audit IS durable — just not freshly emitted.
+    const ctx = {
+      ...baseCtx(),
+      idempotencyCtx: {
+        tenantId: T_US,
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/chat',
+        actorId: 'patient_abc',
+        bodyHash: 'a'.repeat(64),
+      },
+    };
+    const r1 = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
+    expect(r1.kind).toBe('crisis');
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
+
+    const r2 = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
+    expect(r2.kind).toBe('crisis');
+    // Audit count UNCHANGED — dedupe marker blocked the second emit.
+    expect(await countCrisisAudits(ctx.resourceId)).toBe(1);
+  });
+
+  it('retry under DIFFERENT idempotency-key emits a fresh audit (dedupe scoped per key)', async () => {
+    const baseCtxShared = baseCtx();
+    const ctx1 = {
+      ...baseCtxShared,
+      idempotencyCtx: {
+        tenantId: T_US,
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/chat',
+        actorId: 'patient_abc',
+        bodyHash: 'a'.repeat(64),
+      },
+    };
+    const r1 = await runCrisisGate(ctx1, "i don't want to live anymore", 'ai_chat_input');
+    expect(r1.kind).toBe('crisis');
+    expect(await countCrisisAudits(ctx1.resourceId)).toBe(1);
+
+    // Distinct Idempotency-Key → distinct dedupe marker → fresh emit.
+    const ctx2 = {
+      ...baseCtxShared,
+      idempotencyCtx: {
+        tenantId: T_US,
+        idempotencyKey: ulid(),
+        endpoint: 'POST /v0/ai/chat',
+        actorId: 'patient_abc',
+        bodyHash: 'a'.repeat(64),
+      },
+    };
+    const r2 = await runCrisisGate(ctx2, "i don't want to live anymore", 'ai_chat_input');
+    expect(r2.kind).toBe('crisis');
+    // Same resource_id → both audits land on it; count goes 1 → 2.
+    expect(await countCrisisAudits(ctx2.resourceId)).toBe(2);
   });
 });

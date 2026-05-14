@@ -162,7 +162,7 @@ export {
 // singleton `crisisDetector` from src/lib/crisis-detection.ts +
 // emits the canonical `crisis_detection_trigger` Category A audit
 // per AUDIT_EVENTS v5.3 on positive detection.
-export type { AICrisisDetectionSource } from './internal/crisis/audit.js';
+export type { AICrisisAuditEnvelope, AICrisisDetectionSource } from './internal/crisis/audit.js';
 export { emitAICrisisDetectionTrigger } from './internal/crisis/audit.js';
 export type { CrisisGateContext, CrisisGateOutcome } from './internal/crisis/gate.js';
 export { runCrisisGate } from './internal/crisis/gate.js';

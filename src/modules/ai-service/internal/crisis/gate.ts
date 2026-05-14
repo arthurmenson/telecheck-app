@@ -50,11 +50,17 @@
  *     based on which detection_source fired)
  */
 
+import { claimAuditDedupeSlot } from '../../../../lib/audit-dedupe.js';
 import { crisisDetector } from '../../../../lib/crisis-detection.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withTransaction } from '../../../../lib/db.js';
+import type { IdempotencyCtx } from '../../../../lib/idempotency.js';
 
-import { type AICrisisDetectionSource, emitAICrisisDetectionTrigger } from './audit.js';
+import {
+  type AICrisisAuditEnvelope,
+  type AICrisisDetectionSource,
+  emitAICrisisDetectionTrigger,
+} from './audit.js';
 
 export type CrisisGateOutcome =
   | {
@@ -91,6 +97,59 @@ export interface CrisisGateContext {
    *  caller from CCR + crisis type; null if not resolvable
    *  (the audit still fires; ops alerts on null). */
   escalationDestination: string | null;
+  /** Idempotency context from the request lifecycle (handler-side
+   *  `buildIdempotencyCtx` output). When supplied, the gate claims
+   *  an `audit_dedupe_markers` slot before emitting so a retry
+   *  under the same Idempotency-Key after a partial-failure window
+   *  cannot double-emit the Category A audit. Omit for direct
+   *  service-call paths and tests. Per Codex PR F R1 HIGH closure
+   *  2026-05-13 — same pattern as forms-intake's submission-service
+   *  runCrisisGate (Sprint 34 / SI-006). */
+  idempotencyCtx?: IdempotencyCtx;
+}
+
+/**
+ * Derive the FLOOR-020 (workload_type, autonomy_level) pair the
+ * Category A audit MUST carry, from the resource aggregate the text
+ * came from. Mode 1 chat surfaces are conversational_assistant +
+ * advisory; Mode 2 case-prep / protocol-execution surfaces are
+ * protocol_execution + action_with_confirm.
+ *
+ * Surfaced as a pure-function derivation (rather than a free
+ * parameter on `CrisisGateContext`) so a future surface that mis-
+ * pairs detection_source with resourceType (e.g., an `ai_chat_output`
+ * fired against an `ai_workflow_execution` aggregate) fails at the
+ * compile-or-test layer rather than producing a mislabeled audit row.
+ * Per Codex PR F R1 HIGH closure 2026-05-13.
+ */
+function deriveAuditEnvelope(
+  resourceType: 'ai_chat_session' | 'ai_workflow_execution',
+  detectionSource: AICrisisDetectionSource,
+): AICrisisAuditEnvelope {
+  // Defense in depth: the source MUST belong to the same surface as
+  // the aggregate. ai_chat_* against ai_workflow_execution (or
+  // ai_case_prep_* against ai_chat_session) is a programmer error;
+  // throw loud rather than emit a mislabeled audit row.
+  if (resourceType === 'ai_chat_session') {
+    if (detectionSource !== 'ai_chat_input' && detectionSource !== 'ai_chat_output') {
+      throw new Error(
+        `runCrisisGate: detectionSource=${detectionSource} is not a Mode 1 chat ` +
+          `source but resourceType=ai_chat_session implies Mode 1. Refusing to emit ` +
+          `a mislabeled FLOOR-020 envelope.`,
+      );
+    }
+    return { workloadType: 'conversational_assistant', autonomyLevel: 'advisory' };
+  }
+  // resourceType === 'ai_workflow_execution' (Mode 2 case-prep /
+  // protocol_execution surface).
+  if (detectionSource !== 'ai_case_prep_input' && detectionSource !== 'ai_case_prep_output') {
+    throw new Error(
+      `runCrisisGate: detectionSource=${detectionSource} is not a Mode 2 case-prep ` +
+        `source but resourceType=ai_workflow_execution implies Mode 2. Refusing to ` +
+        `emit a mislabeled FLOOR-020 envelope.`,
+    );
+  }
+  return { workloadType: 'protocol_execution', autonomyLevel: 'action_with_confirm' };
 }
 
 /**
@@ -107,6 +166,22 @@ export interface CrisisGateContext {
  * audit committed with their own writing transaction (e.g., a
  * future surface that wants to atomically record both the
  * detection AND a state change).
+ *
+ * **Idempotency dedupe (Codex PR F R1 HIGH closure 2026-05-13):**
+ * When `ctx.idempotencyCtx` is supplied (the canonical caller
+ * pattern from an idempotency-protected HTTP handler), the gate
+ * claims an `audit_dedupe_markers` slot via `claimAuditDedupeSlot`
+ * BEFORE emitting. A retry under the same Idempotency-Key after a
+ * partial-failure window (audit committed, idempotency completion
+ * UPDATE rolled back) hits ON CONFLICT DO NOTHING, skips the second
+ * emit, and the gate still returns `{ kind: 'crisis', audit_emitted:
+ * true }` because the audit IS durable from the prior attempt. Same
+ * pattern as forms-intake's `submission-service.ts` runCrisisGate
+ * (Sprint 34 / SI-006 audit-dedupe SI).
+ *
+ * Without `idempotencyCtx` (direct service-call paths, tests), the
+ * dedupe step is skipped — caller accepts the documented duplicate-
+ * audit risk on retry.
  */
 export async function runCrisisGate(
   ctx: CrisisGateContext,
@@ -126,6 +201,13 @@ export async function runCrisisGate(
     return { kind: 'no_crisis' };
   }
 
+  // Derive the FLOOR-020 (workload_type, autonomy_level) pair from
+  // the resource aggregate. Mode 1 chat → conversational_assistant +
+  // advisory; Mode 2 case-prep → protocol_execution +
+  // action_with_confirm. Throws loud on (resourceType, detectionSource)
+  // mismatch rather than producing a mislabeled audit row.
+  const auditEnvelope = deriveAuditEnvelope(ctx.resourceType, detectionSource);
+
   // Positive detection — emit the canonical Category A audit.
   // Per FLOOR-020 crisis-write exception: if the audit emission
   // fails, the caller still proceeds with the crisis-resource
@@ -135,6 +217,29 @@ export async function runCrisisGate(
   try {
     const emit = async (tx: DbTransaction) => {
       await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
+      // Idempotency dedupe: if the caller is on an idempotency-
+      // protected path, claim a marker BEFORE emitting. A second
+      // attempt under the same Idempotency-Key + body + endpoint +
+      // actor + audit-action 5-tuple hits ON CONFLICT and returns
+      // false — we skip the emit (the audit is already durable
+      // from the first attempt). Per Codex PR F R1 HIGH closure.
+      if (ctx.idempotencyCtx !== undefined) {
+        const claimed = await claimAuditDedupeSlot(tx, {
+          tenantId: ctx.idempotencyCtx.tenantId,
+          idempotencyKey: ctx.idempotencyCtx.idempotencyKey,
+          endpoint: ctx.idempotencyCtx.endpoint,
+          actorId: ctx.idempotencyCtx.actorId,
+          bodyHash: ctx.idempotencyCtx.bodyHash,
+          auditAction: 'crisis_detection_trigger',
+        });
+        if (!claimed) {
+          // Prior attempt already emitted this exact audit on this
+          // exact request — short-circuit. The caller still gets
+          // `{ kind: 'crisis', audit_emitted: true }` because the
+          // audit IS durable (just from the earlier attempt).
+          return;
+        }
+      }
       await emitAICrisisDetectionTrigger(
         {
           tenantId: ctx.tenantId,
@@ -147,6 +252,7 @@ export async function runCrisisGate(
           resourceId: ctx.resourceId,
           responseProvided: true, // canonical path: caller WILL surface crisis resources
           escalationDestination: ctx.escalationDestination,
+          auditEnvelope,
         },
         tx,
       );
