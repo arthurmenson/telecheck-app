@@ -27,6 +27,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
+import { ulid } from '../../src/lib/ulid.ts';
 
 let app: FastifyInstance | null = null;
 
@@ -150,10 +151,17 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     // route at all, we close that risk by construction. Locking
     // this in: a future PR that accidentally mounts /chat without
     // PR F's gating will trip this test and fail loud.
+    //
+    // We MUST supply an Idempotency-Key header because the global
+    // idempotency-plugin preHandler returns 400
+    // `internal.idempotency.missing_key` on every state-changing
+    // POST before route resolution fires. Sending a valid key lets
+    // the request reach route-matching, which then returns 404 for
+    // the unregistered path.
     const r = await app!.inject({
       method: 'POST',
       url: '/v0/ai/chat',
-      headers: { host: 'heroshealth.com' },
+      headers: { host: 'heroshealth.com', 'idempotency-key': ulid() },
       payload: { message: 'hi' },
     });
     expect(r.statusCode).toBe(404);
