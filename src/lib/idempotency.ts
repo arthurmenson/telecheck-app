@@ -812,30 +812,44 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
         return;
       }
 
-      // Same 4-tuple key, same body — handle by processing_state:
+      // Same 4-tuple key, same body — fall through to the handler. We do
+      // NOT short-circuit-replay completed responses from the preHandler.
       //
-      //   completed → fast-path replay from the preHandler. Handler does
-      //               not run.
-      //   pending   → another request owns the reservation. The
-      //               preHandler runs OUTSIDE the writing transaction,
-      //               so it sees `pending` only after that transaction
-      //               commits (MVCC; uncommitted reservations are
-      //               invisible). When this branch fires, the writing
-      //               request crashed mid-execution and left a
-      //               'pending' row, OR a clean concurrent request is
-      //               in a brief between-completion window. Either way:
-      //               pass through. The handler's `withIdempotency`
-      //               will see the same 'pending' row, throw
-      //               IdempotencyInFlightError, and the handler returns
-      //               409 cleanly. We don't 409 from preHandler because
-      //               we can't distinguish stale-pending from
-      //               in-flight-pending here without a serializable
-      //               read, which is more cost than benefit.
-      if (existing.processingState === 'completed') {
-        await reply.code(existing.statusCode).send(existing.body);
-        return;
-      }
-      // Fall through to context stash + handler invocation.
+      // History: prior to TLC-055 PR F (2026-05-13) the preHandler served
+      // cached completed responses directly here. The Codex R2 adversarial
+      // review on PR F flagged that as an authentication-bypass vector:
+      // `authContextPlugin` runs before this hook and populates the actor
+      // context from a still-valid JWT signature, but does NOT verify the
+      // underlying session is still live. A clinician whose session is
+      // revoked AFTER the first 200 could replay the same Idempotency-Key
+      // + body and receive the cached PHI response, because the
+      // route-handler liveness check (`requireClinicianLiveSession` and
+      // similar) never runs on the preHandler fast-path. The integration
+      // test `pharmacy-clinician-discontinue-http.test.ts` Group F locks
+      // this in as a regression guard.
+      //
+      // Fix: move the cache-hit replay into the handler. Every state-
+      // changing endpoint already wraps its body in
+      // `withIdempotentExecution`, which calls `withIdempotency` AFTER
+      // the route's auth/role/liveness gates have run. That helper does
+      // its own cache lookup inside the handler-owned transaction and
+      // throws `IdempotencyReplayError` on a completed match;
+      // `withIdempotentExecution` catches it and replays the cached
+      // status + body. The functional outcome (status + body verbatim)
+      // is identical to the old preHandler fast-path — only the order
+      // changes: auth runs first, then replay.
+      //
+      // Pending records also fall through to the handler. The handler's
+      // `withIdempotency` will see the same 'pending' row, throw
+      // `IdempotencyInFlightError`, and `withIdempotentExecution` returns
+      // 409 cleanly. We don't 409 from preHandler because we can't
+      // distinguish stale-pending from in-flight-pending here without a
+      // serializable read, which is more cost than benefit.
+      //
+      // The body-mismatch 409 above is preserved as a fast-path because
+      // it leaks no PHI — the 409 envelope is a generic idempotency-
+      // contract error, and the actor on a body-mismatch is by
+      // definition mounting a contract violation, not a PHI-read attempt.
     }
 
     // First request OR pending-record pass-through. The handler runs.
