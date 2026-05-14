@@ -411,6 +411,26 @@ function mapWriteServiceError(err: unknown, reply: FastifyReply, reqId: string):
       );
     return true;
   }
+  // I012RejectError bubbles out of the approveAsClinician service when
+  // any of I-012's three reject-unless clauses fails. The audit chain
+  // already captured the precise violated_clauses via
+  // prescribing.execution_rejected; the public envelope collapses to a
+  // generic conflict to avoid leaking guard internals. For the v1.0
+  // clinician-only path this branch is defense-in-depth — every guard
+  // field is service-controlled — but it satisfies the I-012
+  // bare-suppression-forbidden rule (I-003).
+  if (err instanceof Error && err.name === 'I012RejectError') {
+    void reply
+      .code(409)
+      .send(
+        makeErrorEnvelope(
+          reqId,
+          'internal.resource.conflict',
+          'Medication request state conflict.',
+        ),
+      );
+    return true;
+  }
   return false;
 }
 
@@ -951,6 +971,84 @@ export async function clinicianDiscontinueMedicationRequestHandler(
       { accountId: actor.accountId },
       id,
       reason,
+      tx,
+    );
+    return { status: 200, view: toPatientMedicationRequestView(updated) };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// POST /v0/pharmacy/prescriptions/:id/approve
+//
+// Clinician-only I-012-gated activation per State Machines v1.2 §19:
+//
+//   pending_clinician_review --[clinician_approve]--> active
+//
+// Body is empty — the approval transition takes no parameters. The body
+// parser rejects unexpected fields explicitly so a clinician can't
+// smuggle in an override of the server-derived prescribed_at or
+// approval_pathway.
+//
+// Returns:
+//   - 200 + PHI-safe view (status=active, prescribed_at set,
+//     prescribed_by_clinician_account_id set).
+//   - 400 on non-empty / non-object body.
+//   - 401 on missing JWT / dead session / mismatched account binding.
+//   - 403 on patient-role JWT.
+//   - 404 on not-found / cross-tenant / malformed id (I-025 collapsed).
+//   - 409 on row not in 'pending_clinician_review' OR concurrent writer
+//     raced OR I-012 reject-unless violation (the latter is service-
+//     layer-bug defense-in-depth; v1.0 clinician-only fields are all
+//     service-controlled).
+//
+// Idempotency-Key REQUIRED per IDEMPOTENCY v5.1. The handler-owned
+// idempotency check sits AFTER requireClinicianLiveSession, so a
+// revoked-session replay 401s before any cached PHI can be served
+// (platform fix landed alongside TLC-055 PR F).
+// ---------------------------------------------------------------------------
+
+export async function approveMedicationRequestHandler(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const { ctx, actor } = await requireClinicianLiveSession(req);
+
+  // Reject non-empty body. The approve transition takes no parameters.
+  if (
+    req.body !== undefined &&
+    req.body !== null &&
+    (typeof req.body !== 'object' ||
+      Array.isArray(req.body) ||
+      Object.keys(req.body as Record<string, unknown>).length > 0)
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Approve accepts no body — the state transition takes no parameters.',
+        ),
+      );
+  }
+
+  let id;
+  try {
+    id = asMedicationRequestId(req.params.id);
+  } catch (err) {
+    if (err instanceof GlossaryViolationError) {
+      return reply
+        .code(404)
+        .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
+    }
+    throw err;
+  }
+
+  return withIdempotentExecution(req, reply, mapWriteServiceError, async (tx) => {
+    const updated = await medicationRequestService.approveAsClinician(
+      ctx,
+      { accountId: actor.accountId },
+      id,
       tx,
     );
     return { status: 200, view: toPatientMedicationRequestView(updated) };
