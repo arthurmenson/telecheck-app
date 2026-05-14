@@ -122,6 +122,37 @@ export {
 export { NullLLMProvider } from './internal/providers/null-provider.js';
 export { resolveProvider } from './internal/providers/registry.js';
 
+// Guardrail templates per AI_LAYERING v5.2 §3 (AI-GUARD-001..005).
+// PR E ships:
+//   - Type contracts (GuardrailTemplate, GuardrailScope,
+//     GuardrailEscalation, CanonicalGuardrailTemplateName,
+//     PlatformFloorRule)
+//   - The immutable Conservative Default template (AI-GUARD-003)
+//   - Registry lookup (Conservative Default only at v1.0; per-tenant
+//     + per-program variants land when their slices activate)
+//   - Floor-compliance validator (AI-GUARD-002)
+//   - Emergency rollback entry point (AI-GUARD-005)
+//
+// Other Ghana launch templates (GLP-1 Program, ED Program, Labs)
+// land alongside their program/feature slices. Tenant overrides
+// land when the admin AI-configuration surface ships.
+export type {
+  CanonicalGuardrailTemplateName,
+  GuardrailEscalation,
+  GuardrailScope,
+  GuardrailTemplate,
+  PlatformFloorRule,
+} from './internal/guardrails/types.js';
+export { PLATFORM_FLOOR_RULES } from './internal/guardrails/types.js';
+export { CONSERVATIVE_DEFAULT_TEMPLATE } from './internal/guardrails/conservative-default.js';
+export {
+  GuardrailFloorViolationError,
+  getActiveGuardrailTemplate,
+  getEmergencyRollbackTemplate,
+  getTemplateByName,
+  validatePlatformFloorCompliance,
+} from './internal/guardrails/registry.js';
+
 // Fastify plugin for app.ts wiring. Currently exposes only `/health`
 // (200) + `/ready` (503). Real handlers land in subsequent PRs.
 export { aiServicePlugin } from './plugin.js';
