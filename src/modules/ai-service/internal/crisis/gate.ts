@@ -231,66 +231,80 @@ export async function runCrisisGate(
     return { kind: 'no_crisis' };
   }
 
-  // Derive the FLOOR-020 (workload_type, autonomy_level) pair from
-  // the resource aggregate. Mode 1 chat → conversational_assistant +
-  // advisory; Mode 2 case-prep → protocol_execution +
-  // action_with_confirm. Throws loud on (resourceType, detectionSource)
-  // mismatch rather than producing a mislabeled audit row.
-  const auditEnvelope = deriveAuditEnvelope(ctx.resourceType, detectionSource);
+  // SAFETY-FIRST ENVELOPE (Codex PR F R10 HIGH closure 2026-05-13):
+  // ALL validation that runs after positive detection lives INSIDE the
+  // FLOOR-020 try/catch from this point forward, including caller-
+  // wiring validations (tenant equality, case-prep discriminator
+  // presence, discriminator shape, and resourceType/detectionSource
+  // envelope-derivation mismatches). Earlier rounds (R3 / R7 / R8)
+  // routed these throws around the try/catch to signal "programmer
+  // error" — but R10 observed that on a real positive crisis
+  // detection, the gate's contract is "always return the crisis
+  // sentinel so the caller surfaces resources." Letting a wiring bug
+  // bypass that contract converts a patient crisis into a 500 error
+  // and denies them the crisis-resource response. The wiring bug
+  // still surfaces via the ops-alert path (audit_emitted=false +
+  // audit_error.{name,message} captures the validation error), so
+  // diagnostics are preserved — but the safety sentinel ALWAYS
+  // returns when detection is positive.
+  let auditEmitted = true;
+  let auditError: { name: string; message: string } | undefined;
+  try {
+    // Derive the FLOOR-020 (workload_type, autonomy_level) pair from
+    // the resource aggregate. Mode 1 chat → conversational_assistant +
+    // advisory; Mode 2 case-prep → protocol_execution +
+    // action_with_confirm. Throws on (resourceType, detectionSource)
+    // mismatch — now caught by the safety envelope so the patient
+    // still gets the crisis-resource response.
+    const auditEnvelope = deriveAuditEnvelope(ctx.resourceType, detectionSource);
 
-  // Tenant equality guard: the gate's tenant_id is the authoritative
-  // tenant for both the audit row AND the dedupe marker. A caller
-  // wiring bug that passed an idempotencyCtx scoped to a different
-  // tenant would create or conflict on a marker under tenant B while
-  // the audit IS emitted under tenant A — or, worse, would short-
-  // circuit on tenant B's prior marker and return `audit_emitted:
-  // true` with no audit row for tenant A at all. The check runs
-  // BEFORE the try/catch envelope so the throw propagates as a
-  // programmer-error signal — distinct from the FLOOR-020 crisis-
-  // write exception which is reserved for runtime audit-write
-  // infrastructure failures. Per Codex PR F R3 HIGH closure
-  // 2026-05-13.
-  if (ctx.idempotencyCtx !== undefined && ctx.idempotencyCtx.tenantId !== ctx.tenantId) {
-    throw new Error(
-      `runCrisisGate: idempotencyCtx.tenantId=${ctx.idempotencyCtx.tenantId} ` +
-        `must equal ctx.tenantId=${ctx.tenantId}. Refusing to claim a dedupe ` +
-        `marker under a different tenant than the audit row.`,
-    );
-  }
+    // Tenant equality guard: the gate's tenant_id is the authoritative
+    // tenant for both the audit row AND the dedupe marker. A caller
+    // wiring bug that passed an idempotencyCtx scoped to a different
+    // tenant would create or conflict on a marker under tenant B
+    // while the audit IS emitted under tenant A — or, worse, would
+    // short-circuit on tenant B's prior marker and return
+    // `audit_emitted: true` with no audit row for tenant A. Per
+    // Codex PR F R3 HIGH closure 2026-05-13 (moved inside the
+    // safety envelope per R10).
+    if (ctx.idempotencyCtx !== undefined && ctx.idempotencyCtx.tenantId !== ctx.tenantId) {
+      throw new Error(
+        `runCrisisGate: idempotencyCtx.tenantId=${ctx.idempotencyCtx.tenantId} ` +
+          `must equal ctx.tenantId=${ctx.tenantId}. Refusing to claim a dedupe ` +
+          `marker under a different tenant than the audit row.`,
+      );
+    }
 
-  // Case-prep multi-segment guard: Mode 2 case-prep handlers are
-  // documented to scan multiple segments of the same consult (e.g.,
-  // chief_complaint + history_of_present_illness + review_of_systems)
-  // for the same source. Without a per-segment discriminator the
-  // dedupe key would collapse those segments and silently suppress
-  // the second-and-later positive audits. Make this fail-closed:
-  // when an idempotencyCtx is supplied for a case-prep source, the
-  // caller MUST also supply `auditDedupeDiscriminator`. Mode 1 chat
-  // sources are exempt — they're single-scan per source per request
-  // by design (one user message, one AI response). Per Codex PR F
-  // R7 HIGH closure 2026-05-13.
-  if (
-    ctx.idempotencyCtx !== undefined &&
-    (detectionSource === 'ai_case_prep_input' || detectionSource === 'ai_case_prep_output') &&
-    ctx.auditDedupeDiscriminator === undefined
-  ) {
-    throw new Error(
-      `runCrisisGate: auditDedupeDiscriminator is required for case-prep ` +
-        `(detectionSource=${detectionSource}) when idempotencyCtx is supplied. ` +
-        `Case-prep handlers scan multiple segments per consult; without a per-` +
-        `segment discriminator the dedupe marker would silently suppress later ` +
-        `positive detections. Supply a non-PHI segment id (e.g., a field name).`,
-    );
-  }
+    // Case-prep multi-segment guard: Mode 2 case-prep handlers are
+    // documented to scan multiple segments of the same consult (e.g.,
+    // chief_complaint + history_of_present_illness + review_of_systems)
+    // for the same source. Without a per-segment discriminator the
+    // dedupe key would collapse those segments and silently suppress
+    // later positive audits. Per Codex PR F R7 HIGH closure 2026-05-13
+    // (moved inside the safety envelope per R10).
+    if (
+      ctx.idempotencyCtx !== undefined &&
+      (detectionSource === 'ai_case_prep_input' || detectionSource === 'ai_case_prep_output') &&
+      ctx.auditDedupeDiscriminator === undefined
+    ) {
+      throw new Error(
+        `runCrisisGate: auditDedupeDiscriminator is required for case-prep ` +
+          `(detectionSource=${detectionSource}) when idempotencyCtx is supplied. ` +
+          `Case-prep handlers scan multiple segments per consult; without a per-` +
+          `segment discriminator the dedupe marker would silently suppress later ` +
+          `positive detections. Supply a non-PHI segment id (e.g., a field name).`,
+      );
+    }
 
-  // Discriminator shape validation: empty string, whitespace, or
-  // delimiter-bearing values would either match the no-discriminator
-  // case OR collide across distinct segments via the colon-
-  // concatenation in the dedupe key. Constrain to a tight character
-  // set so multi-segment dedupe semantics are guaranteed. Per Codex
-  // PR F R8 HIGH closure 2026-05-13.
-  if (ctx.auditDedupeDiscriminator !== undefined) {
-    if (!AUDIT_DEDUPE_DISCRIMINATOR_RE.test(ctx.auditDedupeDiscriminator)) {
+    // Discriminator shape validation: empty string, whitespace, or
+    // delimiter-bearing values would either match the no-discriminator
+    // case OR collide across distinct segments via the colon-
+    // concatenation in the dedupe key. Per Codex PR F R8 HIGH closure
+    // 2026-05-13 (moved inside the safety envelope per R10).
+    if (
+      ctx.auditDedupeDiscriminator !== undefined &&
+      !AUDIT_DEDUPE_DISCRIMINATOR_RE.test(ctx.auditDedupeDiscriminator)
+    ) {
       throw new Error(
         `runCrisisGate: auditDedupeDiscriminator must match ` +
           `${AUDIT_DEDUPE_DISCRIMINATOR_RE.source} (1..64 chars from ` +
@@ -298,16 +312,7 @@ export async function runCrisisGate(
           `${JSON.stringify(ctx.auditDedupeDiscriminator)}`,
       );
     }
-  }
 
-  // Positive detection — emit the canonical Category A audit.
-  // Per FLOOR-020 crisis-write exception: if the audit emission
-  // fails, the caller still proceeds with the crisis-resource
-  // response. We capture the failure on the returned outcome so
-  // the caller can fire an ops alert.
-  let auditEmitted = true;
-  let auditError: { name: string; message: string } | undefined;
-  try {
     const emit = async (tx: DbTransaction) => {
       await tx.query('SELECT set_tenant_context($1)', [ctx.tenantId]);
       // Idempotency dedupe: if the caller is on an idempotency-

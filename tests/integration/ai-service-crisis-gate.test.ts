@@ -247,15 +247,21 @@ describe('runCrisisGate — positive detection path', () => {
     });
   });
 
-  it('(resourceType, detectionSource) mismatch throws loud (no mislabeled emit)', async () => {
-    // Mode 1 chat aggregate with a Mode 2 case-prep source is a
-    // programmer error — the gate refuses to emit a mislabeled
-    // FLOOR-020 envelope. Per Codex PR F R1 HIGH closure.
+  it('(resourceType, detectionSource) mismatch — safety sentinel still returns, audit fails open with audit_error', async () => {
+    // Per Codex PR F R10 HIGH closure 2026-05-13: a caller wiring
+    // bug (Mode 1 chat aggregate with a Mode 2 case-prep source, or
+    // vice versa) is a programmer error — but on a real positive
+    // crisis detection, the gate's contract is "always return the
+    // crisis sentinel so the caller surfaces resources." The
+    // wiring bug surfaces via `audit_emitted=false` + `audit_error`,
+    // NOT by denying the patient the crisis-resource response.
     const ctx = baseCtx(); // resourceType=ai_chat_session
-    await expect(
-      runCrisisGate(ctx, "i don't want to live anymore", 'ai_case_prep_input'),
-    ).rejects.toThrow(/Refusing to emit a mislabeled FLOOR-020 envelope/);
-    // And no audit row was written.
+    const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_case_prep_input');
+    expect(r.kind).toBe('crisis');
+    if (r.kind === 'crisis') {
+      expect(r.audit_emitted).toBe(false);
+      expect(r.audit_error?.message).toMatch(/Refusing to emit a mislabeled FLOOR-020 envelope/);
+    }
     expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
 
     // Reverse direction: Mode 2 aggregate with Mode 1 source.
@@ -264,9 +270,12 @@ describe('runCrisisGate — positive detection path', () => {
       aiActorId: 'system:ai_mode_2_case_prep',
       resourceType: 'ai_workflow_execution' as const,
     };
-    await expect(
-      runCrisisGate(ctx2, "i don't want to live anymore", 'ai_chat_input'),
-    ).rejects.toThrow(/Refusing to emit a mislabeled FLOOR-020 envelope/);
+    const r2 = await runCrisisGate(ctx2, "i don't want to live anymore", 'ai_chat_input');
+    expect(r2.kind).toBe('crisis');
+    if (r2.kind === 'crisis') {
+      expect(r2.audit_emitted).toBe(false);
+      expect(r2.audit_error?.message).toMatch(/Refusing to emit a mislabeled FLOOR-020 envelope/);
+    }
     expect(await countCrisisAudits(ctx2.resourceId)).toBe(0);
   });
 });
@@ -425,7 +434,7 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     expect(await countCrisisAudits(ctx2.resourceId)).toBe(1);
   });
 
-  it('case-prep + idempotencyCtx WITHOUT auditDedupeDiscriminator throws (fail-closed)', async () => {
+  it('case-prep + idempotencyCtx WITHOUT auditDedupeDiscriminator — safety sentinel returns, audit_error populated', async () => {
     // Per Codex PR F R7 HIGH closure 2026-05-13: case-prep sources
     // scan multiple segments per consult. Without a per-segment
     // discriminator the dedupe key would silently suppress later
@@ -443,15 +452,23 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
         actorId: 'clinician_xyz',
         bodyHash: 'd'.repeat(64),
       },
-      // NO auditDedupeDiscriminator — must throw.
+      // NO auditDedupeDiscriminator — fails inside safety envelope.
     };
-    await expect(
-      runCrisisGate(
-        ctxCasePrep,
-        'patient reports persistent suicidal ideation',
-        'ai_case_prep_input',
-      ),
-    ).rejects.toThrow(/auditDedupeDiscriminator is required for case-prep/);
+    const rFail = await runCrisisGate(
+      ctxCasePrep,
+      'patient reports persistent suicidal ideation',
+      'ai_case_prep_input',
+    );
+    // Per Codex PR F R10 HIGH closure: safety sentinel ALWAYS
+    // returns on positive detection. Wiring bugs surface via
+    // audit_emitted=false + audit_error, NOT by throwing.
+    expect(rFail.kind).toBe('crisis');
+    if (rFail.kind === 'crisis') {
+      expect(rFail.audit_emitted).toBe(false);
+      expect(rFail.audit_error?.message).toMatch(
+        /auditDedupeDiscriminator is required for case-prep/,
+      );
+    }
     expect(await countCrisisAudits(ctxCasePrep.resourceId)).toBe(0);
 
     // Mode 1 chat WITHOUT discriminator + idempotencyCtx is fine —
@@ -523,7 +540,7 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     expect(await countCrisisAudits(shared.resourceId)).toBe(2); // unchanged
   });
 
-  it('rejects invalid auditDedupeDiscriminator (empty / whitespace / colons / too long)', async () => {
+  it('invalid auditDedupeDiscriminator — safety sentinel returns, audit_error populated', async () => {
     // Per Codex PR F R8 HIGH closure 2026-05-13: discriminator must
     // match /^[A-Za-z0-9_.-]{1,64}$/. Empty / whitespace / colon-
     // bearing values could either match the no-discriminator case
@@ -553,21 +570,29 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
     ];
     for (const v of invalid) {
       const ctx = ctxFor(v);
-      await expect(
-        runCrisisGate(ctx, 'patient reports persistent suicidal ideation', 'ai_case_prep_input'),
-      ).rejects.toThrow(/auditDedupeDiscriminator must match/);
+      const r = await runCrisisGate(
+        ctx,
+        'patient reports persistent suicidal ideation',
+        'ai_case_prep_input',
+      );
+      // Per Codex PR F R10 HIGH closure: safety sentinel ALWAYS
+      // returns; validation errors surface via audit_error.
+      expect(r.kind).toBe('crisis');
+      if (r.kind === 'crisis') {
+        expect(r.audit_emitted).toBe(false);
+        expect(r.audit_error?.message).toMatch(/auditDedupeDiscriminator must match/);
+      }
       expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
     }
   });
 
-  it('idempotencyCtx.tenantId !== ctx.tenantId throws loud (no cross-tenant marker)', async () => {
-    // Per Codex PR F R3 HIGH closure 2026-05-13: a caller wiring bug
-    // that supplied an idempotencyCtx scoped to a different tenant
-    // than the gate's ctx.tenantId could create or conflict on a
-    // marker under tenant B while the audit row is supposed to land
-    // under tenant A — or short-circuit on tenant B's marker and
-    // return `audit_emitted: true` with NO audit row for tenant A.
-    // The gate refuses to proceed.
+  it('idempotencyCtx.tenantId !== ctx.tenantId — safety sentinel returns, audit_error captures the tenant mismatch', async () => {
+    // Per Codex PR F R3 HIGH closure 2026-05-13 + R10 HIGH closure:
+    // a caller wiring bug that supplied an idempotencyCtx scoped to
+    // a different tenant is a programmer error. The safety sentinel
+    // still returns on positive detection (so the patient gets the
+    // crisis-resource response), but `audit_emitted=false` +
+    // `audit_error` surfaces the wiring bug for ops review.
     const ctx = {
       ...baseCtx(), // tenantId = T_US
       idempotencyCtx: {
@@ -578,9 +603,12 @@ describe('runCrisisGate — idempotency dedupe (Codex PR F R1 HIGH closure)', ()
         bodyHash: 'a'.repeat(64),
       },
     };
-    await expect(
-      runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input'),
-    ).rejects.toThrow(/must equal ctx.tenantId/);
+    const r = await runCrisisGate(ctx, "i don't want to live anymore", 'ai_chat_input');
+    expect(r.kind).toBe('crisis');
+    if (r.kind === 'crisis') {
+      expect(r.audit_emitted).toBe(false);
+      expect(r.audit_error?.message).toMatch(/must equal ctx.tenantId/);
+    }
     // No audit row was emitted under either tenant.
     expect(await countCrisisAudits(ctx.resourceId)).toBe(0);
   });
