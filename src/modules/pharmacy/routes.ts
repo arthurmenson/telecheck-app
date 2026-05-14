@@ -57,7 +57,7 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     status: 'ok',
     module: 'pharmacy',
     phase:
-      'schema_ratified_read_and_write_wired_clinician_approve_and_decline_landed_supersede_and_engine_writeback_pending',
+      'schema_ratified_read_and_write_wired_clinician_decisions_and_engine_writeback_landed_supersession_pending',
     schema_ratified: true,
     schema_ratified_at: '2026-05-11',
     schema_ratified_by: 'P-011',
@@ -73,8 +73,11 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
       'TLC-055 PR E (draft + submit) + PR F (discontinue) + PR G (approve) + PR H (decline)',
     i012_first_gated_activation_wired: true,
     i012_first_gated_activation_wired_by: 'TLC-055 PR G (clinician_approve)',
+    engine_writeback_wired: true,
+    engine_writeback_wired_at: '2026-05-13',
+    engine_writeback_wired_by: 'TLC-055 PR I (service-callable; no HTTP surface at v1.0)',
     handlers_wired: false,
-    handlers_wired_tracking: 'TLC-055 PR I (supersession + engine writeback)',
+    handlers_wired_tracking: 'TLC-055 PR J (supersession write-path)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -92,23 +95,24 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
       status: 'not_ready',
       module: 'pharmacy',
       phase:
-        'schema_ratified_read_and_write_wired_clinician_approve_and_decline_landed_supersede_and_engine_writeback_pending',
-      pending: 'TLC-055 PR I (supersession + engine writeback)',
+        'schema_ratified_read_and_write_wired_clinician_decisions_and_engine_writeback_landed_supersession_pending',
+      pending: 'TLC-055 PR J (supersession write-path)',
       pending_message:
         'Module is not yet fully ready to serve traffic — read surface (PR C), ' +
         'patient-origin write surface (PR D), clinician createDraft + submit ' +
         '(PR E), clinician_discontinue + adverse_event_discontinue (PR F), the ' +
-        'first I-012-gated activation clinician_approve (PR G), and ' +
-        'clinician_decline (PR H 2026-05-13) are all wired. Still pending ' +
-        'TLC-055 PR I: supersession write-path (active → superseded paired ' +
-        'with new draft → active, uses migration 026 deferred trigger) AND ' +
-        'engine writeback (Med Interaction Engine flips ' +
-        'pending_interaction_check → pending_clinician_review). Mode 2 ' +
+        'first I-012-gated activation clinician_approve (PR G), ' +
+        'clinician_decline (PR H), AND engine writeback service-callable ' +
+        '(PR I 2026-05-13) are all wired. Still pending TLC-055 PR J: ' +
+        'supersession write-path (active → superseded paired with new draft → ' +
+        'active, uses migration 026 deferred reciprocity trigger). Mode 2 ' +
         'protocol_authorized_prescribing route is intentionally NOT exposed ' +
-        'at v1.0 — it ships with the protocol engine slice. Per the ' +
-        'async-consult readiness-flip precedent, /ready flips to 200 only ' +
-        'when the slice is fully production-ready (every documented endpoint ' +
-        'wired).',
+        'at v1.0 — it ships with the protocol engine slice. Engine writeback ' +
+        'is service-callable only (no HTTP) at v1.0 because system-actor JWT ' +
+        'tokens do not yet exist; an HTTP surface lands when the system-token ' +
+        'issuance slice ships. Per the async-consult readiness-flip ' +
+        'precedent, /ready flips to 200 only when the slice is fully ' +
+        'production-ready.',
     });
   });
 
