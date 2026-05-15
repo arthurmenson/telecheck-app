@@ -21,8 +21,10 @@
 --    we're about to remove + the new canonical-hash signature we're
 --    about to drop). Also drop the F-4 CHECK constraint + the new
 --    set_break_glass_context signature.
-ALTER TABLE audit_records
-    DROP CONSTRAINT IF EXISTS audit_records_actor_tenant_id_required_for_human_actors;
+-- Note: the audit_records_actor_tenant_id_required_for_human_actors
+-- CHECK constraint moved to migration 030 (rolling-deploy safety per
+-- R9 closure). Rolling back 029 doesn't touch that constraint; roll
+-- back 030 separately to drop the constraint.
 DROP FUNCTION IF EXISTS set_break_glass_context(TEXT, TEXT, TEXT, TEXT, TEXT);
 DROP TRIGGER IF EXISTS audit_records_before_insert ON audit_records;
 DROP TRIGGER IF EXISTS audit_records_hash_insert_trigger ON audit_records;
