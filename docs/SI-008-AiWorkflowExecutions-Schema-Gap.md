@@ -180,6 +180,29 @@ Codex R2 HIGH-2 correctly identified that application-layer closure enforcement 
 
 The procedure is the AI-workflow analog of SI-005's `record_consult_clinician_decision` + `rotate_consult_clinician_decision_kms` definer-rights pattern.
 
+### Declarative same-consult enforcement for the FORWARD pointer (R5 HIGH closure 2026-05-15)
+
+Codex R5 HIGH correctly identified that even with the procedure-only-write GRANT model, a future migration / owner-role SQL / backfill path could obtain UPDATE rights and bypass the procedure. The forward FK in SI-005's resolution path must be tightened to enforce same-consult lineage declaratively, not just same-tenant.
+
+**Forward FK (SI-005 closure must use this shape):**
+
+```sql
+-- The `consults` table needs a UNIQUE (tenant_id, id) (it already does
+-- per SI-005's existing composite UNIQUE). The forward pointer FK is
+-- a triple-composite that proves the pointed-at execution belongs to
+-- THIS consult, not just to this tenant.
+ALTER TABLE consults
+    ADD CONSTRAINT fk_consults_ai_workflow_execution
+    FOREIGN KEY (tenant_id, id, ai_workflow_execution_id)
+    REFERENCES ai_workflow_executions (tenant_id, consult_id, id);
+```
+
+The FK uses the SI-008 placeholder's `UNIQUE (tenant_id, consult_id, id)` (added at R4 closure) as the referenced uniqueness target. Now a `consult` row can ONLY point at an execution whose `consult_id` equals the `consult`'s own `id` — DB-enforced, regardless of which code path mutates the pointer.
+
+`record_workflow_pointer_swap()` continues to enforce the CAS guard + state validation + audit emission. The FK is the declarative backstop that catches any path that bypasses the procedure.
+
+**SI-005 closure follow-up:** the SI-005 resolution path's FK 6 definition must be updated to use this triple-composite shape, replacing the original `(tenant_id, ai_workflow_execution_id) → ai_workflow_executions (tenant_id, id)` proposal.
+
 ## Open questions for CDM author
 
 - **state vocabulary:** is `pending | running | completed | failed | cancelled` the canonical set, or does Mode 2 case-prep need additional states (e.g., `requires_clinician_review`, `clinician_approved`, `clinician_declined`)? If the workflow lifecycle includes clinician-decision states, those may belong on the Consult entity (per SI-005's clinician_decision_class column set) rather than here.
