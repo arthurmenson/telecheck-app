@@ -25,10 +25,14 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
+import { asTenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import * as submissionService from '../../src/modules/forms-intake/internal/services/submission-service.ts';
+import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+const T_US = asTenantId(TENANT_US);
 
 // ---------------------------------------------------------------------------
 // Test app lifecycle
@@ -212,7 +216,12 @@ describe('GET /v0/forms/submissions/:submissionId/snapshot — HTTP-level', () =
       url: `/v0/forms/submissions/${submissionId}/snapshot`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
 
@@ -241,7 +250,12 @@ describe('GET /v0/forms/submissions/:submissionId/snapshot — HTTP-level', () =
       url: `/v0/forms/submissions/${submissionId}/snapshot`,
       headers: {
         host: 'localhost',
-        'x-patient-id': wrongPatientId,
+        ...bearerAuthHeader({
+          accountId: wrongPatientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
 
@@ -274,10 +288,16 @@ describe('GET /v0/forms/snapshots/:snapshotId — HTTP-level', () => {
 
     // Look up the snapshot_id via the by-submission endpoint (the only
     // direct surface; it's also test infrastructure for the next call).
+    const patientAuthHeader = bearerAuthHeader({
+      accountId: patientId,
+      tenantId: T_US,
+      countryOfCare: 'US',
+      role: 'patient',
+    });
     const submissionResp = await app!.inject({
       method: 'GET',
       url: `/v0/forms/submissions/${submissionId}/snapshot`,
-      headers: { host: 'localhost', 'x-patient-id': patientId },
+      headers: { host: 'localhost', ...patientAuthHeader },
     });
     expect(submissionResp.statusCode).toBe(200);
     const snapshotId = submissionResp.json<{ snapshot_id: string }>().snapshot_id;
@@ -288,7 +308,7 @@ describe('GET /v0/forms/snapshots/:snapshotId — HTTP-level', () => {
       url: `/v0/forms/snapshots/${snapshotId}`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
+        ...patientAuthHeader,
       },
     });
     expect(byIdResp.statusCode).toBe(200);
@@ -308,7 +328,12 @@ describe('GET /v0/forms/snapshots/:snapshotId — HTTP-level', () => {
       url: `/v0/forms/snapshots/${ulid()}`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
     expect(response.statusCode).toBe(404);
