@@ -448,10 +448,14 @@ REVOKE ALL ON FUNCTION set_break_glass_context(TEXT, TEXT, TEXT, TEXT, TEXT) FRO
 -- (which have NULL actor_tenant_id even for non-system actor types) are
 -- exempt; new rows must pass. VALIDATE CONSTRAINT can run as a separate
 -- maintenance op after legacy rows are backfilled (separate runbook).
+-- F-4 R8 MEDIUM closure (Codex 2026-05-15): the CHECK constraint
+-- rejects not just NULL but also blank/whitespace actor_tenant_id
+-- so direct-SQL paths cannot persist unusable attribution that
+-- satisfies the IS NOT NULL gate but provides no forensic value.
 ALTER TABLE audit_records
     ADD CONSTRAINT audit_records_actor_tenant_id_required_for_human_actors
     CHECK (
         actor_type IN ('system', 'ai_workload')
-        OR actor_tenant_id IS NOT NULL
+        OR (actor_tenant_id IS NOT NULL AND btrim(actor_tenant_id) <> '')
     )
     NOT VALID;

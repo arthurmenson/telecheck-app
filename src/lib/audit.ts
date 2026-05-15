@@ -773,18 +773,23 @@ export async function emitAudit(
   // platform_admin, tenant_admin, pharmacist, etc. Previously only
   // listed {patient, clinician, operator, delegate}, which left admin
   // and AI-adjacent actor types as a forensic blind spot.
+  // R8 MEDIUM closure (2026-05-15): not just null/undefined — also
+  // reject empty string + whitespace-only. Blank attribution defeats
+  // the forensic purpose of the column.
   const NON_ATTRIBUTING_ACTOR_TYPES: ReadonlySet<string> = new Set(['system', 'ai_workload']);
-  if (
-    !NON_ATTRIBUTING_ACTOR_TYPES.has(input.actor_type) &&
-    (input.actor_tenant_id === null || input.actor_tenant_id === undefined)
-  ) {
-    throw new Error(
-      `emitAudit: action="${input.action}" actor_type="${input.actor_type}" requires ` +
-        'non-null actor_tenant_id (F-4 attribution). Only system and ai_workload ' +
-        'actor types may omit it; every other actor type must populate it. ' +
-        'Caller must thread resolveActorTenantIdForAudit(req) into the audit ' +
-        'emitter call site.',
-    );
+  if (!NON_ATTRIBUTING_ACTOR_TYPES.has(input.actor_type)) {
+    const rawAttribution = input.actor_tenant_id;
+    const trimmed =
+      typeof rawAttribution === 'string' ? rawAttribution.trim() : null;
+    if (trimmed === null || trimmed.length === 0) {
+      throw new Error(
+        `emitAudit: action="${input.action}" actor_type="${input.actor_type}" requires ` +
+          'non-null non-blank actor_tenant_id (F-4 attribution). Only system and ' +
+          'ai_workload actor types may omit it; every other actor type must populate it ' +
+          'with a usable tenant identifier. Caller must thread ' +
+          'resolveActorTenantIdForAudit(req) into the audit emitter call site.',
+      );
+    }
   }
 
   // 3. Auto-enforce audit_sensitivity_level = high_pii for research export events (I-031)
