@@ -34,7 +34,7 @@ import fp from 'fastify-plugin';
 import { config } from './config.js';
 import type { TenantId } from './glossary.js';
 import { verifyAccessToken } from './jwt.js';
-import { KNOWN_TENANT_IDS } from './tenant-context.js';
+import { KNOWN_TENANT_IDS, lookupActiveTenantById } from './tenant-context.js';
 
 // ---------------------------------------------------------------------------
 // ActorContext type
@@ -170,20 +170,29 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
     if (claims.role !== 'platform_admin') {
       if (tenantCtx.tenantId !== claims.tenant_id) return;
     } else {
-      // Phase 2 R4 HIGH-2 closure (2026-05-15): platform_admin is
-      // global, but the JWT's home-tenant claim MUST still be a
-      // recognized active tenant. Without this check, a signed
-      // platform_admin token with a stale/deleted/nonsensical home
-      // tenant would authenticate and the audit attribution would
-      // point to a non-existent tenant. Closes Codex R4 HIGH:
-      // "platform_admin skips validation of the JWT home tenant
-      // before global authorization."
+      // Phase 2 R4 HIGH-2 + R5 HIGH-2 closure (2026-05-15; F-2):
+      // platform_admin is global, but the JWT's home-tenant claim
+      // MUST still be a recognized ACTIVE tenant. R4 closure used a
+      // static KNOWN_TENANT_IDS set; R5 HIGH-2 correctly identified
+      // that a static set ignores DB lifecycle (a suspended/archived
+      // home-tenant would still authenticate). F-2 closure here adds
+      // the DB-authoritative active-tenant check.
       //
-      // The known-tenant set is the canonical operating-tenant
-      // identifiers from tenant-context.ts. A future SI-008-style
-      // expansion to additional tenants only requires updating
-      // KNOWN_TENANT_IDS at the source.
-      if (!KNOWN_TENANT_IDS.has(claims.tenant_id)) return;
+      // Tiered lookup (mirrors resolveHostToTenant's pattern):
+      //   - DB query 'active' → proceed (authoritative)
+      //   - DB query 'inactive_or_unknown' → fail closed (response
+      //     stays tenant-blind per I-025)
+      //   - DB query 'unreachable' (connection failure, NOT SQL
+      //     error) → fall back to KNOWN_TENANT_IDS bootstrap set
+      //     for resilience during DB outages / local-dev-without-DB
+      //   - Reachable-DB SQL error → re-throw (surfaces as 500;
+      //     prevents silent bypass on schema misconfig)
+      const dbResult = await lookupActiveTenantById(claims.tenant_id);
+      if (dbResult === 'inactive_or_unknown') return;
+      if (dbResult === 'unreachable') {
+        if (!KNOWN_TENANT_IDS.has(claims.tenant_id)) return;
+      }
+      // 'active' OR ('unreachable' + bootstrap-set hit) → proceed
     }
 
     // Phase 2 admin widening (2026-05-15): cross-tenant admin defense

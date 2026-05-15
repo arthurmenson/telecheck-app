@@ -376,6 +376,55 @@ async function resolveHostFromDb(host: string): Promise<DbResolution> {
 }
 
 /**
+ * Phase 2 admin widening F-2 closure (2026-05-15; Codex R5 HIGH-2):
+ * look up a tenant BY ID and report whether it is active in the
+ * database. Used by `authContextPlugin` to validate the home-tenant
+ * claim on a platform_admin JWT — a global-scope admin token whose
+ * home tenant is suspended/archived/deleted MUST NOT authenticate
+ * even if the tenant_id appears in a static set.
+ *
+ * Returns:
+ *   - 'active': tenants.status='active' for this tenant_id.
+ *   - 'inactive_or_unknown': zero rows OR status != 'active'. Caller
+ *     fails closed (leaves actorContext undefined).
+ *   - 'unreachable': DB connection failure (NOT SQL/schema error).
+ *     Caller falls back to KNOWN_TENANT_IDS for bootstrap +
+ *     local-dev-without-DB resilience; reachable-DB SQL errors
+ *     re-throw to surface as 500 (same discipline as
+ *     resolveHostFromDb).
+ *
+ * The DB lookup is keyed on `tenants.id` (the operating-tenant
+ * identifier; matches the JWT's tenant_id claim format
+ * 'Telecheck-{Country}').
+ */
+export async function lookupActiveTenantById(
+  tenantId: string,
+): Promise<'active' | 'inactive_or_unknown' | 'unreachable'> {
+  if (tenantId === '') return 'inactive_or_unknown';
+
+  let result: Awaited<ReturnType<typeof withConnection<{ rows: unknown[] }>>>;
+  try {
+    result = await withConnection(async (client) => {
+      return client.query<{ status: string }>(`SELECT status FROM tenants WHERE id = $1 LIMIT 1`, [
+        tenantId,
+      ]);
+    });
+  } catch (err) {
+    if (isConnectionError(err)) {
+      return 'unreachable';
+    }
+    // Reachable DB SQL/schema/permission error. Re-throw — same
+    // discipline as resolveHostFromDb's tightened path.
+    throw err;
+  }
+
+  if (result.rows.length === 0) return 'inactive_or_unknown';
+  const row = result.rows[0] as { status: string } | undefined;
+  if (row === undefined) return 'inactive_or_unknown';
+  return row.status === 'active' ? 'active' : 'inactive_or_unknown';
+}
+
+/**
  * Two-tier resolver with DB as the AUTHORITATIVE status check + the
  * hardcoded SUBDOMAIN_TENANT_MAP as a bootstrap-only fallback:
  *
