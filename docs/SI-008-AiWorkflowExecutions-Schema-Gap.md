@@ -177,14 +177,25 @@ The caller MUST supply `$expected_prior_execution_id` (the value they read at wo
 
 Codex R2 HIGH-2 correctly identified that application-layer closure enforcement leaves direct-SQL / migration / alternate-worker paths able to violate the invariant. v0.3 moves closure enforcement to the DB layer:
 
-**Definer-rights stored procedure `record_workflow_pointer_swap(...)`** is the ONLY path that can UPDATE `consults.ai_workflow_execution_id`. The procedure:
-1. Row-locks both `consults` and the new `ai_workflow_executions` row (in canonical id-order to prevent deadlocks)
-2. Validates the new execution's `consult_id` equals the consult's `id`
-3. Validates the new execution's `tenant_id` equals the consult's `tenant_id`
-4. Validates the new execution's `state = 'completed'`
-5. Validates the CAS guard (`$expected_prior_execution_id`)
-6. Performs the UPDATE + sets `supersedes_execution_id` on the new execution + INSERTs the paired audit row in the same transaction
-7. Returns success/failure
+**Definer-rights stored procedure `record_workflow_pointer_swap(...)`** is the ONLY path that can UPDATE `consults.ai_workflow_execution_id`. R10 HIGH closure: the procedure adopts a SINGLE canonical lifecycle reconciling R6/R9's immutability trigger with the swap flow.
+
+**Canonical lifecycle (R10):** the execution row already exists (it was INSERTed at workflow START with `state='running'` and an INSERT-time-fixed `supersedes_execution_id` value — either NULL for first-write, or `$expected_prior_execution_id` for a planned supersession). The procedure ONLY swaps the consult's forward pointer; it does NOT mutate `supersedes_execution_id` on the execution row (immutable post-INSERT per R9).
+
+The procedure performs (in order):
+1. Row-locks `consults` and the existing `ai_workflow_executions` row (canonical id-order to prevent deadlocks)
+2. Validates the execution's `consult_id` equals the consult's `id` (declarative FK already enforces this; defense-in-depth)
+3. Validates the execution's `tenant_id` equals the consult's `tenant_id` (declarative FK already enforces this)
+4. Validates the execution's `state = 'completed'` (workflow caller has already transitioned `running → completed` BEFORE invoking the procedure; this gate ensures the procedure operates on terminal-state rows)
+5. Validates the CAS guard: `consults.ai_workflow_execution_id = $expected_prior_execution_id`
+6. Validates supersession chain acyclicity per R6: walks the consult's current supersession chain from `consults.ai_workflow_execution_id` recursively via `supersedes_execution_id` and REJECTS if the proposed new execution's id appears anywhere
+7. Performs the UPDATE on `consults.ai_workflow_execution_id` + INSERTs the paired audit row in the same transaction
+8. Returns success / specific rejection code
+
+**Failed-CAS recovery:** if the procedure rejects (CAS guard, state, chain, or other validation fails), the execution row stays in `state='completed'` with its INSERT-time-fixed `supersedes_execution_id`, but is NOT authoritative on the consult. The workflow caller emits `ai_workflow_execution.swap_rejected` Category A audit + can either:
+- Retry the swap with a refreshed `$expected_prior_execution_id` (treats the failed swap as a CAS race; the now-completed but unswapped execution row is preserved as a forensic record)
+- Mark the workflow as abandoned by INSERTing a NEW `ai_workflow_executions` row representing a fresh retry with state='cancelled' + supersedes_execution_id=NULL pointing-policy
+
+**Orphan-row interpretation:** a completed execution row whose id never appears in the consult's authoritative forward pointer + chain is a LEGITIMATE forensic artifact — it records a workflow that succeeded computationally but failed to win the swap race. The chain walker filters these out when reconstructing the authoritative recommendation history.
 
 **GRANT model:** application code's role has NO direct UPDATE privilege on `consults.ai_workflow_execution_id` or `ai_workflow_executions.consult_id` or `ai_workflow_executions.supersedes_execution_id`. All mutations go through `record_workflow_pointer_swap()`. This closes Codex R2 HIGH-2 by making the closure rule a DB contract, not an application convention.
 
