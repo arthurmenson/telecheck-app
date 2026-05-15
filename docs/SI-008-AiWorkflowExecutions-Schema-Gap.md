@@ -167,9 +167,11 @@ The caller MUST supply `$expected_prior_execution_id` (the value they read at wo
 
 **Cold-path failure:** if the first-write UPDATE affects zero rows (consult not UNDER_REVIEW or already has a pointer), the workflow caller reads the current consult state, decides whether to retry as a supersession OR fail the workflow with `ai_workflow_execution.race_lost` audit.
 
-### Same-tenant invariant via composite FK
+### Forward FK invariant (R5 + R7 + R8 closure: triple-composite same-tenant + same-consult)
 
-- The forward FK uses `(tenant_id, ai_workflow_execution_id)` so the pointed-at execution must be in the same tenant as the consult. Backward FK already enforces same-tenant per (2) above.
+- The forward FK is a TRIPLE-composite: `(tenant_id, id, ai_workflow_execution_id) → ai_workflow_executions (tenant_id, consult_id, id)`. This enforces both same-tenant AND same-consult lineage declaratively at the DB layer. See "Declarative same-consult enforcement for the FORWARD pointer (R5 HIGH closure)" below for the canonical SQL.
+- The earlier-drafted same-tenant-only shape `(tenant_id, ai_workflow_execution_id) → (tenant_id, id)` is REJECTED throughout this SI. Any implementer following any section of this document MUST use the triple-composite form.
+- Backward FK from `ai_workflow_executions.consult_id → consults (tenant_id, id)` already enforces same-tenant per (2) above; combined with the triple-composite forward FK, the bidirectional consistency is DB-enforced.
 
 ### Closure rule (v0.3 R2 HIGH-2 closure)
 
