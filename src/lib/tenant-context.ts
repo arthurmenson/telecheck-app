@@ -397,31 +397,50 @@ async function resolveHostFromDb(host: string): Promise<DbResolution> {
  * identifier; matches the JWT's tenant_id claim format
  * 'Telecheck-{Country}').
  */
-export async function lookupActiveTenantById(
-  tenantId: string,
-): Promise<'active' | 'inactive_or_unknown' | 'unreachable'> {
-  if (tenantId === '') return 'inactive_or_unknown';
+/**
+ * F-2 R2 HIGH closure (2026-05-15): result type now carries
+ * `country_of_care` so callers can bind the trusted country to the
+ * resolved actor context (Codex flagged that returning only 'active'
+ * status left the JWT's country_of_care claim unverified — a
+ * platform_admin token could carry a stale country and the auth hook
+ * would propagate it unchecked into ActorContext).
+ */
+export type ActiveTenantLookup =
+  | { kind: 'active'; country_of_care: 'US' | 'GH' }
+  | { kind: 'inactive_or_unknown' }
+  | { kind: 'unreachable' };
+
+export async function lookupActiveTenantById(tenantId: string): Promise<ActiveTenantLookup> {
+  if (tenantId === '') return { kind: 'inactive_or_unknown' };
 
   let result: Awaited<ReturnType<typeof withConnection<{ rows: unknown[] }>>>;
   try {
     result = await withConnection(async (client) => {
-      return client.query<{ status: string }>(`SELECT status FROM tenants WHERE id = $1 LIMIT 1`, [
-        tenantId,
-      ]);
+      return client.query<{ status: string; country_of_care: string }>(
+        `SELECT status, country_of_care FROM tenants WHERE id = $1 LIMIT 1`,
+        [tenantId],
+      );
     });
   } catch (err) {
     if (isConnectionError(err)) {
-      return 'unreachable';
+      return { kind: 'unreachable' };
     }
     // Reachable DB SQL/schema/permission error. Re-throw — same
     // discipline as resolveHostFromDb's tightened path.
     throw err;
   }
 
-  if (result.rows.length === 0) return 'inactive_or_unknown';
-  const row = result.rows[0] as { status: string } | undefined;
-  if (row === undefined) return 'inactive_or_unknown';
-  return row.status === 'active' ? 'active' : 'inactive_or_unknown';
+  if (result.rows.length === 0) return { kind: 'inactive_or_unknown' };
+  const row = result.rows[0] as { status: string; country_of_care: string } | undefined;
+  if (row === undefined) return { kind: 'inactive_or_unknown' };
+  if (row.status !== 'active') return { kind: 'inactive_or_unknown' };
+  if (row.country_of_care !== 'US' && row.country_of_care !== 'GH') {
+    // Defensive: CHECK constraint enforces the set, but if a migration
+    // widens it without updating this code, fail closed rather than
+    // forge a malformed actor context downstream.
+    return { kind: 'inactive_or_unknown' };
+  }
+  return { kind: 'active', country_of_care: row.country_of_care };
 }
 
 /**
