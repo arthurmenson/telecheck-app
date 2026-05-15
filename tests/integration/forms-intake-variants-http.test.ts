@@ -61,8 +61,24 @@ import { asTenantId } from '../../src/lib/glossary.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import * as templateService from '../../src/modules/forms-intake/internal/services/template-service.ts';
+import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+const T_US = asTenantId(TENANT_US);
+const T_GH = asTenantId('Telecheck-Ghana');
+
+// Phase 2 admin JWT migration (2026-05-15): standard tenant_admin JWT
+// for variants-http admin tests (US tenant). Each test passes its
+// own actor accountId; the binding defaults to T_US per the JWT helper.
+function adminAuth(accountId: string): { authorization: string } {
+  return bearerAuthHeader({
+    accountId,
+    tenantId: T_US,
+    countryOfCare: 'US',
+    role: 'tenant_admin',
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Test app lifecycle
@@ -315,11 +331,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       url: '/v0/forms/variants',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_create',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_create'),
       },
       payload: {
         deploymentId,
@@ -353,11 +365,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       url: '/v0/forms/variants',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_retired',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_retired'),
       },
       payload: {
         deploymentId,
@@ -387,11 +395,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       url: '/v0/forms/variants',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dup_first',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dup_first'),
       },
       payload: {
         deploymentId,
@@ -409,11 +413,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       url: '/v0/forms/variants',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dup_second',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dup_second'),
       },
       payload: {
         deploymentId,
@@ -449,11 +449,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       url: '/v0/forms/variants',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_draft',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_draft'),
       },
       payload: {
         deploymentId,
@@ -474,11 +470,7 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       url: '/v0/forms/variants',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_nobody',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_nobody'),
       },
       payload: {},
     });
@@ -531,9 +523,13 @@ describe('POST /v0/forms/variants — HTTP-level', () => {
       url: '/v0/forms/variants',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_no_admin_role',
-        // Non-admin role.
-        'x-actor-roles': 'patient',
+        // Non-admin role (patient JWT) — fails admin authz.
+        ...bearerAuthHeader({
+          accountId: 'op_no_admin_role',
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
       payload: {
         deploymentId,
@@ -570,11 +566,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
         host: 'localhost',
         // Admin endpoints (incl. reads) require an authenticated actor —
         // Codex variants-resume-http-r1 closure 2026-05-03.
-        'x-actor-id': 'op_get',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_get'),
       },
     });
 
@@ -638,11 +630,12 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       url: `/v0/forms/variants/${usVariantId}`,
       headers: {
         host: 'ghana.heroshealth.com',
-        'x-actor-id': 'op_xt',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': 'Telecheck-Ghana',
+        ...bearerAuthHeader({
+          accountId: 'op_xt',
+          tenantId: T_GH,
+          countryOfCare: 'GH',
+          role: 'tenant_admin',
+        }),
       },
     });
 
@@ -657,11 +650,7 @@ describe('GET /v0/forms/variants/:variantId — HTTP-level', () => {
       url: `/v0/forms/variants/${ulid()}`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_missing',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_missing'),
       },
     });
 
@@ -709,11 +698,7 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
       url: `/v0/forms/variants/${armAId}/promote`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_promote',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_promote'),
       },
       payload: {
         rationale: 'Arm A converted 12% better; p < 0.01 over n=2000 sessions.',
@@ -749,11 +734,7 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
       url: `/v0/forms/variants/${variantId}/promote`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_promote_first',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_promote_first'),
       },
       payload: {
         rationale: 'first',
@@ -769,11 +750,7 @@ describe('POST /v0/forms/variants/:variantId/promote — HTTP-level', () => {
       url: `/v0/forms/variants/${variantId}/promote`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_promote_second',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_promote_second'),
       },
       payload: {
         rationale: 'second',
