@@ -76,6 +76,21 @@ export interface ActorContext {
    * tenantId at JWT-verify time). null for all other roles.
    */
   adminTenantBinding: string | null;
+  /**
+   * Phase 2 R3 HIGH closure (2026-05-15): for role='platform_admin',
+   * the admin's HOME tenant (the tenant_id claim from the JWT). Used
+   * for audit attribution showing which admin acted, distinct from the
+   * RESOURCE tenant (which is the resolved request tenant carried by
+   * `tenantId` above). null for all other roles.
+   *
+   * Why this exists: platform_admin is GLOBAL — a platform_admin
+   * issued under Telecheck-US CAN administer Telecheck-Ghana
+   * resources via JWT. The resource side scopes via
+   * `actorContext.tenantId` (= resolved request tenant). The actor
+   * side is attributed via `adminHomeTenantId` so audit records can
+   * trace which admin's home tenant the cross-tenant action came from.
+   */
+  adminHomeTenantId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,41 +127,75 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
 
     const claims = result.claims;
 
-    // Cross-tenant token-forge defense: if the request's resolved tenant
-    // context (from Host header) doesn't match the JWT's tenant_id
-    // claim, the token was issued for a different tenant. Reject by
-    // leaving actorContext undefined; handlers that require auth will
-    // 401, response stays tenant-blind per I-025.
+    // Resolve request tenant context (set by tenant-context plugin from
+    // Host header). For pre-auth / allowlisted endpoints this is
+    // undefined; without a tenant we can't run any cross-tenant check,
+    // so leave actorContext undefined.
     const tenantCtx = request.tenantContext;
-    if (tenantCtx === undefined) return; // allowlisted endpoint; no tenant → no actor
-    if (tenantCtx.tenantId !== claims.tenant_id) return;
+    if (tenantCtx === undefined) return;
 
-    // Phase 2 admin widening (2026-05-15): cross-tenant admin defense.
-    // For role='tenant_admin', the JWT's admin_tenant_binding claim
-    // MUST match the request's resolved tenant context. Without that
-    // match, the actor is rejected (response stays tenant-blind per
-    // I-025). platform_admin is global (binding MUST be absent/null,
-    // enforced by verify path).
+    // Phase 2 R3 HIGH closure (2026-05-15): tenant-scope validation
+    // varies by role:
+    //
+    //   - patient / clinician / tenant_admin: the actor is tenant-scoped.
+    //     The JWT's tenant_id claim MUST equal the resolved request
+    //     tenant. Mismatch = cross-tenant token forge attempt → reject.
+    //
+    //   - platform_admin: the actor is GLOBAL. The JWT's tenant_id
+    //     claim is the admin's HOME tenant (used for audit attribution
+    //     showing which admin acted) but does NOT need to match the
+    //     resolved request tenant. A platform_admin issued under
+    //     Telecheck-US CAN administer Telecheck-Ghana resources via JWT.
+    //
+    // Closes Codex R3 HIGH: "Global platform_admin JWTs are still
+    // tenant-pinned by the auth hook" — the original implementation
+    // enforced tenant_id match for every role, making platform_admin
+    // unusable across tenants and defeating the documented global
+    // scope.
+    if (claims.role !== 'platform_admin') {
+      if (tenantCtx.tenantId !== claims.tenant_id) return;
+    }
+
+    // Phase 2 admin widening (2026-05-15): cross-tenant admin defense
+    // for tenant_admin. The JWT's admin_tenant_binding claim MUST
+    // match the resolved request tenant. Without that match, the
+    // actor is rejected (response stays tenant-blind per I-025).
+    // platform_admin has no binding (global; enforced by verify path
+    // that requires binding to be absent/null for platform_admin).
     if (claims.role === 'tenant_admin') {
       // verifyAccessToken already enforced binding is a non-empty string
       // for tenant_admin; this is the request-side scope check.
-      if (claims.admin_tenant_binding !== claims.tenant_id) return;
-      // Also enforce binding === request's resolved tenant (defense in
-      // depth; tenant_id === resolved tenantCtx.tenantId is already
-      // enforced above, so this is logically equivalent, but readers
-      // shouldn't have to reason about transitive equality).
       if (claims.admin_tenant_binding !== tenantCtx.tenantId) return;
+      // Also enforce binding === JWT's tenant_id (defense in depth;
+      // tenant_id === resolved tenantCtx.tenantId is already enforced
+      // above for non-platform_admin roles, so this is logically
+      // equivalent, but readers shouldn't have to reason about
+      // transitive equality).
+      if (claims.admin_tenant_binding !== claims.tenant_id) return;
     }
+
+    // actorContext.tenantId:
+    //   - For tenant-scoped roles, this === resolved tenantCtx.tenantId
+    //     (already enforced equal to claims.tenant_id above).
+    //   - For platform_admin, this is set to the RESOLVED request
+    //     tenant — the tenant the admin is currently acting on —
+    //     because handlers + audit emission scope to actorContext.tenantId
+    //     when writing tenant-scoped resources. The admin's home
+    //     tenant from claims.tenant_id is retained as
+    //     adminHomeTenantId for audit-attribution purposes.
+    const effectiveTenantId =
+      claims.role === 'platform_admin' ? tenantCtx.tenantId : claims.tenant_id;
 
     request.actorContext = {
       accountId: claims.sub,
       sessionId: claims.session_id,
-      tenantId: claims.tenant_id,
+      tenantId: effectiveTenantId,
       role: claims.role,
       countryOfCare: claims.country_of_care,
       delegateId: claims.delegate_id ?? null,
       adminTenantBinding:
         claims.role === 'tenant_admin' ? (claims.admin_tenant_binding ?? null) : null,
+      adminHomeTenantId: claims.role === 'platform_admin' ? claims.tenant_id : null,
     };
   });
 };
