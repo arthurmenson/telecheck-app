@@ -107,9 +107,23 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
     // (pre-auth endpoints rely on this); malformed header is also FINE
     // (we silently leave actorContext undefined, and handlers that
     // require it will 401 via requireActorContext()).
+    //
+    // Phase 2 R5 HIGH-1 closure (2026-05-15): parse the auth scheme
+    // CASE-INSENSITIVELY per RFC 7235 §2.1 ("the scheme name is
+    // case-insensitive"). Original `.startsWith('Bearer ')` rejected
+    // `authorization: bearer <token>` (lowercase b) — leaving both
+    // actorContext undefined AND bearerTokenPresented false, which on
+    // admin routes with ALLOW_ACTOR_HEADER_AUTH=true would let a forged
+    // `x-actor-roles: platform_admin` header elevate via the legacy
+    // shim (the fail-closed boundary added at R2 only triggers when
+    // bearerTokenPresented=true). Case-insensitive parsing closes the
+    // header-casing-based bypass.
     const authHeader = request.headers.authorization;
     if (typeof authHeader !== 'string') return;
-    if (!authHeader.startsWith('Bearer ')) return;
+    // Match "Bearer " case-insensitively (anchor: 6-char scheme + 1 space)
+    if (authHeader.length < 7) return;
+    const scheme = authHeader.slice(0, 7);
+    if (scheme.toLowerCase() !== 'bearer ') return;
     const token = authHeader.slice(7).trim();
     if (token.length === 0) return;
 
