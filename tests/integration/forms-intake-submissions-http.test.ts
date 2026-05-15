@@ -25,10 +25,14 @@ import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fas
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
+import { asTenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import * as submissionService from '../../src/modules/forms-intake/internal/services/submission-service.ts';
+import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+const T_US = asTenantId(TENANT_US);
 
 // ---------------------------------------------------------------------------
 // Test app lifecycle
@@ -229,8 +233,12 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       url: '/v0/forms/submissions',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_start',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { deploymentId },
@@ -254,8 +262,12 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       url: '/v0/forms/submissions',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_404',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { deploymentId: fakeDeploymentId },
@@ -275,8 +287,12 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       url: '/v0/forms/submissions',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_dupe1',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { deploymentId },
@@ -288,8 +304,12 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       url: '/v0/forms/submissions',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_dupe2',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { deploymentId },
@@ -298,7 +318,7 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
     assertTenantBlindErrorEnvelope(second);
   });
 
-  it('returns 401 when no patient identity header is supplied', async () => {
+  it('returns 401 when no auth header is supplied', async () => {
     const { deploymentId } = await seedActiveDeployment();
 
     const response = await injectWithIdempotency({
@@ -306,7 +326,9 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       url: '/v0/forms/submissions',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_noid',
+        // Intentionally no Authorization header — Tier 1 leaves
+        // req.actorContext undefined; Tier 2 fallback (now also no
+        // x-actor-id / x-patient-id) returns 401.
         'content-type': 'application/json',
       },
       payload: { deploymentId },
@@ -321,8 +343,12 @@ describe('POST /v0/forms/submissions — HTTP-level', () => {
       url: '/v0/forms/submissions',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_nobody',
-        'x-patient-id': ulid(),
+        ...bearerAuthHeader({
+          accountId: ulid(),
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: {},
@@ -363,7 +389,12 @@ describe('GET /v0/forms/submissions/:submissionId — HTTP-level', () => {
       url: `/v0/forms/submissions/${submission.submission_id}`,
       headers: {
         host: US_HOST,
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
 
@@ -400,7 +431,12 @@ describe('GET /v0/forms/submissions/:submissionId — HTTP-level', () => {
       url: `/v0/forms/submissions/${submission.submission_id}`,
       headers: {
         host: US_HOST,
-        'x-patient-id': patientB,
+        ...bearerAuthHeader({
+          accountId: patientB,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
     expect(response.statusCode).toBe(404);
@@ -413,7 +449,12 @@ describe('GET /v0/forms/submissions/:submissionId — HTTP-level', () => {
       url: `/v0/forms/submissions/${ulid()}`,
       headers: {
         host: US_HOST,
-        'x-patient-id': ulid(),
+        ...bearerAuthHeader({
+          accountId: ulid(),
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
     expect(response.statusCode).toBe(404);
@@ -453,8 +494,12 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_upd',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { responses: { field_age: 30 } },
@@ -492,8 +537,12 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_crisis',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       // Phrase from CRISIS_PATTERNS.suicidal_ideation.
@@ -534,8 +583,12 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_xpat_upd',
-        'x-patient-id': patientB,
+        ...bearerAuthHeader({
+          accountId: patientB,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { responses: { f: 'v' } },
@@ -572,7 +625,7 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (au
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_noid',
+        // No Authorization header → Tier 1 leaves actorContext undefined → 401
         'content-type': 'application/json',
       },
       payload: { responses: { f: 'v' } },
@@ -613,8 +666,12 @@ describe('PATCH /v0/forms/submissions/:submissionId/responses — HTTP-level (pa
       url: `/v0/forms/submissions/${submission.submission_id}/responses`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_pause',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: {
@@ -668,8 +725,12 @@ describe('POST /v0/forms/submissions/:submissionId/submit — HTTP-level', () =>
       url: `/v0/forms/submissions/${submission.submission_id}/submit`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_submit',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: {},
@@ -725,8 +786,12 @@ describe('POST /v0/forms/submissions/:submissionId/submit — HTTP-level', () =>
       url: `/v0/forms/submissions/${submission.submission_id}/submit`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_double',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: {},
@@ -761,7 +826,7 @@ describe('POST /v0/forms/submissions/:submissionId/submit — HTTP-level', () =>
       url: `/v0/forms/submissions/${submission.submission_id}/submit`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_subnoid',
+        // No Authorization header → Tier 1 leaves actorContext undefined → 401
         'content-type': 'application/json',
       },
       payload: {},
