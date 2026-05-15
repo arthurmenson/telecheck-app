@@ -9,8 +9,9 @@
 **v0.6 advanced:** 2026-05-14 (close Codex R4 HIGH — v1.0 CI guardrail blocks unregistered consumers)
 **v0.7 advanced:** 2026-05-14 (close Codex R5 HIGH — concrete enforceable v1.0 guardrail; valid CODEOWNERS syntax)
 **v0.8 advanced:** 2026-05-14 (close Codex R6 HIGH — G-2 scans ALL changed files; manifest purpose field enforces emits-only)
+**v0.9 advanced:** 2026-05-14 (close Codex R7 HIGH — G-5 single-API-surface fail-closed on outbox-reader imports + dynamic-selector tests)
 **Severity:** medium
-**Status:** OPEN — v0.8 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
+**Status:** OPEN — v0.9 DRAFT, ratification-ready (6 HIGH findings closed across pre-ratification rounds; remaining gaps tracked as implementation-PR deliverables not architecture-ratification blockers)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_DOMAIN_EVENTS.md` (v5.2 → **v5.3**)
 **Promotion Ledger target:** **P-015** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 in flight at PR #136)
 **Parallel SI:** SI-002 (audit-side placeholder gap; concurrent dot-namespaced naming convention)
@@ -303,6 +304,16 @@ Twelve detail-shape archetypes, one per aggregate-prefix. Listed here for ratifi
       purpose: emits-only
   ```
 
+- **G-5. Single-API-surface fail-closed on outbox-reader helper imports (v0.9 NEW; Codex R7 HIGH closure).** G-2's added-line regex grep can miss consumers that use dynamic selectors, query-builder APIs, or imported event-type constants. v0.9 closes this gap by mandating a **single canonical outbox-reader API surface** at `src/lib/outbox-reader.ts` (or `src/lib/domain-events-reader.ts`; exact name TBD at v5.3 promotion). ALL programmatic outbox-read access flows through this module — no other code may construct an SQL query against `domain_events_outbox`, instantiate a query-builder targeting it, or import event-type constants for filter-construction outside this module.
+
+  **G-5 enforcement (CI script extensions):**
+  1. The G-2 script extends its grep set to flag any `import ... from ['"].*outbox-reader.*['"]` (and the equivalent `require()`) in ADDED lines of any changed file. The disposition rule (per G-2 step 4) applies: `purpose: emits-only` entries fail, no manifest entry fails, only `purpose: reads-*` entries with explicit allowlist hits pass.
+  2. The G-2 script also flags any `import ... from ['"].*domain-event-types.*['"]` (the canonical event_type constants module, also TBD at v5.3 promotion). Same disposition rule.
+  3. The G-2 unit test suite is extended with at least 5 additional cases: (a) dynamic-string-built `event_type IN (...)` query, (b) query-builder API targeting the outbox table, (c) array of event_type constants used as filter, (d) helper function call that internally hits the outbox, (e) re-export of outbox-reader module from a non-manifest path.
+  4. A baseline-enforcement workflow (`.github/workflows/outbox-reader-api-surface-check.yml`) runs once per CI invocation to assert that `src/lib/outbox-reader.ts` is the ONLY file performing direct `domain_events_outbox` SQL access, by AST-walking every `.ts` file under `src/` and failing if any other file constructs a Postgres query string mentioning the table. The walk uses `ts-morph` or equivalent (lightweight; runs in CI in <30s).
+
+  **G-5 is a STATIC architectural invariant** (single-reader-API surface) backed by AST-level enforcement, not just diff-grep. This eliminates the Codex R7 "indirect consumer via helper-import" gap.
+
 - **G-4. Architectural gate for out-of-monorepo consumers.** If an external service can live outside this monorepo (a separate microservice with its own repo, a third-party analytics consumer, etc.), no in-repo CI can detect it. v0.7 requires an **architectural Promotion Ledger entry** before any out-of-monorepo service is permitted to read `domain_events_outbox`. The entry name format: `P-NNN — Out-of-monorepo outbox consumer registered: <service-name> @ <repo-url>`. This entry is observable in the Promotion Ledger (which is append-only per the spec corpus discipline) and pairs with a `docs/outbox-consumer-registry.yaml` entry adding the external service. **No external service can read the outbox without this entry.** Enforcement is governance-level (not CI), but the rule is auditable: any external service emitting metrics tagged with telecheck event_types but lacking a corresponding Promotion Ledger entry is a finding for the Platform Eventing team to triage.
 
 **Interim v1.0 deliverables (NOT deferred; part of SI-003 ratification):**
@@ -311,6 +322,7 @@ Twelve detail-shape archetypes, one per aggregate-prefix. Listed here for ratifi
 - **G-2 deliverable:** `.github/workflows/outbox-consumer-guard.yml` + `scripts/check-outbox-consumer-guard.sh`, committed in the v5.3 promotion PR. Script MUST include a unit-test suite at `scripts/check-outbox-consumer-guard.test.sh` exercising at least 8 test cases: (1) new file in allowlisted path passes, (2) new file outside allowlist with no outbox reference passes, (3) new file outside allowlist with `domain_events_outbox` reference fails, (4) new file outside allowlist matching a canonical event_type string in a SQL-like context fails, (5) new file outside allowlist with a helper-import from `lib/outbox-*.ts` fails, (6) manifest-added entry permits a new path, (7) the bypass label permits override, (8) a malformed manifest fails the script's preflight.
 - **G-3 deliverable:** `docs/outbox-consumer-registry.yaml`, committed in the v5.3 promotion PR with the 3 emitting slices' entries.
 - **G-4 deliverable:** Promotion Ledger discipline documented in the v5.3 promotion PR's release notes. Enforcement is procedural (no CI artifact required for v1.0 since no out-of-monorepo consumers exist yet).
+- **G-5 deliverable (v0.9):** `src/lib/outbox-reader.ts` single-API-surface module + `.github/workflows/outbox-reader-api-surface-check.yml` + AST baseline-enforcement workflow + G-2 script extensions for outbox-reader-helper-import + canonical event-type-constants-module-import detection + 5 additional unit-test cases.
 
 These four interim controls — G-1 path-based CODEOWNERS, G-2 CI script with concrete diff parsing + manifest validation + unit-tested patterns, G-3 file-based registration manifest, G-4 Promotion Ledger discipline for out-of-monorepo consumers — eliminate the Codex R5 gap. Zero infrastructure dependency remains (no dispatcher, no DB registry, no /v0/internal/ endpoint).
 
