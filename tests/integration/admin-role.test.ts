@@ -85,6 +85,26 @@ import type { TenantContext } from '../../src/lib/tenant-context.ts';
 function makeReq(opts: {
   tenantId: string;
   headers?: Record<string, string | undefined>;
+  /**
+   * Phase 2 admin JWT widening (2026-05-15): optional actorContext +
+   * bearerTokenPresented to exercise requireAdminRole's Tier 1 JWT
+   * branch + the bearerTokenPresented fail-closed branch. When
+   * actorContext is supplied, the function returns the admin role
+   * directly without consulting headers; when bearerTokenPresented
+   * is true but actorContext is absent, the function 401s without
+   * consulting headers (rejected-JWT fail-closed).
+   */
+  actorContext?: {
+    accountId: string;
+    sessionId: string;
+    tenantId: string;
+    role: 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
+    countryOfCare: 'US' | 'GH';
+    delegateId: string | null;
+    adminTenantBinding: string | null;
+    adminHomeTenantId: string | null;
+  };
+  bearerTokenPresented?: boolean;
 }): FastifyRequest {
   const tenantContext: TenantContext = {
     tenantId: opts.tenantId as TenantContext['tenantId'],
@@ -98,6 +118,8 @@ function makeReq(opts: {
   const stub = {
     headers: opts.headers ?? {},
     tenantContext,
+    actorContext: opts.actorContext,
+    bearerTokenPresented: opts.bearerTokenPresented ?? false,
     server: {
       httpErrors: {
         unauthorized: (msg: string): FastifyError => {
@@ -467,5 +489,275 @@ describe('requireAdminRole — header parsing (whitespace, casing)', () => {
       }),
       403,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §7 Phase 2 admin-role JWT widening (2026-05-15)
+//
+// Closes the JWT-path coverage gap. Pre-Phase-2 the function ONLY consulted
+// `x-actor-roles` / `x-actor-admin-tenant` headers. Phase 2 widened the
+// function to a tiered model:
+//   Tier 1 (preferred): req.actorContext (verified JWT) — when populated,
+//     authoritative; no header fall-through.
+//   Tier 1b (fail-closed): if req.bearerTokenPresented=true but
+//     actorContext=undefined (presented-but-rejected JWT), throw 401
+//     without consulting headers.
+//   Tier 2 (legacy): when no JWT presented at all, fall back to the
+//     header shim (covered by §1-§6 above).
+//
+// This section pins each branch of the new Tier 1 + Tier 1b matrix.
+// ---------------------------------------------------------------------------
+
+describe('requireAdminRole — Phase 2 JWT path (Tier 1)', () => {
+  beforeEach(() => {
+    process.env['NODE_ENV'] = 'test';
+  });
+
+  // §7.1 platform_admin paths
+  it('§7.1a platform_admin JWT (same-tenant home) → returns platform_admin', () => {
+    // Standard platform_admin acting in their own home tenant.
+    const req = makeReq({
+      tenantId: TENANT_US,
+      actorContext: {
+        accountId: 'acct_pa1',
+        sessionId: 'sess_pa1',
+        tenantId: TENANT_US,
+        role: 'platform_admin',
+        countryOfCare: 'US',
+        delegateId: null,
+        adminTenantBinding: null,
+        adminHomeTenantId: TENANT_US,
+      },
+      bearerTokenPresented: true,
+    });
+    expect(requireAdminRole(req)).toBe('platform_admin');
+  });
+
+  it('§7.1b platform_admin JWT (cross-tenant: home Ghana, acting on US) → returns platform_admin', () => {
+    // platform_admin is GLOBAL — home tenant Ghana can admin US resources.
+    // authContextPlugin populates actorContext.tenantId from the resolved
+    // request tenant; adminHomeTenantId carries the JWT claim tenant.
+    const req = makeReq({
+      tenantId: TENANT_US,
+      actorContext: {
+        accountId: 'acct_pa2',
+        sessionId: 'sess_pa2',
+        tenantId: TENANT_US, // resolved request tenant
+        role: 'platform_admin',
+        countryOfCare: 'US',
+        delegateId: null,
+        adminTenantBinding: null,
+        adminHomeTenantId: TENANT_GHANA, // admin's home (audit attribution)
+      },
+      bearerTokenPresented: true,
+    });
+    expect(requireAdminRole(req)).toBe('platform_admin');
+  });
+
+  // §7.2 tenant_admin paths
+  it('§7.2a tenant_admin JWT with matching binding → returns tenant_admin', () => {
+    const req = makeReq({
+      tenantId: TENANT_US,
+      actorContext: {
+        accountId: 'acct_ta1',
+        sessionId: 'sess_ta1',
+        tenantId: TENANT_US,
+        role: 'tenant_admin',
+        countryOfCare: 'US',
+        delegateId: null,
+        adminTenantBinding: TENANT_US,
+        adminHomeTenantId: null,
+      },
+      bearerTokenPresented: true,
+    });
+    expect(requireAdminRole(req)).toBe('tenant_admin');
+  });
+
+  it('§7.2b tenant_admin JWT with mismatched binding → 403 (defense in depth)', () => {
+    // authContextPlugin normally rejects this (binding ≠ resolved tenant
+    // leaves actorContext undefined). If for any reason the actor reached
+    // requireAdminRole with a wrong binding still in actorContext, the
+    // defense-in-depth check in requireAdminRole 403s.
+    expectThrowsWithStatus(
+      makeReq({
+        tenantId: TENANT_US,
+        actorContext: {
+          accountId: 'acct_ta2',
+          sessionId: 'sess_ta2',
+          tenantId: TENANT_US,
+          role: 'tenant_admin',
+          countryOfCare: 'US',
+          delegateId: null,
+          adminTenantBinding: TENANT_GHANA, // mismatched
+          adminHomeTenantId: null,
+        },
+        bearerTokenPresented: true,
+      }),
+      403,
+    );
+  });
+
+  // §7.3 non-admin roles fail closed under JWT
+  it('§7.3a patient JWT → 403 (JWT authoritative; no header fall-through)', () => {
+    expectThrowsWithStatus(
+      makeReq({
+        tenantId: TENANT_US,
+        actorContext: {
+          accountId: 'acct_p',
+          sessionId: 'sess_p',
+          tenantId: TENANT_US,
+          role: 'patient',
+          countryOfCare: 'US',
+          delegateId: null,
+          adminTenantBinding: null,
+          adminHomeTenantId: null,
+        },
+        bearerTokenPresented: true,
+      }),
+      403,
+    );
+  });
+
+  it('§7.3b clinician JWT → 403 (JWT authoritative)', () => {
+    expectThrowsWithStatus(
+      makeReq({
+        tenantId: TENANT_US,
+        actorContext: {
+          accountId: 'acct_c',
+          sessionId: 'sess_c',
+          tenantId: TENANT_US,
+          role: 'clinician',
+          countryOfCare: 'US',
+          delegateId: null,
+          adminTenantBinding: null,
+          adminHomeTenantId: null,
+        },
+        bearerTokenPresented: true,
+      }),
+      403,
+    );
+  });
+
+  // §7.4 Anti-elevation defense: verified non-admin JWT + forged admin headers
+  it('§7.4a patient JWT + forged x-actor-roles=platform_admin header → 403 (R1 closure)', () => {
+    // Closes Codex R1 HIGH: a verified non-admin JWT MUST NOT be elevated
+    // to admin via a forged x-actor-roles header. Pre-Phase-2 this would
+    // have authorized as platform_admin via the header shim. Post-Phase-2
+    // the JWT is authoritative; verified patient → 403 regardless of
+    // header contents.
+    expectThrowsWithStatus(
+      makeReq({
+        tenantId: TENANT_US,
+        headers: {
+          'x-actor-roles': 'platform_admin', // FORGED
+          'x-actor-id': 'forged_actor',
+        },
+        actorContext: {
+          accountId: 'acct_p',
+          sessionId: 'sess_p',
+          tenantId: TENANT_US,
+          role: 'patient', // real role from JWT
+          countryOfCare: 'US',
+          delegateId: null,
+          adminTenantBinding: null,
+          adminHomeTenantId: null,
+        },
+        bearerTokenPresented: true,
+      }),
+      403,
+    );
+  });
+
+  it('§7.4b clinician JWT + forged x-actor-roles=tenant_admin header → 403 (R1 closure)', () => {
+    expectThrowsWithStatus(
+      makeReq({
+        tenantId: TENANT_US,
+        headers: {
+          'x-actor-roles': 'tenant_admin', // FORGED
+          'x-actor-admin-tenant': TENANT_US, // FORGED
+        },
+        actorContext: {
+          accountId: 'acct_c',
+          sessionId: 'sess_c',
+          tenantId: TENANT_US,
+          role: 'clinician',
+          countryOfCare: 'US',
+          delegateId: null,
+          adminTenantBinding: null,
+          adminHomeTenantId: null,
+        },
+        bearerTokenPresented: true,
+      }),
+      403,
+    );
+  });
+});
+
+describe('requireAdminRole — Phase 2 bearerTokenPresented fail-closed (Tier 1b)', () => {
+  beforeEach(() => {
+    process.env['NODE_ENV'] = 'test';
+  });
+
+  // §8.1 presented-but-rejected JWT cannot fall through to header shim
+  it('§8.1a bearerTokenPresented=true + actorContext=undefined → 401 (R2 closure)', () => {
+    // Closes Codex R2 HIGH: a presented-but-rejected JWT (invalid sig,
+    // expired, wrong tenant, wrong binding) MUST NOT be elevated by a
+    // forged x-actor-roles header. The R2 fail-closed branch in
+    // requireAdminRole triggers regardless of header contents.
+    expectThrowsWithStatus(
+      makeReq({
+        tenantId: TENANT_US,
+        bearerTokenPresented: true,
+        // actorContext absent (verification failed)
+      }),
+      401,
+    );
+  });
+
+  it('§8.1b bearerTokenPresented=true + forged x-actor-roles=platform_admin → 401 (R2 closure)', () => {
+    // The forged admin header CANNOT elevate when a JWT was attempted
+    // but rejected. This is the canonical R2 HIGH closure scenario.
+    expectThrowsWithStatus(
+      makeReq({
+        tenantId: TENANT_US,
+        headers: {
+          'x-actor-roles': 'platform_admin', // FORGED
+        },
+        bearerTokenPresented: true,
+        // actorContext absent (JWT rejected at verify time)
+      }),
+      401,
+    );
+  });
+
+  it('§8.1c bearerTokenPresented=true + forged tenant_admin headers → 401 (R2 closure)', () => {
+    expectThrowsWithStatus(
+      makeReq({
+        tenantId: TENANT_US,
+        headers: {
+          'x-actor-roles': 'tenant_admin', // FORGED
+          'x-actor-admin-tenant': TENANT_US, // FORGED
+        },
+        bearerTokenPresented: true,
+      }),
+      401,
+    );
+  });
+
+  it('§8.2 bearerTokenPresented=false + valid x-actor-roles header → header shim allowed (Tier 2 OK)', () => {
+    // Sanity: when NO JWT was presented (bearerTokenPresented=false +
+    // actorContext=undefined), the legacy Tier 2 header shim is still
+    // honored. This is the only branch where header-based admin auth
+    // still works post-Phase-2 — and only in non-prod or with
+    // ALLOW_ACTOR_HEADER_AUTH=true (covered by §1 tests).
+    const req = makeReq({
+      tenantId: TENANT_US,
+      bearerTokenPresented: false,
+      headers: {
+        'x-actor-roles': 'platform_admin',
+      },
+    });
+    expect(requireAdminRole(req)).toBe('platform_admin');
   });
 });
