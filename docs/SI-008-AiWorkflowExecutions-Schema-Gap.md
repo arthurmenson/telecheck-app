@@ -84,6 +84,25 @@ Mirror of SI-005 + SI-007 discipline:
 2. `ai_workflow_executions FK (tenant_id, consult_id) → consults (tenant_id, id)` — prevents a tenant-A consult from being associated with a tenant-B workflow execution
 3. KMS column-update path through a definer-rights stored procedure (mirror of SI-005 Decision 8 5a/5b): prevents direct UPDATE of the KMS envelope columns without same-tx audit emission
 
+## Bidirectional pointer invariant (Codex R1 HIGH closure 2026-05-15)
+
+The schema has two pointers:
+
+- **Forward:** `consults.ai_workflow_execution_id → ai_workflow_executions (tenant_id, id)` (added at SI-005 closure)
+- **Backward:** `ai_workflow_executions.consult_id → consults (tenant_id, id)` (this SI)
+
+Without a single source of truth + consistency invariant, retries / re-runs / partial rollback could leave consult A pointing at execution X while execution Y ALSO claims consult A. Multiple workflows per consult is a legitimate semantic (a consult may have re-runs after a draft failure), but at any moment exactly ONE of those workflows is the **current authoritative** one whose recommendation drives clinician review.
+
+**Decision (v0.2; pre-ratification):**
+
+- **`ai_workflow_executions.consult_id` is non-unique** — a single consult may have multiple workflow execution rows representing retries / re-runs over time.
+- **`consults.ai_workflow_execution_id` is the authoritative current pointer** — at any moment, points to the SINGLE execution whose recommendation is currently in the consult's clinician-review queue.
+- **State machine invariant:** the workflow whose id is in `consults.ai_workflow_execution_id` MUST have `state='completed'`. The forward pointer is set when a workflow execution transitions `running → completed` AND wins the "current execution" race (atomic UPDATE with `WHERE consults.state='UNDER_REVIEW' AND consults.ai_workflow_execution_id IS NULL` or equivalent).
+- **Same-tenant invariant via composite FK:** the forward FK uses `(tenant_id, ai_workflow_execution_id)` so the pointed-at execution must be in the same tenant as the consult. Backward FK already enforces same-tenant per (2) above.
+- **Closure rule:** `ai_workflow_executions.consult_id` MUST equal `consults.id` for the execution row that `consults.ai_workflow_execution_id` points to. This invariant is enforced at the application layer (the state-machine transition that sets `consults.ai_workflow_execution_id` reads the execution row's `consult_id` and validates equality before UPDATE). A trigger-level enforcement is desirable for defense-in-depth but is complex (requires reading two rows in a single trigger fire); DB-level enforcement deferred until the application-layer invariant is proven stable.
+
+This decision preserves the ability to re-run a workflow after failure (multiple execution rows allowed) while pinning authoritative reference to a single row at any moment.
+
 ## Open questions for CDM author
 
 - **state vocabulary:** is `pending | running | completed | failed | cancelled` the canonical set, or does Mode 2 case-prep need additional states (e.g., `requires_clinician_review`, `clinician_approved`, `clinician_declined`)? If the workflow lifecycle includes clinician-decision states, those may belong on the Consult entity (per SI-005's clinician_decision_class column set) rather than here.
