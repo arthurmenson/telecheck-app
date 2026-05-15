@@ -3,8 +3,9 @@
 **Raised by:** Engineering (autonomous turn 2026-05-05; Sprint 9 PM kickoff verification gate; filed at TLC-021a)
 **Date:** 2026-05-05
 **v0.2 advanced:** 2026-05-15 (concrete proposals + pre-ratification gate alignment with SI-002 / SI-003 / SI-004 / SI-007)
+**v0.3 advanced:** 2026-05-15 (close Codex R1 MEDIUMs — column count reconciliation + KMS envelope explicit)
 **Severity:** medium (does NOT block Sprint 9 authoring; placeholder schema ships with this gap as the resume-gate)
-**Status:** OPEN — v0.2 DRAFT, awaiting CDM v1.2 §4 row-shape expansion (Codex pre-ratification gate pending; mirror SI-007 cadence)
+**Status:** OPEN — v0.3 DRAFT, awaiting CDM v1.2 §4 row-shape expansion (Codex pre-ratification gate continuing; mirror SI-007 cadence)
 **Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md` (v1.2 → **v1.3**)
 **Promotion Ledger target:** **P-017** (P-013 SI-007 merged 2026-05-14, P-014 SI-002 merged 2026-05-14, P-015 SI-003 PR #137 in flight, P-016 SI-004 PR #138 in flight)
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md`
@@ -30,9 +31,9 @@ EHBG §7: engineering does NOT author canonical schema. CLAUDE.md hard rule: "Do
 
 ### Decision 1 — Ratify Sprint 9 placeholder columns as the canonical baseline (CDM v1.2 → v1.3 §4.16 + §4.17)
 
-The 9 placeholder columns on `consults` and 8 placeholder columns on `consult_events` SHALL be ratified verbatim as the canonical baseline column set. Zero rename required. Reasoning identical to SI-007: Sprint 9 placeholders were authored with the canonical column-naming discipline (snake_case, ULID FKs, timestamptz with NOW() defaults, denormalized tenant_id for RLS).
+The 10 placeholder columns on `consults` and 9 placeholder columns on `consult_events` SHALL be ratified verbatim as the canonical baseline column set (v0.3 R1 MEDIUM closure: counts reconciled to match the tables below — v0.2 prose said "9 + 8" but the tables enumerate 10 + 9; tables are authoritative). Zero rename required. Reasoning identical to SI-007: Sprint 9 placeholders were authored with the canonical column-naming discipline (snake_case, ULID FKs, timestamptz with NOW() defaults, denormalized tenant_id for RLS).
 
-#### §4.16 Consult (canonical baseline; 9 columns)
+#### §4.16 Consult (canonical baseline; 10 columns)
 
 | # | Column | Type | Nullable | Notes |
 |---|---|---|---|---|
@@ -47,7 +48,7 @@ The 9 placeholder columns on `consults` and 8 placeholder columns on `consult_ev
 | 9 | `created_at` | TIMESTAMPTZ | NOT NULL | DEFAULT NOW() |
 | 10 | `updated_at` | TIMESTAMPTZ | NOT NULL | DEFAULT NOW() |
 
-#### §4.17 ConsultEvent (canonical baseline; 8 columns)
+#### §4.17 ConsultEvent (canonical baseline; 9 columns)
 
 | # | Column | Type | Nullable | Notes |
 |---|---|---|---|---|
@@ -77,13 +78,23 @@ Sprint 9 implements transitions 1-6 + 16 (INITIATED → INTAKE → SUBMITTED →
 | 16 | `escalation_target_sync_session_id` | VARCHAR(26) | NULL | nullable; populated only when terminal_state='ESCALATED_TO_SYNC' AND the target sync session has been allocated |
 | 17 | `last_state_transition_at` | TIMESTAMPTZ | NOT NULL | DEFAULT NOW(); updated by trigger on state column change; used for stale-consult detection |
 
-**Encrypted-on-row clinical-rationale field (NOT a column):** per SI-004 Decision 4 `consult.clinician_decision_recorded` detail discipline, the clinical-rationale text + decision payload live ENCRYPTED on the AsyncConsult row via the standard tenant-KMS encryption pattern. The encrypted-blob column SHALL be:
+**Encrypted-on-row clinical-rationale columns (v0.3 R1 MEDIUM closure — full KMS envelope ratified):** per SI-004 Decision 4 `consult.clinician_decision_recorded` detail discipline, the clinical-rationale text + decision payload live ENCRYPTED on the AsyncConsult row via the standard tenant-KMS encryption pattern. **v0.2 was inconsistent (labelled "NOT a column" then ratified column 18); v0.3 ratifies the full KMS envelope columns explicitly.** The envelope mirrors the existing pattern used by `forms_submission.encrypted_responses` + companion key-metadata columns (audited at migration 003 and forward).
 
 | # | Column | Type | Nullable | Notes |
 |---|---|---|---|---|
-| 18 | `clinician_decision_encrypted` | BYTEA | NULL | nullable until clinician decision recorded; tenant-KMS-encrypted; decryption key alias = tenant.kms_key_alias |
+| 18 | `clinician_decision_encrypted` | BYTEA | NULL | nullable until clinician decision recorded; AES-256-GCM ciphertext of the canonical clinical-decision JSON (rationale text + decision payload) |
+| 19 | `clinician_decision_kms_key_id` | TEXT | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; the tenant-KMS data-key ID used to encrypt column 18; references the AWS KMS DEK envelope ID returned at encrypt-time. Distinct from `tenant.kms_key_alias` (the master-key alias) — this column carries the per-row DEK ID so key rotation can re-encrypt without losing audit-chain linkage to the original encryption event |
+| 20 | `clinician_decision_kms_key_version` | INTEGER | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; integer version of the DEK; supports rotation tracking; matches the version returned by KMS at the time of encrypt |
+| 21 | `clinician_decision_nonce` | BYTEA | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; the 12-byte AES-256-GCM nonce/IV (96-bit IV per NIST SP 800-38D §8.2.1). Random per-encryption; MUST never repeat for the same (key_id, key_version) pair |
+| 22 | `clinician_decision_aad` | BYTEA | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; the AES-256-GCM Additional Authenticated Data binding the ciphertext to the row context. Canonical AAD = `tenant_id \| consult_id \| 'clinician_decision' \| schema_version` (pipe-separated bytes). AAD binding prevents ciphertext-relocation attacks (an attacker who copies the ciphertext from consult X to consult Y cannot decrypt because the AAD no longer matches) |
+| 23 | `clinician_decision_schema_version` | INTEGER | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; integer schema version of the encrypted payload's plaintext structure; allows forward-compat plaintext schema migrations without re-encryption. Bound into the AAD per column 22 |
+| 24 | `clinician_decision_encrypted_at` | TIMESTAMPTZ | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; chain-of-custody timestamp; immutable per encrypt event |
 
-Total `consults` canonical column count at v1.3: **18 columns** (10 baseline + 7 Sprint 10+ additions + 1 encrypted-blob).
+**Key rotation semantics:** when tenant-KMS rotates the master key, a forward-fixup job decrypts column 18 with the old (key_id, key_version) pair, re-encrypts with the new pair, and updates columns 18-24 atomically. The original chain-of-custody is preserved by emitting a paired `consult_event{event_type='kms_rotation'}` row referencing both the old and new key_versions. The `encrypted_at` column 24 is NOT updated on re-encryption — it preserves the original-encryption timestamp; rotation produces a NEW `consult_event` row with `created_at=NOW()` for the rotation event.
+
+**Integrity check:** the AES-256-GCM tag is included in column 18's ciphertext (per standard GCM ciphertext format: nonce + ciphertext + tag). Tag verification at decrypt time + AAD match together prove tamper-evidence; failure to verify is a `KmsIntegrityException` raised by `lib/tenant-kms.ts` (the standard decrypt path).
+
+Total `consults` canonical column count at v1.3: **24 columns** (10 baseline + 7 Sprint 10+ additions + 7 KMS envelope columns for the clinical-decision encryption).
 
 #### §4.17 ConsultEvent (Sprint 10+ column additions; +2 columns; total 11)
 
