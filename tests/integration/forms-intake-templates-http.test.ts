@@ -16,10 +16,16 @@
  * 200 hits + assert no leakage on 4xx responses (where errors must be
  * tenant-blind per I-025 regardless of surface).
  *
- * **Auth gate (Codex variants-resume-http-r1 pattern):** all four
- * handlers require an authenticated `x-actor-id`. The list + by-id
- * read endpoints had the auth gate landed in this commit (preemptive
- * fix to the same gap Codex flagged on getVariantHandler).
+ * **Auth gate (Phase 2 admin JWT migration 2026-05-15):** all four
+ * handlers require an authenticated admin actor. JWT-based identity:
+ * tenant_admin (binding to resolved tenant) OR platform_admin
+ * (global). Each test mints a JWT via `adminAuth` / `platformAdminAuth`
+ * helpers (top of file). Pre-Phase-2 these tests used the
+ * `x-actor-id` / `x-actor-roles` / `x-actor-admin-tenant` header shim;
+ * the migration replaces all three with `bearerAuthHeader(...)`.
+ * Cross-tenant tenant_admin tests now return 401 (JWT rejection at
+ * authContextPlugin → bearerTokenPresented fail-closed) instead of
+ * the pre-Phase-2 403 from the header shim's tenant-binding check.
  *
  * Spec references:
  *   - Slice PRD v2.1 §6 (visual builder workflows)
@@ -33,9 +39,35 @@ import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fas
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
+import { asTenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+const T_US = asTenantId(TENANT_US);
+const T_GH = asTenantId('Telecheck-Ghana');
+
+// Phase 2 admin JWT migration (2026-05-15): standard tenant_admin
+// header for templates-http tests. Each test that needs a different
+// actor mints its own with a per-test accountId.
+function adminAuth(accountId: string): { authorization: string } {
+  return bearerAuthHeader({
+    accountId,
+    tenantId: T_US,
+    countryOfCare: 'US',
+    role: 'tenant_admin',
+  });
+}
+
+function platformAdminAuth(accountId: string): { authorization: string } {
+  return bearerAuthHeader({
+    accountId,
+    tenantId: T_US,
+    countryOfCare: 'US',
+    role: 'platform_admin',
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Test app lifecycle
@@ -178,11 +210,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
       url: '/v0/forms/templates',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_create_tpl',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_create_tpl'),
         'content-type': 'application/json',
       },
       payload: {
@@ -207,11 +235,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
       url: '/v0/forms/templates',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_no_body',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_no_body'),
         'content-type': 'application/json',
       },
       payload: {},
@@ -241,21 +265,28 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
     assertNoTenantIdLeakageInError(response);
   });
 
-  // Codex admin-auth-r1 closure 2026-05-03 — tenant_admin scope is
-  // tenant-bound. A tenant_admin for tenant A cannot administer tenant B
-  // even with a valid actor identity + admin role + actor-admin-tenant
-  // header pointing at A. The shim's tenant-scope check refuses.
-  it('returns 403 when tenant_admin role is scoped to a different tenant', async () => {
+  // Phase 2 admin JWT migration (2026-05-15): tenant_admin scope is
+  // tenant-bound. A tenant_admin JWT with admin_tenant_binding ≠
+  // resolved request tenant is REJECTED at the authContextPlugin level
+  // (actorContext stays undefined). Then requireAdminRole sees
+  // bearerTokenPresented=true → 401 (no header-shim fall-through). The
+  // pre-Phase-2 expectation was 403 (via header shim's tenant-binding
+  // check), but the JWT-based fail-closed model 401s on rejected tokens
+  // because the rejection is authoritative — the request was attempting
+  // JWT auth and that authentication failed.
+  it('returns 401 when tenant_admin JWT binding points at a different tenant', async () => {
     const response = await injectWithIdempotency({
       method: 'POST',
       url: '/v0/forms/templates',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_xt_admin',
-        'x-actor-roles': 'tenant_admin',
-        // Role binding points to a DIFFERENT tenant than the request's
-        // resolved context (which is Telecheck-US per host=localhost).
-        'x-actor-admin-tenant': 'Telecheck-Ghana',
+        ...bearerAuthHeader({
+          accountId: 'op_xt_admin',
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'tenant_admin',
+          adminTenantBinding: T_GH, // mismatched: request is Telecheck-US
+        }),
         'content-type': 'application/json',
       },
       payload: {
@@ -267,7 +298,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
         approvalGovernance: {},
       },
     });
-    expect(response.statusCode).toBe(403);
+    expect(response.statusCode).toBe(401);
     assertNoTenantIdLeakageInError(response);
   });
 
@@ -280,10 +311,7 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
       url: '/v0/forms/templates',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_platform_admin',
-        'x-actor-roles': 'platform_admin',
-        // Deliberately NO x-actor-admin-tenant header — platform_admin
-        // is global per RBAC v1.1.
+        ...platformAdminAuth('op_platform_admin'),
         'content-type': 'application/json',
       },
       payload: {
@@ -309,9 +337,13 @@ describe('POST /v0/forms/templates — HTTP-level', () => {
       url: '/v0/forms/templates',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_no_admin_role',
-        // Deliberately a non-admin role.
-        'x-actor-roles': 'patient',
+        // Deliberately a non-admin role (patient JWT).
+        ...bearerAuthHeader({
+          accountId: 'op_no_admin_role',
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: {
@@ -341,11 +373,7 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
       url: '/v0/forms/templates?limit=5',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_list',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_list'),
       },
     });
 
@@ -361,11 +389,7 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
       url: '/v0/forms/templates?limit=abc',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_list_bad',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_list_bad'),
       },
     });
     expect(response.statusCode).toBe(400);
@@ -378,11 +402,7 @@ describe('GET /v0/forms/templates — HTTP-level', () => {
       url: '/v0/forms/templates?cursor=not-a-real-cursor',
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_list_cur',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_list_cur'),
       },
     });
     expect(response.statusCode).toBe(400);
@@ -417,11 +437,7 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
       url: `/v0/forms/templates/${templateId}`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_get',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_get'),
       },
     });
 
@@ -440,11 +456,12 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
       url: `/v0/forms/templates/${templateId}`,
       headers: {
         host: 'ghana.heroshealth.com',
-        'x-actor-id': 'op_xt',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': 'Telecheck-Ghana',
+        ...bearerAuthHeader({
+          accountId: 'op_xt',
+          tenantId: T_GH,
+          countryOfCare: 'GH',
+          role: 'tenant_admin',
+        }),
       },
     });
 
@@ -458,11 +475,7 @@ describe('GET /v0/forms/templates/:templateId — HTTP-level', () => {
       url: `/v0/forms/templates/${ulid()}`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_missing',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_missing'),
       },
     });
     expect(response.statusCode).toBe(404);
@@ -532,11 +545,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_publish',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_publish'),
         'content-type': 'application/json',
       },
       payload: {},
@@ -557,11 +566,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_double_publish',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_double_publish'),
         'content-type': 'application/json',
       },
       payload: {},
@@ -577,11 +582,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       url: `/v0/forms/templates/${ulid()}/versions/${ulid()}/publish`,
       headers: {
         host: US_HOST,
-        'x-actor-id': 'op_pub_missing',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_pub_missing'),
         'content-type': 'application/json',
       },
       payload: {},
@@ -627,11 +628,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
         url: `/v0/forms/templates/${templateId}/versions/${templateId}/publish`,
         headers: {
           host: US_HOST,
-          'x-actor-id': 'op_pub_failclose',
-
-          'x-actor-roles': 'tenant_admin',
-
-          'x-actor-admin-tenant': TENANT_US,
+          ...adminAuth('op_pub_failclose'),
           'content-type': 'application/json',
         },
         payload: {},
