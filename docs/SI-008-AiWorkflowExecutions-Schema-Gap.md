@@ -187,9 +187,10 @@ The procedure performs (in order):
 3. Validates the execution's `tenant_id` equals the consult's `tenant_id` (declarative FK already enforces this)
 4. Validates the execution's `state = 'completed'` (workflow caller has already transitioned `running → completed` BEFORE invoking the procedure; this gate ensures the procedure operates on terminal-state rows)
 5. Validates the CAS guard: `consults.ai_workflow_execution_id = $expected_prior_execution_id`
-6. Validates supersession chain acyclicity per R6: walks the consult's current supersession chain from `consults.ai_workflow_execution_id` recursively via `supersedes_execution_id` and REJECTS if the proposed new execution's id appears anywhere
-7. Performs the UPDATE on `consults.ai_workflow_execution_id` + INSERTs the paired audit row in the same transaction
-8. Returns success / specific rejection code
+6. **R13 HIGH closure:** validates the supersession-pointer-vs-CAS-prior consistency: `new_execution.supersedes_execution_id IS NOT DISTINCT FROM $expected_prior_execution_id`. This rejects a completed-but-unswapped row created against a stale prior from becoming authoritative under a refreshed CAS — the supersession pointer + the CAS guard MUST agree about what the proposed swap replaces. Retries after CAS loss require inserting a FRESH execution row with `supersedes_execution_id` set to the refreshed current pointer.
+7. Validates supersession chain acyclicity per R6: walks the consult's current supersession chain from `consults.ai_workflow_execution_id` recursively via `supersedes_execution_id` and REJECTS if the proposed new execution's id appears anywhere
+8. Performs the UPDATE on `consults.ai_workflow_execution_id` + INSERTs the paired audit row in the same transaction
+9. Returns success / specific rejection code
 
 **Failed-CAS recovery:** if the procedure rejects (CAS guard, state, chain, or other validation fails), the execution row stays in `state='completed'` with its INSERT-time-fixed `supersedes_execution_id`, but is NOT authoritative on the consult. The workflow caller emits `ai_workflow_execution.swap_rejected` Category A audit + can either:
 - Retry the swap with a refreshed `$expected_prior_execution_id` (treats the failed swap as a CAS race; the now-completed but unswapped execution row is preserved as a forensic record)
@@ -232,7 +233,34 @@ Codex R6 HIGH correctly identified that the self-cycle CHECK alone (`supersedes_
 
 Combined, these three contracts make the supersession chain a strictly-monotonic DAG: each execution appears at most once per consult lineage, the chain root (NULL `supersedes_execution_id`) is set once at INSERT, and post-INSERT `supersedes_execution_id` is immutable.
 
-**Failure behavior:** all three checks raise `SQLSTATE 22000` (data exception) inside the procedure with HINT messages directing operators to the specific violation. The audit row emitted is `ai_workflow_execution.supersession_rejected` Category A capturing the (proposed_new_execution_id, prior_pointer, rejection_reason) tuple for forensic recovery.
+**Failure behavior (R13 MEDIUM closure 2026-05-15):** all validation failures use a NON-THROWING rejection path. The procedure RETURNS a structured `(success: boolean, rejection_code: TEXT, rejection_detail: JSONB)` tuple instead of raising. This is essential because Postgres transactional semantics roll back any audit row INSERTed in the same transaction as a raised exception — claiming "same-transaction audit durability" for a raised-exception path is incorrect.
+
+For rejections, the procedure runs in a NESTED transaction (via SAVEPOINT):
+
+```sql
+BEGIN  -- outer transaction (caller's)
+  SAVEPOINT swap_attempt;
+  ... validation checks ...
+  IF any_check_fails THEN
+    ROLLBACK TO SAVEPOINT swap_attempt;  -- discard partial work
+    -- Emit the rejection audit AFTER the savepoint rollback so it's
+    -- in the OUTER transaction, NOT the rolled-back savepoint
+    INSERT INTO audit_records (... action='ai_workflow_execution.swap_rejected' ...);
+    RETURN (success=false, rejection_code=$code, rejection_detail=$detail);
+  END IF;
+  ... perform swap ...
+  INSERT INTO audit_records (... action='ai_workflow_execution.current_pointer_swapped' ...);
+  RETURN (success=true, ...);
+END
+```
+
+The rejection audit row is now DURABLE (committed in the outer transaction, not rolled back by the savepoint discard). Callers receive a structured result they can branch on; they do NOT need to catch SQL exceptions.
+
+Three rejection codes:
+- `cas_mismatch`: CAS guard violation (step 5)
+- `supersession_pointer_mismatch`: supersedes_execution_id != $expected_prior (step 6)
+- `chain_cycle`: proposed id already in chain (step 7)
+- `state_invalid`: execution not in 'completed' state (step 4)
 
 ### Declarative same-consult enforcement for the FORWARD pointer (R5 HIGH closure 2026-05-15)
 
