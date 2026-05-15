@@ -116,7 +116,12 @@ function baseInput(overrides: Partial<AuditEnvelopeInput> = {}): AuditEnvelopeIn
     tenant_id: T_US,
     actor_type: 'patient',
     actor_id: 'usr_test_patient_001',
-    actor_tenant_id: null,
+    // F-4 R6 closure (2026-05-15): non-system actors require non-null
+    // actor_tenant_id. For tenant-scoped roles like 'patient' the
+    // canonical value equals tenant_id (resource tenant). Tests
+    // overriding to actor_type='system' or 'ai_workload' may set this
+    // to null explicitly.
+    actor_tenant_id: T_US,
     target_patient_id: 'pat_test_001',
     delegate_context: null,
     action: 'consent_granted', // canonical Category C; not in I-012 set; not high_pii
