@@ -64,9 +64,13 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
+import { asTenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+const T_US = asTenantId(TENANT_US);
 
 const US_HOST = 'localhost';
 
@@ -103,12 +107,20 @@ afterAll(async () => {
  * threads actorId from the test scope.
  */
 function adminHeaders(idempotencyKey: string, actorId: string): Record<string, string> {
+  // Phase 2 admin JWT migration (2026-05-15): the actorId becomes the
+  // JWT's `sub` claim (account_id), which then becomes the
+  // idempotency 4-tuple PK's actor_id. Replay-pair tests pass the
+  // SAME actorId to both calls so the JWT (and thus the 4-tuple PK
+  // actor_id) is stable across the pair.
   return {
     host: US_HOST,
     'idempotency-key': idempotencyKey,
-    'x-actor-id': actorId,
-    'x-actor-roles': 'tenant_admin',
-    'x-actor-admin-tenant': TENANT_US,
+    ...bearerAuthHeader({
+      accountId: actorId,
+      tenantId: T_US,
+      countryOfCare: 'US',
+      role: 'tenant_admin',
+    }),
     'content-type': 'application/json',
   };
 }
