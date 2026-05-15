@@ -26,6 +26,9 @@
 -- R9 closure). Rolling back 029 doesn't touch that constraint; roll
 -- back 030 separately to drop the constraint.
 DROP FUNCTION IF EXISTS set_break_glass_context(TEXT, TEXT, TEXT, TEXT, TEXT);
+-- Also drop the 4-arg tombstone added in 029. Migration 003's
+-- original 4-arg function will be restored below.
+DROP FUNCTION IF EXISTS set_break_glass_context(TEXT, TEXT, TEXT, TEXT);
 DROP TRIGGER IF EXISTS audit_records_before_insert ON audit_records;
 DROP TRIGGER IF EXISTS audit_records_hash_insert_trigger ON audit_records;
 DROP FUNCTION IF EXISTS audit_records_hash_insert();

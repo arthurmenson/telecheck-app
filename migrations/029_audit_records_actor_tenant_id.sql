@@ -444,6 +444,38 @@ $$;
 
 REVOKE ALL ON FUNCTION set_break_glass_context(TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC;
 
+-- 4-arg tombstone: F-4 R10 HIGH closure. The old signature is
+-- preserved but raises a clear migration error so external break-
+-- glass callers (operational runbooks, DBA scripts, on-call tooling)
+-- get an actionable message rather than "function does not exist"
+-- at the moment they need break-glass most. Drop this tombstone in
+-- a future migration once all operational clients have migrated to
+-- the 5-arg signature.
+CREATE OR REPLACE FUNCTION set_break_glass_context(
+    p_actor_id          TEXT,
+    p_target_tenant     TEXT,
+    p_justification     TEXT,
+    p_authorized_until  TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+    RAISE EXCEPTION 'set_break_glass_context: signature changed in migration 029. '
+        'The 4-arg variant is no longer functional. Update your call site to the '
+        '5-arg signature: set_break_glass_context(p_actor_id, p_target_tenant, '
+        'p_justification, p_authorized_until, p_actor_home_tenant_id). The new '
+        'p_actor_home_tenant_id is the platform_admin''s home tenant for F-4 '
+        'audit attribution; it MUST be non-null and non-blank. See '
+        'migrations/029_audit_records_actor_tenant_id.sql for details.'
+        USING ERRCODE = 'feature_not_supported',
+              HINT = 'Migrate to the 5-arg signature with the new p_actor_home_tenant_id parameter.';
+END;
+$$;
+REVOKE ALL ON FUNCTION set_break_glass_context(TEXT, TEXT, TEXT, TEXT) FROM PUBLIC;
+
 -- (2) DB-level CHECK constraint as backstop. NOT VALID so pre-029 rows
 -- (which have NULL actor_tenant_id even for non-system actor types) are
 -- exempt; new rows must pass. VALIDATE CONSTRAINT can run as a separate
