@@ -275,7 +275,7 @@ async function seedControlVariant(opts: {
   const variant = await withTenantContext(opts.ctx.tenantId, () =>
     templateService.createVariant(
       opts.ctx,
-      opts.actorId ?? 'op_http_setup',
+      { actorId: opts.actorId ?? 'op_http_setup', actorTenantId: opts.ctx.tenantId },
       {
         deploymentId: opts.deploymentId,
         variantTemplateId: opts.variantTemplateId,

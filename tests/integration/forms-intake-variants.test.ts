@@ -194,7 +194,7 @@ describe('forms-intake createVariant — happy path', () => {
     const variant = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_variant_create',
+        { actorId: 'op_variant_create', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -257,7 +257,7 @@ describe('forms-intake createVariant — happy path', () => {
     const variant = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_variant_alt',
+        { actorId: 'op_variant_alt', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: altTemplateId,
@@ -291,7 +291,7 @@ describe('forms-intake createVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.createVariant(
           US_CTX,
-          'op_variant_retired',
+          { actorId: 'op_variant_retired', actorTenantId: TENANT_US },
           {
             deploymentId,
             variantTemplateId: templateId,
@@ -314,7 +314,7 @@ describe('forms-intake createVariant — failure modes', () => {
     await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_variant_first',
+        { actorId: 'op_variant_first', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -329,7 +329,7 @@ describe('forms-intake createVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.createVariant(
           US_CTX,
-          'op_variant_second',
+          { actorId: 'op_variant_second', actorTenantId: TENANT_US },
           {
             deploymentId,
             variantTemplateId: templateId,
@@ -361,7 +361,7 @@ describe('forms-intake createVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.createVariant(
           US_CTX,
-          'op_variant_xt',
+          { actorId: 'op_variant_xt', actorTenantId: TENANT_US },
           {
             deploymentId,
             variantTemplateId: ghanaTemplateId,
@@ -382,7 +382,7 @@ describe('forms-intake createVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.createVariant(
           US_CTX,
-          'op_variant_missing',
+          { actorId: 'op_variant_missing', actorTenantId: TENANT_US },
           {
             deploymentId: fakeDeployment,
             variantTemplateId: fakeTemplate,
@@ -412,7 +412,7 @@ describe('forms-intake createVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.createVariant(
           US_CTX,
-          'op_variant_draft',
+          { actorId: 'op_variant_draft', actorTenantId: TENANT_US },
           {
             deploymentId,
             variantTemplateId: draftTemplateId,
@@ -438,7 +438,7 @@ describe('forms-intake createVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.createVariant(
           US_CTX,
-          'op_variant_super',
+          { actorId: 'op_variant_super', actorTenantId: TENANT_US },
           {
             deploymentId,
             variantTemplateId: supersededTemplateId,
@@ -469,7 +469,7 @@ describe('forms-intake createVariant — failure modes', () => {
     const winner = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_postwin_setup',
+        { actorId: 'op_postwin_setup', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -482,7 +482,7 @@ describe('forms-intake createVariant — failure modes', () => {
     await withTenantContext(TENANT_US, () =>
       templateService.promoteVariant(
         US_CTX,
-        'op_postwin_promote',
+        { actorId: 'op_postwin_promote', actorTenantId: TENANT_US },
         winner.variant_id,
         {
           rationale: 'first',
@@ -498,7 +498,7 @@ describe('forms-intake createVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.createVariant(
           US_CTX,
-          'op_postwin_late',
+          { actorId: 'op_postwin_late', actorTenantId: TENANT_US },
           {
             deploymentId,
             variantTemplateId: altTemplateId,
@@ -524,7 +524,7 @@ describe('forms-intake createVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.createVariant(
           US_CTX,
-          'op_variant_arch',
+          { actorId: 'op_variant_arch', actorTenantId: TENANT_US },
           {
             deploymentId,
             variantTemplateId: archivedTemplateId,
@@ -553,7 +553,7 @@ describe('forms-intake getVariant — hit + tenant-blind miss', () => {
     const created = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_get',
+        { actorId: 'op_get', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -582,7 +582,7 @@ describe('forms-intake getVariant — hit + tenant-blind miss', () => {
     const created = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_xtread',
+        { actorId: 'op_xtread', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -624,7 +624,7 @@ describe('forms-intake promoteVariant — winner promotion', () => {
     const control = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_promote_setup',
+        { actorId: 'op_promote_setup', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -637,7 +637,7 @@ describe('forms-intake promoteVariant — winner promotion', () => {
     const armA = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_promote_setup',
+        { actorId: 'op_promote_setup', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: altTemplateId,
@@ -650,7 +650,7 @@ describe('forms-intake promoteVariant — winner promotion', () => {
     const armB = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_promote_setup',
+        { actorId: 'op_promote_setup', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: altTemplateId,
@@ -665,7 +665,7 @@ describe('forms-intake promoteVariant — winner promotion', () => {
     const promoted = await withTenantContext(TENANT_US, () =>
       templateService.promoteVariant(
         US_CTX,
-        'op_promote',
+        { actorId: 'op_promote', actorTenantId: TENANT_US },
         armA.variant_id,
         {
           rationale: 'Arm A converted 12% better; p < 0.01 over n=2000 sessions.',
@@ -782,7 +782,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.promoteVariant(
           US_CTX,
-          'op_promote_missing',
+          { actorId: 'op_promote_missing', actorTenantId: TENANT_US },
           fakeVariantId,
           {
             rationale: 'forced',
@@ -805,7 +805,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
     const control = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_pdsetup',
+        { actorId: 'op_pdsetup', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -820,7 +820,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
     await withTenantContext(TENANT_US, () =>
       templateService.promoteVariant(
         US_CTX,
-        'op_pd_first',
+        { actorId: 'op_pd_first', actorTenantId: TENANT_US },
         control.variant_id,
         {
           rationale: 'first promote',
@@ -836,7 +836,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.promoteVariant(
           US_CTX,
-          'op_pd_second',
+          { actorId: 'op_pd_second', actorTenantId: TENANT_US },
           control.variant_id,
           {
             rationale: 'second promote',
@@ -860,7 +860,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
     const winner = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_ret_setup',
+        { actorId: 'op_ret_setup', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -873,7 +873,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
     const loser = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_ret_setup',
+        { actorId: 'op_ret_setup', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: altTemplateId,
@@ -888,7 +888,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
     await withTenantContext(TENANT_US, () =>
       templateService.promoteVariant(
         US_CTX,
-        'op_ret_promote',
+        { actorId: 'op_ret_promote', actorTenantId: TENANT_US },
         winner.variant_id,
         {
           rationale: 'r',
@@ -904,7 +904,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
       withTenantContext(TENANT_US, () =>
         templateService.promoteVariant(
           US_CTX,
-          'op_ret_attempt',
+          { actorId: 'op_ret_attempt', actorTenantId: TENANT_US },
           loser.variant_id,
           {
             rationale: 'belated',
@@ -926,7 +926,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
     const usVariant = await withTenantContext(TENANT_US, () =>
       templateService.createVariant(
         US_CTX,
-        'op_xt_setup',
+        { actorId: 'op_xt_setup', actorTenantId: TENANT_US },
         {
           deploymentId,
           variantTemplateId: templateId,
@@ -942,7 +942,7 @@ describe('forms-intake promoteVariant — failure modes', () => {
       withTenantContext(TENANT_GHANA, () =>
         templateService.promoteVariant(
           GH_CTX,
-          'op_xt_attempt',
+          { actorId: 'op_xt_attempt', actorTenantId: TENANT_GHANA },
           usVariant.variant_id,
           {
             rationale: 'cross-tenant',

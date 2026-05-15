@@ -315,6 +315,9 @@ export async function publishVersionHandler(
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
+  // F-4: compute audit-attribution tenant for platform_admin cross-
+  // tenant action correctness.
+  const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   const params = req.params as Record<string, unknown>;
   const templateIdParam = params['templateId'];
@@ -343,7 +346,7 @@ export async function publishVersionHandler(
     try {
       const published = await templateService.publishVersion(
         ctx,
-        actorId,
+        { actorId, actorTenantId },
         versionIdParam,
         parsed.data,
         tx,

@@ -17,6 +17,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireAdminRole } from '../../../../lib/admin-role.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateVariantRequestSchema, PromoteVariantRequestSchema } from '../../schemas.js';
@@ -92,6 +93,8 @@ export async function createVariantHandler(
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
+  // F-4: audit-attribution tenant.
+  const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   const parsed = CreateVariantRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -104,7 +107,12 @@ export async function createVariantHandler(
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
     try {
-      const variant = await templateService.createVariant(ctx, actorId, parsed.data, tx);
+      const variant = await templateService.createVariant(
+        ctx,
+        { actorId, actorTenantId },
+        parsed.data,
+        tx,
+      );
       return { status: 201, view: variant };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -179,6 +187,8 @@ export async function promoteVariantHandler(
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
+  // F-4: audit-attribution tenant.
+  const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   const params = req.params as Record<string, unknown>;
   const variantIdParam = params['variantId'];
@@ -199,7 +209,7 @@ export async function promoteVariantHandler(
     try {
       const promoted = await templateService.promoteVariant(
         ctx,
-        actorId,
+        { actorId, actorTenantId },
         variantIdParam,
         parsed.data,
         tx,

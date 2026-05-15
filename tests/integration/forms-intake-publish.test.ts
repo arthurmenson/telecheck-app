@@ -131,9 +131,11 @@ async function publishWithGatesBypassed(
   const prior = process.env['FORMS_PUBLISH_GATES_BYPASS'];
   process.env['FORMS_PUBLISH_GATES_BYPASS'] = 'unsafe-test-only';
   try {
+    // F-4: tests are in-tenant operations (no platform_admin cross-
+    // tenant scenarios here), so actorTenantId === ctx.tenantId.
     return await templateService.publishVersion(
       ctx,
-      actorId,
+      { actorId, actorTenantId: ctx.tenantId },
       versionId,
       { changeNotes },
       // externalTx: pass the test client so the service's transactional
@@ -364,7 +366,7 @@ describe('forms-intake publishVersion — fail-closed governance gate', () => {
         withTenantContext(TENANT_US, () =>
           templateService.publishVersion(
             US_CTX,
-            'op_gate_test',
+            { actorId: 'op_gate_test', actorTenantId: TENANT_US },
             draftId,
             { changeNotes: undefined },
             getTestClient(),
@@ -404,7 +406,7 @@ describe('forms-intake publishVersion — fail-closed governance gate', () => {
         withTenantContext(TENANT_US, () =>
           templateService.publishVersion(
             US_CTX,
-            'op_typo_test',
+            { actorId: 'op_typo_test', actorTenantId: TENANT_US },
             draftId,
             { changeNotes: undefined },
             getTestClient(),
