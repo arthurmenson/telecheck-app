@@ -32,7 +32,9 @@ Per the established SI-001 / SI-005 / SI-007 pattern, when async-consult Mode 2 
 Placeholder columns (minimal-viable for Mode 2 case-prep authoring):
 
 ```sql
--- v0.1 placeholder columns; SI-008 resume gate
+-- v0.3 placeholder columns; SI-008 resume gate (R3 HIGH closure: schema
+-- now includes every column referenced by the v0.3 CAS rerun protocol +
+-- DB-layer closure procedure)
 id                          VARCHAR(26)  PRIMARY KEY
 tenant_id                   TEXT         NOT NULL REFERENCES tenants(id)
 consult_id                  VARCHAR(26)  NOT NULL  -- composite FK below
@@ -43,7 +45,8 @@ protocol_version            INTEGER      NOT NULL  -- versioned per FORMS_ENGINE
 model_version               VARCHAR(50)  NOT NULL  -- provider+model identifier
 guardrail_template_id       VARCHAR(26)  NULL  -- if Mode 1-style guardrails apply
 autonomy_level              VARCHAR(50)  NOT NULL CHECK (...)  -- AUTONOMY_LEVELS v5.2 enum
-state                       VARCHAR(30)  NOT NULL CHECK (...)  -- e.g. 'pending', 'completed', 'failed'
+state                       VARCHAR(30)  NOT NULL CHECK (...)  -- e.g. 'pending', 'running', 'completed', 'failed', 'cancelled'
+supersedes_execution_id     VARCHAR(26)  NULL  -- R3 closure: rerun chain (NULL for first execution; set when superseding a prior)
 created_at                  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 started_at                  TIMESTAMPTZ  NULL
 completed_at                TIMESTAMPTZ  NULL
@@ -56,9 +59,22 @@ recommendation_schema_version INTEGER    NULL
 recommendation_encrypted_at TIMESTAMPTZ  NULL
 recommendation_dek_ciphertext BYTEA      NULL
 
-UNIQUE (tenant_id, id)  -- composite UNIQUE for cross-tenant FK safety (precedent: SI-005, SI-007)
+UNIQUE (tenant_id, id)  -- composite UNIQUE for cross-entity composite FK safety (SI-005, SI-007 precedent)
 FOREIGN KEY (tenant_id, consult_id) REFERENCES consults (tenant_id, id)
 FOREIGN KEY (tenant_id, protocol_id) REFERENCES protocols (tenant_id, id)  -- when protocols table ratifies
+
+-- R3 closure: self-referential composite FK for the rerun chain.
+-- Same-tenant enforcement: a workflow execution cannot supersede an
+-- execution in a different tenant. The FK is NOT VALID at migration
+-- time (no rows to validate against; satisfied by future INSERTs).
+FOREIGN KEY (tenant_id, supersedes_execution_id) REFERENCES ai_workflow_executions (tenant_id, id)
+
+-- R3 closure: acyclicity guard. A workflow execution MUST NOT
+-- supersede itself. Deeper-cycle detection (A→B→A) requires graph
+-- walking; deferred to application-layer assertion in
+-- record_workflow_pointer_swap() (which validates against the consult's
+-- current forward pointer before accepting the supersession).
+CHECK (supersedes_execution_id IS NULL OR supersedes_execution_id <> id)
 ```
 
 The KMS envelope columns mirror SI-005's Decision 8 (8-column envelope including DEK ciphertext) — the same Mode-2-output-protection-at-rest pattern. When SI-008 closes, the column set may consolidate via a shared `EncryptedPayload` composite type.
