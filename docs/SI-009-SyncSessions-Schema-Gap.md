@@ -82,21 +82,28 @@ Same lessons-learned as SI-008's 14-round Codex review series apply here:
 
 - **No supersession chain needed (simpler than SI-008).** Unlike AI workflow executions which support automated reruns, sync sessions transition via human action (clinician schedules, patient joins, technical failure → manual reschedule). The consult's forward pointer is updated via standard state-machine transitions on `consults`, not via the SI-008-style CAS-and-supersession protocol.
 
-- **Guarded forward-pointer update protocol (R1 MEDIUM closure 2026-05-15):** even without supersession-chain machinery, concurrent reschedule / cancel / no-show handling can race. A stale actor could move `consults.escalation_target_sync_session_id` back to an older cancelled / no_show session or away from a newly scheduled one. The pointer update MUST use a guarded UPDATE with both CAS-on-pointer + state-precondition:
+- **Guarded forward-pointer update protocol (R1 MEDIUM + R2 HIGH closures 2026-05-15):** even without supersession-chain machinery, concurrent reschedule / cancel / no-show handling can race. A stale actor could move `consults.escalation_target_sync_session_id` back to an older cancelled / no_show / completed session or away from a newly scheduled one. The pointer update MUST use a guarded UPDATE with FOUR atomic predicates: CAS-on-pointer + consult-state-precondition + new-session-existence + new-session-state-actionable.
 
   ```sql
-  UPDATE consults
-     SET escalation_target_sync_session_id = $new_sync_session_id
-   WHERE id = $consult_id
-     AND tenant_id = $tenant_id
-     AND state IN ('UNDER_REVIEW', 'ESCALATED_TO_SYNC')
-     AND escalation_target_sync_session_id IS NOT DISTINCT FROM $expected_prior_pointer
-  RETURNING id;
+  UPDATE consults c
+     SET escalation_target_sync_session_id = s.id
+   FROM sync_sessions s
+   WHERE c.id = $consult_id
+     AND c.tenant_id = $tenant_id
+     AND c.state IN ('UNDER_REVIEW', 'ESCALATED_TO_SYNC')
+     AND c.escalation_target_sync_session_id IS NOT DISTINCT FROM $expected_prior_pointer
+     AND s.id = $new_sync_session_id
+     AND s.tenant_id = c.tenant_id
+     AND s.originating_consult_id = c.id
+     AND s.state IN ('scheduled', 'waiting_room', 'in_progress')
+  RETURNING c.id;
   ```
 
-  Where `$expected_prior_pointer` is the value the caller read at the start of the transition (NULL for first-write, or the prior sync_session_id for a reschedule). Zero-row return triggers `consult.escalation_target_swap_failed` Category C audit + caller-side conflict resolution (typically refresh + re-attempt). Every successful swap emits `consult.escalation_target_swapped` Category C audit capturing `(prior_pointer, new_pointer, actor_id)` for forensic recovery.
+  **R2 HIGH closure (Codex 2026-05-15):** the original R1 guard only validated `consults` row state + the CAS pointer. The triple-composite FK proved tenant/lineage but NOT lifecycle state of the target. A caller could repoint a consult to a `cancelled`/`no_show`/`completed` sync session for the same consult — referentially valid but operationally invalid. The R2 fix adds the sync-session lifecycle precondition (`s.state IN ('scheduled', 'waiting_room', 'in_progress')`) atomically in the same UPDATE. Inactive sessions can no longer become the current forward pointer.
 
-  No DB-layer procedure-only path is required (unlike SI-008's `record_workflow_pointer_swap()`) because the sync-session lifecycle is human-driven + scheduling-data has simpler integrity semantics than AI-recommendation lineage. Application-layer CAS + audit is the proportionate defense for this surface.
+  Zero-row return triggers `consult.escalation_target_swap_failed` Category C audit (captures the specific predicate that filtered: caller can probe by reading the current consult + target session state to determine whether CAS lost OR the target was inactive) + caller-side conflict resolution (typically refresh + re-attempt with a freshly scheduled session). Every successful swap emits `consult.escalation_target_swapped` Category C audit capturing `(prior_pointer, new_pointer, actor_id)` for forensic recovery.
+
+  No DB-layer procedure-only path is required (unlike SI-008's `record_workflow_pointer_swap()`) because the sync-session lifecycle is human-driven + scheduling-data has simpler integrity semantics than AI-recommendation lineage. Application-layer four-predicate atomic UPDATE + audit is the proportionate defense for this surface.
 
 ## Resolution path
 
