@@ -3,8 +3,9 @@
 **Raised by:** Engineering (autonomous turn 2026-05-05; Sprint 8 retro decision; filed at TLC-021a)
 **Date:** 2026-05-05
 **v0.2 advanced:** 2026-05-14 (concrete proposals + pre-ratification gate alignment with SI-002 / SI-003)
+**v0.3 advanced:** 2026-05-14 (close Codex R1 HIGH — prescription_created vs creation_attempted split; R1 MEDIUM — reserved-name-registry separated from emit allowlist)
 **Severity:** medium (does NOT block Sprint 9 authoring; placeholder events ship with this gap as the resume-gate)
-**Status:** OPEN — v0.2 DRAFT, awaiting Contracts Pack v5.X AUDIT_EVENTS ratification (Codex pre-ratification gate pending; mirror SI-007 / SI-002 / SI-003 cadence)
+**Status:** OPEN — v0.3 DRAFT, awaiting Contracts Pack v5.X AUDIT_EVENTS ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 / SI-003 cadence)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (v5.5 once SI-002 closes → **v5.6** at SI-004 closure)
 **Promotion Ledger target:** **P-016** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 PR #136 MERGED 2026-05-14; P-015 reserved by SI-003 PR #137 in flight)
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md` §13
@@ -72,7 +73,8 @@ Enumerates all 13 events (11 PRD §13 + 2 state-machine derived). v0.2 ratificat
 | 5 | `consult.ai_preparation_completed` | C | AI preparation completed | Sprint 10+ ⏸️ |
 | 6 | `consult.case_claimed` | C | Case claimed by clinician | Sprint 10 ⏸️ |
 | 7 | `consult.clinician_decision_recorded` | **B (governance)** | Clinician decision | Sprint 10 ⏸️ |
-| 8 | `consult.prescription_created` | **B (governance)** | Prescription created | Sprint 10 ⏸️ (depends on SI-001 closure) |
+| 8a | `consult.prescription_creation_attempted` | **B (governance)** | (split per v0.3 R1 HIGH closure) | Sprint 10 ⏸️ (depends on SI-001 closure) |
+| 8b | `consult.prescription_created` | **B (governance)** | Prescription created | Sprint 10 ⏸️ (depends on SI-001 closure) |
 | 9 | `consult.additional_data_requested` | C | Additional data requested | Sprint 10 ⏸️ |
 | 10 | `consult.escalated_to_sync` | **B (governance)** | Escalation to sync | Sprint 10+ ⏸️ |
 | 11 | `consult.patient_notification_sent` | C | Patient notification sent | Sprint 10+ ⏸️ |
@@ -158,16 +160,29 @@ Per AUDIT_EVENTS v5.2 §envelope, every audit event already carries the canonica
 ```
 Note: Category B detail intentionally does NOT include the rationale text or the decision payload itself — those live encrypted on the AsyncConsult row. The audit detail carries the HASH for tamper-evidence + a boolean for compliance reporting (was a clinical rationale recorded? per regulatory requirement).
 
-#### `consult.prescription_created` (Category B; governance — medico-legal + regulatory)
+#### `consult.prescription_creation_attempted` (Category B; governance — medico-legal; v0.3 R1 HIGH closure)
+```json
+{
+  "consult_id": "<ULID>",
+  "clinician_account_id": "<ULID>",
+  "candidate_medication_request_id": "<ULID; provisional ID assigned at attempt time, retained for chain reconstruction even if the attempt is rejected>",
+  "interaction_check_outcome": "pending|passed|warnings_accepted|blocked",
+  "attempt_outcome": "in_progress|created|rejected"
+}
+```
+Emitted at I-012 reject-unless three-clause GATE ENTRY (i.e., the moment a clinician initiates a prescription creation but BEFORE the gate's outcome is known). The terminal `attempt_outcome` is set when the gate completes: `created` if I-012 allow-path succeeded (paired with a `consult.prescription_created` event); `rejected` if I-012 blocked (paired with a `medication_request.execution_rejected` event per I-012 §rejection). Multiple attempts on the same consult emit multiple `consult.prescription_creation_attempted` rows (each with a distinct `candidate_medication_request_id`).
+
+#### `consult.prescription_created` (Category B; governance — medico-legal + regulatory; v0.3 narrowed)
 ```json
 {
   "consult_id": "<ULID>",
   "medication_request_id": "<ULID — references medication_request entity per SI-001>",
   "clinician_account_id": "<ULID>",
-  "interaction_check_outcome": "passed|warnings_accepted|blocked-override"
+  "interaction_check_outcome": "passed|warnings_accepted",
+  "preceding_attempt_audit_id": "<ULID — the consult.prescription_creation_attempted audit_id that terminated as attempt_outcome=created>"
 }
 ```
-Note: Per glossary `medication_request` (NOT `prescription`). Per platform-floor I-012 reject-unless three-clause rule: `interaction_check_outcome=passed|warnings_accepted` AND `autonomy_level == action_with_confirm` AND explicit clinician confirmation. If blocked-override, the matching `medication_request.execution_rejected` event MUST emit per I-012 §rejection.
+**v0.3 R1 HIGH closure:** `interaction_check_outcome=blocked-override` REMOVED. Only `passed` and `warnings_accepted` are permitted on `consult.prescription_created`. Blocked-override cases never emit a `prescription_created` event — they emit `consult.prescription_creation_attempted{attempt_outcome=rejected}` + the paired `medication_request.execution_rejected`. This eliminates the v0.2 contradiction where two audit facts (created + rejected) could co-exist for the same regulated action. Per glossary `medication_request` (NOT `prescription`). Per platform-floor I-012 reject-unless three-clause rule: only the I-012 allow-path emits `consult.prescription_created`; the I-012 deny-path emits the rejection events.
 
 #### `consult.additional_data_requested` (Category C)
 ```json
@@ -236,7 +251,15 @@ The following event-type strings are RESERVED at SI-004 ratification but NOT yet
 - `consult.data_export_requested` — reserved for Research Data slice (cross-references ADR-028 + I-029 6-condition gate).
 - `consult.crisis_resource_surfaced` — reserved for I-019 crisis-detection-gate emission specifically from the consult intake flow (the canonical I-019 event lives elsewhere; this is the consult-bound paired entry).
 
-Per SI-003 Decision 7A discipline, reserved event-type strings MUST be added to the canonicalization map at SI-004 closure even though no code emits them yet, so the v1.0 CI guardrail (G-2 grep over the canonical 13-string list + 3 reserved = 16 strings) catches premature emission attempts.
+**v0.3 R1 MEDIUM closure — separate `reserved_name_registry` from emit allowlist.** v0.2 added reserved strings to the canonicalization map, which the SI-003 G-2 CI guardrail uses as its 28-canonical-event_type allowlist. That meant a developer could emit `consult.data_export_requested` from any manifest-`reads-*` path without the Research Data slice gate (ADR-028 + I-029) being implemented — the CI would PASS because the string was on the allowlist. v0.3 splits the two registries:
+
+- **`canonical_emitted_set`** (the SI-003 G-2 allowlist) — strings whose emission has a ratified implementation gate AND is permitted from a manifest-`reads-*` path. The 13 events in Decision 3 are in this set at SI-004 closure. The 3 reserved events are NOT.
+- **`reserved_name_registry`** (NEW v0.3) — strings whose canonical name is RESERVED (no other team may steal the namespace) but whose emission is BLOCKED by CI until the implementing PR also lands the required gate/spec closure. Each reserved entry carries a `gating_spec_pointer` field referencing the SI or ADR that must close first:
+  - `consult.reviewed_by_safety_team` → gates on §16.3 platform-clinical-governance safety-review workflow ratification (separate SI to be raised).
+  - `consult.data_export_requested` → gates on ADR-028 Research Data Posture A activation + I-029 6-condition gate implementation.
+  - `consult.crisis_resource_surfaced` → gates on the consult slice's I-019 wiring landing (already in flight per the AI-service rollout 24h status doc).
+
+The CI guardrail (SI-003 G-2) is extended in SI-004 ratification: any added line emitting a `reserved_name_registry` string fails the check with the message `event_type <name> is reserved; emit BLOCKED until <gating_spec_pointer> closes`. The PR that closes the gating spec MUST also move the string from `reserved_name_registry` to `canonical_emitted_set` (one atomic commit). The two registries live in the same artifact `docs/AUDIT_ACTION_ID_CANONICALIZATION_MAP_P_016.md` (SI-002's existing map extended), with two top-level YAML sections: `canonical_emitted_set:` and `reserved_name_registry:`.
 
 ### Decision 7 — Cutover discipline (mirror SI-003 Decision 7A)
 
