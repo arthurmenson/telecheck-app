@@ -779,8 +779,7 @@ export async function emitAudit(
   const NON_ATTRIBUTING_ACTOR_TYPES: ReadonlySet<string> = new Set(['system', 'ai_workload']);
   if (!NON_ATTRIBUTING_ACTOR_TYPES.has(input.actor_type)) {
     const rawAttribution = input.actor_tenant_id;
-    const trimmed =
-      typeof rawAttribution === 'string' ? rawAttribution.trim() : null;
+    const trimmed = typeof rawAttribution === 'string' ? rawAttribution.trim() : null;
     if (trimmed === null || trimmed.length === 0) {
       throw new Error(
         `emitAudit: action="${input.action}" actor_type="${input.actor_type}" requires ` +

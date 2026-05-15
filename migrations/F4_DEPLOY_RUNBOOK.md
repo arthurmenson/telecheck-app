@@ -31,11 +31,13 @@ If migration 029 is rolled back AFTER app is deployed, the new app emitter break
 Migration 030's CHECK constraint covers `actor_records_actor_tenant_id_required_for_human_actors` for new rows. Any direct INSERT into audit_records that bypasses emitAudit must populate actor_tenant_id for non-system actor types.
 
 Inventory of direct INSERT paths (per Codex F-4 R11 MEDIUM):
+
 - `tests/integration/audit-chain-walker.test.ts` — direct INSERT in walker fixtures. UPDATED at R7 to populate hash_schema_version=2; actor_type='system' in these fixtures means the row is exempt from the 030 CHECK constraint.
 - `tests/invariants/i003-audit-append-only.test.ts` — may have direct INSERTs; needs audit before 030 lands.
 - `tests/integration/tenant-isolation-rls.test.ts` — same.
 
 Before applying migration 030, ops MUST run a grep across the test suite + app source for `INSERT INTO audit_records` and confirm every site either:
+
 - uses actor_type='system' or 'ai_workload', OR
 - populates actor_tenant_id with a non-blank value.
 
