@@ -4,8 +4,9 @@
 **Date:** 2026-05-05
 **v0.2 advanced:** 2026-05-15 (concrete proposals + pre-ratification gate alignment with SI-002 / SI-003 / SI-004 / SI-007)
 **v0.3 advanced:** 2026-05-15 (close Codex R1 MEDIUMs — column count reconciliation + KMS envelope explicit)
+**v0.4 advanced:** 2026-05-15 (close Codex R2 MEDIUMs — Decision 2 heading +14/total 24 reconciliation; Decision 8 enumerates all 14 columns; CONSULT_EVENT_TYPES adds kms_rotation)
 **Severity:** medium (does NOT block Sprint 9 authoring; placeholder schema ships with this gap as the resume-gate)
-**Status:** OPEN — v0.3 DRAFT, awaiting CDM v1.2 §4 row-shape expansion (Codex pre-ratification gate continuing; mirror SI-007 cadence)
+**Status:** OPEN — v0.4 DRAFT, ratification-ready (5 MEDIUM findings closed across R1+R2; remaining gaps tracked as v5.3 promotion PR deliverables)
 **Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md` (v1.2 → **v1.3**)
 **Promotion Ledger target:** **P-017** (P-013 SI-007 merged 2026-05-14, P-014 SI-002 merged 2026-05-14, P-015 SI-003 PR #137 in flight, P-016 SI-004 PR #138 in flight)
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md`
@@ -66,7 +67,7 @@ The 10 placeholder columns on `consults` and 9 placeholder columns on `consult_e
 
 Sprint 9 implements transitions 1-6 + 16 (INITIATED → INTAKE → SUBMITTED → QUEUED, plus ABANDONED + EXPIRED). Sprint 10 will implement transitions 7-15 (AI preparation, clinician claim, decision, prescription, additional data, escalation, completion). Those transitions require additional columns that SHALL be ratified at SI-005 closure (not deferred to a future SI):
 
-#### §4.16 Consult (Sprint 10+ column additions; +7 columns; total 16)
+#### §4.16 Consult (Sprint 10+ column additions; +14 columns; total 24) (v0.4 R2 MEDIUM reconciliation — header reflects the 7 transition columns 11-17 + 7 KMS envelope columns 18-24 enumerated below)
 
 | # | Column | Type | Nullable | Notes |
 |---|---|---|---|---|
@@ -144,17 +145,18 @@ The `state` column CHECK constraint enumerates the CONSULT_STATES vocabulary. v1
 
 **State-machine reconciliation note:** State Machines v1.1 §3 currently enumerates 17 transitions but the state-set enumeration is implicit in the transition edges. SI-005 ratification SHALL fold the state-set enumeration into State Machines v1.2 (separate spec doc; SI-005 raises a paired SI if necessary; preliminary check: enumeration matches the 17 distinct from_state/to_state values in the transition list).
 
-### Decision 5 — CONSULT_EVENT_TYPES vocabulary
+### Decision 5 — CONSULT_EVENT_TYPES vocabulary (v0.4 R2 MEDIUM closure — kms_rotation added)
 
-The `event_type` column CHECK constraint enumerates the CONSULT_EVENT_TYPES vocabulary. v1.3 ratifies 5 event-type values at SI-005 closure:
+The `event_type` column CHECK constraint enumerates the CONSULT_EVENT_TYPES vocabulary. v1.3 ratifies 6 event-type values at SI-005 closure (v0.2 had 5; v0.4 R2 MEDIUM-3 closure adds `kms_rotation` because the Decision 2 KMS-envelope key-rotation semantics require emitting it):
 
 1. `state_transition` — paired with non-null from_state + to_state; the primary event type for state-machine driven transitions
 2. `ai_workflow_completed` — emitted when an AI workflow execution returns a result; paired with metadata.ai_workflow_execution_id
 3. `clinician_note_added` — emitted when a clinician adds a free-form note (encrypted on the consult row); paired with metadata.note_id
 4. `patient_message_received` — emitted when a patient submits a message; paired with metadata.message_id
 5. `clinician_message_sent` — emitted when a clinician sends a message; paired with metadata.message_id
+6. `kms_rotation` (v0.4 NEW) — emitted by the tenant-KMS rotation forward-fixup job when columns 18-24 are re-encrypted under a new (key_id, key_version). Paired metadata: `{ old_kms_key_id, old_kms_key_version, new_kms_key_id, new_kms_key_version, rotated_at, rotation_batch_id }`. The from_state/to_state columns are NULL for kms_rotation events (rotation does not change consult state). actor_id is the system rotation-job actor (`system:kms_rotation_job`). The rotation is observable in compliance audits via the canonical event without exposing the master key in either column.
 
-**Cross-alignment with SI-004 audit events:** for state_transition events, the paired audit event from SI-004's 14-event canonical list MUST also emit same-tx via the standard same-tx pattern (audit_records INSERT + consult_events INSERT in the same transaction; both reference the same `correlation_id` per Decision 2 column 10).
+**Cross-alignment with SI-004 audit events:** for state_transition events, the paired audit event from SI-004's 14-event canonical list MUST also emit same-tx via the standard same-tx pattern (audit_records INSERT + consult_events INSERT in the same transaction; both reference the same `correlation_id` per Decision 2 column 10). For kms_rotation events, the paired audit event is `system.kms_rotation_completed` from the broader KMS-ops audit catalog (cross-references SI-002 v5.5 Category B governance events; if not yet enumerated there, a paired SI MUST be raised at SI-005 ratification).
 
 ### Decision 6 — Sprint 10+ cross-entity coordination table (mirror SI-007 cross-entity discipline)
 
@@ -178,18 +180,67 @@ Sprint 10+ transitions span Consult → MedicationRequest (via `consult.prescrip
 
 **SI-002 / SI-003 cross-alignment:** the v1.0 CI guardrail (G-1 through G-5 per SI-003) applies — any new consult/consult_event direct table access outside the async-consult module path must go through @platform-eventing-team review per CODEOWNERS. SI-005 ratification SHALL extend the `docs/outbox-consumer-registry.yaml` manifest with a `src/modules/async-consult/**` entry once that module ships (purpose: emits-only).
 
-### Decision 8 — Migration discipline (no destructive rewrites; mirror SI-007 P-013 pattern)
+### Decision 8 — Migration discipline (no destructive rewrites; mirror SI-007 P-013 pattern; v0.4 R2 MEDIUM closure enumerates all 14 columns)
 
-SI-005 closure produces a migration 020a (or sequentially-numbered) that:
+SI-005 closure produces a migration 020a (or sequentially-numbered) that performs the following ALTERs in order:
 
-1. Adds the 7 Sprint 10+ columns to `consults` (Decision 2; nullable so existing rows pass the schema-add)
-2. Adds the encrypted-blob column to `consults`
-3. Adds the 2 Sprint 10+ columns to `consult_events`
-4. Adds the 3 new composite FK constraints (5, 6, 7 per Decision 3 v0.2 additions; constraints 6 and 7 may need to be deferred behind their target tables landing)
-5. Backfills any defaults required for existing rows (`last_state_transition_at` defaults to `updated_at` for existing rows)
-6. Removes the `-- v0.1 placeholder columns; SI-005 resume gate` SQL comments from migration 020 (forward-fixup commit)
+1. **Add the 7 Sprint 10+ transition columns to `consults`** (Decision 2; nullable so existing rows pass the schema-add):
+   - 11. `ai_workflow_execution_id VARCHAR(26) NULL`
+   - 12. `claiming_clinician_id VARCHAR(26) NULL`
+   - 13. `claimed_at TIMESTAMPTZ NULL`
+   - 14. `terminal_state VARCHAR(30) NULL CHECK (terminal_state IS NULL OR terminal_state IN ('PRESCRIBED','DECLINED','ESCALATED_TO_SYNC','EXPIRED','ABANDONED'))`
+   - 15. `terminal_at TIMESTAMPTZ NULL`
+   - 16. `escalation_target_sync_session_id VARCHAR(26) NULL`
+   - 17. `last_state_transition_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` (with a state-column trigger to update on transitions)
+2. **Add the 7 KMS envelope columns to `consults`** (per the encrypted-blob ratification at lines 18-24; v0.4 R2 MEDIUM-2 closure: NO ambiguous "encrypted-blob column" wording — all 7 columns enumerated):
+   - 18. `clinician_decision_encrypted BYTEA NULL`
+   - 19. `clinician_decision_kms_key_id TEXT NULL`
+   - 20. `clinician_decision_kms_key_version INTEGER NULL`
+   - 21. `clinician_decision_nonce BYTEA NULL`
+   - 22. `clinician_decision_aad BYTEA NULL`
+   - 23. `clinician_decision_schema_version INTEGER NULL`
+   - 24. `clinician_decision_encrypted_at TIMESTAMPTZ NULL`
+3. **Add a CHECK constraint enforcing all-or-none nullability across columns 18-24** to prevent partial-encryption rows that would be undecipherable:
+   ```sql
+   CHECK (
+     (clinician_decision_encrypted IS NULL
+       AND clinician_decision_kms_key_id IS NULL
+       AND clinician_decision_kms_key_version IS NULL
+       AND clinician_decision_nonce IS NULL
+       AND clinician_decision_aad IS NULL
+       AND clinician_decision_schema_version IS NULL
+       AND clinician_decision_encrypted_at IS NULL)
+     OR
+     (clinician_decision_encrypted IS NOT NULL
+       AND clinician_decision_kms_key_id IS NOT NULL
+       AND clinician_decision_kms_key_version IS NOT NULL
+       AND clinician_decision_nonce IS NOT NULL
+       AND clinician_decision_aad IS NOT NULL
+       AND clinician_decision_schema_version IS NOT NULL
+       AND clinician_decision_encrypted_at IS NOT NULL)
+   )
+   ```
+4. **Add CHECK constraints enforcing nonce + schema_version semantics:**
+   - `CHECK (clinician_decision_nonce IS NULL OR octet_length(clinician_decision_nonce) = 12)` — 12-byte AES-256-GCM IV per NIST SP 800-38D §8.2.1
+   - `CHECK (clinician_decision_schema_version IS NULL OR clinician_decision_schema_version >= 1)` — version must be a positive integer
+5. **Add a row-level trigger on `consults`** to enforce immutability of `clinician_decision_encrypted_at`: BEFORE UPDATE, raise an exception if `OLD.clinician_decision_encrypted_at IS NOT NULL AND NEW.clinician_decision_encrypted_at IS DISTINCT FROM OLD.clinician_decision_encrypted_at`. Key-rotation operations are EXEMPT from this trigger via a session variable (set by `lib/tenant-kms.ts` rotation routine).
+6. **Add the 2 Sprint 10+ columns to `consult_events`** (Decision 2):
+   - 10. `correlation_id VARCHAR(26) NULL`
+   - 11. `audit_id VARCHAR(26) NULL`
+7. **Extend `consult_events.event_type` CHECK constraint** to include the 6 ratified values (Decision 5; v0.4 adds `kms_rotation`):
+   ```sql
+   CHECK (event_type IN ('state_transition','ai_workflow_completed','clinician_note_added',
+                         'patient_message_received','clinician_message_sent','kms_rotation'))
+   ```
+8. **Add the 3 new composite FK constraints** (5, 6, 7 per Decision 3 v0.2 additions; constraints 6 and 7 deferred behind their target tables landing):
+   - FK 5 added unconditionally (accounts already shipped)
+   - FK 6 + FK 7 declared as DEFERRED in the migration comment and added by a future migration when ai_workflow_executions + sync_sessions tables ship
+9. **Backfill `last_state_transition_at` for existing rows** to `updated_at` (the pre-Sprint-10+ rows' best-available proxy for the timestamp).
+10. **Remove the `-- v0.1 placeholder columns; SI-005 resume gate` SQL comments** from migration 020 (forward-fixup commit).
 
-**Zero destructive rewrites.** The placeholder columns are ratified, not replaced.
+**Total ALTER count: +14 columns on `consults` + 2 columns on `consult_events` + 5 new CHECK constraints + 1 trigger + 1 composite FK + 2 deferred composite FKs.** All-or-none nullability + nonce length + schema version constraints + immutability trigger guarantee that any row with non-NULL encrypted data has the full KMS envelope necessary for decrypt, rotation, audit, and tamper-resistance.
+
+**Zero destructive rewrites.** The 10 baseline placeholder columns are ratified, not replaced.
 
 ### Decision 9 — Reserved column-name namespace (forward-compat)
 
