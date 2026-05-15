@@ -7,8 +7,9 @@
 **v0.4 advanced:** 2026-05-15 (close Codex R2 MEDIUMs — Decision 2 heading +14/total 24 reconciliation; Decision 8 enumerates all 14 columns; CONSULT_EVENT_TYPES adds kms_rotation)
 **v0.5 advanced:** 2026-05-15 (close Codex R3 HIGH — KMS envelope adds encrypted-DEK column 25; R3 MEDIUM — rotation via stored-procedure with DB-enforced same-tx audit coupling, not session-variable bypass)
 **v0.6 advanced:** 2026-05-15 (close Codex R4 HIGH — initial-write path ALSO requires definer-rights stored procedure; GRANT model symmetric across initial-write + rotation)
+**v0.7 advanced:** 2026-05-15 (close Codex R5 HIGH x2 — decision_class=request_more_data → to_state=AWAITING_DATA mapping; consult_events.audit_id + correlation_id MUST be populated by both stored procedures with audit_id generated FIRST)
 **Severity:** medium (does NOT block Sprint 9 authoring; placeholder schema ships with this gap as the resume-gate)
-**Status:** OPEN — v0.6 DRAFT, ratification-ready (2 HIGH + 6 MEDIUM findings closed across R1+R2+R3+R4)
+**Status:** OPEN — v0.7 DRAFT, ratification-ready (4 HIGH + 6 MEDIUM findings closed across R1+R2+R3+R4+R5 — 5 rounds)
 **Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md` (v1.2 → **v1.3**)
 **Promotion Ledger target:** **P-017** (P-013 SI-007 merged 2026-05-14, P-014 SI-002 merged 2026-05-14, P-015 SI-003 PR #137 in flight, P-016 SI-004 PR #138 in flight)
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md`
@@ -231,7 +232,77 @@ SI-005 closure produces a migration 020a (or sequentially-numbered) that perform
    - `CHECK (clinician_decision_schema_version IS NULL OR clinician_decision_schema_version >= 1)` — version must be a positive integer
 5. **Stored-procedure-only path for KMS column updates — BOTH initial-write AND rotation (v0.5 R3 + v0.6 R4 HIGH closure).** v0.4's session-variable bypass was unsafe — a buggy or privileged code path could set the variable and update columns 18-25 without emitting the kms_rotation consult_event/audit row. v0.5 replaced the bypass with a DB-enforced rotation stored procedure. **v0.6 R4 HIGH closure (Codex 2026-05-15):** v0.5 only scoped the stored-procedure-only requirement to UPDATEs on an already-encrypted row. The INITIAL write (NULL → values for columns 18-25) was still governed only by the all-or-none nullability CHECK, with no schema-level requirement to emit the paired `consult.clinician_decision_recorded` audit row + state_transition consult_event in the same transaction. v0.6 closes this by requiring a SECOND stored procedure for the initial-write path; the GRANT model revokes application-role direct UPDATE on columns 18-25 for BOTH paths.
 
-   **5a. Initial-write stored procedure** `record_consult_clinician_decision(...)` (v0.6 NEW). Atomically: row-locks the consult row; verifies `state='UNDER_REVIEW'` (rejects out-of-order writes); verifies columns 18-25 are NULL (rejects re-write attempts that must use the rotation path instead); UPDATEs `state` + `last_state_transition_at` + columns 18-25; INSERTs a `consult_events` row with `event_type='state_transition'` and `from_state='UNDER_REVIEW'` + `to_state ∈ {'PRESCRIBED','DECLINED','ESCALATED_TO_SYNC'}`; INSERTs the paired `audit_records` row with `action_id='consult.clinician_decision_recorded'` per SI-004 v0.5 Decision 4 detail shape (decision_hash = SHA-256 of encrypted_ciphertext || aad; full payload stays on consult row; audit carries the hash for tamper-evidence). Procedure parameters carry the decision_class (`prescribe|decline|request_more_data|escalate_to_sync`) and clinician_account_id. **Procedure is the ONLY path that can transition columns 18-25 from NULL → non-NULL.**
+   **5a. Initial-write stored procedure** `record_consult_clinician_decision(...)` (v0.6 NEW; v0.7 R5 HIGH-1+2 closure). Atomically: row-locks the consult row; verifies `state='UNDER_REVIEW'` (rejects out-of-order writes); verifies columns 18-25 are NULL (rejects re-write attempts that must use the rotation path instead).
+
+   **decision_class → to_state mapping (v0.7 R5 HIGH-1 closure):**
+
+   | `decision_class` parameter | `to_state` written to consults | `terminal_state` written | Notes |
+   |---|---|---|---|
+   | `prescribe` | `PRESCRIBED` | `'PRESCRIBED'` | terminal path; medication_request created in same tx |
+   | `decline` | `DECLINED` | `'DECLINED'` | terminal path |
+   | `request_more_data` | `AWAITING_DATA` | `NULL` | NON-terminal path; consult returns to QUEUED after patient supplies data; `terminal_at` also NULL |
+   | `escalate_to_sync` | `ESCALATED_TO_SYNC` | `'ESCALATED_TO_SYNC'` | terminal path; sync_session allocation in same tx if available |
+
+   The procedure enforces a SQL CASE expression mapping `decision_class` to `to_state` + `terminal_state`. CHECK constraint on the procedure parameters: `decision_class IN ('prescribe','decline','request_more_data','escalate_to_sync')`. Any other value raises an exception before the UPDATE executes.
+
+   **Audit-pairing invariant (v0.7 R5 HIGH-2 closure):** the procedure MUST generate the `v_audit_id` ULID FIRST, then insert the `consult_events` row carrying `(audit_id=v_audit_id, correlation_id=v_correlation_id)` populated, THEN insert the `audit_records` row with the same `v_audit_id`. The original v0.6 sketch had this backwards — it generated `v_consult_event_id` first and the `INSERT INTO consult_events` column list omitted `audit_id` + `correlation_id`. v0.7 reorders to:
+
+   ```sql
+   -- Generate the audit_id BEFORE the consult_events insert so the
+   -- durable join works in both directions (compliance queries
+   -- starting from either table can navigate to the paired row).
+   v_audit_id        := ulid_gen();
+   v_correlation_id  := ulid_gen();  -- shared by both tables
+   v_consult_event_id := ulid_gen();
+
+   INSERT INTO consult_events
+     (id, consult_id, tenant_id, event_type, from_state, to_state,
+      actor_id, metadata, audit_id, correlation_id, created_at)
+     VALUES (v_consult_event_id, p_consult_id, p_tenant_id, 'state_transition',
+             v_old_state, v_to_state, p_clinician_account_id,
+             jsonb_build_object('decision_class', p_decision_class, ...),
+             v_audit_id, v_correlation_id, NOW());
+
+   INSERT INTO audit_records
+     (audit_id, tenant_id, action_id, actor_id, resource_type, resource_id, at,
+      detail, ...)
+     VALUES (v_audit_id, p_tenant_id, 'consult.clinician_decision_recorded',
+             p_clinician_account_id, 'consult', p_consult_id, NOW(),
+             jsonb_build_object(
+               'consult_id', p_consult_id,
+               'clinician_account_id', p_clinician_account_id,
+               'decision_class', p_decision_class,
+               'decision_hash', v_decision_hash,
+               'paired_consult_event_id', v_consult_event_id,
+               'correlation_id', v_correlation_id
+             ),
+             ...);
+   ```
+
+   **FK enforcement of the audit pairing:** v0.7 adds a `NOT VALID` foreign-key constraint at migration time:
+
+   ```sql
+   ALTER TABLE consult_events
+     ADD CONSTRAINT fk_consult_events_audit
+     FOREIGN KEY (tenant_id, audit_id)
+     REFERENCES audit_records (tenant_id, audit_id)
+     NOT VALID;  -- existing rows pre-Sprint-10+ have NULL audit_id; not-yet-validated
+
+   -- Once backfill complete (or for new clusters), validate:
+   ALTER TABLE consult_events VALIDATE CONSTRAINT fk_consult_events_audit;
+   ```
+
+   The composite FK (tenant_id, audit_id) preserves I-023 cross-tenant safety per the SI-007 + Decision 3 discipline. For event_type values that require paired audit rows (`state_transition`, `kms_rotation`), a separate trigger validates the FK is non-NULL on INSERT; for event_type values that don't require pairing (e.g., `clinician_note_added`), audit_id MAY be NULL. The trigger logic:
+
+   ```sql
+   CREATE TRIGGER trg_consult_events_audit_required
+     BEFORE INSERT ON consult_events
+     FOR EACH ROW
+     WHEN (NEW.event_type IN ('state_transition','kms_rotation'))
+     EXECUTE FUNCTION assert_consult_event_audit_id_present();
+   ```
+
+   Procedure parameters carry the `decision_class` (4 values) and `clinician_account_id`. **Procedure is the ONLY path that can transition columns 18-25 from NULL → non-NULL.**
 
    **5b. Rotation stored procedure** `rotate_consult_clinician_decision_kms(...)` (v0.5; preserved verbatim):
 
