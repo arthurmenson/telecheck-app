@@ -34,6 +34,7 @@ import fp from 'fastify-plugin';
 import { config } from './config.js';
 import type { TenantId } from './glossary.js';
 import { verifyAccessToken } from './jwt.js';
+import { KNOWN_TENANT_IDS } from './tenant-context.js';
 
 // ---------------------------------------------------------------------------
 // ActorContext type
@@ -44,27 +45,53 @@ import { verifyAccessToken } from './jwt.js';
  * valid JWT is presented; remains undefined for pre-auth endpoints.
  */
 export interface ActorContext {
-  /** Account ID = the authenticated patient. */
+  /** Account ID = the authenticated actor. */
   accountId: string;
   /** The session row backing this token. */
   sessionId: string;
   /** Tenant ID from the token (matches request's tenant context). */
   tenantId: TenantId;
   /**
-   * Actor role at v1.0: patient | clinician. Operator / admin / research-
-   * data-steward / etc. land with their respective slices (RBAC v1.1).
-   * Widened from 'patient'-only at TLC-058 / 2026-05-13 to unblock the
-   * pharmacy clinician-write surface (TLC-055 PR E onward). The
-   * authContextPlugin populates this from the verified JWT's role claim;
-   * the JWT verify path rejects any out-of-enum value, so a handler
-   * receiving an actorContext can trust that role is one of the
-   * canonical AccessTokenRole values.
+   * Actor role. Phase 2 (2026-05-15) widens beyond patient + clinician
+   * to include tenant_admin + platform_admin. Operator / pharmacist /
+   * research-data-steward etc. land with their respective slices
+   * (RBAC v1.1). The authContextPlugin populates this from the verified
+   * JWT's role claim; the JWT verify path rejects any out-of-enum value,
+   * so a handler receiving an actorContext can trust that role is one
+   * of the canonical AccessTokenRole values.
+   *
+   * Cross-tenant admin defense: for role='tenant_admin', the
+   * authContextPlugin ALSO verifies the JWT's admin_tenant_binding claim
+   * matches the request's resolved tenant context. A binding mismatch
+   * leaves actorContext undefined (handler will 401, response stays
+   * tenant-blind per I-025). platform_admin is global (no binding).
    */
-  role: 'patient' | 'clinician';
+  role: 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
   /** Country of care from token. */
   countryOfCare: 'US' | 'GH';
   /** Delegate context when the patient is acting as a delegate. */
   delegateId: string | null;
+  /**
+   * Phase 2 admin widening: for role='tenant_admin', the tenant_id the
+   * admin is authorized to administer (already verified to match
+   * tenantId at JWT-verify time). null for all other roles.
+   */
+  adminTenantBinding: string | null;
+  /**
+   * Phase 2 R3 HIGH closure (2026-05-15): for role='platform_admin',
+   * the admin's HOME tenant (the tenant_id claim from the JWT). Used
+   * for audit attribution showing which admin acted, distinct from the
+   * RESOURCE tenant (which is the resolved request tenant carried by
+   * `tenantId` above). null for all other roles.
+   *
+   * Why this exists: platform_admin is GLOBAL — a platform_admin
+   * issued under Telecheck-US CAN administer Telecheck-Ghana
+   * resources via JWT. The resource side scopes via
+   * `actorContext.tenantId` (= resolved request tenant). The actor
+   * side is attributed via `adminHomeTenantId` so audit records can
+   * trace which admin's home tenant the cross-tenant action came from.
+   */
+  adminHomeTenantId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -73,39 +100,132 @@ export interface ActorContext {
 
 const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstance) => {
   fastify.decorateRequest('actorContext', undefined);
+  fastify.decorateRequest('bearerTokenPresented', false);
 
   fastify.addHook('onRequest', async (request, _reply) => {
     // Authorization header parsing. Tolerant: missing header is FINE
     // (pre-auth endpoints rely on this); malformed header is also FINE
     // (we silently leave actorContext undefined, and handlers that
     // require it will 401 via requireActorContext()).
+    //
+    // Phase 2 R5 HIGH-1 closure (2026-05-15): parse the auth scheme
+    // CASE-INSENSITIVELY per RFC 7235 §2.1 ("the scheme name is
+    // case-insensitive"). Original `.startsWith('Bearer ')` rejected
+    // `authorization: bearer <token>` (lowercase b) — leaving both
+    // actorContext undefined AND bearerTokenPresented false, which on
+    // admin routes with ALLOW_ACTOR_HEADER_AUTH=true would let a forged
+    // `x-actor-roles: platform_admin` header elevate via the legacy
+    // shim (the fail-closed boundary added at R2 only triggers when
+    // bearerTokenPresented=true). Case-insensitive parsing closes the
+    // header-casing-based bypass.
     const authHeader = request.headers.authorization;
     if (typeof authHeader !== 'string') return;
-    if (!authHeader.startsWith('Bearer ')) return;
+    // Match "Bearer " case-insensitively (anchor: 6-char scheme + 1 space)
+    if (authHeader.length < 7) return;
+    const scheme = authHeader.slice(0, 7);
+    if (scheme.toLowerCase() !== 'bearer ') return;
     const token = authHeader.slice(7).trim();
     if (token.length === 0) return;
+
+    // Phase 2 R2 HIGH closure (2026-05-15): record that a Bearer token
+    // was presented BEFORE attempting verification. This lets
+    // downstream auth gates (requireAdminRole) distinguish
+    // "no JWT attempted" (header shim acceptable) from "JWT attempted
+    // but rejected" (header shim MUST NOT be used; the rejection is
+    // authoritative). Without this flag, an invalid/expired/wrong-
+    // tenant/wrong-binding JWT combined with a forged x-actor-roles
+    // header would silently elevate via the legacy path.
+    request.bearerTokenPresented = true;
 
     const result = verifyAccessToken(token, config.jwtSigningKey);
     if (!result.ok) return;
 
     const claims = result.claims;
 
-    // Cross-tenant token-forge defense: if the request's resolved tenant
-    // context (from Host header) doesn't match the JWT's tenant_id
-    // claim, the token was issued for a different tenant. Reject by
-    // leaving actorContext undefined; handlers that require auth will
-    // 401, response stays tenant-blind per I-025.
+    // Resolve request tenant context (set by tenant-context plugin from
+    // Host header). For pre-auth / allowlisted endpoints this is
+    // undefined; without a tenant we can't run any cross-tenant check,
+    // so leave actorContext undefined.
     const tenantCtx = request.tenantContext;
-    if (tenantCtx === undefined) return; // allowlisted endpoint; no tenant → no actor
-    if (tenantCtx.tenantId !== claims.tenant_id) return;
+    if (tenantCtx === undefined) return;
+
+    // Phase 2 R3 HIGH closure (2026-05-15): tenant-scope validation
+    // varies by role:
+    //
+    //   - patient / clinician / tenant_admin: the actor is tenant-scoped.
+    //     The JWT's tenant_id claim MUST equal the resolved request
+    //     tenant. Mismatch = cross-tenant token forge attempt → reject.
+    //
+    //   - platform_admin: the actor is GLOBAL. The JWT's tenant_id
+    //     claim is the admin's HOME tenant (used for audit attribution
+    //     showing which admin acted) but does NOT need to match the
+    //     resolved request tenant. A platform_admin issued under
+    //     Telecheck-US CAN administer Telecheck-Ghana resources via JWT.
+    //
+    // Closes Codex R3 HIGH: "Global platform_admin JWTs are still
+    // tenant-pinned by the auth hook" — the original implementation
+    // enforced tenant_id match for every role, making platform_admin
+    // unusable across tenants and defeating the documented global
+    // scope.
+    if (claims.role !== 'platform_admin') {
+      if (tenantCtx.tenantId !== claims.tenant_id) return;
+    } else {
+      // Phase 2 R4 HIGH-2 closure (2026-05-15): platform_admin is
+      // global, but the JWT's home-tenant claim MUST still be a
+      // recognized active tenant. Without this check, a signed
+      // platform_admin token with a stale/deleted/nonsensical home
+      // tenant would authenticate and the audit attribution would
+      // point to a non-existent tenant. Closes Codex R4 HIGH:
+      // "platform_admin skips validation of the JWT home tenant
+      // before global authorization."
+      //
+      // The known-tenant set is the canonical operating-tenant
+      // identifiers from tenant-context.ts. A future SI-008-style
+      // expansion to additional tenants only requires updating
+      // KNOWN_TENANT_IDS at the source.
+      if (!KNOWN_TENANT_IDS.has(claims.tenant_id)) return;
+    }
+
+    // Phase 2 admin widening (2026-05-15): cross-tenant admin defense
+    // for tenant_admin. The JWT's admin_tenant_binding claim MUST
+    // match the resolved request tenant. Without that match, the
+    // actor is rejected (response stays tenant-blind per I-025).
+    // platform_admin has no binding (global; enforced by verify path
+    // that requires binding to be absent/null for platform_admin).
+    if (claims.role === 'tenant_admin') {
+      // verifyAccessToken already enforced binding is a non-empty string
+      // for tenant_admin; this is the request-side scope check.
+      if (claims.admin_tenant_binding !== tenantCtx.tenantId) return;
+      // Also enforce binding === JWT's tenant_id (defense in depth;
+      // tenant_id === resolved tenantCtx.tenantId is already enforced
+      // above for non-platform_admin roles, so this is logically
+      // equivalent, but readers shouldn't have to reason about
+      // transitive equality).
+      if (claims.admin_tenant_binding !== claims.tenant_id) return;
+    }
+
+    // actorContext.tenantId:
+    //   - For tenant-scoped roles, this === resolved tenantCtx.tenantId
+    //     (already enforced equal to claims.tenant_id above).
+    //   - For platform_admin, this is set to the RESOLVED request
+    //     tenant — the tenant the admin is currently acting on —
+    //     because handlers + audit emission scope to actorContext.tenantId
+    //     when writing tenant-scoped resources. The admin's home
+    //     tenant from claims.tenant_id is retained as
+    //     adminHomeTenantId for audit-attribution purposes.
+    const effectiveTenantId =
+      claims.role === 'platform_admin' ? tenantCtx.tenantId : claims.tenant_id;
 
     request.actorContext = {
       accountId: claims.sub,
       sessionId: claims.session_id,
-      tenantId: claims.tenant_id,
+      tenantId: effectiveTenantId,
       role: claims.role,
       countryOfCare: claims.country_of_care,
       delegateId: claims.delegate_id ?? null,
+      adminTenantBinding:
+        claims.role === 'tenant_admin' ? (claims.admin_tenant_binding ?? null) : null,
+      adminHomeTenantId: claims.role === 'platform_admin' ? claims.tenant_id : null,
     };
   });
 };
@@ -133,6 +253,28 @@ declare module 'fastify' {
      * Handlers requiring authentication MUST call `requireActorContext()`.
      */
     actorContext: ActorContext | undefined;
+
+    /**
+     * Phase 2 R2 HIGH closure (2026-05-15): true if the request's
+     * `Authorization: Bearer <token>` header carried a non-empty
+     * token VALUE — set BEFORE JWT verification. This decouples
+     * "client attempted JWT auth" from "JWT verified successfully":
+     *
+     *   - bearerTokenPresented=false + actorContext=undefined: client
+     *     did not attempt JWT auth. Legacy header shim is acceptable.
+     *   - bearerTokenPresented=true + actorContext=undefined: client
+     *     attempted JWT auth but verification rejected (invalid
+     *     signature / expired / wrong tenant / wrong binding /
+     *     malformed). Legacy header shim MUST NOT authorize this
+     *     request — the rejection is authoritative.
+     *   - bearerTokenPresented=true + actorContext=ActorContext: JWT
+     *     verified successfully.
+     *
+     * Used by `requireAdminRole` to fail closed when a JWT was
+     * presented but rejected, even if a forged `x-actor-roles` header
+     * is also present.
+     */
+    bearerTokenPresented: boolean;
   }
 }
 
@@ -187,14 +329,17 @@ export function requireActorContext(req: FastifyRequest): ActorContext {
 // and bring their own per-route role logic.
 // ---------------------------------------------------------------------------
 
+export type ActorRole = 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
+
 export class UnauthorizedRoleError extends Error {
   readonly statusCode = 403;
   readonly code = 'internal.auth.insufficient_scope';
   constructor(
-    public readonly required: 'patient' | 'clinician',
-    public readonly observed: 'patient' | 'clinician',
+    public readonly required: ActorRole | ReadonlyArray<ActorRole>,
+    public readonly observed: ActorRole,
   ) {
-    super(`This endpoint requires role=${required}; actor role=${observed}.`);
+    const requiredStr = Array.isArray(required) ? required.join('|') : String(required);
+    super(`This endpoint requires role=${requiredStr}; actor role=${observed}.`);
     this.name = 'UnauthorizedRoleError';
   }
 }
@@ -250,10 +395,12 @@ export function requireClinicianActorContext(
  * (pre-existing gap, tracked as a separate follow-on for the admin-role
  * gate PR).
  *
- * The narrow scope is deliberate: this PR's mission is the clinician role
- * mechanism. Closing the pre-existing patient gap on admin routes
- * properly requires authoring the admin-role token + admin-role
- * mapping in identity, which is its own PR.
+ * **Phase 2 admin widening note (2026-05-15):** Phase 2 lands the proper
+ * admin-role gate via `requireAdminActorContext` (below). New admin
+ * handlers SHOULD use that gate; this legacy helper is preserved for
+ * back-compat with handlers that haven't migrated yet but no longer
+ * blocks tenant_admin / platform_admin actors (they pass the legacy
+ * "anyone-not-clinician" floor).
  */
 export function rejectClinicianOnAdminRoute(req: FastifyRequest): ActorContext {
   const actor = requireActorContext(req);
@@ -261,4 +408,77 @@ export function rejectClinicianOnAdminRoute(req: FastifyRequest): ActorContext {
     throw new UnauthorizedRoleError('patient', 'clinician');
   }
   return actor;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 admin-role gates (2026-05-15)
+//
+// `requireTenantAdminActorContext` and `requirePlatformAdminActorContext`
+// land alongside the AccessTokenRole widening so admin handlers can adopt
+// JWT-based admin identity (replacing the legacy `x-actor-roles` header
+// shim + `requireAdminRole`). `requireAdminActorContext` accepts EITHER
+// admin role — the right gate for endpoints that don't need to distinguish
+// (e.g., forms-intake admin CRUD where both tenant_admin and platform_admin
+// can manage templates).
+// ---------------------------------------------------------------------------
+
+/**
+ * Assert that the request carries an authenticated TENANT_ADMIN actor.
+ * Mirror of requirePatientActorContext.
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'tenant_admin'
+ *
+ * NOTE: the cross-tenant binding check (the tenant_admin's
+ * admin_tenant_binding === resolved tenantCtx.tenantId) is already
+ * enforced by authContextPlugin before this guard runs. A handler
+ * receiving the returned actor can trust the binding has been verified.
+ */
+export function requireTenantAdminActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'tenant_admin' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'tenant_admin') {
+    throw new UnauthorizedRoleError('tenant_admin', actor.role);
+  }
+  return actor as ActorContext & { role: 'tenant_admin' };
+}
+
+/**
+ * Assert that the request carries an authenticated PLATFORM_ADMIN actor.
+ * Mirror of requireTenantAdminActorContext. platform_admin is global —
+ * authorized in any tenant context.
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'platform_admin'
+ */
+export function requirePlatformAdminActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'platform_admin' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'platform_admin') {
+    throw new UnauthorizedRoleError('platform_admin', actor.role);
+  }
+  return actor as ActorContext & { role: 'platform_admin' };
+}
+
+/**
+ * Assert that the request carries an authenticated admin actor — EITHER
+ * tenant_admin OR platform_admin. Use this on admin endpoints that don't
+ * need to distinguish (e.g., forms-intake template CRUD).
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'tenant_admin' && role !== 'platform_admin'
+ */
+export function requireAdminActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'tenant_admin' | 'platform_admin' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'tenant_admin' && actor.role !== 'platform_admin') {
+    throw new UnauthorizedRoleError(['tenant_admin', 'platform_admin'], actor.role);
+  }
+  return actor as ActorContext & { role: 'tenant_admin' | 'platform_admin' };
 }

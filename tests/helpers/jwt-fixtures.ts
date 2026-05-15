@@ -93,9 +93,10 @@ export interface MintTestJwtInput {
    */
   countryOfCare: 'US' | 'GH';
   /**
-   * Role for this session. Patient and clinician supported at v1.0;
-   * admin roles (tenant_admin, platform_admin) land when the Identity
-   * slice extends `AccessTokenRole` past TLC-058.
+   * Role for this session. Patient, clinician, tenant_admin, and
+   * platform_admin supported (Phase 2 admin widening 2026-05-15).
+   * Future roles (pharmacist, research_data_steward, etc.) land with
+   * their respective slices.
    */
   role: AccessTokenRole;
   /**
@@ -109,6 +110,17 @@ export interface MintTestJwtInput {
    * Defaults to null (non-delegate session — the common case).
    */
   delegateId?: string | null;
+  /**
+   * Phase 2 admin widening: required when role='tenant_admin'; MUST be
+   * the tenant_id the admin is authorized to administer (typically ===
+   * tenantId but kept distinct so cross-tenant-admin-forge defense
+   * tests can construct a mismatched binding). MUST be null/undefined
+   * for role='platform_admin' (global; no binding) and for
+   * role='patient' | 'clinician'. mintTestJwt forwards this verbatim
+   * to issueAccessToken which enforces the role/binding consistency
+   * rules at issue time.
+   */
+  adminTenantBinding?: string | null;
 }
 
 /**
@@ -137,6 +149,18 @@ export interface MintTestJwtInput {
  *   });
  */
 export function mintTestJwt(input: MintTestJwtInput): string {
+  // Phase 2 admin widening (2026-05-15): default the admin binding for
+  // tenant_admin to the request's tenantId so the common case (admin
+  // managing their own tenant) doesn't require callers to pass the
+  // binding explicitly. Cross-tenant-admin-forge tests can override by
+  // passing an explicit adminTenantBinding that differs from tenantId.
+  const adminTenantBinding =
+    input.adminTenantBinding !== undefined
+      ? input.adminTenantBinding
+      : input.role === 'tenant_admin'
+        ? input.tenantId
+        : null;
+
   return issueAccessToken(
     {
       account_id: input.accountId,
@@ -145,6 +169,9 @@ export function mintTestJwt(input: MintTestJwtInput): string {
       role: input.role,
       country_of_care: input.countryOfCare,
       ...(input.delegateId !== undefined ? { delegate_id: input.delegateId } : {}),
+      ...(input.role === 'tenant_admin' || input.role === 'platform_admin'
+        ? { admin_tenant_binding: input.role === 'tenant_admin' ? adminTenantBinding : null }
+        : {}),
     },
     config.jwtSigningKey,
   );

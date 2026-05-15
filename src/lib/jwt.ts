@@ -36,18 +36,24 @@ import type { TenantId } from './glossary.js';
 /**
  * Canonical access-token role enum. The set of role names the JWT layer
  * accepts. v1.0: patient + clinician (TLC-058 / PR for migration 027
- * 2026-05-13). Additional roles (pharmacist, operator, admin, research
- * data steward) land with their respective slices.
+ * 2026-05-13). Phase 2 (2026-05-15) widens to include tenant_admin +
+ * platform_admin so the forms-intake admin handlers (templates,
+ * variants, deployments) can resolve admin identity from JWT instead
+ * of the legacy `x-actor-roles` header shim. Additional roles
+ * (pharmacist, operator, research data steward) land with their
+ * respective slices.
  *
  * The verify path validates incoming `claims.role` against this set and
  * rejects with reason='invalid_payload' on any unknown value — defense
  * against a future bug in the issuer that mints out-of-enum roles.
  */
-export type AccessTokenRole = 'patient' | 'clinician';
+export type AccessTokenRole = 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
 
 const VALID_ACCESS_TOKEN_ROLES: ReadonlySet<AccessTokenRole> = new Set<AccessTokenRole>([
   'patient',
   'clinician',
+  'tenant_admin',
+  'platform_admin',
 ]);
 
 /**
@@ -55,12 +61,23 @@ const VALID_ACCESS_TOKEN_ROLES: ReadonlySet<AccessTokenRole> = new Set<AccessTok
  *   - sub         : account_id (subject; the actor's account)
  *   - tenant_id   : operating-tenant identifier ('Telecheck-{Country}')
  *   - session_id  : the server-side session row binding this token
- *   - role        : 'patient' | 'clinician' (TLC-058 widened from
- *                   'patient'-only). Future v1.x adds pharmacist,
- *                   operator, admin, research_data_steward.
+ *   - role        : 'patient' | 'clinician' | 'tenant_admin' |
+ *                   'platform_admin' (Phase 2 admin widening
+ *                   2026-05-15). Future v1.x adds pharmacist,
+ *                   operator, research_data_steward.
  *   - country_of_care: ISO 3166-1 alpha-2 (drives CCR resolution)
  *   - delegate_id : non-null when a patient is acting as a delegate
- *                   (does NOT apply to clinician role)
+ *                   (does NOT apply to clinician/admin roles)
+ *   - admin_tenant_binding : non-null only for `tenant_admin` role;
+ *                   carries the tenant_id this admin is authorized to
+ *                   administer. authContextPlugin verifies this matches
+ *                   the request's resolved tenant context — without a
+ *                   match the actor is rejected (cross-tenant admin
+ *                   forge defense). For `platform_admin` this field
+ *                   MUST be null (or undefined); for `tenant_admin`
+ *                   this field MUST be non-null and verify-rejected
+ *                   otherwise. For `patient` / `clinician` this field
+ *                   is unused.
  *   - iat         : issued-at (seconds since epoch)
  *   - exp         : expires-at (seconds since epoch; iat + ACCESS_TTL_SEC)
  */
@@ -71,6 +88,7 @@ export interface AccessTokenClaims {
   role: AccessTokenRole;
   country_of_care: 'US' | 'GH';
   delegate_id?: string | null;
+  admin_tenant_binding?: string | null;
   iat: number;
   exp: number;
 }
@@ -123,6 +141,18 @@ export interface IssueAccessTokenInput {
   role: AccessTokenRole;
   country_of_care: 'US' | 'GH';
   delegate_id?: string | null;
+  /**
+   * Phase 2 admin widening (2026-05-15): when role='tenant_admin', this
+   * MUST be set to the tenant_id the admin is authorized to administer
+   * (typically === tenant_id but the values are kept separate so a
+   * platform_admin or pseudo-tenant token can later carry distinct
+   * binding semantics). When role='platform_admin', MUST be null.
+   * For 'patient' | 'clinician', MUST be null. issueAccessToken
+   * enforces the role/binding consistency at runtime — rejecting any
+   * mismatch with a thrown Error so misuse fails at issue time, not
+   * verify time.
+   */
+  admin_tenant_binding?: string | null;
 }
 
 /**
@@ -142,10 +172,31 @@ export function issueAccessToken(input: IssueAccessTokenInput, signingKey: strin
   if (!VALID_ACCESS_TOKEN_ROLES.has(input.role)) {
     throw new Error(
       `issueAccessToken: role ${String(input.role)} is not a valid AccessTokenRole. ` +
-        'Valid values: patient | clinician. Update VALID_ACCESS_TOKEN_ROLES + the ' +
-        'AccessTokenRole union when widening (RBAC v1.1 §1.2).',
+        'Valid values: patient | clinician | tenant_admin | platform_admin. ' +
+        'Update VALID_ACCESS_TOKEN_ROLES + the AccessTokenRole union when ' +
+        'widening (RBAC v1.1 §1.2).',
     );
   }
+
+  // Phase 2 admin widening (2026-05-15): enforce admin_tenant_binding
+  // consistency with role at ISSUE time so misuse fails fast (not at
+  // verify time where the failure mode is silent).
+  if (input.role === 'tenant_admin') {
+    if (input.admin_tenant_binding == null || input.admin_tenant_binding.length === 0) {
+      throw new Error(
+        'issueAccessToken: role=tenant_admin requires non-null admin_tenant_binding ' +
+          '(the tenant_id this admin is authorized to administer).',
+      );
+    }
+  } else if (input.admin_tenant_binding != null) {
+    // platform_admin, patient, clinician — admin_tenant_binding MUST be
+    // null/undefined. A non-null binding for these roles is a caller bug.
+    throw new Error(
+      `issueAccessToken: role=${input.role} must NOT carry admin_tenant_binding. ` +
+        'admin_tenant_binding applies ONLY to role=tenant_admin.',
+    );
+  }
+
   const now = Math.floor(Date.now() / 1000);
   const claims: AccessTokenClaims = {
     sub: input.account_id,
@@ -156,6 +207,9 @@ export function issueAccessToken(input: IssueAccessTokenInput, signingKey: strin
     iat: now,
     exp: now + ACCESS_TOKEN_TTL_SECONDS,
     ...(input.delegate_id !== undefined ? { delegate_id: input.delegate_id } : {}),
+    ...(input.admin_tenant_binding !== undefined
+      ? { admin_tenant_binding: input.admin_tenant_binding }
+      : {}),
   };
 
   const payload = base64urlEncode(JSON.stringify(claims));
@@ -246,13 +300,33 @@ export function verifyAccessToken(token: string, signingKey: string): VerifyAcce
     return { ok: false, reason: 'invalid_payload' };
   }
 
-  // Role enum validation (TLC-058 / 2026-05-13). Reject any role
-  // outside the canonical AccessTokenRole set so a buggy or
-  // compromised issuer can't mint tokens with arbitrary role strings
-  // that downstream RBAC checks would have to enumerate defensively.
-  // Failure maps to invalid_payload so the JWT verify hook treats it
-  // as a malformed token (caller stays unauthenticated, 401).
+  // Role enum validation (TLC-058 / 2026-05-13; Phase 2 admin widening
+  // 2026-05-15). Reject any role outside the canonical AccessTokenRole
+  // set so a buggy or compromised issuer can't mint tokens with arbitrary
+  // role strings that downstream RBAC checks would have to enumerate
+  // defensively. Failure maps to invalid_payload so the JWT verify hook
+  // treats it as a malformed token (caller stays unauthenticated, 401).
   if (typeof claims.role !== 'string' || !VALID_ACCESS_TOKEN_ROLES.has(claims.role)) {
+    return { ok: false, reason: 'invalid_payload' };
+  }
+
+  // Phase 2 admin widening (2026-05-15): verify-side role/binding
+  // consistency. Defense-in-depth: the issuer enforces this too, but the
+  // verify path MUST also reject mismatches in case a token was forged
+  // or modified in transit. tenant_admin MUST carry a non-empty
+  // admin_tenant_binding; platform_admin / patient / clinician MUST NOT
+  // carry a non-empty binding.
+  if (claims.role === 'tenant_admin') {
+    if (
+      typeof claims.admin_tenant_binding !== 'string' ||
+      claims.admin_tenant_binding.length === 0
+    ) {
+      return { ok: false, reason: 'invalid_payload' };
+    }
+  } else if (
+    claims.admin_tenant_binding != null &&
+    (typeof claims.admin_tenant_binding !== 'string' || claims.admin_tenant_binding.length > 0)
+  ) {
     return { ok: false, reason: 'invalid_payload' };
   }
 

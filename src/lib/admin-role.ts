@@ -79,6 +79,81 @@ const ADMIN_ROLES = new Set<string>([PLATFORM_ADMIN_ROLE, TENANT_SCOPED_ADMIN_RO
  *   no admin role authorized for the resolved tenant.
  */
 export function requireAdminRole(req: FastifyRequest): string {
+  // Resolved tenant for THIS request. The handler always runs
+  // requireTenantContext() before this shim, so calling it here is a
+  // safe property read on the decorated request.
+  const ctxTenantId: TenantId = requireTenantContext(req).tenantId;
+
+  // Phase 2 admin widening (2026-05-15; v0.2 R1 HIGH closure
+  // 2026-05-15): Tier 1 JWT-based admin identity. If the request
+  // carries a verified JWT (req.actorContext present), the JWT IS
+  // authoritative — there is NO fall-through to the legacy
+  // x-actor-roles header shim. Closes Codex R1 HIGH:
+  // "Verified non-admin JWT can fall through to trusted admin headers"
+  // — without this fail-closed rule, a request with a verified
+  // patient/clinician JWT + a forged `x-actor-roles: platform_admin`
+  // header would authorize as admin in any environment with
+  // ALLOW_ACTOR_HEADER_AUTH=true. The JWT identity boundary MUST
+  // dominate.
+  //
+  // The JWT verify path + authContextPlugin have already enforced:
+  //   - HS256 signature integrity
+  //   - exp > now
+  //   - role enum validation
+  //   - role/admin_tenant_binding consistency
+  //   - tenant_admin's admin_tenant_binding === resolved tenantCtx.tenantId
+  //     (cross-tenant admin defense; rejected at authContextPlugin so
+  //     req.actorContext is undefined for a wrong-tenant tenant_admin)
+  // So: if req.actorContext.role is tenant_admin or platform_admin
+  // HERE, we can trust the actor is authorized for the resolved tenant.
+  const actorCtx = req.actorContext;
+  if (actorCtx !== undefined) {
+    if (actorCtx.role === PLATFORM_ADMIN_ROLE) {
+      return PLATFORM_ADMIN_ROLE;
+    }
+    if (actorCtx.role === TENANT_SCOPED_ADMIN_ROLE) {
+      // Defense-in-depth: re-check the binding here even though the
+      // authContextPlugin already enforced it.
+      if (actorCtx.adminTenantBinding === ctxTenantId) {
+        return TENANT_SCOPED_ADMIN_ROLE;
+      }
+      // tenant_admin with wrong binding → 403 (fail closed, NO header
+      // fall-through). The authContextPlugin would normally reject a
+      // wrong-binding tenant_admin BEFORE this point (leaving
+      // actorContext undefined), so reaching here means an internal
+      // invariant broke; refuse anyway.
+      throw req.server.httpErrors.forbidden('This action requires an administrative role.');
+    }
+    // Authenticated as patient or clinician — does NOT authorize admin
+    // surfaces. JWT is authoritative; fail closed. Do NOT fall through
+    // to header shim (closes Codex R1 HIGH where a verified non-admin
+    // JWT could be elevated by a forged x-actor-roles header in
+    // ALLOW_ACTOR_HEADER_AUTH=true environments).
+    throw req.server.httpErrors.forbidden('This action requires an administrative role.');
+  }
+
+  // Phase 2 R2 HIGH closure (2026-05-15): if a Bearer token was
+  // PRESENTED but rejected (invalid sig / expired / wrong tenant /
+  // wrong admin binding / malformed), the JWT rejection is
+  // authoritative — fail closed. Do NOT fall through to the header
+  // shim. Closes Codex R2 HIGH: "Presented-but-rejected JWTs can
+  // still fall through to trusted admin headers."
+  //
+  // The bearerTokenPresented flag is set by authContextPlugin BEFORE
+  // verifyAccessToken runs, so it's true even when the token failed
+  // any of the verification gates. This distinguishes "client did not
+  // attempt JWT auth" (legacy shim acceptable) from "client attempted
+  // JWT auth but failed" (legacy shim MUST NOT elevate).
+  if (req.bearerTokenPresented) {
+    throw req.server.httpErrors.unauthorized(
+      'Actor authorization could not be verified for this request.',
+    );
+  }
+
+  // Tier 2 (legacy header shim): ONLY when no JWT was presented at all.
+  // Used by tests that haven't migrated to JWT-based admin yet AND by
+  // local-dev opt-in flows. Production requires ALLOW_ACTOR_HEADER_AUTH
+  // opt-in; without it, unauthenticated requests get 401.
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
   if (isProd && !optIn) {
@@ -93,11 +168,6 @@ export function requireAdminRole(req: FastifyRequest): string {
     .split(',')
     .map((r) => r.trim())
     .filter((r) => r.length > 0);
-
-  // Resolved tenant for THIS request. The handler always runs
-  // requireTenantContext() before this shim, so calling it here is a
-  // safe property read on the decorated request.
-  const ctxTenantId: TenantId = requireTenantContext(req).tenantId;
 
   for (const role of roles) {
     if (!ADMIN_ROLES.has(role)) continue;
