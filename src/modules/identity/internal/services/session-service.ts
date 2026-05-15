@@ -31,7 +31,8 @@ import type {
 } from '../types.js';
 
 // ---------------------------------------------------------------------------
-// account_type → session role mapping (TLC-058 / 2026-05-13)
+// account_type → session role mapping (TLC-058 / 2026-05-13; Phase 2 admin
+// widening 2026-05-15 closes F-1 deferred follow-on)
 //
 // Centralizes the single source of truth for "what role does this account
 // log in as?". `issueSession` calls this with the resolved account_type
@@ -39,16 +40,25 @@ import type {
 // account_type addition only needs to update this map.
 //
 // Mapping rationale (per RBAC v1.1):
-//   - 'patient'   → 'patient' session
-//   - 'clinician' → 'clinician' session
-//   - 'delegate'  → 'patient' session (delegates use the patient session
-//                   role; the delegate_id claim distinguishes them. The
-//                   delegate's PRIMARY surface authority is still the
-//                   patient's account they're acting on behalf of.)
+//   - 'patient'        → 'patient' session
+//   - 'clinician'      → 'clinician' session
+//   - 'delegate'       → 'patient' session (delegates use the patient
+//                        session role; the delegate_id claim distinguishes
+//                        them. The delegate's PRIMARY surface authority is
+//                        still the patient's account they're acting on
+//                        behalf of.)
+//   - 'tenant_admin'   → 'tenant_admin' session (Phase 2 R3 closure: the
+//                        admin_tenant_binding claim is the admin's home
+//                        tenant, supplied by issueSession from ctx.tenantId
+//                        at issue time)
+//   - 'platform_admin' → 'platform_admin' session (Phase 2 R3 closure:
+//                        admin_tenant_binding is NULL; global scope; the
+//                        JWT tenant_id claim carries the admin's home
+//                        tenant for audit attribution)
 //
-// When the pharmacist / operator / admin / research-data-steward roles
-// land, both this map and the AccessTokenRole enum need to widen in
-// the same PR.
+// When the pharmacist / operator / research-data-steward roles land,
+// both this map and the AccessTokenRole enum need to widen in the
+// same PR.
 // ---------------------------------------------------------------------------
 
 function sessionRoleForAccountType(accountType: AccountType): AccessTokenRole {
@@ -59,6 +69,38 @@ function sessionRoleForAccountType(accountType: AccountType): AccessTokenRole {
       return 'clinician';
     case 'delegate':
       return 'patient';
+    case 'tenant_admin':
+      return 'tenant_admin';
+    case 'platform_admin':
+      return 'platform_admin';
+  }
+}
+
+/**
+ * For a given AccountType, resolve the admin_tenant_binding JWT claim.
+ *
+ * Phase 2 R3 closure: tenant_admin binding = the admin's home tenant
+ * (= ctx.tenantId at session-issuance time). platform_admin binding
+ * is NULL (global scope). Non-admin roles have no binding.
+ *
+ * The home-tenant model means a tenant_admin can only administer their
+ * own home tenant. If a future ADR introduces cross-tenant administrative
+ * assignments (e.g., a single tenant_admin row scoped to a DIFFERENT
+ * tenant), this function needs to consult a new accounts.admin_tenant_binding
+ * column.
+ */
+function adminTenantBindingForAccountType(
+  accountType: AccountType,
+  homeTenantId: string,
+): string | null {
+  switch (accountType) {
+    case 'tenant_admin':
+      return homeTenantId;
+    case 'platform_admin':
+    case 'patient':
+    case 'clinician':
+    case 'delegate':
+      return null;
   }
 }
 
@@ -158,16 +200,18 @@ export async function issueSession(
   if (input.user_agent !== undefined) repoInput.user_agent = input.user_agent;
 
   let resolvedRole: AccessTokenRole | null = null;
+  let resolvedAdminTenantBinding: string | null = null;
   const session = await sessionRepo.createSession(
     repoInput,
     async (tx, persisted) => {
       // Resolve the role for this session from the persisted account's
       // account_type. Lookup happens INSIDE the same transaction as the
       // sessions INSERT so the role is consistent with the account at
-      // session-issuance time (TLC-058 / 2026-05-13). The account MUST
-      // exist (it was just referenced by the sessions FK), but null-
-      // guard defensively so a missing row throws a typed error rather
-      // than producing a malformed JWT later.
+      // session-issuance time (TLC-058 / 2026-05-13; Phase 2 admin
+      // widening 2026-05-15 closes F-1). The account MUST exist (it was
+      // just referenced by the sessions FK), but null-guard defensively
+      // so a missing row throws a typed error rather than producing a
+      // malformed JWT later.
       const account = await accountRepo.findAccountById(ctx.tenantId, persisted.account_id, tx);
       if (account === null) {
         throw new Error(
@@ -177,6 +221,10 @@ export async function issueSession(
         );
       }
       resolvedRole = sessionRoleForAccountType(account.account_type);
+      resolvedAdminTenantBinding = adminTenantBindingForAccountType(
+        account.account_type,
+        ctx.tenantId,
+      );
 
       await emitSessionIssuedAudit(
         {
@@ -215,6 +263,14 @@ export async function issueSession(
   // platform-wide (production fail-closed gated in config.ts) — same
   // key signs across all tenants; tenant_id is a claim INSIDE the JWT,
   // not part of the signing input.
+  //
+  // Phase 2 admin widening (2026-05-15; F-1 closure): for tenant_admin
+  // accounts, admin_tenant_binding is the home tenant (ctx.tenantId).
+  // For platform_admin, admin_tenant_binding is null (global scope; the
+  // JWT's tenant_id claim is the admin's home tenant for audit
+  // attribution per Phase 2 R3 closure). For non-admin roles,
+  // admin_tenant_binding is null. issueAccessToken enforces the
+  // role/binding consistency rules and throws on mismatch.
   const accessToken = issueAccessToken(
     {
       account_id: session.account_id,
@@ -222,6 +278,9 @@ export async function issueSession(
       session_id: session.session_id,
       role: resolvedRole,
       country_of_care: ctx.countryOfCare,
+      ...(resolvedAdminTenantBinding !== null
+        ? { admin_tenant_binding: resolvedAdminTenantBinding }
+        : {}),
     },
     config.jwtSigningKey,
   );

@@ -1,0 +1,102 @@
+-- =============================================================================
+-- File:    migrations/028_accounts_account_type_admin.sql
+-- Purpose: Widen the accounts.account_type CHECK constraint to allow
+--          'tenant_admin' and 'platform_admin' alongside the existing
+--          'patient', 'delegate', and 'clinician'. Closes the Phase 2
+--          F-1 deferred follow-on: PR #140 widened the JWT layer's
+--          AccessTokenRole enum to include the admin roles, but the
+--          accounts table CHECK still rejected admin account rows, so
+--          production session-service.issueSession could never mint an
+--          admin JWT — only test fixtures could call issueAccessToken
+--          directly.
+--
+-- Spec:    - RBAC v1.1 §1.1, §1.2 (platform_admin global scope;
+--            tenant_admin per-tenant scope)
+--          - CDM v1.2 §3.2 (Account entity; account_type discriminator)
+--          - Identity & Authentication Spec v1.0 §3.3 (access token
+--            claims; role is derived from accounts.account_type)
+--          - I-023 / I-024 (tenant isolation; tenant_admin is
+--            tenant-scoped via the resolved request tenant; platform_admin
+--            is global with adminHomeTenantId attribution per Phase 2 R3
+--            closure)
+--          - migrations/012_accounts.sql (original CHECK)
+--          - migrations/027_accounts_account_type_clinician.sql (prior
+--            widening for clinician)
+--          - docs/PHASE_2_ADMIN_JWT_SCOPE_AND_FOLLOW_ONS.md F-1
+--          - migrations/rollback/028_rollback.sql
+--
+-- HISTORY:
+--   Migration 012 admitted {'patient', 'delegate'}. Migration 027 widened
+--   to include 'clinician' for the pharmacy slice. Phase 2 (2026-05-15;
+--   PR #140 merged at main 6448fd0) widened the JWT-layer AccessTokenRole
+--   enum to {patient, clinician, tenant_admin, platform_admin} so admin
+--   handlers (forms-intake templates / variants / deployments) could
+--   resolve admin identity from a JWT. But the production session-service
+--   maps accounts.account_type → AccessTokenRole, and the accounts CHECK
+--   still rejected admin rows. So admin JWTs could only be minted via
+--   test fixtures (tests/helpers/jwt-fixtures.ts calling issueAccessToken
+--   directly), not via the real login flow.
+--
+--   This migration closes the F-1 deferred gap: accounts.account_type can
+--   now hold 'tenant_admin' or 'platform_admin', session-service can map
+--   each to the JWT role, and the real login flow can mint admin JWTs.
+--
+-- ADDED VALUES:
+--   - 'tenant_admin' — a tenant-scoped administrator. The accounts row
+--     belongs to a single tenant (existing accounts.tenant_id FK enforces
+--     that); the session-service derives the JWT's
+--     admin_tenant_binding claim from that tenant_id at issue time, so
+--     a tenant_admin's binding always equals their home tenant. (Future
+--     extension: a separate admin_tenant_binding column on accounts could
+--     support cross-tenant administrative assignments, but at v1.0 the
+--     home-tenant model is sufficient. ADR follow-on if that need
+--     surfaces.)
+--   - 'platform_admin' — a globally-scoped administrator. The accounts
+--     row still belongs to a tenant (the admin's HOME tenant; used for
+--     audit attribution via the JWT's tenant_id claim per Phase 2 R3
+--     closure), but the admin_tenant_binding claim is NULL — the admin
+--     can administer resources in any tenant.
+--
+-- PRECONDITIONS:
+--   migrations/012_accounts.sql + 027_accounts_account_type_clinician.sql
+--   applied (target table exists with the prior CHECK admitting
+--   {patient, delegate, clinician}).
+--
+-- ROLLBACK:
+--   migrations/rollback/028_rollback.sql
+--
+-- COMPAT:
+--   Migration is non-destructive: no existing rows are modified. The
+--   widened CHECK accepts every value the previous CHECK accepted plus
+--   the two admin types. Admin-role JWT issuance is a SEPARATE opt-in
+--   (issueSession looks up account_type → resolves role + binding), so
+--   an account_type=tenant_admin row in the DB alone does NOT change
+--   behavior for any existing handler. Handlers that authorize via
+--   requireAdminRole already accept admin JWTs (PR #140 wired the Tier 1
+--   JWT path before this migration); this migration enables the
+--   production minting path that admin handlers' tests have been using
+--   via fixtures since PR #140.
+--
+-- POST-MIGRATION:
+--   The session-service mapping in
+--   src/modules/identity/internal/services/session-service.ts is updated
+--   in the same PR to:
+--     - 'tenant_admin'   → JWT role 'tenant_admin', admin_tenant_binding
+--                          = ctx.tenantId (the admin's home tenant)
+--     - 'platform_admin' → JWT role 'platform_admin', admin_tenant_binding
+--                          = null (global)
+--   The AccountType union in src/modules/identity/internal/types.ts is
+--   also widened to match the CHECK.
+-- =============================================================================
+
+ALTER TABLE accounts
+    DROP CONSTRAINT IF EXISTS accounts_account_type_check;
+
+ALTER TABLE accounts
+    ADD CONSTRAINT accounts_account_type_check CHECK (
+        account_type IN ('patient', 'delegate', 'clinician', 'tenant_admin', 'platform_admin')
+    );
+
+-- No backfill needed: every existing row has account_type ∈
+-- {'patient', 'delegate', 'clinician'} from the prior CHECK, all of
+-- which remain valid under the widened CHECK.

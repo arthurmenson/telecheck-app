@@ -54,7 +54,25 @@ export function asDeviceId(raw: string): DeviceId {
 // ---------------------------------------------------------------------------
 
 export type AccountStatus = 'pending_verification' | 'active' | 'suspended' | 'archived';
-export type AccountType = 'patient' | 'delegate' | 'clinician';
+/**
+ * AccountType — the discriminator on accounts row that determines the
+ * actor's JWT role at session issuance time.
+ *
+ * Phase 2 admin widening (2026-05-15): added 'tenant_admin' and
+ * 'platform_admin' alongside the existing patient/delegate/clinician
+ * set. The accounts.account_type CHECK constraint is widened in the
+ * same PR via migration 028. session-service.sessionRoleForAccountType
+ * maps these to JWT role 'tenant_admin' / 'platform_admin' respectively,
+ * and issueSession passes admin_tenant_binding=ctx.tenantId for
+ * tenant_admin / null for platform_admin.
+ *
+ * Spec refs:
+ *   - RBAC v1.1 §1.1 (platform_admin global scope)
+ *   - RBAC v1.1 §1.2 (tenant_admin per-tenant scope)
+ *   - migrations/028_accounts_account_type_admin.sql
+ *   - docs/PHASE_2_ADMIN_JWT_SCOPE_AND_FOLLOW_ONS.md F-1 closure
+ */
+export type AccountType = 'patient' | 'delegate' | 'clinician' | 'tenant_admin' | 'platform_admin';
 export type AccountGender = 'female' | 'male' | 'non_binary' | 'prefer_not_to_say';
 
 export interface Account {
