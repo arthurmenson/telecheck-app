@@ -34,7 +34,25 @@ import fp from 'fastify-plugin';
 import { config } from './config.js';
 import type { TenantId } from './glossary.js';
 import { verifyAccessToken } from './jwt.js';
-import { KNOWN_TENANT_IDS } from './tenant-context.js';
+import { lookupActiveTenantById } from './tenant-context.js';
+
+/**
+ * Phase 2 F-2 R1 MEDIUM closure (2026-05-15): canonical tenant_id
+ * format validator. Rejects whitespace-padded, empty, lowercase, and
+ * any value not matching `Telecheck-{Country}` (one uppercase letter
+ * followed by letters). Tightens the DB-lookup boundary so a
+ * malformed JWT claim cannot probe the tenants table.
+ *
+ * Matches the format pattern from `glossary.ts asTenantId()`, kept
+ * local to avoid pulling in the validation error path (auth hook
+ * silently leaves actorContext undefined on failure).
+ */
+const CANONICAL_TENANT_ID_PATTERN = /^Telecheck-[A-Z][A-Za-z]+$/;
+function isCanonicalTenantIdFormat(raw: string): boolean {
+  if (typeof raw !== 'string') return false;
+  if (raw.trim() !== raw) return false; // reject leading/trailing whitespace
+  return CANONICAL_TENANT_ID_PATTERN.test(raw);
+}
 
 // ---------------------------------------------------------------------------
 // ActorContext type
@@ -167,23 +185,52 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
     // enforced tenant_id match for every role, making platform_admin
     // unusable across tenants and defeating the documented global
     // scope.
+    let trustedHomeCountryOfCare: 'US' | 'GH' | null = null;
     if (claims.role !== 'platform_admin') {
       if (tenantCtx.tenantId !== claims.tenant_id) return;
     } else {
-      // Phase 2 R4 HIGH-2 closure (2026-05-15): platform_admin is
-      // global, but the JWT's home-tenant claim MUST still be a
-      // recognized active tenant. Without this check, a signed
-      // platform_admin token with a stale/deleted/nonsensical home
-      // tenant would authenticate and the audit attribution would
-      // point to a non-existent tenant. Closes Codex R4 HIGH:
-      // "platform_admin skips validation of the JWT home tenant
-      // before global authorization."
+      // Phase 2 R4 HIGH-2 + R5 HIGH-2 + F-2 R1+R2 closure
+      // (2026-05-15): platform_admin is global, but the JWT's
+      // home-tenant claim MUST be a DB-active tenant AND its
+      // country_of_care claim MUST match the DB row's country.
+      // Closes F-2 R2 HIGH: "Platform admin DB validation does not
+      // bind country_of_care to the validated tenant." Without this
+      // bind, a JWT could carry a stale country_of_care that flowed
+      // into ActorContext unchecked.
       //
-      // The known-tenant set is the canonical operating-tenant
-      // identifiers from tenant-context.ts. A future SI-008-style
-      // expansion to additional tenants only requires updating
-      // KNOWN_TENANT_IDS at the source.
-      if (!KNOWN_TENANT_IDS.has(claims.tenant_id)) return;
+      // Admin auth is fail-closed on every uncertainty:
+      //   - format validation rejects whitespace/non-canonical IDs
+      //   - DB 'inactive_or_unknown' → fail closed
+      //   - DB 'unreachable' → fail closed (closes R1 HIGH; unlike
+      //     host resolution, admin auth has higher criticality than
+      //     availability)
+      //   - country_of_care claim ≠ DB row → fail closed
+      if (!isCanonicalTenantIdFormat(claims.tenant_id)) return;
+      // F-2 R3 HIGH closure (2026-05-15): a reachable-DB SQL/schema/
+      // permission error from lookupActiveTenantById re-throws by
+      // design (caller-discretion semantics; same pattern as
+      // resolveHostFromDb). For the AUTH BOUNDARY here, that would
+      // escape and turn admin requests into 500s instead of
+      // tenant-blind 401s. Wrap with try/catch + fail closed, but
+      // still log the underlying error so operators can triage
+      // schema drift / permission regressions without losing the
+      // signal. Connection failures and 'inactive_or_unknown' both
+      // fall through to the unified fail-closed path below.
+      let dbResult: Awaited<ReturnType<typeof lookupActiveTenantById>>;
+      try {
+        dbResult = await lookupActiveTenantById(claims.tenant_id);
+      } catch (err) {
+        request.log?.error?.(
+          { err, tenant_id: claims.tenant_id, sub: claims.sub },
+          'auth-context: lookupActiveTenantById threw for platform_admin JWT — failing closed',
+        );
+        return;
+      }
+      if (dbResult.kind !== 'active') return;
+      // Country binding: the JWT's country_of_care claim MUST match
+      // the validated home tenant's country in the tenants row.
+      if (claims.country_of_care !== dbResult.country_of_care) return;
+      trustedHomeCountryOfCare = dbResult.country_of_care;
     }
 
     // Phase 2 admin widening (2026-05-15): cross-tenant admin defense
@@ -216,12 +263,22 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
     const effectiveTenantId =
       claims.role === 'platform_admin' ? tenantCtx.tenantId : claims.tenant_id;
 
+    // F-2 R2 HIGH closure: for platform_admin, prefer the DB-trusted
+    // country (which equals the JWT claim after the equality check
+    // above — but using the DB value defensively kills any path where
+    // a later refactor relaxes the equality check and the claim still
+    // flows through).
+    const effectiveCountryOfCare =
+      claims.role === 'platform_admin' && trustedHomeCountryOfCare !== null
+        ? trustedHomeCountryOfCare
+        : claims.country_of_care;
+
     request.actorContext = {
       accountId: claims.sub,
       sessionId: claims.session_id,
       tenantId: effectiveTenantId,
       role: claims.role,
-      countryOfCare: claims.country_of_care,
+      countryOfCare: effectiveCountryOfCare,
       delegateId: claims.delegate_id ?? null,
       adminTenantBinding:
         claims.role === 'tenant_admin' ? (claims.admin_tenant_binding ?? null) : null,
