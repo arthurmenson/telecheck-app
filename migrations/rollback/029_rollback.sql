@@ -19,7 +19,11 @@
 
 -- 1. Drop the trigger + new function bodies (depend on the columns
 --    we're about to remove + the new canonical-hash signature we're
---    about to drop).
+--    about to drop). Also drop the F-4 CHECK constraint + the new
+--    set_break_glass_context signature.
+ALTER TABLE audit_records
+    DROP CONSTRAINT IF EXISTS audit_records_actor_tenant_id_required_for_human_actors;
+DROP FUNCTION IF EXISTS set_break_glass_context(TEXT, TEXT, TEXT, TEXT, TEXT);
 DROP TRIGGER IF EXISTS audit_records_before_insert ON audit_records;
 DROP TRIGGER IF EXISTS audit_records_hash_insert_trigger ON audit_records;
 DROP FUNCTION IF EXISTS audit_records_hash_insert();
@@ -154,6 +158,61 @@ CREATE TRIGGER audit_records_before_insert
     BEFORE INSERT ON audit_records
     FOR EACH ROW
     EXECUTE FUNCTION audit_records_hash_insert();
+
+-- 4b. Recreate pre-029 set_break_glass_context (4-parameter signature
+-- without actor_home_tenant). Verbatim from migration 003.
+CREATE OR REPLACE FUNCTION set_break_glass_context(
+    p_actor_id          TEXT,
+    p_target_tenant     TEXT,
+    p_justification     TEXT,
+    p_authorized_until  TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_session_id    TEXT;
+    v_payload       JSONB;
+BEGIN
+    PERFORM 1 FROM public.tenants WHERE id = p_target_tenant AND status = 'active';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'break_glass_target_unavailable';
+    END IF;
+    IF p_justification IS NULL OR trim(p_justification) = '' THEN
+        RAISE EXCEPTION 'break_glass_justification_required';
+    END IF;
+    v_session_id := uuid_generate_v4()::TEXT;
+    INSERT INTO public._session_tenant_context (pg_backend_pid, tenant_id, bound_at, expires_at)
+    VALUES (pg_backend_pid(), p_target_tenant, NOW(),
+            LEAST(NOW() + INTERVAL '5 minutes',
+                  COALESCE(p_authorized_until::TIMESTAMPTZ, NOW() + INTERVAL '5 minutes')))
+    ON CONFLICT (pg_backend_pid) DO UPDATE
+        SET tenant_id = EXCLUDED.tenant_id, bound_at = EXCLUDED.bound_at, expires_at = EXCLUDED.expires_at;
+    v_payload := jsonb_build_object(
+        'break_glass_session_id', v_session_id, 'actor_id', p_actor_id,
+        'target_tenant_id', p_target_tenant, 'justification', p_justification,
+        'authorized_until', p_authorized_until,
+        'privacy_officer_review_status', 'pending', 'initiated_at', NOW()::TEXT);
+    INSERT INTO public.audit_records (
+        tenant_id, category, audit_sensitivity_level, action,
+        actor_type, actor_id, resource_type, resource_id,
+        break_glass, payload, recorded_at
+    ) VALUES (
+        p_target_tenant, 'B', 'standard', 'cross_tenant_break_glass_initiated',
+        'platform_admin', p_actor_id, 'tenant', p_target_tenant,
+        jsonb_build_object('session_id', v_session_id, 'reason', p_justification,
+                           'authorized_until', p_authorized_until,
+                           'privacy_officer_review_status', 'pending'),
+        v_payload, NOW()
+    );
+    PERFORM set_config('app.break_glass_session_id', v_session_id,       FALSE);
+    PERFORM set_config('app.break_glass_actor_id',   p_actor_id,         FALSE);
+    PERFORM set_config('app.break_glass_until',      p_authorized_until, FALSE);
+END;
+$$;
+REVOKE ALL ON FUNCTION set_break_glass_context(TEXT, TEXT, TEXT, TEXT) FROM PUBLIC;
 
 -- 5. Finally drop the columns (no longer referenced by any function or
 --    trigger).

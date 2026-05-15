@@ -313,3 +313,145 @@ CREATE TRIGGER audit_records_before_insert
     BEFORE INSERT ON audit_records
     FOR EACH ROW
     EXECUTE FUNCTION audit_records_hash_insert();
+
+-- ---------------------------------------------------------------------------
+-- F-4 R7 HIGH-2 closure (Codex 2026-05-15): close the SQL-side bypass on
+-- set_break_glass_context. The function in migration 003 inserts directly
+-- into audit_records with actor_type='platform_admin' but no actor_tenant_id.
+-- The emitAudit runtime guard can't catch this — it only runs on the
+-- application-layer path. Two-pronged defense:
+--   (1) Update set_break_glass_context to require + insert actor_home_tenant.
+--   (2) Add a DB-level CHECK constraint as a NOT-VALID backstop so future
+--       direct-SQL inserts cannot regress attribution.
+-- ---------------------------------------------------------------------------
+
+-- (1) Replace set_break_glass_context with a 5-parameter signature.
+-- The function in migration 003 is DROP'd + recreated; no app code
+-- currently calls it (only a code comment references it), so the
+-- signature change is safe at v1.0. The new parameter is positional
+-- last to preserve argument order for callers if added later.
+DROP FUNCTION IF EXISTS set_break_glass_context(TEXT, TEXT, TEXT, TEXT);
+
+CREATE OR REPLACE FUNCTION set_break_glass_context(
+    p_actor_id               TEXT,
+    p_target_tenant          TEXT,
+    p_justification          TEXT,
+    p_authorized_until       TEXT,
+    p_actor_home_tenant_id   TEXT  -- F-4 R7 HIGH-2 closure
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_session_id    TEXT;
+    v_payload       JSONB;
+BEGIN
+    PERFORM 1
+    FROM    public.tenants
+    WHERE   id = p_target_tenant
+      AND   status = 'active';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'break_glass_target_unavailable'
+            USING HINT = 'The break-glass target tenant context could not be established.';
+    END IF;
+
+    IF p_justification IS NULL OR trim(p_justification) = '' THEN
+        RAISE EXCEPTION 'break_glass_justification_required'
+            USING HINT = 'A written justification is mandatory for break-glass access per I-024.';
+    END IF;
+
+    -- F-4 R7 HIGH-2: actor's home tenant is required for non-system
+    -- audit attribution. Reject missing or whitespace value rather
+    -- than fall back to p_target_tenant (which would re-create the
+    -- forensic blind spot).
+    IF p_actor_home_tenant_id IS NULL OR trim(p_actor_home_tenant_id) = '' THEN
+        RAISE EXCEPTION 'break_glass_actor_home_tenant_required'
+            USING HINT = 'The actor''s home tenant_id is required for F-4 audit attribution.';
+    END IF;
+
+    v_session_id := uuid_generate_v4()::TEXT;
+
+    INSERT INTO public._session_tenant_context (pg_backend_pid, tenant_id, bound_at, expires_at)
+    VALUES (
+        pg_backend_pid(),
+        p_target_tenant,
+        NOW(),
+        LEAST(
+            NOW() + INTERVAL '5 minutes',
+            COALESCE(p_authorized_until::TIMESTAMPTZ, NOW() + INTERVAL '5 minutes')
+        )
+    )
+    ON CONFLICT (pg_backend_pid) DO UPDATE
+        SET tenant_id  = EXCLUDED.tenant_id,
+            bound_at   = EXCLUDED.bound_at,
+            expires_at = EXCLUDED.expires_at;
+
+    v_payload := jsonb_build_object(
+        'break_glass_session_id',           v_session_id,
+        'actor_id',                         p_actor_id,
+        'target_tenant_id',                 p_target_tenant,
+        'justification',                    p_justification,
+        'authorized_until',                 p_authorized_until,
+        'privacy_officer_review_status',    'pending',
+        'initiated_at',                     NOW()::TEXT
+    );
+
+    -- F-4 attribution: actor_tenant_id = p_actor_home_tenant_id (the
+    -- platform_admin's HOME tenant), distinct from tenant_id (the
+    -- RESOURCE tenant = p_target_tenant). Cross-tenant break-glass is
+    -- THE canonical case for non-equal actor_tenant_id and tenant_id.
+    INSERT INTO public.audit_records (
+        tenant_id,
+        category,
+        audit_sensitivity_level,
+        action,
+        actor_type,
+        actor_id,
+        actor_tenant_id,
+        resource_type,
+        resource_id,
+        break_glass,
+        payload,
+        recorded_at
+    ) VALUES (
+        p_target_tenant,
+        'B',
+        'standard',
+        'cross_tenant_break_glass_initiated',
+        'platform_admin',
+        p_actor_id,
+        p_actor_home_tenant_id,
+        'tenant',
+        p_target_tenant,
+        jsonb_build_object(
+            'session_id',                   v_session_id,
+            'reason',                       p_justification,
+            'authorized_until',             p_authorized_until,
+            'privacy_officer_review_status','pending'
+        ),
+        v_payload,
+        NOW()
+    );
+
+    PERFORM set_config('app.break_glass_session_id', v_session_id,       FALSE);
+    PERFORM set_config('app.break_glass_actor_id',   p_actor_id,         FALSE);
+    PERFORM set_config('app.break_glass_until',      p_authorized_until, FALSE);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION set_break_glass_context(TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC;
+
+-- (2) DB-level CHECK constraint as backstop. NOT VALID so pre-029 rows
+-- (which have NULL actor_tenant_id even for non-system actor types) are
+-- exempt; new rows must pass. VALIDATE CONSTRAINT can run as a separate
+-- maintenance op after legacy rows are backfilled (separate runbook).
+ALTER TABLE audit_records
+    ADD CONSTRAINT audit_records_actor_tenant_id_required_for_human_actors
+    CHECK (
+        actor_type IN ('system', 'ai_workload')
+        OR actor_tenant_id IS NOT NULL
+    )
+    NOT VALID;
