@@ -69,8 +69,24 @@ import { buildApp } from '../../src/app.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+const T_US = asTenantId(TENANT_US);
+const T_GH = asTenantId('Telecheck-Ghana');
+
+// Phase 2 admin JWT migration (2026-05-15): tenant_admin JWT for
+// deployments-http admin tests (US tenant). Each test passes its own
+// actor accountId.
+function adminAuth(accountId: string): { authorization: string } {
+  return bearerAuthHeader({
+    accountId,
+    tenantId: T_US,
+    countryOfCare: 'US',
+    role: 'tenant_admin',
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Test app lifecycle
@@ -276,11 +292,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_create',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_create'),
       },
       payload: { templateId },
     });
@@ -315,11 +327,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_draft',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_draft'),
       },
       payload: { templateId: draftTemplateId },
     });
@@ -340,11 +348,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_missing',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_missing'),
       },
       payload: { templateId: ulid() },
     });
@@ -388,9 +392,13 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_no_admin_role',
-        // Non-admin role.
-        'x-actor-roles': 'patient',
+        // Non-admin role (patient JWT) — fails admin authz.
+        ...bearerAuthHeader({
+          accountId: 'op_no_admin_role',
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
       payload: { templateId },
     });
@@ -407,11 +415,7 @@ describe('POST /v0/forms/deployments — HTTP-level', () => {
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_emptybody',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_emptybody'),
       },
       payload: {},
     });
@@ -439,11 +443,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_get_create',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_get_create'),
       },
       payload: { templateId },
     });
@@ -460,11 +460,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
         // extended to deployments by this test pass. The handler patch in
         // the same commit adds `void resolveActorId(req)` to
         // getDeploymentHandler.
-        'x-actor-id': 'op_http_dep_get',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_get'),
       },
     });
 
@@ -494,11 +490,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_get401_create',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_get401_create'),
       },
       payload: { templateId },
     });
@@ -530,11 +522,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_xt_create',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_xt_create'),
       },
       payload: { templateId },
     });
@@ -546,11 +534,12 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       url: `/v0/forms/deployments/${usDeploymentId}`,
       headers: {
         host: 'ghana.heroshealth.com',
-        'x-actor-id': 'op_http_dep_xt_read',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': 'Telecheck-Ghana',
+        ...bearerAuthHeader({
+          accountId: 'op_http_dep_xt_read',
+          tenantId: T_GH,
+          countryOfCare: 'GH',
+          role: 'tenant_admin',
+        }),
       },
     });
 
@@ -566,11 +555,7 @@ describe('GET /v0/forms/deployments/:deploymentId — HTTP-level', () => {
       url: `/v0/forms/deployments/${ulid()}`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_missing_get',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_missing_get'),
       },
     });
 
@@ -595,11 +580,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_retire_create',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_retire_create'),
       },
       payload: { templateId },
     });
@@ -611,11 +592,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       url: `/v0/forms/deployments/${deployment_id}/retire`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_retire',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_retire'),
       },
     });
 
@@ -642,11 +619,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_dup_create',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_dup_create'),
       },
       payload: { templateId },
     });
@@ -658,11 +631,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       url: `/v0/forms/deployments/${deployment_id}/retire`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_dup_first',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_dup_first'),
       },
     });
     expect(first.statusCode).toBe(200);
@@ -672,11 +641,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       url: `/v0/forms/deployments/${deployment_id}/retire`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_dup_second',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_dup_second'),
       },
     });
 
@@ -698,11 +663,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       url: `/v0/forms/deployments/${ulid()}/retire`,
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_retire_missing',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_retire_missing'),
       },
     });
 
@@ -724,11 +685,7 @@ describe('POST /v0/forms/deployments/:deploymentId/retire — HTTP-level', () =>
       url: '/v0/forms/deployments',
       headers: {
         host: 'localhost',
-        'x-actor-id': 'op_http_dep_retire_noactor_create',
-
-        'x-actor-roles': 'tenant_admin',
-
-        'x-actor-admin-tenant': TENANT_US,
+        ...adminAuth('op_http_dep_retire_noactor_create'),
       },
       payload: { templateId },
     });
