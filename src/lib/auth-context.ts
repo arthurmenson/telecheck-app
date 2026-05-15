@@ -44,27 +44,38 @@ import { verifyAccessToken } from './jwt.js';
  * valid JWT is presented; remains undefined for pre-auth endpoints.
  */
 export interface ActorContext {
-  /** Account ID = the authenticated patient. */
+  /** Account ID = the authenticated actor. */
   accountId: string;
   /** The session row backing this token. */
   sessionId: string;
   /** Tenant ID from the token (matches request's tenant context). */
   tenantId: TenantId;
   /**
-   * Actor role at v1.0: patient | clinician. Operator / admin / research-
-   * data-steward / etc. land with their respective slices (RBAC v1.1).
-   * Widened from 'patient'-only at TLC-058 / 2026-05-13 to unblock the
-   * pharmacy clinician-write surface (TLC-055 PR E onward). The
-   * authContextPlugin populates this from the verified JWT's role claim;
-   * the JWT verify path rejects any out-of-enum value, so a handler
-   * receiving an actorContext can trust that role is one of the
-   * canonical AccessTokenRole values.
+   * Actor role. Phase 2 (2026-05-15) widens beyond patient + clinician
+   * to include tenant_admin + platform_admin. Operator / pharmacist /
+   * research-data-steward etc. land with their respective slices
+   * (RBAC v1.1). The authContextPlugin populates this from the verified
+   * JWT's role claim; the JWT verify path rejects any out-of-enum value,
+   * so a handler receiving an actorContext can trust that role is one
+   * of the canonical AccessTokenRole values.
+   *
+   * Cross-tenant admin defense: for role='tenant_admin', the
+   * authContextPlugin ALSO verifies the JWT's admin_tenant_binding claim
+   * matches the request's resolved tenant context. A binding mismatch
+   * leaves actorContext undefined (handler will 401, response stays
+   * tenant-blind per I-025). platform_admin is global (no binding).
    */
-  role: 'patient' | 'clinician';
+  role: 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
   /** Country of care from token. */
   countryOfCare: 'US' | 'GH';
   /** Delegate context when the patient is acting as a delegate. */
   delegateId: string | null;
+  /**
+   * Phase 2 admin widening: for role='tenant_admin', the tenant_id the
+   * admin is authorized to administer (already verified to match
+   * tenantId at JWT-verify time). null for all other roles.
+   */
+  adminTenantBinding: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +110,23 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
     if (tenantCtx === undefined) return; // allowlisted endpoint; no tenant → no actor
     if (tenantCtx.tenantId !== claims.tenant_id) return;
 
+    // Phase 2 admin widening (2026-05-15): cross-tenant admin defense.
+    // For role='tenant_admin', the JWT's admin_tenant_binding claim
+    // MUST match the request's resolved tenant context. Without that
+    // match, the actor is rejected (response stays tenant-blind per
+    // I-025). platform_admin is global (binding MUST be absent/null,
+    // enforced by verify path).
+    if (claims.role === 'tenant_admin') {
+      // verifyAccessToken already enforced binding is a non-empty string
+      // for tenant_admin; this is the request-side scope check.
+      if (claims.admin_tenant_binding !== claims.tenant_id) return;
+      // Also enforce binding === request's resolved tenant (defense in
+      // depth; tenant_id === resolved tenantCtx.tenantId is already
+      // enforced above, so this is logically equivalent, but readers
+      // shouldn't have to reason about transitive equality).
+      if (claims.admin_tenant_binding !== tenantCtx.tenantId) return;
+    }
+
     request.actorContext = {
       accountId: claims.sub,
       sessionId: claims.session_id,
@@ -106,6 +134,8 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
       role: claims.role,
       countryOfCare: claims.country_of_care,
       delegateId: claims.delegate_id ?? null,
+      adminTenantBinding:
+        claims.role === 'tenant_admin' ? (claims.admin_tenant_binding ?? null) : null,
     };
   });
 };
@@ -187,14 +217,17 @@ export function requireActorContext(req: FastifyRequest): ActorContext {
 // and bring their own per-route role logic.
 // ---------------------------------------------------------------------------
 
+export type ActorRole = 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
+
 export class UnauthorizedRoleError extends Error {
   readonly statusCode = 403;
   readonly code = 'internal.auth.insufficient_scope';
   constructor(
-    public readonly required: 'patient' | 'clinician',
-    public readonly observed: 'patient' | 'clinician',
+    public readonly required: ActorRole | ReadonlyArray<ActorRole>,
+    public readonly observed: ActorRole,
   ) {
-    super(`This endpoint requires role=${required}; actor role=${observed}.`);
+    const requiredStr = Array.isArray(required) ? required.join('|') : String(required);
+    super(`This endpoint requires role=${requiredStr}; actor role=${observed}.`);
     this.name = 'UnauthorizedRoleError';
   }
 }
@@ -250,10 +283,12 @@ export function requireClinicianActorContext(
  * (pre-existing gap, tracked as a separate follow-on for the admin-role
  * gate PR).
  *
- * The narrow scope is deliberate: this PR's mission is the clinician role
- * mechanism. Closing the pre-existing patient gap on admin routes
- * properly requires authoring the admin-role token + admin-role
- * mapping in identity, which is its own PR.
+ * **Phase 2 admin widening note (2026-05-15):** Phase 2 lands the proper
+ * admin-role gate via `requireAdminActorContext` (below). New admin
+ * handlers SHOULD use that gate; this legacy helper is preserved for
+ * back-compat with handlers that haven't migrated yet but no longer
+ * blocks tenant_admin / platform_admin actors (they pass the legacy
+ * "anyone-not-clinician" floor).
  */
 export function rejectClinicianOnAdminRoute(req: FastifyRequest): ActorContext {
   const actor = requireActorContext(req);
@@ -261,4 +296,77 @@ export function rejectClinicianOnAdminRoute(req: FastifyRequest): ActorContext {
     throw new UnauthorizedRoleError('patient', 'clinician');
   }
   return actor;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 admin-role gates (2026-05-15)
+//
+// `requireTenantAdminActorContext` and `requirePlatformAdminActorContext`
+// land alongside the AccessTokenRole widening so admin handlers can adopt
+// JWT-based admin identity (replacing the legacy `x-actor-roles` header
+// shim + `requireAdminRole`). `requireAdminActorContext` accepts EITHER
+// admin role — the right gate for endpoints that don't need to distinguish
+// (e.g., forms-intake admin CRUD where both tenant_admin and platform_admin
+// can manage templates).
+// ---------------------------------------------------------------------------
+
+/**
+ * Assert that the request carries an authenticated TENANT_ADMIN actor.
+ * Mirror of requirePatientActorContext.
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'tenant_admin'
+ *
+ * NOTE: the cross-tenant binding check (the tenant_admin's
+ * admin_tenant_binding === resolved tenantCtx.tenantId) is already
+ * enforced by authContextPlugin before this guard runs. A handler
+ * receiving the returned actor can trust the binding has been verified.
+ */
+export function requireTenantAdminActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'tenant_admin' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'tenant_admin') {
+    throw new UnauthorizedRoleError('tenant_admin', actor.role);
+  }
+  return actor as ActorContext & { role: 'tenant_admin' };
+}
+
+/**
+ * Assert that the request carries an authenticated PLATFORM_ADMIN actor.
+ * Mirror of requireTenantAdminActorContext. platform_admin is global —
+ * authorized in any tenant context.
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'platform_admin'
+ */
+export function requirePlatformAdminActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'platform_admin' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'platform_admin') {
+    throw new UnauthorizedRoleError('platform_admin', actor.role);
+  }
+  return actor as ActorContext & { role: 'platform_admin' };
+}
+
+/**
+ * Assert that the request carries an authenticated admin actor — EITHER
+ * tenant_admin OR platform_admin. Use this on admin endpoints that don't
+ * need to distinguish (e.g., forms-intake template CRUD).
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'tenant_admin' && role !== 'platform_admin'
+ */
+export function requireAdminActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'tenant_admin' | 'platform_admin' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'tenant_admin' && actor.role !== 'platform_admin') {
+    throw new UnauthorizedRoleError(['tenant_admin', 'platform_admin'], actor.role);
+  }
+  return actor as ActorContext & { role: 'tenant_admin' | 'platform_admin' };
 }

@@ -79,6 +79,50 @@ const ADMIN_ROLES = new Set<string>([PLATFORM_ADMIN_ROLE, TENANT_SCOPED_ADMIN_RO
  *   no admin role authorized for the resolved tenant.
  */
 export function requireAdminRole(req: FastifyRequest): string {
+  // Resolved tenant for THIS request. The handler always runs
+  // requireTenantContext() before this shim, so calling it here is a
+  // safe property read on the decorated request.
+  const ctxTenantId: TenantId = requireTenantContext(req).tenantId;
+
+  // Phase 2 admin widening (2026-05-15): Tier 1 JWT-based admin
+  // identity. If the request carries a verified JWT with role
+  // ∈ {tenant_admin, platform_admin}, authorize from that — the JWT
+  // verify path + authContextPlugin have already enforced:
+  //   - HS256 signature integrity
+  //   - exp > now
+  //   - role enum validation
+  //   - role/admin_tenant_binding consistency
+  //   - tenant_admin's admin_tenant_binding === resolved tenantCtx.tenantId
+  //     (cross-tenant admin defense; rejected at authContextPlugin so
+  //     req.actorContext is undefined for a wrong-tenant tenant_admin)
+  // Net: if req.actorContext.role is tenant_admin or platform_admin
+  // HERE, we can trust the actor is authorized for the resolved tenant.
+  const actorCtx = req.actorContext;
+  if (actorCtx !== undefined) {
+    if (actorCtx.role === PLATFORM_ADMIN_ROLE) {
+      return PLATFORM_ADMIN_ROLE;
+    }
+    if (actorCtx.role === TENANT_SCOPED_ADMIN_ROLE) {
+      // Defense-in-depth: re-check the binding here even though the
+      // authContextPlugin already enforced it. If for any reason an
+      // actor with role=tenant_admin reached us with a binding that
+      // doesn't match the resolved tenant, refuse.
+      if (actorCtx.adminTenantBinding === ctxTenantId) {
+        return TENANT_SCOPED_ADMIN_ROLE;
+      }
+      // tenant_admin with wrong binding → fall through to header shim
+      // (which will also reject since the JWT path didn't authorize).
+      // The 403 below catches this.
+    }
+    // Authenticated as patient or clinician — does NOT authorize admin
+    // surfaces. Fall through to the legacy header shim (which will
+    // reject too unless the request also presents an x-actor-roles
+    // header — in which case the test/legacy fallback applies).
+  }
+
+  // Tier 2 (legacy header shim): same posture as before this widening.
+  // Used by tests that haven't migrated to JWT-based admin yet AND by
+  // local-dev opt-in flows.
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
   if (isProd && !optIn) {
@@ -93,11 +137,6 @@ export function requireAdminRole(req: FastifyRequest): string {
     .split(',')
     .map((r) => r.trim())
     .filter((r) => r.length > 0);
-
-  // Resolved tenant for THIS request. The handler always runs
-  // requireTenantContext() before this shim, so calling it here is a
-  // safe property read on the decorated request.
-  const ctxTenantId: TenantId = requireTenantContext(req).tenantId;
 
   for (const role of roles) {
     if (!ADMIN_ROLES.has(role)) continue;

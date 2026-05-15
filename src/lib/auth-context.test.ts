@@ -37,6 +37,7 @@ const ACTOR: ActorContext = {
   role: 'patient',
   countryOfCare: 'US',
   delegateId: null,
+  adminTenantBinding: null,
 };
 
 function makeStubReq(ctx: ActorContext | undefined): FastifyRequest {
