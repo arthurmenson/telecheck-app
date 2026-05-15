@@ -254,7 +254,35 @@ BEGIN  -- outer transaction (caller's)
 END
 ```
 
-The rejection audit row is now DURABLE (committed in the outer transaction, not rolled back by the savepoint discard). Callers receive a structured result they can branch on; they do NOT need to catch SQL exceptions.
+The rejection audit row SURVIVES the savepoint rollback (it's emitted AFTER the `ROLLBACK TO SAVEPOINT`), so it's in the outer transaction. **But R14 HIGH closure (Codex 2026-05-15):** that is NOT the same as "durable." If the caller's outer transaction rolls back (timeout, later error, application-level abort), the rejection audit row is lost.
+
+**Durability contract — three-tier defense (R14 closure):**
+
+1. **Tier 1 (savepoint survival):** the SAVEPOINT-rollback-then-INSERT pattern above. Rejection audit survives the partial-work discard. Sufficient when the caller's outer transaction commits.
+
+2. **Tier 2 (autonomous-transaction rejection log):** the procedure ALSO emits the rejection record to a SEPARATE `audit_swap_rejection_log` table via an autonomous-transaction wrapper (Postgres lacks native `PRAGMA AUTONOMOUS_TRANSACTION` but the same effect is achieved via `dblink` to localhost or a deferred constraint trigger with a wrapper function on a separate background-worker connection). This table is non-tenant-scoped (operational) and writes commit independently of the caller's transaction state. The schema:
+   ```sql
+   CREATE TABLE audit_swap_rejection_log (
+       id BIGSERIAL PRIMARY KEY,
+       attempted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       tenant_id TEXT NOT NULL,
+       consult_id VARCHAR(26) NOT NULL,
+       proposed_execution_id VARCHAR(26) NOT NULL,
+       expected_prior_execution_id VARCHAR(26),
+       rejection_code TEXT NOT NULL,
+       rejection_detail JSONB NOT NULL,
+       caller_actor_id VARCHAR(26)
+   );
+   ```
+   Rows survive caller rollback. The chain walker reconciles `audit_swap_rejection_log` entries with the `audit_records` chain when reconstructing forensic history.
+
+3. **Tier 3 (caller-required commit boundary):** the SI's acceptance criteria require that `record_workflow_pointer_swap()` be invoked inside a transaction the caller commits IMMEDIATELY upon receiving the result tuple — no further work in the same transaction after the procedure returns. This contract is enforced via a runtime check at procedure entry that inspects the call stack via `current_query()` and rejects with a hard exception if invoked from inside a long-lived application transaction. The check is best-effort (Postgres exposes limited transaction context); the Tier 2 autonomous log is the unconditional durability backstop.
+
+**Acceptance criteria:** an SI-008 implementation MUST include a regression test that:
+1. Invokes `record_workflow_pointer_swap()` from a caller transaction that then rolls back
+2. Asserts the `audit_swap_rejection_log` row IS PRESENT post-rollback (Tier 2 durability)
+3. Asserts the `audit_records.ai_workflow_execution.swap_rejected` row IS ABSENT post-rollback (Tier 1 within-tx behavior; expected loss)
+4. Reconciles forensic history by joining the rejection log + the audit chain in the chain-walker test helper
 
 Three rejection codes:
 - `cas_mismatch`: CAS guard violation (step 5)
