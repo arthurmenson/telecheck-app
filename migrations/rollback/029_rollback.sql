@@ -17,14 +17,18 @@
 -- Spec:    Companion to migrations/029_audit_records_actor_tenant_id.sql.
 -- =============================================================================
 
--- 1. Drop the trigger + new function bodies (depend on the column we're
---    about to remove + the new canonical-hash signature we're about to
---    drop).
+-- 1. Drop the trigger + new function bodies (depend on the columns
+--    we're about to remove + the new canonical-hash signature we're
+--    about to drop).
 DROP TRIGGER IF EXISTS audit_records_before_insert ON audit_records;
 DROP TRIGGER IF EXISTS audit_records_hash_insert_trigger ON audit_records;
 DROP FUNCTION IF EXISTS audit_records_hash_insert();
 DROP FUNCTION IF EXISTS audit_records_canonical_hash(
     UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT,
+    JSONB, TEXT, TEXT, TEXT, JSONB, JSONB, BYTEA, BIGINT, TIMESTAMPTZ
+);
+DROP FUNCTION IF EXISTS audit_records_canonical_hash_v1(
+    UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT,
     JSONB, TEXT, TEXT, TEXT, JSONB, JSONB, BYTEA, BIGINT, TIMESTAMPTZ
 );
 
@@ -151,7 +155,10 @@ CREATE TRIGGER audit_records_before_insert
     FOR EACH ROW
     EXECUTE FUNCTION audit_records_hash_insert();
 
--- 5. Finally drop the column (no longer referenced by any function or
+-- 5. Finally drop the columns (no longer referenced by any function or
 --    trigger).
 ALTER TABLE audit_records
     DROP COLUMN IF EXISTS actor_tenant_id;
+
+ALTER TABLE audit_records
+    DROP COLUMN IF EXISTS hash_schema_version;

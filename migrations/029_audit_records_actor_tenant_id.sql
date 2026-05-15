@@ -66,6 +66,25 @@ COMMENT ON COLUMN audit_records.actor_tenant_id IS
     'while tenant_id reflects the resource tenant. NULL for system actors and '
     'pre-migration-029 legacy rows.';
 
+-- F-4 R7 HIGH-1 closure (Codex 2026-05-15): add hash_schema_version
+-- column so the verifier can dispatch by version. Pre-029 rows have
+-- NULL version (= legacy v1 hash function without actor_tenant_id);
+-- new rows get version 2 (the trigger sets it). Without this dispatch,
+-- the new canonical_hash function would compute different hashes for
+-- pre-029 rows (because COALESCE(NULL,'') still produces a different
+-- concat_ws output than the old function omitting actor_tenant_id
+-- entirely) — making historical rows look tampered.
+ALTER TABLE audit_records
+    ADD COLUMN IF NOT EXISTS hash_schema_version SMALLINT NULL;
+
+COMMENT ON COLUMN audit_records.hash_schema_version IS
+    'F-4 R7 closure: canonical-hash function version. NULL/1 = pre-029 '
+    'legacy hash (no actor_tenant_id in serialization). 2 = post-029 hash '
+    'with actor_tenant_id in serialization. The verifier dispatches by '
+    'this column. hash_schema_version itself participates in v2+ hashes '
+    'so a tamperer cannot downgrade a v2 row to v1 without invalidating '
+    'the hash.';
+
 -- ---------------------------------------------------------------------------
 -- F-4 R3 HIGH closure (Codex 2026-05-15): persisting actor_tenant_id is
 -- not enough — without including it in the hash chain, a malicious or
@@ -95,6 +114,12 @@ DROP FUNCTION IF EXISTS audit_records_canonical_hash(
     JSONB, TEXT, TEXT, TEXT, JSONB, JSONB, BYTEA, BIGINT, TIMESTAMPTZ
 );
 
+-- v2 canonical hash function. The serialization includes
+-- actor_tenant_id AND hash_schema_version so a tamperer cannot
+-- downgrade a v2 row to v1 hash without invalidating record_hash.
+-- A new p_hash_schema_version parameter is added (caller passes 2
+-- for new rows; the function panics if called with v1 since v1 rows
+-- use audit_records_canonical_hash_v1 below).
 CREATE OR REPLACE FUNCTION audit_records_canonical_hash(
     p_audit_id            UUID,
     p_tenant_id           TEXT,
@@ -122,8 +147,12 @@ LANGUAGE sql
 IMMUTABLE
 SET search_path = pg_catalog, public
 AS $$
+    -- v2 canonical: includes actor_tenant_id + hash_schema_version
+    -- discriminator at a fixed position so the version itself is
+    -- tamper-evident (downgrading version invalidates hash).
     SELECT digest(
         concat_ws('|',
+            'v2', -- hash schema version discriminator (defends against version-downgrade tamper)
             p_audit_id::TEXT,
             p_tenant_id,
             p_category,
@@ -151,6 +180,67 @@ $$;
 
 GRANT EXECUTE ON FUNCTION audit_records_canonical_hash(
     UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT,
+    JSONB, TEXT, TEXT, TEXT, JSONB, JSONB, BYTEA, BIGINT, TIMESTAMPTZ
+) TO PUBLIC;
+
+-- v1 canonical hash function (legacy; verbatim from migration 002).
+-- Preserves bit-exact serialization for pre-029 rows so the verifier
+-- can dispatch by hash_schema_version. Pre-029 rows have NULL version
+-- → treated as v1.
+CREATE OR REPLACE FUNCTION audit_records_canonical_hash_v1(
+    p_audit_id            UUID,
+    p_tenant_id           TEXT,
+    p_category            TEXT,
+    p_audit_sensitivity_level TEXT,
+    p_action              TEXT,
+    p_actor_type          TEXT,
+    p_actor_id            TEXT,
+    p_ai_workload_type    TEXT,
+    p_autonomy_level      TEXT,
+    p_target_patient_id   TEXT,
+    p_delegate_context    JSONB,
+    p_resource_type       TEXT,
+    p_resource_id         TEXT,
+    p_country_of_care     TEXT,
+    p_break_glass         JSONB,
+    p_payload             JSONB,
+    p_prev_hash           BYTEA,
+    p_sequence_number     BIGINT,
+    p_recorded_at         TIMESTAMPTZ
+)
+RETURNS BYTEA
+LANGUAGE sql
+IMMUTABLE
+SET search_path = pg_catalog, public
+AS $$
+    SELECT digest(
+        concat_ws('|',
+            p_audit_id::TEXT,
+            p_tenant_id,
+            p_category,
+            p_audit_sensitivity_level,
+            p_action,
+            p_actor_type,
+            p_actor_id,
+            COALESCE(p_ai_workload_type,  ''),
+            COALESCE(p_autonomy_level,    ''),
+            COALESCE(p_target_patient_id, ''),
+            COALESCE(p_delegate_context::TEXT, ''),
+            COALESCE(p_resource_type,     ''),
+            COALESCE(p_resource_id,       ''),
+            COALESCE(p_country_of_care,   ''),
+            COALESCE(p_break_glass::TEXT, ''),
+            p_payload::TEXT,
+            p_prev_hash::TEXT,
+            p_sequence_number::TEXT,
+            p_recorded_at::TEXT
+        ),
+        'sha256'
+    );
+$$;
+
+GRANT EXECUTE ON FUNCTION audit_records_canonical_hash_v1(
+    UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT,
     JSONB, TEXT, TEXT, TEXT, JSONB, JSONB, BYTEA, BIGINT, TIMESTAMPTZ
 ) TO PUBLIC;
 
@@ -184,9 +274,12 @@ BEGIN
         NEW.sequence_number := v_prev_record.sequence_number + 1;
     END IF;
 
-    -- F-4 R3 closure: include actor_tenant_id in canonical hash so
-    -- tampering with the column post-INSERT is detected by chain
-    -- validation.
+    -- F-4 R3+R7 closure: set hash_schema_version=2 on every new row
+    -- + include actor_tenant_id in canonical hash. Pre-029 rows
+    -- already in the table keep their NULL hash_schema_version and
+    -- their original v1 record_hash; the verifier dispatches by
+    -- column value.
+    NEW.hash_schema_version := 2;
     NEW.record_hash := audit_records_canonical_hash(
         NEW.audit_id,
         NEW.tenant_id,

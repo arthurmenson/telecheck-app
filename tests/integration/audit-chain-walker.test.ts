@@ -758,13 +758,15 @@ describe('assertAuditChainIntact — broken chain link (HIGH-1 closure)', () => 
             target_patient_id, action, category,
             audit_sensitivity_level, resource_type, resource_id,
             ai_workload_type, autonomy_level, payload,
-            sequence_number, prev_hash, record_hash, recorded_at)
+            sequence_number, prev_hash, record_hash, recorded_at,
+            hash_schema_version)
          VALUES
            ($1, $2, 'system', 'sys_broken_test',
             $3, 'consent_granted', 'C',
             'standard', 'consent_record', $4,
             NULL, NULL, '{}'::jsonb,
-            2, decode($5, 'hex'), decode($6, 'hex'), $7::timestamptz)`,
+            2, decode($5, 'hex'), decode($6, 'hex'), $7::timestamptz,
+            2)`,
         [
           secondAuditId,
           TENANT_US,
@@ -838,13 +840,15 @@ describe('assertAuditChainIntact — forged genesis (HIGH-1 closure)', () => {
             target_patient_id, action, category,
             audit_sensitivity_level, resource_type, resource_id,
             ai_workload_type, autonomy_level, payload,
-            sequence_number, prev_hash, record_hash, recorded_at)
+            sequence_number, prev_hash, record_hash, recorded_at,
+            hash_schema_version)
          VALUES
            ($1, $2, 'system', 'sys_forged_genesis',
             $3, 'consent_granted', 'C',
             'standard', 'consent_record', $4,
             NULL, NULL, '{}'::jsonb,
-            1, decode($5, 'hex'), decode($6, 'hex'), $7::timestamptz)`,
+            1, decode($5, 'hex'), decode($6, 'hex'), $7::timestamptz,
+            2)`,
         [
           auditId,
           TENANT_US,
