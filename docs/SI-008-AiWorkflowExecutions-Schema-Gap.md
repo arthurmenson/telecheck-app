@@ -60,14 +60,24 @@ recommendation_encrypted_at TIMESTAMPTZ  NULL
 recommendation_dek_ciphertext BYTEA      NULL
 
 UNIQUE (tenant_id, id)  -- composite UNIQUE for cross-entity composite FK safety (SI-005, SI-007 precedent)
+
+-- R4 closure: triple-composite UNIQUE for same-consult-lineage
+-- supersession FK below. Required so the (tenant_id, consult_id, id)
+-- composite is referenceable.
+UNIQUE (tenant_id, consult_id, id)
+
 FOREIGN KEY (tenant_id, consult_id) REFERENCES consults (tenant_id, id)
 FOREIGN KEY (tenant_id, protocol_id) REFERENCES protocols (tenant_id, id)  -- when protocols table ratifies
 
--- R3 closure: self-referential composite FK for the rerun chain.
--- Same-tenant enforcement: a workflow execution cannot supersede an
--- execution in a different tenant. The FK is NOT VALID at migration
--- time (no rows to validate against; satisfied by future INSERTs).
-FOREIGN KEY (tenant_id, supersedes_execution_id) REFERENCES ai_workflow_executions (tenant_id, id)
+-- R3 + R4 closure: self-referential triple-composite FK for the rerun
+-- chain. Enforces SAME-TENANT AND SAME-CONSULT lineage at the DB
+-- layer — a workflow execution can only supersede a prior execution
+-- that belongs to the SAME consult, not just any execution in the
+-- same tenant. Closes Codex R4 HIGH: prior FK only enforced
+-- same-tenant, leaving the supersession chain corrupt-able via a
+-- stale forward pointer.
+FOREIGN KEY (tenant_id, consult_id, supersedes_execution_id)
+    REFERENCES ai_workflow_executions (tenant_id, consult_id, id)
 
 -- R3 closure: acyclicity guard. A workflow execution MUST NOT
 -- supersede itself. Deeper-cycle detection (A→B→A) requires graph
