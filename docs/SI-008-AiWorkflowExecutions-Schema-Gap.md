@@ -215,7 +215,20 @@ Codex R6 HIGH correctly identified that the self-cycle CHECK alone (`supersedes_
 
 2. **Pointer swaps target a fresh execution not already in the chain.** `record_workflow_pointer_swap()` MUST walk the consult's existing supersession chain (starting from `consults.ai_workflow_execution_id` and recursively following `supersedes_execution_id` until NULL) and REJECT the swap if the proposed new execution's id appears anywhere in the chain. The chain walk runs INSIDE the procedure's row-locked transaction so it sees the current authoritative state.
 
-3. **Reusing a completed execution as a fresh swap target is rejected.** If `new_execution.supersedes_execution_id IS NOT NULL` (i.e., it was already the result of a prior supersession), AND the same `new_execution.id` is being swapped INTO `consults.ai_workflow_execution_id`, the procedure REJECTS. This is the A→B→A guard: B can only supersede A once; reusing B (with its B→A supersession) to subsequently replace any execution in the same consult is forbidden.
+3. **Reusing an already-authoritative execution as a fresh swap target is rejected (R12 HIGH closure).** The procedure REJECTS the swap if the proposed `new_execution.id` was EVER previously authoritative on this consult — i.e., if it appears anywhere in the consult's current supersession chain (walked from `consults.ai_workflow_execution_id` recursively via `supersedes_execution_id`). The check at R6 contract item 2 above already implements this walk; this item is the explicit guard.
+
+   Codex R12 HIGH correctly identified that a naive "reject if `supersedes_execution_id IS NOT NULL`" guard would block every legitimate rerun (every supersession row has non-NULL supersedes_execution_id by definition). The CORRECT guard rejects only `id`-already-in-chain reuse.
+
+   **Accepted examples:**
+   - First-write: insert A with supersedes_execution_id=NULL, swap pointer to A. ✓
+   - First rerun: insert B with supersedes_execution_id=A (the current pointer), swap pointer A→B. ✓
+   - Second rerun: insert C with supersedes_execution_id=B, swap pointer B→C. Chain is C→B→A. ✓
+   - Deep chain: D supersedes C, becomes authoritative. Chain is D→C→B→A. ✓
+
+   **Rejected examples:**
+   - A→B→A cycle: attempt to swap pointer back to A after chain is B→A. A already in chain → REJECT.
+   - Re-INSERT of completed-but-unswapped orphan: a workflow caller cannot swap an orphaned completed row into authority via a NEW insert with the same id; ULIDs are unique by construction so this is impossible at the DB layer.
+   - Reuse of completed authoritative row: impossible by construction since IDs are unique + supersedes_execution_id is INSERT-time-immutable.
 
 Combined, these three contracts make the supersession chain a strictly-monotonic DAG: each execution appears at most once per consult lineage, the chain root (NULL `supersedes_execution_id`) is set once at INSERT, and post-INSERT `supersedes_execution_id` is immutable.
 
