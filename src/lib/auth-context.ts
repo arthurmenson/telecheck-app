@@ -34,7 +34,25 @@ import fp from 'fastify-plugin';
 import { config } from './config.js';
 import type { TenantId } from './glossary.js';
 import { verifyAccessToken } from './jwt.js';
-import { KNOWN_TENANT_IDS, lookupActiveTenantById } from './tenant-context.js';
+import { lookupActiveTenantById } from './tenant-context.js';
+
+/**
+ * Phase 2 F-2 R1 MEDIUM closure (2026-05-15): canonical tenant_id
+ * format validator. Rejects whitespace-padded, empty, lowercase, and
+ * any value not matching `Telecheck-{Country}` (one uppercase letter
+ * followed by letters). Tightens the DB-lookup boundary so a
+ * malformed JWT claim cannot probe the tenants table.
+ *
+ * Matches the format pattern from `glossary.ts asTenantId()`, kept
+ * local to avoid pulling in the validation error path (auth hook
+ * silently leaves actorContext undefined on failure).
+ */
+const CANONICAL_TENANT_ID_PATTERN = /^Telecheck-[A-Z][A-Za-z]+$/;
+function isCanonicalTenantIdFormat(raw: string): boolean {
+  if (typeof raw !== 'string') return false;
+  if (raw.trim() !== raw) return false; // reject leading/trailing whitespace
+  return CANONICAL_TENANT_ID_PATTERN.test(raw);
+}
 
 // ---------------------------------------------------------------------------
 // ActorContext type
@@ -170,29 +188,23 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
     if (claims.role !== 'platform_admin') {
       if (tenantCtx.tenantId !== claims.tenant_id) return;
     } else {
-      // Phase 2 R4 HIGH-2 + R5 HIGH-2 closure (2026-05-15; F-2):
+      // Phase 2 R4 HIGH-2 + R5 HIGH-2 + F-2 R1 closure (2026-05-15):
       // platform_admin is global, but the JWT's home-tenant claim
-      // MUST still be a recognized ACTIVE tenant. R4 closure used a
-      // static KNOWN_TENANT_IDS set; R5 HIGH-2 correctly identified
-      // that a static set ignores DB lifecycle (a suspended/archived
-      // home-tenant would still authenticate). F-2 closure here adds
-      // the DB-authoritative active-tenant check.
+      // MUST be a DB-active tenant. ADMIN AUTH IS FAIL-CLOSED ON
+      // EVERY UNCERTAINTY — including DB unreachable. Closes Codex
+      // F-2 R1 HIGH: "DB outage fallback re-authorizes platform_admin
+      // tokens for inactive home tenants." Unlike host-resolution
+      // (where DB-unreachable falls back to KNOWN_TENANT_IDS for
+      // bootstrap/local-dev resilience), admin auth has higher
+      // criticality and MUST NOT preserve the prior fail-open path.
       //
-      // Tiered lookup (mirrors resolveHostToTenant's pattern):
-      //   - DB query 'active' → proceed (authoritative)
-      //   - DB query 'inactive_or_unknown' → fail closed (response
-      //     stays tenant-blind per I-025)
-      //   - DB query 'unreachable' (connection failure, NOT SQL
-      //     error) → fall back to KNOWN_TENANT_IDS bootstrap set
-      //     for resilience during DB outages / local-dev-without-DB
-      //   - Reachable-DB SQL error → re-throw (surfaces as 500;
-      //     prevents silent bypass on schema misconfig)
+      // Also normalizes format defense: reject any tenant_id whose
+      // raw value doesn't pass the canonical Telecheck-{Country}
+      // pattern. Closes Codex F-2 R1 MEDIUM: "Empty tenant IDs are
+      // rejected but whitespace tenant IDs still hit the database."
+      if (!isCanonicalTenantIdFormat(claims.tenant_id)) return;
       const dbResult = await lookupActiveTenantById(claims.tenant_id);
-      if (dbResult === 'inactive_or_unknown') return;
-      if (dbResult === 'unreachable') {
-        if (!KNOWN_TENANT_IDS.has(claims.tenant_id)) return;
-      }
-      // 'active' OR ('unreachable' + bootstrap-set hit) → proceed
+      if (dbResult !== 'active') return; // covers inactive + unknown + unreachable
     }
 
     // Phase 2 admin widening (2026-05-15): cross-tenant admin defense
