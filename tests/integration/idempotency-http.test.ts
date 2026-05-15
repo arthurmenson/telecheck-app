@@ -35,9 +35,13 @@ import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fas
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
+import { asTenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+const T_US = asTenantId(TENANT_US);
 
 // ---------------------------------------------------------------------------
 // Test app lifecycle
@@ -101,14 +105,35 @@ function assertNoTenantIdLeakageInError(response: { body: string }): void {
  * endpoint is admin-scoped (avoids the patient ownership complexity)
  * and creates a row with a deterministic shape on success.
  */
-async function adminAuthHeaders(): Promise<Record<string, string>> {
+async function adminAuthHeaders(accountId?: string): Promise<Record<string, string>> {
+  // Phase 2 admin JWT migration (2026-05-15): replaced legacy
+  // `x-actor-roles` / `x-actor-admin-tenant` header shim with JWT
+  // bearer. The accountId parameter lets callers override for the
+  // 4-tuple-PK actor-independence test (default: fresh per-call ULID).
   return {
     host: 'localhost',
-    'x-actor-id': `op_idem_${ulid()}`,
-    'x-actor-roles': 'tenant_admin',
-    'x-actor-admin-tenant': TENANT_US,
+    ...bearerAuthHeader({
+      accountId: accountId ?? `op_idem_${ulid()}`,
+      tenantId: T_US,
+      countryOfCare: 'US',
+      role: 'tenant_admin',
+    }),
     'content-type': 'application/json',
   };
+}
+
+/**
+ * Mint a fresh admin-JWT bearer header for a SPECIFIC accountId.
+ * Used by the 4-tuple-PK actor-independence test where actor A and
+ * actor B must produce distinct idempotency-key rows.
+ */
+function adminBearerForActor(accountId: string): { authorization: string } {
+  return bearerAuthHeader({
+    accountId,
+    tenantId: T_US,
+    countryOfCare: 'US',
+    role: 'tenant_admin',
+  });
 }
 
 function createTemplatePayload(): Record<string, unknown> {
@@ -297,8 +322,10 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
     const payloadA = createTemplatePayload();
     const payloadB = createTemplatePayload();
 
-    // Actor A creates with the key.
-    const headersA = { ...baseHeaders, 'x-actor-id': 'op_idem_actorA' };
+    // Actor A creates with the key. Override the JWT (which carries
+    // the accountId) so the idempotency 4-tuple PK's actor_id differs
+    // from Actor B's.
+    const headersA = { ...baseHeaders, ...adminBearerForActor('op_idem_actorA') };
     const first = await inject({
       method: 'POST',
       url: '/v0/forms/templates',
@@ -312,7 +339,7 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
     // cache this would 409 (body mismatch); with the 4-tuple PK
     // (tenant, key, endpoint, actor) it's an independent record so
     // the handler runs again and creates a SECOND template.
-    const headersB = { ...baseHeaders, 'x-actor-id': 'op_idem_actorB' };
+    const headersB = { ...baseHeaders, ...adminBearerForActor('op_idem_actorB') };
     const second = await inject({
       method: 'POST',
       url: '/v0/forms/templates',
@@ -392,10 +419,16 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
 
     // Tenant US: POST with the key. Host header `heroshealth.com` resolves
     // to TENANT_US per src/lib/tenant-context.ts hostname mapping.
-    const headersUS = {
-      ...(await adminAuthHeaders()),
+    // JWT minted with tenant=US so the cross-tenant claim check passes.
+    const headersUS: Record<string, string> = {
       host: 'heroshealth.com',
-      'x-actor-admin-tenant': TENANT_US,
+      ...bearerAuthHeader({
+        accountId: `op_idem_us_${ulid()}`,
+        tenantId: T_US,
+        countryOfCare: 'US',
+        role: 'tenant_admin',
+      }),
+      'content-type': 'application/json',
     };
     const first = await inject({
       method: 'POST',
@@ -411,11 +444,17 @@ describe('idempotency plugin HTTP — 4-tuple PK independence', () => {
     // → resolves to TENANT_GHANA. With a single-tenant cache this would
     // 409 (body mismatch); with the 4-tuple PK (tenant, key, endpoint,
     // actor) it's an independent record so the handler runs again and
-    // creates a SECOND template.
-    const headersGH = {
-      ...(await adminAuthHeaders()),
+    // creates a SECOND template. JWT minted with tenant=Ghana so the
+    // cross-tenant claim check passes.
+    const headersGH: Record<string, string> = {
       host: 'ghana.heroshealth.com',
-      'x-actor-admin-tenant': TENANT_GHANA,
+      ...bearerAuthHeader({
+        accountId: `op_idem_gh_${ulid()}`,
+        tenantId: asTenantId(TENANT_GHANA),
+        countryOfCare: 'GH',
+        role: 'tenant_admin',
+      }),
+      'content-type': 'application/json',
     };
     const second = await inject({
       method: 'POST',
