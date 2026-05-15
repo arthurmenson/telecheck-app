@@ -742,7 +742,7 @@ describe('assertAuditChainIntact — broken chain link (HIGH-1 closure)', () => 
         `SELECT encode(
             audit_records_canonical_hash(
               $1::uuid, $2, 'C', 'standard', 'consent_granted',
-              'system', 'sys_broken_test', NULL, NULL,
+              'system', 'sys_broken_test', NULL, NULL, NULL,
               $3, NULL, 'consent_record', $4, NULL, NULL,
               '{}'::jsonb, decode($5, 'hex'), 2::bigint, $6::timestamptz
             ),
@@ -822,7 +822,7 @@ describe('assertAuditChainIntact — forged genesis (HIGH-1 closure)', () => {
         `SELECT encode(
             audit_records_canonical_hash(
               $1::uuid, $2, 'C', 'standard', 'consent_granted',
-              'system', 'sys_forged_genesis', NULL, NULL,
+              'system', 'sys_forged_genesis', NULL, NULL, NULL,
               $3, NULL, 'consent_record', $4, NULL, NULL,
               '{}'::jsonb, decode($5, 'hex'), 1::bigint, $6::timestamptz
             ),

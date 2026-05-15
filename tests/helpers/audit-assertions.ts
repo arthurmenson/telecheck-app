@@ -130,7 +130,7 @@ const ENVELOPE_SELECT = `
     encode(
       audit_records_canonical_hash(
         audit_id, tenant_id, category, audit_sensitivity_level, action,
-        actor_type, actor_id, ai_workload_type, autonomy_level,
+        actor_type, actor_id, actor_tenant_id, ai_workload_type, autonomy_level,
         target_patient_id, delegate_context, resource_type, resource_id,
         country_of_care, break_glass, payload, prev_hash, sequence_number,
         recorded_at

@@ -65,3 +65,149 @@ COMMENT ON COLUMN audit_records.actor_tenant_id IS
     'For platform_admin cross-tenant actions, this is the admin''s home tenant '
     'while tenant_id reflects the resource tenant. NULL for system actors and '
     'pre-migration-029 legacy rows.';
+
+-- ---------------------------------------------------------------------------
+-- F-4 R3 HIGH closure (Codex 2026-05-15): persisting actor_tenant_id is
+-- not enough — without including it in the hash chain, a malicious or
+-- buggy actor could mutate actor_tenant_id post-INSERT without the
+-- chain verifier detecting the tampering. Drop + recreate the canonical
+-- hash function with actor_tenant_id participating in the canonical
+-- serialization. Update the trigger function to pass NEW.actor_tenant_id.
+-- ---------------------------------------------------------------------------
+
+-- DROP first because we're changing the function's parameter list signature
+-- (Postgres requires a DROP-then-CREATE; CREATE OR REPLACE doesn't support
+-- signature changes). The trigger function holds a reference, so we
+-- recreate both in dependency order: drop trigger → drop canonical hash
+-- → recreate canonical hash with new sig → recreate trigger function
+-- → re-bind trigger.
+DROP TRIGGER IF EXISTS audit_records_hash_insert_trigger ON audit_records;
+DROP FUNCTION IF EXISTS audit_records_hash_insert();
+DROP FUNCTION IF EXISTS audit_records_canonical_hash(
+    UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT,
+    JSONB, TEXT, TEXT, TEXT, JSONB, JSONB, BYTEA, BIGINT, TIMESTAMPTZ
+);
+
+CREATE OR REPLACE FUNCTION audit_records_canonical_hash(
+    p_audit_id            UUID,
+    p_tenant_id           TEXT,
+    p_category            TEXT,
+    p_audit_sensitivity_level TEXT,
+    p_action              TEXT,
+    p_actor_type          TEXT,
+    p_actor_id            TEXT,
+    p_actor_tenant_id     TEXT,
+    p_ai_workload_type    TEXT,
+    p_autonomy_level      TEXT,
+    p_target_patient_id   TEXT,
+    p_delegate_context    JSONB,
+    p_resource_type       TEXT,
+    p_resource_id         TEXT,
+    p_country_of_care     TEXT,
+    p_break_glass         JSONB,
+    p_payload             JSONB,
+    p_prev_hash           BYTEA,
+    p_sequence_number     BIGINT,
+    p_recorded_at         TIMESTAMPTZ
+)
+RETURNS BYTEA
+LANGUAGE sql
+IMMUTABLE
+SET search_path = pg_catalog, public
+AS $$
+    SELECT digest(
+        concat_ws('|',
+            p_audit_id::TEXT,
+            p_tenant_id,
+            p_category,
+            p_audit_sensitivity_level,
+            p_action,
+            p_actor_type,
+            p_actor_id,
+            COALESCE(p_actor_tenant_id, ''),
+            COALESCE(p_ai_workload_type,  ''),
+            COALESCE(p_autonomy_level,    ''),
+            COALESCE(p_target_patient_id, ''),
+            COALESCE(p_delegate_context::TEXT, ''),
+            COALESCE(p_resource_type,     ''),
+            COALESCE(p_resource_id,       ''),
+            COALESCE(p_country_of_care,   ''),
+            COALESCE(p_break_glass::TEXT, ''),
+            p_payload::TEXT,
+            p_prev_hash::TEXT,
+            p_sequence_number::TEXT,
+            p_recorded_at::TEXT
+        ),
+        'sha256'
+    );
+$$;
+
+GRANT EXECUTE ON FUNCTION audit_records_canonical_hash(
+    UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT,
+    JSONB, TEXT, TEXT, TEXT, JSONB, JSONB, BYTEA, BIGINT, TIMESTAMPTZ
+) TO PUBLIC;
+
+CREATE OR REPLACE FUNCTION audit_records_hash_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_partition_key     TEXT;
+    v_prev_record       RECORD;
+BEGIN
+    v_partition_key := NEW.tenant_id || ':' || COALESCE(NEW.target_patient_id, 'PLATFORM');
+    PERFORM pg_advisory_xact_lock(hashtextextended(v_partition_key, 0));
+
+    SELECT sequence_number, record_hash
+    INTO   v_prev_record
+    FROM   public.audit_records
+    WHERE  tenant_id = NEW.tenant_id
+      AND  COALESCE(target_patient_id, 'PLATFORM') = COALESCE(NEW.target_patient_id, 'PLATFORM')
+    ORDER BY sequence_number DESC
+    LIMIT  1
+    FOR    UPDATE;
+
+    IF v_prev_record IS NULL THEN
+        NEW.prev_hash       := digest('GENESIS:' || v_partition_key, 'sha256');
+        NEW.sequence_number := 1;
+    ELSE
+        NEW.prev_hash       := v_prev_record.record_hash;
+        NEW.sequence_number := v_prev_record.sequence_number + 1;
+    END IF;
+
+    -- F-4 R3 closure: include actor_tenant_id in canonical hash so
+    -- tampering with the column post-INSERT is detected by chain
+    -- validation.
+    NEW.record_hash := audit_records_canonical_hash(
+        NEW.audit_id,
+        NEW.tenant_id,
+        NEW.category,
+        NEW.audit_sensitivity_level,
+        NEW.action,
+        NEW.actor_type,
+        NEW.actor_id,
+        NEW.actor_tenant_id,
+        NEW.ai_workload_type,
+        NEW.autonomy_level,
+        NEW.target_patient_id,
+        NEW.delegate_context,
+        NEW.resource_type,
+        NEW.resource_id,
+        NEW.country_of_care,
+        NEW.break_glass,
+        NEW.payload,
+        NEW.prev_hash,
+        NEW.sequence_number,
+        NEW.recorded_at
+    );
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER audit_records_hash_insert_trigger
+    BEFORE INSERT ON audit_records
+    FOR EACH ROW
+    EXECUTE FUNCTION audit_records_hash_insert();
