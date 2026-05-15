@@ -6,8 +6,9 @@
 **v0.3 advanced:** 2026-05-14 (close Codex R1 HIGH — subscriber-compat protocol for cutover)
 **v0.4 advanced:** 2026-05-14 (close Codex R2 HIGH — dispatcher-side observability + merge-time inventory re-run)
 **v0.5 advanced:** 2026-05-14 (close Codex R3 HIGH — split protocol into v1.0 vs v1.X+; explicit prerequisite block)
+**v0.6 advanced:** 2026-05-14 (close Codex R4 HIGH — v1.0 CI guardrail blocks unregistered consumers)
 **Severity:** medium
-**Status:** OPEN — v0.5 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
+**Status:** OPEN — v0.6 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_DOMAIN_EVENTS.md` (v5.2 → **v5.3**)
 **Promotion Ledger target:** **P-015** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 in flight at PR #136)
 **Parallel SI:** SI-002 (audit-side placeholder gap; concurrent dot-namespaced naming convention)
@@ -214,6 +215,18 @@ Twelve detail-shape archetypes, one per aggregate-prefix. Listed here for ratifi
 3. **Producer cutover (one PR per slice).** Each slice atomically replaces placeholder strings with canonical strings in `src/modules/<slice>/events.ts` AND the slice's outbox-landing test file AND the forward-compat fixture (step 2). PRs are squash-merged; CI gate is the standard test-suite green + the new fixture green.
 
 **Promotion trigger from v1.0 → v1.X protocol.** The FIRST time a non-test external service (a worker, a separate microservice, an analytics consumer, etc.) issues `POST /v0/internal/outbox/subscribe` to the dispatcher, Decision 7B activates. The activation is observable: the `subscriber_registry` table goes from 0 rows to 1+ rows. The first registration MUST be paired with a Promotion Ledger entry "P-NNN — Outbox subscriber inventory crossed zero; Decision 7B activates" and any in-flight rename PR MUST pause and re-evaluate under 7B.
+
+**v0.6 — interim v1.0 CI guardrail (Codex R4 HIGH closure 2026-05-14).** The activation observation point (`POST /v0/internal/outbox/subscribe` + `subscriber_registry`) is itself part of the deferred Decision 7B infrastructure. Without an enforceable v1.0 interim control, a first consumer could be deployed BEFORE P-1 through P-5 exist by directly querying `domain_events_outbox` or matching event_type strings in its own code, and the registry would remain empty even though a consumer is reading the outbox. v0.6 closes this gap with two layered v1.0-period enforcement controls:
+
+- **G-1. CODEOWNERS grep-block on direct outbox access.** The file `.github/CODEOWNERS` MUST be amended at SI-003 ratification time to require `@platform-eventing-team` review for ANY change that introduces a new direct query against `domain_events_outbox` outside the 3 emitting slices' module trees AND outside `lib/domain-events.ts` itself. The CODEOWNERS rule is `tests/integration/**outbox** @platform-eventing-team` (already covered) plus a new pattern `src/modules/**/!(consent|identity|forms-intake)/** @platform-eventing-team` scoped narrowly via a `domain_events_outbox` grep in the CI check.
+- **G-2. CI grep-block PR check.** A new GitHub Actions workflow `.github/workflows/outbox-consumer-guard.yml` runs on every PR. The check fails if `git diff origin/main HEAD` adds a line containing either `domain_events_outbox` OR `event_type` (in the context of an outbox read) outside the allowlist: `src/modules/consent/**`, `src/modules/identity/**`, `src/modules/forms-intake/**`, `src/lib/domain-events.ts`, `src/lib/outbox-relay.ts` (forward-compat once P-1 lands), `tests/integration/**outbox**`, `docs/SI-003-*.md`, `docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_*.md`. A new consumer service MUST either expand this allowlist (via a PR that triggers @platform-eventing-team review per G-1) or wait for the Decision 7B infrastructure to land. The CI gate is bypass-able only by an explicit `outbox-consumer-guard: bypass` label applied by @platform-eventing-team.
+
+**Interim v1.0 deliverables (NOT deferred; part of SI-003 ratification):**
+
+- **G-1 deliverable:** the CODEOWNERS amendment + the explanatory comment block, committed in the v5.3 promotion PR.
+- **G-2 deliverable:** the GitHub Actions workflow + its allowlist, committed in the v5.3 promotion PR.
+
+These two interim controls have zero infrastructure dependency (no dispatcher, no registry table, no /v0/internal/ endpoint) and can be shipped as part of the SI-003 ratification deliverables. They guarantee that any first external consumer triggers human review by the team that owns the Decision 7B infrastructure, eliminating the "consumer ships silently before 7B exists" gap.
 
 #### Decision 7B — v1.X+ cutover protocol (active once any external subscriber registers)
 
