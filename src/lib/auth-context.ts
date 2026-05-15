@@ -206,7 +206,26 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
       //     availability)
       //   - country_of_care claim ≠ DB row → fail closed
       if (!isCanonicalTenantIdFormat(claims.tenant_id)) return;
-      const dbResult = await lookupActiveTenantById(claims.tenant_id);
+      // F-2 R3 HIGH closure (2026-05-15): a reachable-DB SQL/schema/
+      // permission error from lookupActiveTenantById re-throws by
+      // design (caller-discretion semantics; same pattern as
+      // resolveHostFromDb). For the AUTH BOUNDARY here, that would
+      // escape and turn admin requests into 500s instead of
+      // tenant-blind 401s. Wrap with try/catch + fail closed, but
+      // still log the underlying error so operators can triage
+      // schema drift / permission regressions without losing the
+      // signal. Connection failures and 'inactive_or_unknown' both
+      // fall through to the unified fail-closed path below.
+      let dbResult: Awaited<ReturnType<typeof lookupActiveTenantById>>;
+      try {
+        dbResult = await lookupActiveTenantById(claims.tenant_id);
+      } catch (err) {
+        request.log?.error?.(
+          { err, tenant_id: claims.tenant_id, sub: claims.sub },
+          'auth-context: lookupActiveTenantById threw for platform_admin JWT — failing closed',
+        );
+        return;
+      }
       if (dbResult.kind !== 'active') return;
       // Country binding: the JWT's country_of_care claim MUST match
       // the validated home tenant's country in the tenants row.
