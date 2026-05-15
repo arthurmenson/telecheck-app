@@ -3,7 +3,7 @@
 **Raised by:** Engineering (autonomous turn 2026-05-05)
 **Date raised:** 2026-05-05
 **Severity:** medium
-**Status:** **OPEN — v0.2 DRAFT** (concrete proposals added 2026-05-14: naming convention picked, category assignments + detail shapes proposed, P-NUM target updated; pre-ratification Codex gate pending)
+**Status:** **OPEN — v0.3 DRAFT** (Codex R1 HIGH + MEDIUM closed 2026-05-14: identity authentication-proof events promoted to Category B; forms.submission detail shape split per-event with explicit nullability)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (v5.2 → v5.5 proposed; v5.3 was bumped at P-011 for crisis-detection MedicationRequest closure, v5.4 by SI-007 P-013 for refill/dispensing/shipment, so SI-002 closure targets v5.5)
 **Promotion Ledger:** **P-014** (updated from v0.1's P-012 — P-012 slot was deferred to a future implementation-milestone-class entry per Addendum 4 status doc; P-013 is now claimed by SI-007 v0.19 merged 2026-05-14)
 **Related slice PRDs:** Forms/Intake v2.1 §13, Identity Spec §3, Consent Slice PRD v1.0 §10
@@ -79,17 +79,17 @@ Per-event categorization for the 31 IDs (v0.2 proposal):
 
 #### Identity & Auth (9 events)
 
-| Canonical ID                     | Category | Rationale                                                                                                                 |
-| -------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `identity.account.created`       | C        | Account lifecycle; operational                                                                                            |
-| `identity.account.activated`     | C        | Account lifecycle; operational                                                                                            |
-| `identity.session.issued`        | C        | Session lifecycle; operational                                                                                            |
-| `identity.session.revoked`       | B        | Revocation has security-policy significance; governance                                                                   |
-| `identity.otp.issued`            | C        | OTP lifecycle; operational                                                                                                |
-| `identity.otp.consumed`          | C        | OTP lifecycle; operational                                                                                                |
-| `identity.otp.lockout_triggered` | B        | Lockout is a security event; governance for ops review (Codex review pattern: lockouts may indicate brute-force attempts) |
-| `identity.device.registered`     | C        | Device lifecycle; operational                                                                                             |
-| `identity.device.revoked`        | B        | Device revocation has security significance; governance                                                                   |
+| Canonical ID                     | Category | Rationale                                                                                                                                                  |
+| -------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `identity.account.created`       | C        | Account lifecycle; operational                                                                                                                             |
+| `identity.account.activated`     | C        | Account lifecycle; operational                                                                                                                             |
+| `identity.session.issued`        | **B**    | Authentication proof: security/compliance review must reconstruct who got authenticated when. Promoted from C → B per Codex R1 HIGH closure 2026-05-14.    |
+| `identity.session.revoked`       | B        | Revocation has security-policy significance; governance                                                                                                    |
+| `identity.otp.issued`            | **B**    | Authentication-proof issuance: compliance must see issuance regardless of whether lockout fires. Promoted from C → B per Codex R1 HIGH closure 2026-05-14. |
+| `identity.otp.consumed`          | **B**    | Authentication-proof consumption: compliance must see successful proof independently of lockout. Promoted from C → B per Codex R1 HIGH closure 2026-05-14. |
+| `identity.otp.lockout_triggered` | B        | Lockout is a security event; governance for ops review                                                                                                     |
+| `identity.device.registered`     | C        | Device lifecycle; operational                                                                                                                              |
+| `identity.device.revoked`        | B        | Device revocation has security significance; governance                                                                                                    |
 
 #### Consent + Delegated Access (8 events)
 
@@ -104,26 +104,28 @@ Per-event categorization for the 31 IDs (v0.2 proposal):
 | `delegation.scope.granted` | B        | Scope changes affect what the delegate can do; governance           |
 | `delegation.scope.revoked` | B        | Scope changes; governance                                           |
 
-**Summary:** 14 Category B (governance) + 17 Category C (operational). Zero Category A in SI-002 — Category A is reserved for safety-critical events (crisis, prescribing); the SI-002 set is operational + governance lifecycle.
+**Summary:** **17 Category B (governance) + 14 Category C (operational)** post-Codex-R1 closure. Zero Category A in SI-002 — Category A is reserved for safety-critical events (crisis, prescribing); the SI-002 set is operational + governance lifecycle. (Counts updated v0.2 → v0.3 per Codex R1 HIGH closure: 3 identity authentication-proof events `session.issued`, `otp.issued`, `otp.consumed` promoted C → B; was 14 B + 17 C in v0.2.)
 
 ### Detail-shape ratification per action
 
 The AUDIT_EVENTS v5.2 envelope's `detail` JSONB column is currently free-shape. v0.2 proposes the following **mandatory minimum field set** per action (additional fields are optional and slice-specific):
 
-| Action prefix                                               | Required `detail` fields                                                                                                                 |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `forms.template.*`                                          | `template_id`, `template_version`, `program_id`                                                                                          |
-| `forms.eligibility_logic.*` / `forms.approval_governance.*` | `template_id`, `template_version`, `changed_by_actor_id`, `change_summary`                                                               |
-| `forms.deployment.*`                                        | `deployment_id`, `template_id`, `template_version`, `program_id`, `country_of_care`                                                      |
-| `forms.submission.*`                                        | `submission_id`, `deployment_id`, `patient_id`, `status_before`, `status_after` (for state-transition events)                            |
-| `forms.variant.*`                                           | `variant_id`, `template_id`, `assignment_rule_summary`                                                                                   |
-| `identity.account.*`                                        | `account_id`, `phone_e164_hash` (NEVER plaintext phone), `account_type`                                                                  |
-| `identity.session.*`                                        | `session_id`, `account_id`, `device_id` (nullable; null for password-flow sessions), `revocation_reason` (for `.revoked` only)           |
-| `identity.otp.*`                                            | `otp_id`, `account_id`, `purpose` (`login` / `mfa` / etc.), `attempt_count` (for `.lockout_triggered` only)                              |
-| `identity.device.*`                                         | `device_id`, `account_id`, `device_fingerprint_hash` (NEVER plaintext fingerprint), `revocation_reason` (for `.revoked` only)            |
-| `consent.*`                                                 | `consent_id`, `account_id`, `consent_type`, `granted_at` (for `.granted` only), `revoked_at` + `revocation_reason` (for `.revoked` only) |
-| `delegation.*`                                              | `delegation_id`, `patient_account_id`, `delegate_account_id`, `scope_codes[]`, `status_before`, `status_after`                           |
-| `delegation.scope.*`                                        | `delegation_id`, `scope_code`, `granted_at` (for `.granted`) / `revoked_at` + `revocation_reason` (for `.revoked`)                       |
+| Action prefix                                               | Required `detail` fields                                                                                                                                                                                      |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `forms.template.*`                                          | `template_id`, `template_version`, `program_id`                                                                                                                                                               |
+| `forms.eligibility_logic.*` / `forms.approval_governance.*` | `template_id`, `template_version`, `changed_by_actor_id`, `change_summary`                                                                                                                                    |
+| `forms.deployment.*`                                        | `deployment_id`, `template_id`, `template_version`, `program_id`, `country_of_care`                                                                                                                           |
+| `forms.submission.started`                                  | `submission_id`, `deployment_id`, `patient_id`, `event_attempt_id` (correlation ID for retry-safe reconstruction). NO `status_before` (no prior state) per Codex R1 MEDIUM closure 2026-05-14.                |
+| `forms.submission.paused` / `.resumed` / `.abandoned`       | `submission_id`, `deployment_id`, `patient_id`, `status_before`, `status_after`, `transition_id` (correlation ID for idempotency-safe reconstruction across retries)                                          |
+| `forms.submission.completed`                                | `submission_id`, `deployment_id`, `patient_id`, `status_before` (typically `in_progress`), `status_after` (`completed`), `snapshot_id` (FK to forms_submission_snapshot row written same-tx), `transition_id` |
+| `forms.variant.*`                                           | `variant_id`, `template_id`, `assignment_rule_summary`                                                                                                                                                        |
+| `identity.account.*`                                        | `account_id`, `phone_e164_hash` (NEVER plaintext phone), `account_type`                                                                                                                                       |
+| `identity.session.*`                                        | `session_id`, `account_id`, `device_id` (nullable; null for password-flow sessions), `revocation_reason` (for `.revoked` only)                                                                                |
+| `identity.otp.*`                                            | `otp_id`, `account_id`, `purpose` (`login` / `mfa` / etc.), `attempt_count` (for `.lockout_triggered` only)                                                                                                   |
+| `identity.device.*`                                         | `device_id`, `account_id`, `device_fingerprint_hash` (NEVER plaintext fingerprint), `revocation_reason` (for `.revoked` only)                                                                                 |
+| `consent.*`                                                 | `consent_id`, `account_id`, `consent_type`, `granted_at` (for `.granted` only), `revoked_at` + `revocation_reason` (for `.revoked` only)                                                                      |
+| `delegation.*`                                              | `delegation_id`, `patient_account_id`, `delegate_account_id`, `scope_codes[]`, `status_before`, `status_after`                                                                                                |
+| `delegation.scope.*`                                        | `delegation_id`, `scope_code`, `granted_at` (for `.granted`) / `revoked_at` + `revocation_reason` (for `.revoked`)                                                                                            |
 
 **PHI guarantee:** every `detail` shape above either (a) references PHI by ID rather than value, OR (b) uses a hash (`phone_e164_hash`, `device_fingerprint_hash`) so the audit chain never carries plaintext PHI. This mirrors the SI-007 + crisis-detection-trigger discipline.
 
@@ -255,4 +257,10 @@ The autonomous-turn discipline: **never invent new canonical contract artifacts 
   - **Promotion Ledger target updated:** P-012 → P-014 (P-013 claimed by SI-007 v0.19 merged 2026-05-14).
   - **AUDIT_EVENTS version target updated:** v5.2 → v5.5 (was v5.2 → v5.3 in v0.1; v5.3 + v5.4 bumps consumed at P-011 + P-013).
   - **Pre-ratification gate added** per SI-001 + SI-007 retrospective lessons.
-- **Next:** v0.3 after Codex R1 review. Iterate to convergence per the SI-007 trajectory pattern (R1 → R18 was SI-007's path; SI-002's scope is broader and may extend longer).
+- **v0.3 — 2026-05-14** — Codex R1 HIGH + MEDIUM closed:
+  - **HIGH — Authentication-proof events were misclassified as operational.** v0.2 had `identity.session.issued`, `identity.otp.issued`, `identity.otp.consumed` as Category C. Codex R1: these are the audit trail for authentication proof + account-takeover investigation; under brute-force / replay / SIM-swap / compromised-account scenarios, compliance review needs visibility BEFORE `lockout_triggered` fires (which is a happy-path assumption that attacks cross the lockout threshold). Fix: promoted all 3 events to Category B. Recomputed counts: 17 B + 14 C (was 14 B + 17 C in v0.2).
+  - **MEDIUM — `forms.submission.*` prefix detail shape conflated state-transition events with non-transition events.** v0.2 mandated `status_before` + `status_after` for the whole `forms.submission.*` prefix, but `forms.submission.started` has no meaningful prior state. Fix: split the row per-event:
+    - `started`: `event_attempt_id` (no `status_before`).
+    - `paused` / `resumed` / `abandoned`: `status_before` + `status_after` + `transition_id`.
+    - `completed`: `status_before` + `status_after` + `transition_id` + `snapshot_id` (FK to same-tx snapshot row).
+- **Next:** v0.4 after Codex R2 review. Iterate to convergence per the SI-007 trajectory pattern (R1 → R18 was SI-007's path; SI-002's scope is broader and may extend longer).
