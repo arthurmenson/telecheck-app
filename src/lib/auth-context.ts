@@ -34,6 +34,7 @@ import fp from 'fastify-plugin';
 import { config } from './config.js';
 import type { TenantId } from './glossary.js';
 import { verifyAccessToken } from './jwt.js';
+import { KNOWN_TENANT_IDS } from './tenant-context.js';
 
 // ---------------------------------------------------------------------------
 // ActorContext type
@@ -154,6 +155,21 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
     // scope.
     if (claims.role !== 'platform_admin') {
       if (tenantCtx.tenantId !== claims.tenant_id) return;
+    } else {
+      // Phase 2 R4 HIGH-2 closure (2026-05-15): platform_admin is
+      // global, but the JWT's home-tenant claim MUST still be a
+      // recognized active tenant. Without this check, a signed
+      // platform_admin token with a stale/deleted/nonsensical home
+      // tenant would authenticate and the audit attribution would
+      // point to a non-existent tenant. Closes Codex R4 HIGH:
+      // "platform_admin skips validation of the JWT home tenant
+      // before global authorization."
+      //
+      // The known-tenant set is the canonical operating-tenant
+      // identifiers from tenant-context.ts. A future SI-008-style
+      // expansion to additional tenants only requires updating
+      // KNOWN_TENANT_IDS at the source.
+      if (!KNOWN_TENANT_IDS.has(claims.tenant_id)) return;
     }
 
     // Phase 2 admin widening (2026-05-15): cross-tenant admin defense

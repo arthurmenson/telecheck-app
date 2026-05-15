@@ -114,6 +114,22 @@ type SubdomainTenantEntry = {
   consumerSubdomain: string;
 };
 
+/**
+ * Phase 2 admin widening (2026-05-15): canonical set of operating-tenant
+ * identifiers known to the platform. Used by `authContextPlugin` to
+ * validate platform_admin JWTs' home-tenant claim (a platform_admin
+ * token issued with a stale/deleted/nonsensical tenant_id should be
+ * rejected even though platform_admin is globally scoped — otherwise
+ * audit attribution would reference a non-existent tenant).
+ *
+ * NOTE: derived from SUBDOMAIN_TENANT_MAP values at module-load time
+ * so the source of truth remains the subdomain registry.
+ */
+export const KNOWN_TENANT_IDS: ReadonlySet<string> = new Set<string>([
+  'Telecheck-US',
+  'Telecheck-Ghana',
+]);
+
 /** Maps hostname pattern → tenant entry. Case-insensitive on lookup. */
 const SUBDOMAIN_TENANT_MAP: Record<string, SubdomainTenantEntry> = {
   // Telecheck-US: heroshealth.com (consumer DBA: Heros Health)

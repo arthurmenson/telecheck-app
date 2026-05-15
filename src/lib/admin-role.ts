@@ -122,18 +122,14 @@ export function requireAdminRole(req: FastifyRequest): string {
       // wrong-binding tenant_admin BEFORE this point (leaving
       // actorContext undefined), so reaching here means an internal
       // invariant broke; refuse anyway.
-      throw req.server.httpErrors.forbidden(
-        'This action requires an administrative role.',
-      );
+      throw req.server.httpErrors.forbidden('This action requires an administrative role.');
     }
     // Authenticated as patient or clinician — does NOT authorize admin
     // surfaces. JWT is authoritative; fail closed. Do NOT fall through
     // to header shim (closes Codex R1 HIGH where a verified non-admin
     // JWT could be elevated by a forged x-actor-roles header in
     // ALLOW_ACTOR_HEADER_AUTH=true environments).
-    throw req.server.httpErrors.forbidden(
-      'This action requires an administrative role.',
-    );
+    throw req.server.httpErrors.forbidden('This action requires an administrative role.');
   }
 
   // Phase 2 R2 HIGH closure (2026-05-15): if a Bearer token was
