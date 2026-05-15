@@ -760,29 +760,30 @@ export async function emitAudit(
   // 2. Workload field validation (I-012 closure rule + sentinel rules)
   validateWorkloadFields(input);
 
-  // 2b. F-4 R5 MEDIUM closure (Codex 2026-05-15): runtime assertion that
-  // human actor types carry actor_tenant_id. The DB column is nullable
+  // 2b. F-4 R5+R6 closure (Codex 2026-05-15): runtime assertion that
+  // non-system actors carry actor_tenant_id. The DB column is nullable
   // by design (legacy pre-029 rows + system actors), but new emissions
-  // from human actors (patient/clinician/admin/operator/delegate)
-  // MUST populate it. Without this gate, a future caller that forgets
-  // to thread actorTenantId through would silently produce a non-system
-  // audit row with NULL attribution — durable bad evidence rather than
-  // a detectable failure.
-  const HUMAN_ACTOR_TYPES: ReadonlySet<string> = new Set([
-    'patient',
-    'clinician',
-    'operator',
-    'delegate',
-  ]);
+  // from non-system actors MUST populate it. Without this gate, a
+  // future caller that forgets to thread actorTenantId through would
+  // silently produce a non-system audit row with NULL attribution —
+  // durable bad evidence rather than a detectable failure.
+  //
+  // R6 closure: the invariant is now deny-by-default (require attribution
+  // for every actor_type except 'system' and 'ai_workload'). Including
+  // platform_admin, tenant_admin, pharmacist, etc. Previously only
+  // listed {patient, clinician, operator, delegate}, which left admin
+  // and AI-adjacent actor types as a forensic blind spot.
+  const NON_ATTRIBUTING_ACTOR_TYPES: ReadonlySet<string> = new Set(['system', 'ai_workload']);
   if (
-    HUMAN_ACTOR_TYPES.has(input.actor_type) &&
+    !NON_ATTRIBUTING_ACTOR_TYPES.has(input.actor_type) &&
     (input.actor_tenant_id === null || input.actor_tenant_id === undefined)
   ) {
     throw new Error(
       `emitAudit: action="${input.action}" actor_type="${input.actor_type}" requires ` +
-        'non-null actor_tenant_id (F-4 attribution). System actors may omit it; ' +
-        'human/admin/operator actors must populate it. Caller must thread ' +
-        'resolveActorTenantIdForAudit(req) into the audit emitter call site.',
+        'non-null actor_tenant_id (F-4 attribution). Only system and ai_workload ' +
+        'actor types may omit it; every other actor type must populate it. ' +
+        'Caller must thread resolveActorTenantIdForAudit(req) into the audit ' +
+        'emitter call site.',
     );
   }
 

@@ -113,7 +113,7 @@ const ENVELOPE_SELECT = `
     tenant_id,
     actor_type,
     actor_id,
-    NULL::text                            AS actor_tenant_id,
+    actor_tenant_id,
     target_patient_id,
     action,
     category,
