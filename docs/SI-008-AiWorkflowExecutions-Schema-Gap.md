@@ -180,6 +180,22 @@ Codex R2 HIGH-2 correctly identified that application-layer closure enforcement 
 
 The procedure is the AI-workflow analog of SI-005's `record_consult_clinician_decision` + `rotate_consult_clinician_decision_kms` definer-rights pattern.
 
+### Acyclicity enforcement for the SUPERSESSION chain (R6 HIGH closure 2026-05-15)
+
+Codex R6 HIGH correctly identified that the self-cycle CHECK alone (`supersedes_execution_id <> id`) doesn't prevent deeper cycles (A→B→A) or reuse of a stale execution as a supersession target. The R3 application-layer assertion was vague about exact enforcement.
+
+**Three concrete DB contracts to close R6 HIGH:**
+
+1. **`supersedes_execution_id` is IMMUTABLE once set.** Add a trigger BEFORE UPDATE on `ai_workflow_executions` that REJECTS any UPDATE where `OLD.supersedes_execution_id IS NOT NULL AND NEW.supersedes_execution_id IS DISTINCT FROM OLD.supersedes_execution_id`. This prevents post-INSERT mutation of the lineage column. Combined with the v0.3 GRANT model (app role has NO direct UPDATE rights on this column), only `record_workflow_pointer_swap()` can set the value — and only on a fresh INSERT or as a transition NULL → value.
+
+2. **Pointer swaps target a fresh execution not already in the chain.** `record_workflow_pointer_swap()` MUST walk the consult's existing supersession chain (starting from `consults.ai_workflow_execution_id` and recursively following `supersedes_execution_id` until NULL) and REJECT the swap if the proposed new execution's id appears anywhere in the chain. The chain walk runs INSIDE the procedure's row-locked transaction so it sees the current authoritative state.
+
+3. **Reusing a completed execution as a fresh swap target is rejected.** If `new_execution.supersedes_execution_id IS NOT NULL` (i.e., it was already the result of a prior supersession), AND the same `new_execution.id` is being swapped INTO `consults.ai_workflow_execution_id`, the procedure REJECTS. This is the A→B→A guard: B can only supersede A once; reusing B (with its B→A supersession) to subsequently replace any execution in the same consult is forbidden.
+
+Combined, these three contracts make the supersession chain a strictly-monotonic DAG: each execution appears at most once per consult lineage, the chain root (NULL `supersedes_execution_id`) is set once at INSERT, and post-INSERT `supersedes_execution_id` is immutable.
+
+**Failure behavior:** all three checks raise `SQLSTATE 22000` (data exception) inside the procedure with HINT messages directing operators to the specific violation. The audit row emitted is `ai_workflow_execution.supersession_rejected` Category A capturing the (proposed_new_execution_id, prior_pointer, rejection_reason) tuple for forensic recovery.
+
 ### Declarative same-consult enforcement for the FORWARD pointer (R5 HIGH closure 2026-05-15)
 
 Codex R5 HIGH correctly identified that even with the procedure-only-write GRANT model, a future migration / owner-role SQL / backfill path could obtain UPDATE rights and bypass the procedure. The forward FK in SI-005's resolution path must be tightened to enforce same-consult lineage declaratively, not just same-tenant.
