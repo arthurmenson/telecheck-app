@@ -93,15 +93,66 @@ The schema has two pointers:
 
 Without a single source of truth + consistency invariant, retries / re-runs / partial rollback could leave consult A pointing at execution X while execution Y ALSO claims consult A. Multiple workflows per consult is a legitimate semantic (a consult may have re-runs after a draft failure), but at any moment exactly ONE of those workflows is the **current authoritative** one whose recommendation drives clinician review.
 
-**Decision (v0.2; pre-ratification):**
+**Decision (v0.3; Codex R2 HIGH x2 closure 2026-05-15):**
 
-- **`ai_workflow_executions.consult_id` is non-unique** — a single consult may have multiple workflow execution rows representing retries / re-runs over time.
+### Non-unique backward pointer + supersession-aware forward pointer
+
+- **`ai_workflow_executions.consult_id` is non-unique** — a single consult may have multiple workflow execution rows over its lifecycle (re-runs after failure, refinement passes, etc.).
 - **`consults.ai_workflow_execution_id` is the authoritative current pointer** — at any moment, points to the SINGLE execution whose recommendation is currently in the consult's clinician-review queue.
-- **State machine invariant:** the workflow whose id is in `consults.ai_workflow_execution_id` MUST have `state='completed'`. The forward pointer is set when a workflow execution transitions `running → completed` AND wins the "current execution" race (atomic UPDATE with `WHERE consults.state='UNDER_REVIEW' AND consults.ai_workflow_execution_id IS NULL` or equivalent).
-- **Same-tenant invariant via composite FK:** the forward FK uses `(tenant_id, ai_workflow_execution_id)` so the pointed-at execution must be in the same tenant as the consult. Backward FK already enforces same-tenant per (2) above.
-- **Closure rule:** `ai_workflow_executions.consult_id` MUST equal `consults.id` for the execution row that `consults.ai_workflow_execution_id` points to. This invariant is enforced at the application layer (the state-machine transition that sets `consults.ai_workflow_execution_id` reads the execution row's `consult_id` and validates equality before UPDATE). A trigger-level enforcement is desirable for defense-in-depth but is complex (requires reading two rows in a single trigger fire); DB-level enforcement deferred until the application-layer invariant is proven stable.
+- **`ai_workflow_executions.supersedes_execution_id`** (NEW v0.3): when a re-run replaces an earlier execution, the new execution's `supersedes_execution_id` MUST equal the prior `consults.ai_workflow_execution_id` value at the moment of the swap. Audit trail recovers the entire chain via `supersedes_execution_id` walks.
 
-This decision preserves the ability to re-run a workflow after failure (multiple execution rows allowed) while pinning authoritative reference to a single row at any moment.
+### Compare-and-swap protocol for forward-pointer updates (v0.3 R2 HIGH-1 closure)
+
+Codex R2 HIGH-1 correctly identified that `WHERE consults.ai_workflow_execution_id IS NULL` blocks legitimate re-runs. v0.3 defines explicit CAS rules:
+
+**First-write (cold path):**
+```sql
+UPDATE consults
+   SET ai_workflow_execution_id = $new_execution_id
+ WHERE id = $consult_id
+   AND tenant_id = $tenant_id
+   AND state = 'UNDER_REVIEW'
+   AND ai_workflow_execution_id IS NULL    -- expected prior
+RETURNING id;
+```
+
+**Supersession (re-run path):**
+```sql
+UPDATE consults
+   SET ai_workflow_execution_id = $new_execution_id
+ WHERE id = $consult_id
+   AND tenant_id = $tenant_id
+   AND state = 'UNDER_REVIEW'                                     -- consult still pending decision
+   AND ai_workflow_execution_id = $expected_prior_execution_id    -- CAS guard
+RETURNING id;
+```
+
+The caller MUST supply `$expected_prior_execution_id` (the value they read at workflow-start time) — this is the compare-and-swap discriminator that prevents lost updates when two re-runs race. The new execution's `supersedes_execution_id` MUST also be set to `$expected_prior_execution_id` in the same transaction.
+
+**Audit emission paired with every swap:** every forward-pointer UPDATE (first-write OR supersession) emits an `ai_workflow_execution.current_pointer_swapped` Category A audit row capturing the (prior, new) execution_id pair + the actor that initiated the swap. The `supersedes_execution_id` column on the new execution + the audit row together enable forensic recovery of the full execution chain.
+
+**Cold-path failure:** if the first-write UPDATE affects zero rows (consult not UNDER_REVIEW or already has a pointer), the workflow caller reads the current consult state, decides whether to retry as a supersession OR fail the workflow with `ai_workflow_execution.race_lost` audit.
+
+### Same-tenant invariant via composite FK
+
+- The forward FK uses `(tenant_id, ai_workflow_execution_id)` so the pointed-at execution must be in the same tenant as the consult. Backward FK already enforces same-tenant per (2) above.
+
+### Closure rule (v0.3 R2 HIGH-2 closure)
+
+Codex R2 HIGH-2 correctly identified that application-layer closure enforcement leaves direct-SQL / migration / alternate-worker paths able to violate the invariant. v0.3 moves closure enforcement to the DB layer:
+
+**Definer-rights stored procedure `record_workflow_pointer_swap(...)`** is the ONLY path that can UPDATE `consults.ai_workflow_execution_id`. The procedure:
+1. Row-locks both `consults` and the new `ai_workflow_executions` row (in canonical id-order to prevent deadlocks)
+2. Validates the new execution's `consult_id` equals the consult's `id`
+3. Validates the new execution's `tenant_id` equals the consult's `tenant_id`
+4. Validates the new execution's `state = 'completed'`
+5. Validates the CAS guard (`$expected_prior_execution_id`)
+6. Performs the UPDATE + sets `supersedes_execution_id` on the new execution + INSERTs the paired audit row in the same transaction
+7. Returns success/failure
+
+**GRANT model:** application code's role has NO direct UPDATE privilege on `consults.ai_workflow_execution_id` or `ai_workflow_executions.consult_id` or `ai_workflow_executions.supersedes_execution_id`. All mutations go through `record_workflow_pointer_swap()`. This closes Codex R2 HIGH-2 by making the closure rule a DB contract, not an application convention.
+
+The procedure is the AI-workflow analog of SI-005's `record_consult_clinician_decision` + `rotate_consult_clinician_decision_kms` definer-rights pattern.
 
 ## Open questions for CDM author
 
