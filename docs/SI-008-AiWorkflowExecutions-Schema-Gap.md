@@ -99,7 +99,15 @@ When SI-008 closes:
 4. DOMAIN_EVENTS expansion canonicalizes the wire-out events.
 5. Forward migration ALTER (paired with rollback) adds any new columns ratified by §4 that the placeholder set didn't include.
 6. Forward migration ALTER (paired with rollback) renames / retypes any columns where placeholder + ratified differ.
-7. SI-005 deferred FK 6 (`consults.ai_workflow_execution_id`) can now be added as a NOT VALID composite FK referencing `ai_workflow_executions (tenant_id, id)`.
+7. SI-005 deferred FK 6 (`consults.ai_workflow_execution_id`) MUST be added as a TRIPLE-composite FK enforcing same-tenant AND same-consult lineage (per R5 closure below):
+   ```sql
+   ALTER TABLE consults
+       ADD CONSTRAINT fk_consults_ai_workflow_execution
+       FOREIGN KEY (tenant_id, id, ai_workflow_execution_id)
+       REFERENCES ai_workflow_executions (tenant_id, consult_id, id)
+       NOT VALID;
+   ```
+   The earlier-drafted shape `(tenant_id, ai_workflow_execution_id) → (tenant_id, id)` is **REJECTED** because it only enforces same-tenant — a tenant-A consult could point at any tenant-A execution regardless of which consult that execution belongs to. R5 HIGH closure made this triple-composite the only acceptable closure target.
 8. SI-008 status changed to "Resolved"; placeholder column SQL comments removed.
 
 ## Cross-tenant safety constraints (NOT placeholders; permanent)
