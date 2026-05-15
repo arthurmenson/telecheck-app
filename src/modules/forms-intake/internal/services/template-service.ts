@@ -76,9 +76,26 @@ import type {
  * catalog slice lands, add the lookup as the first step here so an
  * invalid program rejects with 400 before the INSERT.
  */
+/**
+ * F-4 actor parameter shape (Phase 2 R6 HIGH-2 closure 2026-05-15):
+ * services now accept actor as `{ actorId, actorTenantId }` instead of
+ * the bare actorId string. `actorTenantId` is the audit-attribution
+ * tenant — equals the resource tenant for tenant-scoped roles, equals
+ * the platform_admin's home tenant for cross-tenant admin actions.
+ * Handlers compute this via `resolveActorTenantId(req)`.
+ *
+ * Pre-F-4 callers passed `actorId` directly + audit envelope hardcoded
+ * `actorTenantId: ctx.tenantId`. That conflated resource tenant with
+ * actor tenant — wrong for platform_admin cross-tenant actions.
+ */
+export interface FormsIntakeActor {
+  actorId: string;
+  actorTenantId: string;
+}
+
 export async function createDraftTemplate(
   ctx: TenantContext,
-  actorId: string,
+  actor: FormsIntakeActor,
   input: CreateTemplateRequest,
   externalTx?: DbTransaction,
 ): Promise<FormTemplate> {
@@ -92,7 +109,7 @@ export async function createDraftTemplate(
       // and lands in the NOT NULL `created_by` column. Once the Identity
       // slice replaces the header shim with real session resolution,
       // actorId will be a validated ULID by construction.
-      createdBy: actorId,
+      createdBy: actor.actorId,
       presentationContent: input.layout,
       branchingLogic: input.branchingLogic,
       eligibilityLogic: input.eligibilityLogic,
@@ -105,8 +122,8 @@ export async function createDraftTemplate(
       await emitFormsTemplateCreatedAudit(
         {
           tenantId: ctx.tenantId,
-          actorId,
-          actorTenantId: ctx.tenantId,
+          actorId: actor.actorId,
+          actorTenantId: actor.actorTenantId,
           countryOfCare: ctx.countryOfCare,
           templateId: template.template_id,
           programId: template.program_id,
@@ -123,7 +140,7 @@ export async function createDraftTemplate(
         programId: template.program_id,
         countryOfCare: ctx.countryOfCare,
         templateVersion: template.template_version,
-        actorId,
+        actorId: actor.actorId,
       });
     },
     externalTx,

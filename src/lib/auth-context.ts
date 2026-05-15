@@ -539,3 +539,83 @@ export function requireAdminActorContext(
   }
   return actor as ActorContext & { role: 'tenant_admin' | 'platform_admin' };
 }
+
+// ---------------------------------------------------------------------------
+// F-4 platform_admin audit attribution helper (Phase 2 R6 HIGH-2 closure;
+// 2026-05-15)
+//
+// Closes Codex R6 HIGH-2: "Cross-tenant platform-admin actions are audited
+// under the resource tenant, not the admin home tenant." Handlers that emit
+// audit records pass actor_tenant_id to the audit envelope. Pre-F-4
+// convention was to pass ctx.tenantId (the resolved resource tenant) —
+// which is correct for tenant-scoped actors (patient/clinician/tenant_admin
+// all act within their home tenant) but WRONG for platform_admin acting
+// cross-tenant: a US platform_admin administering a Telecheck-Ghana
+// resource would be audited as a Ghana actor, hiding the cross-tenant
+// administrative access.
+//
+// resolveActorTenantId returns the correct actor_tenant_id for audit:
+//   - platform_admin → adminHomeTenantId (the admin's home tenant; the
+//     audit row's tenant_id is still the resource tenant via ctx.tenantId,
+//     but actor_tenant_id traces back to the admin's home)
+//   - tenant_admin → tenantId (== adminTenantBinding == resource tenant;
+//     all equal by the authContextPlugin's binding check)
+//   - patient / clinician → tenantId (actor's home tenant, which is also
+//     the resource tenant for these tenant-scoped roles)
+//   - unauthenticated → throws UnauthenticatedError (401)
+//
+// Handlers call this BEFORE the service-layer audit emission and thread
+// the result to the service, which in turn passes it to the audit
+// envelope's actor_tenant_id field. Services that hardcoded
+// `actorTenantId: ctx.tenantId` are migrated to accept actorTenantId
+// from the caller.
+// ---------------------------------------------------------------------------
+
+export function resolveActorTenantId(req: FastifyRequest): string {
+  const actor = requireActorContext(req);
+  if (actor.role === 'platform_admin') {
+    // Defense-in-depth: adminHomeTenantId is populated by
+    // authContextPlugin for platform_admin and is the JWT's tenant_id
+    // claim post-DB-validation (F-2). If for any reason it's null,
+    // refuse — better to surface a hard error than mis-attribute the
+    // audit row.
+    if (actor.adminHomeTenantId === null || actor.adminHomeTenantId.length === 0) {
+      throw new Error(
+        'resolveActorTenantId: platform_admin actor has null/empty adminHomeTenantId. ' +
+          'authContextPlugin should have populated this from the JWT claim. ' +
+          'This is a programming error; investigate.',
+      );
+    }
+    return actor.adminHomeTenantId;
+  }
+  // patient / clinician / tenant_admin — actor's tenant equals the
+  // resource tenant (enforced at JWT verify + tenant-claim equality
+  // check for non-platform_admin roles).
+  return actor.tenantId;
+}
+
+/**
+ * Transition-aware wrapper around `resolveActorTenantId` for handlers
+ * that may receive non-JWT requests during the Tier 2 retirement
+ * transition. When `req.actorContext` is populated, delegates to
+ * `resolveActorTenantId` (returns adminHomeTenantId for platform_admin,
+ * tenantId for tenant-scoped roles). When actorContext is undefined
+ * (legacy x-actor-id header-shim path), returns the supplied fallback
+ * — typically `ctx.tenantId`, which preserves pre-F-4 behavior for
+ * non-JWT actors.
+ *
+ * Used by admin handlers that still accept the Tier 2 header shim per
+ * src/lib/admin-role.ts's `requireAdminRole` no-JWT-attempted branch.
+ * Once ALLOW_ACTOR_HEADER_AUTH is removed entirely (cleanup blocked on
+ * all admin endpoints migrating to JWT-only), callers can switch
+ * directly to `resolveActorTenantId(req)`.
+ */
+export function resolveActorTenantIdForAudit(
+  req: FastifyRequest,
+  fallbackTenantId: string,
+): string {
+  if (req.actorContext === undefined) {
+    return fallbackTenantId;
+  }
+  return resolveActorTenantId(req);
+}
