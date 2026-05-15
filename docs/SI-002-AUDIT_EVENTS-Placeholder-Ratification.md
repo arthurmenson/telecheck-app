@@ -3,7 +3,7 @@
 **Raised by:** Engineering (autonomous turn 2026-05-05)
 **Date raised:** 2026-05-05
 **Severity:** medium
-**Status:** **OPEN — v0.4 DRAFT** (Codex R2 HIGH closed 2026-05-14: explicit transition contract added — atomic cutover, no dual-write window, test-update sequence ratified)
+**Status:** **OPEN — v0.5 DRAFT** (Codex R3 HIGH closed 2026-05-14: category-canonicalization bridge added alongside action-id bridge — auth-proof rows pre-P-014 stored as Category C must be queryable as effectively Category B for compliance reviews spanning the boundary)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (v5.2 → v5.5 proposed; v5.3 was bumped at P-011 for crisis-detection MedicationRequest closure, v5.4 by SI-007 P-013 for refill/dispensing/shipment, so SI-002 closure targets v5.5)
 **Promotion Ledger:** **P-014** (updated from v0.1's P-012 — P-012 slot was deferred to a future implementation-milestone-class entry per Addendum 4 status doc; P-013 is now claimed by SI-007 v0.19 merged 2026-05-14)
 **Related slice PRDs:** Forms/Intake v2.1 §13, Identity Spec §3, Consent Slice PRD v1.0 §10
@@ -157,6 +157,33 @@ WHERE action IN ('forms.template.created', 'forms_template_created')
 
 The two-element `IN` list is the bridge; once historical-row retention timelines pass the P-014 timestamp + audit retention period, the bridge can be dropped.
 
+**Category-canonicalization bridge (v0.5 per Codex R3 HIGH closure 2026-05-14):** the auth-proof events (`identity.session.issued`, `identity.otp.issued`, `identity.otp.consumed`) are promoted from Category C → Category B at P-014. Historical rows pre-P-014 are stored with `category = 'C'` in the `audit_records` row (the trigger writes the category at INSERT time; I-003 append-only means the category column on prior rows cannot be retroactively rewritten). A compliance review filtering on Category B alone would silently MISS the historical auth-proof events — exactly the failure mode the C → B promotion was meant to fix.
+
+Bridge: the mapping artifact (Step 4 above) MUST extend beyond `(placeholder_action, canonical_action)` pairs to also carry **effective-category overrides for the 3 auth-proof actions**:
+
+| Placeholder action        | Canonical action          | Stored category (pre-P-014) | Effective category (post-P-014 compliance semantics) |
+| ------------------------- | ------------------------- | --------------------------- | ---------------------------------------------------- |
+| `identity_session_issued` | `identity.session.issued` | C                           | **B**                                                |
+| `identity_otp_issued`     | `identity.otp.issued`     | C                           | **B**                                                |
+| `identity_otp_consumed`   | `identity.otp.consumed`   | C                           | **B**                                                |
+
+Compliance-query contract for queries spanning P-014:
+
+```sql
+-- WRONG (silently misses pre-P-014 auth-proof rows):
+SELECT * FROM audit_records WHERE category = 'B';
+
+-- RIGHT (joins the mapping artifact for effective category):
+SELECT a.* FROM audit_records a
+LEFT JOIN audit_action_canonicalization_map m
+  ON a.action = m.stored_action_id
+WHERE COALESCE(m.effective_category, a.category) = 'B';
+```
+
+(The `audit_action_canonicalization_map` is a STATIC artifact at `docs/AUDIT_ACTION_ID_CANONICALIZATION_MAP_P_014.md` — not a runtime DB table. Compliance tooling materializes it as a query-time CTE or a static SQL view. The static-doc approach preserves I-003 append-only — audit_records itself is never rewritten — while letting compliance dashboards reconstruct effective classification across the boundary.)
+
+**Test gate for category-filtered queries:** compliance-tooling test suite (lives in the audit-tooling module when it materializes) MUST include a category-bridge-spanning test that asserts the auth-proof events are visible to a Category B query both before and after a simulated P-014 boundary. Without this gate, a compliance dashboard regression would silently drop the 3 auth-proof event types from review queries.
+
 ### v5.2 → v5.5 promotion semantics
 
 - AUDIT_EVENTS v5.2 → v5.3 was bumped at P-011 (MedicationRequest § amendment).
@@ -300,4 +327,7 @@ The autonomous-turn discipline: **never invent new canonical contract artifacts 
     - **Historical audit rows NOT migrated** (audit chain append-only per I-003; rewriting prior rows would break chain-hash).
     - **One-time mapping artifact** at `docs/AUDIT_ACTION_ID_CANONICALIZATION_MAP_P_014.md` documents the 31 pairs for queries that span the P-014 boundary.
     - **Compliance-query bridge** via two-element `IN` list (`WHERE action IN ('forms.template.created', 'forms_template_created')`) for the audit-retention overlap period; dropped after retention window passes.
-- **Next:** v0.5 after Codex R3 review. Iterate to convergence per the SI-007 trajectory pattern (R1 → R18 was SI-007's path; SI-002's scope is broader and may extend longer).
+- **v0.5 — 2026-05-14** — Codex R3 HIGH closed:
+  - **HIGH — Auth-proof Category C → B promotion lacked a category-canonicalization bridge.** v0.4's mapping artifact carried only `(placeholder_action, canonical_action)` pairs. Historical rows pre-P-014 are stored with `category = 'C'` (I-003 append-only — category column on prior rows cannot be retroactively rewritten). A compliance review filtering on Category B alone would silently miss the historical auth-proof events — exactly the failure mode the C → B promotion was meant to fix.
+  - Fix: extended the mapping artifact to carry `effective_category` override for the 3 auth-proof actions. Compliance-query contract spanning P-014 boundary uses `COALESCE(m.effective_category, a.category) = 'B'` rather than `a.category = 'B'`. Added category-bridge test gate requirement.
+- **Next:** v0.6 after Codex R4 review.
