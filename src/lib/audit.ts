@@ -844,19 +844,24 @@ export async function emitAudit(
     // matches the stored row exactly, even when concurrent same-partition
     // inserts race on an empty partition.
     try {
+      // F-4 R2 HIGH closure (2026-05-15; migration 029): persist
+      // actor_tenant_id. Pre-F-4 the envelope carried this field
+      // in-memory only — the INSERT did not project it, so cross-
+      // tenant platform_admin attribution was lost on persistence.
+      // Migration 029 adds the column; this INSERT now writes it.
       const result = await tx.query(
         `INSERT INTO audit_records (
             audit_id, tenant_id, category, audit_sensitivity_level, action,
-            actor_type, actor_id, ai_workload_type, autonomy_level,
+            actor_type, actor_id, actor_tenant_id, ai_workload_type, autonomy_level,
             target_patient_id, delegate_context, resource_type, resource_id,
             country_of_care, break_glass, payload, prev_hash, record_hash,
             sequence_number, recorded_at
          ) VALUES (
             $1, $2, $3, $4, $5,
-            $6, $7, $8, $9,
-            $10, $11::jsonb, $12, $13,
-            $14, $15::jsonb, $16::jsonb, decode($17, 'hex'), decode($18, 'hex'),
-            $19, $20
+            $6, $7, $8, $9, $10,
+            $11, $12::jsonb, $13, $14,
+            $15, $16::jsonb, $17::jsonb, decode($18, 'hex'), decode($19, 'hex'),
+            $20, $21
          )
          RETURNING
            encode(prev_hash,   'hex') AS prev_hash_hex,
@@ -870,6 +875,7 @@ export async function emitAudit(
           envelope.action,
           envelope.actor_type,
           envelope.actor_id,
+          envelope.actor_tenant_id,
           envelope.ai_workload_type,
           envelope.autonomy_level,
           envelope.target_patient_id,
