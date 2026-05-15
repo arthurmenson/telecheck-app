@@ -47,6 +47,13 @@ updated_at                  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 
 -- Cross-tenant safety constraints (NOT placeholders; permanent)
 UNIQUE (tenant_id, id)
+
+-- R1 HIGH closure: triple-composite UNIQUE required so the forward
+-- FK from consults.escalation_target_sync_session_id can REFERENCE
+-- a uniquely-backed column set. Without this, the triple FK fails
+-- to install at migration time.
+UNIQUE (tenant_id, originating_consult_id, id)
+
 FOREIGN KEY (tenant_id, patient_id) REFERENCES accounts (tenant_id, account_id)
 FOREIGN KEY (tenant_id, clinician_account_id) REFERENCES accounts (tenant_id, account_id)
 
@@ -54,7 +61,7 @@ FOREIGN KEY (tenant_id, clinician_account_id) REFERENCES accounts (tenant_id, ac
 -- when originating_consult_id is set, it MUST be a consult in the
 -- SAME tenant. The originating consult may have additional sync
 -- sessions over its lifecycle (clinician reschedule, technical
--- failure retry), so this is non-unique.
+-- failure retry), so the column is non-unique on its own.
 FOREIGN KEY (tenant_id, originating_consult_id) REFERENCES consults (tenant_id, id)
 ```
 
@@ -73,7 +80,23 @@ Same lessons-learned as SI-008's 14-round Codex review series apply here:
 
 - **Multiple sync sessions per consult are legitimate.** Reschedule, technical-failure retry, etc. all produce additional rows. The consult's authoritative forward pointer (`escalation_target_sync_session_id`) tracks the CURRENT scheduled/in-progress session.
 
-- **No supersession chain needed (simpler than SI-008).** Unlike AI workflow executions which support automated reruns, sync sessions transition via human action (clinician schedules, patient joins, technical failure → manual reschedule). The consult's forward pointer is updated via standard state-machine transitions on `consults`, not via the SI-008-style CAS-and-supersession protocol. If a sync session ends in 'cancelled' or 'no_show' state and a new one is needed, the consult's forward pointer simply moves to the new session via standard UPDATE.
+- **No supersession chain needed (simpler than SI-008).** Unlike AI workflow executions which support automated reruns, sync sessions transition via human action (clinician schedules, patient joins, technical failure → manual reschedule). The consult's forward pointer is updated via standard state-machine transitions on `consults`, not via the SI-008-style CAS-and-supersession protocol.
+
+- **Guarded forward-pointer update protocol (R1 MEDIUM closure 2026-05-15):** even without supersession-chain machinery, concurrent reschedule / cancel / no-show handling can race. A stale actor could move `consults.escalation_target_sync_session_id` back to an older cancelled / no_show session or away from a newly scheduled one. The pointer update MUST use a guarded UPDATE with both CAS-on-pointer + state-precondition:
+
+  ```sql
+  UPDATE consults
+     SET escalation_target_sync_session_id = $new_sync_session_id
+   WHERE id = $consult_id
+     AND tenant_id = $tenant_id
+     AND state IN ('UNDER_REVIEW', 'ESCALATED_TO_SYNC')
+     AND escalation_target_sync_session_id IS NOT DISTINCT FROM $expected_prior_pointer
+  RETURNING id;
+  ```
+
+  Where `$expected_prior_pointer` is the value the caller read at the start of the transition (NULL for first-write, or the prior sync_session_id for a reschedule). Zero-row return triggers `consult.escalation_target_swap_failed` Category C audit + caller-side conflict resolution (typically refresh + re-attempt). Every successful swap emits `consult.escalation_target_swapped` Category C audit capturing `(prior_pointer, new_pointer, actor_id)` for forensic recovery.
+
+  No DB-layer procedure-only path is required (unlike SI-008's `record_workflow_pointer_swap()`) because the sync-session lifecycle is human-driven + scheduling-data has simpler integrity semantics than AI-recommendation lineage. Application-layer CAS + audit is the proportionate defense for this surface.
 
 ## Resolution path
 
