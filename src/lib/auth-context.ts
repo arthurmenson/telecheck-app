@@ -84,6 +84,7 @@ export interface ActorContext {
 
 const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstance) => {
   fastify.decorateRequest('actorContext', undefined);
+  fastify.decorateRequest('bearerTokenPresented', false);
 
   fastify.addHook('onRequest', async (request, _reply) => {
     // Authorization header parsing. Tolerant: missing header is FINE
@@ -95,6 +96,16 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
     if (!authHeader.startsWith('Bearer ')) return;
     const token = authHeader.slice(7).trim();
     if (token.length === 0) return;
+
+    // Phase 2 R2 HIGH closure (2026-05-15): record that a Bearer token
+    // was presented BEFORE attempting verification. This lets
+    // downstream auth gates (requireAdminRole) distinguish
+    // "no JWT attempted" (header shim acceptable) from "JWT attempted
+    // but rejected" (header shim MUST NOT be used; the rejection is
+    // authoritative). Without this flag, an invalid/expired/wrong-
+    // tenant/wrong-binding JWT combined with a forged x-actor-roles
+    // header would silently elevate via the legacy path.
+    request.bearerTokenPresented = true;
 
     const result = verifyAccessToken(token, config.jwtSigningKey);
     if (!result.ok) return;
@@ -163,6 +174,28 @@ declare module 'fastify' {
      * Handlers requiring authentication MUST call `requireActorContext()`.
      */
     actorContext: ActorContext | undefined;
+
+    /**
+     * Phase 2 R2 HIGH closure (2026-05-15): true if the request's
+     * `Authorization: Bearer <token>` header carried a non-empty
+     * token VALUE — set BEFORE JWT verification. This decouples
+     * "client attempted JWT auth" from "JWT verified successfully":
+     *
+     *   - bearerTokenPresented=false + actorContext=undefined: client
+     *     did not attempt JWT auth. Legacy header shim is acceptable.
+     *   - bearerTokenPresented=true + actorContext=undefined: client
+     *     attempted JWT auth but verification rejected (invalid
+     *     signature / expired / wrong tenant / wrong binding /
+     *     malformed). Legacy header shim MUST NOT authorize this
+     *     request — the rejection is authoritative.
+     *   - bearerTokenPresented=true + actorContext=ActorContext: JWT
+     *     verified successfully.
+     *
+     * Used by `requireAdminRole` to fail closed when a JWT was
+     * presented but rejected, even if a forged `x-actor-roles` header
+     * is also present.
+     */
+    bearerTokenPresented: boolean;
   }
 }
 

@@ -136,8 +136,26 @@ export function requireAdminRole(req: FastifyRequest): string {
     );
   }
 
-  // Tier 2 (legacy header shim): ONLY when no JWT was presented. Used
-  // by tests that haven't migrated to JWT-based admin yet AND by
+  // Phase 2 R2 HIGH closure (2026-05-15): if a Bearer token was
+  // PRESENTED but rejected (invalid sig / expired / wrong tenant /
+  // wrong admin binding / malformed), the JWT rejection is
+  // authoritative — fail closed. Do NOT fall through to the header
+  // shim. Closes Codex R2 HIGH: "Presented-but-rejected JWTs can
+  // still fall through to trusted admin headers."
+  //
+  // The bearerTokenPresented flag is set by authContextPlugin BEFORE
+  // verifyAccessToken runs, so it's true even when the token failed
+  // any of the verification gates. This distinguishes "client did not
+  // attempt JWT auth" (legacy shim acceptable) from "client attempted
+  // JWT auth but failed" (legacy shim MUST NOT elevate).
+  if (req.bearerTokenPresented) {
+    throw req.server.httpErrors.unauthorized(
+      'Actor authorization could not be verified for this request.',
+    );
+  }
+
+  // Tier 2 (legacy header shim): ONLY when no JWT was presented at all.
+  // Used by tests that haven't migrated to JWT-based admin yet AND by
   // local-dev opt-in flows. Production requires ALLOW_ACTOR_HEADER_AUTH
   // opt-in; without it, unauthenticated requests get 401.
   const isProd = process.env['NODE_ENV'] === 'production';
