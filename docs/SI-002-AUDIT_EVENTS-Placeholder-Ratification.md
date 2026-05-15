@@ -3,7 +3,7 @@
 **Raised by:** Engineering (autonomous turn 2026-05-05)
 **Date raised:** 2026-05-05
 **Severity:** medium
-**Status:** **OPEN — v0.3 DRAFT** (Codex R1 HIGH + MEDIUM closed 2026-05-14: identity authentication-proof events promoted to Category B; forms.submission detail shape split per-event with explicit nullability)
+**Status:** **OPEN — v0.4 DRAFT** (Codex R2 HIGH closed 2026-05-14: explicit transition contract added — atomic cutover, no dual-write window, test-update sequence ratified)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (v5.2 → v5.5 proposed; v5.3 was bumped at P-011 for crisis-detection MedicationRequest closure, v5.4 by SI-007 P-013 for refill/dispensing/shipment, so SI-002 closure targets v5.5)
 **Promotion Ledger:** **P-014** (updated from v0.1's P-012 — P-012 slot was deferred to a future implementation-milestone-class entry per Addendum 4 status doc; P-013 is now claimed by SI-007 v0.19 merged 2026-05-14)
 **Related slice PRDs:** Forms/Intake v2.1 §13, Identity Spec §3, Consent Slice PRD v1.0 §10
@@ -128,6 +128,34 @@ The AUDIT_EVENTS v5.2 envelope's `detail` JSONB column is currently free-shape. 
 | `delegation.scope.*`                                        | `delegation_id`, `scope_code`, `granted_at` (for `.granted`) / `revoked_at` + `revocation_reason` (for `.revoked`)                                                                                            |
 
 **PHI guarantee:** every `detail` shape above either (a) references PHI by ID rather than value, OR (b) uses a hash (`phone_e164_hash`, `device_fingerprint_hash`) so the audit chain never carries plaintext PHI. This mirrors the SI-007 + crisis-detection-trigger discipline.
+
+### Transition contract: placeholder → canonical cutover (v0.4 per Codex R2 HIGH closure)
+
+The transition from placeholder action IDs (`forms_template_created`, etc.) to canonical IDs (`forms.template.created`, etc.) MUST be **atomic per slice**, not dual-write. Rationale:
+
+1. **No dual-write window.** Dual-write (emitter emits BOTH `forms_template_created` AND `forms.template.created` for the same event during a transition window) would double the audit chain entries for every emission, double-count compliance dashboards, and require downstream consumers to dedupe — fragile and audit-chain-non-additive (I-003 append-only contract makes "the chain has BOTH placeholder and canonical for the same business event" hard to interpret post-cutover).
+2. **No `LIKE` matching across both naming styles.** Audit-query tooling MUST NOT carry a `WHERE action LIKE 'forms_%' OR action LIKE 'forms.%'` compatibility predicate — that masks the migration permanently and obscures whether the cutover completed.
+3. **Per-slice atomic cutover.** Each slice (forms-intake, identity, consent) gets its own cutover PR; within that PR the slice's audit emitter, placeholder type definition, and slice-side tests all change to canonical IDs in a single commit. CI gate ensures no row of the slice emits the old ID after the PR merges.
+
+**Concrete cutover sequence per slice:**
+
+| Step | Action                                                                                                                                                                                                                                                                                                               | Atomicity                                       |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| 1    | Spec corpus: AUDIT_EVENTS v5.4 → v5.5 promotion bumps adds the 31 canonical IDs (P-014).                                                                                                                                                                                                                             | Spec-corpus side, single Promotion Ledger entry |
+| 2    | Implementation: per-slice cutover PR — `src/modules/{slice}/audit.ts` changes placeholder type definition + cast helper to use canonical IDs; all test predicate matchers in `tests/integration/{slice}-*.test.ts` updated in lockstep.                                                                              | Single PR per slice; CI rejects mixed-state     |
+| 3    | Historical audit rows: NOT migrated. Pre-P-014 rows retain placeholder strings (audit chain is append-only per I-003; rewriting prior rows would break the chain hash).                                                                                                                                              | Permanent split at the P-014 timestamp boundary |
+| 4    | Compliance tooling: a one-time `audit_action_id_canonicalization` mapping table documents the 31 placeholder→canonical pairs for queries that need to span the P-014 boundary. NOT a runtime DB table — a static doc artifact (e.g., `docs/AUDIT_ACTION_ID_CANONICALIZATION_MAP_P_014.md` authored alongside P-014). | One-time spec-corpus artifact                   |
+
+**Compatibility window: zero.** The cutover PR is the cutover; there is no overlap period. Code reviewers verify the per-slice PR's diff replaces 100% of references atomically before merge.
+
+**Compliance-query bridge:** the mapping artifact (Step 4) is the canonical compatibility layer. A compliance review needing all `forms.template.created` events for a quarter that spans the P-014 boundary queries:
+
+```sql
+SELECT * FROM audit_records
+WHERE action IN ('forms.template.created', 'forms_template_created')
+```
+
+The two-element `IN` list is the bridge; once historical-row retention timelines pass the P-014 timestamp + audit retention period, the bridge can be dropped.
 
 ### v5.2 → v5.5 promotion semantics
 
@@ -263,4 +291,13 @@ The autonomous-turn discipline: **never invent new canonical contract artifacts 
     - `started`: `event_attempt_id` (no `status_before`).
     - `paused` / `resumed` / `abandoned`: `status_before` + `status_after` + `transition_id`.
     - `completed`: `status_before` + `status_after` + `transition_id` + `snapshot_id` (FK to same-tx snapshot row).
-- **Next:** v0.4 after Codex R2 review. Iterate to convergence per the SI-007 trajectory pattern (R1 → R18 was SI-007's path; SI-002's scope is broader and may extend longer).
+- **v0.4 — 2026-05-14** — Codex R2 HIGH closed:
+  - **HIGH — Placeholder-to-canonical rename had no transition contract.** v0.3 proposed the rename (snake_case → dot-namespaced) but the "What I'm doing in the meantime" section still said "all slices use placeholder cast helpers and tests pin the 31 strings until close-out" — ambiguous on whether the cutover is dual-write, atomic, or a permanent compatibility window. Audit-corpus split across two naming styles would be a real risk.
+  - Fix: added an explicit **Transition contract: placeholder → canonical cutover** section specifying:
+    - **Atomic per-slice cutover** (no dual-write window).
+    - **No `LIKE` matching** across both naming styles (would mask migration completion permanently).
+    - **Per-slice cutover PR** changes audit.ts emitter + tests in one commit; CI rejects mixed-state.
+    - **Historical audit rows NOT migrated** (audit chain append-only per I-003; rewriting prior rows would break chain-hash).
+    - **One-time mapping artifact** at `docs/AUDIT_ACTION_ID_CANONICALIZATION_MAP_P_014.md` documents the 31 pairs for queries that span the P-014 boundary.
+    - **Compliance-query bridge** via two-element `IN` list (`WHERE action IN ('forms.template.created', 'forms_template_created')`) for the audit-retention overlap period; dropped after retention window passes.
+- **Next:** v0.5 after Codex R3 review. Iterate to convergence per the SI-007 trajectory pattern (R1 → R18 was SI-007's path; SI-002's scope is broader and may extend longer).
