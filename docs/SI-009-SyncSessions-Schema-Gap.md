@@ -106,14 +106,24 @@ Same lessons-learned as SI-008's 14-round Codex review series apply here:
   **R3 HIGH closure (Codex 2026-05-15):** the application-layer atomic UPDATE alone leaves the invariant bypassable by direct UPDATE, migration, admin repair, or background job paths. To match the same DB-boundary discipline SI-008 establishes for AI workflow pointer swaps, the swap MUST be enforced at the DB layer via a definer-rights stored procedure:
 
   - **GRANT model:** application code's role has NO direct UPDATE privilege on `consults.escalation_target_sync_session_id`. All mutations go through `record_consult_escalation_target_swap(...)`.
-  - **Procedure signature:** `record_consult_escalation_target_swap(p_consult_id, p_tenant_id, p_new_sync_session_id, p_expected_prior_pointer, p_actor_id, p_actor_account_tenant_id)` returns `(success: boolean, rejection_code: TEXT, rejection_detail: JSONB)`.
+  - **Procedure signature:** `record_consult_escalation_target_swap(p_consult_id, p_tenant_id, p_new_sync_session_id, p_expected_prior_pointer)` returns `(success: boolean, rejection_code: TEXT, rejection_detail: JSONB)`.
 
-  - **R4 HIGH closure — actor authorization guard (Codex 2026-05-15):** the procedure is SECURITY DEFINER so it bypasses RLS. Without an explicit authorization predicate, any role with EXECUTE could supply another tenant's `p_consult_id` / `p_new_sync_session_id` and perform a referentially valid cross-tenant pointer swap. The procedure MUST validate, BEFORE the guarded UPDATE:
-    - `p_actor_account_tenant_id = p_tenant_id` — the actor's account home tenant matches the target consult's tenant (caller cannot escalate across tenants by spoofing p_tenant_id)
-    - The actor exists in `accounts` with `account_type ∈ {clinician, tenant_admin, platform_admin}` AND `tenant_id = p_actor_account_tenant_id` (or for `platform_admin` per F-4 attribution, the F-4 R5 rules apply — see PHASE_2 F-4 closure for cross-tenant admin path)
-    - For non-platform_admin actors: the actor must hold a session bound to a JWT-verified context per F-3 (deferred Identity/RBAC slice work) OR fail closed if F-3 prerequisites are not yet wired
-    - Rejection messages MUST be tenant-blind per I-025 (do not reveal cross-tenant row existence in the rejection_detail JSON)
+  - **R4 + R5 HIGH closure — server-derived actor authorization (Codex 2026-05-15):** the procedure is SECURITY DEFINER so it bypasses RLS. The R4 closure accepted `p_actor_id` + `p_actor_account_tenant_id` as caller-supplied — but Codex R5 correctly identified that caller-supplied identity is the bypass class R4 was supposed to eliminate. An app-role caller could present the target tenant as the actor tenant and pass the existence check.
+
+    R5 closure: the procedure derives actor identity from SERVER-TRUSTED session-context GUCs populated by the authContextPlugin from a verified JWT (mirror of `current_tenant_id()` in `_session_tenant_context` table that already exists per migration 003):
+    - Add a `_session_actor_context` table (or extend the existing `_session_tenant_context`) carrying `(pg_backend_pid, actor_account_id, actor_account_tenant_id, actor_role, actor_admin_home_tenant_id, session_id, bound_at, expires_at)`. The authContextPlugin INSERTs/UPSERTs into this table on every authenticated request before any business query runs.
+    - Procedure reads the actor context via a definer-safe helper function `current_actor_account_id()`, `current_actor_account_tenant_id()`, `current_actor_role()`, `current_actor_admin_home_tenant_id()` analogous to the existing `current_tenant_id()`.
+    - Procedure validates:
+      - `current_actor_account_id() IS NOT NULL` — caller is authenticated (else fail closed)
+      - `current_actor_role() ∈ {clinician, tenant_admin, platform_admin}` — caller has appropriate role for sync session escalation
+      - For non-platform_admin: `current_actor_account_tenant_id() = p_tenant_id` — caller's account home tenant matches target consult tenant
+      - For platform_admin: per F-4 cross-tenant admin attribution; `current_actor_admin_home_tenant_id()` becomes the audit row's `actor_tenant_id` (NOT `p_tenant_id`)
+    - **No caller-supplied actor identity** — the procedure ignores any actor-related arguments and trusts ONLY the server-derived context. Caller-supplied `p_actor_id` / `p_actor_account_tenant_id` parameters REMOVED from the signature.
+    - Rejection messages MUST be tenant-blind per I-025.
+
   - **EXECUTE grants:** the procedure has `REVOKE ALL ... FROM PUBLIC` + `GRANT EXECUTE TO telecheck_app_role` (the canonical application role). Direct-SQL break-glass paths require the `telecheck_admin_role` GRANT (per the F-4 break-glass pattern).
+
+  **Prerequisite for procedure landing:** the `_session_actor_context` table + authContextPlugin DB-binding work is itself a separate slice / SI deliverable that lands BEFORE this procedure (the procedure cannot reference helpers that don't exist). Track that prerequisite as the new F-3 successor follow-on: Identity slice extension for session-bound DB context. Until F-3 lands, the procedure either fails closed (no _session_actor_context binding → reject all swaps) OR a transitional GRANT model restricts the procedure to a privileged break-glass role only.
   - **Procedure body:** runs the four-predicate atomic UPDATE shown above (CAS + consult-state + same-tenant + same-originating-consult + target-session-actionable-state). Emits paired audit row in same transaction on success.
   - **Failure modes:** four-predicate UPDATE returns zero rows → rejection_code ∈ {`cas_mismatch`, `consult_state_invalid`, `target_session_missing`, `target_session_inactive`}. Procedure probes both rows post-UPDATE to determine which predicate filtered.
   - **Durability:** same three-tier durability pattern as SI-008's `record_workflow_pointer_swap()` (savepoint + autonomous-transaction rejection log + caller-commit-boundary contract). The autonomous log is `audit_swap_rejection_log` (same table as SI-008; the `target_table` discriminator column says `consults`).
