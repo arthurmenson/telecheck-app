@@ -196,7 +196,17 @@ Codex R6 HIGH correctly identified that the self-cycle CHECK alone (`supersedes_
 
 **Three concrete DB contracts to close R6 HIGH:**
 
-1. **`supersedes_execution_id` is IMMUTABLE once set.** Add a trigger BEFORE UPDATE on `ai_workflow_executions` that REJECTS any UPDATE where `OLD.supersedes_execution_id IS NOT NULL AND NEW.supersedes_execution_id IS DISTINCT FROM OLD.supersedes_execution_id`. This prevents post-INSERT mutation of the lineage column. Combined with the v0.3 GRANT model (app role has NO direct UPDATE rights on this column), only `record_workflow_pointer_swap()` can set the value — and only on a fresh INSERT or as a transition NULL → value.
+1. **`supersedes_execution_id` is IMMUTABLE for ALL post-INSERT mutations (R9 HIGH closure).** Add a trigger BEFORE UPDATE on `ai_workflow_executions` that REJECTS any UPDATE where `NEW.supersedes_execution_id IS DISTINCT FROM OLD.supersedes_execution_id` — regardless of whether OLD was NULL or non-NULL. This is stricter than the original R6 formulation (which only blocked non-NULL → other transitions). The stricter rule prevents owner-role SQL / migrations / backfills from retroactively inserting a NULL-supersession row into a lineage chain.
+
+   Combined with this immutability rule, `record_workflow_pointer_swap()` sets `supersedes_execution_id` ONLY at the SAME-TRANSACTION INSERT of the new execution row (NOT via post-INSERT UPDATE). The procedure performs:
+   ```
+   INSERT INTO ai_workflow_executions (..., supersedes_execution_id, ...)
+     VALUES (..., $expected_prior_execution_id, ...);
+   UPDATE consults
+     SET ai_workflow_execution_id = $new_execution_id
+     WHERE ... (CAS guard from §"Compare-and-swap protocol");
+   ```
+   `supersedes_execution_id` is supplied at INSERT time; the trigger's BEFORE UPDATE then forbids ANY change to that column on ANY future UPDATE of the row. No owner-role SQL, migration, or backfill can mutate it post-INSERT — the trigger fires on every UPDATE attempt regardless of caller role.
 
 2. **Pointer swaps target a fresh execution not already in the chain.** `record_workflow_pointer_swap()` MUST walk the consult's existing supersession chain (starting from `consults.ai_workflow_execution_id` and recursively following `supersedes_execution_id` until NULL) and REJECT the swap if the proposed new execution's id appears anywhere in the chain. The chain walk runs INSIDE the procedure's row-locked transaction so it sees the current authoritative state.
 
