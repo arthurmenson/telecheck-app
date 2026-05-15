@@ -5,8 +5,9 @@
 **v0.2 advanced:** 2026-05-15 (concrete proposals + pre-ratification gate alignment with SI-002 / SI-003 / SI-004 / SI-007)
 **v0.3 advanced:** 2026-05-15 (close Codex R1 MEDIUMs — column count reconciliation + KMS envelope explicit)
 **v0.4 advanced:** 2026-05-15 (close Codex R2 MEDIUMs — Decision 2 heading +14/total 24 reconciliation; Decision 8 enumerates all 14 columns; CONSULT_EVENT_TYPES adds kms_rotation)
+**v0.5 advanced:** 2026-05-15 (close Codex R3 HIGH — KMS envelope adds encrypted-DEK column 25; R3 MEDIUM — rotation via stored-procedure with DB-enforced same-tx audit coupling, not session-variable bypass)
 **Severity:** medium (does NOT block Sprint 9 authoring; placeholder schema ships with this gap as the resume-gate)
-**Status:** OPEN — v0.4 DRAFT, ratification-ready (5 MEDIUM findings closed across R1+R2; remaining gaps tracked as v5.3 promotion PR deliverables)
+**Status:** OPEN — v0.5 DRAFT, ratification-ready (1 HIGH + 6 MEDIUM findings closed across R1+R2+R3; remaining gaps tracked as v1.3 promotion PR deliverables)
 **Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md` (v1.2 → **v1.3**)
 **Promotion Ledger target:** **P-017** (P-013 SI-007 merged 2026-05-14, P-014 SI-002 merged 2026-05-14, P-015 SI-003 PR #137 in flight, P-016 SI-004 PR #138 in flight)
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md`
@@ -90,12 +91,13 @@ Sprint 9 implements transitions 1-6 + 16 (INITIATED → INTAKE → SUBMITTED →
 | 22 | `clinician_decision_aad` | BYTEA | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; the AES-256-GCM Additional Authenticated Data binding the ciphertext to the row context. Canonical AAD = `tenant_id \| consult_id \| 'clinician_decision' \| schema_version` (pipe-separated bytes). AAD binding prevents ciphertext-relocation attacks (an attacker who copies the ciphertext from consult X to consult Y cannot decrypt because the AAD no longer matches) |
 | 23 | `clinician_decision_schema_version` | INTEGER | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; integer schema version of the encrypted payload's plaintext structure; allows forward-compat plaintext schema migrations without re-encryption. Bound into the AAD per column 22 |
 | 24 | `clinician_decision_encrypted_at` | TIMESTAMPTZ | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; chain-of-custody timestamp; immutable per encrypt event |
+| 25 | `clinician_decision_dek_ciphertext` | BYTEA | NULL | nullable iff column 18 is NULL; otherwise NOT NULL; **the KMS-encrypted Data-Encryption-Key (DEK) used to encrypt column 18**. v0.5 R3 HIGH closure: without this column, columns 19-20 (kms_key_id + key_version) alone are NOT sufficient to recover the plaintext, because envelope-encryption decryption requires the actual encrypted DEK bytes returned by KMS at encrypt-time. The `lib/tenant-kms.ts` decrypt path requires three inputs: (a) the encrypted DEK ciphertext (this column), (b) the KMS key handle resolved via columns 19 + 20, (c) the AAD for KMS-side authentication. Persisting only key id/version leaves the row UNRECOVERABLE on key rotation or master-key replacement. AWS KMS DEK ciphertexts are typically ~200-400 bytes. |
 
 **Key rotation semantics:** when tenant-KMS rotates the master key, a forward-fixup job decrypts column 18 with the old (key_id, key_version) pair, re-encrypts with the new pair, and updates columns 18-24 atomically. The original chain-of-custody is preserved by emitting a paired `consult_event{event_type='kms_rotation'}` row referencing both the old and new key_versions. The `encrypted_at` column 24 is NOT updated on re-encryption — it preserves the original-encryption timestamp; rotation produces a NEW `consult_event` row with `created_at=NOW()` for the rotation event.
 
 **Integrity check:** the AES-256-GCM tag is included in column 18's ciphertext (per standard GCM ciphertext format: nonce + ciphertext + tag). Tag verification at decrypt time + AAD match together prove tamper-evidence; failure to verify is a `KmsIntegrityException` raised by `lib/tenant-kms.ts` (the standard decrypt path).
 
-Total `consults` canonical column count at v1.3: **24 columns** (10 baseline + 7 Sprint 10+ additions + 7 KMS envelope columns for the clinical-decision encryption).
+Total `consults` canonical column count at v1.3: **25 columns** (10 baseline + 7 Sprint 10+ additions + 8 KMS envelope columns for the clinical-decision encryption — v0.5 R3 HIGH closure added column 25 `clinician_decision_dek_ciphertext`).
 
 #### §4.17 ConsultEvent (Sprint 10+ column additions; +2 columns; total 11)
 
@@ -192,7 +194,7 @@ SI-005 closure produces a migration 020a (or sequentially-numbered) that perform
    - 15. `terminal_at TIMESTAMPTZ NULL`
    - 16. `escalation_target_sync_session_id VARCHAR(26) NULL`
    - 17. `last_state_transition_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` (with a state-column trigger to update on transitions)
-2. **Add the 7 KMS envelope columns to `consults`** (per the encrypted-blob ratification at lines 18-24; v0.4 R2 MEDIUM-2 closure: NO ambiguous "encrypted-blob column" wording — all 7 columns enumerated):
+2. **Add the 8 KMS envelope columns to `consults`** (v0.5 R3 HIGH closure: column 25 added; total now 8 not 7):
    - 18. `clinician_decision_encrypted BYTEA NULL`
    - 19. `clinician_decision_kms_key_id TEXT NULL`
    - 20. `clinician_decision_kms_key_version INTEGER NULL`
@@ -200,7 +202,8 @@ SI-005 closure produces a migration 020a (or sequentially-numbered) that perform
    - 22. `clinician_decision_aad BYTEA NULL`
    - 23. `clinician_decision_schema_version INTEGER NULL`
    - 24. `clinician_decision_encrypted_at TIMESTAMPTZ NULL`
-3. **Add a CHECK constraint enforcing all-or-none nullability across columns 18-24** to prevent partial-encryption rows that would be undecipherable:
+   - 25. `clinician_decision_dek_ciphertext BYTEA NULL` (KMS-encrypted DEK bytes; required for decrypt + rotation)
+3. **Add a CHECK constraint enforcing all-or-none nullability across columns 18-25** (v0.5: includes new column 25) to prevent partial-encryption rows that would be undecipherable:
    ```sql
    CHECK (
      (clinician_decision_encrypted IS NULL
@@ -209,7 +212,8 @@ SI-005 closure produces a migration 020a (or sequentially-numbered) that perform
        AND clinician_decision_nonce IS NULL
        AND clinician_decision_aad IS NULL
        AND clinician_decision_schema_version IS NULL
-       AND clinician_decision_encrypted_at IS NULL)
+       AND clinician_decision_encrypted_at IS NULL
+       AND clinician_decision_dek_ciphertext IS NULL)
      OR
      (clinician_decision_encrypted IS NOT NULL
        AND clinician_decision_kms_key_id IS NOT NULL
@@ -217,13 +221,91 @@ SI-005 closure produces a migration 020a (or sequentially-numbered) that perform
        AND clinician_decision_nonce IS NOT NULL
        AND clinician_decision_aad IS NOT NULL
        AND clinician_decision_schema_version IS NOT NULL
-       AND clinician_decision_encrypted_at IS NOT NULL)
+       AND clinician_decision_encrypted_at IS NOT NULL
+       AND clinician_decision_dek_ciphertext IS NOT NULL)
    )
    ```
 4. **Add CHECK constraints enforcing nonce + schema_version semantics:**
    - `CHECK (clinician_decision_nonce IS NULL OR octet_length(clinician_decision_nonce) = 12)` — 12-byte AES-256-GCM IV per NIST SP 800-38D §8.2.1
    - `CHECK (clinician_decision_schema_version IS NULL OR clinician_decision_schema_version >= 1)` — version must be a positive integer
-5. **Add a row-level trigger on `consults`** to enforce immutability of `clinician_decision_encrypted_at`: BEFORE UPDATE, raise an exception if `OLD.clinician_decision_encrypted_at IS NOT NULL AND NEW.clinician_decision_encrypted_at IS DISTINCT FROM OLD.clinician_decision_encrypted_at`. Key-rotation operations are EXEMPT from this trigger via a session variable (set by `lib/tenant-kms.ts` rotation routine).
+5. **Stored-procedure-only path for KMS column updates (v0.5 R3 MEDIUM closure).** v0.4's session-variable bypass was unsafe — a buggy or privileged code path could set the variable and update columns 18-25 without emitting the kms_rotation consult_event/audit row. v0.5 replaces the bypass with a DB-enforced stored procedure that performs the rotation atomically:
+
+   ```sql
+   -- Rotate clinical-decision KMS envelope for a consult row.
+   -- ATOMIC: the UPDATE on consults + INSERT on consult_events + INSERT
+   -- on audit_records all run in the same transaction. Any failure rolls
+   -- back the entire rotation. There is NO other path to update
+   -- columns 18-25 on an already-encrypted row.
+   CREATE PROCEDURE rotate_consult_clinician_decision_kms (
+     p_consult_id           VARCHAR(26),
+     p_tenant_id            TEXT,
+     p_new_encrypted        BYTEA,
+     p_new_kms_key_id       TEXT,
+     p_new_kms_key_version  INTEGER,
+     p_new_nonce            BYTEA,
+     p_new_aad              BYTEA,
+     p_new_schema_version   INTEGER,
+     p_new_dek_ciphertext   BYTEA,
+     p_rotation_batch_id    VARCHAR(26),
+     p_actor_id             VARCHAR(26)
+   )
+   LANGUAGE plpgsql
+   AS $$
+   DECLARE
+     v_old_kms_key_id       TEXT;
+     v_old_kms_key_version  INTEGER;
+     v_rotation_event_id    VARCHAR(26);
+     v_rotation_audit_id    VARCHAR(26);
+   BEGIN
+     -- Read old key metadata for the rotation event detail
+     SELECT clinician_decision_kms_key_id, clinician_decision_kms_key_version
+       INTO v_old_kms_key_id, v_old_kms_key_version
+       FROM consults
+       WHERE id = p_consult_id AND tenant_id = p_tenant_id;
+
+     IF v_old_kms_key_id IS NULL THEN
+       RAISE EXCEPTION 'rotate_consult_clinician_decision_kms: row has no existing encryption to rotate';
+     END IF;
+
+     -- UPDATE columns 18-25 (encrypted_at preserved per Decision 2 chain-of-custody)
+     UPDATE consults
+       SET clinician_decision_encrypted        = p_new_encrypted,
+           clinician_decision_kms_key_id       = p_new_kms_key_id,
+           clinician_decision_kms_key_version  = p_new_kms_key_version,
+           clinician_decision_nonce            = p_new_nonce,
+           clinician_decision_aad              = p_new_aad,
+           clinician_decision_schema_version   = p_new_schema_version,
+           clinician_decision_dek_ciphertext   = p_new_dek_ciphertext
+           -- encrypted_at intentionally NOT updated (chain-of-custody preserved)
+       WHERE id = p_consult_id AND tenant_id = p_tenant_id;
+
+     -- INSERT the kms_rotation consult_event
+     v_rotation_event_id := ulid_gen();
+     INSERT INTO consult_events
+       (id, consult_id, tenant_id, event_type, actor_id, metadata, created_at)
+       VALUES (v_rotation_event_id, p_consult_id, p_tenant_id, 'kms_rotation', p_actor_id,
+               jsonb_build_object(
+                 'old_kms_key_id', v_old_kms_key_id,
+                 'old_kms_key_version', v_old_kms_key_version,
+                 'new_kms_key_id', p_new_kms_key_id,
+                 'new_kms_key_version', p_new_kms_key_version,
+                 'rotation_batch_id', p_rotation_batch_id,
+                 'rotated_at', NOW()
+               ),
+               NOW());
+
+     -- INSERT the paired audit_records row (Category B; per SI-004 cross-alignment)
+     v_rotation_audit_id := ulid_gen();
+     INSERT INTO audit_records (...)
+       VALUES (v_rotation_audit_id, p_tenant_id, 'system.kms_rotation_completed', p_actor_id,
+               'consult', p_consult_id, NOW(), ...,
+               jsonb_build_object('consult_event_id', v_rotation_event_id, ...),
+               ...);
+   END;
+   $$;
+   ```
+
+   The immutability rule on `clinician_decision_encrypted_at` is now enforced unconditionally at the SQL level by a CHECK constraint OR by the GRANT model: **no role has UPDATE privilege on columns 18-25 of `consults` except via this stored procedure** (the procedure runs as a definer-rights role with the needed privileges; application code's role does NOT have direct UPDATE on those columns). This eliminates the session-variable escape hatch entirely. Any attempt to UPDATE columns 18-25 outside the procedure fails with a `permission denied for column` error.
 6. **Add the 2 Sprint 10+ columns to `consult_events`** (Decision 2):
    - 10. `correlation_id VARCHAR(26) NULL`
    - 11. `audit_id VARCHAR(26) NULL`
