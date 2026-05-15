@@ -5,8 +5,9 @@
 **v0.2 advanced:** 2026-05-14 (concrete proposals + pre-ratification gate alignment with SI-002 / SI-003)
 **v0.3 advanced:** 2026-05-14 (close Codex R1 HIGH — prescription_created vs creation_attempted split; R1 MEDIUM — reserved-name-registry separated from emit allowlist)
 **v0.4 advanced:** 2026-05-14 (close Codex R2 HIGH — three immutable events for prescription gate; honor I-003 append-only)
+**v0.5 advanced:** 2026-05-14 (close Codex R3 HIGH — deferred-set separated from emit allowlist; R3 MEDIUM — Category B count reconciled)
 **Severity:** medium (does NOT block Sprint 9 authoring; placeholder events ship with this gap as the resume-gate)
-**Status:** OPEN — v0.4 DRAFT, awaiting Contracts Pack v5.X AUDIT_EVENTS ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 / SI-003 cadence)
+**Status:** OPEN — v0.5 DRAFT, ratification-ready (3 HIGH + 1 MEDIUM findings closed across Codex pre-ratification rounds R1-R3; remaining implementation-detail gaps tracked as deliverables for the v5.6 promotion PR)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (v5.5 once SI-002 closes → **v5.6** at SI-004 closure)
 **Promotion Ledger target:** **P-016** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 PR #136 MERGED 2026-05-14; P-015 reserved by SI-003 PR #137 in flight)
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md` §13
@@ -83,9 +84,15 @@ Enumerates all 13 events (11 PRD §13 + 2 state-machine derived). v0.2 ratificat
 | 12 | `consult.follow_up_message_sent` | C | Follow-up message | Sprint 10+ ⏸️ |
 | 13 | `consult.completed` | C | Consult completed | Sprint 10 ⏸️ |
 
-**Category B vs C rationale (Decision 3a):**
-- **Category B (governance)** for 3 events: `consult.clinician_decision_recorded` (clinical decision; medico-legal artifact), `consult.prescription_created` (medication order; medico-legal + regulatory; cross-references SI-001 MedicationRequest schema gap and SI-007 P-013 refill ratification), `consult.escalated_to_sync` (case-routing change affecting on-call governance + clinical-safety triage path).
-- **Category C (operational)** for 10 events: state-machine transitions, intake bookkeeping, notifications. No medico-legal artifact; no regulatory significance beyond audit trail.
+**Category B vs C rationale (Decision 3a; v0.5 R3 MEDIUM reconciled):**
+- **Category B (governance) — 5 events** (counting reconciled with canonical table at v0.5):
+  - `consult.clinician_decision_recorded` (clinical decision; medico-legal artifact)
+  - `consult.prescription_creation_attempted` (gate-entry; medico-legal pretransaction record; required for regulator's chain-of-custody reconstruction even when the gate denies the prescription)
+  - `consult.prescription_created` (medication order issued; medico-legal + regulatory; cross-references SI-001 MedicationRequest schema gap and SI-007 P-013 refill ratification)
+  - `consult.prescription_creation_rejected` (medication order DENIED; medico-legal + regulatory; required for I-012 deny-path audit completeness and for regulatory compliance reporting on prescription denials)
+  - `consult.escalated_to_sync` (case-routing change affecting on-call governance + clinical-safety triage path)
+- **Category C (operational) — 9 events:** state-machine transitions, intake bookkeeping, notifications. No medico-legal artifact; no regulatory significance beyond audit trail.
+- **Total events: 14** (13 enumerated in v0.2 + 1 added at v0.4 via the prescription gate split 8a/8b/8c).
 
 ### Decision 4 — Mandatory detail-shape proposals
 
@@ -271,9 +278,22 @@ The following event-type strings are RESERVED at SI-004 ratification but NOT yet
 - `consult.data_export_requested` — reserved for Research Data slice (cross-references ADR-028 + I-029 6-condition gate).
 - `consult.crisis_resource_surfaced` — reserved for I-019 crisis-detection-gate emission specifically from the consult intake flow (the canonical I-019 event lives elsewhere; this is the consult-bound paired entry).
 
-**v0.3 R1 MEDIUM closure — separate `reserved_name_registry` from emit allowlist.** v0.2 added reserved strings to the canonicalization map, which the SI-003 G-2 CI guardrail uses as its 28-canonical-event_type allowlist. That meant a developer could emit `consult.data_export_requested` from any manifest-`reads-*` path without the Research Data slice gate (ADR-028 + I-029) being implemented — the CI would PASS because the string was on the allowlist. v0.3 splits the two registries:
+**v0.3 R1 MEDIUM closure — separate `reserved_name_registry` from emit allowlist. v0.5 R3 HIGH closure — separate `deferred_emit_set` from `canonical_emitted_set`.** v0.2 added reserved strings to the canonicalization map, which the SI-003 G-2 CI guardrail uses as its allowlist. That meant a developer could emit `consult.data_export_requested` from any manifest-`reads-*` path without the Research Data slice gate (ADR-028 + I-029) being implemented — the CI would PASS because the string was on the allowlist. v0.3 split out the reserved registry; v0.5 recognizes that the SAME failure mode applies to the 10-of-14 events that are declared-but-deferred for Sprint 10+ (their implementation gates have not landed). v0.5 splits the registries into three:
 
-- **`canonical_emitted_set`** (the SI-003 G-2 allowlist) — strings whose emission has a ratified implementation gate AND is permitted from a manifest-`reads-*` path. The 13 events in Decision 3 are in this set at SI-004 closure. The 3 reserved events are NOT.
+- **`canonical_emitted_set`** (the SI-003 G-2 allowlist) — strings whose implementation gate HAS landed (state-machine transition implemented + emit code present + emission tests green). Emission permitted from manifest-`reads-*` paths. At SI-004 closure 2026-05-14: ONLY the 4 Sprint 9 events qualify (`consult.initiated`, `consult.intake_submitted`, `consult.abandoned`, `consult.expired`). The other 10 events are NOT in this set yet.
+- **`deferred_emit_set`** (NEW v0.5) — strings whose canonical name is ratified at SI-004 closure but whose implementation gate has NOT yet landed. Each entry carries a `gating_milestone` field referencing the sprint/SI/ADR that must close first. CI behavior: ANY emission attempt fails with `event_type <name> is deferred; gate at <gating_milestone> must land first`. When the implementing PR lands the gate + emit code + tests, that PR also atomically moves the string from `deferred_emit_set` to `canonical_emitted_set` (one atomic commit; G-2 enforces the manifest move).
+  - The 10 deferred events at SI-004 closure (all reference Sprint 10+ as gating_milestone):
+    - `consult.ai_preparation_completed` (gating_milestone: AI service wiring Sprint 10+)
+    - `consult.case_claimed` (gating_milestone: Sprint 10 clinician-workflow transitions)
+    - `consult.clinician_decision_recorded` (gating_milestone: Sprint 10)
+    - `consult.prescription_creation_attempted` (gating_milestone: Sprint 10 + SI-001 closure for medication_request)
+    - `consult.prescription_created` (gating_milestone: Sprint 10 + SI-001 closure)
+    - `consult.prescription_creation_rejected` (gating_milestone: Sprint 10 + SI-001 closure + I-012 deny-path wiring)
+    - `consult.additional_data_requested` (gating_milestone: Sprint 10)
+    - `consult.escalated_to_sync` (gating_milestone: Sprint 10+ sync-consult slice readiness)
+    - `consult.patient_notification_sent` (gating_milestone: Sprint 10+ notification slice)
+    - `consult.follow_up_message_sent` (gating_milestone: Sprint 10+ messaging slice)
+    - `consult.completed` (gating_milestone: Sprint 10 terminal-state-machine transitions)
 - **`reserved_name_registry`** (NEW v0.3) — strings whose canonical name is RESERVED (no other team may steal the namespace) but whose emission is BLOCKED by CI until the implementing PR also lands the required gate/spec closure. Each reserved entry carries a `gating_spec_pointer` field referencing the SI or ADR that must close first:
   - `consult.reviewed_by_safety_team` → gates on §16.3 platform-clinical-governance safety-review workflow ratification (separate SI to be raised).
   - `consult.data_export_requested` → gates on ADR-028 Research Data Posture A activation + I-029 6-condition gate implementation.
