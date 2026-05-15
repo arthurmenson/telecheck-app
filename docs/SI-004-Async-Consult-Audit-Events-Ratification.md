@@ -4,8 +4,9 @@
 **Date:** 2026-05-05
 **v0.2 advanced:** 2026-05-14 (concrete proposals + pre-ratification gate alignment with SI-002 / SI-003)
 **v0.3 advanced:** 2026-05-14 (close Codex R1 HIGH — prescription_created vs creation_attempted split; R1 MEDIUM — reserved-name-registry separated from emit allowlist)
+**v0.4 advanced:** 2026-05-14 (close Codex R2 HIGH — three immutable events for prescription gate; honor I-003 append-only)
 **Severity:** medium (does NOT block Sprint 9 authoring; placeholder events ship with this gap as the resume-gate)
-**Status:** OPEN — v0.3 DRAFT, awaiting Contracts Pack v5.X AUDIT_EVENTS ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 / SI-003 cadence)
+**Status:** OPEN — v0.4 DRAFT, awaiting Contracts Pack v5.X AUDIT_EVENTS ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 / SI-003 cadence)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (v5.5 once SI-002 closes → **v5.6** at SI-004 closure)
 **Promotion Ledger target:** **P-016** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 PR #136 MERGED 2026-05-14; P-015 reserved by SI-003 PR #137 in flight)
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md` §13
@@ -73,8 +74,9 @@ Enumerates all 13 events (11 PRD §13 + 2 state-machine derived). v0.2 ratificat
 | 5 | `consult.ai_preparation_completed` | C | AI preparation completed | Sprint 10+ ⏸️ |
 | 6 | `consult.case_claimed` | C | Case claimed by clinician | Sprint 10 ⏸️ |
 | 7 | `consult.clinician_decision_recorded` | **B (governance)** | Clinician decision | Sprint 10 ⏸️ |
-| 8a | `consult.prescription_creation_attempted` | **B (governance)** | (split per v0.3 R1 HIGH closure) | Sprint 10 ⏸️ (depends on SI-001 closure) |
-| 8b | `consult.prescription_created` | **B (governance)** | Prescription created | Sprint 10 ⏸️ (depends on SI-001 closure) |
+| 8a | `consult.prescription_creation_attempted` | **B (governance)** | (gate-entry; v0.3 split) | Sprint 10 ⏸️ (depends on SI-001 closure) |
+| 8b | `consult.prescription_created` | **B (governance)** | Prescription created (terminal-success) | Sprint 10 ⏸️ (depends on SI-001 closure) |
+| 8c | `consult.prescription_creation_rejected` | **B (governance)** | (terminal-failure; v0.4 R2 HIGH split) | Sprint 10 ⏸️ (depends on SI-001 closure) |
 | 9 | `consult.additional_data_requested` | C | Additional data requested | Sprint 10 ⏸️ |
 | 10 | `consult.escalated_to_sync` | **B (governance)** | Escalation to sync | Sprint 10+ ⏸️ |
 | 11 | `consult.patient_notification_sent` | C | Patient notification sent | Sprint 10+ ⏸️ |
@@ -160,29 +162,47 @@ Per AUDIT_EVENTS v5.2 §envelope, every audit event already carries the canonica
 ```
 Note: Category B detail intentionally does NOT include the rationale text or the decision payload itself — those live encrypted on the AsyncConsult row. The audit detail carries the HASH for tamper-evidence + a boolean for compliance reporting (was a clinical rationale recorded? per regulatory requirement).
 
-#### `consult.prescription_creation_attempted` (Category B; governance — medico-legal; v0.3 R1 HIGH closure)
+#### `consult.prescription_creation_attempted` (Category B; governance — medico-legal; gate-entry IMMUTABLE event; v0.4 R2 HIGH closure)
 ```json
 {
   "consult_id": "<ULID>",
   "clinician_account_id": "<ULID>",
   "candidate_medication_request_id": "<ULID; provisional ID assigned at attempt time, retained for chain reconstruction even if the attempt is rejected>",
-  "interaction_check_outcome": "pending|passed|warnings_accepted|blocked",
-  "attempt_outcome": "in_progress|created|rejected"
+  "gate_correlation_id": "<ULID; pairs this attempt to its terminal outcome event (created OR rejected). Same as `attempt_audit_id` referenced from the terminal event>",
+  "preflight_interaction_check_state": "not_yet_run|in_progress",
+  "i012_clauses_evaluated": "none|partial"
 }
 ```
-Emitted at I-012 reject-unless three-clause GATE ENTRY (i.e., the moment a clinician initiates a prescription creation but BEFORE the gate's outcome is known). The terminal `attempt_outcome` is set when the gate completes: `created` if I-012 allow-path succeeded (paired with a `consult.prescription_created` event); `rejected` if I-012 blocked (paired with a `medication_request.execution_rejected` event per I-012 §rejection). Multiple attempts on the same consult emit multiple `consult.prescription_creation_attempted` rows (each with a distinct `candidate_medication_request_id`).
+**v0.4 R2 HIGH closure:** v0.3 said the same event carried a mutable `attempt_outcome` field. That violated **I-003 audit append-only** — once a row is INSERTed into `audit_records`, the chain hash is sealed; UPDATE-ing the detail JSONB would either break the chain (forbidden) or require a post-insert mutable field outside the chain (defeats the point of audit). v0.4 makes this event **IMMUTABLE**: emitted at I-012 gate ENTRY (the moment a clinician initiates a prescription creation), it carries ONLY the gate-entry state. The terminal outcome is recorded by a SEPARATE appended event (`consult.prescription_created` for success; `consult.prescription_creation_rejected` for failure). Both terminal events reference this row by `gate_correlation_id`. The chain is reconstructible via SQL join: `SELECT * FROM audit_records WHERE detail->>'gate_correlation_id' = $1`.
 
-#### `consult.prescription_created` (Category B; governance — medico-legal + regulatory; v0.3 narrowed)
+Retries do not mutate: if the gate times out or the system crashes between attempt-emission and terminal-emission, the operator MAY emit a new attempt event with a fresh `gate_correlation_id` (the stale prior attempt remains in the chain as a permanent record of the abandoned attempt). To detect stale unterminated attempts in compliance reporting, a query joins `consult.prescription_creation_attempted` rows whose `gate_correlation_id` has NO corresponding `consult.prescription_created` OR `consult.prescription_creation_rejected` row within a regulator-defined window (proposed: 72 hours). Stale-attempt detection is operational, not a chain-integrity concern.
+
+Idempotency: per IDEMPOTENCY v5.1, the gate-entry emission is wrapped in a same-tx reserve-then-execute pattern. If the same clinician retries the gate-entry within the idempotency window with the same `Idempotency-Key`, the same `gate_correlation_id` is returned and no duplicate audit row is created. Different idempotency keys produce different `gate_correlation_id`s (legitimate distinct attempts).
+
+#### `consult.prescription_created` (Category B; governance — medico-legal + regulatory; terminal-success IMMUTABLE; v0.4 narrowed)
 ```json
 {
   "consult_id": "<ULID>",
   "medication_request_id": "<ULID — references medication_request entity per SI-001>",
   "clinician_account_id": "<ULID>",
   "interaction_check_outcome": "passed|warnings_accepted",
-  "preceding_attempt_audit_id": "<ULID — the consult.prescription_creation_attempted audit_id that terminated as attempt_outcome=created>"
+  "gate_correlation_id": "<ULID — matches the consult.prescription_creation_attempted row's gate_correlation_id>"
 }
 ```
-**v0.3 R1 HIGH closure:** `interaction_check_outcome=blocked-override` REMOVED. Only `passed` and `warnings_accepted` are permitted on `consult.prescription_created`. Blocked-override cases never emit a `prescription_created` event — they emit `consult.prescription_creation_attempted{attempt_outcome=rejected}` + the paired `medication_request.execution_rejected`. This eliminates the v0.2 contradiction where two audit facts (created + rejected) could co-exist for the same regulated action. Per glossary `medication_request` (NOT `prescription`). Per platform-floor I-012 reject-unless three-clause rule: only the I-012 allow-path emits `consult.prescription_created`; the I-012 deny-path emits the rejection events.
+Emitted ONLY when I-012 allow-path succeeded. `interaction_check_outcome ∈ {passed, warnings_accepted}` — `blocked-override` REMOVED per v0.3. Blocked cases emit `consult.prescription_creation_rejected` instead. Per glossary `medication_request` (NOT `prescription`).
+
+#### `consult.prescription_creation_rejected` (Category B; governance — medico-legal; terminal-failure IMMUTABLE; v0.4 NEW)
+```json
+{
+  "consult_id": "<ULID>",
+  "candidate_medication_request_id": "<ULID — matches the attempt event's candidate_medication_request_id; no medication_request entity row was created>",
+  "clinician_account_id": "<ULID>",
+  "rejection_reason_code": "<enum: i012_autonomy_level_mismatch|i012_no_clinician_confirmation|i012_rbac_unauthorized|interaction_check_blocked|formulary_constraint_violated|other>",
+  "rejection_reason_detail_hash": "<SHA-256 hex of free-form rejection rationale; the rationale itself is on the AsyncConsult row, hash here for chain-integrity>",
+  "gate_correlation_id": "<ULID — matches the consult.prescription_creation_attempted row's gate_correlation_id>"
+}
+```
+Emitted when I-012 reject-unless three-clause gate denies the prescription, OR when the interaction-check returns `blocked` and the clinician does NOT override (the override case becomes a NEW gate-entry attempt; rejection here means the gate path terminated in denial). Paired with the standard `medication_request.execution_rejected` event per I-012 §rejection — both audit rows reference the same `gate_correlation_id`. The dual emission is intentional: `consult.prescription_creation_rejected` is the consult-bound view (queries on a consult get the rejection history); `medication_request.execution_rejected` is the platform-floor I-012 invariant event that fires regardless of where the rejection originated.
 
 #### `consult.additional_data_requested` (Category C)
 ```json
