@@ -103,7 +103,15 @@ Same lessons-learned as SI-008's 14-round Codex review series apply here:
 
   Zero-row return triggers `consult.escalation_target_swap_failed` Category C audit (captures the specific predicate that filtered: caller can probe by reading the current consult + target session state to determine whether CAS lost OR the target was inactive) + caller-side conflict resolution (typically refresh + re-attempt with a freshly scheduled session). Every successful swap emits `consult.escalation_target_swapped` Category C audit capturing `(prior_pointer, new_pointer, actor_id)` for forensic recovery.
 
-  No DB-layer procedure-only path is required (unlike SI-008's `record_workflow_pointer_swap()`) because the sync-session lifecycle is human-driven + scheduling-data has simpler integrity semantics than AI-recommendation lineage. Application-layer four-predicate atomic UPDATE + audit is the proportionate defense for this surface.
+  **R3 HIGH closure (Codex 2026-05-15):** the application-layer atomic UPDATE alone leaves the invariant bypassable by direct UPDATE, migration, admin repair, or background job paths. To match the same DB-boundary discipline SI-008 establishes for AI workflow pointer swaps, the swap MUST be enforced at the DB layer via a definer-rights stored procedure:
+
+  - **GRANT model:** application code's role has NO direct UPDATE privilege on `consults.escalation_target_sync_session_id`. All mutations go through `record_consult_escalation_target_swap(...)`.
+  - **Procedure signature:** `record_consult_escalation_target_swap(p_consult_id, p_tenant_id, p_new_sync_session_id, p_expected_prior_pointer, p_actor_id)` returns `(success: boolean, rejection_code: TEXT, rejection_detail: JSONB)`.
+  - **Procedure body:** runs the four-predicate atomic UPDATE shown above (CAS + consult-state + same-tenant + same-originating-consult + target-session-actionable-state). Emits paired audit row in same transaction on success.
+  - **Failure modes:** four-predicate UPDATE returns zero rows → rejection_code ∈ {`cas_mismatch`, `consult_state_invalid`, `target_session_missing`, `target_session_inactive`}. Procedure probes both rows post-UPDATE to determine which predicate filtered.
+  - **Durability:** same three-tier durability pattern as SI-008's `record_workflow_pointer_swap()` (savepoint + autonomous-transaction rejection log + caller-commit-boundary contract). The autonomous log is `audit_swap_rejection_log` (same table as SI-008; the `target_table` discriminator column says `consults`).
+
+  The procedure is the AI-workflow-pointer-swap pattern from SI-008 applied to sync session escalation. Same definer-rights enforcement; same GRANT model; same audit durability. The earlier text claiming "application-layer is proportionate" is REJECTED — direct-SQL / migration / admin-repair paths are real risk surfaces and the DB-boundary discipline is mandatory.
 
 ## Resolution path
 
