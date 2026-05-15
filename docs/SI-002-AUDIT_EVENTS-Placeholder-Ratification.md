@@ -1,11 +1,14 @@
 # SI-002 — AUDIT_EVENTS v5.2 placeholder action IDs awaiting ratification
 
 **Raised by:** Engineering (autonomous turn 2026-05-05)
-**Date:** 2026-05-05
+**Date raised:** 2026-05-05
 **Severity:** medium
-**Status:** Open — awaiting Privacy/Compliance + Engineering Lead ratification
-**Target spec doc:** `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (v5.2 in headers)
+**Status:** **OPEN — v0.2 DRAFT** (concrete proposals added 2026-05-14: naming convention picked, category assignments + detail shapes proposed, P-NUM target updated; pre-ratification Codex gate pending)
+**Target spec doc:** `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (v5.2 → v5.5 proposed; v5.3 was bumped at P-011 for crisis-detection MedicationRequest closure, v5.4 by SI-007 P-013 for refill/dispensing/shipment, so SI-002 closure targets v5.5)
+**Promotion Ledger:** **P-014** (updated from v0.1's P-012 — P-012 slot was deferred to a future implementation-milestone-class entry per Addendum 4 status doc; P-013 is now claimed by SI-007 v0.19 merged 2026-05-14)
 **Related slice PRDs:** Forms/Intake v2.1 §13, Identity Spec §3, Consent Slice PRD v1.0 §10
+**Companion SIs:** SI-001 (CLOSED P-011), SI-003 (DOMAIN_EVENTS — same pattern, sibling doc), SI-004 (Async-Consult — same pattern, downstream consumer of SI-002 v5.5 amendment), SI-007 (v0.19 merged 2026-05-14; closes at P-013)
+**Pre-ratification gate:** mandatory per SI-001 + SI-007 retrospective lessons — multi-round Codex convergence before ratification attempt
 
 ---
 
@@ -32,6 +35,106 @@ The 31 placeholder action ID strings are listed below. Each needs:
 1. **Ratification** — does Privacy/Compliance accept this exact string? Or should the casing / dot-vs-underscore / namespacing change?
 2. **Category assignment** — which AUDIT_EVENTS v5.2 safety classification (A / B / C) does each event belong to? The slices currently emit as Category C (operational); some may belong in Category B (governance) once ratified.
 3. **Schema-shape ratification** — what fields are mandatory in `envelope.detail` for each action? The slices emit a slice-specific shape; the canonical AUDIT_EVENTS v5.2 schema likely expects a more constrained shape.
+
+## Concrete proposals (v0.2 — 2026-05-14)
+
+### Naming convention: dot-namespaced
+
+The corpus mixes both `snake_case` (placeholder shape) and `dot.namespaced` (Category A canonical IDs like `crisis_detection_trigger`, `prescribing.protocol_authorization_granted`). v0.2 proposes **dot-namespaced** as canonical for SI-002's 31 actions because:
+
+1. **Consistency with Category A precedent.** The P-011 + SI-007 Category A additions (`crisis_detection_trigger`, `prescribing.protocol_authorization_granted`, `refill.expired`, `shipment.cancelled_before_dispatch`, etc.) use dot-namespaced. The v0.2 31-action proposal extends the established pattern; v0.1's snake_case would create an inconsistent two-style corpus.
+2. **Hierarchical filtering.** Audit-query tooling (compliance dashboards, ops triage, denylist filters) needs to group events by domain (`forms.*`, `identity.*`, `consent.*`). Dot-namespacing makes this a prefix match; snake_case requires per-event registration.
+3. **Forward-compat with reserved namespaces.** ADR-029 reserved workload types (`autonomous_agent`, `multi_agent_supervisor`, `tool_using_agent`) will emit audits under their own namespace when activated (e.g., `autonomous_agent.action_executed`). Dot-namespacing scales cleanly.
+
+The "Proposed canonical (illustrative)" column in the v0.1 tables below is now the **proposed CANONICAL** column (not illustrative). Implementation closure replaces `{slice}AuditPlaceholder('forms_template_created')` with the direct typed reference to `'forms.template.created'`.
+
+### Category assignment (A / B / C per AUDIT_EVENTS v5.2 §classification)
+
+Three categories per AUDIT_EVENTS v5.2:
+
+- **Category A:** safety-critical (crisis detection, prescribing execution, etc.) — strict immutability + escalation-on-emission semantics.
+- **Category B:** governance (template publishing, governance edits, deployment lifecycle) — visible to compliance review + audit chain integrity, but no escalation.
+- **Category C:** operational (account activity, session lifecycle, submission lifecycle) — chain-integrity-preserved but treated as observability.
+
+Per-event categorization for the 31 IDs (v0.2 proposal):
+
+#### Forms/Intake (14 events)
+
+| Canonical ID                       | Category | Rationale                                                                                                                                                                                   |
+| ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `forms.template.created`           | B        | Template authorship is governance-class; alters what patients can see                                                                                                                       |
+| `forms.template.version_published` | B        | Publishing is a governance event (Slice PRD v2.1 §3.5 approval rule)                                                                                                                        |
+| `forms.eligibility_logic.edited`   | B        | Eligibility logic is governance-class per Slice PRD §13 explicit assignment                                                                                                                 |
+| `forms.approval_governance.edited` | B        | Approval-governance edits are explicitly Category B per Slice PRD §13                                                                                                                       |
+| `forms.deployment.created`         | B        | Deployment is a governance event (binds template version to a market)                                                                                                                       |
+| `forms.deployment.retired`         | B        | Retirement is governance — patient surface changes                                                                                                                                          |
+| `forms.submission.started`         | C        | Patient activity; operational                                                                                                                                                               |
+| `forms.submission.paused`          | C        | Patient activity; operational                                                                                                                                                               |
+| `forms.submission.resumed`         | C        | Patient activity; operational                                                                                                                                                               |
+| `forms.submission.completed`       | C        | Patient activity; operational. (Note: distinct from `crisis_detection_trigger` Category A which fires inside `submission.responses.patched` via I-019 — separate event, separate category.) |
+| `forms.submission.abandoned`       | C        | Patient activity; operational                                                                                                                                                               |
+| `forms.variant.created`            | B        | A/B variant authorship is governance                                                                                                                                                        |
+| `forms.variant.winner_promoted`    | B        | Promotion changes patient surface; governance                                                                                                                                               |
+| `forms.variant.retired`            | B        | Retirement changes patient surface; governance                                                                                                                                              |
+
+#### Identity & Auth (9 events)
+
+| Canonical ID                     | Category | Rationale                                                                                                                 |
+| -------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `identity.account.created`       | C        | Account lifecycle; operational                                                                                            |
+| `identity.account.activated`     | C        | Account lifecycle; operational                                                                                            |
+| `identity.session.issued`        | C        | Session lifecycle; operational                                                                                            |
+| `identity.session.revoked`       | B        | Revocation has security-policy significance; governance                                                                   |
+| `identity.otp.issued`            | C        | OTP lifecycle; operational                                                                                                |
+| `identity.otp.consumed`          | C        | OTP lifecycle; operational                                                                                                |
+| `identity.otp.lockout_triggered` | B        | Lockout is a security event; governance for ops review (Codex review pattern: lockouts may indicate brute-force attempts) |
+| `identity.device.registered`     | C        | Device lifecycle; operational                                                                                             |
+| `identity.device.revoked`        | B        | Device revocation has security significance; governance                                                                   |
+
+#### Consent + Delegated Access (8 events)
+
+| Canonical ID               | Category | Rationale                                                           |
+| -------------------------- | -------- | ------------------------------------------------------------------- |
+| `consent.granted`          | B        | Consent is a regulatory artifact (HIPAA, GDPR); governance category |
+| `consent.revoked`          | B        | Revocation has compliance significance; governance                  |
+| `delegation.invited`       | B        | Delegated-access creation is governance                             |
+| `delegation.accepted`      | B        | Delegated-access activation is governance                           |
+| `delegation.declined`      | B        | Outcome of delegated-access flow; governance                        |
+| `delegation.revoked`       | B        | Revocation has compliance significance; governance                  |
+| `delegation.scope.granted` | B        | Scope changes affect what the delegate can do; governance           |
+| `delegation.scope.revoked` | B        | Scope changes; governance                                           |
+
+**Summary:** 14 Category B (governance) + 17 Category C (operational). Zero Category A in SI-002 — Category A is reserved for safety-critical events (crisis, prescribing); the SI-002 set is operational + governance lifecycle.
+
+### Detail-shape ratification per action
+
+The AUDIT_EVENTS v5.2 envelope's `detail` JSONB column is currently free-shape. v0.2 proposes the following **mandatory minimum field set** per action (additional fields are optional and slice-specific):
+
+| Action prefix                                               | Required `detail` fields                                                                                                                 |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `forms.template.*`                                          | `template_id`, `template_version`, `program_id`                                                                                          |
+| `forms.eligibility_logic.*` / `forms.approval_governance.*` | `template_id`, `template_version`, `changed_by_actor_id`, `change_summary`                                                               |
+| `forms.deployment.*`                                        | `deployment_id`, `template_id`, `template_version`, `program_id`, `country_of_care`                                                      |
+| `forms.submission.*`                                        | `submission_id`, `deployment_id`, `patient_id`, `status_before`, `status_after` (for state-transition events)                            |
+| `forms.variant.*`                                           | `variant_id`, `template_id`, `assignment_rule_summary`                                                                                   |
+| `identity.account.*`                                        | `account_id`, `phone_e164_hash` (NEVER plaintext phone), `account_type`                                                                  |
+| `identity.session.*`                                        | `session_id`, `account_id`, `device_id` (nullable; null for password-flow sessions), `revocation_reason` (for `.revoked` only)           |
+| `identity.otp.*`                                            | `otp_id`, `account_id`, `purpose` (`login` / `mfa` / etc.), `attempt_count` (for `.lockout_triggered` only)                              |
+| `identity.device.*`                                         | `device_id`, `account_id`, `device_fingerprint_hash` (NEVER plaintext fingerprint), `revocation_reason` (for `.revoked` only)            |
+| `consent.*`                                                 | `consent_id`, `account_id`, `consent_type`, `granted_at` (for `.granted` only), `revoked_at` + `revocation_reason` (for `.revoked` only) |
+| `delegation.*`                                              | `delegation_id`, `patient_account_id`, `delegate_account_id`, `scope_codes[]`, `status_before`, `status_after`                           |
+| `delegation.scope.*`                                        | `delegation_id`, `scope_code`, `granted_at` (for `.granted`) / `revoked_at` + `revocation_reason` (for `.revoked`)                       |
+
+**PHI guarantee:** every `detail` shape above either (a) references PHI by ID rather than value, OR (b) uses a hash (`phone_e164_hash`, `device_fingerprint_hash`) so the audit chain never carries plaintext PHI. This mirrors the SI-007 + crisis-detection-trigger discipline.
+
+### v5.2 → v5.5 promotion semantics
+
+- AUDIT_EVENTS v5.2 → v5.3 was bumped at P-011 (MedicationRequest § amendment).
+- AUDIT_EVENTS v5.3 → v5.4 was bumped at SI-007 P-013 (Refill + Dispensing + Shipment additions; 38 net-new IDs).
+- AUDIT_EVENTS v5.4 → v5.5 is proposed for SI-002 closure (31 net-new IDs across forms-intake, identity, consent; ratification of placeholder pattern).
+- Total net-new at v5.5: 31 IDs + canonical-name ratification of the placeholder pattern.
+
+The version bump is the smallest semver step appropriate to additive-only Category-B + Category-C enumeration (no normative-rule change to envelope; just enumeration). Precedent: P-011 (v5.2 → v5.3) and P-013 (v5.3 → v5.4) used the same semver-minimal step for additive Category-A enumeration.
 
 ## What I'd propose
 
@@ -137,5 +240,19 @@ The autonomous-turn discipline: **never invent new canonical contract artifacts 
 
 ## Resolution expectations
 
-- **Target close-out:** Spec Issue resolution lands as Promotion Ledger entry **P-012** (next available P-NUM after P-011 closes SI-001 MedicationRequest schema).
+- **Target close-out:** Spec Issue resolution lands as Promotion Ledger entry **P-014** (P-012 was deferred to a future implementation-milestone-class entry per the Addendum 4 status doc; P-013 is now claimed by SI-007 v0.19 merged 2026-05-14).
 - **Until then:** SI-002 stays open in this file; all slices use placeholder cast helpers; tests pin the 31 strings as assertion predicates so an out-of-band rename surfaces as test failure.
+
+---
+
+## Document control
+
+- **v0.1 — 2026-05-05** — Initial DRAFT raised during the Sprint 33-34 cycle. Identified 31 placeholder action IDs across 3 slices (Forms/Intake + Identity + Consent). Left naming convention, category assignment, and detail-shape questions open.
+- **v0.2 — 2026-05-14** — Concrete proposals added:
+  - **Naming convention picked:** dot-namespaced (consistency with Category A precedent from P-011 + SI-007; hierarchical filtering for compliance tooling; forward-compat with ADR-029 reserved workload namespaces).
+  - **Per-event category assignment:** 14 Category B (governance) + 17 Category C (operational). Zero Category A in SI-002 set.
+  - **Detail-shape proposals:** mandatory minimum field set per action prefix; PHI-by-ID + hashed-when-necessary discipline mirroring SI-007 + crisis-detection-trigger pattern.
+  - **Promotion Ledger target updated:** P-012 → P-014 (P-013 claimed by SI-007 v0.19 merged 2026-05-14).
+  - **AUDIT_EVENTS version target updated:** v5.2 → v5.5 (was v5.2 → v5.3 in v0.1; v5.3 + v5.4 bumps consumed at P-011 + P-013).
+  - **Pre-ratification gate added** per SI-001 + SI-007 retrospective lessons.
+- **Next:** v0.3 after Codex R1 review. Iterate to convergence per the SI-007 trajectory pattern (R1 → R18 was SI-007's path; SI-002's scope is broader and may extend longer).
