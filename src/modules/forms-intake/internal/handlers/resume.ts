@@ -41,45 +41,71 @@ function mapServiceError(): boolean {
 /**
  * Resolve the request's patient identity for the resume metadata read.
  *
- * Mirrors the same shim pattern as `submissions.ts` (production fail-closed
- * unless `ALLOW_ACTOR_HEADER_AUTH=true`); the Identity & Auth slice
- * replaces both shims when it lands.
+ * Tier 1 (preferred): `req.actorContext` populated by authContextPlugin
+ * from a JWT bearer token. Patient account_id IS the patient_id at v1.0
+ * (Account = Patient per CDM §3.2). Role-gated via
+ * requirePatientActorContext — a clinician JWT throws
+ * UnauthorizedRoleError (→ 403) BEFORE this function returns, to prevent
+ * patient submission data from being scoped under a non-patient account.
+ *
+ * Tier 2 (legacy header shim, gated by ALLOW_ACTOR_HEADER_AUTH in
+ * non-prod): falls back to `x-patient-id` or `x-device-anonymous-token`.
+ * The Identity & Auth slice retires Tier 2 at the same time it retires
+ * the shim in `submissions.ts`.
  *
  * **Anonymous-flow caveat:** for the device-anonymous resume path
  * (Slice PRD §8.2), the patient is not yet registered and identity is
- * carried by `x-device-anonymous-token` instead of `x-patient-id`. This
- * shim reads BOTH headers and returns whichever is present; the service
- * layer matches against the row's identity anchor (patient_id OR
- * device_anonymous_token, never both).
+ * carried by `x-device-anonymous-token`. Anonymous tokens never carry a
+ * JWT, so the JWT branch is bypassed entirely when only the device token
+ * is presented.
  *
- * Either header is required — bearing only the resume token is no longer
+ * Either branch must succeed — bearing only the resume token is no longer
  * sufficient (Codex resume-r1 HIGH closure 2026-05-03).
  */
 function resolveResumeOwnership(req: FastifyRequest): {
   patientId: PatientId | null;
   deviceAnonymousToken: string | null;
 } {
+  // Tier 1: JWT actorContext (patient role-gated)
+  if (req.actorContext !== undefined) {
+    const patientActor = requirePatientActorContext(req);
+    return {
+      patientId: patientActor.accountId,
+      deviceAnonymousToken: null,
+    };
+  }
+
+  // Tier 2: header shim (device-anonymous OR pre-JWT-migration patient)
   const isProd = process.env['NODE_ENV'] === 'production';
   const optIn = process.env['ALLOW_ACTOR_HEADER_AUTH'] === 'true';
+
+  // The device-anonymous path remains valid even when Tier 2 is gated
+  // off, because anonymous tokens are a first-class auth mechanism on
+  // the resume flow (not a shim). Read the device header first; if
+  // present, return early without tripping the prod-fail-closed branch.
+  const deviceHeader = req.headers['x-device-anonymous-token'];
+  const deviceAnonymousToken =
+    typeof deviceHeader === 'string' && deviceHeader.length > 0 ? deviceHeader : null;
+  if (deviceAnonymousToken !== null) {
+    return { patientId: null, deviceAnonymousToken };
+  }
+
   if (isProd && !optIn) {
     throw req.server.httpErrors.unauthorized(
       'Patient identity could not be authenticated for this request.',
     );
   }
+
   const patientHeader = req.headers['x-patient-id'];
   const patientId =
     typeof patientHeader === 'string' && patientHeader.length > 0 ? patientHeader : null;
 
-  const deviceHeader = req.headers['x-device-anonymous-token'];
-  const deviceAnonymousToken =
-    typeof deviceHeader === 'string' && deviceHeader.length > 0 ? deviceHeader : null;
-
-  if (patientId === null && deviceAnonymousToken === null) {
+  if (patientId === null) {
     throw req.server.httpErrors.unauthorized(
       'No patient or device-anonymous identity resolved for this request.',
     );
   }
-  return { patientId, deviceAnonymousToken };
+  return { patientId, deviceAnonymousToken: null };
 }
 
 /**
