@@ -3,8 +3,9 @@
 **Raised by:** Engineering (autonomous turn 2026-05-05)
 **Date:** 2026-05-05
 **v0.2 advanced:** 2026-05-14 (concrete proposals + pre-ratification gate alignment)
+**v0.3 advanced:** 2026-05-14 (close Codex R1 HIGH — subscriber-compat protocol for cutover)
 **Severity:** medium
-**Status:** OPEN — v0.2 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate pending; mirror SI-007 / SI-002 cadence)
+**Status:** OPEN — v0.3 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_DOMAIN_EVENTS.md` (v5.2 → **v5.3**)
 **Promotion Ledger target:** **P-015** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 in flight at PR #136)
 **Parallel SI:** SI-002 (audit-side placeholder gap; concurrent dot-namespaced naming convention)
@@ -191,17 +192,23 @@ Twelve detail-shape archetypes, one per aggregate-prefix. Listed here for ratifi
 - `granted`: `{ ...minimum, delegation_scope_id: ULID, delegation_id: ULID, scope: string }`
 - `revoked`: `{ ...minimum, delegation_scope_id: ULID, delegation_id: ULID }`
 
-### Decision 7 — Transition contract (atomic per-slice cutover; mirror SI-002 Decision)
+### Decision 7 — Transition contract (subscriber-compat-gated per-slice cutover; v0.3 revised)
 
-**No dual-write window.** Each affected slice's events.ts file (`consent`, `identity`, `forms-intake`) cuts over from placeholder strings to canonical strings in a single atomic commit per slice. The cutover commit:
+**v0.3 revision (Codex R1 HIGH closure 2026-05-14):** the v0.2 "no dual-write window" rule was unsafe for production subscribers. Although at v1.0 there are NO production subscribers of the outbox (the 3 emitting slices are implementation-complete but no downstream consumer service has been deployed against them), Decision 7 MUST treat subscriber compatibility as the precondition for cutover so the same rule applies once consumers ship (Pharmacy refill-on-consent, AI-service intake-evaluation triggers, etc.).
 
-1. Updates the placeholder string literal in the `emitDomainEvent` call site
-2. Updates the corresponding test-assertion literal in the slice's outbox-landing test file
-3. Lands in a dedicated PR (one per slice; 3 PRs total: `consent`, `identity`, `forms-intake`)
+**Producer-cutover gating (5-step protocol):**
 
-**Rationale:** the outbox table's `event_type` column is free-form TEXT — there is no schema migration. The cost of a brief dual-state (placeholder in events.ts, canonical in tests OR vice versa) is a test failure on the cutover PR's branch, which is acceptable. Avoiding dual-write keeps subscribers' match logic linear.
+1. **Subscriber inventory (precondition for any rename PR).** Before any producer-cutover PR is opened, the cutover author MUST enumerate every subscriber service that matches against the placeholder strings being renamed. At v1.0 the inventory is empty (no subscribers exist), and the empty result is recorded in the cutover PR description with a grep audit demonstrating no consumer-side match selectors exist outside the emitting slice + its outbox-landing test.
+2. **Subscriber-side dual-read deploy first.** If the inventory is non-empty, each subscriber MUST first ship a release that accepts BOTH the placeholder and the canonical string (a `MATCH IN (...)` selector or equivalent). This release deploys to all environments BEFORE the producer cutover PR opens. No producer rename merges until every inventoried subscriber has dual-read live in production.
+3. **Alias map artifact committed at ratification.** A static `docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_P_015.md` enumerates every (placeholder → canonical) pair. Subscribers reference this artifact authoritatively. The map is committed as part of the v5.3 promotion PR (alongside DOMAIN_EVENTS v5.3 promotion). It does NOT live in the producer-cutover PRs.
+4. **Observability for unmatched event types.** Each subscriber service MUST emit a metric `outbox.unmatched_event_type{event_type=…}` on every event it dropped because no selector matched. A non-zero rate after a producer cutover PR merges is the alarm signal for a stranded rename. At v1.0 with no subscribers, this requirement is **forward-looking** — when the first subscriber service ships, its build-out plan MUST include this metric per `docs/SI-003 §Decision 7 step 4`. The metric SHALL be wired into the standard SLI dashboard with a `PageDuty` alert on `> 0` 5-minute sustained.
+5. **Producer cutover (one PR per slice).** Once steps 1-4 are satisfied for a given slice (or step 1 returns empty for v1.0), the producer-cutover PR opens. It atomically replaces placeholder strings with canonical strings in `src/modules/<slice>/events.ts` and the slice's outbox-landing test file. Each slice's PR is independent (no cross-slice ordering dependency).
 
-**Cross-slice migration matrix:** an additional artifact `docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_P_015.md` SHALL be authored at ratification time, listing every (placeholder → canonical) pair so consumers can be migrated mechanically.
+**Removal window.** After all producer-cutover PRs merge AND all subscriber metrics show `outbox.unmatched_event_type{event_type=<placeholder>} == 0` for **30 consecutive days**, the placeholder strings MAY be removed from subscriber dual-read selectors. The 30-day quiet period MUST be observed even when the inventory was empty at cutover, in case a new subscriber shipped during the cutover window without consulting the canonicalization map.
+
+**Rationale for not waiting for consumers at v1.0:** the v1.0 outbox is producer-only — its consumers don't exist yet. Holding the SI-003 ratification until consumers exist would extend the placeholder-string emission window indefinitely, and the eventual rename would have N consumers (not zero) to migrate. Ratifying now establishes the canonical names; the subscriber-compat protocol above ensures the rename is safe regardless of N at cutover time.
+
+**Cross-slice migration matrix:** the canonicalization map artifact (`docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_P_015.md`) is committed at ratification time, listing every (placeholder → canonical) pair so consumers can be migrated mechanically and so the alarm metric in step 4 has a known key-set.
 
 ### Decision 8 — Cross-SI alignment with SI-002 (NEW; per Codex pre-ratification expectation)
 
