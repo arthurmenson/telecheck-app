@@ -81,6 +81,13 @@ COMMENT ON COLUMN audit_records.actor_tenant_id IS
 -- recreate both in dependency order: drop trigger → drop canonical hash
 -- → recreate canonical hash with new sig → recreate trigger function
 -- → re-bind trigger.
+--
+-- F-4 R4 CRITICAL closure (Codex 2026-05-15): trigger name in
+-- migration 002 is `audit_records_before_insert` (not the
+-- speculative `audit_records_hash_insert_trigger` from an earlier
+-- draft). Drop BOTH possible names so the migration is idempotent
+-- under rerun + tolerant of the alternative-name historical artifact.
+DROP TRIGGER IF EXISTS audit_records_before_insert ON audit_records;
 DROP TRIGGER IF EXISTS audit_records_hash_insert_trigger ON audit_records;
 DROP FUNCTION IF EXISTS audit_records_hash_insert();
 DROP FUNCTION IF EXISTS audit_records_canonical_hash(
@@ -207,7 +214,9 @@ BEGIN
 END;
 $$;
 
-CREATE TRIGGER audit_records_hash_insert_trigger
+-- Bind under the canonical migration-002 trigger name so the
+-- pin in tests/i003-audit-append-only assumptions stays stable.
+CREATE TRIGGER audit_records_before_insert
     BEFORE INSERT ON audit_records
     FOR EACH ROW
     EXECUTE FUNCTION audit_records_hash_insert();
