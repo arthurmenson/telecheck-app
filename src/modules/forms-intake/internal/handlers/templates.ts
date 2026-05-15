@@ -19,6 +19,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireAdminRole } from '../../../../lib/admin-role.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateTemplateRequestSchema, PublishVersionRequestSchema } from '../../schemas.js';
@@ -111,6 +112,12 @@ export async function createTemplateHandler(
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
+  // F-4 (Phase 2 R6 HIGH-2 closure): compute audit-attribution tenant.
+  // For platform_admin cross-tenant actions this is the admin's home
+  // tenant; for tenant-scoped roles it's the resource tenant. The
+  // helper falls back to ctx.tenantId when no JWT was presented
+  // (legacy header-shim path during transition).
+  const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   const parsed = CreateTemplateRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -122,7 +129,12 @@ export async function createTemplateHandler(
   }
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
-    const template = await templateService.createDraftTemplate(ctx, actorId, parsed.data, tx);
+    const template = await templateService.createDraftTemplate(
+      ctx,
+      { actorId, actorTenantId },
+      parsed.data,
+      tx,
+    );
     return { status: 201, view: template };
   });
 }
@@ -303,6 +315,9 @@ export async function publishVersionHandler(
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
+  // F-4: compute audit-attribution tenant for platform_admin cross-
+  // tenant action correctness.
+  const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   const params = req.params as Record<string, unknown>;
   const templateIdParam = params['templateId'];
@@ -331,7 +346,7 @@ export async function publishVersionHandler(
     try {
       const published = await templateService.publishVersion(
         ctx,
-        actorId,
+        { actorId, actorTenantId },
         versionIdParam,
         parsed.data,
         tx,

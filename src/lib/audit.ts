@@ -760,6 +760,37 @@ export async function emitAudit(
   // 2. Workload field validation (I-012 closure rule + sentinel rules)
   validateWorkloadFields(input);
 
+  // 2b. F-4 R5+R6 closure (Codex 2026-05-15): runtime assertion that
+  // non-system actors carry actor_tenant_id. The DB column is nullable
+  // by design (legacy pre-029 rows + system actors), but new emissions
+  // from non-system actors MUST populate it. Without this gate, a
+  // future caller that forgets to thread actorTenantId through would
+  // silently produce a non-system audit row with NULL attribution —
+  // durable bad evidence rather than a detectable failure.
+  //
+  // R6 closure: the invariant is now deny-by-default (require attribution
+  // for every actor_type except 'system' and 'ai_workload'). Including
+  // platform_admin, tenant_admin, pharmacist, etc. Previously only
+  // listed {patient, clinician, operator, delegate}, which left admin
+  // and AI-adjacent actor types as a forensic blind spot.
+  // R8 MEDIUM closure (2026-05-15): not just null/undefined — also
+  // reject empty string + whitespace-only. Blank attribution defeats
+  // the forensic purpose of the column.
+  const NON_ATTRIBUTING_ACTOR_TYPES: ReadonlySet<string> = new Set(['system', 'ai_workload']);
+  if (!NON_ATTRIBUTING_ACTOR_TYPES.has(input.actor_type)) {
+    const rawAttribution = input.actor_tenant_id;
+    const trimmed = typeof rawAttribution === 'string' ? rawAttribution.trim() : null;
+    if (trimmed === null || trimmed.length === 0) {
+      throw new Error(
+        `emitAudit: action="${input.action}" actor_type="${input.actor_type}" requires ` +
+          'non-null non-blank actor_tenant_id (F-4 attribution). Only system and ' +
+          'ai_workload actor types may omit it; every other actor type must populate it ' +
+          'with a usable tenant identifier. Caller must thread ' +
+          'resolveActorTenantIdForAudit(req) into the audit emitter call site.',
+      );
+    }
+  }
+
   // 3. Auto-enforce audit_sensitivity_level = high_pii for research export events (I-031)
   const sensitivityLevel: AuditSensitivityLevel = RESEARCH_HIGH_PII_ACTIONS.has(input.action)
     ? 'high_pii'
@@ -844,19 +875,24 @@ export async function emitAudit(
     // matches the stored row exactly, even when concurrent same-partition
     // inserts race on an empty partition.
     try {
+      // F-4 R2 HIGH closure (2026-05-15; migration 029): persist
+      // actor_tenant_id. Pre-F-4 the envelope carried this field
+      // in-memory only — the INSERT did not project it, so cross-
+      // tenant platform_admin attribution was lost on persistence.
+      // Migration 029 adds the column; this INSERT now writes it.
       const result = await tx.query(
         `INSERT INTO audit_records (
             audit_id, tenant_id, category, audit_sensitivity_level, action,
-            actor_type, actor_id, ai_workload_type, autonomy_level,
+            actor_type, actor_id, actor_tenant_id, ai_workload_type, autonomy_level,
             target_patient_id, delegate_context, resource_type, resource_id,
             country_of_care, break_glass, payload, prev_hash, record_hash,
             sequence_number, recorded_at
          ) VALUES (
             $1, $2, $3, $4, $5,
-            $6, $7, $8, $9,
-            $10, $11::jsonb, $12, $13,
-            $14, $15::jsonb, $16::jsonb, decode($17, 'hex'), decode($18, 'hex'),
-            $19, $20
+            $6, $7, $8, $9, $10,
+            $11, $12::jsonb, $13, $14,
+            $15, $16::jsonb, $17::jsonb, decode($18, 'hex'), decode($19, 'hex'),
+            $20, $21
          )
          RETURNING
            encode(prev_hash,   'hex') AS prev_hash_hex,
@@ -870,6 +906,7 @@ export async function emitAudit(
           envelope.action,
           envelope.actor_type,
           envelope.actor_id,
+          envelope.actor_tenant_id,
           envelope.ai_workload_type,
           envelope.autonomy_level,
           envelope.target_patient_id,

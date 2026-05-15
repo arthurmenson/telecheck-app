@@ -76,9 +76,26 @@ import type {
  * catalog slice lands, add the lookup as the first step here so an
  * invalid program rejects with 400 before the INSERT.
  */
+/**
+ * F-4 actor parameter shape (Phase 2 R6 HIGH-2 closure 2026-05-15):
+ * services now accept actor as `{ actorId, actorTenantId }` instead of
+ * the bare actorId string. `actorTenantId` is the audit-attribution
+ * tenant — equals the resource tenant for tenant-scoped roles, equals
+ * the platform_admin's home tenant for cross-tenant admin actions.
+ * Handlers compute this via `resolveActorTenantId(req)`.
+ *
+ * Pre-F-4 callers passed `actorId` directly + audit envelope hardcoded
+ * `actorTenantId: ctx.tenantId`. That conflated resource tenant with
+ * actor tenant — wrong for platform_admin cross-tenant actions.
+ */
+export interface FormsIntakeActor {
+  actorId: string;
+  actorTenantId: string;
+}
+
 export async function createDraftTemplate(
   ctx: TenantContext,
-  actorId: string,
+  actor: FormsIntakeActor,
   input: CreateTemplateRequest,
   externalTx?: DbTransaction,
 ): Promise<FormTemplate> {
@@ -92,7 +109,7 @@ export async function createDraftTemplate(
       // and lands in the NOT NULL `created_by` column. Once the Identity
       // slice replaces the header shim with real session resolution,
       // actorId will be a validated ULID by construction.
-      createdBy: actorId,
+      createdBy: actor.actorId,
       presentationContent: input.layout,
       branchingLogic: input.branchingLogic,
       eligibilityLogic: input.eligibilityLogic,
@@ -105,8 +122,8 @@ export async function createDraftTemplate(
       await emitFormsTemplateCreatedAudit(
         {
           tenantId: ctx.tenantId,
-          actorId,
-          actorTenantId: ctx.tenantId,
+          actorId: actor.actorId,
+          actorTenantId: actor.actorTenantId,
           countryOfCare: ctx.countryOfCare,
           templateId: template.template_id,
           programId: template.program_id,
@@ -123,7 +140,7 @@ export async function createDraftTemplate(
         programId: template.program_id,
         countryOfCare: ctx.countryOfCare,
         templateVersion: template.template_version,
-        actorId,
+        actorId: actor.actorId,
       });
     },
     externalTx,
@@ -202,7 +219,7 @@ export const PUBLISH_GATES_NOT_IMPLEMENTED = 'forms.publish.gates_not_implemente
  */
 export async function publishVersion(
   ctx: TenantContext,
-  actorId: string,
+  actor: FormsIntakeActor,
   versionId: FormTemplateId,
   input: PublishVersionRequest,
   externalTx?: DbTransaction,
@@ -251,8 +268,8 @@ export async function publishVersion(
       const auditEnvelope = await emitFormsTemplateVersionPublishedAudit(
         {
           tenantId: ctx.tenantId,
-          actorId,
-          actorTenantId: ctx.tenantId,
+          actorId: actor.actorId,
+          actorTenantId: actor.actorTenantId,
           countryOfCare: ctx.countryOfCare,
           templateId: published.template_id,
           versionId: published.template_id, // Pattern A: version IS the template row
@@ -272,7 +289,7 @@ export async function publishVersion(
         countryOfCare: ctx.countryOfCare,
         templateVersion: published.template_version,
         priorPublishedVersionId: supersededVersionId,
-        actorId,
+        actorId: actor.actorId,
         changeNotes: input.changeNotes ?? null,
         auditId: auditEnvelope.audit_id,
       });
@@ -347,7 +364,7 @@ export async function listTemplates(
  */
 export async function createDeployment(
   ctx: TenantContext,
-  actorId: string,
+  actor: FormsIntakeActor,
   input: CreateDeploymentRequest,
   externalTx?: DbTransaction,
 ): Promise<FormDeployment> {
@@ -375,14 +392,14 @@ export async function createDeployment(
       ctx.tenantId,
       {
         templateId: input.templateId,
-        deployedBy: actorId,
+        deployedBy: actor.actorId,
       },
       async (tx, deployment) => {
         await emitFormsDeploymentCreatedAudit(
           {
             tenantId: ctx.tenantId,
-            actorId,
-            actorTenantId: ctx.tenantId,
+            actorId: actor.actorId,
+            actorTenantId: actor.actorTenantId,
             countryOfCare: ctx.countryOfCare,
             deploymentId: deployment.deployment_id,
             templateId: deployment.template_id,
@@ -397,7 +414,7 @@ export async function createDeployment(
           templateId: deployment.template_id,
           programId: deployment.program_id,
           countryOfCare: ctx.countryOfCare,
-          actorId,
+          actorId: actor.actorId,
         });
       },
       externalTx,
@@ -454,7 +471,7 @@ export async function getDeployment(
  */
 export async function retireDeployment(
   ctx: TenantContext,
-  actorId: string,
+  actor: FormsIntakeActor,
   deploymentId: FormDeploymentId,
   externalTx?: DbTransaction,
 ): Promise<FormDeployment> {
@@ -467,8 +484,8 @@ export async function retireDeployment(
       const auditEnvelope = await emitFormsDeploymentRetiredAudit(
         {
           tenantId: ctx.tenantId,
-          actorId,
-          actorTenantId: ctx.tenantId,
+          actorId: actor.actorId,
+          actorTenantId: actor.actorTenantId,
           countryOfCare: ctx.countryOfCare,
           deploymentId: retired.deployment_id,
           templateId: retired.template_id,
@@ -484,7 +501,7 @@ export async function retireDeployment(
         templateId: retired.template_id,
         programId: retired.program_id,
         countryOfCare: ctx.countryOfCare,
-        actorId,
+        actorId: actor.actorId,
         auditId: auditEnvelope.audit_id,
       });
     },
@@ -523,7 +540,7 @@ export async function retireDeployment(
  */
 export async function createVariant(
   ctx: TenantContext,
-  actorId: string,
+  actor: FormsIntakeActor,
   input: CreateVariantRequest,
   externalTx?: DbTransaction,
 ): Promise<FormVariant> {
@@ -534,14 +551,14 @@ export async function createVariant(
       variantTemplateId: input.variantTemplateId,
       label: input.label,
       trafficPercent: input.trafficPercent,
-      createdBy: actorId,
+      createdBy: actor.actorId,
     },
     async (tx, variant) => {
       const auditEnvelope = await emitFormsVariantCreatedAudit(
         {
           tenantId: ctx.tenantId,
-          actorId,
-          actorTenantId: ctx.tenantId,
+          actorId: actor.actorId,
+          actorTenantId: actor.actorTenantId,
           countryOfCare: ctx.countryOfCare,
           variantId: variant.variant_id,
           deploymentId: variant.deployment_id,
@@ -608,7 +625,7 @@ export async function getVariant(
  */
 export async function promoteVariant(
   ctx: TenantContext,
-  actorId: string,
+  actor: FormsIntakeActor,
   variantId: FormVariantId,
   input: PromoteVariantRequest,
   externalTx?: DbTransaction,
@@ -616,14 +633,14 @@ export async function promoteVariant(
   return submissionRepo.promoteVariantToWinner(
     ctx.tenantId,
     variantId,
-    actorId,
+    actor.actorId,
     input.rationale,
     async (tx, promoted, retiredLoserIds) => {
       await emitFormsVariantWinnerPromotedAudit(
         {
           tenantId: ctx.tenantId,
-          actorId,
-          actorTenantId: ctx.tenantId,
+          actorId: actor.actorId,
+          actorTenantId: actor.actorTenantId,
           countryOfCare: ctx.countryOfCare,
           variantId: promoted.variant_id,
           deploymentId: promoted.deployment_id,
@@ -650,8 +667,8 @@ export async function promoteVariant(
         await emitFormsVariantRetiredAudit(
           {
             tenantId: ctx.tenantId,
-            actorId,
-            actorTenantId: ctx.tenantId,
+            actorId: actor.actorId,
+            actorTenantId: actor.actorTenantId,
             countryOfCare: ctx.countryOfCare,
             variantId: loserId,
             deploymentId: promoted.deployment_id,

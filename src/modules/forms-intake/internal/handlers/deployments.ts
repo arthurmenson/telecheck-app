@@ -14,6 +14,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireAdminRole } from '../../../../lib/admin-role.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { CreateDeploymentRequestSchema } from '../../schemas.js';
@@ -92,6 +93,8 @@ export async function createDeploymentHandler(
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
+  // F-4: audit-attribution tenant (platform_admin home tenant vs resource tenant).
+  const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   const parsed = CreateDeploymentRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -104,7 +107,12 @@ export async function createDeploymentHandler(
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
     try {
-      const deployment = await templateService.createDeployment(ctx, actorId, parsed.data, tx);
+      const deployment = await templateService.createDeployment(
+        ctx,
+        { actorId, actorTenantId },
+        parsed.data,
+        tx,
+      );
       return { status: 201, view: deployment };
     } catch (err) {
       // Precondition-failure error codes map to 400 with the canonical code
@@ -187,6 +195,8 @@ export async function retireDeploymentHandler(
   const ctx = requireTenantContext(req);
   const actorId = resolveActorId(req);
   requireAdminRole(req);
+  // F-4: audit-attribution tenant.
+  const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   const params = req.params as Record<string, unknown>;
   const deploymentIdParam = params['deploymentId'];
@@ -196,7 +206,12 @@ export async function retireDeploymentHandler(
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
     try {
-      const retired = await templateService.retireDeployment(ctx, actorId, deploymentIdParam, tx);
+      const retired = await templateService.retireDeployment(
+        ctx,
+        { actorId, actorTenantId },
+        deploymentIdParam,
+        tx,
+      );
       return { status: 200, view: retired };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

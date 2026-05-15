@@ -346,7 +346,12 @@ describe('forms-intake retireDeployment — happy path', () => {
     });
 
     const retired = await withTenantContext(TENANT_US, () =>
-      templateService.retireDeployment(US_CTX, 'op_retire_ok', deploymentId, getTestClient()),
+      templateService.retireDeployment(
+        US_CTX,
+        { actorId: 'op_retire_ok', actorTenantId: TENANT_US },
+        deploymentId,
+        getTestClient(),
+      ),
     );
 
     expect(retired.deployment_id).toBe(deploymentId);
@@ -410,12 +415,22 @@ describe('forms-intake retireDeployment — already-retired surface', () => {
     const { deploymentId } = await insertTemplateAndDeployment({ ctx: US_CTX, programId });
 
     await withTenantContext(TENANT_US, () =>
-      templateService.retireDeployment(US_CTX, 'op_retire_idem', deploymentId, getTestClient()),
+      templateService.retireDeployment(
+        US_CTX,
+        { actorId: 'op_retire_idem', actorTenantId: TENANT_US },
+        deploymentId,
+        getTestClient(),
+      ),
     );
 
     await expect(
       withTenantContext(TENANT_US, () =>
-        templateService.retireDeployment(US_CTX, 'op_retire_idem', deploymentId, getTestClient()),
+        templateService.retireDeployment(
+          US_CTX,
+          { actorId: 'op_retire_idem', actorTenantId: TENANT_US },
+          deploymentId,
+          getTestClient(),
+        ),
       ),
     ).rejects.toThrow(submissionRepo.DEPLOYMENT_ALREADY_RETIRED);
   });
@@ -432,7 +447,12 @@ describe('forms-intake retireDeployment — cross-tenant isolation (I-023)', () 
 
     await expect(
       withTenantContext(TENANT_GHANA, () =>
-        templateService.retireDeployment(GH_CTX, 'op_retire_xten', deploymentId, getTestClient()),
+        templateService.retireDeployment(
+          GH_CTX,
+          { actorId: 'op_retire_xten', actorTenantId: TENANT_GHANA },
+          deploymentId,
+          getTestClient(),
+        ),
       ),
     ).rejects.toThrow(submissionRepo.DEPLOYMENT_NOT_FOUND);
 

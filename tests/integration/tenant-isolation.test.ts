@@ -98,11 +98,11 @@ describe('audit_records — cross-tenant isolation (I-023, I-027)', () => {
     await withTenantContext(TENANT_US, async () => {
       await client.query(
         `INSERT INTO audit_records
-           (audit_id, tenant_id, actor_type, actor_id,
+           (audit_id, tenant_id, actor_type, actor_id, actor_tenant_id,
             target_patient_id, action, category, audit_sensitivity_level,
             resource_type, resource_id, payload)
          VALUES
-           ($1, $2, 'clinician', 'clin_xtenant_001',
+           ($1, $2, 'clinician', 'clin_xtenant_001', $2,
             'pat_xtenant_002', 'prescribing.approved', 'A', 'standard',
             'medication_request', 'mr_xtenant_002', '{}'::jsonb)`,
         [auditId, TENANT_US],

@@ -113,7 +113,7 @@ const ENVELOPE_SELECT = `
     tenant_id,
     actor_type,
     actor_id,
-    NULL::text                            AS actor_tenant_id,
+    actor_tenant_id,
     target_patient_id,
     action,
     category,
@@ -127,14 +127,28 @@ const ENVELOPE_SELECT = `
     sequence_number,
     encode(prev_hash, 'hex')              AS previous_hash,
     encode(record_hash, 'hex')            AS record_hash,
+    -- F-4 R7 closure: dispatch by hash_schema_version. NULL/1 → v1
+    -- (pre-029 legacy rows, no actor_tenant_id in serialization).
+    -- 2 → v2 (post-029 rows with actor_tenant_id + version
+    -- discriminator). Verifier is now bit-exact for both eras.
     encode(
-      audit_records_canonical_hash(
-        audit_id, tenant_id, category, audit_sensitivity_level, action,
-        actor_type, actor_id, ai_workload_type, autonomy_level,
-        target_patient_id, delegate_context, resource_type, resource_id,
-        country_of_care, break_glass, payload, prev_hash, sequence_number,
-        recorded_at
-      ),
+      CASE COALESCE(hash_schema_version, 1)
+        WHEN 1 THEN audit_records_canonical_hash_v1(
+          audit_id, tenant_id, category, audit_sensitivity_level, action,
+          actor_type, actor_id, ai_workload_type, autonomy_level,
+          target_patient_id, delegate_context, resource_type, resource_id,
+          country_of_care, break_glass, payload, prev_hash, sequence_number,
+          recorded_at
+        )
+        WHEN 2 THEN audit_records_canonical_hash(
+          audit_id, tenant_id, category, audit_sensitivity_level, action,
+          actor_type, actor_id, actor_tenant_id, ai_workload_type, autonomy_level,
+          target_patient_id, delegate_context, resource_type, resource_id,
+          country_of_care, break_glass, payload, prev_hash, sequence_number,
+          recorded_at
+        )
+        ELSE NULL::bytea
+      END,
       'hex'
     )                                     AS expected_record_hash
   FROM audit_records

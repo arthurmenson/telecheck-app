@@ -57,26 +57,33 @@ async function insertMinimalAuditRecord(opts: {
   const client = getTestClient();
   const auditId = opts.auditId ?? randomUUID();
 
+  // F-4 migration 030 CHECK requires non-blank actor_tenant_id for
+  // non-system actor types. Populate it from TENANT_US for non-system
+  // rows; leave NULL for actor_type='system' (CHECK exempts system).
+  const actorType = opts.actor_type ?? 'system';
+  const actorTenantId = actorType === 'system' ? null : TENANT_US;
+
   await client.query(
     `INSERT INTO audit_records
-       (audit_id, tenant_id, actor_type, actor_id,
+       (audit_id, tenant_id, actor_type, actor_id, actor_tenant_id,
         target_patient_id, action, category,
         audit_sensitivity_level, resource_type, resource_id,
         ai_workload_type, autonomy_level, payload)
      VALUES
-       ($1, $2, $3, $4,
+       ($1, $2, $3, $4, $9,
         $5, $6, 'A',
         'standard', 'medication_request', $7,
         NULL, NULL, $8::jsonb)`,
     [
       auditId,
       TENANT_US,
-      opts.actor_type ?? 'system',
+      actorType,
       opts.actor_id ?? 'sys_i003_test',
       opts.target_patient_id ?? `pat_i003_test_${auditId.slice(0, 8)}`,
       opts.action ?? 'prescribing.initiated',
       opts.resource_id,
       JSON.stringify(opts.payload ?? {}),
+      actorTenantId,
     ],
   );
 
