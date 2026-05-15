@@ -760,6 +760,32 @@ export async function emitAudit(
   // 2. Workload field validation (I-012 closure rule + sentinel rules)
   validateWorkloadFields(input);
 
+  // 2b. F-4 R5 MEDIUM closure (Codex 2026-05-15): runtime assertion that
+  // human actor types carry actor_tenant_id. The DB column is nullable
+  // by design (legacy pre-029 rows + system actors), but new emissions
+  // from human actors (patient/clinician/admin/operator/delegate)
+  // MUST populate it. Without this gate, a future caller that forgets
+  // to thread actorTenantId through would silently produce a non-system
+  // audit row with NULL attribution — durable bad evidence rather than
+  // a detectable failure.
+  const HUMAN_ACTOR_TYPES: ReadonlySet<string> = new Set([
+    'patient',
+    'clinician',
+    'operator',
+    'delegate',
+  ]);
+  if (
+    HUMAN_ACTOR_TYPES.has(input.actor_type) &&
+    (input.actor_tenant_id === null || input.actor_tenant_id === undefined)
+  ) {
+    throw new Error(
+      `emitAudit: action="${input.action}" actor_type="${input.actor_type}" requires ` +
+        'non-null actor_tenant_id (F-4 attribution). System actors may omit it; ' +
+        'human/admin/operator actors must populate it. Caller must thread ' +
+        'resolveActorTenantIdForAudit(req) into the audit emitter call site.',
+    );
+  }
+
   // 3. Auto-enforce audit_sensitivity_level = high_pii for research export events (I-031)
   const sensitivityLevel: AuditSensitivityLevel = RESEARCH_HIGH_PII_ACTIONS.has(input.action)
     ? 'high_pii'

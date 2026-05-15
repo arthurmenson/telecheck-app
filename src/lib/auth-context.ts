@@ -615,6 +615,37 @@ export function resolveActorTenantIdForAudit(
   fallbackTenantId: string,
 ): string {
   if (req.actorContext === undefined) {
+    // F-4 R5 HIGH closure (Codex 2026-05-15): the legacy header-shim
+    // path for `x-actor-roles: platform_admin` has NO trusted home-
+    // tenant source (no JWT claim, no DB-validated actor binding).
+    // Falling back to fallbackTenantId would attribute a cross-tenant
+    // header-shim platform_admin action to the resource tenant —
+    // recreating the exact F-4 misattribution this work is closing.
+    //
+    // Reject the legacy platform_admin path entirely. The Phase 2
+    // admin migration trilogy (PRs #142/#143/#144) migrated admin
+    // endpoint tests to JWT-only, so this rejection only blocks
+    // environments still relying on the Tier 2 header shim for
+    // platform_admin specifically. Tenant-scoped legacy roles
+    // (tenant_admin via `x-actor-roles: tenant_admin` +
+    // `x-actor-admin-tenant`) continue to work — for them, the
+    // header shim's tenant-binding check already verified
+    // actorTenantId == resource tenant.
+    const rawRoles = req.headers['x-actor-roles'];
+    const rolesHeader = typeof rawRoles === 'string' ? rawRoles : '';
+    const claimsPlatformAdmin = rolesHeader
+      .split(',')
+      .map((r) => r.trim())
+      .includes('platform_admin');
+    if (claimsPlatformAdmin) {
+      throw new Error(
+        'resolveActorTenantIdForAudit: legacy x-actor-roles platform_admin path ' +
+          'has no trusted actor home-tenant source. Audit attribution would default ' +
+          'to the resource tenant, recreating the F-4 misattribution. Migrate this ' +
+          'admin endpoint to JWT-based admin identity (Phase 2 F-1) before emitting ' +
+          'audits for header-shim platform_admin actors.',
+      );
+    }
     return fallbackTenantId;
   }
   return resolveActorTenantId(req);
