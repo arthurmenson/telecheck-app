@@ -35,10 +35,14 @@ import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fas
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
+import { asTenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import * as submissionService from '../../src/modules/forms-intake/internal/services/submission-service.ts';
+import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+const T_US = asTenantId(TENANT_US);
 
 // ---------------------------------------------------------------------------
 // Test app lifecycle
@@ -336,7 +340,12 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
       url: `/v0/forms/resume/${resumeToken}`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
 
@@ -367,7 +376,12 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
       url: `/v0/forms/resume/${resumeToken}`,
       headers: {
         host: 'localhost',
-        'x-patient-id': wrongPatientId,
+        ...bearerAuthHeader({
+          accountId: wrongPatientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
 
@@ -399,7 +413,12 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
       url: `/v0/forms/resume/${tampered}`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
       },
     });
 
@@ -409,7 +428,7 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     expect(body.error?.code).toBeDefined();
   });
 
-  it('returns 401 when neither x-patient-id nor x-device-anonymous-token is supplied', async () => {
+  it('returns 401 when neither Authorization JWT nor x-device-anonymous-token is supplied', async () => {
     const { resumeToken } = await seedPausedSubmission();
 
     const response = await injectWithIdempotency({
@@ -417,6 +436,9 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
       url: `/v0/forms/resume/${resumeToken}`,
       headers: {
         host: 'localhost',
+        // No Authorization header → Tier 1 leaves actorContext undefined.
+        // resolveResumeOwnership's Tier 2 fallback (now also no
+        // x-patient-id) returns 401 per the ownership-shim contract.
       },
     });
 
@@ -437,7 +459,15 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     const crossPatient = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/resume/${resumeToken}`,
-      headers: { host: 'localhost', 'x-patient-id': ulid() },
+      headers: {
+        host: 'localhost',
+        ...bearerAuthHeader({
+          accountId: ulid(),
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
+      },
     });
 
     // Tampered-signature 404
@@ -449,7 +479,15 @@ describe('GET /v0/forms/resume/:resumeToken — HTTP-level', () => {
     const tamperedResp = await injectWithIdempotency({
       method: 'GET',
       url: `/v0/forms/resume/${tampered}`,
-      headers: { host: 'localhost', 'x-patient-id': tamperedPatient },
+      headers: {
+        host: 'localhost',
+        ...bearerAuthHeader({
+          accountId: tamperedPatient,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
+      },
     });
 
     expect(crossPatient.statusCode).toBe(404);
@@ -474,8 +512,12 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
       url: `/v0/forms/resume`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
-        'x-actor-id': 'op_resume_http',
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { resumeToken },
@@ -509,8 +551,12 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
       url: `/v0/forms/resume`,
       headers: {
         host: 'localhost',
-        'x-patient-id': wrongPatientId,
-        'x-actor-id': 'op_resume_http_wrong',
+        ...bearerAuthHeader({
+          accountId: wrongPatientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { resumeToken },
@@ -526,13 +572,18 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     const { resumeToken, patientId } = await seedPausedSubmission();
 
     // First restore — must succeed.
+    const patientAuthHeader = bearerAuthHeader({
+      accountId: patientId,
+      tenantId: T_US,
+      countryOfCare: 'US',
+      role: 'patient',
+    });
     const first = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
-        'x-actor-id': 'op_resume_http_replay',
+        ...patientAuthHeader,
         'content-type': 'application/json',
       },
       payload: { resumeToken },
@@ -549,8 +600,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
       url: `/v0/forms/resume`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
-        'x-actor-id': 'op_resume_http_replay',
+        ...patientAuthHeader,
         'content-type': 'application/json',
       },
       payload: { resumeToken },
@@ -561,16 +611,13 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
     expect(body.error?.code).toBeDefined();
   });
 
-  it('returns 401 when neither x-patient-id nor x-device-anonymous-token is supplied', async () => {
+  it('returns 401 when neither Authorization JWT nor x-device-anonymous-token is supplied', async () => {
     const { resumeToken } = await seedPausedSubmission();
 
-    // Note: x-actor-id is also required by `resolveActorId`, but
-    // `resolveResumeOwnership` is invoked AFTER `resolveActorId` in the
-    // POST handler — meaning a request with neither identity header trips
-    // the actor-id 401 first. Either way the surface is 401, which is
-    // what this case asserts. (The GET handler does NOT require an
-    // actor-id, so the GET-side 401 case above is a clean
-    // ownership-shim 401.)
+    // No Authorization header → Tier 1 leaves req.actorContext undefined.
+    // The POST handler's resolveActorId + resolveResumeOwnership both
+    // require some identity proof; without auth headers OR Tier 2
+    // fallback (now also absent), the handler returns 401.
     const response = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
@@ -594,8 +641,12 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
       url: `/v0/forms/resume`,
       headers: {
         host: 'localhost',
-        'x-patient-id': patientId,
-        'x-actor-id': 'op_resume_http_bad_body',
+        ...bearerAuthHeader({
+          accountId: patientId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: {},
@@ -616,8 +667,12 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
       url: `/v0/forms/resume`,
       headers: {
         host: 'localhost',
-        'x-patient-id': ulid(),
-        'x-actor-id': 'op_norm_xpat',
+        ...bearerAuthHeader({
+          accountId: ulid(),
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        }),
         'content-type': 'application/json',
       },
       payload: { resumeToken: seedA.resumeToken },
@@ -625,13 +680,18 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
 
     // Replay (paused -> restored once, then restored again)
     const seedB = await seedPausedSubmission();
+    const seedBAuthHeader = bearerAuthHeader({
+      accountId: seedB.patientId,
+      tenantId: T_US,
+      countryOfCare: 'US',
+      role: 'patient',
+    });
     const firstRestore = await injectWithIdempotency({
       method: 'POST',
       url: `/v0/forms/resume`,
       headers: {
         host: 'localhost',
-        'x-patient-id': seedB.patientId,
-        'x-actor-id': 'op_norm_replay_first',
+        ...seedBAuthHeader,
         'content-type': 'application/json',
       },
       payload: { resumeToken: seedB.resumeToken },
@@ -642,8 +702,7 @@ describe('POST /v0/forms/resume — HTTP-level', () => {
       url: `/v0/forms/resume`,
       headers: {
         host: 'localhost',
-        'x-patient-id': seedB.patientId,
-        'x-actor-id': 'op_norm_replay_second',
+        ...seedBAuthHeader,
         'content-type': 'application/json',
       },
       payload: { resumeToken: seedB.resumeToken },
