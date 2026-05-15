@@ -7,8 +7,9 @@
 **v0.4 advanced:** 2026-05-14 (close Codex R2 HIGH — dispatcher-side observability + merge-time inventory re-run)
 **v0.5 advanced:** 2026-05-14 (close Codex R3 HIGH — split protocol into v1.0 vs v1.X+; explicit prerequisite block)
 **v0.6 advanced:** 2026-05-14 (close Codex R4 HIGH — v1.0 CI guardrail blocks unregistered consumers)
+**v0.7 advanced:** 2026-05-14 (close Codex R5 HIGH — concrete enforceable v1.0 guardrail; valid CODEOWNERS syntax)
 **Severity:** medium
-**Status:** OPEN — v0.6 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
+**Status:** OPEN — v0.7 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_DOMAIN_EVENTS.md` (v5.2 → **v5.3**)
 **Promotion Ledger target:** **P-015** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 in flight at PR #136)
 **Parallel SI:** SI-002 (audit-side placeholder gap; concurrent dot-namespaced naming convention)
@@ -216,17 +217,97 @@ Twelve detail-shape archetypes, one per aggregate-prefix. Listed here for ratifi
 
 **Promotion trigger from v1.0 → v1.X protocol.** The FIRST time a non-test external service (a worker, a separate microservice, an analytics consumer, etc.) issues `POST /v0/internal/outbox/subscribe` to the dispatcher, Decision 7B activates. The activation is observable: the `subscriber_registry` table goes from 0 rows to 1+ rows. The first registration MUST be paired with a Promotion Ledger entry "P-NNN — Outbox subscriber inventory crossed zero; Decision 7B activates" and any in-flight rename PR MUST pause and re-evaluate under 7B.
 
-**v0.6 — interim v1.0 CI guardrail (Codex R4 HIGH closure 2026-05-14).** The activation observation point (`POST /v0/internal/outbox/subscribe` + `subscriber_registry`) is itself part of the deferred Decision 7B infrastructure. Without an enforceable v1.0 interim control, a first consumer could be deployed BEFORE P-1 through P-5 exist by directly querying `domain_events_outbox` or matching event_type strings in its own code, and the registry would remain empty even though a consumer is reading the outbox. v0.6 closes this gap with two layered v1.0-period enforcement controls:
+**v0.7 — concrete enforceable v1.0 CI guardrail (Codex R4+R5 HIGH closure 2026-05-14).** The activation observation point (`POST /v0/internal/outbox/subscribe` + `subscriber_registry`) is itself part of the deferred Decision 7B infrastructure. Without an enforceable v1.0 interim control, a first consumer could be deployed BEFORE P-1 through P-5 exist by directly querying `domain_events_outbox` or matching event_type strings in its own code, and the registry would remain empty even though a consumer is reading the outbox. **v0.6's grep-based proposal used unsupported CODEOWNERS extglob syntax (Codex R5) — v0.7 replaces it with truly enforceable path-based + registration-manifest controls.**
 
-- **G-1. CODEOWNERS grep-block on direct outbox access.** The file `.github/CODEOWNERS` MUST be amended at SI-003 ratification time to require `@platform-eventing-team` review for ANY change that introduces a new direct query against `domain_events_outbox` outside the 3 emitting slices' module trees AND outside `lib/domain-events.ts` itself. The CODEOWNERS rule is `tests/integration/**outbox** @platform-eventing-team` (already covered) plus a new pattern `src/modules/**/!(consent|identity|forms-intake)/** @platform-eventing-team` scoped narrowly via a `domain_events_outbox` grep in the CI check.
-- **G-2. CI grep-block PR check.** A new GitHub Actions workflow `.github/workflows/outbox-consumer-guard.yml` runs on every PR. The check fails if `git diff origin/main HEAD` adds a line containing either `domain_events_outbox` OR `event_type` (in the context of an outbox read) outside the allowlist: `src/modules/consent/**`, `src/modules/identity/**`, `src/modules/forms-intake/**`, `src/lib/domain-events.ts`, `src/lib/outbox-relay.ts` (forward-compat once P-1 lands), `tests/integration/**outbox**`, `docs/SI-003-*.md`, `docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_*.md`. A new consumer service MUST either expand this allowlist (via a PR that triggers @platform-eventing-team review per G-1) or wait for the Decision 7B infrastructure to land. The CI gate is bypass-able only by an explicit `outbox-consumer-guard: bypass` label applied by @platform-eventing-team.
+- **G-1. Path-based CODEOWNERS (valid GitHub syntax).** The file `.github/CODEOWNERS` is amended with the following block, using only path-pattern syntax that GitHub actually supports (no `!` exclusion; no diff-content predicates):
+
+  ```
+  # SI-003 v0.7: any new outbox-consumer code path requires @platform-eventing-team review.
+  # The allowlist below is the EXHAUSTIVE set of v1.0 consumers permitted to touch
+  # domain_events_outbox directly. New consumers MUST extend this list via a PR that
+  # requires @platform-eventing-team approval per the catchall rule below.
+  /src/modules/consent/                      @consent-team @platform-eventing-team
+  /src/modules/identity/                     @identity-team @platform-eventing-team
+  /src/modules/forms-intake/                 @forms-team @platform-eventing-team
+  /src/lib/domain-events.ts                  @platform-eventing-team
+  /src/lib/outbox-relay.ts                   @platform-eventing-team
+  /tests/integration/*outbox*                @platform-eventing-team
+  /docs/SI-003-*.md                          @platform-eventing-team
+  /docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_*.md  @platform-eventing-team
+  /.github/workflows/outbox-consumer-guard.yml      @platform-eventing-team
+  /docs/outbox-consumer-registry.yaml        @platform-eventing-team
+  ```
+  This is purely path-based; GitHub enforces it natively. The catchall is enforced by G-2 (any new outbox reader added in a path NOT in this list will be flagged by G-2 and routed back to @platform-eventing-team via the bypass-label flow).
+
+- **G-2. CI script with concrete diff parsing (`scripts/check-outbox-consumer-guard.sh`).** A bash script invoked by `.github/workflows/outbox-consumer-guard.yml` performs the diff inspection. The script:
+  1. Reads `docs/outbox-consumer-registry.yaml` (a YAML manifest listing every authorized outbox reader: `{ path: <glob>, owner: <team>, registered_at: <date>, allowed_event_types: [<canonical>...] }`).
+  2. Runs `git diff --name-only origin/main HEAD` and groups changed files by manifest entry.
+  3. For any changed file NOT covered by a manifest entry, runs `git diff origin/main HEAD -- <file>` and greps the ADDED lines (`^+`) for the following patterns: `domain_events_outbox`, `\bdomain_events_outbox\b`, `from\s+['"].*outbox.*['"]` (import-from), `subscribe\(.*event_type`, `where.*event_type`, `\.event_type\s*=`, `select.*from.*outbox`. **A match in any added line is a blocking finding.**
+  4. The script ALSO greps for known canonical event_type STRINGS (the full 28-string canonical list per Decision 4) in added lines outside the manifest-covered paths. This catches consumers that match by aggregate-prefix-only or by helper indirection.
+  5. The script exits non-zero on any finding; the workflow gates the PR.
+  6. The CI gate is bypass-able only by the `outbox-consumer-guard: bypass` label applied by @platform-eventing-team (label-protected via repo settings).
+
+- **G-3. Registration manifest (`docs/outbox-consumer-registry.yaml`).** A YAML manifest enumerates every authorized v1.0 outbox reader. Adding a new reader requires editing this manifest AND triggering @platform-eventing-team review via G-1 (the manifest path is in the CODEOWNERS list). The manifest is the v1.0 surrogate for the eventual Decision 7B `subscriber_registry` table — same shape, file-based instead of DB-based.
+
+  Example shape:
+  ```yaml
+  consumers:
+    - path: src/modules/consent/
+      owner: consent-team
+      registered_at: 2026-05-XX  # at SI-003 ratification
+      allowed_event_types:
+        - consent.granted
+        - consent.revoked
+        - delegation.invited
+        - delegation.accepted
+        - delegation.declined
+        - delegation.revoked
+        - delegation_scope.granted
+        - delegation_scope.revoked
+      purpose: emits-only (no external read path)
+    - path: src/modules/identity/
+      owner: identity-team
+      registered_at: 2026-05-XX
+      allowed_event_types:
+        - account.created
+        - account.activated
+        - session.issued
+        - session.revoked
+        - otp.issued
+        - otp.consumed
+        - otp.lockout_triggered
+        - device.registered
+        - device.revoked
+      purpose: emits-only
+    - path: src/modules/forms-intake/
+      owner: forms-team
+      registered_at: 2026-05-XX
+      allowed_event_types:
+        - forms_template.created
+        - forms_template.version_published
+        - forms_deployment.created
+        - forms_deployment.retired
+        - forms_variant.created
+        - forms_variant.winner_promoted
+        - forms_variant.retired
+        - forms_resume_state.saved
+        - forms_resume_state.restored
+        - intake_response.submitted
+        - intake_response.completed
+        - intake_subscription_intent
+      purpose: emits-only
+  ```
+
+- **G-4. Architectural gate for out-of-monorepo consumers.** If an external service can live outside this monorepo (a separate microservice with its own repo, a third-party analytics consumer, etc.), no in-repo CI can detect it. v0.7 requires an **architectural Promotion Ledger entry** before any out-of-monorepo service is permitted to read `domain_events_outbox`. The entry name format: `P-NNN — Out-of-monorepo outbox consumer registered: <service-name> @ <repo-url>`. This entry is observable in the Promotion Ledger (which is append-only per the spec corpus discipline) and pairs with a `docs/outbox-consumer-registry.yaml` entry adding the external service. **No external service can read the outbox without this entry.** Enforcement is governance-level (not CI), but the rule is auditable: any external service emitting metrics tagged with telecheck event_types but lacking a corresponding Promotion Ledger entry is a finding for the Platform Eventing team to triage.
 
 **Interim v1.0 deliverables (NOT deferred; part of SI-003 ratification):**
 
-- **G-1 deliverable:** the CODEOWNERS amendment + the explanatory comment block, committed in the v5.3 promotion PR.
-- **G-2 deliverable:** the GitHub Actions workflow + its allowlist, committed in the v5.3 promotion PR.
+- **G-1 deliverable:** `.github/CODEOWNERS` amendment, committed in the v5.3 promotion PR.
+- **G-2 deliverable:** `.github/workflows/outbox-consumer-guard.yml` + `scripts/check-outbox-consumer-guard.sh`, committed in the v5.3 promotion PR. Script MUST include a unit-test suite at `scripts/check-outbox-consumer-guard.test.sh` exercising at least 8 test cases: (1) new file in allowlisted path passes, (2) new file outside allowlist with no outbox reference passes, (3) new file outside allowlist with `domain_events_outbox` reference fails, (4) new file outside allowlist matching a canonical event_type string in a SQL-like context fails, (5) new file outside allowlist with a helper-import from `lib/outbox-*.ts` fails, (6) manifest-added entry permits a new path, (7) the bypass label permits override, (8) a malformed manifest fails the script's preflight.
+- **G-3 deliverable:** `docs/outbox-consumer-registry.yaml`, committed in the v5.3 promotion PR with the 3 emitting slices' entries.
+- **G-4 deliverable:** Promotion Ledger discipline documented in the v5.3 promotion PR's release notes. Enforcement is procedural (no CI artifact required for v1.0 since no out-of-monorepo consumers exist yet).
 
-These two interim controls have zero infrastructure dependency (no dispatcher, no registry table, no /v0/internal/ endpoint) and can be shipped as part of the SI-003 ratification deliverables. They guarantee that any first external consumer triggers human review by the team that owns the Decision 7B infrastructure, eliminating the "consumer ships silently before 7B exists" gap.
+These four interim controls — G-1 path-based CODEOWNERS, G-2 CI script with concrete diff parsing + manifest validation + unit-tested patterns, G-3 file-based registration manifest, G-4 Promotion Ledger discipline for out-of-monorepo consumers — eliminate the Codex R5 gap. Zero infrastructure dependency remains (no dispatcher, no DB registry, no /v0/internal/ endpoint).
 
 #### Decision 7B — v1.X+ cutover protocol (active once any external subscriber registers)
 
