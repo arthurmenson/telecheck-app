@@ -8,8 +8,9 @@
 **v0.5 advanced:** 2026-05-14 (close Codex R3 HIGH — split protocol into v1.0 vs v1.X+; explicit prerequisite block)
 **v0.6 advanced:** 2026-05-14 (close Codex R4 HIGH — v1.0 CI guardrail blocks unregistered consumers)
 **v0.7 advanced:** 2026-05-14 (close Codex R5 HIGH — concrete enforceable v1.0 guardrail; valid CODEOWNERS syntax)
+**v0.8 advanced:** 2026-05-14 (close Codex R6 HIGH — G-2 scans ALL changed files; manifest purpose field enforces emits-only)
 **Severity:** medium
-**Status:** OPEN — v0.7 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
+**Status:** OPEN — v0.8 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_DOMAIN_EVENTS.md` (v5.2 → **v5.3**)
 **Promotion Ledger target:** **P-015** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 in flight at PR #136)
 **Parallel SI:** SI-002 (audit-side placeholder gap; concurrent dot-namespaced naming convention)
@@ -239,13 +240,17 @@ Twelve detail-shape archetypes, one per aggregate-prefix. Listed here for ratifi
   ```
   This is purely path-based; GitHub enforces it natively. The catchall is enforced by G-2 (any new outbox reader added in a path NOT in this list will be flagged by G-2 and routed back to @platform-eventing-team via the bypass-label flow).
 
-- **G-2. CI script with concrete diff parsing (`scripts/check-outbox-consumer-guard.sh`).** A bash script invoked by `.github/workflows/outbox-consumer-guard.yml` performs the diff inspection. The script:
-  1. Reads `docs/outbox-consumer-registry.yaml` (a YAML manifest listing every authorized outbox reader: `{ path: <glob>, owner: <team>, registered_at: <date>, allowed_event_types: [<canonical>...] }`).
-  2. Runs `git diff --name-only origin/main HEAD` and groups changed files by manifest entry.
-  3. For any changed file NOT covered by a manifest entry, runs `git diff origin/main HEAD -- <file>` and greps the ADDED lines (`^+`) for the following patterns: `domain_events_outbox`, `\bdomain_events_outbox\b`, `from\s+['"].*outbox.*['"]` (import-from), `subscribe\(.*event_type`, `where.*event_type`, `\.event_type\s*=`, `select.*from.*outbox`. **A match in any added line is a blocking finding.**
-  4. The script ALSO greps for known canonical event_type STRINGS (the full 28-string canonical list per Decision 4) in added lines outside the manifest-covered paths. This catches consumers that match by aggregate-prefix-only or by helper indirection.
-  5. The script exits non-zero on any finding; the workflow gates the PR.
-  6. The CI gate is bypass-able only by the `outbox-consumer-guard: bypass` label applied by @platform-eventing-team (label-protected via repo settings).
+- **G-2. CI script with concrete diff parsing (`scripts/check-outbox-consumer-guard.sh`; v0.8 redesigned).** A bash script invoked by `.github/workflows/outbox-consumer-guard.yml` performs the diff inspection. **v0.8 R6 closure (Codex 2026-05-14):** v0.7 allowed manifest-covered paths to bypass the diff grep, which meant a developer could add an outbox-read selector inside `src/modules/consent/` (a manifest-covered emitter directory) and never be flagged. v0.8 inverts the logic: **all changed files are scanned for outbox reads regardless of manifest coverage; the manifest's `purpose` field is enforced as a constraint, not as a bypass.**
+  1. Reads `docs/outbox-consumer-registry.yaml` (the manifest; shape per G-3 below).
+  2. Runs `git diff --name-only origin/main HEAD` to identify changed files.
+  3. **For EVERY changed file (regardless of manifest coverage)**, runs `git diff origin/main HEAD -- <file>` and greps the ADDED lines (`^+`) for the following patterns: `domain_events_outbox`, `\bdomain_events_outbox\b`, `from\s+['"].*outbox.*['"]` (import-from), `subscribe\(.*event_type`, `where.*event_type`, `\.event_type\s*=`, `select.*from.*outbox`. **A match in any added line is a finding.**
+  4. **Finding-disposition rule (v0.8 NEW):**
+     - **If the file is covered by a manifest entry with `purpose: reads-and-writes` OR `purpose: reads-only`** AND every matched event_type literal in the added lines is listed in the entry's `allowed_event_types`, the finding is RESOLVED — proceed.
+     - **If the file is covered by a manifest entry with `purpose: emits-only`** (the case for the 3 producer slices), ANY outbox-read pattern in the added lines is a BLOCKING finding. The manifest's `purpose: emits-only` becomes a positive constraint: emitter directories may not acquire reader code. Fixing requires either splitting the new reader code into a non-emitter directory + adding it as a new manifest entry, OR amending the entry's `purpose` to `reads-and-writes` (which itself requires @platform-eventing-team review per CODEOWNERS).
+     - **If the file is NOT covered by any manifest entry**, the finding is BLOCKING regardless of pattern. Adding outbox-read code in an unregistered path is the case the guard was designed to prevent.
+  5. The script ALSO greps for known canonical event_type STRINGS (the full 28-string canonical list per Decision 4) in added lines across **all changed files**. The same finding-disposition rule applies: only manifest entries with `purpose: reads-*` AND explicit allowlist entries for the matched strings permit the addition.
+  6. The script exits non-zero on any BLOCKING finding; the workflow gates the PR.
+  7. The CI gate is bypass-able only by the `outbox-consumer-guard: bypass` label applied by @platform-eventing-team (label-protected via repo settings). Bypasses are logged to `docs/outbox-consumer-guard-bypass-log.md` (append-only) via a separate workflow that runs on label-add.
 
 - **G-3. Registration manifest (`docs/outbox-consumer-registry.yaml`).** A YAML manifest enumerates every authorized v1.0 outbox reader. Adding a new reader requires editing this manifest AND triggering @platform-eventing-team review via G-1 (the manifest path is in the CODEOWNERS list). The manifest is the v1.0 surrogate for the eventual Decision 7B `subscriber_registry` table — same shape, file-based instead of DB-based.
 
