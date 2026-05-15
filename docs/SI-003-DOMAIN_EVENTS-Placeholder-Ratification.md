@@ -5,8 +5,9 @@
 **v0.2 advanced:** 2026-05-14 (concrete proposals + pre-ratification gate alignment)
 **v0.3 advanced:** 2026-05-14 (close Codex R1 HIGH — subscriber-compat protocol for cutover)
 **v0.4 advanced:** 2026-05-14 (close Codex R2 HIGH — dispatcher-side observability + merge-time inventory re-run)
+**v0.5 advanced:** 2026-05-14 (close Codex R3 HIGH — split protocol into v1.0 vs v1.X+; explicit prerequisite block)
 **Severity:** medium
-**Status:** OPEN — v0.4 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
+**Status:** OPEN — v0.5 DRAFT, awaiting Engineering Lead + Privacy/Compliance ratification (Codex pre-ratification gate continuing; mirror SI-007 / SI-002 cadence)
 **Target spec doc:** `Telecheck_Contracts_Pack_v5_00_DOMAIN_EVENTS.md` (v5.2 → **v5.3**)
 **Promotion Ledger target:** **P-015** (P-013 consumed by SI-007 merged 2026-05-14; P-014 reserved by SI-002 in flight at PR #136)
 **Parallel SI:** SI-002 (audit-side placeholder gap; concurrent dot-namespaced naming convention)
@@ -193,11 +194,42 @@ Twelve detail-shape archetypes, one per aggregate-prefix. Listed here for ratifi
 - `granted`: `{ ...minimum, delegation_scope_id: ULID, delegation_id: ULID, scope: string }`
 - `revoked`: `{ ...minimum, delegation_scope_id: ULID, delegation_id: ULID }`
 
-### Decision 7 — Transition contract (subscriber-compat-gated per-slice cutover; v0.3 revised)
+### Decision 7 — Transition contract (split protocol: v1.0 vs v1.X+; v0.5 revised)
 
-**v0.3 revision (Codex R1 HIGH closure 2026-05-14):** the v0.2 "no dual-write window" rule was unsafe for production subscribers. Although at v1.0 there are NO production subscribers of the outbox (the 3 emitting slices are implementation-complete but no downstream consumer service has been deployed against them), Decision 7 MUST treat subscriber compatibility as the precondition for cutover so the same rule applies once consumers ship (Pharmacy refill-on-consent, AI-service intake-evaluation triggers, etc.).
+**v0.5 revision (Codex R3 HIGH closure 2026-05-14):** the v0.4 5-step protocol depended on dispatcher infrastructure (outbox-relay, subscriber_registry table, `POST /v0/internal/outbox/subscribe` endpoint, merge-time CI check) that does NOT exist in the v1.0 codebase. Without splitting the protocol, the rename either blocks indefinitely (because the infrastructure is unowned and unimplemented) or gets manually waived (defeating the safety gate). v0.5 explicitly splits the protocol into two regimes:
 
-**Producer-cutover gating (5-step protocol):**
+#### Decision 7A — v1.0 cutover protocol (active until first external subscriber registers)
+
+**Preconditions assumed in this regime:** no external subscriber service has been deployed against the outbox; the 3 emitting slices (consent, identity, forms-intake) are the ONLY code that touches the canonical event_type strings; the dispatcher / outbox-relay infrastructure (Decision 7B) does NOT exist.
+
+**Producer-cutover protocol (3 steps):**
+
+1. **Comprehensive grep audit** (mandatory in cutover PR description). The cutover author MUST run a project-wide grep across the entire telecheck-app monorepo for the placeholder string about to be renamed. The output MUST show only:
+   - The emitting slice's `events.ts` call sites (will be edited by the cutover PR)
+   - The slice's outbox-landing test file (will be edited by the cutover PR)
+   - The SI-003 documentation itself (catalog references; preserved as-is)
+   - The canonicalization map artifact `docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_P_015.md` (cataloged references; preserved as-is)
+   Any OTHER match is a blocking finding. The grep output is committed to the PR description verbatim.
+2. **Forward-compat fixture committed in cutover PR.** The cutover PR MUST add a test fixture at `tests/integration/domain-event-canonicalization-fixture.test.ts` that asserts: for each renamed event_type, the canonical string is emitted by the slice; the placeholder string is NOT emitted; the canonicalization map artifact lists the pair. This is the canary that would fail if a subsequent slice or migration accidentally re-introduces the placeholder string.
+3. **Producer cutover (one PR per slice).** Each slice atomically replaces placeholder strings with canonical strings in `src/modules/<slice>/events.ts` AND the slice's outbox-landing test file AND the forward-compat fixture (step 2). PRs are squash-merged; CI gate is the standard test-suite green + the new fixture green.
+
+**Promotion trigger from v1.0 → v1.X protocol.** The FIRST time a non-test external service (a worker, a separate microservice, an analytics consumer, etc.) issues `POST /v0/internal/outbox/subscribe` to the dispatcher, Decision 7B activates. The activation is observable: the `subscriber_registry` table goes from 0 rows to 1+ rows. The first registration MUST be paired with a Promotion Ledger entry "P-NNN — Outbox subscriber inventory crossed zero; Decision 7B activates" and any in-flight rename PR MUST pause and re-evaluate under 7B.
+
+#### Decision 7B — v1.X+ cutover protocol (active once any external subscriber registers)
+
+**Preconditions:** at least one external subscriber service exists and has registered with the dispatcher. The dispatcher / outbox-relay infrastructure (described below) is implemented.
+
+**Prerequisite infrastructure (MUST be delivered BEFORE the first v1.X subscriber ships):**
+
+- **P-1.** `lib/outbox-relay.ts` — outbox-relay component that publishes from `domain_events_outbox` to the downstream notification surface. Owner: Platform Eventing team (does not exist at v1.0; deferred SI to be raised when the first subscriber needs it).
+- **P-2.** `subscriber_registry` table — schema migration with `(subscriber_id, event_type, registered_at, last_heartbeat_at)`. Tenant-scoped (every row carries `tenant_id` per I-023). Owner: Platform Eventing.
+- **P-3.** `POST /v0/internal/outbox/subscribe` endpoint — registration write path; subscriber-authenticated via mutual TLS or internal-service JWT. Owner: Platform Eventing.
+- **P-4.** `outbox.published_canonical_event_type{event_type, downstream_acks=N}` metric — emitted by `lib/outbox-relay.ts` per Decision 7B step 4a below. Owner: Platform Eventing + Observability.
+- **P-5.** Merge-time CI check — queries `subscriber_registry` for placeholder-name entries; blocks merge if found. Implementation: GitHub Actions workflow that runs against a production-replica view of `subscriber_registry`. Owner: DevEx.
+
+**These 5 deliverables are FORWARD-LOOKING. They are NOT part of the SI-003 ratification deliverables (P-015 closes SI-003 by enumerating canonical event-type strings and detail shapes; it does NOT include dispatcher infrastructure).** The dispatcher infrastructure will be specified by a separate SI when the first external subscriber concretely needs it. Until then, Decision 7A governs.
+
+**Producer-cutover protocol once Decision 7B activates (5 steps):**
 
 1. **Subscriber inventory (precondition for any rename PR).** Before any producer-cutover PR is opened, the cutover author MUST enumerate every subscriber service that matches against the placeholder strings being renamed. At v1.0 the inventory is empty (no subscribers exist), and the empty result is recorded in the cutover PR description with a grep audit demonstrating no consumer-side match selectors exist outside the emitting slice + its outbox-landing test.
 2. **Subscriber-side dual-read deploy first.** If the inventory is non-empty, each subscriber MUST first ship a release that accepts BOTH the placeholder and the canonical string (a `MATCH IN (...)` selector or equivalent). This release deploys to all environments BEFORE the producer cutover PR opens. No producer rename merges until every inventoried subscriber has dual-read live in production.
@@ -212,9 +244,9 @@ Twelve detail-shape archetypes, one per aggregate-prefix. Listed here for ratifi
 
 **Inventory staleness mitigation (v0.4 NEW).** The grep audit in step 1 is a **point-in-time check** — it cannot prove subscribers that exist outside the monorepo (e.g., a future Pharmacy-service subscriber that grew from another git history). The dispatcher-side subscriber_registry in step 4b is the **canonical** inventory; the grep audit is a corroborating signal but not the sole authority. At v1.0 with no subscribers shipped, the registry is empty and matches the grep audit; once the first external subscriber registers, the registry diverges from grep and the registry MUST win.
 
-**Rationale for not waiting for consumers at v1.0:** the v1.0 outbox is producer-only — its consumers don't exist yet. Holding the SI-003 ratification until consumers exist would extend the placeholder-string emission window indefinitely, and the eventual rename would have N consumers (not zero) to migrate. Ratifying now establishes the canonical names; the subscriber-compat protocol above ensures the rename is safe regardless of N at cutover time.
+**Rationale for not waiting for consumers at v1.0:** the v1.0 outbox is producer-only — its consumers don't exist yet. Holding the SI-003 ratification until consumers exist would extend the placeholder-string emission window indefinitely, and the eventual rename would have N consumers (not zero) to migrate. Ratifying now establishes the canonical names; Decision 7A handles the v1.0 cutover (grep-based; dispatcher-free); Decision 7B handles cutovers once subscribers exist (dispatcher-gated). The Decision 7B prerequisites are explicitly deferred from SI-003 ratification deliverables.
 
-**Cross-slice migration matrix:** the canonicalization map artifact (`docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_P_015.md`) is committed at ratification time, listing every (placeholder → canonical) pair so consumers can be migrated mechanically and so the alarm metric in step 4 has a known key-set.
+**Cross-slice migration matrix:** the canonicalization map artifact (`docs/DOMAIN_EVENT_TYPE_CANONICALIZATION_MAP_P_015.md`) is committed at ratification time, listing every (placeholder → canonical) pair so consumers can be migrated mechanically and so the alarm metric in Decision 7B step 4a has a known key-set when activated.
 
 ### Decision 8 — Cross-SI alignment with SI-002 (NEW; per Codex pre-ratification expectation)
 
