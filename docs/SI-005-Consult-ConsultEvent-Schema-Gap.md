@@ -6,8 +6,9 @@
 **v0.3 advanced:** 2026-05-15 (close Codex R1 MEDIUMs — column count reconciliation + KMS envelope explicit)
 **v0.4 advanced:** 2026-05-15 (close Codex R2 MEDIUMs — Decision 2 heading +14/total 24 reconciliation; Decision 8 enumerates all 14 columns; CONSULT_EVENT_TYPES adds kms_rotation)
 **v0.5 advanced:** 2026-05-15 (close Codex R3 HIGH — KMS envelope adds encrypted-DEK column 25; R3 MEDIUM — rotation via stored-procedure with DB-enforced same-tx audit coupling, not session-variable bypass)
+**v0.6 advanced:** 2026-05-15 (close Codex R4 HIGH — initial-write path ALSO requires definer-rights stored procedure; GRANT model symmetric across initial-write + rotation)
 **Severity:** medium (does NOT block Sprint 9 authoring; placeholder schema ships with this gap as the resume-gate)
-**Status:** OPEN — v0.5 DRAFT, ratification-ready (1 HIGH + 6 MEDIUM findings closed across R1+R2+R3; remaining gaps tracked as v1.3 promotion PR deliverables)
+**Status:** OPEN — v0.6 DRAFT, ratification-ready (2 HIGH + 6 MEDIUM findings closed across R1+R2+R3+R4)
 **Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md` (v1.2 → **v1.3**)
 **Promotion Ledger target:** **P-017** (P-013 SI-007 merged 2026-05-14, P-014 SI-002 merged 2026-05-14, P-015 SI-003 PR #137 in flight, P-016 SI-004 PR #138 in flight)
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md`
@@ -228,7 +229,11 @@ SI-005 closure produces a migration 020a (or sequentially-numbered) that perform
 4. **Add CHECK constraints enforcing nonce + schema_version semantics:**
    - `CHECK (clinician_decision_nonce IS NULL OR octet_length(clinician_decision_nonce) = 12)` — 12-byte AES-256-GCM IV per NIST SP 800-38D §8.2.1
    - `CHECK (clinician_decision_schema_version IS NULL OR clinician_decision_schema_version >= 1)` — version must be a positive integer
-5. **Stored-procedure-only path for KMS column updates (v0.5 R3 MEDIUM closure).** v0.4's session-variable bypass was unsafe — a buggy or privileged code path could set the variable and update columns 18-25 without emitting the kms_rotation consult_event/audit row. v0.5 replaces the bypass with a DB-enforced stored procedure that performs the rotation atomically:
+5. **Stored-procedure-only path for KMS column updates — BOTH initial-write AND rotation (v0.5 R3 + v0.6 R4 HIGH closure).** v0.4's session-variable bypass was unsafe — a buggy or privileged code path could set the variable and update columns 18-25 without emitting the kms_rotation consult_event/audit row. v0.5 replaced the bypass with a DB-enforced rotation stored procedure. **v0.6 R4 HIGH closure (Codex 2026-05-15):** v0.5 only scoped the stored-procedure-only requirement to UPDATEs on an already-encrypted row. The INITIAL write (NULL → values for columns 18-25) was still governed only by the all-or-none nullability CHECK, with no schema-level requirement to emit the paired `consult.clinician_decision_recorded` audit row + state_transition consult_event in the same transaction. v0.6 closes this by requiring a SECOND stored procedure for the initial-write path; the GRANT model revokes application-role direct UPDATE on columns 18-25 for BOTH paths.
+
+   **5a. Initial-write stored procedure** `record_consult_clinician_decision(...)` (v0.6 NEW). Atomically: row-locks the consult row; verifies `state='UNDER_REVIEW'` (rejects out-of-order writes); verifies columns 18-25 are NULL (rejects re-write attempts that must use the rotation path instead); UPDATEs `state` + `last_state_transition_at` + columns 18-25; INSERTs a `consult_events` row with `event_type='state_transition'` and `from_state='UNDER_REVIEW'` + `to_state ∈ {'PRESCRIBED','DECLINED','ESCALATED_TO_SYNC'}`; INSERTs the paired `audit_records` row with `action_id='consult.clinician_decision_recorded'` per SI-004 v0.5 Decision 4 detail shape (decision_hash = SHA-256 of encrypted_ciphertext || aad; full payload stays on consult row; audit carries the hash for tamper-evidence). Procedure parameters carry the decision_class (`prescribe|decline|request_more_data|escalate_to_sync`) and clinician_account_id. **Procedure is the ONLY path that can transition columns 18-25 from NULL → non-NULL.**
+
+   **5b. Rotation stored procedure** `rotate_consult_clinician_decision_kms(...)` (v0.5; preserved verbatim):
 
    ```sql
    -- Rotate clinical-decision KMS envelope for a consult row.
@@ -305,7 +310,7 @@ SI-005 closure produces a migration 020a (or sequentially-numbered) that perform
    $$;
    ```
 
-   The immutability rule on `clinician_decision_encrypted_at` is now enforced unconditionally at the SQL level by a CHECK constraint OR by the GRANT model: **no role has UPDATE privilege on columns 18-25 of `consults` except via this stored procedure** (the procedure runs as a definer-rights role with the needed privileges; application code's role does NOT have direct UPDATE on those columns). This eliminates the session-variable escape hatch entirely. Any attempt to UPDATE columns 18-25 outside the procedure fails with a `permission denied for column` error.
+   The immutability rule on `clinician_decision_encrypted_at` is now enforced unconditionally at the SQL level by a CHECK constraint OR by the GRANT model: **no role has UPDATE privilege on columns 18-25 of `consults` except via the two definer-rights stored procedures** (`record_consult_clinician_decision` for initial-write and `rotate_consult_clinician_decision_kms` for rotation). Both procedures run as a definer-rights role with the needed privileges; application code's role does NOT have direct UPDATE on those columns. This eliminates the session-variable escape hatch AND closes the initial-write coupling gap. Any attempt to UPDATE columns 18-25 outside the procedures fails with a `permission denied for column` error. **Symmetry guarantee (v0.6 R4 closure):** initial-write and rotation share the same DB-enforced same-transaction audit/event invariant — every transition of columns 18-25 (whether NULL → values OR values → values) produces a paired consult_event row AND a paired audit_records row in the same tx.
 6. **Add the 2 Sprint 10+ columns to `consult_events`** (Decision 2):
    - 10. `correlation_id VARCHAR(26) NULL`
    - 11. `audit_id VARCHAR(26) NULL`
