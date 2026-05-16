@@ -30,6 +30,7 @@ import { aiServicePlugin } from './modules/ai-service/index.js';
 import { asyncConsultPlugin } from './modules/async-consult/index.js';
 import { consentPlugin } from './modules/consent/plugin.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
+import { assertNoPublishGateBypassAtBoot } from './modules/forms-intake/internal/services/publish-gates-killswitch.js';
 import { identityPlugin } from './modules/identity/plugin.js';
 import { medInteractionPlugin } from './modules/med-interaction/index.js';
 import { pharmacyPlugin } from './modules/pharmacy/plugin.js';
@@ -45,6 +46,21 @@ export interface AppOptions {
 }
 
 export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> {
+  // SI-011 publish-gates bypass kill-switch (defense-in-depth layer 1).
+  //
+  // BEFORE any Fastify instance is constructed, scan the process env for
+  // any FORMS_PUBLISH_GATES_BYPASS or FORMS_PUBLISH_GATES_TEST_OVERRIDE_*
+  // env var presence in NODE_ENV !== 'test'. If detected, throw a
+  // canonical sentinel error — the Fastify instance is never built,
+  // the HTTP listener never binds, the process exits non-zero. Every
+  // bypass attempt is therefore visible in boot logs (canonical code
+  // `forms.publish.bypass_in_production`) before any request is served.
+  //
+  // SI-011 §"Production environment guard (kill-switch)" specifies this
+  // as layer 1 of four; layer 2 is the runtime check inside
+  // publishVersion() (see template-service.ts).
+  assertNoPublishGateBypassAtBoot(process.env);
+
   const app = Fastify({
     logger: opts.logger ?? defaultLoggerConfig(),
     // Per I-025 (tenant-blind error responses): suppress framework error

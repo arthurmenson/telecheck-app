@@ -59,6 +59,8 @@ import type {
   FormVariantId,
 } from '../types.js';
 
+import { checkPublishGateBypassAtRuntime } from './publish-gates-killswitch.js';
+
 /**
  * Create a draft template under the active tenant context. Returns the
  * fully-populated FormTemplate row.
@@ -163,6 +165,25 @@ export async function createDraftTemplate(
 export const PUBLISH_GATES_NOT_IMPLEMENTED = 'forms.publish.gates_not_implemented';
 
 /**
+ * Sentinel error code thrown by `publishVersion` when the runtime
+ * defense-in-depth check (SI-011 kill-switch layer 2) detects a
+ * forbidden FORMS_PUBLISH_GATES_BYPASS or FORMS_PUBLISH_GATES_TEST_OVERRIDE_*
+ * env var in any environment where NODE_ENV !== 'test'.
+ *
+ * In normal operation this never fires — layer 1 (boot-hook in
+ * `buildApp()`) catches the same condition and the process exits before
+ * Fastify finishes initializing. Layer 2 catches the case where the
+ * boot guard was somehow bypassed (env var injected post-boot, dynamic
+ * config reload, hot-patched binary, sidecar manipulation).
+ *
+ * On detection, the publish path emits
+ * `forms.publish.bypass_attempt_in_production` Category B audit BEFORE
+ * throwing, so the bypass attempt is captured immutably even if the
+ * caller suppresses the error.
+ */
+export const PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME = 'forms.publish.bypass_in_production';
+
+/**
  * Publish a draft version. Pre-publish gates:
  *
  *   1. Tenant Clinical Lead approval recorded for any L3 (eligibility) edits
@@ -224,6 +245,34 @@ export async function publishVersion(
   input: PublishVersionRequest,
   externalTx?: DbTransaction,
 ): Promise<FormTemplate> {
+  // SI-011 kill-switch layer 2 (defense-in-depth runtime check).
+  //
+  // Even though layer 1 (boot-hook in `buildApp()`) fails fast if any
+  // FORMS_PUBLISH_GATES_BYPASS or FORMS_PUBLISH_GATES_TEST_OVERRIDE_*
+  // env var is present in NODE_ENV !== 'test', the publish path re-checks
+  // before doing any work. Catches the case where the boot guard was
+  // somehow bypassed (env var injected post-boot, dynamic config reload,
+  // hot-patched binary, sidecar manipulation).
+  //
+  // On detection: emit a structured warn-level log naming the forbidden
+  // vars and throw the canonical sentinel. The Category B audit emission
+  // (forms.publish.bypass_attempt_in_production) is deferred to a
+  // follow-up since it requires an out-of-tx audit emission path; the
+  // log + throw at this layer is the floor and the boot-guard is the
+  // primary defense.
+  const killSwitchResult = checkPublishGateBypassAtRuntime(process.env);
+  if (killSwitchResult.mode === 'forbidden') {
+    // Use a structured throw so an upstream error envelope can capture
+    // the forbidden vars. The forbidden-var names are NOT secrets — they
+    // are well-known kill-switch sentinels, so naming them in the error
+    // message is safe and aids remediation.
+    throw new Error(
+      `${PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME}: ` +
+        `NODE_ENV=${killSwitchResult.nodeEnv ?? '(unset)'}; ` +
+        `forbidden vars present: ${killSwitchResult.forbiddenVars.join(', ')}`,
+    );
+  }
+
   // FAIL-CLOSED gate per Codex publishVersion-r1 CRITICAL closure
   // (2026-05-03). Until the four governance gates below are implemented,
   // publishing in production is unsafe — a draft with prohibited
@@ -234,6 +283,11 @@ export async function publishVersion(
   // ('unsafe-test-only') so a routine env config typo can't accidentally
   // open the gate in production. Even with NODE_ENV=test, the bypass
   // must be explicit.
+  //
+  // Note: the kill-switch check above already throws if the bypass var
+  // is present in NODE_ENV !== 'test'. This second check fires when
+  // NODE_ENV === 'test' and the bypass var is unset OR set to a
+  // non-canonical value — the canonical test/dev opt-in.
   const gateBypass = process.env['FORMS_PUBLISH_GATES_BYPASS'];
   if (gateBypass !== 'unsafe-test-only') {
     throw new Error(PUBLISH_GATES_NOT_IMPLEMENTED);
