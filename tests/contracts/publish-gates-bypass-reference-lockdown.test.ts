@@ -59,7 +59,8 @@
  */
 
 import { execSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -161,35 +162,78 @@ describe('SI-011 layer 3 — publish-gates-bypass reference lockdown', () => {
     ).toEqual([]);
   });
 
-  it('the layer-1 boot-hook test remains wired (canary)', () => {
-    // Layer 1 boot-hook function `assertNoPublishGateBypassAtBoot` MUST
-    // be exercised by the kill-switch unit tests file. If that
-    // reference disappears (test deletion, refactor, file rename), the
-    // contract fails loudly — preserving the kill-switch's safety floor
-    // requires both layer test files to remain wired.
-    const layer1Files = new Set(gitGrepTypescript('assertNoPublishGateBypassAtBoot'));
+  // ---------------------------------------------------------------------
+  // Layer-coverage canaries (R6 closure: count CALL expressions, not
+  // textual mentions, so comments / imports / docblocks don't satisfy
+  // the canary).
+  // ---------------------------------------------------------------------
+
+  const KILL_SWITCH_TEST_PATH = 'tests/integration/forms-intake-publish-gates-killswitch.test.ts';
+
+  /**
+   * Read the kill-switch test file and strip comment regions so the
+   * canaries assert against EXECUTABLE code only. Strips, in order:
+   *   - block comments (slash-star ... star-slash, including JSDoc)
+   *   - line comments (two-slash to end of line)
+   *
+   * String literals containing `//` or `/*` are NOT stripped — that's a
+   * known limitation acceptable for this contract test (the function
+   * names we're scanning for are identifiers, never appearing inside
+   * string literals in normal test code).
+   */
+  function readTestFileStrippedOfComments(): string {
+    const source = readFileSync(join(REPO_ROOT, KILL_SWITCH_TEST_PATH), 'utf-8');
+    return source
+      .replace(/\/\*[\s\S]*?\*\//g, '') // block comments
+      .replace(/\/\/[^\n]*$/gm, ''); // line comments
+  }
+
+  /**
+   * Counts call-expression occurrences of `name(` in the source string.
+   * Requires the identifier to appear as a callee — matching the open
+   * paren ensures we're not counting import statements, type-only refs,
+   * or string literals.
+   *
+   * Minimum threshold for the canaries is 2 — the kill-switch test
+   * file should have at least one assertion using each layer function
+   * AND typically additional setup/expect calls. A value below 2
+   * strongly indicates the layer's tests were deleted.
+   */
+  function countCallExpressions(source: string, identifier: string): number {
+    // Escape regex metachars in the identifier (defensive; current
+    // identifiers are bare words but a future test might pass a
+    // method-style name).
+    const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`\\b${escaped}\\s*\\(`, 'g');
+    return (source.match(pattern) ?? []).length;
+  }
+
+  const MIN_CALLS_PER_LAYER = 2;
+
+  it('the layer-1 boot-hook test remains wired (call-expression canary)', () => {
+    const stripped = readTestFileStrippedOfComments();
+    const callCount = countCallExpressions(stripped, 'assertNoPublishGateBypassAtBoot');
     expect(
-      layer1Files.has('tests/integration/forms-intake-publish-gates-killswitch.test.ts'),
-      'Layer 1 (boot-hook) test wiring missing: ' +
-        'tests/integration/forms-intake-publish-gates-killswitch.test.ts no longer ' +
-        'references assertNoPublishGateBypassAtBoot. If the file was renamed, ' +
-        'update both this canary and SANCTIONED_FILES.',
+      callCount >= MIN_CALLS_PER_LAYER,
+      `Layer 1 (boot-hook) test coverage missing in ${KILL_SWITCH_TEST_PATH}. ` +
+        `Expected at least ${MIN_CALLS_PER_LAYER} call expressions to ` +
+        `assertNoPublishGateBypassAtBoot(), found ${callCount}. ` +
+        `Comments/imports/docblock references do not count toward this canary — ` +
+        `executable test calls only.`,
     ).toBe(true);
   });
 
-  it('the layer-2 runtime-check test remains wired (canary)', () => {
-    // Layer 2b runtime function `checkPublishGateBypassAtRuntime` MUST
-    // be exercised by the kill-switch unit tests file. Asserted
-    // independently from layer 1 so a future commit that deletes ONE
-    // layer's tests (but keeps the other) still fails CI — preventing
-    // silent coverage loss on the four-layer defense.
-    const layer2Files = new Set(gitGrepTypescript('checkPublishGateBypassAtRuntime'));
+  it('the layer-2 runtime-check test remains wired (call-expression canary)', () => {
+    const stripped = readTestFileStrippedOfComments();
+    const callCount = countCallExpressions(stripped, 'checkPublishGateBypassAtRuntime');
     expect(
-      layer2Files.has('tests/integration/forms-intake-publish-gates-killswitch.test.ts'),
-      'Layer 2 (runtime-check) test wiring missing: ' +
-        'tests/integration/forms-intake-publish-gates-killswitch.test.ts no longer ' +
-        'references checkPublishGateBypassAtRuntime. If the file was renamed, ' +
-        'update both this canary and SANCTIONED_FILES.',
+      callCount >= MIN_CALLS_PER_LAYER,
+      `Layer 2 (runtime-check) test coverage missing in ${KILL_SWITCH_TEST_PATH}. ` +
+        `Expected at least ${MIN_CALLS_PER_LAYER} call expressions to ` +
+        `checkPublishGateBypassAtRuntime(), found ${callCount}. ` +
+        `Comments/imports/docblock references do not count toward this canary — ` +
+        `executable test calls only. Asserted independently from layer 1 so ` +
+        `deleting one layer's tests while preserving the other still fails CI.`,
     ).toBe(true);
   });
 });
