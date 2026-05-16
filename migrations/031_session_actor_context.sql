@@ -366,7 +366,7 @@ BEGIN
     VALUES
       (p_nonce, p_actor_account_id,
        p_actor_account_tenant_id, p_actor_role, p_actor_admin_home_tenant_id,
-       p_session_id, NOW() + (p_ttl_seconds || ' seconds')::INTERVAL)
+       p_session_id, NOW() + (p_ttl_seconds * INTERVAL '1 second'))
     ON CONFLICT (nonce) DO UPDATE
       SET expires_at = EXCLUDED.expires_at,
           bound_at = NOW()
