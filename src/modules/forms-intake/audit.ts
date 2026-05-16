@@ -168,7 +168,9 @@ type FormsAuditActionPlaceholder =
   // Variant lifecycle (A/B)
   | 'forms_variant_created'
   | 'forms_variant_winner_promoted'
-  | 'forms_variant_retired';
+  | 'forms_variant_retired'
+  // Publish-gate kill-switch (SI-011 layer 2)
+  | 'forms_publish_bypass_attempt_in_production';
 
 /**
  * formsAuditPlaceholder — single sanctioned `as AuditAction` cast site.
@@ -995,6 +997,72 @@ export async function emitFormsVariantRetired(
         rationale: args.rationale,
         promoted_winner_id: args.promotedWinnerId,
         retired_as_part_of: 'winner_promotion',
+      },
+    }),
+    tx,
+  );
+}
+
+/**
+ * Emit `forms_publish_bypass_attempt_in_production` — SI-011 layer-2
+ * runtime check detected a forbidden FORMS_PUBLISH_GATES_BYPASS or
+ * FORMS_PUBLISH_GATES_TEST_OVERRIDE_* env var in any environment where
+ * NODE_ENV !== 'test'. Category B (governance). Emitted from the
+ * publish HTTP handler BEFORE any transaction or idempotency work, so
+ * the bypass attempt is captured in the immutable audit stream even
+ * though the publish itself is rejected.
+ *
+ * `resource_id` is the version path-param the operator tried to publish
+ * — not the result of any DB lookup, so this never reveals cross-tenant
+ * existence per I-025 (the version isn't dereferenced; we only audit
+ * the attempt).
+ *
+ * SPEC ISSUE: AUDIT_EVENTS v5.2 does not enumerate this action ID; it
+ * routes through the same `formsAuditPlaceholder()` helper as the other
+ * unratified IDs in this module. Ratification request: add
+ * `forms_publish_bypass_attempt_in_production` to the canonical
+ * `AuditAction` enum alongside the other 11 forms-engine placeholders
+ * per the migration plan in the file-header §"Migration trigger".
+ *
+ * Spec reference: docs/SI-011-Forms-Publish-Governance-Gates.md
+ * §"Production environment guard (kill-switch)" — Codex R1 H1 +
+ * layer-2 audit requirement.
+ */
+export async function emitFormsPublishBypassAttemptInProduction(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    /** The :versionId path param the operator tried to publish (NOT dereferenced; I-025-safe). */
+    attemptedVersionId: string;
+    /** Canonical-sorted list of forbidden env-var names detected by the kill-switch. */
+    forbiddenVars: ReadonlyArray<string>;
+    /** Observed NODE_ENV at the time of detection (or null if unset). */
+    nodeEnvObserved: string | null;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildEnvelope(formsAuditPlaceholder('forms_publish_bypass_attempt_in_production'), 'B', {
+      tenant_id: args.tenantId,
+      actor_type: 'operator',
+      actor_id: args.actorId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: null, // platform-scope event
+      country_of_care: args.countryOfCare,
+      resource_type: 'forms_template',
+      resource_id: args.attemptedVersionId,
+      detail: {
+        attempted_version_id: args.attemptedVersionId,
+        forbidden_vars: [...args.forbiddenVars], // strip readonly for JSONB
+        node_env_observed: args.nodeEnvObserved,
+        // The forbidden-var NAMES are well-known kill-switch sentinels,
+        // not secrets, so naming them in the audit detail is safe and
+        // aids forensic remediation. The VALUES are NOT captured — they
+        // could plausibly carry sensitive data (e.g., copy-pasted from
+        // an internal env file).
+        detector_layer: 'http_handler_pre_idempotency',
       },
     }),
     tx,

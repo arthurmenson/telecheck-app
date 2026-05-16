@@ -181,7 +181,8 @@ export const PUBLISH_GATES_NOT_IMPLEMENTED = 'forms.publish.gates_not_implemente
  * throwing, so the bypass attempt is captured immutably even if the
  * caller suppresses the error.
  */
-export const PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME = 'forms.publish.bypass_in_production';
+export const PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME =
+  'forms.publish.bypass_attempt_in_production';
 
 /**
  * Publish a draft version. Pre-publish gates:
