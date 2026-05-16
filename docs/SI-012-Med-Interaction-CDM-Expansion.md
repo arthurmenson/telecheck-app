@@ -23,7 +23,7 @@ This SI scopes the CDM expansion need as a formal deliverable so the spec-corpus
 Per the 2026-05-15 Implementation State Audit:
 
 > **Pilot-blocking work (in order):**
-> 1. Med-Interaction core checks (drug-drug, drug-condition, drug-allergy)
+> 1. Med-Interaction core checks (per Slice PRD v1.0 §4 five check classes: drug-drug, drug-condition, drug-lab, pharmacogenomic, special-clinical-flag). Note: drug-allergy is NOT a separate class in §4 — allergies are represented via drug-condition (allergy is a condition) and/or special-clinical-flag mechanisms.
 > 2. Async-Consult completion (clinician decision loop, SI-005 procedure)
 > 3. AI Service Mode 1 conversational scaffolding ✅ (PR #160 closed 2026-05-16)
 > 4. Crisis Response slice (resource lookup + escalation; detection wired)
@@ -43,9 +43,9 @@ Per slice PRD §5.1:
 |---|---|---|
 | `interaction_signal_id` | PK | `intsig_<ULID>` |
 | `tenant_id` | FK → tenants | I-027 required |
-| `patient_id` | FK → patients | nullable when signal is for a prescription-in-flight before patient binding |
-| `prescription_request_id` | FK → prescription_requests | the request the signal was raised against |
-| `check_class` | ENUM | `drug_drug` \| `drug_condition` \| `drug_lab` \| `pharmacogenomic` \| `special_clinical_flag` (per §4) |
+| `patient_id` | FK → patients | nullable when signal is for a medication request in-flight before patient binding |
+| `medication_request_id` | FK → medication_requests | per glossary rule + canonical entity from migration 025; the request the signal was raised against |
+| `check_class` | ENUM | `drug_drug` \| `drug_condition` \| `drug_lab` \| `pharmacogenomic` \| `special_clinical_flag` (the exact five classes enumerated in Slice PRD §4; drug-allergy is NOT a separate class — allergies surface via drug_condition or special_clinical_flag) |
 | `severity` | ENUM | `info` \| `caution` \| `warning` \| `severe` \| `contraindicated` (per §5.2) |
 | `recommended_action` | ENUM | per §5.3 |
 | `signal_payload` | JSONB | structured signal-class-specific detail |
