@@ -273,9 +273,6 @@ async function installTestAppRole(client: Client): Promise<void> {
     // Schema + table grants — broad enough for tests to INSERT / SELECT against
     // every PHI table; RLS still filters cross-tenant rows.
     await client.query(`GRANT USAGE ON SCHEMA public TO ${TEST_APP_ROLE}`);
-    await client.query(
-      `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${TEST_APP_ROLE}`,
-    );
     await client.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${TEST_APP_ROLE}`);
     await client.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${TEST_APP_ROLE}`);
 
@@ -294,20 +291,44 @@ async function installTestAppRole(client: Client): Promise<void> {
     //  active. The combination normalized a production shape where the app
     //  role can attempt audit mutation — a layer of belt that I-003 expects
     //  to be in place independently of the suspenders.)
-    await client.query(`REVOKE UPDATE, DELETE ON audit_records FROM ${TEST_APP_ROLE}`);
-    // forms_snapshot is also append-only per Forms/Intake slice; revoke
-    // pre-emptively if the table exists. The IF EXISTS pattern via DO block
-    // tolerates skeleton-state runs where forms_snapshot hasn't been created
-    // by the slice migration yet.
-    await client.query(`
-      DO $$
-      BEGIN
-        IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'forms_snapshot' AND relkind = 'r') THEN
-          EXECUTE 'REVOKE UPDATE, DELETE ON forms_snapshot FROM ${TEST_APP_ROLE}';
-        END IF;
-      END
-      $$;
-    `);
+    //
+    // (Patch 2026-05-16 — i003 flake race fix: the prior implementation
+    //  ran `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES` then
+    //  `REVOKE UPDATE, DELETE ON audit_records` as TWO separate autocommit
+    //  statements. Between them, other parallel test forks observed the
+    //  GRANTED state for audit_records and the i003 privilege-revoke test
+    //  saw `[{privilege_type:'UPDATE'}]` for a brief window. Even with the
+    //  pg_advisory_lock serializing installTestAppRole across forks, a
+    //  fork running i003 test AFTER its own beforeAll completed could
+    //  observe ANOTHER fork's mid-install state. Wrap the GRANT-then-REVOKE
+    //  sequence in BEGIN/COMMIT so other sessions see only the post-commit
+    //  state (REVOKE applied) per Postgres' snapshot-isolation catalog
+    //  reads. Closes the recurring i003-audit-append-only flake observed
+    //  across PRs #136, #140, #146, #149.)
+    await client.query('BEGIN');
+    try {
+      await client.query(
+        `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${TEST_APP_ROLE}`,
+      );
+      await client.query(`REVOKE UPDATE, DELETE ON audit_records FROM ${TEST_APP_ROLE}`);
+      // forms_snapshot is also append-only per Forms/Intake slice; revoke
+      // pre-emptively if the table exists. The IF EXISTS pattern via DO block
+      // tolerates skeleton-state runs where forms_snapshot hasn't been created
+      // by the slice migration yet.
+      await client.query(`
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'forms_snapshot' AND relkind = 'r') THEN
+            EXECUTE 'REVOKE UPDATE, DELETE ON forms_snapshot FROM ${TEST_APP_ROLE}';
+          END IF;
+        END
+        $$;
+      `);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
   } finally {
     await client.query(`SELECT pg_advisory_unlock(hashtext('telecheck_test_install_role')::int)`);
   }
