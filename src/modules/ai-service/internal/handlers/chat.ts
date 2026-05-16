@@ -82,8 +82,23 @@ import { asAIChatSessionId, type Mode1ChatResponseView } from '../types.js';
  *     tokens, so 4000 chars is conservative enough to fit any
  *     reasonable provider's input limit.
  */
+/**
+ * R3 H2 closure (Codex 2026-05-16): the request body no longer carries
+ * `ai_chat_session_id`. At v1.0 the handler generates a fresh
+ * server-side session id bound to the authenticated (tenant, patient)
+ * — this prevents the trust hazard of accepting an unvalidated
+ * session_id from the client (cross-tenant / cross-patient pollution
+ * of the audit chain). When the session-lifecycle endpoints land
+ * (POST /v0/ai/chat-sessions, GET /v0/ai/chat-sessions/:id, etc.),
+ * the client will create sessions explicitly and POST /chat will
+ * accept the validated session_id with owner-patient verification.
+ *
+ * Trade-off: at v1.0 every Mode 1 chat call creates a one-shot
+ * session id. That's acceptable for the fail-soft posture (NullLLMProvider
+ * always returns AI-RESIL-001 anyway). Real conversational continuity
+ * lands with the real provider adapter + session persistence layer.
+ */
 const Mode1ChatRequestSchema = z.object({
-  ai_chat_session_id: z.string().min(1).max(128, 'ai_chat_session_id must be ≤128 chars'),
   message_text: z
     .string()
     .min(1, 'message_text is required')
@@ -140,14 +155,41 @@ const CRISIS_RESPONSE_TEXT =
 // ---------------------------------------------------------------------------
 
 /**
- * Service-error mapper for `withIdempotentExecution`. The Mode 1 chat
- * handler doesn't currently surface domain-specific Error subclasses
- * up to the helper (LLMProviderUnavailableError is caught inside the
- * lifecycle for the AI-RESIL-001 fail-soft path). Unmapped errors
- * propagate to Fastify's global error handler — same shape as other
- * slices' service-error mappers.
+ * Mode 1 chat handler's typed audit-emission-failure sentinel — used
+ * to translate a rethrown FLOOR-020 audit error into the documented
+ * 503 envelope (R3 H1 closure 2026-05-16). The withIdempotentExecution
+ * helper rolls back the cache reservation on any callback throw; this
+ * wrapper carries the original error through to the global error
+ * handler for log + ops-alert visibility while ensuring the wire
+ * response is the retryable 503 not a generic 500.
  */
-function mapServiceError(): boolean {
+class Mode1AuditEmissionFailedError extends Error {
+  /** Original audit-emission error; preserved for ops triage. */
+  readonly auditCause: unknown;
+  constructor(auditCause: unknown) {
+    super('mode_1_chat_audit_emission_failed');
+    this.name = 'Mode1AuditEmissionFailedError';
+    this.auditCause = auditCause;
+  }
+}
+
+/**
+ * Service-error mapper for `withIdempotentExecution`. Translates the
+ * Mode1AuditEmissionFailedError into a tenant-blind 503 with retry-
+ * advisory semantics. Other unmapped errors propagate to Fastify's
+ * global error handler.
+ */
+function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): boolean {
+  if (err instanceof Mode1AuditEmissionFailedError) {
+    void reply.code(503).send({
+      error: {
+        code: 'ai_chat.audit_emission_unavailable',
+        message: 'AI chat is temporarily unable to record the response audit. Please try again.',
+        request_id: reqId,
+      },
+    });
+    return true;
+  }
   return false;
 }
 
@@ -186,7 +228,12 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
     );
   }
   const body = parsed.data;
-  const sessionId = asAIChatSessionId(body.ai_chat_session_id);
+  // R3 H2 closure (Codex 2026-05-16): server-side session ID generation.
+  // The handler does NOT accept an ai_chat_session_id from the client;
+  // every call creates a fresh ID bound to the authenticated (tenant,
+  // patient). Future session-lifecycle endpoints will accept explicit
+  // session IDs with owner-patient validation against a sessions table.
+  const sessionId = asAIChatSessionId(`aics_${ulid()}`);
   const messageId = `aimsg_${ulid()}`;
 
   // R1 H1 closure (Codex 2026-05-16): wrap the lifecycle in
@@ -303,29 +350,47 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
     // already). It does NOT apply to the Category C operational
     // response audit — losing that audit forever in exchange for
     // caching a 200 is the worse trade.
-    await emitMode1ChatResponseAudit(
-      {
-        tenantId: asTenantId(ctx.tenantId),
-        actorId: actor.accountId,
-        actorTenantId: ctx.tenantId,
-        countryOfCare: ctx.countryOfCare,
-        targetPatientId: actor.accountId,
-        aiModelVersion,
-        detail: {
+    try {
+      await emitMode1ChatResponseAudit(
+        {
+          tenantId: asTenantId(ctx.tenantId),
+          actorId: actor.accountId,
+          actorTenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          targetPatientId: actor.accountId,
+          aiModelVersion,
+          detail: {
+            ai_chat_session_id: sessionId,
+            message_id: messageId,
+            ai_mode: 'mode_1',
+            guardrail_template_id: 'conservative_default',
+            guardrail_version: CONSERVATIVE_DEFAULT_TEMPLATE.version,
+            crisis_detected: crisisDetected,
+            escalation_triggered: crisisDetected,
+            provider_unavailable: providerUnavailable,
+            input_text_length: body.message_text.length,
+            response_text_length: responseText.length,
+          },
+        },
+        _tx,
+      );
+    } catch (auditErr) {
+      // R3 H1 closure (Codex 2026-05-16): translate to typed error so
+      // mapServiceError can map to the documented 503. Log + propagate
+      // the cause for ops triage.
+      req.log.error(
+        {
+          err: auditErr,
           ai_chat_session_id: sessionId,
           message_id: messageId,
-          ai_mode: 'mode_1',
-          guardrail_template_id: 'conservative_default',
-          guardrail_version: CONSERVATIVE_DEFAULT_TEMPLATE.version,
           crisis_detected: crisisDetected,
-          escalation_triggered: crisisDetected,
           provider_unavailable: providerUnavailable,
-          input_text_length: body.message_text.length,
-          response_text_length: responseText.length,
+          ai_model_version: aiModelVersion,
         },
-      },
-      _tx,
-    );
+        'mode1_chat: FLOOR-020 audit emission failed — translating to 503; idempotency cache rolls back',
+      );
+      throw new Mode1AuditEmissionFailedError(auditErr);
+    }
 
     const view: Mode1ChatResponseView = {
       ai_chat_session_id: sessionId,
