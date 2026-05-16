@@ -395,6 +395,239 @@ export async function closePool(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// SI-010 dedicated bind pool
+// ---------------------------------------------------------------------------
+//
+// SI-010 requires `bind_actor_context()` to be invoked from a connection
+// whose session_user is `bind_actor_context_role` (NOT `telecheck_app_role`)
+// per migration 031's session_user gate. This pool is the dedicated path —
+// constructed from `config.bindActorContextDatabaseUrl` so operators wire
+// it to a connection string authenticating as the bind role directly
+// (NOT via SET ROLE from the main app role, which would defeat the
+// caller-isolation guarantee).
+//
+// When `config.bindActorContextDatabaseUrl` is undefined (dev/test where
+// SI-010 wiring is opt-in), `getBindActorContextPool()` returns null. The
+// authContextPlugin's onRequest hook treats null as "skip bind"; requests
+// proceed without an actorNonce and DB-side `current_actor_*()` helpers
+// correctly raise `actor_context_unbound` if invoked.
+//
+// In integration tests, `setTestPool()` also installs an override here so
+// the bind path can run against the shared test client (which holds
+// elevated DDL/DML privileges in the test schema). Production fail-closed
+// posture is preserved by the migration's session_user gate.
+// ---------------------------------------------------------------------------
+
+let _bindActorContextPool: pg.Pool | null = null;
+
+/**
+ * Test-mode override for the bind pool. Mirrors `_testPoolOverride` for
+ * the main pool; installed by `setTestPool()` so tests can exercise
+ * `bind_actor_context()` against the shared savepoint-wrapped client.
+ */
+let _bindActorContextPoolTestOverride: pg.Pool | null = null;
+
+/**
+ * Test-only: install a wrapper pool for SI-010 bind invocations. Called
+ * by tests/setup.ts in the same beforeAll that installs the main test
+ * pool, so the bind helper and the main DB share the same shared
+ * client + savepoint isolation.
+ *
+ * Production code MUST NOT call this. The bind pool is constructed
+ * lazily from `config.bindActorContextDatabaseUrl` when first requested.
+ */
+export function setBindActorContextTestPool(client: DbClient): void {
+  const connect = async (): Promise<unknown> => ({
+    query: client.query.bind(client),
+    release: () => {
+      /* no-op; harness owns lifecycle */
+    },
+  });
+  const wrapper = {
+    connect,
+    end: async () => {
+      /* no-op */
+    },
+    on: () => {
+      /* no-op */
+    },
+  } as unknown as pg.Pool;
+  _bindActorContextPoolTestOverride = wrapper;
+  _bindActorContextPool = null;
+}
+
+/**
+ * Test-only: clear the bind-pool test override.
+ */
+export function clearBindActorContextTestPool(): void {
+  _bindActorContextPoolTestOverride = null;
+  _bindActorContextPool = null;
+}
+
+/**
+ * Returns the SI-010 bind pool, or null when bind-pool wiring is not
+ * configured (dev/test where the env var is absent). authContextPlugin
+ * treats null as "skip bind"; requests proceed without an actorNonce.
+ *
+ * The returned pool authenticates as `bind_actor_context_role` per the
+ * env-var contract. The migration's session_user gate (inside
+ * `bind_actor_context()`) refuses calls whose session_user is
+ * `telecheck_app_role`, providing defense-in-depth against an operator
+ * pointing this var at the main app credentials.
+ */
+export function getBindActorContextPool(): pg.Pool | null {
+  if (_bindActorContextPoolTestOverride !== null) {
+    return _bindActorContextPoolTestOverride;
+  }
+  if (config.bindActorContextDatabaseUrl === undefined) {
+    return null;
+  }
+  if (_bindActorContextPool === null) {
+    _bindActorContextPool = new Pool({
+      connectionString: config.bindActorContextDatabaseUrl,
+      max: config.bindActorContextPoolMax,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000,
+      ssl: config.dbSslMode === 'require' ? { rejectUnauthorized: false } : false,
+    });
+    _bindActorContextPool.on('error', (err) => {
+      // eslint-disable-next-line no-console
+      console.error('[db] unexpected bind-pool error:', err);
+      // Don't exit — the pool can recover; surface loudly. authContextPlugin
+      // will treat individual bind failures as fail-closed (leave
+      // actorNonce undefined) so a transient pool error doesn't elevate
+      // requests beyond their authenticated identity.
+    });
+  }
+  return _bindActorContextPool;
+}
+
+/**
+ * Close the bind pool. Test cleanup + graceful shutdown.
+ */
+export async function closeBindActorContextPool(): Promise<void> {
+  if (_bindActorContextPool !== null) {
+    await _bindActorContextPool.end();
+    _bindActorContextPool = null;
+  }
+}
+
+/**
+ * SI-010 production boot probe (Codex R2 closure 2026-05-15).
+ *
+ * Acquires a connection from the bind pool and verifies the deployment
+ * is correctly wired BEFORE Fastify accepts traffic. Catches the
+ * misconfiguration classes that `loadConfig()`'s missing-env check
+ * cannot catch:
+ *   - Wrong password / unreachable host (connect throws)
+ *   - Connection authenticating as the wrong role (session_user check)
+ *   - Migration 031 not applied / bind_actor_context() missing
+ *     (has_function_privilege returns null)
+ *   - Connection role lacks EXECUTE on bind_actor_context()
+ *     (has_function_privilege returns false)
+ *
+ * Called from `buildApp()` once per process boot when
+ * `config.bindActorContextDatabaseUrl !== undefined`. Throws on any
+ * failure — the process exits non-zero and the listener never binds.
+ *
+ * Skipped automatically when the bind pool is unconfigured (dev/test
+ * opt-in path; bind-pool null = SI-010 wiring opt-out).
+ *
+ * @throws if probe fails — propagated up so buildApp() aborts.
+ */
+export async function verifyBindActorContextPoolOrThrow(): Promise<void> {
+  const pool = getBindActorContextPool();
+  if (pool === null) {
+    // Unconfigured. Production fail-fast is enforced at config-loader
+    // boundary (BIND_ACTOR_CONTEXT_DATABASE_URL required in production);
+    // here we only short-circuit when the pool is genuinely null.
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    // 1) R3 HIGH closure (Codex 2026-05-15): session_user MUST be
+    //    EXACTLY `bind_actor_context_role`. A non-app-role-but-still-
+    //    over-privileged login (superuser, migration owner,
+    //    accidentally-granted ops role) would otherwise satisfy the
+    //    EXECUTE check and pass this probe — defeating the trust
+    //    boundary the bind-pool model is designed to enforce. The
+    //    probe is the latest-still-safe checkpoint to catch URL
+    //    miswiring at an over-privileged role.
+    //
+    //    Defense-in-depth: even with role-name match, refuse if the
+    //    role is unexpectedly elevated (operator may have ALTERed
+    //    the role's attributes post-migration). bind_actor_context_role
+    //    is narrowly scoped: NOT superuser, NOT bypassrls.
+    const sessionResult = await client.query<{
+      session_user: string;
+      is_superuser: boolean;
+      is_bypassrls: boolean;
+    }>(
+      'SELECT session_user, rolsuper AS is_superuser, rolbypassrls AS is_bypassrls FROM pg_roles WHERE rolname = session_user',
+    );
+    const row = sessionResult.rows[0];
+    if (row === undefined) {
+      throw new Error(
+        'SI-010 bind-pool probe: SELECT session_user returned no rows. ' +
+          'Verify BIND_ACTOR_CONTEXT_DATABASE_URL credentials are valid.',
+      );
+    }
+    if (row.session_user !== 'bind_actor_context_role') {
+      throw new Error(
+        `SI-010 bind-pool probe: session_user is "${row.session_user}" — ` +
+          'BIND_ACTOR_CONTEXT_DATABASE_URL MUST authenticate as the dedicated ' +
+          'bind_actor_context_role created by migration 031. Any other role ' +
+          '(telecheck_app_role, superuser, migration owner, accidentally-granted ' +
+          'operational role) is rejected at this probe even if it can EXECUTE ' +
+          'bind_actor_context — the trust boundary is the EXACT role identity, ' +
+          'not just the absence of the app role.',
+      );
+    }
+    if (row.is_superuser) {
+      throw new Error(
+        'SI-010 bind-pool probe: bind_actor_context_role unexpectedly has SUPERUSER. ' +
+          'Operator: ALTER ROLE bind_actor_context_role NOSUPERUSER. The trust ' +
+          'boundary requires this role to be narrowly scoped (EXECUTE on the ' +
+          'binder only; no broader DB privileges).',
+      );
+    }
+    if (row.is_bypassrls) {
+      throw new Error(
+        'SI-010 bind-pool probe: bind_actor_context_role unexpectedly has BYPASSRLS. ' +
+          'Operator: ALTER ROLE bind_actor_context_role NOBYPASSRLS. The trust ' +
+          'boundary requires this role to be subject to RLS like every other ' +
+          'application role.',
+      );
+    }
+
+    // 2) bind_actor_context() must exist + bind_actor_context_role
+    //    must have EXECUTE. has_function_privilege returns NULL when
+    //    the function does not exist, FALSE when it exists but no
+    //    EXECUTE, TRUE when callable.
+    const privResult = await client.query<{ has_privilege: boolean | null }>(
+      "SELECT has_function_privilege('bind_actor_context_role', 'bind_actor_context(text, text, text, text, text, uuid, integer)', 'EXECUTE') AS has_privilege",
+    );
+    const hasPrivilege = privResult.rows[0]?.has_privilege ?? null;
+    if (hasPrivilege === null) {
+      throw new Error(
+        'SI-010 bind-pool probe: bind_actor_context() function not found. ' +
+          'Migration 031_session_actor_context.sql is not applied.',
+      );
+    }
+    if (hasPrivilege === false) {
+      throw new Error(
+        'SI-010 bind-pool probe: bind_actor_context_role lacks EXECUTE on ' +
+          'bind_actor_context(). Migration 031 GRANTs it; verify the migration ' +
+          'applied cleanly and no subsequent migration revoked the GRANT.',
+      );
+    }
+  } finally {
+    client.release();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Connection + transaction helpers
 // ---------------------------------------------------------------------------
 

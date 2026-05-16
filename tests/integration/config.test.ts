@@ -201,14 +201,20 @@ describe('config — NODE_ENV enum', () => {
     for (const env of ['development', 'test', 'production'] as const) {
       applyBaseline();
       vi.stubEnv('NODE_ENV', env);
-      // Production also requires a >=32-char RESUME_TOKEN_SECRET AND
-      // DATABASE_SSL_MODE=require to pass — both are enforced as
-      // procedural checks at config-load time per the production
+      // Production also requires a >=32-char RESUME_TOKEN_SECRET,
+      // DATABASE_SSL_MODE=require, JWT_SIGNING_KEY, AND
+      // BIND_ACTOR_CONTEXT_DATABASE_URL (SI-010 trust anchor per
+      // Codex R1 closure on PR #158) to pass — each is enforced as
+      // a procedural check at config-load time per the production
       // fail-closed gates.
       if (env === 'production') {
         vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(40));
         vi.stubEnv('DATABASE_SSL_MODE', 'require');
         vi.stubEnv('JWT_SIGNING_KEY', 'a'.repeat(40));
+        vi.stubEnv(
+          'BIND_ACTOR_CONTEXT_DATABASE_URL',
+          'postgres://bind_actor_context_role:x@localhost:5432/z',
+        );
       }
       const fresh = await loadFreshConfig();
       expect(fresh.config.nodeEnv).toBe(env);
@@ -322,6 +328,10 @@ describe('config — DATABASE_SSL_MODE enum', () => {
     vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(40));
     vi.stubEnv('DATABASE_SSL_MODE', 'require');
     vi.stubEnv('JWT_SIGNING_KEY', 'a'.repeat(40));
+    vi.stubEnv(
+      'BIND_ACTOR_CONTEXT_DATABASE_URL',
+      'postgres://bind_actor_context_role:x@localhost:5432/z',
+    );
     const fresh = await loadFreshConfig();
     expect(fresh.config.dbSslMode).toBe('require');
     expect(fresh.config.nodeEnv).toBe('production');
@@ -521,6 +531,10 @@ describe('config — RESUME_TOKEN_SECRET production gate', () => {
     vi.stubEnv('DATABASE_SSL_MODE', 'require');
     vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(32));
     vi.stubEnv('JWT_SIGNING_KEY', 'a'.repeat(40));
+    vi.stubEnv(
+      'BIND_ACTOR_CONTEXT_DATABASE_URL',
+      'postgres://bind_actor_context_role:x@localhost:5432/z',
+    );
     const fresh = await loadFreshConfig();
     expect(fresh.config.resumeTokenSecret).toBe('a'.repeat(32));
   });
@@ -531,6 +545,10 @@ describe('config — RESUME_TOKEN_SECRET production gate', () => {
     vi.stubEnv('DATABASE_SSL_MODE', 'require');
     vi.stubEnv('RESUME_TOKEN_SECRET', 'a'.repeat(64));
     vi.stubEnv('JWT_SIGNING_KEY', 'a'.repeat(40));
+    vi.stubEnv(
+      'BIND_ACTOR_CONTEXT_DATABASE_URL',
+      'postgres://bind_actor_context_role:x@localhost:5432/z',
+    );
     const fresh = await loadFreshConfig();
     expect(fresh.config.resumeTokenSecret.length).toBe(64);
   });

@@ -23,6 +23,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 
 import { aiContextPlugin } from './lib/ai-context.js';
 import { authContextPlugin } from './lib/auth-context.js';
+import { verifyBindActorContextPoolOrThrow } from './lib/db.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
@@ -64,6 +65,21 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // as layer 1 of four; layer 2 is the runtime check inside
   // publishVersion() (see template-service.ts).
   assertNoPublishGateBypassAtBoot(process.env);
+
+  // SI-010 bind-pool startup probe (Codex R2 closure 2026-05-15).
+  //
+  // BEFORE Fastify accepts traffic, verify the bind pool is reachable,
+  // the connection authenticates as a role that is NOT
+  // telecheck_app_role, and that role has EXECUTE on bind_actor_context().
+  // Catches misconfigurations (wrong password, unreachable host, wrong
+  // role, missing GRANT, missing migration 031) at boot rather than
+  // letting the listener bind and then failing every authenticated
+  // request silently.
+  //
+  // When config.bindActorContextDatabaseUrl is undefined (dev/test
+  // opt-in), the probe is a no-op. Production fail-fast on missing
+  // URL is enforced at loadConfig() time.
+  await verifyBindActorContextPoolOrThrow();
 
   const app = Fastify({
     logger: opts.logger ?? defaultLoggerConfig(),

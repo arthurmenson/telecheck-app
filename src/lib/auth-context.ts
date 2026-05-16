@@ -30,8 +30,11 @@
 
 import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastify';
 import fp from 'fastify-plugin';
+import type { PoolClient } from 'pg';
 
+import { type BindActorRole, bindActorContextForRequest } from './actor-context-binding.js';
 import { config } from './config.js';
+import { getBindActorContextPool } from './db.js';
 import type { TenantId } from './glossary.js';
 import { verifyAccessToken } from './jwt.js';
 import { lookupActiveTenantById } from './tenant-context.js';
@@ -289,6 +292,83 @@ const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstanc
         claims.role === 'tenant_admin' ? (claims.admin_tenant_binding ?? null) : null,
       adminHomeTenantId: claims.role === 'platform_admin' ? claims.tenant_id : null,
     };
+
+    // SI-010: bind a per-request actor identity row in
+    // _session_actor_context so DB-side SECURITY DEFINER procedures
+    // (SI-005 record_consult_clinician_decision, SI-008
+    // record_workflow_pointer_swap, SI-009
+    // record_consult_escalation_target_swap, etc.) can resolve the
+    // authenticated actor via current_actor_*() helpers — without
+    // trusting caller-supplied parameters or GUC values.
+    //
+    // Trust model (per docs/SI-010 §"Trust model"):
+    //   - The bind invocation runs on a DEDICATED bind pool (config.
+    //     bindActorContextDatabaseUrl) whose session_user is
+    //     bind_actor_context_role, NOT telecheck_app_role.
+    //   - The migration's session_user gate inside bind_actor_context()
+    //     refuses calls whose session_user is telecheck_app_role.
+    //   - The nonce is high-entropy UUIDv4, generated server-side,
+    //     NEVER logged (LOG_REDACT_PATHS covers req.actorNonce).
+    //
+    // Fail-closed posture:
+    //   - When the bind pool is not configured (dev/test), skip the
+    //     bind. Requests proceed without actorNonce; DB-side helpers
+    //     raise actor_context_unbound if invoked, which is correct
+    //     fail-closed behavior at the procedure boundary.
+    //   - When the bind pool is configured but the invocation throws
+    //     (DB unreachable, session_user gate triggered by misconfig,
+    //     malformed inputs), CLEAR actorContext + leave actorNonce
+    //     undefined. The request flows to handlers without an
+    //     authenticated identity — requireActorContext() will 401
+    //     via the canonical tenant-blind envelope. The thrown error
+    //     is logged (without the nonce value) for ops triage.
+    const bindPool = getBindActorContextPool();
+    if (bindPool !== null) {
+      // pg.PoolClient is the precise type from `bindPool.connect()`.
+      let bindClient: PoolClient | null = null;
+      try {
+        bindClient = await bindPool.connect();
+        // Role mapping mirrors the migration's CHECK constraint.
+        // `delegate` is currently not minted by the JWT scaffold but is
+        // included in BindActorRole for future delegated-access flows
+        // (Consent slice).
+        const bindRole: BindActorRole = claims.role;
+        const adminHome = claims.role === 'platform_admin' ? claims.tenant_id : null;
+        const bound = await bindActorContextForRequest(bindClient, {
+          actorAccountId: claims.sub,
+          actorAccountTenantId: claims.tenant_id,
+          actorRole: bindRole,
+          actorAdminHomeTenantId: adminHome,
+          sessionId: claims.session_id,
+        });
+        request.actorNonce = bound.nonce;
+      } catch (err) {
+        // Fail closed: clear actorContext so the request is effectively
+        // unauthenticated. Log with shallow error context only — do NOT
+        // include the (never-set) nonce. The logger's redact paths
+        // cover req.actorNonce anyway; this is belt-and-suspenders.
+        request.log?.error?.(
+          {
+            err,
+            sub: claims.sub,
+            role: claims.role,
+            tenant_id: claims.tenant_id,
+          },
+          'auth-context: SI-010 bind_actor_context failed — failing closed (actorContext cleared)',
+        );
+        request.actorContext = undefined;
+        request.actorNonce = undefined;
+      } finally {
+        if (bindClient !== null) {
+          try {
+            bindClient.release();
+          } catch {
+            // Best-effort release; swallow to avoid masking the
+            // primary error path above.
+          }
+        }
+      }
+    }
   });
 };
 

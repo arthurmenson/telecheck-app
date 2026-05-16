@@ -375,6 +375,38 @@ beforeAll(async () => {
   // The CI run on commit 37db5b3 surfaced this as
   // `forms.deployment.template_not_found` on a freshly-seeded template.
   setTestPool(_client as unknown as DbClient);
+
+  // R2 + R4 closure (Codex 2026-05-15): the SI-010 bind-pool test
+  // override is NOT installed globally. Two reasons:
+  //
+  //   1. Coverage scope: most tests don't authenticate JWT requests,
+  //      and even those that do don't need to exercise the SI-010
+  //      bind path. Installing the override globally would invoke
+  //      the bind invocation on every JWT-authenticated request,
+  //      slowing the suite for no test benefit.
+  //
+  //   2. Trust-boundary parity (R4 closure): `verifyBindActorContextPoolOrThrow`
+  //      requires session_user === 'bind_actor_context_role' EXACTLY.
+  //      The shared test client runs as `telecheck_test_app`, NOT as
+  //      bind_actor_context_role. GRANT membership does NOT change
+  //      session_user — so the global override would fail the boot
+  //      probe even with the membership. The probe is the production
+  //      trust-boundary surface; bypassing it in tests would mean
+  //      tests don't exercise the actual production wiring.
+  //
+  // SI-010 integration tests are slice-level opt-in: a test that
+  // wants to exercise the bind path uses its OWN pg.Pool authenticated
+  // as bind_actor_context_role (separate connection, separate
+  // session_user). The migration creates the role; the test
+  // infrastructure provisions a password (or uses peer auth) at
+  // suite setup, then installs that real pool via
+  // setBindActorContextTestPool(). Non-SI-010 tests proceed with
+  // bind-pool null → authContextPlugin skips bind invocation →
+  // requests authenticate without an actorNonce. DB-side
+  // current_actor_*() helpers correctly raise actor_context_unbound
+  // if a procedure that requires identity is invoked in such a test
+  // (i.e., the test must explicitly opt into the bind path to
+  // exercise such procedures).
 });
 
 // ---------------------------------------------------------------------------
