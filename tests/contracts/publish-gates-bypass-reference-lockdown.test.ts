@@ -171,21 +171,44 @@ describe('SI-011 layer 3 — publish-gates-bypass reference lockdown', () => {
   const KILL_SWITCH_TEST_PATH = 'tests/integration/forms-intake-publish-gates-killswitch.test.ts';
 
   /**
-   * Read the kill-switch test file and strip comment regions so the
-   * canaries assert against EXECUTABLE code only. Strips, in order:
-   *   - block comments (slash-star ... star-slash, including JSDoc)
-   *   - line comments (two-slash to end of line)
+   * Read the kill-switch test file and strip non-code regions so the
+   * canaries assert against EXECUTABLE source only. Strips, in order:
+   *   1. block comments (slash-star ... star-slash, including JSDoc)
+   *   2. line comments (two-slash to end of line)
+   *   3. single-quoted string literals
+   *   4. double-quoted string literals
+   *   5. template literals (backtick ... backtick, including ${} expressions)
    *
-   * String literals containing `//` or `/*` are NOT stripped — that's a
-   * known limitation acceptable for this contract test (the function
-   * names we're scanning for are identifiers, never appearing inside
-   * string literals in normal test code).
+   * After stripping, only executable identifiers + punctuation remain.
+   * An assertion message like
+   *   `... ${KILL_SWITCH_TEST_PATH} no longer references
+   *   assertNoPublishGateBypassAtBoot ...`
+   * would have been counted as a layer-1 call by the prior regex, but
+   * after template-literal stripping it cannot — defending R6/R7's
+   * "executable test calls only" guarantee.
+   *
+   * Note on regex literals: not stripped here because the test file
+   * has none that contain the target identifiers. If future tests add
+   * regex literals containing the identifiers (highly unusual), extend
+   * this function to strip `/.../flags` as well.
    */
-  function readTestFileStrippedOfComments(): string {
+  function readTestFileExecutableSource(): string {
     const source = readFileSync(join(REPO_ROOT, KILL_SWITCH_TEST_PATH), 'utf-8');
-    return source
-      .replace(/\/\*[\s\S]*?\*\//g, '') // block comments
-      .replace(/\/\/[^\n]*$/gm, ''); // line comments
+    return (
+      source
+        // 1. block comments
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        // 2. line comments
+        .replace(/\/\/[^\n]*$/gm, '')
+        // 3. single-quoted strings (with escape handling)
+        .replace(/'(?:\\.|[^'\\])*'/g, "''")
+        // 4. double-quoted strings (with escape handling)
+        .replace(/"(?:\\.|[^"\\])*"/g, '""')
+        // 5. template literals (handles ${} interpolation by greedy match
+        //    to next unescaped backtick; nested templates are not handled
+        //    perfectly but suffice for this codebase's test conventions)
+        .replace(/`(?:\\.|[^`\\])*`/g, '``')
+    );
   }
 
   /**
@@ -211,7 +234,7 @@ describe('SI-011 layer 3 — publish-gates-bypass reference lockdown', () => {
   const MIN_CALLS_PER_LAYER = 2;
 
   it('the layer-1 boot-hook test remains wired (call-expression canary)', () => {
-    const stripped = readTestFileStrippedOfComments();
+    const stripped = readTestFileExecutableSource();
     const callCount = countCallExpressions(stripped, 'assertNoPublishGateBypassAtBoot');
     expect(
       callCount >= MIN_CALLS_PER_LAYER,
@@ -224,7 +247,7 @@ describe('SI-011 layer 3 — publish-gates-bypass reference lockdown', () => {
   });
 
   it('the layer-2 runtime-check test remains wired (call-expression canary)', () => {
-    const stripped = readTestFileStrippedOfComments();
+    const stripped = readTestFileExecutableSource();
     const callCount = countCallExpressions(stripped, 'checkPublishGateBypassAtRuntime');
     expect(
       callCount >= MIN_CALLS_PER_LAYER,
@@ -235,5 +258,55 @@ describe('SI-011 layer 3 — publish-gates-bypass reference lockdown', () => {
         `executable test calls only. Asserted independently from layer 1 so ` +
         `deleting one layer's tests while preserving the other still fails CI.`,
     ).toBe(true);
+  });
+
+  // ---------------------------------------------------------------------
+  // Regression test for R7 (mutation-style): prove that string-literal
+  // mentions of the layer functions do NOT satisfy the canary.
+  //
+  // Constructs synthetic sources where the identifiers appear ONLY
+  // inside string/template literals + comments, and asserts the call-
+  // expression counter returns 0. This pins the "executable only"
+  // guarantee against future regressions in the strip pipeline.
+  // ---------------------------------------------------------------------
+
+  it('countCallExpressions returns 0 when identifier appears only in comments / strings / templates', () => {
+    // Inline-construct the fixture so we don't have to keep a separate
+    // sample file in sync. Each literal-class is exercised:
+    // - block comment
+    // - line comment
+    // - single-quoted string
+    // - double-quoted string
+    // - template literal
+    // The strip pipeline must remove ALL of these before counting calls.
+    const fixture = [
+      '/* assertNoPublishGateBypassAtBoot(envFixture) — in block comment */',
+      '// assertNoPublishGateBypassAtBoot(envFixture) — in line comment',
+      "const a = 'assertNoPublishGateBypassAtBoot(envFixture) — single-quoted';",
+      'const b = "assertNoPublishGateBypassAtBoot(envFixture) — double-quoted";',
+      'const c = `assertNoPublishGateBypassAtBoot(envFixture) — template`;',
+      'const d = `with ${interpolation} but no call here`;',
+    ].join('\n');
+
+    const stripped = fixture
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*$/gm, '')
+      .replace(/'(?:\\.|[^'\\])*'/g, "''")
+      .replace(/"(?:\\.|[^"\\])*"/g, '""')
+      .replace(/`(?:\\.|[^`\\])*`/g, '``');
+
+    const callCount = countCallExpressions(stripped, 'assertNoPublishGateBypassAtBoot');
+    expect(callCount).toBe(0);
+  });
+
+  it('countCallExpressions returns N when identifier appears as N real call expressions', () => {
+    const fixture = [
+      'assertNoPublishGateBypassAtBoot(envOf({}));',
+      'assertNoPublishGateBypassAtBoot ( envOf({}) );', // whitespace before paren
+      'const result = checkPublishGateBypassAtRuntime(process.env);',
+    ].join('\n');
+
+    expect(countCallExpressions(fixture, 'assertNoPublishGateBypassAtBoot')).toBe(2);
+    expect(countCallExpressions(fixture, 'checkPublishGateBypassAtRuntime')).toBe(1);
   });
 });
