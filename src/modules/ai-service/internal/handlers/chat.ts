@@ -140,7 +140,7 @@ function getMode1Provider(): NullLLMProvider {
  * not authorization tokens. The trust chain remains tenant_id + actor_id
  * + target_patient_id in the audit envelope.
  */
-function deriveDeterministicId(prefix: string, ctx: IdempotencyCtx, variant = ''): string {
+export function deriveDeterministicId(prefix: string, ctx: IdempotencyCtx, variant = ''): string {
   const seed = `${ctx.tenantId}|${ctx.idempotencyKey}|${ctx.actorId}|${ctx.endpoint}|${ctx.bodyHash}|${variant}`;
   const hash = createHash('sha256').update(seed).digest('hex');
   // 26 chars to match ULID length conventions (cosmetic; not enforced).
