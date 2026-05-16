@@ -108,31 +108,72 @@ SET LOCAL app.request_nonce = '<uuid>';
 
 `SET LOCAL` is transaction-local — cleared on COMMIT/ROLLBACK regardless of connection pooling. Prevents cross-request bleed.
 
-### Helper functions (SECURITY DEFINER, IMMUTABLE per-tx)
+### Helper functions — self-authenticating from `_session_actor_context` (R3 HIGH closure 2026-05-15)
+
+R3 HIGH correctly identified that helpers returning `current_setting('app.*')` directly trust caller-settable GUCs. A procedure that forgets to call `assert_request_nonce_bound()` first would allow an attacker to spoof actor identity by setting their own `app.*` GUCs. The trust invariant must be inside the helper, not a caller convention.
+
+The helpers read DIRECTLY from `_session_actor_context` keyed by `(pg_backend_pid(), txid_current(), current_setting('app.request_nonce'))`. The temp table is `ON COMMIT DELETE ROWS` so only the current transaction's authContextPlugin-inserted row is visible. A caller cannot fake a row in `_session_actor_context` because the temp table is `pg_temp_<N>` schema-scoped + `(pg_backend_pid, txid)` PK + `ON COMMIT DELETE ROWS`.
 
 ```sql
+-- Internal helper — fetches the single live actor-context row for
+-- the current backend + transaction + supplied nonce. Returns
+-- (account_id, account_tenant_id, role, admin_home_tenant_id) or
+-- raises 'actor_context_unbound' if no live row matches.
+CREATE OR REPLACE FUNCTION _current_actor_context_row()
+RETURNS TABLE (
+    account_id              TEXT,
+    account_tenant_id       TEXT,
+    role                    TEXT,
+    admin_home_tenant_id    TEXT
+)
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_nonce UUID;
+BEGIN
+    v_nonce := current_setting('app.request_nonce', /*missing_ok=*/false)::UUID;
+    RETURN QUERY
+    SELECT s.actor_account_id, s.actor_account_tenant_id, s.actor_role, s.actor_admin_home_tenant_id
+      FROM _session_actor_context s
+     WHERE s.pg_backend_pid = pg_backend_pid()
+       AND s.txid = txid_current()
+       AND s.nonce = v_nonce
+       AND s.expires_at > NOW();
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'actor_context_unbound'
+            USING HINT = 'No live _session_actor_context row matches current (pg_backend_pid, txid, nonce). Either authContextPlugin did not bind, context expired, or the request_nonce GUC was supplied without a corresponding table row.';
+    END IF;
+END;
+$$;
+
+-- Public helpers — each is a one-liner that reads from the trusted
+-- row. They CANNOT be spoofed by caller-set GUCs because the row's
+-- existence is the trust anchor, not the GUC values.
 CREATE OR REPLACE FUNCTION current_actor_account_id() RETURNS TEXT
 LANGUAGE sql STABLE AS $$
-    SELECT current_setting('app.actor_account_id', /*missing_ok=*/false);
+    SELECT account_id FROM _current_actor_context_row();
 $$;
 
 CREATE OR REPLACE FUNCTION current_actor_account_tenant_id() RETURNS TEXT
 LANGUAGE sql STABLE AS $$
-    SELECT current_setting('app.actor_account_tenant_id', false);
+    SELECT account_tenant_id FROM _current_actor_context_row();
 $$;
 
 CREATE OR REPLACE FUNCTION current_actor_role() RETURNS TEXT
 LANGUAGE sql STABLE AS $$
-    SELECT current_setting('app.actor_role', false);
+    SELECT role FROM _current_actor_context_row();
 $$;
 
 CREATE OR REPLACE FUNCTION current_actor_admin_home_tenant_id() RETURNS TEXT
 LANGUAGE sql STABLE AS $$
-    SELECT NULLIF(current_setting('app.actor_admin_home_tenant_id', false), '');
+    SELECT NULLIF(admin_home_tenant_id, '') FROM _current_actor_context_row();
 $$;
 ```
 
-`missing_ok=false` means `current_setting()` raises `undefined_object` if the GUC isn't set — procedures FAIL CLOSED on unauthenticated invocation.
+**Trust anchor:** the `_session_actor_context` row IS the trust anchor. `SET LOCAL` GUCs are still set by authContextPlugin (for compatibility with the `current_tenant_id()` pattern + future tooling that inspects them), but the helpers IGNORE the GUC VALUES and trust ONLY the temp-table row. The only GUC the helpers consume is `app.request_nonce`, and that value MUST match a row in the temp table — which an attacker cannot fabricate (temp table is in `pg_temp_<N>` schema; attacker cannot INSERT into another backend's temp schema).
+
+**Caller-set GUC defense:** even if an attacker sets `app.actor_account_id = 'spoofed'`, the helpers will not return it. The helpers query the table; the table row was inserted ONLY by authContextPlugin's authenticated path. The `app.request_nonce` value the attacker presents must correspond to a real row in the current transaction's temp table — which only authContextPlugin can create.
 
 ### Nonce assertion helper
 
@@ -181,25 +222,65 @@ fastify.addHook('onRequest', async (request, _reply) => {
 
 The `_session_actor_context` row is automatically cleaned up at transaction end (COMMIT/ROLLBACK).
 
-## Session-liveness check (the original F-3)
+## Session-liveness check + fail-closed request termination (R3 HIGH-2 closure 2026-05-15)
 
-The authContextPlugin's INSERT into `_session_actor_context` is the natural place to add the deferred F-3 session-liveness check: before INSERTing the context row, query the `sessions` table for the JWT's session_id and verify it's not revoked:
+R3 HIGH-2 correctly identified that the original snippet's `return;` from the Fastify `onRequest` hook does NOT abort the request — Fastify continues to the route handler with `request.actorContext = undefined`. Downstream guards (`requireActorContext`, `requireAdminRole`) would each have to fail closed; if any handler reaches business logic without explicit gating, a revoked-session request leaks through.
+
+**Canonical fail-closed ordering:**
 
 ```typescript
-const session = await request.db.query(`
-  SELECT revoked_at FROM sessions
-   WHERE session_id = $1 AND tenant_id = $2
-   LIMIT 1
-`, [request.actorContext.sessionId, request.actorContext.tenantId]);
+fastify.addHook('onRequest', async (request, reply) => {
+  // ... existing JWT verify + tenantContext resolution (gives request.actorContext) ...
 
-if (session.rows.length === 0 || session.rows[0].revoked_at !== null) {
-  // Session was revoked or deleted post-JWT-issuance.
-  request.actorContext = undefined;  // fail closed
-  return;
-}
+  if (request.actorContext === undefined) {
+    return;  // pre-auth endpoint; no DB binding needed; downstream guards 401 if they need auth
+  }
+
+  // STEP 1: Session-liveness check BEFORE any binding work
+  const session = await request.db.query(`
+    SELECT revoked_at, expires_at FROM sessions
+     WHERE session_id = $1 AND tenant_id = $2
+     LIMIT 1
+  `, [request.actorContext.sessionId, request.actorContext.tenantId]);
+
+  const revoked =
+    session.rows.length === 0 ||
+    session.rows[0].revoked_at !== null ||
+    new Date(session.rows[0].expires_at).getTime() <= Date.now();
+
+  if (revoked) {
+    // FAIL CLOSED: throw to terminate the request. The error-envelope
+    // plugin maps UnauthenticatedError to a tenant-blind 401 per I-025.
+    request.actorContext = undefined;
+    throw new UnauthenticatedError();  // terminates request; rolls back tx
+  }
+
+  // STEP 2: Bootstrap temp table on this backend (idempotent)
+  await request.db.query(`
+    CREATE TEMPORARY TABLE IF NOT EXISTS _session_actor_context (...)
+      ON COMMIT DELETE ROWS;
+  `);
+
+  // STEP 3: SET LOCAL GUCs + INSERT context row
+  const nonce = crypto.randomUUID();
+  await request.db.query(`
+    INSERT INTO _session_actor_context (...) VALUES (...);
+    SET LOCAL app.actor_account_id = ...;
+    ...
+    SET LOCAL app.request_nonce = $nonce;
+  `, [...]);
+});
 ```
 
-This closes F-3 in the same wiring change that introduces the DB-side actor context.
+**Key invariants (R3 HIGH-2 closure):**
+- Session-liveness check runs BEFORE any binding work.
+- Revoked / missing / expired session → `throw UnauthenticatedError()`, which Fastify's error-envelope plugin maps to a 401 + rolls back the request transaction. The request DOES NOT proceed to the route handler.
+- Binding work (temp-table bootstrap + INSERT + SET LOCAL) only runs after session-liveness passes. If the route handler later invokes a SECURITY DEFINER procedure, the temp-table row is present + nonce-validated.
+- Pre-auth endpoints (`/health`, OTP-start, etc.) skip the entire path — they neither check sessions nor bind context.
+
+**Regression test:** issue a JWT, revoke the session via `revokeSession()`, send a request with the now-orphaned JWT, assert 401 response + assert no `_session_actor_context` row exists post-rollback.
+
+This closes Phase 2 F-3 (JWT session-liveness check) by virtue of the authContextPlugin wiring change.
 
 ## Resolution path (R2 HIGH-2 closure)
 
