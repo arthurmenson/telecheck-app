@@ -55,7 +55,7 @@ import { join, resolve } from 'node:path';
 import { Client, type ClientConfig } from 'pg';
 import { afterEach, beforeAll, beforeEach } from 'vitest';
 
-import { setBindActorContextTestPool, setTestPool, type DbClient } from '../src/lib/db.ts';
+import { setTestPool, type DbClient } from '../src/lib/db.ts';
 
 // ---------------------------------------------------------------------------
 // Re-export the shared client reference so helpers can import it.
@@ -376,14 +376,29 @@ beforeAll(async () => {
   // `forms.deployment.template_not_found` on a freshly-seeded template.
   setTestPool(_client as unknown as DbClient);
 
-  // SI-010 bind pool test override — same shared-client + savepoint
-  // isolation as the main test pool. authContextPlugin's onRequest
-  // hook can therefore exercise the bind path against test fixtures.
-  // The test app role does not have EXECUTE on bind_actor_context()
-  // by default (the migration GRANTs it only to bind_actor_context_role);
-  // tests that exercise the actual bind invocation grant the role
-  // membership locally inside their setup, then revoke on teardown.
-  setBindActorContextTestPool(_client as unknown as DbClient);
+  // R2 MEDIUM closure (Codex 2026-05-15): the SI-010 bind-pool test
+  // override is NOT installed globally. The shared test client runs
+  // as `telecheck_test_app`, which lacks both EXECUTE on
+  // bind_actor_context() and membership in bind_actor_context_role.
+  // Installing the override globally would mean every
+  // JWT-authenticated test hits the bind path, gets a permission
+  // denied, authContextPlugin clears actorContext, and authenticated
+  // tests become 401s.
+  //
+  // Instead: tests that EXPLICITLY exercise SI-010 wiring opt in by
+  // (a) GRANT bind_actor_context_role TO telecheck_test_app at setup,
+  // (b) call setBindActorContextTestPool(_client) inside their own
+  //     beforeAll,
+  // (c) clearBindActorContextTestPool() + REVOKE the role at
+  //     teardown.
+  // The opt-in shape preserves the production caller-isolation
+  // boundary (SI-010 R0 trust model) while letting targeted tests
+  // exercise the wiring end-to-end.
+  //
+  // Non-SI-010 tests proceed with bind-pool null → authContextPlugin
+  // skips bind invocation → requests authenticate as before this
+  // change. setBindActorContextTestPool remains exported for the
+  // opt-in path; clearBindActorContextTestPool too.
 });
 
 // ---------------------------------------------------------------------------

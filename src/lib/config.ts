@@ -312,6 +312,32 @@ function loadConfig() {
     jwtSigningKey = 'dev-jwt-signing-key-not-for-production-use-32chars-min-padding-padding';
   }
 
+  // R1 HIGH closure (Codex 2026-05-15) — SI-010 production fail-fast:
+  // when NODE_ENV === 'production', BIND_ACTOR_CONTEXT_DATABASE_URL
+  // MUST be set. Without it, requests authenticate successfully but
+  // skip the bind invocation, so DB-side SECURITY DEFINER procedures
+  // (SI-005 / SI-008 / SI-009) fail with `actor_context_unbound` at
+  // request time — a late, easy-to-miss outage mode. The config-time
+  // failure surfaces the misconfiguration at boot, before any traffic
+  // is served.
+  //
+  // Dev/test/staging deliberately remain permissive — those
+  // environments can run with bind-pool wiring opt-in until the
+  // dedicated role + credentials are provisioned.
+  if (
+    parsed.NODE_ENV === 'production' &&
+    parsed.BIND_ACTOR_CONTEXT_DATABASE_URL === undefined
+  ) {
+    throw new Error(
+      'BIND_ACTOR_CONTEXT_DATABASE_URL must be set in production. ' +
+        'SI-010 actor-context binding is the trust anchor for SECURITY DEFINER ' +
+        "procedures (SI-005 / SI-008 / SI-009). Without it, requests authenticate " +
+        'but skip the bind invocation, causing procedure-boundary failures at ' +
+        'request time. Set the env var to a connection string authenticating ' +
+        'as bind_actor_context_role (the LOGIN role created by migration 031).',
+    );
+  }
+
   return {
     nodeEnv: parsed.NODE_ENV,
     port: parsed.PORT,
