@@ -142,29 +142,31 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     expect(readyUnknown.statusCode).toBe(503);
   });
 
-  it('§1d POST /v0/ai/chat is NOT mounted at PR B/C — Fastify returns 404 (Codex PR B R2 CRITICAL closure)', async () => {
-    // Per Codex PR B R2 CRITICAL closure 2026-05-14, the Mode 1 chat
-    // route is deliberately NOT registered until PR F lands the
-    // I-019 crisis-detection wire-in + the FLOOR-020 audit-emission
-    // boundary. Even validating a body MUST NOT happen before
-    // crisis detection runs on the input — by not mounting the
-    // route at all, we close that risk by construction. Locking
-    // this in: a future PR that accidentally mounts /chat without
-    // PR F's gating will trip this test and fail loud.
+  it('§1d POST /v0/ai/chat is MOUNTED — unauthenticated request returns 401 (not 404)', async () => {
+    // 2026-05-16: Mode 1 chat handler mounted (Track 2 first sprint per
+    // Master Completion Plan v1.0). The handler enforces:
+    //   - Bearer JWT (this test sends none → 401 from requireActorContext)
+    //   - Patient-only role (rejected sessions covered by separate tests)
+    //   - Zod body validation
+    //   - I-019 crisis gate
+    //   - FLOOR-020 audit emission
     //
-    // We MUST supply an Idempotency-Key header because the global
-    // idempotency-plugin preHandler returns 400
-    // `internal.idempotency.missing_key` on every state-changing
-    // POST before route resolution fires. Sending a valid key lets
-    // the request reach route-matching, which then returns 404 for
-    // the unregistered path.
+    // This test confirms the route is mounted by asserting we get
+    // an authentication error (401) rather than a route-not-found
+    // (404). Body validation, crisis gate behavior, and audit
+    // emission are covered by dedicated handler integration tests.
+    //
+    // Idempotency-Key required by the global idempotency-plugin
+    // preHandler on every state-changing POST.
     const r = await app!.inject({
       method: 'POST',
       url: '/v0/ai/chat',
       headers: { host: 'heroshealth.com', 'idempotency-key': ulid() },
-      payload: { message: 'hi' },
+      payload: { message_text: 'hi' },
     });
-    expect(r.statusCode).toBe(404);
+    // 401 from requireActorContext (no Bearer JWT). The mounted route
+    // would otherwise have returned a tenant-blind 401 envelope.
+    expect(r.statusCode).toBe(401);
   });
 
   it('§1e POST /v0/ai/case-prep is NOT mounted at PR C — Fastify returns 404', async () => {

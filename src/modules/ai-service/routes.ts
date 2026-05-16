@@ -32,6 +32,8 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { mode1ChatHandler } from './internal/handlers/chat.js';
+
 export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
@@ -101,28 +103,28 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     });
   });
 
-  // Mode 1 conversational assistant — DELIBERATELY NOT MOUNTED at PR B
-  // (Codex PR B R2 CRITICAL closure 2026-05-14). A live /v0/ai/chat
-  // surface that accepts patient free-text input MUST run I-019
-  // crisis detection on every message AND emit the FLOOR-020 audit
-  // record for every response. Both land later:
-  //   - PR D: real Anthropic provider integration (ADR-020
-  //     multi-provider)
-  //   - PR E: guardrail-template repo + Conservative Default
-  //     enforcement (AI-GUARD-003)
-  //   - PR F: crisis-detection wire-in to the chat surface (lib/
-  //     crisis-detection.ts exists; this PR doesn't wire it because
-  //     the platform-floor integration requires the audit-emission
-  //     boundary + escalation pathway which the audit-event spec
-  //     amendment must name first)
+  // Mode 1 conversational assistant — MOUNTED 2026-05-15.
   //
-  // The Mode1ChatResponseView wire contract IS exported from the
-  // module's public interface (see index.ts) so frontends can
-  // integrate against the response shape ahead of the handler.
+  // Lifecycle (per AI_LAYERING v5.2 + Slice PRD v1.0 §3):
+  //   1. tenantContext (foundation plugin) + actorContext (JWT)
+  //   2. Patient-only role gate (Mode 1 is patient-facing)
+  //   3. Body validation (Zod; tenant-blind 400 on failure)
+  //   4. runCrisisGate on INPUT text (I-019; emits Cat A audit on positive)
+  //   5. On crisis: return crisis-resource sentinel (no LLM call)
+  //   6. On no crisis: call resolveProvider → sendCompletion
+  //      (v1.0 NullProvider always throws → AI-RESIL-001 fail-soft)
+  //   7. Emit FLOOR-020 audit (`ai_chat_response_emitted` Cat C)
+  //   8. Return Mode1ChatResponseView
   //
-  // Mode 2 case-prep (POST /v0/ai/case-prep) lands in PR C with the
-  // same gating posture: route not mounted until I-012 audit-chain
-  // + protocol confirmation are wired (the surface inherits the
-  // clinician_approve I-012 reject-unless contract from State
-  // Machines v1.2 §19 §19.X).
+  // The (future) crisis gate on OUTPUT text is planned alongside real
+  // provider integration; at v1.0 the only AI-generated text paths are
+  // the fail-soft envelope ("AI temporarily unavailable") and the
+  // crisis sentinel ("contact your care team") — both authored at
+  // module level and not subject to runtime classification.
+  //
+  // Mode 2 case-prep (POST /v0/ai/case-prep) remains gated pending the
+  // protocol-engine integration that drives the I-012 reject-unless
+  // three-clause rule at the downstream prescribing boundary per
+  // State Machines v1.2 §19 §19.X.
+  app.post('/chat', mode1ChatHandler);
 };
