@@ -32,30 +32,66 @@ Without server-derived identity, the procedures must accept these as parameters 
 
 ## Placeholder design (Sprint X+1)
 
-### `_session_actor_context` table
+### `_session_actor_context` table — TEMPORARY with ON COMMIT DELETE ROWS (R1 HIGH closure 2026-05-15)
 
-Mirror of the existing `_session_tenant_context` table from migration 003. Per-request actor identity binding:
+R1 HIGH correctly identified that a normal permanent table keyed by `(pg_backend_pid, txid)` would NOT be auto-cleaned at transaction end. Rows would accumulate indefinitely, violating the security invariant ("transaction-local binding") and creating unbounded retention of session identity data.
+
+The DDL must use Postgres' `TEMPORARY` + `ON COMMIT DELETE ROWS` to make the table actually transaction-scoped:
 
 ```sql
-CREATE TABLE _session_actor_context (
+-- Created in the auth/security migration as a SESSION-LOCAL temporary
+-- table with auto-truncate semantics. Each Postgres connection gets
+-- its own physical instance of this table (no cross-connection
+-- visibility — matches the per-pg_backend_pid security model). All
+-- rows are deleted at every transaction COMMIT or ROLLBACK.
+CREATE TEMPORARY TABLE IF NOT EXISTS _session_actor_context (
     pg_backend_pid          INTEGER     NOT NULL,
     txid                    BIGINT      NOT NULL,
     actor_account_id        VARCHAR(26) NOT NULL,
-    actor_account_tenant_id TEXT        NOT NULL REFERENCES tenants(id),
+    actor_account_tenant_id TEXT        NOT NULL,  -- no cross-schema FK on a temp table
     actor_role              VARCHAR(50) NOT NULL CHECK (actor_role IN (
         'patient', 'clinician', 'tenant_admin', 'platform_admin', 'delegate'
     )),
-    actor_admin_home_tenant_id TEXT NULL  -- non-null only for platform_admin (F-4 attribution)
+    actor_admin_home_tenant_id TEXT NULL,  -- non-null only for platform_admin (F-4 attribution)
     session_id              VARCHAR(26) NOT NULL,
     nonce                   UUID        NOT NULL,
     bound_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at              TIMESTAMPTZ NOT NULL,
 
     PRIMARY KEY (pg_backend_pid, txid)
-);
+)
+ON COMMIT DELETE ROWS;  -- R1 HIGH closure: rows auto-deleted at every COMMIT/ROLLBACK
 ```
 
-Pooled-connection safety: `(pg_backend_pid, txid)` composite PK means each transaction gets a UNIQUE row. SET LOCAL ALSO sets values (defense-in-depth from SI-009 R6).
+**Implications of TEMPORARY + ON COMMIT DELETE ROWS:**
+
+- **Connection-scoped, not global:** the table exists in `pg_temp_<N>` schema for each Postgres backend. Connection pooling reuses backends, so the table persists across requests on the same backend BUT the rows are wiped at every transaction boundary.
+- **Bootstrap-on-first-use:** the `CREATE TEMPORARY TABLE IF NOT EXISTS` runs at the start of every Postgres session (on connection check-out from pool). For pgbouncer-style transaction-pooling, this MUST run as the first statement of every transaction on a fresh-checkout backend. authContextPlugin's pre-INSERT path is responsible.
+- **No cross-tenant FK:** Postgres forbids FK from temp tables to permanent tables; the `tenants(id)` FK is replaced by the application-layer guarantee that `actor_account_tenant_id` was sourced from a JWT verified against `KNOWN_TENANT_IDS` (per F-2).
+- **Pooled-connection safety preserved:** even though the temp table is connection-scoped, the `ON COMMIT DELETE ROWS` guarantees that request A's row is wiped before request B can run. The `(pg_backend_pid, txid)` PK is now redundant for cross-request safety (the row never coexists with another's data) but is preserved for defense-in-depth + nonce-assertion semantics.
+
+**Updated nonce assertion (uses `expires_at` per R1 HIGH closure):**
+
+```sql
+CREATE OR REPLACE FUNCTION assert_request_nonce_bound() RETURNS BOOLEAN
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_nonce UUID;
+BEGIN
+    v_nonce := current_setting('app.request_nonce', false)::UUID;
+    PERFORM 1 FROM _session_actor_context
+     WHERE pg_backend_pid = pg_backend_pid()
+       AND txid = txid_current()
+       AND nonce = v_nonce
+       AND expires_at > NOW();  -- R1 closure: expiry enforced (defense in depth even with ON COMMIT DELETE ROWS)
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'request_nonce_unbound_or_expired'
+            USING HINT = 'No live _session_actor_context row matches current (pg_backend_pid, txid, nonce). Context not bound, expired, or inherited from another tx/savepoint.';
+    END IF;
+    RETURN TRUE;
+END;
+$$;
+```
 
 ### `SET LOCAL` GUCs
 
