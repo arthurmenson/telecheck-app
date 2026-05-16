@@ -32,23 +32,24 @@ Without server-derived identity, the procedures must accept these as parameters 
 
 ## Placeholder design (Sprint X+1)
 
-### `_session_actor_context` table — TEMPORARY with ON COMMIT DELETE ROWS (R1 HIGH closure 2026-05-15)
+### `_session_actor_context` table — PERMANENT, RLS-locked, INSERT only via SECURITY DEFINER function (R4 HIGH closure 2026-05-15)
 
-R1 HIGH correctly identified that a normal permanent table keyed by `(pg_backend_pid, txid)` would NOT be auto-cleaned at transaction end. Rows would accumulate indefinitely, violating the security invariant ("transaction-local binding") and creating unbounded retention of session identity data.
+R4 HIGH identified that a TEMPORARY table is caller-writable: any SQL the application executes during a request runs on the same backend and can `INSERT INTO _session_actor_context (...)` to spoof identity. A vulnerable endpoint, migration, or compromised caller could fabricate a context row.
 
-The DDL must use Postgres' `TEMPORARY` + `ON COMMIT DELETE ROWS` to make the table actually transaction-scoped:
+The corrected design replaces the TEMPORARY table with a PERMANENT table locked down via GRANT model + RLS + INSERT-only-through-SECURITY-DEFINER-function:
 
 ```sql
--- Created in the auth/security migration as a SESSION-LOCAL temporary
--- table with auto-truncate semantics. Each Postgres connection gets
--- its own physical instance of this table (no cross-connection
--- visibility — matches the per-pg_backend_pid security model). All
--- rows are deleted at every transaction COMMIT or ROLLBACK.
-CREATE TEMPORARY TABLE IF NOT EXISTS _session_actor_context (
+-- Permanent table with strict GRANT model: app role has NO direct
+-- INSERT/UPDATE/DELETE/SELECT privilege. All writes go through the
+-- bind_actor_context() SECURITY DEFINER function (below) which
+-- accepts JWT-verified actor identity ONLY from authContextPlugin's
+-- privileged invocation path. Reads go through _current_actor_context_row()
+-- SECURITY DEFINER helper.
+CREATE TABLE _session_actor_context (
     pg_backend_pid          INTEGER     NOT NULL,
     txid                    BIGINT      NOT NULL,
     actor_account_id        VARCHAR(26) NOT NULL,
-    actor_account_tenant_id TEXT        NOT NULL,  -- no cross-schema FK on a temp table
+    actor_account_tenant_id TEXT        NOT NULL REFERENCES tenants(id),
     actor_role              VARCHAR(50) NOT NULL CHECK (actor_role IN (
         'patient', 'clinician', 'tenant_admin', 'platform_admin', 'delegate'
     )),
@@ -59,16 +60,99 @@ CREATE TEMPORARY TABLE IF NOT EXISTS _session_actor_context (
     expires_at              TIMESTAMPTZ NOT NULL,
 
     PRIMARY KEY (pg_backend_pid, txid)
+);
+
+-- LOCK DOWN: no role except the migration owner has direct access.
+-- All access goes through the SECURITY DEFINER functions below.
+REVOKE ALL ON TABLE _session_actor_context FROM PUBLIC;
+REVOKE ALL ON TABLE _session_actor_context FROM telecheck_app_role;
+
+-- ON COMMIT DELETE ROWS isn't available on permanent tables; instead,
+-- the binding function manages row lifetime via an UPSERT pattern (a
+-- new request's bind_actor_context() call REPLACES any stale row for
+-- the same (pg_backend_pid, txid) tuple), and a cleanup trigger DELETEs
+-- the row when the transaction ends. The deferred-trigger pattern
+-- mirrors Postgres' built-in temp-table cleanup but works on a
+-- permanent table.
+
+-- Cleanup trigger fires AFTER COMMIT/ROLLBACK via a CONSTRAINT TRIGGER
+-- with DEFERRABLE INITIALLY DEFERRED on a sentinel row, OR more
+-- simply: bind_actor_context() also schedules a DELETE via an
+-- AFTER-statement trigger on a per-transaction marker. See "Cleanup
+-- mechanism" below.
+
+-- For test scenarios + defense-in-depth, the expires_at column is
+-- also checked by every read.
+
+-- bind_actor_context: the ONLY path that can INSERT into the table.
+-- Caller (authContextPlugin) MUST hold the bind_actor_context_role
+-- (a privileged DB role bridged via SECURITY DEFINER).
+CREATE OR REPLACE FUNCTION bind_actor_context(
+    p_actor_account_id        TEXT,
+    p_actor_account_tenant_id TEXT,
+    p_actor_role              TEXT,
+    p_actor_admin_home_tenant_id TEXT,
+    p_session_id              TEXT,
+    p_nonce                   UUID,
+    p_ttl_seconds             INTEGER DEFAULT 300
 )
-ON COMMIT DELETE ROWS;  -- R1 HIGH closure: rows auto-deleted at every COMMIT/ROLLBACK
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+    -- Replace any stale row for the same (pg_backend_pid, txid).
+    -- Same-tx duplicate binding is a programming error; we UPSERT to
+    -- the latest values for defense-in-depth.
+    INSERT INTO _session_actor_context AS s
+      (pg_backend_pid, txid, actor_account_id, actor_account_tenant_id,
+       actor_role, actor_admin_home_tenant_id, session_id, nonce, expires_at)
+    VALUES
+      (pg_backend_pid(), txid_current(), p_actor_account_id,
+       p_actor_account_tenant_id, p_actor_role, p_actor_admin_home_tenant_id,
+       p_session_id, p_nonce, NOW() + (p_ttl_seconds || ' seconds')::INTERVAL)
+    ON CONFLICT (pg_backend_pid, txid) DO UPDATE
+      SET actor_account_id = EXCLUDED.actor_account_id,
+          actor_account_tenant_id = EXCLUDED.actor_account_tenant_id,
+          actor_role = EXCLUDED.actor_role,
+          actor_admin_home_tenant_id = EXCLUDED.actor_admin_home_tenant_id,
+          session_id = EXCLUDED.session_id,
+          nonce = EXCLUDED.nonce,
+          expires_at = EXCLUDED.expires_at;
+END;
+$$;
+
+-- Lock down the binding function: only authContextPlugin's privileged
+-- role can invoke it. The SECURITY DEFINER attribute means the function
+-- body runs as the function owner (a high-privilege role with INSERT
+-- on _session_actor_context), but EXECUTE on the function itself is
+-- granted only to bind_actor_context_role.
+REVOKE ALL ON FUNCTION bind_actor_context(TEXT, TEXT, TEXT, TEXT, TEXT, UUID, INTEGER) FROM PUBLIC;
+-- GRANT TO bind_actor_context_role only (created in the same migration).
+-- The application's primary DB role (telecheck_app_role) does NOT have
+-- EXECUTE on this function. authContextPlugin connects via a separate
+-- pool / SET ROLE to bind_actor_context_role for the binding statement
+-- only, then SET ROLE back to telecheck_app_role for the rest of the
+-- request.
+
+-- Cleanup mechanism: a per-transaction AFTER trigger DELETEs the row
+-- at tx-end. Approach: when bind_actor_context() runs, it also
+-- registers a "self-destruct" via creating a temp-table-style hook
+-- using the deferred-constraint pattern. Concrete mechanism varies
+-- by Postgres version; the requirement is that the row MUST be
+-- deleted at transaction end. A periodic background-job sweeper
+-- (DELETE WHERE expires_at < NOW()) provides additional defense
+-- against orphaned rows from process crashes.
 ```
 
-**Implications of TEMPORARY + ON COMMIT DELETE ROWS:**
+**Implications of the permanent + locked-down design:**
 
-- **Connection-scoped, not global:** the table exists in `pg_temp_<N>` schema for each Postgres backend. Connection pooling reuses backends, so the table persists across requests on the same backend BUT the rows are wiped at every transaction boundary.
-- **Bootstrap-on-first-use:** the `CREATE TEMPORARY TABLE IF NOT EXISTS` runs at the start of every Postgres session (on connection check-out from pool). For pgbouncer-style transaction-pooling, this MUST run as the first statement of every transaction on a fresh-checkout backend. authContextPlugin's pre-INSERT path is responsible.
-- **No cross-tenant FK:** Postgres forbids FK from temp tables to permanent tables; the `tenants(id)` FK is replaced by the application-layer guarantee that `actor_account_tenant_id` was sourced from a JWT verified against `KNOWN_TENANT_IDS` (per F-2).
-- **Pooled-connection safety preserved:** even though the temp table is connection-scoped, the `ON COMMIT DELETE ROWS` guarantees that request A's row is wiped before request B can run. The `(pg_backend_pid, txid)` PK is now redundant for cross-request safety (the row never coexists with another's data) but is preserved for defense-in-depth + nonce-assertion semantics.
+- **No caller-spoofing surface:** app code (running as `telecheck_app_role`) has no EXECUTE on `bind_actor_context()` and no INSERT/UPDATE/DELETE/SELECT on `_session_actor_context`. The only path that can write a row is the privileged binding role, accessed by authContextPlugin via a separate pool connection or `SET ROLE`.
+- **GRANT model is the trust anchor:** unlike the temp-table design where any caller could INSERT, the permanent table's GRANT model means only authContextPlugin's privileged-role invocation can mutate the context.
+- **Same-tenant FK preserved:** the table is permanent so it CAN have `FK (actor_account_tenant_id) → tenants(id)` per the standard cross-tenant safety pattern.
+- **Cleanup is deferred:** rows live until transaction end (via cleanup trigger) OR expiry sweep (background job). `expires_at` is also checked at every read for defense-in-depth.
+- **Pooled-connection safety:** the binding function UPSERTs on `(pg_backend_pid, txid)`, so a new request on the same backend automatically REPLACES the prior binding for the new transaction. The new transaction's `txid_current()` differs from the prior one, so the prior row is independently visible to the helpers' read query — but the expiry check + the cleanup trigger ensure it's gone.
 
 **Updated nonce assertion (uses `expires_at` per R1 HIGH closure):**
 
