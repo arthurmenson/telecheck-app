@@ -161,19 +161,43 @@ export function assertNoPublishGateBypassAtBoot(env: NodeJS.ProcessEnv): void {
 }
 
 /**
- * Publish-path runtime check. Called from `publishVersion()` AFTER
- * resolving the actor + tenant context, BEFORE any DB read. Returns
- * the scan result so the caller can emit a Category B audit naming the
- * exact forbidden vars detected and then throw the canonical sentinel
- * error.
+ * Publish-path runtime check. Called from the publish HTTP handler
+ * AFTER tenant context is resolved, BEFORE any publish-related DB
+ * write or idempotency reservation. Returns the scan result so the
+ * caller can emit a Category B audit naming the exact forbidden vars
+ * detected and then throw the canonical sentinel error.
  *
- * This is layer 2 of the four-layer defense — catches the case where
- * the boot-time guard somehow didn't fire (env var injected after
- * boot, dynamic config reload, sidecar manipulation, hot-patched
- * binary).
+ * This is layer 2b of the four-layer defense — catches the case where
+ * the boot-time guard (layer 1) and the early-request guard (layer 2a)
+ * both failed to fire. Practically belt-and-suspenders.
  */
 export function checkPublishGateBypassAtRuntime(
   env: NodeJS.ProcessEnv,
 ): PublishGateBypassScanResult {
   return scanPublishGateBypassEnv(env);
+}
+
+/**
+ * Regex matching the publish HTTP route — used by the layer-2a Fastify
+ * onRequest hook to scope the kill-switch to publish requests only.
+ *
+ * Route shape: `/v0/forms/templates/:templateId/versions/:versionId/publish`
+ *
+ * The regex deliberately accepts any non-empty ULID-shaped segment in the
+ * `:templateId` and `:versionId` slots — we don't validate identifiers
+ * here, just match the URL pattern. The pattern allows an optional
+ * query string and trailing slash.
+ */
+export const PUBLISH_ROUTE_URL_PATTERN =
+  /^\/v0\/forms\/templates\/[^/]+\/versions\/[^/]+\/publish\/?(\?.*)?$/i;
+
+/**
+ * Returns true if the given URL targets the forms publish route.
+ *
+ * Used by the layer-2a Fastify onRequest hook to short-circuit publish
+ * requests when a forbidden bypass env var is present, BEFORE the
+ * tenant-context plugin performs any DB resolution.
+ */
+export function isPublishRouteUrl(url: string): boolean {
+  return PUBLISH_ROUTE_URL_PATTERN.test(url);
 }
