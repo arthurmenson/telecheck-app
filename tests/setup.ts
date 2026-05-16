@@ -55,7 +55,7 @@ import { join, resolve } from 'node:path';
 import { Client, type ClientConfig } from 'pg';
 import { afterEach, beforeAll, beforeEach } from 'vitest';
 
-import { setTestPool, type DbClient } from '../src/lib/db.ts';
+import { setBindActorContextTestPool, setTestPool, type DbClient } from '../src/lib/db.ts';
 
 // ---------------------------------------------------------------------------
 // Re-export the shared client reference so helpers can import it.
@@ -375,6 +375,15 @@ beforeAll(async () => {
   // The CI run on commit 37db5b3 surfaced this as
   // `forms.deployment.template_not_found` on a freshly-seeded template.
   setTestPool(_client as unknown as DbClient);
+
+  // SI-010 bind pool test override — same shared-client + savepoint
+  // isolation as the main test pool. authContextPlugin's onRequest
+  // hook can therefore exercise the bind path against test fixtures.
+  // The test app role does not have EXECUTE on bind_actor_context()
+  // by default (the migration GRANTs it only to bind_actor_context_role);
+  // tests that exercise the actual bind invocation grant the role
+  // membership locally inside their setup, then revoke on teardown.
+  setBindActorContextTestPool(_client as unknown as DbClient);
 });
 
 // ---------------------------------------------------------------------------

@@ -395,6 +395,124 @@ export async function closePool(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// SI-010 dedicated bind pool
+// ---------------------------------------------------------------------------
+//
+// SI-010 requires `bind_actor_context()` to be invoked from a connection
+// whose session_user is `bind_actor_context_role` (NOT `telecheck_app_role`)
+// per migration 031's session_user gate. This pool is the dedicated path —
+// constructed from `config.bindActorContextDatabaseUrl` so operators wire
+// it to a connection string authenticating as the bind role directly
+// (NOT via SET ROLE from the main app role, which would defeat the
+// caller-isolation guarantee).
+//
+// When `config.bindActorContextDatabaseUrl` is undefined (dev/test where
+// SI-010 wiring is opt-in), `getBindActorContextPool()` returns null. The
+// authContextPlugin's onRequest hook treats null as "skip bind"; requests
+// proceed without an actorNonce and DB-side `current_actor_*()` helpers
+// correctly raise `actor_context_unbound` if invoked.
+//
+// In integration tests, `setTestPool()` also installs an override here so
+// the bind path can run against the shared test client (which holds
+// elevated DDL/DML privileges in the test schema). Production fail-closed
+// posture is preserved by the migration's session_user gate.
+// ---------------------------------------------------------------------------
+
+let _bindActorContextPool: pg.Pool | null = null;
+
+/**
+ * Test-mode override for the bind pool. Mirrors `_testPoolOverride` for
+ * the main pool; installed by `setTestPool()` so tests can exercise
+ * `bind_actor_context()` against the shared savepoint-wrapped client.
+ */
+let _bindActorContextPoolTestOverride: pg.Pool | null = null;
+
+/**
+ * Test-only: install a wrapper pool for SI-010 bind invocations. Called
+ * by tests/setup.ts in the same beforeAll that installs the main test
+ * pool, so the bind helper and the main DB share the same shared
+ * client + savepoint isolation.
+ *
+ * Production code MUST NOT call this. The bind pool is constructed
+ * lazily from `config.bindActorContextDatabaseUrl` when first requested.
+ */
+export function setBindActorContextTestPool(client: DbClient): void {
+  const connect = async (): Promise<unknown> => ({
+    query: client.query.bind(client),
+    release: () => {
+      /* no-op; harness owns lifecycle */
+    },
+  });
+  const wrapper = {
+    connect,
+    end: async () => {
+      /* no-op */
+    },
+    on: () => {
+      /* no-op */
+    },
+  } as unknown as pg.Pool;
+  _bindActorContextPoolTestOverride = wrapper;
+  _bindActorContextPool = null;
+}
+
+/**
+ * Test-only: clear the bind-pool test override.
+ */
+export function clearBindActorContextTestPool(): void {
+  _bindActorContextPoolTestOverride = null;
+  _bindActorContextPool = null;
+}
+
+/**
+ * Returns the SI-010 bind pool, or null when bind-pool wiring is not
+ * configured (dev/test where the env var is absent). authContextPlugin
+ * treats null as "skip bind"; requests proceed without an actorNonce.
+ *
+ * The returned pool authenticates as `bind_actor_context_role` per the
+ * env-var contract. The migration's session_user gate (inside
+ * `bind_actor_context()`) refuses calls whose session_user is
+ * `telecheck_app_role`, providing defense-in-depth against an operator
+ * pointing this var at the main app credentials.
+ */
+export function getBindActorContextPool(): pg.Pool | null {
+  if (_bindActorContextPoolTestOverride !== null) {
+    return _bindActorContextPoolTestOverride;
+  }
+  if (config.bindActorContextDatabaseUrl === undefined) {
+    return null;
+  }
+  if (_bindActorContextPool === null) {
+    _bindActorContextPool = new Pool({
+      connectionString: config.bindActorContextDatabaseUrl,
+      max: config.bindActorContextPoolMax,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000,
+      ssl: config.dbSslMode === 'require' ? { rejectUnauthorized: false } : false,
+    });
+    _bindActorContextPool.on('error', (err) => {
+      // eslint-disable-next-line no-console
+      console.error('[db] unexpected bind-pool error:', err);
+      // Don't exit — the pool can recover; surface loudly. authContextPlugin
+      // will treat individual bind failures as fail-closed (leave
+      // actorNonce undefined) so a transient pool error doesn't elevate
+      // requests beyond their authenticated identity.
+    });
+  }
+  return _bindActorContextPool;
+}
+
+/**
+ * Close the bind pool. Test cleanup + graceful shutdown.
+ */
+export async function closeBindActorContextPool(): Promise<void> {
+  if (_bindActorContextPool !== null) {
+    await _bindActorContextPool.end();
+    _bindActorContextPool = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Connection + transaction helpers
 // ---------------------------------------------------------------------------
 

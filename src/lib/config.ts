@@ -136,6 +136,32 @@ const ConfigSchema = z.object({
   // concern handled via the connection string `sslmode=verify-full`.
   DATABASE_SSL_MODE: z.enum(['disable', 'require']).default('disable'),
 
+  // SI-010 dedicated bind-pool URL. Required in production once SI-010
+  // authContextPlugin wiring lands; optional in dev/test (the wiring
+  // skips binding when undefined, leaving actorContext untrusted for
+  // DB-side SECURITY DEFINER procedures — those procedures correctly
+  // raise `actor_context_unbound` if called without a bound row).
+  //
+  // The connection string MUST authenticate as `bind_actor_context_role`
+  // (a LOGIN role created by migration 031 with EXECUTE on
+  // bind_actor_context()). It MUST NOT authenticate as
+  // `telecheck_app_role` — the migration's session_user gate would
+  // reject the bind anyway, but the config layer rejects this early
+  // for clearer operator feedback.
+  BIND_ACTOR_CONTEXT_DATABASE_URL: z
+    .string()
+    .url('BIND_ACTOR_CONTEXT_DATABASE_URL must be a valid PostgreSQL connection string')
+    .optional(),
+
+  // Pool sizing for the SI-010 bind pool. Lower than the main DB pool
+  // because each bind is a single, fast statement. Default 5; tune up
+  // if `bind_actor_context()` becomes a contention point.
+  BIND_ACTOR_CONTEXT_POOL_MAX: z
+    .string()
+    .default('5')
+    .transform((v) => Number.parseInt(v, 10))
+    .pipe(z.number().int().min(1).max(50)),
+
   // Redis (idempotency cache + queues)
   REDIS_URL: z
     .string()
@@ -294,6 +320,12 @@ function loadConfig() {
     databaseUrl: parsed.DATABASE_URL,
     dbPoolMax: parsed.DB_POOL_MAX,
     dbSslMode: parsed.DATABASE_SSL_MODE,
+    // SI-010 dedicated bind pool (optional). When undefined, the
+    // authContextPlugin skips bind invocation; the helpers from
+    // src/lib/actor-context-binding.ts remain importable but the
+    // request lifecycle does not produce an actorNonce.
+    bindActorContextDatabaseUrl: parsed.BIND_ACTOR_CONTEXT_DATABASE_URL,
+    bindActorContextPoolMax: parsed.BIND_ACTOR_CONTEXT_POOL_MAX,
     redisUrl: parsed.REDIS_URL,
     tenantKmsLocalDevKey: parsed.TENANT_KMS_LOCAL_DEV_KEY,
     jwtSigningKey,
