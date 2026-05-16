@@ -51,15 +51,16 @@
  *   - ADR-029 workload taxonomy (conversational_assistant + advisory)
  */
 
+import { createHash } from 'node:crypto';
+
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
 import { asTenantId } from '../../../../lib/glossary.js';
-import { buildIdempotencyCtx } from '../../../../lib/idempotency.js';
+import { buildIdempotencyCtx, type IdempotencyCtx } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { ulid } from '../../../../lib/ulid.js';
 import { emitMode1ChatResponseAudit } from '../../audit.js';
 import { runCrisisGate } from '../crisis/gate.js';
 import { CONSERVATIVE_DEFAULT_TEMPLATE } from '../guardrails/conservative-default.js';
@@ -123,6 +124,27 @@ const Mode1ChatRequestSchema = z.object({
  */
 function getMode1Provider(): NullLLMProvider {
   return new NullLLMProvider();
+}
+
+/**
+ * Derive a deterministic Mode 1 identifier from the idempotency context.
+ * Returns `<prefix><26-char base32 lowercase hash>`. Stable across retries
+ * with the same Idempotency-Key — used for session_id and message_id so
+ * the crisis-gate dedupe key (which includes resourceId) remains stable
+ * after a rollback + retry cycle (R4 H1 closure 2026-05-16).
+ *
+ * `variant` lets us derive distinct IDs (e.g., session vs message) from
+ * the same idempotency context without collision.
+ *
+ * NOT a security boundary — these IDs are opaque per-request handles,
+ * not authorization tokens. The trust chain remains tenant_id + actor_id
+ * + target_patient_id in the audit envelope.
+ */
+function deriveDeterministicId(prefix: string, ctx: IdempotencyCtx, variant = ''): string {
+  const seed = `${ctx.tenantId}|${ctx.idempotencyKey}|${ctx.actorId}|${ctx.endpoint}|${ctx.bodyHash}|${variant}`;
+  const hash = createHash('sha256').update(seed).digest('hex');
+  // 26 chars to match ULID length conventions (cosmetic; not enforced).
+  return `${prefix}${hash.slice(0, 26)}`;
 }
 
 /**
@@ -228,13 +250,26 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
     );
   }
   const body = parsed.data;
-  // R3 H2 closure (Codex 2026-05-16): server-side session ID generation.
-  // The handler does NOT accept an ai_chat_session_id from the client;
-  // every call creates a fresh ID bound to the authenticated (tenant,
-  // patient). Future session-lifecycle endpoints will accept explicit
-  // session IDs with owner-patient validation against a sessions table.
-  const sessionId = asAIChatSessionId(`aics_${ulid()}`);
-  const messageId = `aimsg_${ulid()}`;
+  // R3 H2 + R4 H1 closures (Codex 2026-05-16):
+  //   Server-side session/message ID generation is DETERMINISTIC per
+  //   idempotent request. Deriving the IDs from the idempotency
+  //   4-tuple + body-hash ensures that a retry with the same
+  //   Idempotency-Key produces the SAME session_id and message_id, so:
+  //     - The crisis audit's dedupe key (which includes resourceId)
+  //       remains stable across retries → Category A audit emits at
+  //       most once even if the FLOOR-020 Cat C audit failed and the
+  //       cache row rolled back on the prior attempt.
+  //     - The Mode1ChatResponseView wire shape returned on a cached
+  //       replay carries the same identifiers a client would have
+  //       previously observed (if a prior attempt had succeeded; for
+  //       rollback paths, retries simply land the same IDs fresh).
+  //   The IDs are NOT trust anchors for cross-patient correlation
+  //   (the audit chain's tenant_id + actor_id + target_patient_id
+  //   are); they're per-request opaque identifiers. SHA-256 of the
+  //   IdempotencyCtx is collision-resistant for this purpose.
+  const idempotencyCtx = buildIdempotencyCtx(req);
+  const sessionId = asAIChatSessionId(deriveDeterministicId('aics_', idempotencyCtx));
+  const messageId = deriveDeterministicId('aimsg_', idempotencyCtx, 'message');
 
   // R1 H1 closure (Codex 2026-05-16): wrap the lifecycle in
   // withIdempotentExecution so retries on the same Idempotency-Key
@@ -245,7 +280,8 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
   // pattern). The idempotency cache key is the 4-tuple
   // (tenantId, idempotencyKey, endpoint, actorId) — patient identity
   // is bound so cross-patient replay is impossible.
-  const idempotencyCtx = buildIdempotencyCtx(req);
+  // (idempotencyCtx already built earlier for deriving session/message
+  //  IDs deterministically per R4 H1 closure.)
 
   return withIdempotentExecution(req, reply, mapServiceError, async (_tx) => {
     // I-019 crisis gate on INPUT — runs BEFORE any LLM call. Emits the
