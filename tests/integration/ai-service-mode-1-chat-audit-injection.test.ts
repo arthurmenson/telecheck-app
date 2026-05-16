@@ -48,7 +48,8 @@ import {
   resetMode1AuditFailure,
   setMode1AuditFailure,
 } from '../helpers/mode-1-chat-audit-injection.ts';
-import { TENANT_US } from '../helpers/tenant-fixtures.ts';
+import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
 // vi.mock — replace emitMode1ChatResponseAudit with an injecting stub
@@ -85,6 +86,32 @@ vi.mock('../../src/modules/ai-service/audit.ts', async () => {
 const T_US = asTenantId(TENANT_US);
 const US_HOST = 'heroshealth.com';
 const SAFE_TEXT_SHORT = 'What time should I take my medication today?';
+// Crisis text reused from ai-service-crisis-gate.test.ts so the
+// detector keyword set is shared. Avoids drift if the keyword set
+// is revised.
+const CRISIS_TEXT_SHORT = "i don't want to live anymore, what should I do";
+
+/**
+ * Count Category A crisis_detection_trigger audit rows in the
+ * configured tenant scoped to a specific patient/resource. Used by
+ * H2 to assert exactly-one-audit-across-the-failed-attempt-and-retry
+ * (Codex R1 H1 closure 2026-05-16 for PR #163: the original H2
+ * didn't trigger or count the Category A audit; this helper closes
+ * that gap).
+ */
+async function countCrisisAuditsForPatient(patientId: string): Promise<number> {
+  return withTenantContext(T_US, async () => {
+    const client = getTestClient();
+    const res = await client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM audit_records
+        WHERE tenant_id = $1
+          AND target_patient_id = $2
+          AND action = 'crisis_detection_trigger'`,
+      [T_US, patientId],
+    );
+    return Number.parseInt(res.rows[0]!.n, 10);
+  });
+}
 
 let app: FastifyInstance | null = null;
 
@@ -161,16 +188,25 @@ describe('Mode 1 chat — Group H: audit-failure injection round-trip (R7 round-
     expect(typeof body.error?.request_id).toBe('string');
   });
 
-  it('H2 fail-once round-trip — first attempt 503, retry with same Idempotency-Key + body → 200 with deterministic IDs', async () => {
+  it('H2 fail-once round-trip with CRISIS payload — first attempt 503, retry same key → 200 deterministic IDs, exactly ONE Category A audit', async () => {
+    // R1 H1 closure (Codex 2026-05-16 on PR #163): use CRISIS payload
+    // (not SAFE) so the Category A crisis_detection_trigger audit
+    // actually fires. The deferred R7 invariant is "exactly ONE
+    // Category A audit across the failed-attempt + retry pair" —
+    // a non-crisis payload would emit zero Category A audits, so
+    // the assertion would pass vacuously.
     const accountId = `acct_${ulid()}`;
     const token = mintPatientToken(accountId);
     const idempotencyKey = ulid();
-    const payload = { message_text: SAFE_TEXT_SHORT };
+    const payload = { message_text: CRISIS_TEXT_SHORT };
 
-    // ATTEMPT 1: fail-once consumes itself; audit throws; withIdempotentExecution
-    // catches the typed Mode1AuditEmissionFailedError via mapServiceError and
-    // returns 503; the cache reservation is rolled back so the same key + body
-    // can retry.
+    // ATTEMPT 1: fail-once consumes itself; FLOOR-020 audit throws;
+    // withIdempotentExecution catches the typed
+    // Mode1AuditEmissionFailedError via mapServiceError and returns
+    // 503; the cache reservation rolls back so the same key + body
+    // can retry. The Category A crisis audit was emitted by
+    // runCrisisGate INSIDE the same idempotent transaction (and
+    // claimed its dedupe marker via idempotencyCtx).
     setMode1AuditFailure('fail-once');
     const r1 = await app!.inject({
       method: 'POST',
@@ -181,11 +217,13 @@ describe('Mode 1 chat — Group H: audit-failure injection round-trip (R7 round-
     expect(r1.statusCode).toBe(503);
 
     // ATTEMPT 2: fail-once has self-reset to 'normal'. Same key + body.
-    // The handler runs a FRESH lifecycle (cache doesn't replay because
-    // attempt 1's reservation rolled back). The deterministic ID derivation
-    // means the session_id + message_id are the SAME values attempt 1
-    // would have produced — proves the R4 H1 invariant at the round-trip
-    // level (crisis gate's dedupe key remains stable across the failure).
+    // Handler runs a FRESH lifecycle. Crisis gate re-evaluates the
+    // input; per the gate's audit-dedupe protection (forms-intake
+    // Sprint 34 / SI-006 pattern threaded to ai-service via
+    // idempotencyCtx), the second emit is deduped — the dedupe
+    // marker from attempt 1 survives the rollback of attempt 1's
+    // outer transaction because dedupe markers commit independently.
+    // Net: exactly ONE crisis audit across both attempts.
     const r2 = await app!.inject({
       method: 'POST',
       url: '/v0/ai/chat',
@@ -193,6 +231,20 @@ describe('Mode 1 chat — Group H: audit-failure injection round-trip (R7 round-
       payload,
     });
     expect(r2.statusCode).toBe(200);
+
+    // Crisis sentinel response on the successful retry.
+    const r2body = r2.json<Record<string, unknown>>();
+    expect(r2body['crisis_detected']).toBe(true);
+    expect(r2body['escalation_triggered']).toBe(true);
+
+    // R1 H1 closure: assert EXACTLY ONE Category A
+    // crisis_detection_trigger audit for this patient across the
+    // failed-attempt + successful-retry pair. If the audit emitted
+    // twice, the invariant is broken (retries would multiply
+    // care-team alerts + escalation noise). If it emitted zero, the
+    // test is vacuous.
+    const crisisAuditCount = await countCrisisAuditsForPatient(accountId);
+    expect(crisisAuditCount).toBe(1);
 
     const body2 = r2.json<Record<string, unknown>>();
 
