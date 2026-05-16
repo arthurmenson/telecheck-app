@@ -324,14 +324,11 @@ function loadConfig() {
   // Dev/test/staging deliberately remain permissive — those
   // environments can run with bind-pool wiring opt-in until the
   // dedicated role + credentials are provisioned.
-  if (
-    parsed.NODE_ENV === 'production' &&
-    parsed.BIND_ACTOR_CONTEXT_DATABASE_URL === undefined
-  ) {
+  if (parsed.NODE_ENV === 'production' && parsed.BIND_ACTOR_CONTEXT_DATABASE_URL === undefined) {
     throw new Error(
       'BIND_ACTOR_CONTEXT_DATABASE_URL must be set in production. ' +
         'SI-010 actor-context binding is the trust anchor for SECURITY DEFINER ' +
-        "procedures (SI-005 / SI-008 / SI-009). Without it, requests authenticate " +
+        'procedures (SI-005 / SI-008 / SI-009). Without it, requests authenticate ' +
         'but skip the bind invocation, causing procedure-boundary failures at ' +
         'request time. Set the env var to a connection string authenticating ' +
         'as bind_actor_context_role (the LOGIN role created by migration 031).',
