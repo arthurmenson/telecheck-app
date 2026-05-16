@@ -546,30 +546,67 @@ export async function verifyBindActorContextPoolOrThrow(): Promise<void> {
 
   const client = await pool.connect();
   try {
-    // 1) session_user must NOT be telecheck_app_role. The migration's
-    //    in-function gate would also catch this, but probing early at
-    //    boot surfaces the misconfig before any traffic.
-    const sessionResult = await client.query<{ session_user: string }>('SELECT session_user');
-    const sessionUser = sessionResult.rows[0]?.session_user;
-    if (sessionUser === undefined) {
-      throw new Error('SI-010 bind-pool probe: SELECT session_user returned no rows');
-    }
-    if (sessionUser === 'telecheck_app_role') {
+    // 1) R3 HIGH closure (Codex 2026-05-15): session_user MUST be
+    //    EXACTLY `bind_actor_context_role`. A non-app-role-but-still-
+    //    over-privileged login (superuser, migration owner,
+    //    accidentally-granted ops role) would otherwise satisfy the
+    //    EXECUTE check and pass this probe — defeating the trust
+    //    boundary the bind-pool model is designed to enforce. The
+    //    probe is the latest-still-safe checkpoint to catch URL
+    //    miswiring at an over-privileged role.
+    //
+    //    Defense-in-depth: even with role-name match, refuse if the
+    //    role is unexpectedly elevated (operator may have ALTERed
+    //    the role's attributes post-migration). bind_actor_context_role
+    //    is narrowly scoped: NOT superuser, NOT bypassrls.
+    const sessionResult = await client.query<{
+      session_user: string;
+      is_superuser: boolean;
+      is_bypassrls: boolean;
+    }>(
+      'SELECT session_user, rolsuper AS is_superuser, rolbypassrls AS is_bypassrls FROM pg_roles WHERE rolname = session_user',
+    );
+    const row = sessionResult.rows[0];
+    if (row === undefined) {
       throw new Error(
-        'SI-010 bind-pool probe: session_user is telecheck_app_role — ' +
-          'BIND_ACTOR_CONTEXT_DATABASE_URL points at the main app credentials. ' +
-          'Point it at bind_actor_context_role credentials instead. ' +
-          'The migration session_user gate would refuse calls anyway.',
+        'SI-010 bind-pool probe: SELECT session_user returned no rows. ' +
+          'Verify BIND_ACTOR_CONTEXT_DATABASE_URL credentials are valid.',
+      );
+    }
+    if (row.session_user !== 'bind_actor_context_role') {
+      throw new Error(
+        `SI-010 bind-pool probe: session_user is "${row.session_user}" — ` +
+          'BIND_ACTOR_CONTEXT_DATABASE_URL MUST authenticate as the dedicated ' +
+          'bind_actor_context_role created by migration 031. Any other role ' +
+          '(telecheck_app_role, superuser, migration owner, accidentally-granted ' +
+          'operational role) is rejected at this probe even if it can EXECUTE ' +
+          'bind_actor_context — the trust boundary is the EXACT role identity, ' +
+          'not just the absence of the app role.',
+      );
+    }
+    if (row.is_superuser) {
+      throw new Error(
+        'SI-010 bind-pool probe: bind_actor_context_role unexpectedly has SUPERUSER. ' +
+          'Operator: ALTER ROLE bind_actor_context_role NOSUPERUSER. The trust ' +
+          'boundary requires this role to be narrowly scoped (EXECUTE on the ' +
+          'binder only; no broader DB privileges).',
+      );
+    }
+    if (row.is_bypassrls) {
+      throw new Error(
+        'SI-010 bind-pool probe: bind_actor_context_role unexpectedly has BYPASSRLS. ' +
+          'Operator: ALTER ROLE bind_actor_context_role NOBYPASSRLS. The trust ' +
+          'boundary requires this role to be subject to RLS like every other ' +
+          'application role.',
       );
     }
 
-    // 2) bind_actor_context() must exist + the connection must have
-    //    EXECUTE on it. has_function_privilege returns NULL when the
-    //    function does not exist, FALSE when it exists but no EXECUTE,
-    //    TRUE when callable.
+    // 2) bind_actor_context() must exist + bind_actor_context_role
+    //    must have EXECUTE. has_function_privilege returns NULL when
+    //    the function does not exist, FALSE when it exists but no
+    //    EXECUTE, TRUE when callable.
     const privResult = await client.query<{ has_privilege: boolean | null }>(
-      "SELECT has_function_privilege($1, 'bind_actor_context(text, text, text, text, text, uuid, integer)', 'EXECUTE') AS has_privilege",
-      [sessionUser],
+      "SELECT has_function_privilege('bind_actor_context_role', 'bind_actor_context(text, text, text, text, text, uuid, integer)', 'EXECUTE') AS has_privilege",
     );
     const hasPrivilege = privResult.rows[0]?.has_privilege ?? null;
     if (hasPrivilege === null) {
@@ -580,10 +617,9 @@ export async function verifyBindActorContextPoolOrThrow(): Promise<void> {
     }
     if (hasPrivilege === false) {
       throw new Error(
-        `SI-010 bind-pool probe: session_user "${sessionUser}" lacks ` +
-          'EXECUTE on bind_actor_context(). The configured connection role ' +
-          'must be granted membership in bind_actor_context_role (or be that ' +
-          'role itself) per migration 031 GRANT EXECUTE TO bind_actor_context_role.',
+        'SI-010 bind-pool probe: bind_actor_context_role lacks EXECUTE on ' +
+          'bind_actor_context(). Migration 031 GRANTs it; verify the migration ' +
+          'applied cleanly and no subsequent migration revoked the GRANT.',
       );
     }
   } finally {
