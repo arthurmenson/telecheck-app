@@ -512,6 +512,85 @@ export async function closeBindActorContextPool(): Promise<void> {
   }
 }
 
+/**
+ * SI-010 production boot probe (Codex R2 closure 2026-05-15).
+ *
+ * Acquires a connection from the bind pool and verifies the deployment
+ * is correctly wired BEFORE Fastify accepts traffic. Catches the
+ * misconfiguration classes that `loadConfig()`'s missing-env check
+ * cannot catch:
+ *   - Wrong password / unreachable host (connect throws)
+ *   - Connection authenticating as the wrong role (session_user check)
+ *   - Migration 031 not applied / bind_actor_context() missing
+ *     (has_function_privilege returns null)
+ *   - Connection role lacks EXECUTE on bind_actor_context()
+ *     (has_function_privilege returns false)
+ *
+ * Called from `buildApp()` once per process boot when
+ * `config.bindActorContextDatabaseUrl !== undefined`. Throws on any
+ * failure — the process exits non-zero and the listener never binds.
+ *
+ * Skipped automatically when the bind pool is unconfigured (dev/test
+ * opt-in path; bind-pool null = SI-010 wiring opt-out).
+ *
+ * @throws if probe fails — propagated up so buildApp() aborts.
+ */
+export async function verifyBindActorContextPoolOrThrow(): Promise<void> {
+  const pool = getBindActorContextPool();
+  if (pool === null) {
+    // Unconfigured. Production fail-fast is enforced at config-loader
+    // boundary (BIND_ACTOR_CONTEXT_DATABASE_URL required in production);
+    // here we only short-circuit when the pool is genuinely null.
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    // 1) session_user must NOT be telecheck_app_role. The migration's
+    //    in-function gate would also catch this, but probing early at
+    //    boot surfaces the misconfig before any traffic.
+    const sessionResult = await client.query<{ session_user: string }>('SELECT session_user');
+    const sessionUser = sessionResult.rows[0]?.session_user;
+    if (sessionUser === undefined) {
+      throw new Error('SI-010 bind-pool probe: SELECT session_user returned no rows');
+    }
+    if (sessionUser === 'telecheck_app_role') {
+      throw new Error(
+        'SI-010 bind-pool probe: session_user is telecheck_app_role — ' +
+          'BIND_ACTOR_CONTEXT_DATABASE_URL points at the main app credentials. ' +
+          'Point it at bind_actor_context_role credentials instead. ' +
+          'The migration session_user gate would refuse calls anyway.',
+      );
+    }
+
+    // 2) bind_actor_context() must exist + the connection must have
+    //    EXECUTE on it. has_function_privilege returns NULL when the
+    //    function does not exist, FALSE when it exists but no EXECUTE,
+    //    TRUE when callable.
+    const privResult = await client.query<{ has_privilege: boolean | null }>(
+      "SELECT has_function_privilege($1, 'bind_actor_context(text, text, text, text, text, uuid, integer)', 'EXECUTE') AS has_privilege",
+      [sessionUser],
+    );
+    const hasPrivilege = privResult.rows[0]?.has_privilege ?? null;
+    if (hasPrivilege === null) {
+      throw new Error(
+        'SI-010 bind-pool probe: bind_actor_context() function not found. ' +
+          'Migration 031_session_actor_context.sql is not applied.',
+      );
+    }
+    if (hasPrivilege === false) {
+      throw new Error(
+        `SI-010 bind-pool probe: session_user "${sessionUser}" lacks ` +
+          'EXECUTE on bind_actor_context(). The configured connection role ' +
+          'must be granted membership in bind_actor_context_role (or be that ' +
+          'role itself) per migration 031 GRANT EXECUTE TO bind_actor_context_role.',
+      );
+    }
+  } finally {
+    client.release();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Connection + transaction helpers
 // ---------------------------------------------------------------------------
