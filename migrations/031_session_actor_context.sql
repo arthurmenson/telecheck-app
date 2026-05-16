@@ -102,9 +102,13 @@ $$;
 -- bind_actor_context() and read by _current_actor_context_row().
 --
 -- Schema:
---   (pg_backend_pid, txid)            composite PK — uniqueness invariant
---                                     across same-tx duplicate-bind calls
---                                     handled by UPSERT
+--   (pg_backend_pid, txid, nonce)    composite PK — nonce is the per-
+--                                     request discriminator so multiple
+--                                     bindings within the same tx
+--                                     (batch processor, nested service
+--                                     ops) each get their own row and
+--                                     readers select by their own nonce.
+--                                     R1 HIGH closure 2026-05-15.
 --   actor_account_id                  ULID of the authenticated account
 --   actor_account_tenant_id           tenant_id of the account's home
 --                                     tenant (audit attribution; F-4)
@@ -117,7 +121,8 @@ $$;
 --   nonce                             per-request UUID — MUST match the
 --                                     `app.request_nonce` GUC the
 --                                     plugin sets before any procedure
---                                     call
+--                                     call. Part of the PK so each
+--                                     bind is row-distinct.
 --   bound_at                          insertion timestamp
 --   expires_at                        bound_at + 5 minutes by default;
 --                                     read helpers reject rows past
@@ -126,6 +131,7 @@ $$;
 CREATE TABLE _session_actor_context (
     pg_backend_pid              INTEGER     NOT NULL,
     txid                        BIGINT      NOT NULL,
+    nonce                       UUID        NOT NULL,
     actor_account_id            VARCHAR(26) NOT NULL,
     actor_account_tenant_id     TEXT        NOT NULL REFERENCES tenants(id),
     actor_role                  VARCHAR(50) NOT NULL CHECK (actor_role IN (
@@ -133,11 +139,15 @@ CREATE TABLE _session_actor_context (
     )),
     actor_admin_home_tenant_id  TEXT NULL REFERENCES tenants(id),
     session_id                  VARCHAR(26) NOT NULL,
-    nonce                       UUID        NOT NULL,
     bound_at                    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at                  TIMESTAMPTZ NOT NULL,
 
-    PRIMARY KEY (pg_backend_pid, txid),
+    -- R1 HIGH closure 2026-05-15: nonce is part of the PK so transaction-
+    -- pool / batching patterns with multiple logical requests per tx
+    -- don't have one bind overwrite another. Each request's read
+    -- selects by its own nonce; cross-request identity confusion
+    -- impossible.
+    PRIMARY KEY (pg_backend_pid, txid, nonce),
 
     -- Platform-admin rows MUST carry an admin_home_tenant_id; non-admin
     -- rows MUST NOT (F-4 audit attribution semantics — clarifies in the
@@ -178,15 +188,33 @@ $$;
 --
 -- SECURITY DEFINER: runs as the function owner (migration role), which
 -- has INSERT privilege. EXECUTE on the function itself is GRANTed only
--- to bind_actor_context_role; the application's primary role
--- (telecheck_app_role) cannot invoke it directly. authContextPlugin
--- enters bind_actor_context_role via SET ROLE for the binding statement
--- only.
+-- to bind_actor_context_role.
 --
--- UPSERT semantics: same-tx duplicate bindings (which should not happen
--- in correct application code) UPDATE the row with the latest values,
--- as defense-in-depth against any caller that re-issues the bind. The
--- (pg_backend_pid, txid) composite PK ensures no cross-tx interference.
+-- R0 CRITICAL closure 2026-05-15 — caller-isolation requirement:
+--   The application's primary DB role (telecheck_app_role) MUST NOT
+--   be a member of bind_actor_context_role and MUST NOT have any
+--   SET ROLE path into it. If telecheck_app_role can SET ROLE
+--   into bind_actor_context_role, arbitrary app SQL can spoof
+--   identity. The required deployment topology is therefore:
+--     - bind_actor_context_role is a LOGIN role with its own
+--       password / certificate, used by a DEDICATED CONNECTION POOL
+--       in authContextPlugin (NOT the same pool as the main app).
+--     - The main app pool logs in as telecheck_app_role; it cannot
+--       SET ROLE bind_actor_context_role because the GRANT is absent.
+--     - authContextPlugin uses the dedicated pool only for the
+--       binding statement; all other request work runs on the main
+--       pool as telecheck_app_role.
+--   Defense-in-depth: bind_actor_context() ALSO checks session_user
+--   at entry. If session_user IS telecheck_app_role, the function
+--   raises before doing any work — this catches the case where a
+--   future configuration mistake GRANTs membership.
+--
+-- UPSERT semantics: nonce is part of the PK so a same-tx duplicate
+-- with the same nonce is idempotent (same nonce + identical identity
+-- updates only the expires_at). Different nonce in the same tx
+-- creates a new row, supporting batch processors / nested service
+-- operations. Same nonce + DIFFERENT identity raises — preventing
+-- silent identity-overwrite within a single nonce value.
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION bind_actor_context(
     p_actor_account_id            TEXT,
@@ -203,6 +231,36 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 BEGIN
+    -- R0 CRITICAL closure 2026-05-15: session-user gate.
+    -- session_user is the original login role; SECURITY DEFINER does
+    -- NOT mask it. If the caller logged in as telecheck_app_role,
+    -- raise before doing any work. This catches the case where a
+    -- future config mistake GRANTs telecheck_app_role membership in
+    -- bind_actor_context_role; the function refuses to mint identity
+    -- when called from a role that shouldn't have the privilege.
+    IF session_user = 'telecheck_app_role' THEN
+        RAISE EXCEPTION 'bind_actor_context: forbidden session_user %', session_user
+            USING HINT = 'bind_actor_context must be invoked from a dedicated ' ||
+                         'authContextPlugin pool whose session_user is NOT the ' ||
+                         'application primary role. Configure the auth pool to ' ||
+                         'log in as bind_actor_context_role directly.';
+    END IF;
+
+    -- Lazy expired-row sweep (R3 MEDIUM closure 2026-05-15): every
+    -- bind cleans up rows past their expires_at. Cleans both the
+    -- caller's backend (most common case: prior request's row from
+    -- the SAME backend that wasn't deleted at tx-end) and any other
+    -- expired rows. Bounded to avoid pathological large sweeps —
+    -- LIMIT 100 rows per bind keeps the function fast (~microseconds)
+    -- while still draining the table over many bind calls.
+    DELETE FROM _session_actor_context
+     WHERE (pg_backend_pid, txid, nonce) IN (
+         SELECT pg_backend_pid, txid, nonce
+           FROM _session_actor_context
+          WHERE expires_at < NOW()
+          LIMIT 100
+     );
+
     -- Defensive parameter checks: each is a fail-closed assertion.
     -- These do not constitute trust validation (the caller could pass
     -- arbitrary values); they catch programming errors before they
@@ -235,22 +293,49 @@ BEGIN
         RAISE EXCEPTION 'bind_actor_context: ttl_seconds must be positive';
     END IF;
 
+    -- R1 HIGH closure 2026-05-15: PK includes nonce. ON CONFLICT
+    -- (pg_backend_pid, txid, nonce) targets idempotent same-nonce
+    -- re-binds. The UPDATE clause's WHERE guards against same-nonce-
+    -- with-different-identity (which would be a programming error
+    -- worth surfacing, not silently overwriting). Same nonce +
+    -- identical identity → idempotent expires_at refresh.
     INSERT INTO _session_actor_context AS s
-      (pg_backend_pid, txid, actor_account_id, actor_account_tenant_id,
-       actor_role, actor_admin_home_tenant_id, session_id, nonce, expires_at)
+      (pg_backend_pid, txid, nonce, actor_account_id, actor_account_tenant_id,
+       actor_role, actor_admin_home_tenant_id, session_id, expires_at)
     VALUES
-      (pg_backend_pid(), txid_current(), p_actor_account_id,
+      (pg_backend_pid(), txid_current(), p_nonce, p_actor_account_id,
        p_actor_account_tenant_id, p_actor_role, p_actor_admin_home_tenant_id,
-       p_session_id, p_nonce, NOW() + (p_ttl_seconds || ' seconds')::INTERVAL)
-    ON CONFLICT (pg_backend_pid, txid) DO UPDATE
-      SET actor_account_id = EXCLUDED.actor_account_id,
-          actor_account_tenant_id = EXCLUDED.actor_account_tenant_id,
-          actor_role = EXCLUDED.actor_role,
-          actor_admin_home_tenant_id = EXCLUDED.actor_admin_home_tenant_id,
-          session_id = EXCLUDED.session_id,
-          nonce = EXCLUDED.nonce,
-          expires_at = EXCLUDED.expires_at,
-          bound_at = NOW();
+       p_session_id, NOW() + (p_ttl_seconds || ' seconds')::INTERVAL)
+    ON CONFLICT (pg_backend_pid, txid, nonce) DO UPDATE
+      SET expires_at = EXCLUDED.expires_at,
+          bound_at = NOW()
+      WHERE s.actor_account_id            IS NOT DISTINCT FROM EXCLUDED.actor_account_id
+        AND s.actor_account_tenant_id     IS NOT DISTINCT FROM EXCLUDED.actor_account_tenant_id
+        AND s.actor_role                  IS NOT DISTINCT FROM EXCLUDED.actor_role
+        AND s.actor_admin_home_tenant_id  IS NOT DISTINCT FROM EXCLUDED.actor_admin_home_tenant_id
+        AND s.session_id                  IS NOT DISTINCT FROM EXCLUDED.session_id;
+
+    -- Detect a same-nonce duplicate with DIFFERENT identity by counting
+    -- whether the UPSERT actually wrote a row. If the SELECT below
+    -- finds the (pid, txid, nonce) row but its identity disagrees with
+    -- the parameters, the UPDATE's WHERE rejected the change — raise
+    -- to surface the programming error.
+    PERFORM 1
+      FROM _session_actor_context s
+     WHERE s.pg_backend_pid = pg_backend_pid()
+       AND s.txid           = txid_current()
+       AND s.nonce          = p_nonce
+       AND s.actor_account_id            = p_actor_account_id
+       AND s.actor_account_tenant_id     = p_actor_account_tenant_id
+       AND s.actor_role                  = p_actor_role
+       AND s.actor_admin_home_tenant_id IS NOT DISTINCT FROM p_actor_admin_home_tenant_id
+       AND s.session_id                  = p_session_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'bind_actor_context: nonce_collision_with_different_identity'
+            USING HINT = 'A row with the same (pg_backend_pid, txid, nonce) already ' ||
+                         'exists but with different actor identity. Re-binding the same ' ||
+                         'nonce to a different actor is forbidden; generate a fresh nonce.';
+    END IF;
 END;
 $$;
 
