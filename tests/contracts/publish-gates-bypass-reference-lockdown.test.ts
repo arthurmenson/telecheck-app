@@ -161,19 +161,34 @@ describe('SI-011 layer 3 — publish-gates-bypass reference lockdown', () => {
     ).toEqual([]);
   });
 
-  it('the boot-hook + kill-switch tests remain wired (canary)', () => {
-    // Layer 1 (boot-hook) and Layer 2 (runtime) tests live in
-    // forms-intake-publish-gates-killswitch.test.ts. If someone removes
-    // that file, the lockdown contract should fail loudly — the
-    // kill-switch is a high-signal safety floor and we don't want the
-    // tests for it to disappear silently.
-    const referencingFiles = new Set([
-      ...gitGrepTypescript('assertNoPublishGateBypassAtBoot'),
-      ...gitGrepTypescript('checkPublishGateBypassAtRuntime'),
-    ]);
+  it('the layer-1 boot-hook test remains wired (canary)', () => {
+    // Layer 1 boot-hook function `assertNoPublishGateBypassAtBoot` MUST
+    // be exercised by the kill-switch unit tests file. If that
+    // reference disappears (test deletion, refactor, file rename), the
+    // contract fails loudly — preserving the kill-switch's safety floor
+    // requires both layer test files to remain wired.
+    const layer1Files = new Set(gitGrepTypescript('assertNoPublishGateBypassAtBoot'));
     expect(
-      referencingFiles.has('tests/integration/forms-intake-publish-gates-killswitch.test.ts'),
-      'The kill-switch unit tests must remain wired. If the file was renamed, ' +
+      layer1Files.has('tests/integration/forms-intake-publish-gates-killswitch.test.ts'),
+      'Layer 1 (boot-hook) test wiring missing: ' +
+        'tests/integration/forms-intake-publish-gates-killswitch.test.ts no longer ' +
+        'references assertNoPublishGateBypassAtBoot. If the file was renamed, ' +
+        'update both this canary and SANCTIONED_FILES.',
+    ).toBe(true);
+  });
+
+  it('the layer-2 runtime-check test remains wired (canary)', () => {
+    // Layer 2b runtime function `checkPublishGateBypassAtRuntime` MUST
+    // be exercised by the kill-switch unit tests file. Asserted
+    // independently from layer 1 so a future commit that deletes ONE
+    // layer's tests (but keeps the other) still fails CI — preventing
+    // silent coverage loss on the four-layer defense.
+    const layer2Files = new Set(gitGrepTypescript('checkPublishGateBypassAtRuntime'));
+    expect(
+      layer2Files.has('tests/integration/forms-intake-publish-gates-killswitch.test.ts'),
+      'Layer 2 (runtime-check) test wiring missing: ' +
+        'tests/integration/forms-intake-publish-gates-killswitch.test.ts no longer ' +
+        'references checkPublishGateBypassAtRuntime. If the file was renamed, ' +
         'update both this canary and SANCTIONED_FILES.',
     ).toBe(true);
   });
