@@ -129,10 +129,7 @@ BEGIN
          WHERE r_member.rolname = 'telecheck_app_role'
            AND r_target.rolname = 'bind_actor_context_role';
         IF v_member_count > 0 THEN
-            RAISE EXCEPTION 'SI-010 caller-isolation violation: telecheck_app_role is a member ' ||
-                            'of bind_actor_context_role. Revoke the GRANT before applying this ' ||
-                            'migration. Membership enables app SQL to SET ROLE into the binder ' ||
-                            'and spoof identity (defeats the SECURITY DEFINER trust boundary).';
+            RAISE EXCEPTION 'SI-010 caller-isolation violation: telecheck_app_role is a member of bind_actor_context_role. Revoke the GRANT before applying this migration. Membership enables app SQL to SET ROLE into the binder and spoof identity (defeats the SECURITY DEFINER trust boundary).';
         END IF;
     END IF;
 END;
@@ -303,10 +300,7 @@ BEGIN
     -- when called from a role that shouldn't have the privilege.
     IF session_user = 'telecheck_app_role' THEN
         RAISE EXCEPTION 'bind_actor_context: forbidden session_user %', session_user
-            USING HINT = 'bind_actor_context must be invoked from a dedicated ' ||
-                         'authContextPlugin pool whose session_user is NOT the ' ||
-                         'application primary role. Configure the auth pool to ' ||
-                         'log in as bind_actor_context_role directly.';
+            USING HINT = 'bind_actor_context must be invoked from a dedicated authContextPlugin pool whose session_user is NOT the application primary role. Configure the auth pool to log in as bind_actor_context_role directly.';
     END IF;
 
     -- Lazy expired-row sweep (R3 MEDIUM closure 2026-05-15): every
@@ -391,9 +385,7 @@ BEGIN
        AND s.session_id                   = p_session_id;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'bind_actor_context: nonce_collision_with_different_identity'
-            USING HINT = 'A row with the same nonce already exists but with different ' ||
-                         'actor identity. Re-binding the same nonce to a different actor ' ||
-                         'is forbidden; generate a fresh UUID for each request.';
+            USING HINT = 'A row with the same nonce already exists but with different actor identity. Re-binding the same nonce to a different actor is forbidden; generate a fresh UUID for each request.';
     END IF;
 END;
 $$;
@@ -446,10 +438,7 @@ BEGIN
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'actor_context_unbound'
-            USING HINT = 'No live _session_actor_context row matches the current ' ||
-                         'app.request_nonce. Either authContextPlugin did not bind, ' ||
-                         'context expired (>5 min), or the GUC was supplied without ' ||
-                         'a corresponding table row.';
+            USING HINT = 'No live _session_actor_context row matches the current app.request_nonce. Either authContextPlugin did not bind, context expired (>5 min), or the GUC was supplied without a corresponding table row.';
     END IF;
 END;
 $$;
@@ -528,9 +517,7 @@ BEGIN
        AND expires_at > NOW();
     IF NOT FOUND THEN
         RAISE EXCEPTION 'request_nonce_unbound_or_expired'
-            USING HINT = 'No live _session_actor_context row matches the current ' ||
-                         'app.request_nonce. Context not bound, expired, or ' ||
-                         'app.request_nonce was set without a corresponding bind.';
+            USING HINT = 'No live _session_actor_context row matches the current app.request_nonce. Context not bound, expired, or app.request_nonce was set without a corresponding bind.';
     END IF;
     RETURN TRUE;
 END;
