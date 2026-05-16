@@ -281,56 +281,51 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
     // cache without re-emitting either the crisis audit (deduped via
     // idempotencyCtx-bound gate) OR this response audit (transaction
     // didn't run).
-    try {
-      await emitMode1ChatResponseAudit(
-        {
-          tenantId: asTenantId(ctx.tenantId),
-          actorId: actor.accountId,
-          actorTenantId: ctx.tenantId,
-          countryOfCare: ctx.countryOfCare,
-          targetPatientId: actor.accountId,
-          aiModelVersion,
-          detail: {
-            ai_chat_session_id: sessionId,
-            message_id: messageId,
-            ai_mode: 'mode_1',
-            guardrail_template_id: 'conservative_default',
-            guardrail_version: CONSERVATIVE_DEFAULT_TEMPLATE.version,
-            crisis_detected: crisisDetected,
-            escalation_triggered: crisisDetected,
-            provider_unavailable: providerUnavailable,
-            input_text_length: body.message_text.length,
-            response_text_length: responseText.length,
-          },
-        },
-        _tx,
-      );
-    } catch (auditErr) {
-      // Audit emission failure: log structured error, still surface
-      // response. The structured log carries the response envelope
-      // metadata so SIEM ingestion preserves the forensic record even
-      // if the durable audit row never landed.
-      //
-      // NOTE: an audit-failure here means the surrounding withIdempotentExecution
-      // transaction will roll back the cache reservation when we return,
-      // because the helper treats any throw or partial-failure inside the
-      // callback as a non-cacheable outcome. We don't re-throw — the
-      // patient-facing response is the AI-RESIL-001 / crisis-bypass surface
-      // and crisis-write exception governs durability priorities. The next
-      // retry will re-run the lifecycle (including a fresh crisis audit
-      // attempt) because no cache row exists.
-      req.log.error(
-        {
-          err: auditErr,
+    // R2 H1 closure (Codex 2026-05-16): do NOT swallow audit emission
+    // failures inside the idempotent callback. withIdempotency marks
+    // the cache row completed whenever the callback returns
+    // successfully, so a swallowed audit error would cache an
+    // unaudited patient-visible 200 and replay it on retry — a
+    // permanent FLOOR-020 audit gap exactly where R1 wanted lifecycle
+    // atomicity.
+    //
+    // Correct posture: rethrow on audit failure. The
+    // withIdempotentExecution helper rolls back the cache
+    // reservation; the error envelope plugin maps the throw to a
+    // tenant-blind 503; the client's retry runs a fresh lifecycle
+    // (including a fresh crisis-audit attempt, deduped by
+    // idempotencyCtx so Category A doesn't double-emit on the
+    // retry).
+    //
+    // The AI_LAYERING §6 crisis-write exception applies to the
+    // Category A crisis_detection_trigger audit emitted INSIDE
+    // runCrisisGate (which has its own dedupe-aware fail-soft path
+    // already). It does NOT apply to the Category C operational
+    // response audit — losing that audit forever in exchange for
+    // caching a 200 is the worse trade.
+    await emitMode1ChatResponseAudit(
+      {
+        tenantId: asTenantId(ctx.tenantId),
+        actorId: actor.accountId,
+        actorTenantId: ctx.tenantId,
+        countryOfCare: ctx.countryOfCare,
+        targetPatientId: actor.accountId,
+        aiModelVersion,
+        detail: {
           ai_chat_session_id: sessionId,
           message_id: messageId,
+          ai_mode: 'mode_1',
+          guardrail_template_id: 'conservative_default',
+          guardrail_version: CONSERVATIVE_DEFAULT_TEMPLATE.version,
           crisis_detected: crisisDetected,
+          escalation_triggered: crisisDetected,
           provider_unavailable: providerUnavailable,
-          ai_model_version: aiModelVersion,
+          input_text_length: body.message_text.length,
+          response_text_length: responseText.length,
         },
-        'mode1_chat: FLOOR-020 audit emission failed — response surfaced per AI_LAYERING §6 crisis-write exception',
-      );
-    }
+      },
+      _tx,
+    );
 
     const view: Mode1ChatResponseView = {
       ai_chat_session_id: sessionId,
