@@ -255,9 +255,9 @@ LANGUAGE sql STABLE AS $$
 $$;
 ```
 
-**Trust anchor:** the `_session_actor_context` row IS the trust anchor. `SET LOCAL` GUCs are still set by authContextPlugin (for compatibility with the `current_tenant_id()` pattern + future tooling that inspects them), but the helpers IGNORE the GUC VALUES and trust ONLY the temp-table row. The only GUC the helpers consume is `app.request_nonce`, and that value MUST match a row in the temp table — which an attacker cannot fabricate (temp table is in `pg_temp_<N>` schema; attacker cannot INSERT into another backend's temp schema).
+**Trust anchor (R4 + R5 closure 2026-05-15):** the row in the PERMANENT `_session_actor_context` table is the trust anchor. App code running as `telecheck_app_role` has NO INSERT/UPDATE/DELETE/SELECT on this table; the only write path is `bind_actor_context()` SECURITY DEFINER function whose EXECUTE is granted only to `bind_actor_context_role` (the privileged role authContextPlugin uses for the binding statement). `SET LOCAL` GUCs are still set by authContextPlugin (for compatibility with the `current_tenant_id()` pattern + future tooling), but the helpers IGNORE the GUC values and trust ONLY the table row. The only GUC the helpers consume is `app.request_nonce`, and that value MUST match a row in `_session_actor_context` for `(pg_backend_pid(), txid_current())` — which an attacker cannot fabricate because they lack the GRANT to INSERT (R5 closure 2026-05-15: this earlier section was stale; previously claimed protection via temp-schema scoping which R4 correctly identified as broken).
 
-**Caller-set GUC defense:** even if an attacker sets `app.actor_account_id = 'spoofed'`, the helpers will not return it. The helpers query the table; the table row was inserted ONLY by authContextPlugin's authenticated path. The `app.request_nonce` value the attacker presents must correspond to a real row in the current transaction's temp table — which only authContextPlugin can create.
+**Caller-set GUC defense:** even if an attacker sets `app.actor_account_id = 'spoofed'`, the helpers will not return it. The helpers query the table; the table row was inserted ONLY by `bind_actor_context()`, whose EXECUTE is locked to the privileged role. The `app.request_nonce` value the attacker presents must correspond to a real row inserted by `bind_actor_context()` for the current transaction.
 
 ### Nonce assertion helper
 
@@ -366,29 +366,38 @@ fastify.addHook('onRequest', async (request, reply) => {
 
 This closes Phase 2 F-3 (JWT session-liveness check) by virtue of the authContextPlugin wiring change.
 
-## Resolution path (R2 HIGH-2 closure)
+## Resolution path (R5 HIGH closure 2026-05-15 — supersedes R2 HIGH-2)
 
-R2 HIGH-2 correctly identified that a migration that creates a TEMPORARY table won't provision it on the application's pool connections — temp tables are session-local and disappear when the migration's connection ends. The resolution path is amended:
+R4 HIGH established the permanent locked-down design as the trust anchor. R5 HIGH correctly identified that the prior R2 HIGH-2 resolution path (which mandated per-request temp-table creation) directly contradicts the R4 closure. The resolution path is amended to match the R4 trust-anchor design:
 
 When SI-010 closes:
 
-1. **Migration N adds ONLY permanent objects:** the helper functions (`current_actor_account_id()`, `current_actor_account_tenant_id()`, `current_actor_role()`, `current_actor_admin_home_tenant_id()`, `assert_request_nonce_bound()`) + GRANT statements. **Migration N does NOT create `_session_actor_context`** — temp tables aren't installable via migration.
-2. **authContextPlugin runs the temp-table bootstrap as the first statement of every authenticated request:**
-   ```typescript
-   await request.db.query(`
-     CREATE TEMPORARY TABLE IF NOT EXISTS _session_actor_context (...)
-       ON COMMIT DELETE ROWS;
-   `);
-   ```
-   Postgres treats `CREATE TEMPORARY TABLE IF NOT EXISTS` as idempotent — if the table already exists in the current backend's `pg_temp_<N>` schema (from a prior request on the same checked-out connection), the statement is a no-op. Cheap to run on every request; required correctness for pgbouncer transaction-pooling where a backend may have been freshly assigned.
-3. **authContextPlugin then sets `SET LOCAL` GUCs + INSERTs the context row + performs session-liveness check** (closes Phase 2 F-3).
-4. SI-008 + SI-009 stored procedures can land (each calls `current_actor_*()` helpers + `assert_request_nonce_bound()`).
-5. SI-005's `record_consult_clinician_decision` + `rotate_consult_clinician_decision_kms` procedures also adopt the same helpers.
-6. **Regression tests required:**
-   - Fresh pooled-connection test: assert a brand-new backend checkout succeeds (temp table created on demand)
-   - Pooled-connection bleed test (per SI-009 R6): request B on same connection as A reads B's context (not A's)
-   - Expired-context test: bind, sleep past expiry, attempt procedure invocation → `request_nonce_unbound_or_expired` rejection
-   - Migration-deploy test: assert helper functions exist post-migration; `_session_actor_context` does NOT exist as a permanent table
+1. **Migration N adds:**
+   - `_session_actor_context` PERMANENT TABLE (with FK to tenants(id) + GRANT lockdown)
+   - `bind_actor_context_role` DB role (the privileged binding role)
+   - `bind_actor_context()` SECURITY DEFINER function with EXECUTE granted only to `bind_actor_context_role`
+   - `_current_actor_context_row()` SECURITY DEFINER helper
+   - `current_actor_account_id()` / `current_actor_account_tenant_id()` / `current_actor_role()` / `current_actor_admin_home_tenant_id()` / `assert_request_nonce_bound()` STABLE helpers
+   - Cleanup trigger / mechanism for tx-end row removal
+   - Background-job sweeper SQL for orphan cleanup
+   - REVOKE statements removing `telecheck_app_role`'s access to the table + binding function
+2. **authContextPlugin wiring:**
+   - Connects to DB via a SEPARATE pool (or `SET ROLE bind_actor_context_role` then `RESET ROLE`) for the binding statement only
+   - Performs session-liveness check (FAIL CLOSED on revoked / missing / expired with `throw UnauthenticatedError()`)
+   - On liveness pass: calls `bind_actor_context(...)` via the privileged role
+   - Sets `SET LOCAL app.request_nonce = ...` (the only GUC the helpers consume)
+   - Returns to normal `telecheck_app_role` for the remainder of the request
+   - Pre-auth endpoints skip the entire path
+3. **NO per-request `CREATE TEMPORARY TABLE`.** The R2 HIGH-2 temp-table approach is REJECTED in favor of the R4 permanent-table design.
+4. **Session-liveness check** (deferred F-3) is folded into authContextPlugin's path AS Step 2's first sub-step.
+5. SI-008 + SI-009 stored procedures can land (each calls `current_actor_*()` helpers + `assert_request_nonce_bound()`).
+6. SI-005's `record_consult_clinician_decision` + `rotate_consult_clinician_decision_kms` procedures also adopt the same helpers.
+7. **Regression tests required:**
+   - **GRANT enforcement test:** assert `telecheck_app_role` cannot directly INSERT / UPDATE / DELETE / SELECT on `_session_actor_context`. Assert `telecheck_app_role` cannot directly EXECUTE `bind_actor_context()`.
+   - **Caller-spoof test (adversarial; R4 regression):** with `telecheck_app_role`, attempt to INSERT a fabricated row into `_session_actor_context` OR set `app.request_nonce` to a random UUID OR EXECUTE `bind_actor_context()` directly — all MUST fail with `permission denied`. Invoking a dependent SECURITY DEFINER procedure (e.g., `record_workflow_pointer_swap`) MUST fail with `actor_context_unbound` because no authContextPlugin-bound row exists.
+   - **Pooled-connection bleed test (per SI-009 R6):** request B on same connection as A reads B's context (not A's). Verified via the UPSERT semantics + the txid_current() discriminator.
+   - **Expired-context test:** bind, sleep past expiry, attempt procedure invocation → `request_nonce_unbound_or_expired` rejection (the row is still present but `expires_at > NOW()` predicate fails).
+   - **Migration-deploy test:** assert `_session_actor_context` exists as a permanent table; `bind_actor_context_role` exists; `telecheck_app_role` has zero privileges on the table; only `bind_actor_context_role` has EXECUTE on `bind_actor_context()`.
 
 ## Cross-cutting impact
 
