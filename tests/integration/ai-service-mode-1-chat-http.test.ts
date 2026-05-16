@@ -72,8 +72,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildApp } from '../../src/app.ts';
 import { config } from '../../src/lib/config.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
+import type { IdempotencyCtx } from '../../src/lib/idempotency.ts';
 import { issueAccessToken } from '../../src/lib/jwt.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import { deriveDeterministicId } from '../../src/modules/ai-service/internal/handlers/chat.ts';
 import { TENANT_US } from '../helpers/tenant-fixtures.ts';
 
 // ---------------------------------------------------------------------------
@@ -192,6 +194,53 @@ function patientRequestHeaders(token: string): Record<string, string> {
   };
 }
 
+/**
+ * Codex R1 M1 closure (2026-05-16): patient-facing surfaces MUST NOT
+ * leak `tenant_id` or the operating-tenant identifier `Telecheck-US`
+ * per Master PRD v1.10 §17 + Glossary v5.2 C3 + I-025. The handler's
+ * current `Mode1ChatResponseView` shape does not include `tenant_id`,
+ * but the idempotency cache replays the projected body verbatim — a
+ * future refactor that added `tenant_id` to the response would also
+ * persist it into the cached replay. Pinning the absence invariant
+ * here catches that regression.
+ *
+ * Apply this to EVERY response — success and error — across the suite.
+ */
+function expectNoTenantLeak(body: string): void {
+  expect(body).not.toContain('"tenant_id"');
+  expect(body).not.toContain('Telecheck-US');
+}
+
+/**
+ * Mode1ChatResponseView allowed-key whitelist. Pins the response shape
+ * so a future refactor that adds fields requires explicit test update
+ * (and a deliberate choice that the new field is patient-safe).
+ */
+const ALLOWED_MODE1_RESPONSE_KEYS = new Set([
+  'ai_chat_session_id',
+  'message_id',
+  'patient_id',
+  'source_type',
+  'ai_mode',
+  'ai_workload_type',
+  'autonomy_level',
+  'guardrail_template_id',
+  'guardrail_version',
+  'ai_model_version',
+  'escalation_triggered',
+  'crisis_detected',
+  'response_text',
+]);
+
+function expectMode1ResponseShape(body: Record<string, unknown>): void {
+  for (const key of Object.keys(body)) {
+    expect(
+      ALLOWED_MODE1_RESPONSE_KEYS.has(key),
+      `unexpected key in Mode1ChatResponseView: ${key} — if intentional, add to ALLOWED_MODE1_RESPONSE_KEYS after confirming the new field is patient-safe (no tenant_id, no PHI beyond what the documented view carries)`,
+    ).toBe(true);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Group A — Happy-path / fail-soft (no crisis)
 // ---------------------------------------------------------------------------
@@ -207,7 +256,10 @@ describe('Mode 1 chat — Group A: happy-path / AI-RESIL-001 fail-soft', () => {
       payload: { message_text: SAFE_TEXT_SHORT },
     });
     expect(response.statusCode).toBe(200);
+    // R1 M1 closure: pin tenant-leak absence on every success body.
+    expectNoTenantLeak(response.body);
     const body = response.json<Record<string, unknown>>();
+    expectMode1ResponseShape(body);
 
     // FLOOR-020 envelope discriminators (per Mode1ChatResponseView shape)
     expect(body['source_type']).toBe('ai');
@@ -249,7 +301,9 @@ describe('Mode 1 chat — Group B: I-019 crisis-bypass (always-on per FLOOR-013)
       payload: { message_text: CRISIS_TEXT_SHORT },
     });
     expect(response.statusCode).toBe(200);
+    expectNoTenantLeak(response.body);
     const body = response.json<Record<string, unknown>>();
+    expectMode1ResponseShape(body);
 
     expect(body['crisis_detected']).toBe(true);
     expect(body['escalation_triggered']).toBe(true);
@@ -279,7 +333,9 @@ describe('Mode 1 chat — Group B: I-019 crisis-bypass (always-on per FLOOR-013)
       payload: { message_text: oversizedCrisisMessage },
     });
     expect(response.statusCode).toBe(200);
+    expectNoTenantLeak(response.body);
     const body = response.json<Record<string, unknown>>();
+    expectMode1ResponseShape(body);
     expect(body['crisis_detected']).toBe(true);
     expect(body['escalation_triggered']).toBe(true);
     expect(body['ai_model_version']).toBe('crisis-bypass:no-llm-call');
@@ -419,11 +475,19 @@ describe('Mode 1 chat — Group E: idempotency', () => {
 
     const r1 = await app!.inject({ method: 'POST', url: '/v0/ai/chat', headers, payload });
     expect(r1.statusCode).toBe(200);
+    // Tenant-leak guard applies to BOTH original and replayed bodies
+    // per Codex R1 M1 closure 2026-05-16 — the cache replays the
+    // projected view verbatim, so if a future refactor added tenant_id
+    // to the original body the replay would carry it forward silently.
+    expectNoTenantLeak(r1.body);
     const b1 = r1.json<Record<string, unknown>>();
+    expectMode1ResponseShape(b1);
 
     const r2 = await app!.inject({ method: 'POST', url: '/v0/ai/chat', headers, payload });
     expect(r2.statusCode).toBe(200);
+    expectNoTenantLeak(r2.body);
     const b2 = r2.json<Record<string, unknown>>();
+    expectMode1ResponseShape(b2);
 
     // Cached replay: identical identifiers + identical response.
     expect(b2['ai_chat_session_id']).toBe(b1['ai_chat_session_id']);
@@ -461,40 +525,86 @@ describe('Mode 1 chat — Group E: idempotency', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Group F — Deterministic identifier derivation (R4 H1 closure)
+// Group F — deriveDeterministicId unit-level proof (R4 H1 closure)
+//
+// Codex R1 H1 closure 2026-05-16:
+//   The HTTP-level retry-after-audit-failure scenario can't be
+//   exercised today (no audit-emission injection harness). A same-
+//   Idempotency-Key double-POST proves only cached replay — the
+//   second response is served verbatim from the idempotency cache
+//   before the handler body runs, so the test would still pass even
+//   if deriveDeterministicId returned random values.
+//
+//   So Group F exercises the deterministic-derivation invariant
+//   where it actually lives: the `deriveDeterministicId` helper
+//   itself, via direct import. A future PR with audit-emission
+//   injection can extend this with the full round-trip rollback
+//   regression.
 // ---------------------------------------------------------------------------
 
-describe('Mode 1 chat — Group F: deterministic session/message IDs (R4 H1)', () => {
-  it('F1 same Idempotency-Key + same body across two calls → same session_id + message_id', async () => {
-    // This is the same invariant as E1, but asserted explicitly as the
-    // R4 H1 closure mechanism (deterministic ID derivation from the
-    // idempotency 4-tuple). The retry-after-rollback scenario itself
-    // requires audit-emission injection harness; this test proves the
-    // precondition (stable IDs across retries) so the crisis gate's
-    // dedupe key remains stable even when the response audit fails
-    // and the cache reservation rolls back.
-    const accountId = `acct_${ulid()}`;
-    const token = mintPatientToken(accountId);
-    const idempotencyKey = ulid();
-    const headers = {
-      host: US_HOST,
-      authorization: `Bearer ${token}`,
-      'idempotency-key': idempotencyKey,
-      'content-type': 'application/json',
-    };
-    const payload = { message_text: SAFE_TEXT_SHORT };
+describe('Mode 1 chat — Group F: deriveDeterministicId (R4 H1 unit-level proof)', () => {
+  const ctx: IdempotencyCtx = {
+    tenantId: 'Telecheck-US',
+    idempotencyKey: '01HXYZ_KEY_FIXED',
+    endpoint: '/v0/ai/chat',
+    actorId: 'acct_01ABCDEFGH',
+    bodyHash: 'sha256:0123456789abcdef',
+  };
 
-    const r1 = await app!.inject({ method: 'POST', url: '/v0/ai/chat', headers, payload });
-    const r2 = await app!.inject({ method: 'POST', url: '/v0/ai/chat', headers, payload });
-    expect(r1.statusCode).toBe(200);
-    expect(r2.statusCode).toBe(200);
-    const b1 = r1.json<Record<string, unknown>>();
-    const b2 = r2.json<Record<string, unknown>>();
-    expect(b1['ai_chat_session_id']).toBe(b2['ai_chat_session_id']);
-    expect(b1['message_id']).toBe(b2['message_id']);
+  it('F1 same idempotency context → same identifier across calls', () => {
+    const id1 = deriveDeterministicId('aics_', ctx);
+    const id2 = deriveDeterministicId('aics_', ctx);
+    expect(id1).toBe(id2);
   });
 
-  it('F2 different Idempotency-Keys → different session_id + message_id (independence)', async () => {
+  it('F2 different idempotencyKey → different identifier', () => {
+    const id1 = deriveDeterministicId('aics_', ctx);
+    const id2 = deriveDeterministicId('aics_', { ...ctx, idempotencyKey: 'OTHER_KEY' });
+    expect(id1).not.toBe(id2);
+  });
+
+  it('F3 different actorId → different identifier (per-patient isolation)', () => {
+    const id1 = deriveDeterministicId('aics_', ctx);
+    const id2 = deriveDeterministicId('aics_', { ...ctx, actorId: 'acct_OTHER' });
+    expect(id1).not.toBe(id2);
+  });
+
+  it('F4 different bodyHash → different identifier (per-body isolation)', () => {
+    const id1 = deriveDeterministicId('aics_', ctx);
+    const id2 = deriveDeterministicId('aics_', {
+      ...ctx,
+      bodyHash: 'sha256:fedcba9876543210',
+    });
+    expect(id1).not.toBe(id2);
+  });
+
+  it('F5 variant parameter creates distinct identifiers from same context (session vs message id)', () => {
+    const sessionId = deriveDeterministicId('aics_', ctx);
+    const messageId = deriveDeterministicId('aimsg_', ctx, 'message');
+    expect(sessionId).not.toBe(messageId);
+  });
+
+  it('F6 same variant produces same identifier (idempotent per variant)', () => {
+    const m1 = deriveDeterministicId('aimsg_', ctx, 'message');
+    const m2 = deriveDeterministicId('aimsg_', ctx, 'message');
+    expect(m1).toBe(m2);
+  });
+
+  it('F7 derived id carries the expected prefix + length', () => {
+    const id = deriveDeterministicId('aics_', ctx);
+    expect(id.startsWith('aics_')).toBe(true);
+    // 26-char hash portion (cosmetic ULID-length match per the
+    // helper's documented contract).
+    expect(id.slice('aics_'.length).length).toBe(26);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group G — HTTP-level cached idempotent replay (key independence)
+// ---------------------------------------------------------------------------
+
+describe('Mode 1 chat — Group G: HTTP-level cached idempotent replay', () => {
+  it('G1 different Idempotency-Keys → different session_id + message_id (independence)', async () => {
     const accountId = `acct_${ulid()}`;
     const token = mintPatientToken(accountId);
     const headers1 = {
@@ -520,8 +630,12 @@ describe('Mode 1 chat — Group F: deterministic session/message IDs (R4 H1)', (
     });
     expect(r1.statusCode).toBe(200);
     expect(r2.statusCode).toBe(200);
+    expectNoTenantLeak(r1.body);
+    expectNoTenantLeak(r2.body);
     const b1 = r1.json<Record<string, unknown>>();
     const b2 = r2.json<Record<string, unknown>>();
+    expectMode1ResponseShape(b1);
+    expectMode1ResponseShape(b2);
     expect(b1['ai_chat_session_id']).not.toBe(b2['ai_chat_session_id']);
     expect(b1['message_id']).not.toBe(b2['message_id']);
   });
