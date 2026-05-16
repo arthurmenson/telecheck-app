@@ -20,16 +20,22 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
+import { withTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
+import { emitFormsPublishBypassAttemptInProduction } from '../../audit.js';
 import { CreateTemplateRequestSchema, PublishVersionRequestSchema } from '../../schemas.js';
 import type { ListTemplatesCursor } from '../repositories/template-repo.js';
 import {
   PUBLISH_VERSION_NOT_DRAFT,
   PUBLISH_VERSION_NOT_FOUND,
 } from '../repositories/template-repo.js';
+import { checkPublishGateBypassAtRuntime } from '../services/publish-gates-killswitch.js';
 import * as templateService from '../services/template-service.js';
-import { PUBLISH_GATES_NOT_IMPLEMENTED } from '../services/template-service.js';
+import {
+  PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME,
+  PUBLISH_GATES_NOT_IMPLEMENTED,
+} from '../services/template-service.js';
 
 /**
  * Module-local service-error mapper for `withIdempotentExecution`. The
@@ -339,6 +345,64 @@ export async function publishVersionHandler(
       `Invalid request body: ${parsed.error.issues
         .map((e) => `${e.path.join('.')}: ${e.message}`)
         .join('; ')}`,
+    );
+  }
+
+  // SI-011 kill-switch layer 2 — runtime defense-in-depth.
+  //
+  // Fires BEFORE `withIdempotentExecution` opens a transaction or reserves
+  // an idempotency key, so a forbidden FORMS_PUBLISH_GATES_BYPASS or
+  // FORMS_PUBLISH_GATES_TEST_OVERRIDE_* env var injected post-boot is
+  // caught before ANY DB work — satisfying SI-011's "throw before doing
+  // any work" requirement on the publish HTTP path.
+  //
+  // Layer 1 (boot-hook in buildApp()) catches this same condition during
+  // process start. Layer 2 is the redundant runtime check that survives
+  // post-boot env-var injection (dynamic config reload, sidecar
+  // manipulation, hot-patched binary).
+  //
+  // On detection: emit Category B audit IN A DEDICATED MICRO-TX so the
+  // bypass attempt is durably captured even though the publish itself
+  // is rejected, then throw 503. The audit emission is a separate
+  // transaction from the (never-opened) publish transaction; if audit
+  // emission itself fails (DB outage, etc.), we still throw — the
+  // log + thrown error give us the secondary forensic record.
+  const killSwitchResult = checkPublishGateBypassAtRuntime(process.env);
+  if (killSwitchResult.mode === 'forbidden') {
+    try {
+      await withTransaction(async (tx) => {
+        await emitFormsPublishBypassAttemptInProduction(
+          {
+            tenantId: ctx.tenantId,
+            actorId,
+            actorTenantId,
+            countryOfCare: ctx.countryOfCare,
+            attemptedVersionId: versionIdParam,
+            forbiddenVars: killSwitchResult.forbiddenVars,
+            nodeEnvObserved: killSwitchResult.nodeEnv ?? null,
+          },
+          tx,
+        );
+      });
+    } catch (auditErr) {
+      // Audit emission failure does NOT change the outcome — the publish
+      // is still rejected. Log the audit failure separately so observability
+      // can correlate to the bypass attempt.
+      req.log.error(
+        { err: auditErr, killSwitchResult },
+        'forms.publish.bypass_attempt_audit_emission_failed',
+      );
+    }
+    req.log.warn(
+      {
+        node_env: killSwitchResult.nodeEnv ?? null,
+        forbidden_vars: killSwitchResult.forbiddenVars,
+        attempted_version_id: versionIdParam,
+      },
+      PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME,
+    );
+    throw req.server.httpErrors.serviceUnavailable(
+      'Form template publishing is not yet enabled in this environment.',
     );
   }
 

@@ -30,6 +30,11 @@ import { aiServicePlugin } from './modules/ai-service/index.js';
 import { asyncConsultPlugin } from './modules/async-consult/index.js';
 import { consentPlugin } from './modules/consent/plugin.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
+import {
+  assertNoPublishGateBypassAtBoot,
+  checkPublishGateBypassAtRuntime,
+  isPublishRouteUrl,
+} from './modules/forms-intake/internal/services/publish-gates-killswitch.js';
 import { identityPlugin } from './modules/identity/plugin.js';
 import { medInteractionPlugin } from './modules/med-interaction/index.js';
 import { pharmacyPlugin } from './modules/pharmacy/plugin.js';
@@ -45,6 +50,21 @@ export interface AppOptions {
 }
 
 export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> {
+  // SI-011 publish-gates bypass kill-switch (defense-in-depth layer 1).
+  //
+  // BEFORE any Fastify instance is constructed, scan the process env for
+  // any FORMS_PUBLISH_GATES_BYPASS or FORMS_PUBLISH_GATES_TEST_OVERRIDE_*
+  // env var presence in NODE_ENV !== 'test'. If detected, throw a
+  // canonical sentinel error — the Fastify instance is never built,
+  // the HTTP listener never binds, the process exits non-zero. Every
+  // bypass attempt is therefore visible in boot logs (canonical code
+  // `forms.publish.bypass_in_production`) before any request is served.
+  //
+  // SI-011 §"Production environment guard (kill-switch)" specifies this
+  // as layer 1 of four; layer 2 is the runtime check inside
+  // publishVersion() (see template-service.ts).
+  assertNoPublishGateBypassAtBoot(process.env);
+
   const app = Fastify({
     logger: opts.logger ?? defaultLoggerConfig(),
     // Per I-025 (tenant-blind error responses): suppress framework error
@@ -104,6 +124,61 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
 
   // 3. Error envelope — tenant-blind per I-025 + ERROR_MODEL v5.1
   await app.register(errorEnvelopePlugin);
+
+  // 3.5. SI-011 kill-switch layer 2a (early request guard).
+  //
+  // Fires on EVERY request, BEFORE the tenant-context plugin's onRequest
+  // hook (which performs a tenant-resolution DB lookup). If the request
+  // URL matches the forms publish route AND a forbidden
+  // FORMS_PUBLISH_GATES_BYPASS or FORMS_PUBLISH_GATES_TEST_OVERRIDE_*
+  // env var is present in NODE_ENV !== 'test', reject with 503 BEFORE
+  // any DB read happens (no tenant resolution, no idempotency reservation,
+  // no publish-related write).
+  //
+  // The early hook intentionally does NOT emit a Category B audit at this
+  // layer — audit emission requires a resolved tenant context (per I-027)
+  // which requires the tenant-context DB lookup that this hook is
+  // designed to short-circuit. Instead, this layer emits a structured
+  // error-level log carrying the forensic detail (forbidden var names,
+  // observed NODE_ENV, request URL); SIEM shipping turns the log into
+  // immutable forensic record. The layer-2b runtime check inside the
+  // publish handler emits the Cat B audit when reached (which happens in
+  // the test/dev scenarios where NODE_ENV=test allows the bypass, OR if
+  // this hook is somehow bypassed and the request reaches the handler).
+  //
+  // Why scoped to publish-route URL match (not every request): the
+  // bypass env vars only AFFECT the publish path. Rejecting unrelated
+  // routes (e.g., /v0/forms/templates GET, /v0/identity/health) would
+  // be over-broad. The boot-hook already prevents the process from
+  // serving ANY request when a bypass var is present at startup;
+  // layer-2a covers the post-boot injection case scoped to the only
+  // route whose semantics the bypass alters.
+  app.addHook('onRequest', async (req) => {
+    if (!isPublishRouteUrl(req.url)) {
+      return;
+    }
+    const result = checkPublishGateBypassAtRuntime(process.env);
+    if (result.mode === 'forbidden') {
+      req.log.error(
+        {
+          forbidden_vars: result.forbiddenVars,
+          node_env_observed: result.nodeEnv ?? null,
+          url: req.url,
+          layer: 'forms_publish_killswitch_layer_2a_pre_tenant_context',
+        },
+        'forms.publish.bypass_attempt_in_production',
+      );
+      // Throw via Fastify httpErrors so errorEnvelopePlugin serializes
+      // the response per the canonical ERROR_MODEL v5.1 envelope (with
+      // trace_id, timestamp, retry_after for 503). This keeps the
+      // bypass-attempt response wire-compatible with every other 503
+      // on the platform — operators + SIEM can rely on the canonical
+      // envelope shape even on the forensic tripwire path.
+      throw req.server.httpErrors.serviceUnavailable(
+        'Form template publishing is not yet enabled in this environment.',
+      );
+    }
+  });
 
   // 4. Tenant context resolution — fail-closed per I-023
   //    /health is always allowlisted (tenant-blind endpoint)
