@@ -14,15 +14,45 @@
  *   - ADR-001 (modular monolith)
  *   - Identity & Authentication Spec v1.0 §2 (registration), §3 (authn)
  *   - I-023 / I-025 (tenant scoping + tenant-blind errors)
+ *   - Master Completion Plan v1.0 Phase A item 2 (this slice's route
+ *     surface; production-ready as of 2026-05-15)
  *
- * Out-of-scope (deferred to follow-up commits):
- *   - JWT signing keys + issuance hook (replaces forms-intake's
- *     x-actor-id / x-patient-id header stubs)
- *   - Full route surface: POST /registration/start + verify, POST /login/
- *     start + verify, POST /sessions/refresh + logout, /devices CRUD,
- *     GET /accounts/me
- *   - Currently registers ONLY a /health probe so app.ts wiring can be
- *     verified end-to-end. Real handler routes land in subsequent commits.
+ * Routes mounted (full pilot-viable surface):
+ *
+ *   GET    /health                — module health probe (allowlisted)
+ *
+ *   POST   /registration/start    — issue OTP for unregistered phone
+ *   POST   /registration/verify   — verify OTP + create+activate account
+ *
+ *   POST   /login/start           — issue OTP for existing account
+ *   POST   /login/verify          — verify OTP, issue session
+ *                                   (returns refresh-token + session
+ *                                   + PatientAccountView)
+ *   POST   /sessions/refresh      — extend session via refresh token
+ *   POST   /sessions/logout       — revoke session via refresh token
+ *                                   (idempotent, tenant-blind 204)
+ *
+ *   POST   /devices               — register new device (auto-evicts at 3-cap)
+ *   GET    /devices?account_id=…  — list active devices for account
+ *   DELETE /devices/:deviceId     — revoke device
+ *
+ *   GET    /accounts/me           — authenticated account self-read
+ *
+ * Test coverage: 16 integration test files across handler / service /
+ * repo / cross-tenant isolation / JWT end-to-end / domain events / OTP
+ * lifecycle layers. See tests/integration/identity-*.test.ts.
+ *
+ * SI-010 integration: authContextPlugin (in src/lib/auth-context.ts)
+ * invokes bind_actor_context() on the dedicated bind pool after JWT
+ * verification — so route handlers that need server-derived actor
+ * identity in DB SECURITY DEFINER procedures can read it via
+ * current_actor_*() helpers per migration 031.
+ *
+ * Out of scope (deferred to v1.1):
+ *   - MFA (TOTP / WebAuthn)
+ *   - SSO / OAuth federation
+ *   - Device-trust certificates beyond the 3-cap multi-device baseline
+ *   - Password-reset flow (current v1.0 uses OTP-only login)
  */
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
