@@ -134,32 +134,13 @@ $$;
 
 `missing_ok=false` means `current_setting()` raises `undefined_object` if the GUC isn't set — procedures FAIL CLOSED on unauthenticated invocation.
 
-### Nonce assertion helper (defense-in-depth from SI-009 R6)
+### Nonce assertion helper
 
-```sql
-CREATE OR REPLACE FUNCTION assert_request_nonce_bound() RETURNS BOOLEAN
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    v_nonce UUID;
-BEGIN
-    v_nonce := current_setting('app.request_nonce', false)::UUID;
-    PERFORM 1 FROM _session_actor_context
-     WHERE pg_backend_pid = pg_backend_pid()
-       AND txid = txid_current()
-       AND nonce = v_nonce;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'request_nonce_unbound'
-            USING HINT = 'No _session_actor_context row matches current (pg_backend_pid, txid, nonce). Either authContextPlugin did not bind, or context was inherited from another tx/savepoint.';
-    END IF;
-    RETURN TRUE;
-END;
-$$;
-```
-
-Procedures call `assert_request_nonce_bound()` as the FIRST validation. This catches:
+The R1-closure definition above (with `expires_at > NOW()` predicate) is the canonical version. R2 HIGH closure 2026-05-15: removed an obsolete duplicate definition that would have overwritten the expiry-enforcing version if implementers applied snippets in document order. Procedures call `assert_request_nonce_bound()` as the FIRST validation. This catches:
 - Inadvertent inheritance of `SET LOCAL` values across savepoints
 - Autonomous-transaction calls without explicit context establishment
 - Missing authContextPlugin invocation on a code path
+- Stale context that outlives its 5-minute expiry (e.g., long-running transaction)
 
 ### authContextPlugin wiring
 
@@ -220,16 +201,29 @@ if (session.rows.length === 0 || session.rows[0].revoked_at !== null) {
 
 This closes F-3 in the same wiring change that introduces the DB-side actor context.
 
-## Resolution path
+## Resolution path (R2 HIGH-2 closure)
+
+R2 HIGH-2 correctly identified that a migration that creates a TEMPORARY table won't provision it on the application's pool connections — temp tables are session-local and disappear when the migration's connection ends. The resolution path is amended:
 
 When SI-010 closes:
 
-1. Migration N adds `_session_actor_context` table + helper functions
-2. authContextPlugin wiring sets `SET LOCAL` GUCs + inserts the context row + performs session-liveness check
-3. The session-liveness check closes the Phase 2 F-3 deferred follow-on documented in PHASE_2_ADMIN_JWT_SCOPE_AND_FOLLOW_ONS.md
-4. SI-008 + SI-009 stored procedures can land (each calls `current_actor_*()` helpers + `assert_request_nonce_bound()`)
-5. SI-005's `record_consult_clinician_decision` + `rotate_consult_clinician_decision_kms` procedures also adopt the same helpers when they land
-6. Regression test (per SI-009 R6): pooled-connection bleed test asserts request B on same connection as A reads B's context
+1. **Migration N adds ONLY permanent objects:** the helper functions (`current_actor_account_id()`, `current_actor_account_tenant_id()`, `current_actor_role()`, `current_actor_admin_home_tenant_id()`, `assert_request_nonce_bound()`) + GRANT statements. **Migration N does NOT create `_session_actor_context`** — temp tables aren't installable via migration.
+2. **authContextPlugin runs the temp-table bootstrap as the first statement of every authenticated request:**
+   ```typescript
+   await request.db.query(`
+     CREATE TEMPORARY TABLE IF NOT EXISTS _session_actor_context (...)
+       ON COMMIT DELETE ROWS;
+   `);
+   ```
+   Postgres treats `CREATE TEMPORARY TABLE IF NOT EXISTS` as idempotent — if the table already exists in the current backend's `pg_temp_<N>` schema (from a prior request on the same checked-out connection), the statement is a no-op. Cheap to run on every request; required correctness for pgbouncer transaction-pooling where a backend may have been freshly assigned.
+3. **authContextPlugin then sets `SET LOCAL` GUCs + INSERTs the context row + performs session-liveness check** (closes Phase 2 F-3).
+4. SI-008 + SI-009 stored procedures can land (each calls `current_actor_*()` helpers + `assert_request_nonce_bound()`).
+5. SI-005's `record_consult_clinician_decision` + `rotate_consult_clinician_decision_kms` procedures also adopt the same helpers.
+6. **Regression tests required:**
+   - Fresh pooled-connection test: assert a brand-new backend checkout succeeds (temp table created on demand)
+   - Pooled-connection bleed test (per SI-009 R6): request B on same connection as A reads B's context (not A's)
+   - Expired-context test: bind, sleep past expiry, attempt procedure invocation → `request_nonce_unbound_or_expired` rejection
+   - Migration-deploy test: assert helper functions exist post-migration; `_session_actor_context` does NOT exist as a permanent table
 
 ## Cross-cutting impact
 
