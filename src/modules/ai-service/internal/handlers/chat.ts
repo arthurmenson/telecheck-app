@@ -55,8 +55,9 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
-import { withTransaction } from '../../../../lib/db.js';
 import { asTenantId } from '../../../../lib/glossary.js';
+import { buildIdempotencyCtx } from '../../../../lib/idempotency.js';
+import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import { emitMode1ChatResponseAudit } from '../../audit.js';
@@ -138,9 +139,35 @@ const CRISIS_RESPONSE_TEXT =
 // Handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Service-error mapper for `withIdempotentExecution`. The Mode 1 chat
+ * handler doesn't currently surface domain-specific Error subclasses
+ * up to the helper (LLMProviderUnavailableError is caught inside the
+ * lifecycle for the AI-RESIL-001 fail-soft path). Unmapped errors
+ * propagate to Fastify's global error handler — same shape as other
+ * slices' service-error mappers.
+ */
+function mapServiceError(): boolean {
+  return false;
+}
+
 export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   const ctx = requireTenantContext(req);
   const actor = requireActorContext(req);
+
+  // R1 H2 closure (Codex 2026-05-16): Mode 1 chat is direct-patient
+  // surface at v1.0; delegate sessions are NOT in scope. Reject any
+  // request whose actorContext carries a non-null delegateId rather
+  // than silently treating it as a direct patient action with
+  // misleading audit attribution (actor_type='patient' +
+  // delegate_context=null). When the delegate-aware Mode 1 surface
+  // ships, this guard relaxes to a delegate-scope check + delegate-
+  // context audit threading.
+  if (actor.delegateId !== null) {
+    throw req.server.httpErrors.forbidden(
+      'Mode 1 chat does not support delegated sessions at v1.0.',
+    );
+  }
 
   // Patient-only at v1.0 — Mode 1 is the patient-facing conversational
   // surface. Clinician / admin paths use Mode 2 case-prep when those
@@ -162,91 +189,99 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
   const sessionId = asAIChatSessionId(body.ai_chat_session_id);
   const messageId = `aimsg_${ulid()}`;
 
-  // I-019 crisis gate on INPUT — runs BEFORE any LLM call. Emits the
-  // canonical `crisis_detection_trigger` Category A audit on positive
-  // detection. Always-on per FLOOR-013.
-  const inputCrisisOutcome = await runCrisisGate(
-    {
-      tenantId: ctx.tenantId,
-      countryOfCare: ctx.countryOfCare,
-      aiActorId: 'system:ai_mode_1',
-      patientId: actor.accountId,
-      resourceType: 'ai_chat_session',
-      resourceId: sessionId,
-      // Per-tenant escalation destination resolution lands with the
-      // CCR-driven helpline integration (Slice PRD §6.2 + CCR_RUNTIME
-      // contract). Null at v1.0 → ops alert via the crisis audit row.
-      escalationDestination: null,
-    },
-    body.message_text,
-    'ai_chat_input',
-  );
+  // R1 H1 closure (Codex 2026-05-16): wrap the lifecycle in
+  // withIdempotentExecution so retries on the same Idempotency-Key
+  // return the cached response WITHOUT re-running crisis detection,
+  // re-emitting Category A audit, re-triggering escalation, or
+  // re-emitting the Category C response audit. The crisis gate is
+  // dedupe-protected via idempotencyCtx (forms-intake submission-service
+  // pattern). The idempotency cache key is the 4-tuple
+  // (tenantId, idempotencyKey, endpoint, actorId) — patient identity
+  // is bound so cross-patient replay is impossible.
+  const idempotencyCtx = buildIdempotencyCtx(req);
 
-  const crisisDetected = inputCrisisOutcome.kind === 'crisis';
+  return withIdempotentExecution(req, reply, mapServiceError, async (_tx) => {
+    // I-019 crisis gate on INPUT — runs BEFORE any LLM call. Emits the
+    // canonical `crisis_detection_trigger` Category A audit on positive
+    // detection. Always-on per FLOOR-013. idempotencyCtx threads through
+    // so the gate's audit-dedupe slot prevents Category A double-emit
+    // on Idempotency-Key replay.
+    const inputCrisisOutcome = await runCrisisGate(
+      {
+        tenantId: ctx.tenantId,
+        countryOfCare: ctx.countryOfCare,
+        aiActorId: 'system:ai_mode_1',
+        patientId: actor.accountId,
+        resourceType: 'ai_chat_session',
+        resourceId: sessionId,
+        // Per-tenant escalation destination resolution lands with the
+        // CCR-driven helpline integration (Slice PRD §6.2 + CCR_RUNTIME
+        // contract). Null at v1.0 → ops alert via the crisis audit row.
+        escalationDestination: null,
+        idempotencyCtx,
+      },
+      body.message_text,
+      'ai_chat_input',
+    );
 
-  // Branch: crisis → return crisis-resource sentinel response without
-  // calling the LLM. AI_LAYERING §6 crisis-write exception: the
-  // response surfaces even if the Category A crisis audit emit failed
-  // (the audit_emitted=false case in the gate outcome).
-  let responseText: string;
-  let providerUnavailable: boolean;
-  let aiModelVersion: string;
-  if (crisisDetected) {
-    responseText = CRISIS_RESPONSE_TEXT;
-    providerUnavailable = false;
-    aiModelVersion = 'crisis-bypass:no-llm-call';
-  } else {
-    // No crisis → attempt LLM completion. At v1.0 the NullLLMProvider
-    // throws LLMProviderUnavailableError unconditionally; the
-    // AI-RESIL-001 fail-soft path renders the documented "temporarily
-    // unavailable" UI state.
-    const provider = getMode1Provider();
-    try {
-      // Build a minimal completion request matching the canonical
-      // LLMCompletionRequest shape (snake_case per spec). Guardrail-
-      // template binding + system prompt assembly land with the real
-      // provider adapter (PR D); the Null provider ignores the
-      // request payload anyway and unconditionally throws.
-      const result = await provider.sendCompletion({
-        workload_type: 'conversational_assistant',
-        messages: [{ role: 'user', content: body.message_text }],
-        max_output_tokens: 1024,
-        // Clinical paths default to deterministic (temperature=0) per
-        // AI Safety review; Mode 1 chat is patient-facing advisory and
-        // benefits from the same low-variance posture.
-        temperature: 0,
-        tenant_id: ctx.tenantId,
-      });
-      responseText = result.text;
+    const crisisDetected = inputCrisisOutcome.kind === 'crisis';
+
+    // Branch: crisis → return crisis-resource sentinel response without
+    // calling the LLM. AI_LAYERING §6 crisis-write exception: the
+    // response surfaces even if the Category A crisis audit emit failed
+    // (the audit_emitted=false case in the gate outcome).
+    let responseText: string;
+    let providerUnavailable: boolean;
+    let aiModelVersion: string;
+    if (crisisDetected) {
+      responseText = CRISIS_RESPONSE_TEXT;
       providerUnavailable = false;
-      aiModelVersion = `${result.provider_name}:${result.model_version}`;
-    } catch (err) {
-      if (err instanceof LLMProviderUnavailableError) {
-        responseText = AI_UNAVAILABLE_RESPONSE_TEXT;
-        providerUnavailable = true;
-        aiModelVersion = 'null-provider:unavailable';
-        req.log.warn(
-          { err, ai_chat_session_id: sessionId },
-          'mode1_chat: LLM provider unavailable; surfaced AI-RESIL-001 fail-soft response',
-        );
-      } else {
-        // Unknown error class — re-throw so the global error envelope
-        // plugin can map it to the canonical 5xx surface. The audit
-        // emission below will NOT fire because we don't reach it; the
-        // error becomes the durable record via the error envelope's
-        // standard logging path.
-        throw err;
+      aiModelVersion = 'crisis-bypass:no-llm-call';
+    } else {
+      // No crisis → attempt LLM completion. At v1.0 the NullLLMProvider
+      // throws LLMProviderUnavailableError unconditionally; the
+      // AI-RESIL-001 fail-soft path renders the documented "temporarily
+      // unavailable" UI state.
+      const provider = getMode1Provider();
+      try {
+        // Build a minimal completion request matching the canonical
+        // LLMCompletionRequest shape (snake_case per spec).
+        const result = await provider.sendCompletion({
+          workload_type: 'conversational_assistant',
+          messages: [{ role: 'user', content: body.message_text }],
+          max_output_tokens: 1024,
+          // Clinical paths default to deterministic (temperature=0).
+          temperature: 0,
+          tenant_id: ctx.tenantId,
+        });
+        responseText = result.text;
+        providerUnavailable = false;
+        aiModelVersion = `${result.provider_name}:${result.model_version}`;
+      } catch (err) {
+        if (err instanceof LLMProviderUnavailableError) {
+          responseText = AI_UNAVAILABLE_RESPONSE_TEXT;
+          providerUnavailable = true;
+          aiModelVersion = 'null-provider:unavailable';
+          req.log.warn(
+            { err, ai_chat_session_id: sessionId },
+            'mode1_chat: LLM provider unavailable; surfaced AI-RESIL-001 fail-soft response',
+          );
+        } else {
+          // Unknown error class — re-throw so the global error envelope
+          // plugin can map it to the canonical 5xx surface.
+          throw err;
+        }
       }
     }
-  }
 
-  // Emit FLOOR-020 audit for the response (Category C operational).
-  // Opens a dedicated micro-transaction so the audit is durable even
-  // if no other DB writes happen in this request. On emission failure
-  // we still surface the response per AI_LAYERING §6 crisis-write
-  // exception, but log + ops-alert via the warn-level structured log.
-  try {
-    await withTransaction(async (tx) => {
+    // Emit FLOOR-020 audit for the response (Category C operational)
+    // inside the same transaction the idempotent-execution helper opened.
+    // The audit is durable iff the transaction commits; on commit, the
+    // idempotency cache row captures the response so retries serve from
+    // cache without re-emitting either the crisis audit (deduped via
+    // idempotencyCtx-bound gate) OR this response audit (transaction
+    // didn't run).
+    try {
       await emitMode1ChatResponseAudit(
         {
           tenantId: asTenantId(ctx.tenantId),
@@ -268,41 +303,50 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
             response_text_length: responseText.length,
           },
         },
-        tx,
+        _tx,
       );
-    });
-  } catch (auditErr) {
-    // Audit emission failure: log structured error, still surface
-    // response. The structured log carries the response envelope
-    // metadata so SIEM ingestion preserves the forensic record even
-    // if the durable audit row never landed.
-    req.log.error(
-      {
-        err: auditErr,
-        ai_chat_session_id: sessionId,
-        message_id: messageId,
-        crisis_detected: crisisDetected,
-        provider_unavailable: providerUnavailable,
-        ai_model_version: aiModelVersion,
-      },
-      'mode1_chat: FLOOR-020 audit emission failed — response surfaced per AI_LAYERING §6 crisis-write exception',
-    );
-  }
+    } catch (auditErr) {
+      // Audit emission failure: log structured error, still surface
+      // response. The structured log carries the response envelope
+      // metadata so SIEM ingestion preserves the forensic record even
+      // if the durable audit row never landed.
+      //
+      // NOTE: an audit-failure here means the surrounding withIdempotentExecution
+      // transaction will roll back the cache reservation when we return,
+      // because the helper treats any throw or partial-failure inside the
+      // callback as a non-cacheable outcome. We don't re-throw — the
+      // patient-facing response is the AI-RESIL-001 / crisis-bypass surface
+      // and crisis-write exception governs durability priorities. The next
+      // retry will re-run the lifecycle (including a fresh crisis audit
+      // attempt) because no cache row exists.
+      req.log.error(
+        {
+          err: auditErr,
+          ai_chat_session_id: sessionId,
+          message_id: messageId,
+          crisis_detected: crisisDetected,
+          provider_unavailable: providerUnavailable,
+          ai_model_version: aiModelVersion,
+        },
+        'mode1_chat: FLOOR-020 audit emission failed — response surfaced per AI_LAYERING §6 crisis-write exception',
+      );
+    }
 
-  const view: Mode1ChatResponseView = {
-    ai_chat_session_id: sessionId,
-    message_id: messageId,
-    patient_id: actor.accountId,
-    source_type: 'ai',
-    ai_mode: 'mode_1',
-    ai_workload_type: 'conversational_assistant',
-    autonomy_level: 'advisory',
-    guardrail_template_id: 'conservative_default',
-    guardrail_version: CONSERVATIVE_DEFAULT_TEMPLATE.version,
-    ai_model_version: aiModelVersion,
-    escalation_triggered: crisisDetected,
-    crisis_detected: crisisDetected,
-    response_text: responseText,
-  };
-  return reply.code(200).send(view);
+    const view: Mode1ChatResponseView = {
+      ai_chat_session_id: sessionId,
+      message_id: messageId,
+      patient_id: actor.accountId,
+      source_type: 'ai',
+      ai_mode: 'mode_1',
+      ai_workload_type: 'conversational_assistant',
+      autonomy_level: 'advisory',
+      guardrail_template_id: 'conservative_default',
+      guardrail_version: CONSERVATIVE_DEFAULT_TEMPLATE.version,
+      ai_model_version: aiModelVersion,
+      escalation_triggered: crisisDetected,
+      crisis_detected: crisisDetected,
+      response_text: responseText,
+    };
+    return { status: 200, view };
+  });
 }
