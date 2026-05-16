@@ -153,7 +153,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // serving ANY request when a bypass var is present at startup;
   // layer-2a covers the post-boot injection case scoped to the only
   // route whose semantics the bypass alters.
-  app.addHook('onRequest', async (req, reply) => {
+  app.addHook('onRequest', async (req) => {
     if (!isPublishRouteUrl(req.url)) {
       return;
     }
@@ -168,13 +168,15 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
         },
         'forms.publish.bypass_attempt_in_production',
       );
-      return reply.code(503).send({
-        error: {
-          code: 'forms.publish.bypass_attempt_in_production',
-          message: 'Form template publishing is not yet enabled in this environment.',
-          request_id: req.id,
-        },
-      });
+      // Throw via Fastify httpErrors so errorEnvelopePlugin serializes
+      // the response per the canonical ERROR_MODEL v5.1 envelope (with
+      // trace_id, timestamp, retry_after for 503). This keeps the
+      // bypass-attempt response wire-compatible with every other 503
+      // on the platform — operators + SIEM can rely on the canonical
+      // envelope shape even on the forensic tripwire path.
+      throw req.server.httpErrors.serviceUnavailable(
+        'Form template publishing is not yet enabled in this environment.',
+      );
     }
   });
 
