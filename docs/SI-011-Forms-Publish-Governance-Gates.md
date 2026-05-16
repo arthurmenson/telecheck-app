@@ -47,10 +47,14 @@ The four gates are NOT a single SI — each is its own substantial body of work.
 
 **Implementation outline:**
 
-1. Add `forms_template_l3_edit_log` table tracking every UPDATE to `eligibility_logic` JSONB. Trigger-driven change-data-capture; entry per UPDATE: `(template_id, tenant_id, editor_account_id, edited_at, prior_value_hash, new_value_hash)`.
-2. Publish path queries `forms_template_l3_edit_log` for any entry on this template whose `editor_account_id` equals the publishing actor's `current_actor_account_id()`.
-3. If such an entry exists → reject with `forms.publish.l3_dual_control_violation` Category B audit + sentinel error.
+1. Add `forms_template_l3_edit_log` table tracking every UPDATE to `eligibility_logic` JSONB. Trigger-driven change-data-capture; entry per UPDATE: `(template_id, tenant_id, draft_revision_id, editor_account_id, edited_at, prior_value_hash, new_value_hash, changed_path_set JSONB, value_fingerprint_map JSONB)`. **`changed_path_set` is the canonical sorted JSONPath array of every leaf that differs between prior_value and new_value; `value_fingerprint_map` is the per-path SHA-256 fingerprint of the new value at each leaf.** Hashes prove tamper-evidence; path-set + fingerprints prove *what* changed and form the artifact a second approver actually reviews.
+2. Add `forms_template_l3_approval` table — explicit dual-control approval artifact per edit: `(template_id, tenant_id, draft_revision_id, approved_path_set JSONB, approved_value_fingerprint_map JSONB, editor_account_id, approver_account_id, approver_role_at_approval, approved_at)`. **`approver_account_id != editor_account_id` enforced at row-insert CHECK.** Approval is bound to the exact `(draft_revision_id, path-set, fingerprint-map)` the approver reviewed — not the template generally.
+3. Publish path:
+   - For each `forms_template_l3_edit_log` entry on this template's current draft revision, require a matching `forms_template_l3_approval` row where `approved_path_set ⊇ changed_path_set` AND `approved_value_fingerprint_map` agrees on every shared path AND `approver_account_id != editor_account_id` AND `approver_role_at_approval ∈ {tenant_clinical_lead}`.
+   - If publishing actor is also an editor on this draft → reject (separation of duty floor; second condition layered on top of the path-bound approval requirement).
+   - Any missing/stale/mismatched approval → reject with `forms.publish.l3_dual_control_violation` Category B audit including specific failed precondition.
 4. Validate the publishing actor's role is in the dual-control authorized set: `clinician` with the `tenant_clinical_lead` tag (TBD where this tag lives — `accounts.tags JSONB` per a future RBAC v1.1 extension, OR a separate `tenant_clinical_lead_assignments` table per tenant).
+5. Multi-editor case: when a draft revision has independent L3 edits by different actors, each edit's path-set requires its own approval row. The publish path validates the union of all approvals covers the union of all changed paths. This prevents a single broad approval from rubber-stamping unrelated edits.
 
 **Open questions:** the "Tenant Clinical Lead" role assignment mechanism. RBAC v1.1 lists the role; we need a permission row or account-attribute that lets the publish path query it.
 
@@ -69,9 +73,20 @@ The four gates are NOT a single SI — each is its own substantial body of work.
    - **Pricing/commerce:** approval_governance > pricing_overrides referencing research consent
    - **Outcome messaging:** dynamic copy templates substituting research-consent values
 3. Publish path runs the analyzer; ANY hit → `forms.publish.i030_violation` Category B audit + sentinel error with specific category + path.
-4. False-positive carve-outs require an explicit `i030_exemption_id` field on the template + paired `forms_i030_exemption` row signed off by `tenant_clinical_lead`. Documented case; rare.
+4. False-positive carve-outs require an explicit `i030_exemption_id` field on the template + paired `forms_i030_exemption` row. **Exemptions are narrow, non-reusable approval artifacts** scoped to a single analyzer finding:
+   - **Row shape:** `(id, tenant_id, template_id, draft_revision_id, category, jsonpath, finding_fingerprint, rationale, requester_account_id, approver_account_id, approver_role_at_approval, requested_at, approved_at, expires_at)`.
+   - **Binding rules enforced at publish path:**
+     - `tenant_id` matches the publishing template's tenant (no cross-tenant exemption import).
+     - `template_id` matches; `draft_revision_id` matches the draft being published (no carry-over to subsequent revisions — each revision must be re-exempted explicitly).
+     - `category + jsonpath + finding_fingerprint` exactly match the analyzer-emitted finding (no broad path-prefix carve-outs).
+     - `finding_fingerprint` is SHA-256 of `(category, jsonpath, normalized_offending_subtree_canonical_json)` — changing the offending subtree invalidates the exemption.
+     - `expires_at > now()` — no perpetual exemptions; default expiry policy TBD with Platform Privacy + Clinical Governance (recommend ≤ 90 days).
+     - `approver_account_id != requester_account_id` (separation of duty CHECK).
+     - `approver_role_at_approval ∈ {tenant_clinical_lead, platform_clinical_governance}` (snapshot role at approval time; role re-assignment doesn't retroactively validate).
+   - **Audit emission:** exemption issuance emits `forms.i030.exemption_granted` Category B audit; publish-time consumption emits `forms.publish.i030_exemption_consumed`; expired/invalid exemption attempt at publish emits `forms.publish.i030_exemption_rejected` with specific failed precondition.
+   - **Rationale:** narrow exemptions prevent the abuse path where a single valid `i030_exemption_id` suppresses unrelated findings, cross-tenant exemption import, or stale-revision rubber-stamping. Each finding requires its own paired exemption row.
 
-**Open questions:** the exact JSONPath syntax for the "references research_consent_status" detector. Needs FORMS_ENGINE §I-030 to canonicalize.
+**Open questions:** the exact JSONPath syntax for the "references research_consent_status" detector. Needs FORMS_ENGINE §I-030 to canonicalize. Also: who approves cross-cutting platform-wide exemption patterns (e.g., research-pure cohort study forms) — likely Platform Clinical Governance via a separate `forms_i030_pattern_exemption` mechanism with stronger oversight; out of scope for this SI's narrow-binding default.
 
 ## SI-011c (L4 MarketingCopy approval gate)
 
@@ -79,9 +94,10 @@ The four gates are NOT a single SI — each is its own substantial body of work.
 
 **Implementation outline:**
 
-1. CDM §4 row shape for MarketingCopy must include `status ∈ {draft, in_review, approved, retired}`.
+1. CDM §4 row shape for MarketingCopy must include `(id, tenant_id, status ∈ {draft, in_review, approved, retired}, approved_at, approved_by_account_id, approver_role_at_approval, content_fingerprint)`. `content_fingerprint` is SHA-256 of the canonical-JSON-serialized copy body; approval is bound to the fingerprint such that any post-approval edit invalidates `status='approved'` via trigger.
 2. Publish path walks `presentation_content` extracting every L1 molecule-level reference (e.g., `{ type: 'marketing_copy_ref', id: 'mkt_abc123' }`).
-3. For each reference: query `marketing_copy WHERE id = $ref AND tenant_id = ctx.tenantId AND status = 'approved'`. Missing/non-approved → reject with `forms.publish.marketing_copy_not_approved` + sentinel error.
+3. For each reference: query `marketing_copy WHERE id = $ref AND tenant_id = ctx.tenantId AND status = 'approved'`. **`tenant_id = ctx.tenantId` is mandatory** — cross-tenant MarketingCopy references are categorically forbidden (a tenant cannot publish referencing another tenant's approved copy, even if both tenants approve). Missing/non-approved/cross-tenant → reject with `forms.publish.marketing_copy_not_approved` Category B audit + sentinel error specifying the failing reference `id` and reason (`missing`, `not_approved`, `cross_tenant`, `fingerprint_drift`).
+4. Persist the `content_fingerprint` of each referenced MarketingCopy on the published template row as immutable provenance. Runtime rendering verifies fingerprint still matches at render time; mismatch → render rejects + `forms.runtime.marketing_copy_drift_detected` audit.
 
 **Open questions:** the L1 reference syntax in `presentation_content` — currently underspecified. Should be defined alongside MarketingCopy ratification.
 
@@ -91,11 +107,41 @@ The four gates are NOT a single SI — each is its own substantial body of work.
 
 **Implementation outline:**
 
-1. Mode 2 input contract is the schema of inputs the workflow expects. Each form template declaring Mode 2 integration MUST include a `mode_2_contract` field in `approval_governance` containing the input schema + handler procedure name.
-2. Publish path validates `mode_2_contract.input_schema` is a well-formed JSON Schema AND references only fields the form actually collects (cross-walk between `presentation_content` field IDs and the schema's required-property names).
-3. Mismatch → reject with `forms.publish.mode_2_contract_invalid` + sentinel error.
+1. Mode 2 input contract is the schema of inputs the workflow expects. Each form template declaring Mode 2 integration MUST include a `mode_2_contract` field in `approval_governance` containing:
+   - `handler_id` — canonical ID of a registered Mode 2 workflow handler in the `ai_workflow_handler_registry` table.
+   - `handler_version` — semver of the handler at the time of binding.
+   - `handler_signature_hash` — SHA-256 of the handler's runtime input-validator schema at `handler_version` (computed at handler-registration time; immutable per version).
+   - `input_schema` — the JSON Schema the form will pass to the handler.
+2. Publish path validates ALL of the following; ANY failure → reject with `forms.publish.mode_2_contract_invalid` Category B audit + sentinel error specifying which validation step failed:
+   - **(a) Schema well-formed:** `input_schema` is a syntactically valid JSON Schema (draft-2020-12).
+   - **(b) Form-field cross-walk:** every `required` property in `input_schema` corresponds to a field actually collected in `presentation_content`; field type compatibility verified.
+   - **(c) Handler resolves:** `handler_id @ handler_version` exists in `ai_workflow_handler_registry` and is `status='active'` (not deprecated, not pending-retirement).
+   - **(d) Handler signature compatibility:** computed SHA-256 of registry's current runtime input-validator schema for `handler_id @ handler_version` matches the template's `handler_signature_hash` — proves the template's view of the handler hasn't drifted since template-author bound it.
+   - **(e) Schema-handler compatibility:** `input_schema` is a structural subset of the handler's registered runtime input-validator schema (every required field declared in handler's validator is present in template's `input_schema` with compatible type; no extra required fields that the handler doesn't accept).
+3. On successful publish, persist `(handler_id, handler_version, handler_signature_hash)` to the published template row as immutable provenance. Runtime Mode 2 dispatch verifies the published template's signature hash still matches the handler-at-dispatch-time signature; mismatch → runtime reject + `ai_workflow.contract_drift_detected` audit (separate I-012 reject-unless violation handling).
+4. Handler-registry evolution: when a handler is upgraded to a new `handler_version`, the old version remains queryable for templates that bound to it; the registry enforces a deprecation lifecycle (`active → deprecated → retired`). Published templates bound to retired handlers fail runtime dispatch and require a re-publish through SI-011d gate.
 
-**Open questions:** Mode 2 contract spec ratification (SI-008 dependency).
+**Open questions:**
+- Mode 2 contract spec ratification (SI-008 dependency).
+- `ai_workflow_handler_registry` table location — likely owned by AI Workflow Engine slice; cross-walk to AI_LAYERING / WORKLOAD_TAXONOMY contracts.
+- Backward compat: when a handler ships a v2 that is a strict superset of v1's input schema, can a template auto-migrate? Default: NO (must re-publish through the gate to re-bind `handler_signature_hash`).
+
+## Production environment guard (kill-switch)
+
+**Non-negotiable runtime fail-closed:** in any environment where `NODE_ENV !== 'test'`:
+
+1. **App startup guard:** Fastify boot hook reads `process.env` and **fails fast** (process exits with non-zero, no listener bound) if ANY of the following env vars are present (regardless of value):
+   - `FORMS_PUBLISH_GATES_BYPASS`
+   - `FORMS_PUBLISH_GATES_TEST_OVERRIDE_L3_DUAL_CONTROL`
+   - `FORMS_PUBLISH_GATES_TEST_OVERRIDE_I030_ANALYSIS`
+   - `FORMS_PUBLISH_GATES_TEST_OVERRIDE_MARKETING_COPY`
+   - `FORMS_PUBLISH_GATES_TEST_OVERRIDE_MODE_2_CONTRACT`
+   - (Plus any future `FORMS_PUBLISH_GATES_TEST_OVERRIDE_*` glob match — fail closed on the prefix, not an allow-list.)
+2. **`publishVersion()` defense-in-depth:** the function itself re-checks `NODE_ENV` + the env-var glob before running any gate; on `NODE_ENV !== 'test'` with any of those env vars present, emit `forms.publish.bypass_attempt_in_production` Category B audit and throw before doing any work. Catches the case where startup-guard is somehow bypassed (e.g., env var injected post-boot via a sidecar, dynamic config reload).
+3. **CI gate:** `npm run lint` + `npm test` includes a static check that the bypass kill-switch boot-hook test is wired and that any reference to `FORMS_PUBLISH_GATES_BYPASS` outside of `templateService` + the kill-switch + the test-helper file fails CI.
+4. **Deploy validation:** the production-deploy runbook adds a post-deploy smoke check that hits a diagnostic endpoint confirming no bypass env vars are set. If the smoke check returns non-clean, the deploy auto-rolls-back.
+
+This is a defense-in-depth model: kill-switch at boot + defense-in-depth in the publish path + static analysis in CI + deploy validation. Env-config drift becomes detectable at four independent layers rather than relying on naming + `NODE_ENV` intent alone.
 
 ## Resolution path
 
@@ -103,8 +149,9 @@ When SI-011 closes:
 
 1. Each sub-SI (SI-011a/b/c/d) is filed as its own deliverable + scoped sprint-by-sprint.
 2. As each gate lands, its `if (gateBypass !== 'unsafe-test-only')` early-throw branch in `publishVersion()` is REPLACED with the actual gate logic.
-3. When ALL four gates land, the `FORMS_PUBLISH_GATES_BYPASS` env flag is REMOVED entirely (along with the test helpers that set it).
-4. Tests that previously set the bypass are rewritten to either (a) construct fixtures that pass all four gates, OR (b) use per-gate granular test-only overrides `process.env['FORMS_PUBLISH_GATES_TEST_OVERRIDE_<GATE_NAME>']` (only valid in `NODE_ENV=test`).
+3. When ALL four gates land, the `FORMS_PUBLISH_GATES_BYPASS` env flag is REMOVED entirely (along with the test helpers that set it). The four `FORMS_PUBLISH_GATES_TEST_OVERRIDE_*` vars remain (test-only) for fixture-construction convenience but the production guard above still rejects them in `NODE_ENV !== 'test'`.
+4. Tests that previously set the bypass are rewritten to either (a) construct fixtures that pass all four gates, OR (b) use per-gate granular test-only overrides `process.env['FORMS_PUBLISH_GATES_TEST_OVERRIDE_<GATE_NAME>']` (only valid in `NODE_ENV=test`; production guard fails closed if observed in any other env).
+5. Self-service template authoring for tenant admins remains BLOCKED until ALL FOUR sub-SIs close AND the kill-switch guard is in place AND the all-gates bypass is removed.
 
 ## Cross-cutting impact
 
