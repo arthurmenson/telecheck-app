@@ -241,15 +241,26 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
     throw req.server.httpErrors.forbidden('Mode 1 chat is patient-facing only at v1.0.');
   }
 
-  const parsed = Mode1ChatRequestSchema.safeParse(req.body ?? {});
-  if (!parsed.success) {
+  // R6 H1 closure (Codex 2026-05-16): two-stage body validation.
+  // Crisis detection MUST run on the patient's raw text BEFORE we
+  // 400-reject for length / format. Otherwise an oversized message
+  // that contains crisis indicators would be rejected at validation
+  // with no I-019 audit + no crisis-sentinel response — defeating
+  // FLOOR-013's "always-on" guarantee.
+  //
+  // Stage 1: minimal pre-gate type check. Extract message_text if
+  // present and is a string of ANY length. If the body shape is so
+  // malformed that no string is available, return 400 immediately
+  // (there's no text to scan).
+  // Stage 2: full Zod validation (length + other constraints) AFTER
+  // the crisis gate.
+  const rawBody = (req.body ?? {}) as Record<string, unknown>;
+  const rawMessageText = rawBody['message_text'];
+  if (typeof rawMessageText !== 'string' || rawMessageText.length === 0) {
     throw req.server.httpErrors.badRequest(
-      `Invalid request body: ${parsed.error.issues
-        .map((e) => `${e.path.join('.')}: ${e.message}`)
-        .join('; ')}`,
+      'Invalid request body: message_text is required and must be a non-empty string.',
     );
   }
-  const body = parsed.data;
   // R3 H2 + R4 H1 closures (Codex 2026-05-16):
   //   Server-side session/message ID generation is DETERMINISTIC per
   //   idempotent request. Deriving the IDs from the idempotency
@@ -303,11 +314,27 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
         escalationDestination: null,
         idempotencyCtx,
       },
-      body.message_text,
+      rawMessageText,
       'ai_chat_input',
     );
 
     const crisisDetected = inputCrisisOutcome.kind === 'crisis';
+
+    // Stage 2 validation: enforce the full Zod constraints ONLY if no
+    // crisis was detected. If crisis was detected, we proceed to the
+    // crisis-sentinel response path regardless of message size — the
+    // patient still needs the safety surface + the audit chain has
+    // captured the Category A trigger. Per R6 H1 closure 2026-05-16.
+    if (!crisisDetected) {
+      const parsed = Mode1ChatRequestSchema.safeParse({ message_text: rawMessageText });
+      if (!parsed.success) {
+        throw req.server.httpErrors.badRequest(
+          `Invalid request body: ${parsed.error.issues
+            .map((e) => `${e.path.join('.')}: ${e.message}`)
+            .join('; ')}`,
+        );
+      }
+    }
 
     // Branch: crisis → return crisis-resource sentinel response without
     // calling the LLM. AI_LAYERING §6 crisis-write exception: the
@@ -331,7 +358,7 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
         // LLMCompletionRequest shape (snake_case per spec).
         const result = await provider.sendCompletion({
           workload_type: 'conversational_assistant',
-          messages: [{ role: 'user', content: body.message_text }],
+          messages: [{ role: 'user', content: rawMessageText }],
           max_output_tokens: 1024,
           // Clinical paths default to deterministic (temperature=0).
           temperature: 0,
@@ -404,7 +431,7 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
             crisis_detected: crisisDetected,
             escalation_triggered: crisisDetected,
             provider_unavailable: providerUnavailable,
-            input_text_length: body.message_text.length,
+            input_text_length: rawMessageText.length,
             response_text_length: responseText.length,
           },
         },
