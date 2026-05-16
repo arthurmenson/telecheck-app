@@ -119,6 +119,11 @@ export interface ActorContext {
 const authContextPluginImpl: FastifyPluginAsync = async (fastify: FastifyInstance) => {
   fastify.decorateRequest('actorContext', undefined);
   fastify.decorateRequest('bearerTokenPresented', false);
+  // SI-010 actor-context nonce — populated in a successor PR's onRequest
+  // hook update once the dedicated bind-pool wiring lands. Decorated
+  // here with the default-undefined value so the type augmentation in
+  // this file accurately reflects request runtime shape.
+  fastify.decorateRequest('actorNonce', undefined);
 
   fastify.addHook('onRequest', async (request, _reply) => {
     // Authorization header parsing. Tolerant: missing header is FINE
@@ -332,6 +337,32 @@ declare module 'fastify' {
      * is also present.
      */
     bearerTokenPresented: boolean;
+
+    /**
+     * SI-010 per-request actor-context nonce. Populated by the
+     * authContextPlugin onRequest hook AFTER successful JWT
+     * verification AND successful `bind_actor_context()` invocation
+     * on the dedicated bind pool (added in a successor PR in the
+     * Phase A track of the Master Completion Plan v1.0).
+     *
+     * Treated as a request-bound shared secret (nonce-as-secret per
+     * SI-010 R3 closure):
+     *   - High-entropy UUIDv4 (122 bits).
+     *   - Generated server-side; never accepted from client input.
+     *   - NEVER logged. `LOG_REDACT_PATHS` includes `req.actorNonce`
+     *     and any field path leading to it.
+     *   - TTL 5 minutes (matches the DB row's expires_at).
+     *
+     * Handlers that need server-derived actor identity in DB
+     * procedures use `withActorContext(tx, req.actorNonce, ...)`
+     * (from `actor-context-binding.ts`) inside their existing
+     * `withTransaction` wrapper.
+     *
+     * Undefined when the request was not authenticated OR when the
+     * bind step failed (in which case authContextPlugin fails closed
+     * by leaving both actorContext AND actorNonce undefined).
+     */
+    actorNonce: string | undefined;
   }
 }
 
