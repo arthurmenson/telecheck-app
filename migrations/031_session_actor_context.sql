@@ -75,22 +75,65 @@
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
--- Role: bind_actor_context_role
+-- Role: bind_actor_context_role (LOGIN — R2 CRITICAL closure 2026-05-15)
 --
--- A NON-login role used only as the privileged identity for executing
--- bind_actor_context() from authContextPlugin. The plugin enters this
--- role via SET ROLE for the binding statement only, then SET ROLE back
--- to the application role for the rest of the request. The role is
--- intentionally narrow: its only sanctioned use is the binding
--- function's EXECUTE privilege.
+-- A privileged LOGIN role used by a DEDICATED authContextPlugin pool to
+-- invoke bind_actor_context(). The role MUST be LOGIN because the R1
+-- closure requires the auth pool to AUTHENTICATE as this role directly
+-- — not SET ROLE into it from telecheck_app_role (which would defeat
+-- the caller-isolation boundary).
 --
--- If the role already exists (e.g., the migration is re-applied in a
--- dev environment), the IF NOT EXISTS DO block is a no-op.
+-- Credential provisioning is OUT OF BAND of this migration. Operators
+-- generate a strong credential (password rotation in Vault, AWS RDS
+-- IAM auth, or certificate-based authentication) and configure the
+-- authContextPlugin pool to use it. The migration does NOT set a
+-- password; the role is created without one and operators must run
+--
+--     ALTER ROLE bind_actor_context_role PASSWORD '<vault-provisioned>';
+--   OR
+--     ALTER ROLE bind_actor_context_role WITH LOGIN;  (if env supports cert auth)
+--
+-- before the role is usable. The deploy runbook captures this as a
+-- pre-cutover step. If operators forget, attempts to log in fail and
+-- authContextPlugin reports a clear startup error — fail-closed.
+--
+-- If the role already exists (e.g., migration re-applied in dev),
+-- the DO block is a no-op for CREATE. The membership guard at the
+-- bottom of this section always runs.
 -- -----------------------------------------------------------------------------
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bind_actor_context_role') THEN
-        CREATE ROLE bind_actor_context_role NOLOGIN;
+        CREATE ROLE bind_actor_context_role LOGIN;
+    END IF;
+END;
+$$;
+
+-- R2 CRITICAL closure 2026-05-15 — membership guard:
+-- Even with bind_actor_context_role as a LOGIN role, the caller-
+-- isolation requirement only holds if telecheck_app_role is NOT a
+-- member of bind_actor_context_role (which would let it SET ROLE in
+-- and defeat the session_user gate). The migration fails fast at
+-- apply time if such a membership exists, surfacing the config
+-- problem before any procedure starts trusting server-derived
+-- identity.
+DO $$
+DECLARE
+    v_member_count INTEGER;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'telecheck_app_role') THEN
+        SELECT COUNT(*) INTO v_member_count
+          FROM pg_auth_members am
+          JOIN pg_roles r_member ON am.member = r_member.oid
+          JOIN pg_roles r_target ON am.roleid = r_target.oid
+         WHERE r_member.rolname = 'telecheck_app_role'
+           AND r_target.rolname = 'bind_actor_context_role';
+        IF v_member_count > 0 THEN
+            RAISE EXCEPTION 'SI-010 caller-isolation violation: telecheck_app_role is a member ' ||
+                            'of bind_actor_context_role. Revoke the GRANT before applying this ' ||
+                            'migration. Membership enables app SQL to SET ROLE into the binder ' ||
+                            'and spoof identity (defeats the SECURITY DEFINER trust boundary).';
+        END IF;
     END IF;
 END;
 $$;
