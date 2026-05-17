@@ -12,7 +12,10 @@
 - **10 pending SIs** sit in the ratifier queue (target Promotion Ledger entry P-022). Filed during the post-v1.10 autonomous build run.
 - **3 are Track 1 / pilot-launch blockers** (SI-011 HIGH, SI-012 HIGH, SI-014 HIGH). The rest are platform-infrastructure or contract-amendment SIs that block Sprint resume on already-started slices.
 - **Dependency depth is 3 levels**: SI-010 → SI-005/SI-008/SI-009/SI-011 → SI-012/SI-013/SI-014 are roughly independent of the dependency chain. Two SIs are tightly paired (SI-013 + SI-014 share the `runCrisisGate` callsite).
-- **Recommended ratification order** (8 ceremonies of varying weight; estimated 4-6 hours total ratifier time if batched well; see §3 for details). The order is NOT a strict sequence — several SIs can be batched in parallel sub-ceremonies; the only hard sequencing constraints are the deferred-FK chain (SI-008+SI-009 must ratify before SI-005; SI-010 must ratify before SI-011's L3 dual-control plumbing can land).
+- **Recommended ratification order** (8 ceremonies of varying weight; estimated 4-6 hours total ratifier time if batched well; see §3 for details). The order is NOT a strict sequence — several SIs can be batched in parallel sub-ceremonies. Hard sequencing constraints (Codex R2 H1 closure 2026-05-16; previously summarized as just two constraints which omitted three SI-011 prerequisites):
+  - **Cluster B order**: SI-008 + SI-009 must ratify BEFORE SI-005 (deferred FKs)
+  - **SI-011 has FOUR prerequisites** that must ratify before SI-011 IMPL can land (separate from SI-011's own ratification, which can run any time): SI-010 (`current_actor_role()` for L3) + SI-008 (Mode 2 contract for L2) + MarketingCopy CDM §4 row-shape (for L4 per Slice PRD §25.1) + FORMS_ENGINE §I-030 detection-rule canonicalization (for six-category gate per Slice PRD §25.3). Treating SI-011 as "ready after SI-010 + SI-008" alone would leave two publish gates impossible to implement.
+  - **SI-013 + SI-014 pairing**: same `runCrisisGate` callsite; ratify together to avoid double re-test cycle.
 
 ---
 
@@ -44,7 +47,7 @@ The 10 SIs decompose into **5 clusters** based on inter-SI dependencies. Within 
 ### Cluster A — Independent platform infrastructure (3 SIs)
 
 - **SI-003** DOMAIN_EVENTS placeholders — purely a string-namespace ratification; no entity / audit / CCR changes
-- **SI-004** Async Consult audit events — 11 Category C events under the canonical envelope (already-published shape)
+- **SI-004** Async Consult audit events — **4 currently-emitted Sprint 9 Category C placeholder events** under the canonical envelope (`consult.initiated`, `consult.intake_submitted`, `consult.abandoned`, `consult.expired`); the latter two are State-Machines-required additions NOT in PRD §13. Remaining 7 of the PRD §13 11-event surface are DEFERRED to Sprint 10+ when downstream slice work emits them. Chair makes the all-11-up-front vs 4-only-now scope decision at sub-ceremony 5 (Codex R2 M1 closure 2026-05-16)
 - **SI-010** Session Actor Context DB Binding — Identity Spec extension OR new Identity-RBAC slice; introduces `current_actor_*()` DB helpers
 
 These three are NOT inter-dependent on each other. They can be ratified in any order and in any combination of sub-ceremonies. **SI-010 has the largest downstream impact** — it unblocks SI-005/008/009/011's SECURITY DEFINER procedure impls — so ratifying it first reduces work-in-flight elsewhere.
@@ -204,7 +207,7 @@ This is the largest single judgment in the queue. See SI-014's own text for the 
 - **Not a Promotion Ledger entry**: this is a pre-ceremony briefing. The ceremony itself produces P-022, an append-only entry recording the ratified decisions. This doc helps plan the ceremony; the ledger entry records what was decided.
 - **Not a re-derivation of the SI texts**: this doc summarizes the dependency graph + judgment dimensions. The authoritative content for any ratification decision is the SI's own text at `docs/SI-<NNN>-*.md`.
 - **Not a recommendation for SI-014's classifier choice**: SI-014's four options are deliberately presented WITHOUT a recommendation (the classifier choice is a CRITICAL clinical-safety judgment per the autonomous-work STOP conditions). This briefing doc preserves that neutrality — it surfaces the dimensions to weigh, not which way to weigh them.
-- **Not a forcing function for parallel ratification**: the recommended order in §3 is a maximally-efficient sequence given dependency constraints. The ceremony chair may choose to serialize sub-ceremonies, batch differently, or defer some SIs to a later cycle entirely. The dependency constraints (Cluster B order; SI-010 before SI-011 impl) are the only hard rules.
+- **Not a forcing function for parallel ratification**: the recommended order in §3 is a maximally-efficient sequence given dependency constraints. The ceremony chair may choose to serialize sub-ceremonies, batch differently, or defer some SIs to a later cycle entirely. The dependency constraints (Cluster B order; SI-011's four prerequisites must land before SI-011 impl per §2 Cluster C; SI-013 + SI-014 pairing per §2 Cluster D) are the only hard rules — see the TL;DR + §2 + §3 for the full constraint list. **A previous draft summarized the constraints as just "Cluster B order + SI-010 before SI-011 impl" which omitted three SI-011 prerequisites (Codex R2 H1 closure 2026-05-16); always consult the full TL;DR + §2 constraint enumeration, not this section's summary.**
 
 ## 6. Cross-references
 
