@@ -23,6 +23,7 @@
 The docstring explicitly documents this is a stub:
 
 > **PRODUCTION FOLLOW-UP REQUIRED:**
+>
 > - Replace stub patterns with a clinical-grade NLP classifier trained on crisis language (per clinical safety officer review).
 > - Add multi-language support (EN + TWI for Ghana market at minimum).
 > - Add voice transcript pipeline integration (when voice surface activates).
@@ -87,7 +88,7 @@ This SI deliberately does NOT recommend an option. The classifier choice is a CR
 
 **Pros.** Zero clinical-safety risk from stub-coverage gaps. Clean separation: ratifier can take 60-90 days to evaluate options A/B/C without blocking the chronic-care pilot which doesn't depend on Mode 1 chat. Bypasses the FDA Quality System overhead at v1.0 entirely (no clinical-decision-supporting AI in patient-facing surface).
 
-**Cons.** Mode 1 chat is the marquee feature of the platform — patient acquisition + engagement projections in Master PRD v1.10 §17 assume conversational assistant access. Delaying it pushes engagement KPIs and partnership-grant deliverables (the WHO/UN partnership in ADR-028 has a Mode 1 demo gate in some scopings). The 60-90 day delay is the *minimum* — Option B requires 6-12 months which would push pilot launch past calendar 2026.
+**Cons.** Mode 1 chat is the marquee feature of the platform — patient acquisition + engagement projections in Master PRD v1.10 §17 assume conversational assistant access. Delaying it pushes engagement KPIs and partnership-grant deliverables (the WHO/UN partnership in ADR-028 has a Mode 1 demo gate in some scopings). The 60-90 day delay is the _minimum_ — Option B requires 6-12 months which would push pilot launch past calendar 2026.
 
 **Cost.** No technical cost; significant opportunity cost.
 
@@ -98,8 +99,9 @@ Regardless of which option ratifies, these rules MUST hold per I-019 + I-027 + a
 **Rule 1 — Always-on. The classifier upgrade MUST NOT introduce a config flag or feature toggle that can disable detection.** The existing `CrisisDetector` constructor's `arguments.length > 0` fail-closed gate must be preserved (Codex crisis-detection-r1 closure 2026-05-03). Any classifier implementation passed via injection MUST be a non-nullable parameter — the platform-singleton at the bottom of the file remains the single sanctioned construction site.
 
 **Rule 2 — Failure mode is fail-CLOSED on the safety surface.** If the chosen classifier (Claude API call, on-prem model service, hybrid combiner) throws or times out, the platform MUST NOT return `crisisDetected: false`. Two acceptable fail-closed postures:
-  - **(a) Combine with the regex floor.** If the chosen primary classifier fails, fall through to the existing regex matchers; if regex also returns no-crisis, return no-crisis (acceptable because the regex floor was the v1.0 baseline anyway).
-  - **(b) Hard-fail the request.** Throw a typed `CrisisClassifierUnavailableError` and let the chat handler translate it to a 503 with the canonical retry-advisory envelope (mirrors the Mode 1 Category C audit-failure pattern from PR #163; AI-RESIL-001 / FLOOR-020).
+
+- **(a) Combine with the regex floor.** If the chosen primary classifier fails, fall through to the existing regex matchers; if regex also returns no-crisis, return no-crisis (acceptable because the regex floor was the v1.0 baseline anyway).
+- **(b) Hard-fail the request.** Throw a typed `CrisisClassifierUnavailableError` and let the chat handler translate it to a 503 with the canonical retry-advisory envelope (mirrors the Mode 1 Category C audit-failure pattern from PR #163; AI-RESIL-001 / FLOOR-020).
   Choice between (a) and (b) is a ratifier judgment — (a) preserves throughput but reduces effective coverage; (b) maintains coverage strictness but increases user-visible failure rate. The chosen option's downstream impl MUST pick one explicitly and document the rationale on the Category A audit detail.
 
 **Rule 3 — PHI handling is encoded in the chosen classifier's deployment posture.** Whatever option ratifies, the downstream impl MUST update `Telecheck_Contracts_Pack_v5_00_INVARIANTS.md` §I-022 (PHI processing posture) with an explicit row for "crisis-detection classifier" naming the deployment location (Anthropic API per existing BAA / AWS VPC per ADR-024 / hybrid both with provenance-stamped audits). Any subsequent change of classifier is a new SI.
@@ -107,10 +109,11 @@ Regardless of which option ratifies, these rules MUST hold per I-019 + I-027 + a
 **Rule 4 — Latency budget is platform-floor.** The crisis gate's wall-clock budget is ≤500ms P95 (per Master PRD v1.10 §13.5 SLA table; same budget as today's regex). Any classifier whose P95 detection latency exceeds 500ms cannot ship — even if its accuracy is superior — because Mode 1 chat handler's overall request budget is 5s P95 and the crisis-gate is in the synchronous safety path. The downstream impl MUST include a budget regression test (sub-500ms P95 at the realistic input-size distribution).
 
 **Rule 5 — Audit detail captures classifier provenance** (Codex provenance pattern from PR #164). The Category A `crisis_detection_trigger` audit row's `detail` field MUST include:
-  - `classifier_id: string` — identifies WHICH classifier fired (`'regex_v1'` / `'claude_haiku_v3'` / `'distilbert_crisis_v1.2'` / etc.)
-  - `classifier_confidence?: number` — only for ML-based classifiers; null for regex
-  - `classifier_latency_ms: number` — wall-clock from `detect()` entry to `detect()` return; enables P95 monitoring
-  - `classifier_language_detected?: string` — for multi-language classifiers; null if monolingual
+
+- `classifier_id: string` — identifies WHICH classifier fired (`'regex_v1'` / `'claude_haiku_v3'` / `'distilbert_crisis_v1.2'` / etc.)
+- `classifier_confidence?: number` — only for ML-based classifiers; null for regex
+- `classifier_latency_ms: number` — wall-clock from `detect()` entry to `detect()` return; enables P95 monitoring
+- `classifier_language_detected?: string` — for multi-language classifiers; null if monolingual
   This is a non-breaking addition to the AUDIT_EVENTS `crisis_detection_trigger` detail schema; the downstream impl MUST emit a Spec Issue against AUDIT_EVENTS to amend the schema before code lands. Without provenance the platform cannot measure classifier accuracy regression or distinguish "regex caught this" vs "ML caught this" forensically.
 
 **Rule 6 — Twi (or whatever non-EN language ratifies) is in-scope at first launch.** A classifier upgrade that ships EN-only is not closure of this SI — it perpetuates the silent-miss exposure for Ghana patients (the very tenant this SI is most-needed for). If the chosen option cannot ship multi-language coverage at launch, the SI does not close — it stays open and the Ghana pilot stays on Option D (chat gated off) until multi-language coverage ships.
@@ -160,6 +163,7 @@ When the code change lands (Options A/B/C — Option D is a non-deliverable), th
 ## Cross-cutting impact
 
 This SI's resolution materially changes the platform-floor safety posture. Until ratification:
+
 - Telecheck-US (Heros Health DBA) launch on Mode 1 chat carries the EN-only stub limitation. Acceptable IF the ratifier explicitly judges so (most US patients write EN; the false-negative gap is paraphrase coverage, not language).
 - Telecheck-Ghana (Heros Health Ghana DBA) launch on Mode 1 chat is BLOCKED by Rule 6 — the stub does not satisfy I-019 for the Ghana tenant's expected language mix.
 
