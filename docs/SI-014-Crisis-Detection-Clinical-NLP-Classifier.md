@@ -179,19 +179,30 @@ When SI-014 closes under Options A/B/C:
 
 Code-change scope: Option A ~150 LOC + 1 new module for the Claude classifier client. Option B ~400 LOC + the model-service deployment infra. Option C ~250 LOC + both.
 
-### Closure path B — Option D ratified (classifier deferred)
+### Closure path B — Option D ratified (classifier DEFERRED — SI-014 does NOT close)
 
-When SI-014 closes under Option D, the deliverables are FUNDAMENTALLY DIFFERENT — no classifier ships, no AUDIT_EVENTS amendments are needed (the new Cat B `crisis.classifier_invocation` would have no producer at v1.0), no I-022 amendment is needed (no new PHI-processing surface exists). The closure path is:
+**Important (Codex R3 H1 closure 2026-05-16):** Option D is a DEFERRAL posture, NOT a closure posture. SI-014 itself REMAINS OPEN under Option D — it is rescoped from "open / awaiting classifier choice" to "open / deferred behind patient-access gate; classifier choice rescoped to successor SI-014.1." This framing reconciles with the Cross-cutting impact section's statement that Master Completion Plan Phase B verification requires a non-stub classifier: if Option D ratifies, Phase B's I-019 verification gate is satisfied SOLELY by the patient-access gate being in place (no patient surface = no I-019 verification surface to fail) AND by a hard governance block on any future Mode 1 patient-access re-enable until SI-014.1 ratifies a classifier choice.
+
+A previous draft framed Option D as a clean closure with no further SI obligations — that framing was the R3 H1 contradiction, because it would let governance mark SI-014 / P-022 / Phase B closed while the same document's Cross-cutting impact section said Phase B verification requires the non-stub classifier (which under Option D does not exist). The two cannot both be true: either Option D leaves SI-014 open (this section's framing) or the Cross-cutting impact language must be weakened (which would silently soften the I-019 platform-floor — not acceptable for a clinical-safety surface).
+
+When Option D ratifies, the deliverables are FUNDAMENTALLY DIFFERENT from Options A/B/C — no classifier ships, no AUDIT_EVENTS amendments are needed (the new Cat B `crisis.classifier_invocation` would have no producer), no I-022 amendment is needed (no new PHI-processing surface exists). The interim-deliverable path is:
 
 2. **Mode 1 patient-access gate**: configure the Mode 1 chat handler's route guard so patient JWTs cannot access `/v0/ai/chat` at v1.0. Clinician-test JWTs may retain access for internal QA. This is a small handler-level change (~20 LOC + a feature-flag check) — NOT a classifier change.
-3. **Patient-facing surface communication**: any documentation or marketing copy that promised Mode 1 chat to patients at v1.0 launch MUST be updated to reflect the deferred posture. The Master PRD v1.10 §17 engagement KPI projections may need a footnote acknowledging the Mode 1 deferral.
-4. **Ghana pilot reaffirmation**: confirm with the Telecheck-Ghana operations team that the chronic-care surfaces (forms, async-consult, prescription/refill) are sufficient for revenue-bearing pilot launch WITHOUT Mode 1 chat — this is a stakeholder-alignment step, not a code change.
-5. **Promotion Ledger entry** documenting the deferral decision (NOT a classifier ratification — explicitly an "SI-014 closed by deferring the question; classifier choice rescoped to v1.1 or later"). The next SI in this lineage (SI-014.1 / SI-015) re-opens the classifier-choice when the platform is ready to revisit.
-6. **NO** AUDIT_EVENTS amendments. **NO** I-022 amendment. **NO** Tier 1 / Tier 2 test deliverables (the regression-test obligation list applies ONLY to Options A/B/C — see the preamble of that section). **NO** changes to `src/lib/crisis-detection.ts` (the regex stub remains for the clinician-test patient surface where Mode 1 is still reachable).
+3. **Hard governance block on patient Mode 1 re-enable**: ADR-030 under Option D MUST specify that lifting the patient-access gate requires successor SI-014.1 (or whichever SI succeeds this one) ratifying a classifier choice + the full Closure path A deliverables landing. The patient-access gate is NOT removable by a routine feature-flag flip; the removal MUST be gated by a Promotion Ledger entry that itself depends on SI-014.1 closure.
+4. **Patient-facing surface communication**: any documentation or marketing copy that promised Mode 1 chat to patients at v1.0 launch MUST be updated to reflect the deferred posture. The Master PRD v1.10 §17 engagement KPI projections may need a footnote acknowledging the Mode 1 deferral.
+5. **Ghana pilot reaffirmation**: confirm with the Telecheck-Ghana operations team that the chronic-care surfaces (forms, async-consult, prescription/refill) are sufficient for revenue-bearing pilot launch WITHOUT Mode 1 chat — this is a stakeholder-alignment step, not a code change.
+6. **Promotion Ledger entry** documenting the DEFERRAL decision (NOT a classifier ratification, NOT a closure of SI-014 — explicitly an "SI-014 rescoped to deferral; patient Mode 1 inaccessible; classifier choice routed to SI-014.1"). The ledger entry includes the trigger event(s) that would re-open classifier work (e.g., new partnership requirement; new tenant onboarding requiring Mode 1; clinical-governance ratifier readiness to evaluate options A/B/C).
+7. **SI-014.1 (or successor SI) creation**: filed in the same ratification ceremony, status "Open / awaiting classifier choice" with the option-evaluation framework from this SI carried forward as a baseline. The successor SI is what eventually CLOSES this lineage when Options A/B/C ratify.
+8. **NO** AUDIT_EVENTS amendments. **NO** I-022 amendment. **NO** Tier 1 / Tier 2 test deliverables for this SI (the regression-test obligation list applies ONLY to Options A/B/C — see the preamble of that section). **NO** changes to `src/lib/crisis-detection.ts` (the regex stub remains for the clinician-test patient surface where Mode 1 is still reachable).
 
-Code-change scope: ~20 LOC (the patient-access gate). The "expensive" deliverables are governance + stakeholder-communication, not engineering.
+Code-change scope: ~20 LOC (the patient-access gate) + the governance-block plumbing if the gate's removal needs CI-enforceable protection. The "expensive" deliverables are governance + stakeholder-communication, not engineering.
 
-ADR-030 under Option D MUST explicitly state the rescoping mechanism (which future SI re-opens classifier choice; what trigger event opens it — a new tenant onboarding, a new partnership requirement, etc.) so the deferral cannot become silent permanent neglect.
+**Phase B verification reconciliation.** Under Option D, the Master Completion Plan v1.0 Phase B exit gate's I-019 verification is satisfied as follows:
+
+- For Telecheck-Ghana chronic-care surfaces (forms, async-consult, prescription/refill) that DO operate at v1.0: I-019 verification requires the chosen classifier IF those surfaces ever route patient free-text through `crisisDetector.detect()`. The Forms Engine slice PRD scoping at v1.0 does NOT route free-text through crisis detection (per the Forms-Engine §6 docstring; crisis detection on forms is a Forms-Engine-level decision tracked separately) — so the regex stub remains in place for those surfaces' incidental crisis-detection coverage, and Phase B I-019 verification for them is satisfied by the existing stub plus the patient-access gate on Mode 1.
+- For Mode 1 chat: I-019 verification under Option D is satisfied by the patient-access gate (no patient surface = no patient-facing I-019 obligation to verify). Clinician-test access remains gated by the regex stub which is documented as adequate for the clinician-test surface where false-negative risk is bounded by clinician oversight.
+
+This Phase B reconciliation MUST be cross-referenced in the Master Completion Plan v1.0 §Phase-B-exit-gate documentation as part of Closure path B's deliverables.
 
 ## Regression test obligations (downstream impl)
 
@@ -250,7 +261,10 @@ The Master Completion Plan v1.0 Phase B "Clinical Care" track depends on this SI
 
 - **Filed:** 2026-05-16 (autonomous run; Addendum 27 next-entry-point identification)
 - **Target Promotion Ledger entry:** P-022 (alongside the other 9 pending SIs in the next ratification ceremony — SI-003/004/005/008/009/010/011/012/013/014)
-- **Blocks:** Telecheck-Ghana Mode 1 chat patient launch (per Rule 6); Master Completion Plan Phase B exit gate
+- **Blocks:** Telecheck-Ghana Mode 1 chat patient launch (per Rule 6); Master Completion Plan Phase B exit gate (per Cross-cutting impact below)
 - **Blocked by:** ratifier availability for ADR-030 classifier-choice decision (Evans + Engineering Lead + Platform Clinical Governance + Platform AI Safety)
+- **Closure semantics (Codex R3 H1 closure 2026-05-16):**
+  - **Options A/B/C ratified** → SI-014 CLOSES via Closure path A; Phase B I-019 verification satisfied by the shipped classifier + the two AUDIT_EVENTS amendments + the I-022 amendment + Tier 1+2 test obligations
+  - **Option D ratified** → SI-014 DOES NOT CLOSE; it is RESCOPED to "open / deferred behind patient-access gate" via Closure path B. Successor SI-014.1 is filed in the same ratification ceremony. SI-014 only closes when SI-014.1 ratifies a classifier choice + the full Closure path A deliverables land. Phase B I-019 verification under Option D is satisfied by the patient-access gate (no patient Mode 1 surface = no patient-facing verification obligation) — see Closure path B's Phase B reconciliation
 
 — Claude (Opus 4.7, 1M context), 2026-05-16 autonomous run
