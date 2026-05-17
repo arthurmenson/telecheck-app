@@ -42,7 +42,7 @@ The full SI texts are at `docs/SI-<NNN>-*.md`. This table is the one-screen over
 
 ## 2. Dependency clusters
 
-The 10 SIs decompose into **5 clusters** based on inter-SI dependencies. Within a cluster, the SIs must be ratified together or in a fixed order; across clusters they are independent.
+The 10 SIs decompose into **5 clusters** based on inter-SI relationships. Per the three-class constraint framing from TL;DR + §5 (Codex R5 M1 closure 2026-05-16): within a cluster, only Cluster B carries a HARD ratification-order constraint; Cluster C carries IMPLEMENTATION-readiness gates that do NOT block SI-011's ratification meeting; Cluster D carries RECOMMENDED batching that can be split if signatories require. Clusters A and E are independent (no inter-SI relationships). Across clusters all SIs are independent for ratification scheduling purposes.
 
 ### Cluster A — Independent platform infrastructure (3 SIs)
 
@@ -52,32 +52,32 @@ The 10 SIs decompose into **5 clusters** based on inter-SI dependencies. Within 
 
 These three are NOT inter-dependent on each other. They can be ratified in any order and in any combination of sub-ceremonies. **SI-010 has the largest downstream impact** — it unblocks SI-005/008/009/011's SECURITY DEFINER procedure impls — so ratifying it first reduces work-in-flight elsewhere.
 
-### Cluster B — Async Consult schema family (3 SIs, fixed order)
+### Cluster B — Async Consult schema family (3 SIs, fixed order) — **HARD ratification-correctness constraint**
 
 - **SI-008** AiWorkflowExecution — leaf
 - **SI-009** SyncSession — leaf
 - **SI-005** Consult / ConsultEvent — depends on SI-008 (FK 6: `ai_workflow_execution_id`) AND SI-009 (FK 7: `escalation_target_sync_session_id`)
 
-**Ratification order constraint:** SI-008 + SI-009 must ratify BEFORE SI-005 because SI-005's row shape names the FKs that point at SI-008/009 row shapes. The two leaf SIs (008, 009) can ratify in parallel; SI-005 follows.
+**HARD ratification-correctness constraint** (the ONLY one in the document; see TL;DR + §5 closing): SI-008 + SI-009 must ratify BEFORE SI-005 because SI-005's row shape names FKs that point at SI-008/009 row shapes. Ratifying SI-005 first would record FK targets pointing at unratified row shapes — what the ratification itself records would be wrong, not just downstream impl. The two leaf SIs (008, 009) can ratify in parallel; SI-005 follows.
 
 Strictly speaking SI-005 could ratify with "DEFERRED FK to-be-added-when-SI-008/009-ratify" placeholder semantics — that's what the SIs currently document. But the cleanest closure is to batch all three in the same sub-ceremony so the FKs land immediately and SI-005's impl can use the final FK shapes from day one.
 
-### Cluster C — Forms-Intake governance (1 SI with 4 prerequisites)
+### Cluster C — Forms-Intake governance (1 SI with 4 implementation-readiness gates) — **NOT a ratification-order constraint**
 
-- **SI-011** Forms-Intake publish-time governance gates — depends on:
+- **SI-011** Forms-Intake publish-time governance gates — has FOUR IMPLEMENTATION-readiness gates:
   - **SI-010** (`current_actor_role()` for L3 dual-control)
   - **SI-008** (Mode 2 contract ratification for the L2 Mode 2 input-contract conformance gate)
   - **MarketingCopy CDM §4 row-shape ratification** (for the L4 MarketingCopy approval gate per Slice PRD §25.1 — Codex R1 H1 closure 2026-05-16 surfaced this as a prerequisite not listed in SI-011's own `Parallel SIs:` line; the ceremony chair must either confirm MarketingCopy is in-scope of SI-011 itself or schedule it as a sibling SI before SI-011 impl can land)
   - **FORMS_ENGINE §I-030 detection-rule canonicalization** (for the six-category static analysis per Slice PRD §25.3 — same Codex R1 H1 closure; same scope/scheduling decision needed at the ceremony)
 
-**Ratification order constraint:** SI-010 + SI-008 + MarketingCopy CDM row + I-030 detection-rule shape must ratify BEFORE SI-011's impl can land. The ceremony chair MUST make an explicit decision at SI-011's sub-ceremony: either (a) treat MarketingCopy CDM + I-030 canonicalization as in-scope of SI-011 itself and ratify them together, OR (b) schedule them as siblings ratifying earlier in the same calendar window. Recording SI-011 as "ready after SI-010 + SI-008" without addressing the other two would leave two publish-gate prerequisites unresolved — exactly the failure mode this briefing is meant to prevent.
+**IMPLEMENTATION-readiness gates (NOT ratification-order constraints)** per Codex R5 M1 closure 2026-05-16. The four prerequisites above do NOT block SI-011's ratification meeting — SI-011 itself can ratify at any time. They DO block the engineering impl that lands per SI-011's ratified contract: code cannot land until all four prereqs have ratified. The P-022 entry records the four prereqs as IMPL-readiness gates separately from SI-011's own ratification. The ceremony chair MUST make an explicit decision at SI-011's sub-ceremony: either (a) treat MarketingCopy CDM + I-030 canonicalization as in-scope of SI-011 itself and ratify them together, OR (b) schedule them as siblings ratifying earlier in the same calendar window. The chair MAY also ratify SI-011 before any of the four — that's allowed because SI-011 ratification is not order-gated. What is NOT allowed: marking SI-011 implementation-ready before all four prereqs ratify (that would let the four publish gates ship unenforced).
 
-### Cluster D — Mode 1 chat crisis surface (2 SIs, paired)
+### Cluster D — Mode 1 chat crisis surface (2 SIs, paired) — **RECOMMENDED batching, NOT a ratification-order constraint**
 
 - **SI-013** CCR crisis-helpline keys
 - **SI-014** Crisis-detection NLP classifier upgrade
 
-**Ratification order constraint:** Per SI-014's own header — these two SIs touch the same `runCrisisGate` callsite in `src/modules/ai-service/internal/handlers/chat.ts`. Ratifying them together avoids a second re-test cycle on the crisis-bypass branch. They CAN ratify independently (neither references the other's ratified artifacts), but the engineering cost-of-impl is lower when batched.
+**RECOMMENDED batching (NOT a hard rule)** per Codex R5 M1 closure 2026-05-16. These two SIs touch the same `runCrisisGate` callsite in `src/modules/ai-service/internal/handlers/chat.ts`. Ratifying them together avoids a second engineering re-test cycle on the crisis-bypass branch. They CAN ratify independently in any order (neither references the other's ratified artifacts), and splitting is allowed — the engineering cost is one extra re-test cycle, not a correctness regression. The recommended batching is purely a workflow efficiency: the ratifier ceremony chair may decide to split if signatory availability requires it.
 
 **Special note:** SI-014 is the only SI in the queue that requires a NEW ADR (ADR-030). The classifier-choice decision (Option A/B/C/D) is the CRITICAL clinical-safety + regulatory + cost judgment that distinguishes this from the other SIs — see §4 for the ratifier-evaluation framework.
 
@@ -91,7 +91,7 @@ Strictly speaking SI-005 could ratify with "DEFERRED FK to-be-added-when-SI-008/
 
 ## 3. Recommended ratification order
 
-The 10 SIs decompose into **8 logical sub-ceremonies**. The order below is dependency-aware (no SI ratifies before its prerequisites) and pilot-impact-weighted (HIGH-severity SIs early). Each sub-ceremony has an estimated ratifier time + the minimum-quorum signatories needed.
+The 10 SIs decompose into **8 logical sub-ceremonies**. The order below is dependency-aware for the ONE HARD ratification-order constraint (Cluster B per §2) and pilot-impact-weighted (HIGH-severity SIs early). For SI-011's IMPLEMENTATION-readiness gates and SI-013+SI-014's RECOMMENDED batching, the order is preference, not requirement — the chair can re-order without violating ratification correctness (Codex R5 M1 closure 2026-05-16). Each sub-ceremony has an estimated ratifier time + the minimum-quorum signatories needed.
 
 | Order | Sub-ceremony                                             | SIs                                                            | Quorum                                                                                                                                    | Est. ratifier time                                          | Rationale                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | ----- | -------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
