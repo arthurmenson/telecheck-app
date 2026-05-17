@@ -1,0 +1,134 @@
+# Sibling-Doc Cross-Validation Audit — 2026-05-17
+
+**Authored:** 2026-05-17 (Claude autonomous run; Addendum 33 next-entry-point identification)
+**Audience:** Evans (workstream lead + spec-corpus ratifier) + Engineering Lead + per-slice owners
+**Purpose:** Second cross-doc-drift audit (the first was PR #168's Implementation State Audit which surfaced 3 drift items in the Ratifier Ceremony Agenda + 1 drift item in the SI-014 source). This audit extends the same grep-the-actual-code-and-source-files pattern to TWO additional sibling-doc surfaces that the previous audit didn't cover: the **Promotion Ledger** (`Telecheck_Promotion_Ledger.md` in the spec corpus) and the **per-slice STATUS docs** in this repo (`docs/*_SLICE_STATUS_2026-05-05.md` + `docs/TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md`). Checks each surface against the SI source files for ratification-state drift.
+**Status:** Reference doc, not normative. Authoritative ratification state remains the Promotion Ledger entries themselves + each SI's own Status field. This audit surfaces drift; closures land via the recommended-patch PRs in §3.
+
+---
+
+## TL;DR
+
+- **3 drift items** surfaced across the two sibling-doc surfaces audited (Promotion Ledger + per-slice STATUS docs):
+  1. **`docs/PHARMACY_SLICE_STATUS_2026-05-05.md` is 12 days stale** — claims `Status: ⛔ BLOCKED — Skeleton only at v0.1` + `Blocker: SI-001 (still OPEN; Promotion Ledger entry P-011 pending)`, but P-011 RATIFIED SI-001 on 2026-05-11 + the Pharmacy MedicationRequest/prescribe surface implementation landed shortly after (per Implementation State Audit 2026-05-17 §1 reclassification SKELETON → SUBSTANTIAL based on `src/modules/pharmacy/routes.ts` grep showing 11 routes including 8 mutation routes). **HIGH severity** because the STATUS doc is the canonical per-slice landing doc that a new contributor or sprint planner would consult.
+  2. **`docs/FORMS_INTAKE_SLICE_STATUS_2026-05-05.md` does NOT surface the publish-gate sentinel + SI-011 IMPL gate** — claims "implementation-complete on its v2.1 surface" without mentioning the `FORMS_PUBLISH_GATES_BYPASS='unsafe-test-only'` sentinel that fails-closed the publish path in non-test environments OR the SI-011 publish-time governance gates that need 4 IMPL-readiness gates to ratify. **MEDIUM severity** because the production-deploy blocker is hidden behind the "implementation-complete" framing — matches the Implementation State Audit 2026-05-17 §1 COMPLETE-EXCEPT-PUBLISH-GATES reclassification that PR #168 surfaced for the module-rollup table but NOT this per-slice STATUS doc.
+  3. **Promotion Ledger has zero entries for SIs filed during the autonomous run** (SI-008/009/010/011/012/013/014 + the rediscovered-as-OPEN SI-002/007) — only P-011 (SI-001 ratification) covers an SI in the current queue. **LOW severity** because this is EXPECTED — those SIs are all OPEN, awaiting the Q2 2026 Ratifier Ceremony per the Ratifier Ceremony Agenda. **The ABSENCE is correct; the ratifier ceremony will produce P-022 (target) covering them collectively**. Surfaced here for completeness of the Promotion-Ledger-vs-SI-source-file alignment check, NOT because there's an action needed.
+- **2 sibling-doc surfaces verified DRIFT-FREE:** `docs/CONSENT_SLICE_STATUS_2026-05-05.md` + `docs/IDENTITY_SLICE_STATUS_2026-05-05.md` + `docs/TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md` all accurately reflect their slices as COMPLETE per the Implementation State Audit 2026-05-17 §1 classification. No stale BLOCKED claims or missing-SI-reference drift.
+- **Promotion Ledger structurally drift-free** otherwise — P-001 through P-011 entries all accurately reflect their respective ratification artifacts; no entries claim ratifications that didn't happen; no missing entries for ratifications that DID happen (post-P-011, the only ratification-class event was the v1.10.1 hygiene cycle landing — but that closed pre-autonomous-run and has P-009 entry already).
+
+---
+
+## 1. Promotion Ledger ↔ SI source-file alignment
+
+**Authoritative source for ratification state:** each SI source file's Status field. **Authoritative source for spec-corpus governance acceptance:** Promotion Ledger entries (P-NNN).
+
+For each SI in the current queue (CLOSED + OPEN), does the Promotion Ledger correctly reflect its ratification state?
+
+| SI         | SI source-file Status                                                                                                                 | Ledger entry                                | Alignment                                                                                                                                                               |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **SI-001** | CLOSED 2026-05-12 RATIFIED P-011                                                                                                      | ✅ P-011 entry present (40-89; full record) | DRIFT-FREE                                                                                                                                                              |
+| **SI-002** | OPEN v0.5 DRAFT, target P-014                                                                                                         | (none — P-014 not yet issued)               | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-003** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-004** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-005** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-006** | RESOLVED 2026-05-08 (impl landed via 9 PRs Sprint 33-34; IDEMPOTENCY v5.1→v5.2 spec contract bump DEFERRED to spec corpus governance) | (none — deferred per SI-006 own text)       | DRIFT-FREE (intentional deferral per SI-006 v0.3 closure section; the IDEMPOTENCY contract bump is a future spec-corpus PR, not a Promotion Ledger event in this cycle) |
+| **SI-007** | OPEN v0.19 DRAFT, target P-013                                                                                                        | (none — P-013 not yet issued)               | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-008** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-009** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-010** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-011** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-012** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-013** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+| **SI-014** | OPEN                                                                                                                                  | (none)                                      | DRIFT-FREE (expected; awaiting ceremony)                                                                                                                                |
+
+**Audit verdict for §1:** Promotion Ledger ↔ SI source-file alignment is DRIFT-FREE. No SI source file claims a Promotion Ledger entry that doesn't exist; no Promotion Ledger entry claims an SI is ratified when its source file disagrees. The "no ledger entries for 12 OPEN SIs" state is EXPECTED — those SIs are awaiting the Q2 2026 Ratifier Ceremony (target P-022 per Ratifier Ceremony Agenda + Implementation State Audit).
+
+This is the LOW-severity finding from TL;DR — surfaced for completeness, not for action.
+
+---
+
+## 2. Per-slice STATUS docs ↔ implementation reality
+
+**Authoritative source for implementation reality:** `src/modules/*/routes.ts` + the Implementation State Audit 2026-05-17 §1 per-module classification (which Codex R4 H1 closure on PR #168 grep-verified against the actual routes files).
+
+For each per-slice STATUS doc in `docs/`, does it accurately reflect the current implementation state of its slice?
+
+### 2.1 PHARMACY_SLICE_STATUS_2026-05-05.md — **DRIFT** (HIGH severity)
+
+| Field                | STATUS doc claim (2026-05-05 + 2026-05-08 amendment)                                                                                                       | Implementation reality (2026-05-17)                                                                                                                                                    | Drift                                                                                                                   |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Status               | `⛔ BLOCKED — Skeleton only at v0.1`                                                                                                                       | `SUBSTANTIAL` per Implementation State Audit §1 (MedicationRequest/prescribe surface implemented; refill/dispense/shipment still SKELETON pending SI-007)                              | **STALE** — SI-001 ratified P-011 2026-05-12 + 11 prescribe-surface routes shipped per `src/modules/pharmacy/routes.ts` |
+| Blocker              | `SI-001 MedicationRequest schema gap (still OPEN at the spec corpus governance layer; Promotion Ledger entry P-011 pending)`                               | SI-001 CLOSED via P-011 2026-05-12. Current blocker is **SI-007** (refill/dispense/shipment surface only)                                                                              | **STALE** — wrong SI cited as blocker                                                                                   |
+| `/health` endpoint   | `Returns {status, module, blocked: 'SI-001', blocked_message}` (BLOCKED state)                                                                             | Actual: `/health` returns module ready per state-machine implementation that landed alongside SI-001 ratification                                                                      | **STALE** — endpoint behavior changed                                                                                   |
+| `routes.ts`          | "continues to mount `/health` returning `{ status: 'ok', module: 'pharmacy', state: 'BLOCKED' }` and slice-specific endpoints returning `{ status: 503 }`" | Actual: 11 routes including `/health`, `/ready`, GET by ID, list by patient, 8 mutation routes (create draft, submit for review, approve, decline, supersede, modify, discontinue × 2) | **STALE** — slice-specific endpoints no longer 503                                                                      |
+| Test coverage        | "v0.1 skeleton only"                                                                                                                                       | Actual: full MedicationRequest test suite landed alongside SI-001 ratification + State Machines v1.2 §19 (8 active states + 13 transitions implemented)                                | **STALE** — test layer matured significantly                                                                            |
+| Resume-path estimate | "30-40 commits to reach Pharmacy slice implementation-complete after SI-001 closes"                                                                        | Actual: prescribe surface implementation has already landed; refill/dispense/shipment remains the remaining work blocked on SI-007                                                     | **STALE estimate** — needs split into prescribe-surface-done vs refill/dispense/shipment-still-pending                  |
+
+**Recommended patch:** rewrite the STATUS doc header to reflect the SI-001-ratified post-P-011 state. Split the doc's "Pharmacy" scope into two surfaces — **prescribe surface (implemented; SUBSTANTIAL)** vs **refill/dispense/shipment surfaces (still SKELETON pending SI-007 ratification)** — matching the Implementation State Audit 2026-05-17 §1 + PR #171 Per-Track Navigation doc Track 1 row split. Estimated effort: ~80-100 LOC of STATUS-doc edits + a date-stamp bump to 2026-05-17.
+
+### 2.2 FORMS_INTAKE_SLICE_STATUS_2026-05-05.md — **DRIFT** (MEDIUM severity)
+
+| Field              | STATUS doc claim (2026-05-05 + 2026-05-08 amendment)                                                                                 | Implementation reality (2026-05-17)                                                                                                                                                                                                                                                                            | Drift                                                                                                   |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Summary            | "**implementation-complete on its v2.1 surface**"                                                                                    | Implementation State Audit §1 reclassifies as **COMPLETE-EXCEPT-PUBLISH-GATES** — 11 HTTP surfaces ship but publish is fail-closed in non-test envs via `FORMS_PUBLISH_GATES_BYPASS='unsafe-test-only'` sentinel pending SI-011 IMPL                                                                           | **STALE** — production-deploy blocker hidden behind "implementation-complete" framing                   |
+| Publish-gate state | (not mentioned in the STATUS doc — the `publishVersionHandler` route is listed but the sentinel-bypass behavior is not surfaced)     | Actual: `templateService.publishVersion()` documents 4 TODO-deferred governance gates (I-015 L3 dual-control + I-030 six-category static analysis + L4 MarketingCopy approval + L2 Mode 2 input contract conformance) behind the bypass sentinel; production setting of the sentinel = ALL FOUR gates bypassed | **MISSING** — the STATUS doc's "implementation-complete" framing omits the gate state entirely          |
+| SI references      | SI-003 mentioned ("variant + resume_restored domain events raised at f2a16f3"); no mention of SI-011 (publish-time governance gates) | SI-011 was filed 2026-05-15 (post the STATUS doc's 2026-05-08 amendment); STATUS doc is older than SI-011 by ~7 days                                                                                                                                                                                           | **MISSING** — SI-011 not referenced; the production-deploy blocker it surfaces is not in the STATUS doc |
+
+**Recommended patch:** add a STATUS doc subsection titled "Publish-gate production-deploy blocker (added 2026-05-17 cross-validation patch)" documenting the `FORMS_PUBLISH_GATES_BYPASS` sentinel + the 4 publish-time governance gates SI-011 ratifies + the 4 IMPL-readiness gates SI-011's downstream impl needs (SI-010 + SI-008 + MarketingCopy CDM + I-030 detection rules). Update the Summary to "implementation-complete on its v2.1 surface EXCEPT publish-gate IMPL" + cross-reference to SI-011 + Implementation State Audit 2026-05-17 §1. Estimated effort: ~30-50 LOC of STATUS-doc edits.
+
+### 2.3 CONSENT_SLICE_STATUS_2026-05-05.md — DRIFT-FREE
+
+Slice classified COMPLETE per Implementation State Audit 2026-05-17 §1. STATUS doc accurately reflects this. No stale SI references. No missing blocker disclosure. No publish-gate-class hidden-blocker risk.
+
+### 2.4 IDENTITY_SLICE_STATUS_2026-05-05.md — DRIFT-FREE (with note)
+
+Slice classified COMPLETE per Implementation State Audit 2026-05-17 §1. STATUS doc accurately reflects this.
+
+**Note (not a drift; informational):** SI-010 (Session Actor Context DB Binding; F-3 successor) was filed 2026-05-15 as a future Identity slice extension. SI-010 ratification doesn't change the current Identity slice's correctness (slice remains COMPLETE); its IMPL extension would land via a sibling SI-010-impl PR after the Q2 2026 ratifier ceremony. STATUS doc does not need to surface SI-010 because the current slice is correct as-is — but a forward-looking update once SI-010 ratifies would be a documentation hygiene win, not a drift fix.
+
+### 2.5 TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md — DRIFT-FREE
+
+Foundation module classified COMPLETE per Implementation State Audit 2026-05-17 §1. STATUS doc accurately reflects this. No stale SI references. The "Admin Backend slice v1.1 ratification pending" 503-stub framing for admin-write paths is accurate (Admin Backend v1.1 remains a future slice; the 503-stub posture continues to be correct).
+
+**Note (not a drift; informational):** SI-013 (CCR crisis-helpline keys) was filed 2026-05-16 and proposes 3 new CCR keys + a NEW Cat B audit event under the tenant-config namespace. SI-013 ratification is purely additive (~50 LOC of typed resolvers + the Cat B emitter wiring); the tenant-config foundation module remains COMPLETE either way.
+
+---
+
+## 3. Drift items + recommended patches
+
+Summary of drift items surfaced in §1 + §2 with recommended patch PRs:
+
+| #   | Drift item                                                                                                                                                                 | Severity                                                                         | Recommended patch                                                                                                              | Estimated effort                                                             |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| 1   | `docs/PHARMACY_SLICE_STATUS_2026-05-05.md` claims SI-001 OPEN + skeleton-only (12 days stale)                                                                              | HIGH                                                                             | Rewrite STATUS doc header + split scope into prescribe-surface-implemented vs refill/dispense/shipment-pending                 | ~80-100 LOC; single PR                                                       |
+| 2   | `docs/FORMS_INTAKE_SLICE_STATUS_2026-05-05.md` misses publish-gate sentinel + SI-011 IMPL gate (production-deploy blocker hidden behind "implementation-complete" framing) | MEDIUM                                                                           | Add "Publish-gate production-deploy blocker" subsection + update Summary + cross-reference SI-011 + Implementation State Audit | ~30-50 LOC; same single PR as item 1 (both are per-slice STATUS doc patches) |
+| 3   | Promotion Ledger has no entries for the 12 OPEN SIs (SI-002/003/004/005/007/008/009/010/011/012/013/014)                                                                   | LOW (expected — awaiting Q2 2026 Ratifier Ceremony per Ratifier Ceremony Agenda) | NO patch needed. P-022 (target) will cover them at ceremony close                                                              | 0 (intentional absence)                                                      |
+
+**Recommended single patch PR (items 1 + 2):** "docs(per-slice-status): refresh stale Pharmacy + Forms-Intake STATUS docs against current implementation reality (post 2026-05-17 cross-validation audit)." Bounded scope; ~110-150 LOC across 2 STATUS docs; mirrors the existing per-slice STATUS doc format; can be authored as the next autonomous-run entry.
+
+---
+
+## 4. What this audit is NOT
+
+- **Not a re-derivation of the Promotion Ledger or the per-slice STATUS docs**: those remain authoritative for their respective surfaces. This audit cross-validates them against SI source files + the Implementation State Audit; it does NOT replace them.
+- **Not a Promotion Ledger entry**: the audit identifies a P-022 (target) ceremony for the 12 OPEN SIs but does not produce it. The actual P-022 entry will be authored by Evans at the ceremony close per Promotion Ledger discipline (append-only; one entry per cycle).
+- **Not a substitute for SI ratification ceremonies**: surfacing that a STATUS doc is stale doesn't ratify the underlying SI. The stale-pharmacy-STATUS finding (item 1) is REMEDIATED by updating the STATUS doc; the underlying SI-001 ratification already happened independently via P-011.
+- **Not exhaustive across every doc surface**: this audit covers Promotion Ledger + per-slice STATUS docs. Other doc surfaces (`docs/AUTONOMOUS_TURN_SUMMARY_*.md`, `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md`, `docs/ORT_V1_5_TESTABLE_ITEMS_AUDIT.md`, `docs/PROJECT_CONVENTIONS.md`, etc.) are out of scope for this pass. The traceability matrix at `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` is a known "living artifact" at r6 (2026-05-12); it self-amends in place. Future cross-validation passes could extend the audit pattern to those surfaces.
+- **Not a recommendation on any SI-014 option**: SI-014 source remains authoritative per the autonomous-work STOP conditions. This audit's tenant-config note (§2.5) doesn't recommend any of SI-013's CCR key implementations; it merely notes the additive nature of SI-013 ratification on the tenant-config foundation module's COMPLETE classification.
+
+---
+
+## 5. Cross-references
+
+- First cross-doc-drift audit (this audit extends the pattern): `docs/Implementation-State-Audit-2026-05-17.md` (PR #168)
+- Ratifier Ceremony Agenda Q2 2026 (post-2026-05-17 patch per PR #169): `docs/Ratifier-Ceremony-Agenda-Q2-2026.md`
+- Per-Track SI Navigation 2026-05-17 (PR #171 4th nav artifact): `docs/Per-Track-SI-Navigation-2026-05-17.md`
+- Promotion Ledger (authoritative): `Telecheck_Promotion_Ledger.md` in the spec corpus (sibling repo `arthurmenson/telecheckONE`)
+- Per-slice STATUS docs (subject of §2): `docs/CONSENT_SLICE_STATUS_2026-05-05.md`, `docs/FORMS_INTAKE_SLICE_STATUS_2026-05-05.md`, `docs/IDENTITY_SLICE_STATUS_2026-05-05.md`, `docs/PHARMACY_SLICE_STATUS_2026-05-05.md`, `docs/TENANT_CONFIG_FOUNDATION_STATUS_2026-05-05.md`
+- SI source files (authoritative per-SI Status fields): `docs/SI-<NNN>-*.md`
+- Master Completion Plan v1.0 (Plan-vs-current-state context): `Telecheck_Master_Completion_Plan_v1_0.md` in the spec corpus
+- Cycle Addendum trail: `Telecheck_v1_10_PRD_Update/AI_Service_Rollout_24h_Status_2026-05-14.md` Addenda 21–33
+
+---
+
+— Claude (Opus 4.7, 1M context), 2026-05-17 autonomous run; Addendum 33 next-entry-point identification
