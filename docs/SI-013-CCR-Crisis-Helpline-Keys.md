@@ -127,12 +127,14 @@ When the code change lands, the test suite MUST cover:
 When SI-013 closes:
 
 1. CCR_RUNTIME contract v5.3 (or v5.2 patch) lands with the three keys ratified above + country-profile defaults populated for US + GH.
-2. Engineering authors:
-   - `src/modules/tenant-config/internal/ccr-keys.ts` — extend `CCR_KEYS` constant with the three new entries
-   - `src/modules/ai-service/internal/handlers/chat.ts` — replace `escalationDestination: null` with `resolveCcrKey(ctx, CCR_KEYS.CRISIS_HELPLINE_E164)`
-   - `src/modules/ai-service/internal/handlers/chat.ts` — replace the hardcoded `CRISIS_RESPONSE_TEXT` constant with `renderCrisisSentinel({...})` interpolation
-   - Integration test: assert the resolved helpline number appears in the crisis sentinel response for US + GH tenants respectively
-3. Code change is bounded (≤100 LOC, single PR, Codex-reviewable in 2-3 rounds).
+2. Engineering authors (downstream impl checklist — MUST preserve Rules 1+2+3 from "Surface integration" above; Codex R2 H1 closure 2026-05-16):
+   - `src/modules/tenant-config/internal/ccr-keys.ts` — extend `CCR_KEYS` constant with the three new entries (purely additive; existing surface unchanged)
+   - `src/modules/tenant-config/internal/services/ccr-resolver.ts` — add three typed resolvers (`resolveCrisisHelpline`, `resolveCrisisHelplineLabel`, `resolveCrisisEmergencyNumber`) walking `ccr_configs` override → `country_profiles` default → null. Do NOT use generic `resolveCcrKey` for these values — it only reads `ccr_configs` and skips country-profile defaults (per its own docstring).
+   - `src/modules/ai-service/internal/handlers/chat.ts` — KEEP `runCrisisGate(... escalationDestination: null ...)` exactly as today. Rule 1: gate runs first, unconditional. Do NOT add a CCR call inside or before the gate.
+   - `src/modules/ai-service/internal/handlers/chat.ts` — in the crisis-detected branch (after gate returns `kind: 'crisis'`), invoke the typed crisis resolvers INSIDE a try/catch (Rule 2 fail-soft). On any throw: log warn, set all three values to null, continue to render the generic sentinel.
+   - `src/modules/ai-service/internal/handlers/chat.ts` — replace the hardcoded `CRISIS_RESPONSE_TEXT` module constant with `renderCrisisSentinel({ helplineE164, helplineLabel, emergencyNumber })`. The renderer template gracefully omits the country-specific line when any value is null.
+   - Integration tests per the 5-case obligation list in "Regression test obligations" above.
+3. Code change is bounded (≤150 LOC including the typed resolvers + renderer + 5 tests; single PR; Codex-reviewable in 2-3 rounds).
 
 ## Cross-cutting impact
 
