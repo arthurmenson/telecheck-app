@@ -172,6 +172,50 @@ export interface AuditFailureInjector {
 }
 
 /**
+ * Optional constructor for a sentinel-error subclass. When provided,
+ * `consumeOrThrow` instantiates this subclass instead of the default
+ * `AuditInjectedFailure`. The subclass MUST extend `AuditInjectedFailure`
+ * (so `instanceof AuditInjectedFailure` still holds for callers
+ * matching the generic base type) and MUST accept an `emitterName`
+ * constructor argument.
+ *
+ * Use case: a per-emitter wrapper that wants to preserve a legacy
+ * `instanceof MyEmitterAuditInjectedFailure` API while still
+ * benefiting from the generic factory's state isolation. Mode 1's
+ * `Mode1AuditInjectedFailure` is the canonical example (Codex R1
+ * closure on PR #165) — the wrapper passes the subclass constructor
+ * here so the consume path throws the subclass, not the generic base.
+ *
+ * Signature: `(emitterName: string) => AuditInjectedFailure`. The
+ * subclass's own constructor may accept additional optional
+ * arguments (e.g., a custom message) but the factory only passes
+ * the emitter name.
+ */
+export type AuditInjectedFailureCtor = new (emitterName: string) => AuditInjectedFailure;
+
+/**
+ * Options for createAuditFailureInjector. Optional — passing no
+ * options yields an injector that throws the generic
+ * `AuditInjectedFailure` base class.
+ */
+export interface CreateAuditFailureInjectorOptions {
+  /**
+   * Custom sentinel-error constructor (Codex R1 closure on PR #165).
+   * Passed only the emitter name. When omitted, `consumeOrThrow`
+   * throws `AuditInjectedFailure` directly.
+   *
+   * The constructor SHOULD extend `AuditInjectedFailure` so the
+   * `instanceof AuditInjectedFailure` guard in multi-injector test
+   * setups continues to work for callers that don't care about the
+   * subclass. The factory does not enforce this at construction
+   * time (TypeScript's typing on the parameter already does), but
+   * a custom error class that breaks the `AuditInjectedFailure`
+   * inheritance chain will surprise downstream consumers.
+   */
+  errorCtor?: AuditInjectedFailureCtor;
+}
+
+/**
  * Construct an independent audit-failure injector bound to the
  * given emitter name. Each call returns a fresh injector with its
  * own mode state (no shared module-level globals across injectors).
@@ -182,18 +226,32 @@ export interface AuditFailureInjector {
  * both the test file (set / reset / get) and the corresponding
  * vi.mock factory (consumeOrThrow).
  *
- * The emitter name is recorded on every AuditInjectedFailure
- * sentinel error so multi-injector test setups can disambiguate
- * which emitter failed (`err.emitterName === 'emitFoo'`).
+ * By default `consumeOrThrow` instantiates `AuditInjectedFailure`,
+ * which records the emitter name on every sentinel error so multi-
+ * injector test setups can disambiguate which emitter failed
+ * (`err.emitterName === 'emitFoo'`).
+ *
+ * If a wrapper needs to preserve a legacy `instanceof
+ * SubclassAuditInjectedFailure` API (Mode 1's
+ * `Mode1AuditInjectedFailure` is the canonical example from
+ * PR #165 Codex R1 closure), pass `options.errorCtor` and the
+ * consume path will instantiate that subclass instead.
  */
-export function createAuditFailureInjector(emitterName: string): AuditFailureInjector {
+export function createAuditFailureInjector(
+  emitterName: string,
+  options: CreateAuditFailureInjectorOptions = {},
+): AuditFailureInjector {
   if (typeof emitterName !== 'string' || emitterName.length === 0) {
     throw new Error(
       'createAuditFailureInjector: emitterName must be a non-empty string (used for AuditInjectedFailure.emitterName + diagnostics)',
     );
   }
 
+  const { errorCtor } = options;
   let mode: AuditFailureMode = 'normal';
+
+  const newSentinel = (): AuditInjectedFailure =>
+    errorCtor ? new errorCtor(emitterName) : new AuditInjectedFailure(emitterName);
 
   return {
     emitterName,
@@ -209,10 +267,10 @@ export function createAuditFailureInjector(emitterName: string): AuditFailureInj
         // Self-reset BEFORE throwing so a retry that arrives before
         // the test's catch block can run sees the 'normal' mode.
         mode = 'normal';
-        throw new AuditInjectedFailure(emitterName);
+        throw newSentinel();
       }
       if (mode === 'fail-always') {
-        throw new AuditInjectedFailure(emitterName);
+        throw newSentinel();
       }
       // 'normal' — caller delegates to the real emitter.
     },

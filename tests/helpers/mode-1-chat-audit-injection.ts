@@ -47,14 +47,71 @@ import {
   createAuditFailureInjector,
 } from './audit-failure-injection.ts';
 
+// ---------------------------------------------------------------------------
+// Backwards-compatible sentinel error class (declared FIRST so it can be
+// passed to the injector constructor below; the deprecation note still
+// applies)
+// ---------------------------------------------------------------------------
+//
+// The PR #163 implementation exported a `Mode1AuditInjectedFailure`
+// class. The generic harness consolidates on a single
+// `AuditInjectedFailure` whose `emitterName` field disambiguates
+// which emitter failed (more useful when a test exercises multiple
+// injectors). The class below is retained ONLY for `instanceof
+// Mode1AuditInjectedFailure` assertions that may exist in the
+// PR #163 test file or downstream — it is a thin subclass of
+// `AuditInjectedFailure` so both `instanceof` checks succeed.
+//
+// New test files should `instanceof AuditInjectedFailure` and read
+// `err.emitterName` to identify the emitter — that pattern scales
+// to any number of injectors.
+//
+// IMPORTANT (Codex R1 closure on PR #165): the injector below MUST
+// be constructed with `errorCtor: Mode1AuditInjectedFailure` so the
+// `consumeOrThrow` path throws THIS subclass, not the generic base.
+// Without the errorCtor wiring, `consumeMode1AuditFailureOrThrow`
+// would throw `AuditInjectedFailure` and silently break any
+// `err instanceof Mode1AuditInjectedFailure` assertion downstream.
+
+/**
+ * @deprecated for new test files — use `AuditInjectedFailure` from
+ * `./audit-failure-injection.ts` and check `err.emitterName ===
+ * 'emitMode1ChatResponseAudit'`. Retained as a thin subclass for
+ * backwards compatibility with any `instanceof
+ * Mode1AuditInjectedFailure` assertions in the PR #163 test file or
+ * downstream callers.
+ */
+export class Mode1AuditInjectedFailure extends AuditInjectedFailure {
+  // Match the generic factory's `AuditInjectedFailureCtor` signature
+  // by accepting only `emitterName`. The original PR #163 class
+  // accepted an optional message, but the factory never passes one;
+  // tests that want a custom message can instantiate this class
+  // directly and don't go through the injector.
+  constructor(_emitterName: string = 'emitMode1ChatResponseAudit') {
+    // `super` accepts (emitterName, message?) — the message is left
+    // to the default so AuditInjectedFailure populates it from the
+    // emitter name as usual.
+    super('emitMode1ChatResponseAudit');
+    this.name = 'Mode1AuditInjectedFailure';
+  }
+}
+
 /**
  * The single injector instance bound to
  * `emitMode1ChatResponseAudit`. Tests + the vi.mock factory both
  * reach the same injector via the named re-exports below (or
  * directly via this handle for new test files).
+ *
+ * Wired with `errorCtor: Mode1AuditInjectedFailure` per the Codex
+ * R1 closure on PR #165 so `consumeOrThrow` throws the subclass
+ * (preserving `instanceof Mode1AuditInjectedFailure` for PR #163
+ * compatibility) AND continues to satisfy `instanceof
+ * AuditInjectedFailure` for any generic catch path.
  */
 export const mode1ChatResponseAuditInjector: AuditFailureInjector =
-  createAuditFailureInjector('emitMode1ChatResponseAudit');
+  createAuditFailureInjector('emitMode1ChatResponseAudit', {
+    errorCtor: Mode1AuditInjectedFailure,
+  });
 
 // ---------------------------------------------------------------------------
 // Backwards-compatible named API (PR #163 surface)
@@ -97,33 +154,7 @@ export const resetMode1AuditFailure = (): void => mode1ChatResponseAuditInjector
 export const consumeMode1AuditFailureOrThrow = (): void =>
   mode1ChatResponseAuditInjector.consumeOrThrow();
 
-// ---------------------------------------------------------------------------
-// Backwards-compatible sentinel error class
-// ---------------------------------------------------------------------------
-//
-// The PR #163 implementation exported a `Mode1AuditInjectedFailure`
-// class. The generic harness consolidates on a single
-// `AuditInjectedFailure` whose `emitterName` field disambiguates
-// which emitter failed (more useful when a test exercises multiple
-// injectors). The class below is retained ONLY for
-// `instanceof Mode1AuditInjectedFailure` assertions that may exist
-// in the PR #163 test file — it is a thin subclass of
-// `AuditInjectedFailure` so both `instanceof` checks succeed.
-//
-// New test files should `instanceof AuditInjectedFailure` and read
-// `err.emitterName` to identify the emitter — that pattern scales
-// to any number of injectors.
-
-/**
- * @deprecated for new test files — use `AuditInjectedFailure` from
- * `./audit-failure-injection.ts` and check `err.emitterName ===
- * 'emitMode1ChatResponseAudit'`. Retained as a thin subclass for
- * backwards compatibility with any `instanceof
- * Mode1AuditInjectedFailure` assertions in the PR #163 test file.
- */
-export class Mode1AuditInjectedFailure extends AuditInjectedFailure {
-  constructor(message = 'test: emitMode1ChatResponseAudit forced failure') {
-    super('emitMode1ChatResponseAudit', message);
-    this.name = 'Mode1AuditInjectedFailure';
-  }
-}
+// Mode1AuditInjectedFailure declared above (must precede the injector
+// instantiation that passes it via errorCtor). Re-exporting nothing
+// here intentionally — the class is already exported from its
+// declaration site.
