@@ -1,5 +1,19 @@
 # Autonomous Turn — Cumulative Summary (2026-05-05)
 
+> **Historical-record framing (added 2026-05-17 per PR #174 §5 patch 9):**
+> This is an explicitly-dated 2026-05-05 turn summary. The body below captures state at the time it was written and is **preserved unedited** for traceability. Several body claims are stale relative to current state (2026-05-17) and should be read with that frame:
+>
+> - **"Spec Issues open: 3 (SI-001/002/003)"** is stale. Current OPEN inventory is **12 SIs** (SI-002/003/004/005/007/008/009/010/011/012/013/014); SI-001 RATIFIED P-011 2026-05-11; SI-006 CLOSED Sprint 33-34. See `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` r7 §4 for the current inventory.
+> - **"Slice 4 Pharmacy + Refill v2.1 — ⛔ Blocked on SI-001"** is stale. SI-001 RATIFIED P-011 2026-05-11; Pharmacy MedicationRequest/prescribe surface IMPLEMENTED (12 routes). Refill/dispensing/shipment surfaces remain SKELETON, now blocked on SI-007 (not SI-001).
+> - **"autonomous-friendly work surface is now substantially exhausted"** was a time-bounded 2026-05-05 snapshot; the surface has been productively extended through Sprint 38 (38+ PRs merged; 14 SIs filed; SI-001 + SI-006 closed; ~175 Codex closures).
+> - **"If SI-001 closes:"** forward-looking branch — the branch was taken (P-011).
+>
+> For the current state of the autonomous run + closure-debt list, see `Telecheck_v1_10_PRD_Update/AI_Service_Rollout_24h_Status_2026-05-14.md` Addendum 36+ (most recent at top).
+>
+> **Body below preserved unedited.**
+
+---
+
 **Final commit:** `dd94a27`
 **CI status:** ✅ Green
 **Total commits this resumed turn:** 70+

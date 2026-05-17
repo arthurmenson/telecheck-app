@@ -1,5 +1,19 @@
 # Autonomous Turn — Cumulative Summary (2026-05-11)
 
+> **Historical-record framing (added 2026-05-17 per PR #174 §5 patch 11):**
+> This is an explicitly-dated 2026-05-11 turn summary. The body below captures state at the time it was written and is **preserved unedited** for traceability. Several body claims are stale relative to current state (2026-05-17):
+>
+> - **"PR #95 remains DRAFT pending SI-001 ratification"** is stale. SI-001 RATIFIED P-011 later on 2026-05-11 (same calendar date as this doc, but after the snapshot was captured). PR #95 was superseded by the Sprint 35 scaffold-rebuild branch `feat/slice-4-pharmacy-scaffold-rebuild-p011`; the rebuild branch's successor PR landed the Pharmacy MedicationRequest/prescribe surface.
+> - **"PRs DRAFT-open: 1 (#95)"** is stale (PR #95 superseded).
+> - **"Open Spec Issues with DRAFT closure proposals ready for Evans: 5 (SI-001 through SI-005)"** is partly stale. SI-001 RATIFIED P-011 leaving 4 of the 5 DRAFT closure proposals pending ratifier review (SI-002/003/004/005). Additionally, **SI-007 through SI-014 were filed after this doc was written** (8 new SIs filed 2026-05-14 through 2026-05-16); those 8 do not yet have DRAFT closure proposals.
+> - Current OPEN inventory: **12 SIs** (SI-002/003/004/005/007/008/009/010/011/012/013/014).
+>
+> For the current state of the autonomous run + closure-debt list, see `Telecheck_v1_10_PRD_Update/AI_Service_Rollout_24h_Status_2026-05-14.md` Addendum 36+ (most recent at top).
+>
+> **Body below preserved unedited.**
+
+---
+
 **Final PR merged in this turn:** #107 (amendment 2 — this update)
 **CI status:** ✅ Green on main throughout the run
 **Total PRs this turn:** 18 merged (#87, #88, #93, #94, #96-#107) + 1 DRAFT-open (#95)
