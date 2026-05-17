@@ -64,9 +64,12 @@ The forensic-correlation mechanism is therefore a SECOND audit event ratified by
 - **Detail fields:**
   - `resolved_destination: string | null` — the helpline E.164 if CCR resolved, null otherwise
   - `resolution_status: 'resolved' | 'ccr_unavailable' | 'unmapped_country'` — three-value enum for ops-alert filtering
-- **Emission:** mandatory, ALWAYS fires alongside Category A regardless of CCR outcome. If CCR resolved successfully, status is `resolved`. If CCR threw, status is `ccr_unavailable` (this is the alert-worthy state). If CCR returned null because the tenant's country has no defaults configured, status is `unmapped_country` (also alert-worthy, but a different ops triage path — "add helpline defaults for country X" not "fix CCR connectivity").
+- **Emission policy:** mandatory ATTEMPT alongside Category A regardless of CCR outcome. If CCR resolved successfully, status is `resolved`. If CCR threw, status is `ccr_unavailable` (this is the alert-worthy state). If CCR returned null because the tenant's country has no defaults configured, status is `unmapped_country` (also alert-worthy, but a different ops triage path — "add helpline defaults for country X" not "fix CCR connectivity").
+- **Failure policy — FAIL-SOFT, divergent from FLOOR-020 (Codex R5 H1 closure 2026-05-16).** Emission of this Category B event MUST be wrapped in try/catch by the handler. If the audit write throws (audit DB outage, hash-chain commit failure, etc.) the handler logs at ERROR level for ops triage but STILL returns 200 with the crisis sentinel response to the patient. This is an intentional divergence from the FLOOR-020 operational-audit pattern used by Mode 1 Category C (`ai_chat_response_emitted`), which DOES return 503 on emission failure. The rationale: a patient in crisis MUST receive the sentinel response — losing forensic-correlation coverage on a transient audit-DB outage is a tolerable operational regression; suppressing the safety surface is not. The forensic loss is itself recoverable post-hoc via the Category A row's timestamp + actor + tenant + crisis_session_id, which all remain durably committed on the safety-floor path regardless of Category B's fate.
 
-This decoupling avoids reworking `runCrisisGate` to accept deferred-resolution callbacks (which would complicate the gate's already-careful dedupe logic) and keeps the safety-floor Category A audit semantically unchanged.
+This fail-soft posture is the reason Rule 4 establishes a SEPARATE audit event rather than attempting to amend the Category A `crisis_detection_trigger` write to carry the destination directly. The Category A write must remain on the synchronous safety-floor commit path (cannot be skipped, cannot be deferred); the Category B write rides a softer SLA so we can guarantee Category A delivery without coupling crisis-response delivery to a second blocking audit dependency.
+
+This decoupling also avoids reworking `runCrisisGate` to accept deferred-resolution callbacks (which would complicate the gate's already-careful dedupe logic) and keeps the safety-floor Category A audit semantically unchanged.
 
 ```typescript
 // Mode 1 chat handler — crisis-bypass branch (post-SI-013)
@@ -130,35 +133,54 @@ const crisisResponseText = renderCrisisSentinel({
 //     CCR failed or country has no defaults)
 //   - detail.resolution_status: 'resolved' | 'ccr_unavailable' |
 //     'unmapped_country'
-// This is mandatory, not optional — the SI's stated benefit of
-// removing null-destination ops noise + enabling post-hoc
-// forensic correlation depends on Category B always emitting
-// alongside Category A.
-await emitCrisisEscalationDestinationResolved({
-  linkedAuditId: inputCrisisOutcome.audit_id,
-  resolvedDestination: helplineE164,
-  // Status derivation MUST match the engineering checklist (Codex R4
-  // M1 closure 2026-05-16): 'resolved' iff the primary helpline E.164
-  // resolved; else 'ccr_unavailable' iff the resolver threw (the
-  // alert-worthy connectivity state); else 'unmapped_country' (the
-  // alert-worthy config-gap state — tenant's country has no defaults
-  // for these keys). A pure null-check heuristic without `ccrThrew`
-  // would mis-classify legitimate unmapped-country lookups as CCR
-  // outages and corrupt the ops-alert signal this SI is adding.
-  resolutionStatus: helplineE164 !== null
-    ? 'resolved'
-    : ccrThrew
-      ? 'ccr_unavailable'
-      : 'unmapped_country',
-  // ... tenant + actor + countryOfCare attribution ...
-});
+// This is a mandatory ATTEMPT, not a mandatory commit — the SI's
+// stated benefit of removing null-destination ops noise + enabling
+// post-hoc forensic correlation depends on Category B always
+// emitting alongside Category A WHEN POSSIBLE. Per Codex R5 H1
+// closure 2026-05-16, the emission is FAIL-SOFT (divergent from
+// FLOOR-020 / Category C policy): a Category B write failure logs at
+// ERROR but DOES NOT 503, because the patient is in crisis and must
+// receive the sentinel response regardless of audit-DB liveness.
+// Forensic loss on a transient outage is recoverable post-hoc via
+// Category A's durable timestamp + actor + tenant + crisis_session_id.
+try {
+  await emitCrisisEscalationDestinationResolved({
+    linkedAuditId: inputCrisisOutcome.audit_id,
+    resolvedDestination: helplineE164,
+    // Status derivation MUST match the engineering checklist (Codex R4
+    // M1 closure 2026-05-16): 'resolved' iff the primary helpline
+    // E.164 resolved; else 'ccr_unavailable' iff the resolver threw
+    // (the alert-worthy connectivity state); else 'unmapped_country'
+    // (the alert-worthy config-gap state — tenant's country has no
+    // defaults for these keys). A pure null-check heuristic without
+    // `ccrThrew` would mis-classify legitimate unmapped-country
+    // lookups as CCR outages and corrupt the ops-alert signal this SI
+    // is adding.
+    resolutionStatus: helplineE164 !== null
+      ? 'resolved'
+      : ccrThrew
+        ? 'ccr_unavailable'
+        : 'unmapped_country',
+    // ... tenant + actor + countryOfCare attribution ...
+  });
+} catch (auditErr) {
+  // Rule 4 fail-soft policy (Codex R5 H1 closure 2026-05-16):
+  // DO NOT 503. The crisis sentinel response MUST reach the patient.
+  // Ops triage handles the forensic-audit gap via Category A
+  // recovery; suppressing the safety surface for an audit write is
+  // not acceptable on the crisis branch.
+  req.log.error(
+    { err: auditErr, tenant_id: ctx.tenantId, linked_audit_id: inputCrisisOutcome.audit_id },
+    'mode_1_chat: Category B crisis.escalation_destination_resolved emission failed — sentinel still returned to patient (fail-soft per Rule 4)',
+  );
+}
 ```
 
 The `renderCrisisSentinel` helper interpolates the resolved values into a template; the template itself remains a module constant (reviewable in one place). When any value is null (CCR fail-soft path, or country-profile lookup miss for an unmapped country), the template gracefully omits the country-specific line and surfaces only the generic "your care team has been alerted" text — same as today's pre-SI-013 behavior.
 
 ### Regression test obligations (downstream impl)
 
-When the code change lands, the test suite MUST cover (Codex R3 M1 closure 2026-05-16 expanded Rule 4 coverage in items 6–9):
+When the code change lands, the test suite MUST cover (Codex R3 M1 closure 2026-05-16 expanded Rule 4 coverage in items 6–9; Codex R5 H1 closure 2026-05-16 added item 10 for the fail-soft Category B policy):
 
 1. Happy path: US tenant + crisis input → sentinel contains `'988'` (or whatever US helpline ratifies)
 2. Happy path: GH tenant + crisis input → sentinel contains the Ghana helpline label
@@ -169,6 +191,7 @@ When the code change lands, the test suite MUST cover (Codex R3 M1 closure 2026-
 7. **Rule 4 ccr_unavailable:** crisis input + CCR resolver throws → Category B audit STILL emits with `detail.resolution_status === 'ccr_unavailable'` AND `detail.resolved_destination === null` AND `linked_events` correctly references the Category A audit_id (NOT swallowed by the try/catch — the Category B emission lives OUTSIDE the resolver try/catch)
 8. **Rule 4 unmapped_country:** crisis input + tenant with no country defaults → Category B audit emits with `detail.resolution_status === 'unmapped_country'` AND `detail.resolved_destination === null` (this is the "ratifier needs to add helpline defaults for country X" alert path; semantically distinct from `ccr_unavailable` which is a connectivity alert)
 9. **Rule 4 idempotency-retry invariant:** crisis input with retry under the same Idempotency-Key → across both attempts, exactly ONE Category A `crisis_detection_trigger` AND exactly ONE Category B `crisis.escalation_destination_resolved` (no duplicate emission on replay; same pattern as the FLOOR-020 + I-019 two-layer dedupe from PR #163)
+10. **Rule 4 Category B fail-soft (Codex R5 H1 closure 2026-05-16):** crisis input + Category B audit emitter throws (audit-DB outage simulated via the PR #163 vi.mock injection harness pattern, extended for `emitCrisisEscalationDestinationResolved`) → response is **200** with the crisis sentinel (NOT 503), Category A audit STILL committed durably, ERROR-level log emitted with `linked_audit_id` for ops triage, and NO Category B row present in `audit_records`. This is the test that proves the SI's safety-surface guarantee survives audit-DB outage — and the test that pins the divergence from FLOOR-020/Category C's 503-on-failure policy. A regression here is a P0 because it means the crisis branch CAN fail closed.
 
 ## What this SI does NOT propose
 
@@ -186,13 +209,13 @@ When SI-013 closes:
 3. Engineering authors (downstream impl checklist — MUST preserve Rules 1+2+3+4 from "Surface integration" above; Codex R2 H1 + Codex R3 M1 closures 2026-05-16):
    - `src/modules/tenant-config/internal/ccr-keys.ts` — extend `CCR_KEYS` constant with the three new entries (purely additive; existing surface unchanged)
    - `src/modules/tenant-config/internal/services/ccr-resolver.ts` — add three typed resolvers (`resolveCrisisHelpline`, `resolveCrisisHelplineLabel`, `resolveCrisisEmergencyNumber`) walking `ccr_configs` override → `country_profiles` default → null. Do NOT use generic `resolveCcrKey` for these values — it only reads `ccr_configs` and skips country-profile defaults (per its own docstring).
-   - `src/modules/ai-service/internal/audit.ts` — **NEW emitter `emitCrisisEscalationDestinationResolved(args, tx?)` (Rule 4 mandatory).** Emits a Category B audit row with action `crisis.escalation_destination_resolved`, `linked_events: [<original Category A audit_id>]`, `detail: { resolved_destination: string | null, resolution_status: 'resolved' | 'ccr_unavailable' | 'unmapped_country' }`. Audit-envelope population (tenant_id, actor, ai_workload_type='conversational_assistant', autonomy_level='advisory') follows the same I-027 attribution rules as the existing Mode 1 Category C emitter. Implementation pattern mirrors `emitMode1ChatResponseAudit` so the same vi.mock injection harness from PR #163 can exercise its failure path.
+   - `src/modules/ai-service/internal/audit.ts` — **NEW emitter `emitCrisisEscalationDestinationResolved(args, tx?)` (Rule 4 mandatory attempt; fail-soft callsite per Codex R5 H1 closure 2026-05-16).** Emits a Category B audit row with action `crisis.escalation_destination_resolved`, `linked_events: [<original Category A audit_id>]`, `detail: { resolved_destination: string | null, resolution_status: 'resolved' | 'ccr_unavailable' | 'unmapped_country' }`. Audit-envelope population (tenant_id, actor, ai_workload_type='conversational_assistant', autonomy_level='advisory') follows the same I-027 attribution rules as the existing Mode 1 Category C emitter. Implementation surface mirrors `emitMode1ChatResponseAudit` (so the PR #163 vi.mock injection harness can exercise its failure path), BUT the handler-level callsite wraps it in try/catch and downgrades failure to ERROR log + 200 sentinel (NOT 503). Do NOT introduce a `CrisisEscalationDestinationAuditEmissionFailedError → 503` mapping equivalent to the Mode 1 Category C `Mode1AuditEmissionFailedError` — that pattern is specific to Category C's safety budget and would break Rule 4's fail-soft policy on the crisis branch.
    - `src/modules/ai-service/internal/handlers/chat.ts` — KEEP `runCrisisGate(... escalationDestination: null ...)` exactly as today. Rule 1: gate runs first, unconditional. Do NOT add a CCR call inside or before the gate.
    - `src/modules/ai-service/internal/handlers/chat.ts` — in the crisis-detected branch (after gate returns `kind: 'crisis'`), invoke the typed crisis resolvers INSIDE a try/catch (Rule 2 fail-soft). On any throw: log warn, set all three values to null, continue to render the generic sentinel. Track whether the catch fired (boolean `ccrThrew`) to distinguish `ccr_unavailable` from `unmapped_country` in Rule 4 emission below.
-   - `src/modules/ai-service/internal/handlers/chat.ts` — **MANDATORY (Rule 4):** invoke `emitCrisisEscalationDestinationResolved` AFTER the resolver try/catch returns (success OR failure), passing `linkedAuditId: inputCrisisOutcome.audit_id`, `resolvedDestination: helplineE164`, and `resolutionStatus` derived from the three states: `'resolved'` if `helplineE164 !== null`; else `'ccr_unavailable'` if `ccrThrew === true`; else `'unmapped_country'`. The Category B emission lives OUTSIDE the resolver try/catch so a CCR throw cannot suppress the forensic-correlation audit. Emission failure of the Category B emitter follows the same FLOOR-020 pattern as Category C (operational audit failure → 503 with tenant-blind envelope); the safety surface (Category A + sentinel response) is unaffected because both have already executed by the time Category B emits.
+   - `src/modules/ai-service/internal/handlers/chat.ts` — **MANDATORY ATTEMPT (Rule 4):** invoke `emitCrisisEscalationDestinationResolved` AFTER the resolver try/catch returns (success OR failure), passing `linkedAuditId: inputCrisisOutcome.audit_id`, `resolvedDestination: helplineE164`, and `resolutionStatus` derived from the three states: `'resolved'` if `helplineE164 !== null`; else `'ccr_unavailable'` if `ccrThrew === true`; else `'unmapped_country'`. The Category B invocation lives OUTSIDE the resolver try/catch so a CCR throw cannot suppress the forensic-correlation audit attempt. **FAIL-SOFT (Codex R5 H1 closure 2026-05-16; divergent from FLOOR-020 / Category C):** the Category B emission itself MUST be wrapped in its own try/catch. On audit-write failure, log at ERROR level for ops triage (include `linked_audit_id` so the gap can be reconciled against the durable Category A row post-hoc) and STILL return the 200 + crisis sentinel response. Do NOT translate Category B emitter failure into a 503 — the patient is in crisis and the safety surface must reach them regardless of audit-DB liveness. This is intentionally different from the Mode 1 Category C operational-audit policy, where emission failure DOES return 503 (no safety-surface penalty in that case because there's no in-flight crisis).
    - `src/modules/ai-service/internal/handlers/chat.ts` — replace the hardcoded `CRISIS_RESPONSE_TEXT` module constant with `renderCrisisSentinel({ helplineE164, helplineLabel, emergencyNumber })`. The renderer template gracefully omits the country-specific line when any value is null.
    - Integration tests per the 9-case obligation list in "Regression test obligations" above (items 6–9 cover Rule 4).
-4. Code change is bounded (≤220 LOC including the typed resolvers + Category B emitter + renderer + 9 tests; single PR; Codex-reviewable in 2-3 rounds).
+4. Code change is bounded (≤240 LOC including the typed resolvers + Category B emitter + renderer + 10 tests; single PR; Codex-reviewable in 2-3 rounds).
 
 ## Cross-cutting impact
 
