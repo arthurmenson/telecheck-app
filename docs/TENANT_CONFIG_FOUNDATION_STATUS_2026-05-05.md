@@ -41,7 +41,7 @@ What benefited indirectly from Sprint 33-34:
 
 The tenant-config foundation layer covers CDM v1.2 §4.2-§4.6 — five entities that every CCR-driven downstream slice depends on. **NOT a slice from the EHBG §10b sprint plan** — this is foundational utility infrastructure that would otherwise have been inlined inside Identity, Forms-Intake, and Consent (and forced re-inlining in every future slice). Lifted into its own module per ADR-001 modular monolith.
 
-The work was unblocked because none of the §4.2-§4.6 entities reference `medication_requests`, so SI-001 doesn't gate this module. After Slice 4 unblocks, Pharmacy + Refill will be the first heavyweight CCR-driven consumer.
+The work was unblocked because none of the §4.2-§4.6 entities reference `medication_requests`, so SI-001 didn't gate this module — and per PR #173 2026-05-17 STATUS refresh + Codex R3 M1 closure, Slice 4 Pharmacy + Refill is no longer wholly future-blocked: SI-001 RATIFIED via P-011 2026-05-12 + the Pharmacy MedicationRequest/prescribe surface IS the first heavyweight CCR-driven consumer today (calling `resolveCcrKey(ctx, 'pharmacy.routing_strategy')` etc. per §"Cross-slice consumers" below). The refill + dispensing + shipment surfaces of Slice 4 remain SI-007-blocked; those become CCR-driven consumers when SI-007 ratifies.
 
 ---
 
