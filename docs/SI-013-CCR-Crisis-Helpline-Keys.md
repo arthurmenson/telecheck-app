@@ -39,40 +39,81 @@ Add to `src/modules/tenant-config/internal/ccr-keys.ts` `CCR_KEYS` constant, alp
 
 | Key | Type | Notes |
 |---|---|---|
-| `crisis.helpline_e164` | E.164 phone string | Country-of-care-driven crisis helpline number. Resolved via `resolveCcrKey(ctx, 'crisis.helpline_e164')`. Example values: `'+18002738255'` (US — 988 SMS-compatible alternate), `'+233244841920'` (Ghana — example MindfreedomGhana). Country-profile defaults populated for both US + GH at first ratification. |
-| `crisis.helpline_label` | Display string | Human-readable label for the helpline, surfaced in the crisis-sentinel response text. Examples: `'988 Suicide & Crisis Lifeline'` (US), `'Mental Health Helpline'` (GH). Country-profile defaults. |
-| `crisis.emergency_number_e164` | E.164 phone string | Country's primary emergency-services number. Examples: `'911'` (US — non-E.164 but conventional), `'112'` (GH or 191). Surfaced in the sentinel as "call emergency services" → "call 112". Country-profile defaults. |
+| `crisis.helpline_e164` | E.164 phone string | Country-of-care-driven crisis helpline number. Validated E.164 (`^\+[1-9][0-9]{6,14}$`) — short codes go in `crisis.emergency_number` below, NOT here. Example values: `'+18002738255'` (US — 988 SMS-compatible alternate), `'+233244841920'` (Ghana — example MindfreedomGhana). |
+| `crisis.helpline_label` | Display string | Human-readable label for the helpline, surfaced in the crisis-sentinel response text. Examples: `'988 Suicide & Crisis Lifeline'` (US), `'Mental Health Helpline'` (GH). |
+| `crisis.emergency_number` | Dialable string (NOT E.164) | Country's primary emergency-services number. Per Codex R1 M1 closure 2026-05-16: short codes (`'911'`, `'112'`, `'191'`) are NOT E.164 and naming a key `*_e164` for them is naming drift that downstream tel-link rendering / validation can mangle. The dialable-string contract is: a value the patient device's dialer can place a call to verbatim. Examples: `'911'` (US), `'112'` (GH), `'191'` (GH alternate). Surfaced in the sentinel as "call emergency services at 112". |
 
 ### Surface integration (downstream impl)
 
-When the CCR keys ratify, the Mode 1 chat handler's crisis-bypass branch resolves them at request time:
+When the CCR keys ratify, the Mode 1 chat handler resolves them ONLY on the crisis-detected branch, AFTER `runCrisisGate` has fired. Two safety-floor rules constrain the resolution order (Codex R1 H1+H2 closures 2026-05-16):
+
+**Rule 1 — crisis gate runs FIRST, unconditional.**
+The gate is the I-019 platform-floor; it cannot be gated behind a CCR lookup. The handler passes `escalationDestination: null` to the gate (same as today), the gate emits the Category A `crisis_detection_trigger` audit if positive, and ONLY THEN does the handler resolve the CCR helpline values for the sentinel response. If CCR resolution fails (DB timeout, transient unavailability, version skew), the patient still gets a safety surface — the generic sentinel without country-specific numbers — because the gate has already done its work.
+
+**Rule 2 — CCR resolution is fail-soft.** Wrapped in try/catch; on any failure, the resolver returns null and the sentinel falls back to the generic template. The handler logs the failure at warn level for ops triage but DOES NOT propagate it as a 503.
+
+**Rule 3 — country-profile defaults require TYPED resolvers**, not the generic `resolveCcrKey`. The generic resolver only reads `ccr_configs` and returns null for tenants without overrides; country-profile defaults are not auto-mapped (per the resolver's own docstring — see `src/modules/tenant-config/internal/services/ccr-resolver.ts` "country-profile defaults are NOT auto-mapped here because the country_profiles columns are typed... Use the typed resolvers below..."). So this SI's downstream impl ALSO ratifies typed crisis resolvers — `resolveCrisisHelpline(ctx)`, `resolveCrisisEmergencyNumber(ctx)` — that walk ccr_configs override → country_profile default → null.
 
 ```typescript
 // Mode 1 chat handler — crisis-bypass branch (post-SI-013)
-const helplineE164 = await resolveCcrKey(ctx, CCR_KEYS.CRISIS_HELPLINE_E164);
-const helplineLabel = await resolveCcrKey(ctx, CCR_KEYS.CRISIS_HELPLINE_LABEL);
-const emergencyNumber = await resolveCcrKey(ctx, CCR_KEYS.CRISIS_EMERGENCY_NUMBER_E164);
-
-// Pass to crisis gate so the Category A audit captures the destination
+// Rule 1: crisis gate FIRST with null escalation; gate is unconditional.
 const inputCrisisOutcome = await runCrisisGate(
   {
     // ... existing fields ...
-    escalationDestination: helplineE164,  // was null
+    escalationDestination: null,  // resolved AFTER gate per Rule 1
     idempotencyCtx,
   },
   rawMessageText,
   'ai_chat_input',
 );
 
-// Surface the country-localized sentinel
+const crisisDetected = inputCrisisOutcome.kind === 'crisis';
+if (!crisisDetected) {
+  // ... existing no-crisis branch, no CCR resolution needed ...
+}
+
+// Rule 2: fail-soft CCR resolution. Generic-sentinel fallback on failure.
+let helplineE164: string | null = null;
+let helplineLabel: string | null = null;
+let emergencyNumber: string | null = null;
+try {
+  // Rule 3: typed resolvers, not the generic resolveCcrKey.
+  helplineE164 = await resolveCrisisHelpline(ctx);
+  helplineLabel = await resolveCrisisHelplineLabel(ctx);
+  emergencyNumber = await resolveCrisisEmergencyNumber(ctx);
+} catch (err) {
+  req.log.warn(
+    { err, tenant_id: ctx.tenantId },
+    'mode_1_chat: CCR crisis-resource resolution failed — falling back to generic sentinel',
+  );
+}
+
+// Render sentinel; generic template used if any resolved value is null.
 const crisisResponseText = renderCrisisSentinel({
   helplineE164,
   helplineLabel,
   emergencyNumber,
 });
+
+// Update the Category A audit's escalation_destination AFTER the fact
+// via a follow-up Category B `crisis.escalation_destination_resolved`
+// event? OR: rework runCrisisGate to accept a deferred-resolution
+// callback. Either path is an additional design decision the ratifier
+// settles. At v1.0 the audit's escalation_destination remains null
+// (current behavior); post-SI-013, the field becomes populatable.
 ```
 
-The `renderCrisisSentinel` helper interpolates the resolved values into a template. The template itself remains a module constant (reviewable in one place); only the helpline + emergency-number values vary by country.
+The `renderCrisisSentinel` helper interpolates the resolved values into a template; the template itself remains a module constant (reviewable in one place). When any value is null (CCR fail-soft path, or country-profile lookup miss for an unmapped country), the template gracefully omits the country-specific line and surfaces only the generic "your care team has been alerted" text — same as today's pre-SI-013 behavior.
+
+### Regression test obligations (downstream impl)
+
+When the code change lands, the test suite MUST cover:
+
+1. Happy path: US tenant + crisis input → sentinel contains `'988'` (or whatever US helpline ratifies)
+2. Happy path: GH tenant + crisis input → sentinel contains the Ghana helpline label
+3. Fail-soft: crisis input + CCR resolver throws → 200 generic sentinel (NOT 503) + Category A audit STILL emits
+4. Country-profile default path: tenant with NO ccr_configs override → typed resolver walks to country_profile + returns the default
+5. Unmapped country: tenant whose country_of_care has no defaults → sentinel falls back to generic template, no crash
 
 ## What this SI does NOT propose
 
