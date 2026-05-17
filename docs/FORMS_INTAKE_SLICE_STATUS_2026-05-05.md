@@ -118,6 +118,19 @@ Total: 10 call sites + 5 import-line deletions. Functionally a no-op since PR #4
 
 ---
 
+## ⚠ Everything below this line is HISTORICAL (as-of 2026-05-08 or earlier)
+
+**Codex R5 M1 closure 2026-05-17:** mirrors the Pharmacy STATUS doc's historical-vs-current banner pattern. The sections below describe the Forms-Intake slice state BEFORE PR #172's Sibling-Doc Cross-Validation Audit surfaced the publish-gate sentinel disclosure gap. Present-tense claims like "is implementation-complete on its v2.1 surface" or "the full template authoring → ... → resume after pause pipeline works end-to-end" are accurate AS-OF-2026-05-08 in the test-environment posture but stale relative to the production-deploy posture documented in the 2026-05-17 top-of-doc amendment. **Read these sections as historical record only.** Current state is the 2026-05-17 publish-gate-disclosure amendment at the top of this doc.
+
+Specific historical-vs-current corrections (do NOT use the body text below for current-state decisions):
+
+- "is **implementation-complete on its v2.1 surface**" (historical; accurate for the test-environment posture) → **Current state: COMPLETE-EXCEPT-PUBLISH-GATES** per top-of-doc amendment — 11 HTTP surfaces ship + pass tests; publish route is fail-closed in non-test environments via `FORMS_PUBLISH_GATES_BYPASS='unsafe-test-only'` sentinel pending SI-011 IMPL (production-deploy blocker)
+- "the full **template authoring → deployment → patient-facing intake → crisis-detection gate → snapshot at submit → resume after pause** pipeline works end-to-end" (historical; accurate for the test-environment posture) → **Current state: pipeline works end-to-end in test environments where the `FORMS_PUBLISH_GATES_BYPASS` sentinel can be set; production-deploy publish path is fail-closed pending SI-011 + its 4 IMPL-readiness gates (SI-010 + SI-008 + MarketingCopy CDM + I-030 detection rules) ratifying per Q2 2026 Ratifier Ceremony**
+
+The sections below are PRESERVED verbatim as the audit-trail record of the original Slice 1 landing + the Sprint 33-34 amendment context. They are NOT current-state documentation; they should not be relied on for production-deploy planning. Use the top-of-doc 2026-05-17 amendment for current state.
+
+---
+
 ## Summary
 
 The Forms / Intake Engine slice (Slice 1 of 17 per EHBG §10b sprint plan; **Slice 1** is the platform foundation that unblocks Identity, Consent, Subscription, and every clinical surface that depends on intake-driven account creation) is **implementation-complete on its v2.1 surface**.
