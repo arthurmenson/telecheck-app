@@ -170,7 +170,7 @@ The 6-round Codex trajectory closed these:
 
 - **If `livekit_room_id` PHI-encryption call (SI-009 decision 1) needs Platform Privacy Officer input** — defer SI-009 to sub-ceremony 2.5; ratify SI-008 standalone (no shared dependency on the LiveKit room ID call). Cluster B HARD constraint still holds: SI-008 alone is sufficient to unblock SI-005's FK 6 ratification; FK 7 to SI-009 ratifies whenever SI-009 closes.
 - **If recommendation-storage call (SI-008 decision 3) needs operational deep-dive** — TOAST-BYTEA is the safe default that doesn't preclude future S3-pointer refactor. Ratify as TOAST-BYTEA; revisit at first scale incident.
-- **If any of the 22 SI-008 columns or 13 SI-009 columns need amendment** — engineering opens a v0.4 / v0.X+1 DRAFT amendment + re-runs Codex pre-ratification gate (precedent: SI-007 took 18 rounds; SI-001 took 11; further rounds on SI-008/009 are cheap on Codex).
+- **If any of the 23 SI-008 columns (15 base + 8-column KMS envelope) or 13 SI-009 columns need amendment** — engineering opens a v0.4 / v0.X+1 DRAFT amendment + re-runs Codex pre-ratification gate (precedent: SI-007 took 18 rounds; SI-001 took 11; further rounds on SI-008/009 are cheap on Codex).
 
 ---
 
