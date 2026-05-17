@@ -91,7 +91,7 @@ The 28 placeholder event-type strings emitted by the 3 slices are listed below. 
 2. Pick canonical naming convention (note Forms/Intake mixes `forms_template.created` with `intake_response.submitted` — both work; this corpus might benefit from picking `<aggregate>.<lifecycle_event>` uniformly)
 3. Author the DOMAIN_EVENTS v5.2 enumeration block adding all 28 ratified event-type strings (or v5.3 amendment)
 4. Define the mandatory `payload` shape per event (field names, types, nullability)
-5. Promotion Ledger entry P-013 closes this SI
+5. Next-available Promotion Ledger entry after P-018/SI-008 closes this SI (originally planned for P-013 but P-013 was claimed by SI-007 v0.19 merged 2026-05-14; P-014 by SI-002; P-017 by SI-005; P-018 by SI-008; see the "Resolution expectations" block below for the full chain — updated 2026-05-17 per PR #175 R3 MEDIUM closure to align Step 1's close-out instruction with the Resolution-expectations block)
 
 ### Step 2 (this code repo, owned by Engineering)
 
