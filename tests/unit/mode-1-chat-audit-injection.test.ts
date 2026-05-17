@@ -106,6 +106,54 @@ describe('Mode 1 wrapper — sentinel error contract (PR #163 backwards compat)'
     expect(err).toBeInstanceOf(AuditInjectedFailure);
     expect(err.name).toBe('Mode1AuditInjectedFailure');
     expect(err.emitterName).toBe('emitMode1ChatResponseAudit');
+    // Default message comes from the class's own default, NOT the
+    // generic base's `${emitterName} forced failure` template — so
+    // a downstream test asserting on the exact PR #163 message
+    // string continues to pass.
+    expect(err.message).toBe('test: emitMode1ChatResponseAudit forced failure');
+  });
+
+  it('Mode1AuditInjectedFailure preserves PR #163 legacy custom-message contract (Codex R2 M1)', () => {
+    // The original PR #163 class accepted `(message?: string)` and
+    // passed it to the parent Error. A previous interim refactor
+    // normalized the signature to `(_emitterName?: string)` which
+    // silently broke `new Mode1AuditInjectedFailure('custom diagnostic')`
+    // (the custom message was discarded). Codex R2 M1 reopened the
+    // legacy surface so direct construction with a custom message
+    // continues to carry that message into Error.message verbatim.
+    const err = new Mode1AuditInjectedFailure('custom diagnostic text');
+    expect(err).toBeInstanceOf(Mode1AuditInjectedFailure);
+    expect(err).toBeInstanceOf(AuditInjectedFailure);
+    expect(err.message).toBe('custom diagnostic text');
+    // emitterName is still bound — the custom message does not
+    // change the emitter identity.
+    expect(err.emitterName).toBe('emitMode1ChatResponseAudit');
+  });
+
+  it('factory adapter produces canonical sentinel message (not the literal emitter-name string)', () => {
+    // Regression guard for the Codex R2 M1 closure design:
+    // Mode1AuditInjectedFailureFactoryAdapter must IGNORE the
+    // emitter name the factory passes (the class is already bound
+    // to it) and call the no-argument parent constructor to get
+    // the canonical default sentinel message. A regression where
+    // the adapter forwarded its argument to the public
+    // (message?: string) constructor would put the literal string
+    // 'emitMode1ChatResponseAudit' into err.message — wrong.
+    setMode1AuditFailure('fail-always');
+
+    try {
+      consumeMode1AuditFailureOrThrow();
+      throw new Error('unreachable');
+    } catch (err) {
+      expect(err).toBeInstanceOf(Mode1AuditInjectedFailure);
+      // Canonical default message — NOT the literal emitter-name string.
+      expect((err as Mode1AuditInjectedFailure).message).toBe(
+        'test: emitMode1ChatResponseAudit forced failure',
+      );
+      expect((err as Mode1AuditInjectedFailure).message).not.toBe(
+        'emitMode1ChatResponseAudit',
+      );
+    }
   });
 
   it('exposes the same injector handle via the generic + named APIs', () => {

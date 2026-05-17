@@ -80,19 +80,52 @@ import {
  * backwards compatibility with any `instanceof
  * Mode1AuditInjectedFailure` assertions in the PR #163 test file or
  * downstream callers.
+ *
+ * Public constructor signature preserves the original PR #163
+ * contract: `(message?: string)` (Codex R2 M1 closure on PR #165;
+ * the previous interim signature `(_emitterName?: string)` regressed
+ * legacy direct-construction with a custom message). The factory's
+ * `AuditInjectedFailureCtor` signature — which requires
+ * `(emitterName: string)` — is satisfied by a private adapter
+ * subclass below, so both surfaces work without compromise.
  */
 export class Mode1AuditInjectedFailure extends AuditInjectedFailure {
-  // Match the generic factory's `AuditInjectedFailureCtor` signature
-  // by accepting only `emitterName`. The original PR #163 class
-  // accepted an optional message, but the factory never passes one;
-  // tests that want a custom message can instantiate this class
-  // directly and don't go through the injector.
-  constructor(_emitterName: string = 'emitMode1ChatResponseAudit') {
-    // `super` accepts (emitterName, message?) — the message is left
-    // to the default so AuditInjectedFailure populates it from the
-    // emitter name as usual.
-    super('emitMode1ChatResponseAudit');
+  constructor(message?: string) {
+    // emitterName is always 'emitMode1ChatResponseAudit' for this
+    // class; the optional `message` parameter is the legacy PR #163
+    // surface so `new Mode1AuditInjectedFailure('custom diagnostic')`
+    // still carries the custom string into Error.message.
+    super(
+      'emitMode1ChatResponseAudit',
+      message ?? 'test: emitMode1ChatResponseAudit forced failure',
+    );
     this.name = 'Mode1AuditInjectedFailure';
+  }
+}
+
+/**
+ * Private adapter class used solely by the factory's `errorCtor`
+ * option (Codex R2 M1 closure on PR #165). The factory passes the
+ * emitter name to its `errorCtor`, but `Mode1AuditInjectedFailure`'s
+ * public constructor takes a `message` instead — so a direct pass
+ * would put the literal string 'emitMode1ChatResponseAudit' into
+ * the error's message field.
+ *
+ * This adapter satisfies `AuditInjectedFailureCtor`'s
+ * `(emitterName: string)` signature by ignoring the passed name
+ * (the class is already bound to it) and calling the parent's
+ * no-argument constructor, which yields the default sentinel
+ * message. Instances satisfy `instanceof Mode1AuditInjectedFailure`
+ * AND `instanceof AuditInjectedFailure` so all downstream
+ * assertions continue to pass.
+ *
+ * Not exported — direct callers who want a custom message use the
+ * public `Mode1AuditInjectedFailure` constructor; the factory uses
+ * this adapter internally.
+ */
+class Mode1AuditInjectedFailureFactoryAdapter extends Mode1AuditInjectedFailure {
+  constructor(_emitterName: string) {
+    super();
   }
 }
 
@@ -102,15 +135,17 @@ export class Mode1AuditInjectedFailure extends AuditInjectedFailure {
  * reach the same injector via the named re-exports below (or
  * directly via this handle for new test files).
  *
- * Wired with `errorCtor: Mode1AuditInjectedFailure` per the Codex
- * R1 closure on PR #165 so `consumeOrThrow` throws the subclass
- * (preserving `instanceof Mode1AuditInjectedFailure` for PR #163
- * compatibility) AND continues to satisfy `instanceof
- * AuditInjectedFailure` for any generic catch path.
+ * Wired with `errorCtor: Mode1AuditInjectedFailureFactoryAdapter`
+ * per the Codex R1 + R2 closures on PR #165 so `consumeOrThrow`
+ * throws an `instanceof Mode1AuditInjectedFailure` (preserving
+ * PR #163 compatibility), the error's message is the canonical
+ * default sentinel string (not the literal emitter name a naïve
+ * adapter would produce), AND the dual `instanceof
+ * AuditInjectedFailure` chain holds for generic catch paths.
  */
 export const mode1ChatResponseAuditInjector: AuditFailureInjector =
   createAuditFailureInjector('emitMode1ChatResponseAudit', {
-    errorCtor: Mode1AuditInjectedFailure,
+    errorCtor: Mode1AuditInjectedFailureFactoryAdapter,
   });
 
 // ---------------------------------------------------------------------------
