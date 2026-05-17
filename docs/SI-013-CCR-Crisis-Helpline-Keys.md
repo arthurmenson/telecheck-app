@@ -125,18 +125,24 @@ const crisisResponseText = renderCrisisSentinel({
   emergencyNumber,
 });
 
-// Rule 4 (Codex R3 M1 closure 2026-05-16): forensic correlation
-// REQUIRED. The original Category A crisis_detection_trigger
-// audit's escalation_destination remains null (gate must run
-// first per Rule 1, before we know the destination). A SECOND
-// audit event ratified by this SI — Category B
-// `crisis.escalation_destination_resolved` — emits AFTER the
-// CCR resolution (success OR fail-soft fallback), carrying:
+// Rule 4 (Codex R3 M1 + R7 M1 closures 2026-05-16): forensic
+// correlation REQUIRED. The original Category A
+// crisis_detection_trigger audit's escalation_destination remains
+// null (gate must run first per Rule 1, before we know the
+// destination). A SECOND audit event ratified by this SI — Category
+// B `crisis.escalation_destination_resolved` — emits AFTER the CCR
+// resolution (success OR fail-soft fallback), carrying:
 //   - linked_events: [<original Category A audit_id>]
-//   - detail.resolved_destination: helplineE164 | null (null when
-//     CCR failed or country has no defaults)
-//   - detail.resolution_status: 'resolved' | 'ccr_unavailable' |
-//     'unmapped_country'
+//   - detail.resolved_destination: string | null. Non-null ONLY
+//     when resolution_status === 'resolved' (full localization
+//     rendered to patient). NULL in all three other states because
+//     the renderer fell back to the generic sentinel and the audit
+//     MUST match what the patient saw (R7 M1 patient-surface-
+//     agreement contract).
+//   - detail.resolution_status: 'resolved' | 'partial_defaults' |
+//     'unmapped_country' | 'ccr_unavailable' (FOUR values, not
+//     three — partial_defaults distinguishes config-skew from
+//     fully-unmapped because triage scope differs).
 // This is a mandatory ATTEMPT, not a mandatory commit — the SI's
 // stated benefit of removing null-destination ops noise + enabling
 // post-hoc forensic correlation depends on Category B always
