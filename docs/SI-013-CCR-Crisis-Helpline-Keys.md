@@ -90,12 +90,21 @@ if (!crisisDetected) {
 let helplineE164: string | null = null;
 let helplineLabel: string | null = null;
 let emergencyNumber: string | null = null;
+// Rule 4 status-derivation: track whether the catch fired so we can
+// distinguish 'ccr_unavailable' (resolver threw — connectivity alert)
+// from 'unmapped_country' (resolver returned null for all values
+// because the tenant's country has no defaults — config alert). A
+// null-only heuristic without this flag would mis-classify legitimate
+// unmapped-country lookups as CCR outages (Codex R4 M1 closure
+// 2026-05-16).
+let ccrThrew = false;
 try {
   // Rule 3: typed resolvers, not the generic resolveCcrKey.
   helplineE164 = await resolveCrisisHelpline(ctx);
   helplineLabel = await resolveCrisisHelplineLabel(ctx);
   emergencyNumber = await resolveCrisisEmergencyNumber(ctx);
 } catch (err) {
+  ccrThrew = true;
   req.log.warn(
     { err, tenant_id: ctx.tenantId },
     'mode_1_chat: CCR crisis-resource resolution failed — falling back to generic sentinel',
@@ -128,11 +137,19 @@ const crisisResponseText = renderCrisisSentinel({
 await emitCrisisEscalationDestinationResolved({
   linkedAuditId: inputCrisisOutcome.audit_id,
   resolvedDestination: helplineE164,
+  // Status derivation MUST match the engineering checklist (Codex R4
+  // M1 closure 2026-05-16): 'resolved' iff the primary helpline E.164
+  // resolved; else 'ccr_unavailable' iff the resolver threw (the
+  // alert-worthy connectivity state); else 'unmapped_country' (the
+  // alert-worthy config-gap state — tenant's country has no defaults
+  // for these keys). A pure null-check heuristic without `ccrThrew`
+  // would mis-classify legitimate unmapped-country lookups as CCR
+  // outages and corrupt the ops-alert signal this SI is adding.
   resolutionStatus: helplineE164 !== null
     ? 'resolved'
-    : (helplineLabel === null && emergencyNumber === null
-        ? 'ccr_unavailable'
-        : 'unmapped_country'),
+    : ccrThrew
+      ? 'ccr_unavailable'
+      : 'unmapped_country',
   // ... tenant + actor + countryOfCare attribution ...
 });
 ```
