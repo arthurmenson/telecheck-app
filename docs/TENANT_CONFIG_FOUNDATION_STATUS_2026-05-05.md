@@ -15,12 +15,14 @@ The tenant-config foundation read paths shipped at v1.0 in the Sprint 5-7 burst 
 - **PR #46 / PR-F4 (Sprint 33)** — admin-write 503-stub markers landed across `internal/handlers/admin-write.ts` (PATCH `/tenant-brand`, PATCH `/ccr-configs/:configKey`, POST `/adapter-configs`, PATCH `/adapter-configs/:adapterId`, DELETE `/adapter-configs/:adapterId`). Each handler returns `{ status: 503 }` with the canonical error envelope, signaling that admin-write is unavailable pending Admin Backend slice v1.1 ratification (encryption-at-rest + operator auth + cross-tenant break-glass primitives required before write paths can ship). The `/ready` endpoint at `routes.ts` returns 503 in all environments today via `adminWriteReadyHandler`, so Kubernetes/LB readiness probes continue to keep traffic off the admin-write surface. (1 Codex round; clean close.)
 
 What did NOT change in Sprint 33-34:
+
 - Read paths remain at v1.0: patient-app `GET /v0/tenant-config/me` bootstrap + admin-read endpoints for country profiles, tenant brand, CCR configs, adapter configs all continue to work as authored.
 - Cross-tenant isolation tests (`tenant-config-cross-tenant-isolation.test.ts`) continue to pass; I-023 / I-024 / I-025 enforcement unchanged.
 - CCR resolver service (`ccr-resolver.ts`) and the CCR key registry (`ccr-keys.ts`, including the 11 v1.10-cycle additions for marketing + research) unchanged.
 - Schema layer (`migrations/018_tenant_config.sql` + `migrations/019_adapter_configs_tenant_users.sql`) unchanged.
 
 What benefited indirectly from Sprint 33-34:
+
 - The 503-stub handlers are now wired through the same canonical error envelope path that the implementation-complete slices use — when Admin Backend v1.1 ratifies and write paths un-stub, they will use the reserve-then-execute idempotency pattern + `withIdempotency` + handler-owned cache writes (per PROJECT_CONVENTIONS r5 §3.7) without any per-handler scaffolding cost.
 - The cross-cutting `audit_dedupe_markers` table (`migrations/022_audit_dedupe_markers.sql`) is available for any Category A audit emit on the future write paths (admin-action audit emission per AUDIT_EVENTS v5.2).
 
@@ -159,7 +161,7 @@ Sections:
 
 ## Cross-slice consumers (planned)
 
-- **Pharmacy + Refill (Slice 4, blocked on SI-001):** `resolveCcrKey(ctx, 'pharmacy.routing_strategy')` + `getTenantCountryProfile(ctx).available_pharmacy_adapters` to pick adapter.
+- **Pharmacy + Refill (Slice 4 prescribe surface implemented post-SI-001 P-011 2026-05-12; refill/dispense/shipment surface blocked on SI-007 — per PR #173 per-slice STATUS refresh 2026-05-17):** `resolveCcrKey(ctx, 'pharmacy.routing_strategy')` + `getTenantCountryProfile(ctx).available_pharmacy_adapters` to pick adapter.
 - **Notifications:** `resolveSmsProvider(ctx)` per-tenant SMS routing.
 - **Payments / Subscription:** `resolvePaymentProcessor(ctx)` + `resolveCurrencyCode(ctx)` for Stripe vs Paystack routing.
 - **Crisis-detection (I-019 platform floor):** `resolveEmergencyNumber(ctx)` + `getTenantCountryProfile(ctx).crisis_helplines` rendered in patient-side crisis surfaces (frontend; out of scope for the audit emission path).

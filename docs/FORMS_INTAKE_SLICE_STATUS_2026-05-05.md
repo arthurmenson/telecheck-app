@@ -1,10 +1,56 @@
 # Forms / Intake Engine Slice — Implementation Status
 
-**Date:** 2026-05-05 (Sprint 33-34 amendment 2026-05-08)
+**Date:** 2026-05-05 (Sprint 33-34 amendment 2026-05-08; **publish-gate-disclosure amendment 2026-05-17 — see top section**)
 **Author:** Autonomous turn (Claude Sonnet 4.5)
+**Status (2026-05-17):** **COMPLETE-EXCEPT-PUBLISH-GATES** — 11 HTTP surfaces ship + pass tests; publish route is fail-closed in non-test environments via `FORMS_PUBLISH_GATES_BYPASS='unsafe-test-only'` sentinel pending SI-011 IMPL (production-deploy blocker)
 **Final commit:** `4ab2663` (forms-intake variant + resume_restored domain events wired at `ba2bc41`; SI-003 raised at `f2a16f3`; test-side flip at `4ab2663`; original Slice 1 stable since pre-`d2b6ea9`; JWT migration through `692206e`; status doc landed at `39a0ede`)
 **Sprint 33-34 amendment final commit:** `dc06541` (PR #44 PR-F2 forms-intake migration + PR #49 audit-dedupe wiring + PR #48 cleanup-sweep)
-**CI status:** ✅ Green
+**CI status:** ✅ Green (test path; publish gates exercise the bypass sentinel)
+
+---
+
+## 2026-05-17 publish-gate-disclosure amendment (PR #173 per-slice STATUS refresh)
+
+**Trigger:** PR #172 Sibling-Doc Cross-Validation Audit 2026-05-17 §2.2 surfaced that this STATUS doc claims `implementation-complete on its v2.1 surface` without disclosing the `FORMS_PUBLISH_GATES_BYPASS='unsafe-test-only'` sentinel that fails-closed the publish path in non-test environments OR the SI-011 publish-time governance gates that need 4 IMPL-readiness gates to ratify. The production-deploy blocker was hidden behind the `implementation-complete` framing. This amendment makes the publish-gate state explicit without rewriting the existing Sprint 33-34 amendment content below.
+
+### Current publish-gate state
+
+`templateService.publishVersion()` at `src/modules/forms-intake/internal/services/template-service.ts` documents FOUR pre-publish governance gates that MUST run before a draft template can be promoted to `published` status:
+
+1. **I-015 L3 dual-control** — Tenant Clinical Lead approval recorded for any L3 (eligibility) edits; the clinician who authored an eligibility-logic change MUST NOT be the same operator who authorizes publish.
+2. **I-030 six-category static analysis** — reject publish if ANY of {branching, visibility, validation, eligibility/triage, pricing/commerce, outcome messaging} depends on the `research_consent_status` PHI field per FORMS_ENGINE v5.2 + Slice PRD §25.3.
+3. **L4 MarketingCopy approval** — all molecule-level L1 elements referenced in `presentation_content` MUST resolve to `MarketingCopy` rows in `status='approved'`.
+4. **Mode 2 input contract conformance** — any Mode 2 case-prep workflow integration MUST conform to the contract validator per Slice PRD §10.
+
+At HEAD, the publish path fails closed in production via the `FORMS_PUBLISH_GATES_BYPASS='unsafe-test-only'` sentinel. The bypass is intentionally hostile-named so a routine env-config typo cannot accidentally open the gate. But the gates aren't wired:
+
+- Production cannot legitimately publish without setting the bypass
+- Setting the bypass = ALL FOUR gates skipped (test-only posture)
+- Neither posture is acceptable beyond v1.0 pilot
+
+### SI-011 IMPL-gating
+
+**[SI-011 Forms-Intake publish-time governance gates](./SI-011-Forms-Publish-Governance-Gates.md)** ratifies the 4 publish-gate audit events. SI-011's downstream IMPL has 4 IMPL-readiness gates per its source file:
+
+- **SI-010** Session Actor Context DB Binding (for the L3 dual-control's `current_actor_role()` helper)
+- **SI-008** AiWorkflowExecution CDM (for the L2 Mode 2 input contract conformance)
+- **MarketingCopy CDM §4 row-shape ratification** (for the L4 MarketingCopy approval gate; per Slice PRD §25.1; NOT a separate SI today — chair option (a) ratifies in-scope of SI-011 OR option (b) schedules as sibling readiness-gate SI)
+- **FORMS_ENGINE §I-030 detection-rule canonicalization** (for the six-category static analysis; per Slice PRD §25.3; same scope/scheduling decision needed)
+
+Until SI-011 + its 4 IMPL-readiness gates all ratify (Q2 2026 Ratifier Ceremony per Ratifier Ceremony Agenda + Per-Track SI Navigation), the production-deploy gate replacement work cannot land. SI-011 targets per its source file: `P-021 (umbrella) + P-022 through P-025 (per sub-SI a/b/c/d)`.
+
+### What this amendment intentionally DOES NOT change
+
+- The Sprint 33-34 amendment + the existing Summary below + all body sections are PRESERVED VERBATIM (per the established Sprint-amendment layering pattern in this repo).
+- The phrase `implementation-complete on its v2.1 surface` in the existing Summary remains as-is — this amendment surfaces the publish-gate disclosure at the TOP so a reader sees it before the Summary, but the historical Summary text is left intact for traceability.
+
+### Spec references for the 2026-05-17 amendment
+
+- `docs/Sibling-Doc-Cross-Validation-Audit-2026-05-17.md` §2.2 (the audit that surfaced this STATUS doc as missing publish-gate disclosure)
+- `docs/Implementation-State-Audit-2026-05-17.md` §1 (Forms-Intake module reclassification COMPLETE → COMPLETE-EXCEPT-PUBLISH-GATES)
+- `docs/Per-Track-SI-Navigation-2026-05-17.md` §1 Track 3 (Forms-Intake publish-gate IMPL row)
+- `docs/SI-011-Forms-Publish-Governance-Gates.md` (the ratifier-blocking SI)
+- `src/modules/forms-intake/internal/services/template-service.ts` `publishVersion()` (the TODO-deferred gate documentation)
 
 ---
 
@@ -16,13 +62,13 @@ The Forms-Intake slice received the most security-critical migration in the SI-0
 
 Verified against `src/modules/forms-intake/internal/handlers/*.ts` and the PR #48 cleanup-sweep diff per-file deletion counts (`a02f101`):
 
-| Handler file | Handlers migrated | Endpoints |
-|---|---|---|
-| `templates.ts` | `createTemplateHandler`, `publishVersionHandler` | POST `/templates` + POST `/templates/:templateId/versions/:versionId/publish` |
-| `variants.ts` | `createVariantHandler`, `promoteVariantHandler` | POST `/variants` + POST `/variants/:variantId/promote` |
-| `deployments.ts` | `createDeploymentHandler`, `retireDeploymentHandler` | POST `/deployments` + POST `/deployments/:deploymentId/retire` |
+| Handler file     | Handlers migrated                                                                                                                                                   | Endpoints                                                                                                     |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `templates.ts`   | `createTemplateHandler`, `publishVersionHandler`                                                                                                                    | POST `/templates` + POST `/templates/:templateId/versions/:versionId/publish`                                 |
+| `variants.ts`    | `createVariantHandler`, `promoteVariantHandler`                                                                                                                     | POST `/variants` + POST `/variants/:variantId/promote`                                                        |
+| `deployments.ts` | `createDeploymentHandler`, `retireDeploymentHandler`                                                                                                                | POST `/deployments` + POST `/deployments/:deploymentId/retire`                                                |
 | `submissions.ts` | `startSubmissionHandler`, **`updateSubmissionResponsesHandler`** (the PATCH handler that runs the I-019 crisis gate via `runCrisisGate`), `submitSubmissionHandler` | POST `/submissions` + PATCH `/submissions/:submissionId/responses` + POST `/submissions/:submissionId/submit` |
-| `resume.ts` | `resumeSubmissionHandler` | POST `/resume` |
+| `resume.ts`      | `resumeSubmissionHandler`                                                                                                                                           | POST `/resume`                                                                                                |
 
 ### Service-layer change: `externalTx` threading
 
@@ -47,6 +93,7 @@ PR #49 widened the helper's body-callback signature from `(tx)` to `(tx, idempot
 ### Cleanup-sweep impact (PR #48)
 
 `markIdempotencyManagedByHandler(req)` call sites deleted (verified against `git show a02f101`):
+
 - `deployments.ts`: 2 calls (`createDeploymentHandler`, `retireDeploymentHandler`)
 - `resume.ts`: 1 call (`resumeSubmissionHandler`)
 - `submissions.ts`: 3 calls (`startSubmissionHandler`, `updateSubmissionResponsesHandler`, `submitSubmissionHandler`)
