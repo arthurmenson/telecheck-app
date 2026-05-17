@@ -4,7 +4,7 @@
 **Date:** 2026-05-16
 **Severity:** MEDIUM at pilot launch — the Mode 1 chat handler currently passes `escalationDestination: null` to `runCrisisGate` because the canonical CCR key for crisis helplines hasn't been ratified. Crisis-detection audit rows therefore carry a null escalation field; the crisis-resource sentinel response text is a generic "your care team has been alerted" without a country-localized helpline number. Neither posture is acceptable beyond the v1.0 fail-soft pilot (Telecheck-Ghana chronic care will surface crisis content; patients need a real helpline number).
 **Status:** Open — awaiting spec-corpus ratifier (Evans + Engineering Lead + Contracts Pack v5.2 CCR_RUNTIME owner) to expand the canonical CCR key namespace
-**Target spec docs:** `Telecheck_Contracts_Pack_v5_00_CCR_RUNTIME.md` (canonical key namespace expansion), `Telecheck_AI_Clinical_Assistant_Slice_PRD_v1_0.md` §6.2 (crisis-resource response surface), `Telecheck_Master_Platform_PRD_v1_10.md` §17 (CCR-driven country-of-care config)
+**Target spec docs:** `Telecheck_Contracts_Pack_v5_00_CCR_RUNTIME.md` (canonical key namespace expansion), `Telecheck_Contracts_Pack_v5_00_AUDIT_EVENTS.md` (new Category B action `crisis.escalation_destination_resolved` per Rule 4 / Codex R3 M1 closure), `Telecheck_AI_Clinical_Assistant_Slice_PRD_v1_0.md` §6.2 (crisis-resource response surface), `Telecheck_Master_Platform_PRD_v1_10.md` §17 (CCR-driven country-of-care config)
 **Target slice:** Mode 1 conversational assistant (handler in `src/modules/ai-service/internal/handlers/chat.ts`); future Mode 2 case-prep surface will consume the same keys
 **Parallel SIs:** independent — does not block or depend on other open SIs
 
@@ -54,6 +54,20 @@ The gate is the I-019 platform-floor; it cannot be gated behind a CCR lookup. Th
 
 **Rule 3 — country-profile defaults require TYPED resolvers**, not the generic `resolveCcrKey`. The generic resolver only reads `ccr_configs` and returns null for tenants without overrides; country-profile defaults are not auto-mapped (per the resolver's own docstring — see `src/modules/tenant-config/internal/services/ccr-resolver.ts` "country-profile defaults are NOT auto-mapped here because the country_profiles columns are typed... Use the typed resolvers below..."). So this SI's downstream impl ALSO ratifies typed crisis resolvers — `resolveCrisisHelpline(ctx)`, `resolveCrisisEmergencyNumber(ctx)` — that walk ccr_configs override → country_profile default → null.
 
+**Rule 4 — forensic correlation via paired Category B audit (Codex R3 M1 closure 2026-05-16).** The SI's stated benefit of removing null-destination ops-alert noise + enabling post-hoc forensic correlation requires that the destination be CAPTURED in the audit chain. Since Rule 1 forces the gate to run FIRST with null destination, the original Category A `crisis_detection_trigger` audit will always carry `escalation_destination: null` — that field never gets populated after the fact (I-003 audit append-only).
+
+The forensic-correlation mechanism is therefore a SECOND audit event ratified by this SI:
+
+- **Action ID:** `crisis.escalation_destination_resolved` (new; add to AUDIT_EVENTS Category B at ratification)
+- **Category:** B (governance/operational follow-up; not safety-floor since the safety surface already fired via Category A)
+- **Linked to:** the original Category A `crisis_detection_trigger` audit via `linked_events[]` carrying its `audit_id`
+- **Detail fields:**
+  - `resolved_destination: string | null` — the helpline E.164 if CCR resolved, null otherwise
+  - `resolution_status: 'resolved' | 'ccr_unavailable' | 'unmapped_country'` — three-value enum for ops-alert filtering
+- **Emission:** mandatory, ALWAYS fires alongside Category A regardless of CCR outcome. If CCR resolved successfully, status is `resolved`. If CCR threw, status is `ccr_unavailable` (this is the alert-worthy state). If CCR returned null because the tenant's country has no defaults configured, status is `unmapped_country` (also alert-worthy, but a different ops triage path — "add helpline defaults for country X" not "fix CCR connectivity").
+
+This decoupling avoids reworking `runCrisisGate` to accept deferred-resolution callbacks (which would complicate the gate's already-careful dedupe logic) and keeps the safety-floor Category A audit semantically unchanged.
+
 ```typescript
 // Mode 1 chat handler — crisis-bypass branch (post-SI-013)
 // Rule 1: crisis gate FIRST with null escalation; gate is unconditional.
@@ -95,46 +109,73 @@ const crisisResponseText = renderCrisisSentinel({
   emergencyNumber,
 });
 
-// Update the Category A audit's escalation_destination AFTER the fact
-// via a follow-up Category B `crisis.escalation_destination_resolved`
-// event? OR: rework runCrisisGate to accept a deferred-resolution
-// callback. Either path is an additional design decision the ratifier
-// settles. At v1.0 the audit's escalation_destination remains null
-// (current behavior); post-SI-013, the field becomes populatable.
+// Rule 4 (Codex R3 M1 closure 2026-05-16): forensic correlation
+// REQUIRED. The original Category A crisis_detection_trigger
+// audit's escalation_destination remains null (gate must run
+// first per Rule 1, before we know the destination). A SECOND
+// audit event ratified by this SI — Category B
+// `crisis.escalation_destination_resolved` — emits AFTER the
+// CCR resolution (success OR fail-soft fallback), carrying:
+//   - linked_events: [<original Category A audit_id>]
+//   - detail.resolved_destination: helplineE164 | null (null when
+//     CCR failed or country has no defaults)
+//   - detail.resolution_status: 'resolved' | 'ccr_unavailable' |
+//     'unmapped_country'
+// This is mandatory, not optional — the SI's stated benefit of
+// removing null-destination ops noise + enabling post-hoc
+// forensic correlation depends on Category B always emitting
+// alongside Category A.
+await emitCrisisEscalationDestinationResolved({
+  linkedAuditId: inputCrisisOutcome.audit_id,
+  resolvedDestination: helplineE164,
+  resolutionStatus: helplineE164 !== null
+    ? 'resolved'
+    : (helplineLabel === null && emergencyNumber === null
+        ? 'ccr_unavailable'
+        : 'unmapped_country'),
+  // ... tenant + actor + countryOfCare attribution ...
+});
 ```
 
 The `renderCrisisSentinel` helper interpolates the resolved values into a template; the template itself remains a module constant (reviewable in one place). When any value is null (CCR fail-soft path, or country-profile lookup miss for an unmapped country), the template gracefully omits the country-specific line and surfaces only the generic "your care team has been alerted" text — same as today's pre-SI-013 behavior.
 
 ### Regression test obligations (downstream impl)
 
-When the code change lands, the test suite MUST cover:
+When the code change lands, the test suite MUST cover (Codex R3 M1 closure 2026-05-16 expanded Rule 4 coverage in items 6–9):
 
 1. Happy path: US tenant + crisis input → sentinel contains `'988'` (or whatever US helpline ratifies)
 2. Happy path: GH tenant + crisis input → sentinel contains the Ghana helpline label
 3. Fail-soft: crisis input + CCR resolver throws → 200 generic sentinel (NOT 503) + Category A audit STILL emits
 4. Country-profile default path: tenant with NO ccr_configs override → typed resolver walks to country_profile + returns the default
 5. Unmapped country: tenant whose country_of_care has no defaults → sentinel falls back to generic template, no crash
+6. **Rule 4 happy path:** crisis input + CCR resolves successfully → exactly ONE Category B `crisis.escalation_destination_resolved` audit emits with `detail.resolution_status === 'resolved'` AND `detail.resolved_destination === <expected E.164>` AND `linked_events` contains the original Category A `crisis_detection_trigger` audit_id
+7. **Rule 4 ccr_unavailable:** crisis input + CCR resolver throws → Category B audit STILL emits with `detail.resolution_status === 'ccr_unavailable'` AND `detail.resolved_destination === null` AND `linked_events` correctly references the Category A audit_id (NOT swallowed by the try/catch — the Category B emission lives OUTSIDE the resolver try/catch)
+8. **Rule 4 unmapped_country:** crisis input + tenant with no country defaults → Category B audit emits with `detail.resolution_status === 'unmapped_country'` AND `detail.resolved_destination === null` (this is the "ratifier needs to add helpline defaults for country X" alert path; semantically distinct from `ccr_unavailable` which is a connectivity alert)
+9. **Rule 4 idempotency-retry invariant:** crisis input with retry under the same Idempotency-Key → across both attempts, exactly ONE Category A `crisis_detection_trigger` AND exactly ONE Category B `crisis.escalation_destination_resolved` (no duplicate emission on replay; same pattern as the FLOOR-020 + I-019 two-layer dedupe from PR #163)
 
 ## What this SI does NOT propose
 
 - **The exact helpline numbers per country.** That's a clinical-operations + compliance decision (Ghana mental-health policy, US 988 deployment scope, etc.). The SI proposes the KEY shape; the operational team populates VALUES at ratification.
 - **A new entity in CDM v1.2.** CCR keys live in the existing `ccr_configs` + `country_profiles` tables. No CDM expansion needed.
 - **Per-program overrides.** If a future Ghana program (e.g., a chronic-care cohort) needs a different helpline than the country default, the existing `ccr_configs` per-tenant override path covers it — no SI work needed.
-- **An audit-event amendment.** The `crisis_detection_trigger` Category A audit ALREADY carries `escalation_destination` per AUDIT_EVENTS v5.3 (currently null because we don't pass a value). Populating it once the CCR keys ratify is a code change, not a spec change.
+- **An amendment to the existing Category A `crisis_detection_trigger` audit shape.** That event ALREADY carries `escalation_destination` per AUDIT_EVENTS v5.2 (currently null because the handler passes null per Rule 1 — the gate must run first, before the destination is known). The Category A shape itself is unchanged. (Note: Rule 4 above DOES introduce a NEW Category B event — `crisis.escalation_destination_resolved` — which is a spec change to AUDIT_EVENTS; that is in-scope for this SI per Codex R3 M1 closure. This bullet only clarifies that Category A's pre-existing shape is preserved as-is.)
 
 ## Resolution path
 
 When SI-013 closes:
 
 1. CCR_RUNTIME contract v5.3 (or v5.2 patch) lands with the three keys ratified above + country-profile defaults populated for US + GH.
-2. Engineering authors (downstream impl checklist — MUST preserve Rules 1+2+3 from "Surface integration" above; Codex R2 H1 closure 2026-05-16):
+2. AUDIT_EVENTS contract v5.3 (or v5.2 patch) lands with the new Category B `crisis.escalation_destination_resolved` action ID + the three-value `resolution_status` enum on its detail schema (Codex R3 M1 closure 2026-05-16; Rule 4).
+3. Engineering authors (downstream impl checklist — MUST preserve Rules 1+2+3+4 from "Surface integration" above; Codex R2 H1 + Codex R3 M1 closures 2026-05-16):
    - `src/modules/tenant-config/internal/ccr-keys.ts` — extend `CCR_KEYS` constant with the three new entries (purely additive; existing surface unchanged)
    - `src/modules/tenant-config/internal/services/ccr-resolver.ts` — add three typed resolvers (`resolveCrisisHelpline`, `resolveCrisisHelplineLabel`, `resolveCrisisEmergencyNumber`) walking `ccr_configs` override → `country_profiles` default → null. Do NOT use generic `resolveCcrKey` for these values — it only reads `ccr_configs` and skips country-profile defaults (per its own docstring).
+   - `src/modules/ai-service/internal/audit.ts` — **NEW emitter `emitCrisisEscalationDestinationResolved(args, tx?)` (Rule 4 mandatory).** Emits a Category B audit row with action `crisis.escalation_destination_resolved`, `linked_events: [<original Category A audit_id>]`, `detail: { resolved_destination: string | null, resolution_status: 'resolved' | 'ccr_unavailable' | 'unmapped_country' }`. Audit-envelope population (tenant_id, actor, ai_workload_type='conversational_assistant', autonomy_level='advisory') follows the same I-027 attribution rules as the existing Mode 1 Category C emitter. Implementation pattern mirrors `emitMode1ChatResponseAudit` so the same vi.mock injection harness from PR #163 can exercise its failure path.
    - `src/modules/ai-service/internal/handlers/chat.ts` — KEEP `runCrisisGate(... escalationDestination: null ...)` exactly as today. Rule 1: gate runs first, unconditional. Do NOT add a CCR call inside or before the gate.
-   - `src/modules/ai-service/internal/handlers/chat.ts` — in the crisis-detected branch (after gate returns `kind: 'crisis'`), invoke the typed crisis resolvers INSIDE a try/catch (Rule 2 fail-soft). On any throw: log warn, set all three values to null, continue to render the generic sentinel.
+   - `src/modules/ai-service/internal/handlers/chat.ts` — in the crisis-detected branch (after gate returns `kind: 'crisis'`), invoke the typed crisis resolvers INSIDE a try/catch (Rule 2 fail-soft). On any throw: log warn, set all three values to null, continue to render the generic sentinel. Track whether the catch fired (boolean `ccrThrew`) to distinguish `ccr_unavailable` from `unmapped_country` in Rule 4 emission below.
+   - `src/modules/ai-service/internal/handlers/chat.ts` — **MANDATORY (Rule 4):** invoke `emitCrisisEscalationDestinationResolved` AFTER the resolver try/catch returns (success OR failure), passing `linkedAuditId: inputCrisisOutcome.audit_id`, `resolvedDestination: helplineE164`, and `resolutionStatus` derived from the three states: `'resolved'` if `helplineE164 !== null`; else `'ccr_unavailable'` if `ccrThrew === true`; else `'unmapped_country'`. The Category B emission lives OUTSIDE the resolver try/catch so a CCR throw cannot suppress the forensic-correlation audit. Emission failure of the Category B emitter follows the same FLOOR-020 pattern as Category C (operational audit failure → 503 with tenant-blind envelope); the safety surface (Category A + sentinel response) is unaffected because both have already executed by the time Category B emits.
    - `src/modules/ai-service/internal/handlers/chat.ts` — replace the hardcoded `CRISIS_RESPONSE_TEXT` module constant with `renderCrisisSentinel({ helplineE164, helplineLabel, emergencyNumber })`. The renderer template gracefully omits the country-specific line when any value is null.
-   - Integration tests per the 5-case obligation list in "Regression test obligations" above.
-3. Code change is bounded (≤150 LOC including the typed resolvers + renderer + 5 tests; single PR; Codex-reviewable in 2-3 rounds).
+   - Integration tests per the 9-case obligation list in "Regression test obligations" above (items 6–9 cover Rule 4).
+4. Code change is bounded (≤220 LOC including the typed resolvers + Category B emitter + renderer + 9 tests; single PR; Codex-reviewable in 2-3 rounds).
 
 ## Cross-cutting impact
 
