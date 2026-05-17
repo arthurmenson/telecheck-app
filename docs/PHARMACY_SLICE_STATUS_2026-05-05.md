@@ -48,6 +48,23 @@ The "Status" / "Final commit" / "Blocker" header fields at line 3-9 are the EXCE
 
 ---
 
+## ⚠ Everything below this line is HISTORICAL (as-of 2026-05-08 or earlier)
+
+**Codex R4 M1 closure 2026-05-17:** the sections below describe the v0.1 skeleton state of the Pharmacy module BEFORE SI-001 ratified via P-011 2026-05-12 + the prescribe-surface implementation landed. Present-tense claims like "Schema authoring is paused on SI-001" or "`/health` returns BLOCKED state" or "v0.1 skeleton" or "30-40 commits to reach Pharmacy slice implementation-complete after SI-001 closes" are accurate AS-OF-2026-05-08 but stale relative to current state. **Read these sections as historical record only.** Current state is the 2026-05-17 post-SI-001-ratification amendment at the top of this doc.
+
+Specific historical-vs-current corrections (do NOT use the body text below for current-state decisions):
+
+- "**Status:** ⛔ BLOCKED — Skeleton only at v0.1" (historical) → **Current state: SUBSTANTIAL** per top-of-doc amendment
+- "**Blocker:** SI-001 MedicationRequest schema gap (still OPEN; Promotion Ledger entry P-011 pending)" (historical) → **Current state: SI-001 RATIFIED P-011 2026-05-12; remaining blocker is SI-007 for refill/dispense/shipment surfaces only**
+- "`/health` endpoint returns BLOCKED state" (historical) → **Current state: 12 HTTP routes mounted per `src/modules/pharmacy/routes.ts`; `/health` + `/ready` both return module-ready per the implementation that landed alongside SI-001 ratification**
+- "Test coverage at v0.1: 1 plugin-wiring smoke test" (historical) → **Current state: full MedicationRequest test suite landed alongside SI-001 ratification + State Machines v1.2 §19 transitions tested**
+- "Schema authoring is paused on SI-001" / "No schema migrations authored" (historical) → **Current state: migration 025_medication_requests.sql landed with 14 CHECK constraints + 6 composite FKs + 5 indexes + 2 partial UNIQUE indexes**
+- "Resume path when SI-001 closes" (historical aspirational) → **Current state: the resume path has been executed; the prescribe surface is implemented. Refill/dispense/shipment have their own resume path pending SI-007 ratification**
+
+The sections below are PRESERVED verbatim as the audit-trail record of the v0.1 skeleton era, the Sprint 33-34 amendment context, and the implementation history. They are NOT current-state documentation; they should not be relied on for planning or implementation decisions. Use the top-of-doc 2026-05-17 amendment for current state.
+
+---
+
 ## Sprint 33-34 amendment (2026-05-08)
 
 The Pharmacy + Refill slice is in the **BLOCKED-aware skeleton group** alongside Subscription (also blocked on SI-001) and Med Interaction Engine (blocked on slice PRD ratification). Sprint 33-34 SI-006 closure work targeted only the implementation-complete slices, so pharmacy was untouched at the source level.
