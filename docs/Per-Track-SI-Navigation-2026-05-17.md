@@ -10,9 +10,10 @@
 ## TL;DR
 
 - **6 Tracks** per Master Completion Plan v1.0: Track 1 Clinical Care · Track 2 AI Service · Track 3 Consent + Forms-Intake · Track 4 Mobile + UI · Track 5 Infra & Ops · Track 6 Spec-corpus ratification.
-- **3 Tracks have OPEN SIs gating their advancement: Tracks 1, 2, 3.** Track 4 (Mobile + UI) and Track 5 (Infra & Ops) have no OPEN SI dependencies and can advance fully in parallel with the ratifier work. Track 6 is the ratifier track itself — it gates the other Tracks rather than being gated by them.
+- **Plan-vs-current-state baseline note (Codex R2 H1 closure 2026-05-17):** Master Completion Plan v1.0 was authored 2026-05-15 and frames Phase A's ratifier ceremony scope as "**7 pending SIs** (SI-003/004/005/008/009/010/011) + CDM §4 MarketingCopy + FORMS_ENGINE §I-030 detection rules" + explicitly carves Track 2 Mode 1 out as "**Buildable now without ratification gates**" (Plan §"Status pointer" item 4). Since the Plan was authored, **5 more SIs were filed** (SI-002 + SI-007 rediscovered as OPEN per Implementation State Audit 2026-05-17 cross-doc-drift surfacing; SI-012 + SI-013 + SI-014 filed during the autonomous run 2026-05-16). The current ratifier queue is **12 SIs**, not 7. **This doc is a POST-PLAN refinement** that surfaces the evolved queue + recommends a Plan patch (see §5 + §6); it does NOT unilaterally redefine the Plan's Phase A scope or its Track 2 Buildable-now carveout.
+- **3 Tracks have OPEN SIs gating their advancement: Tracks 1, 2, 3.** Track 4 (Mobile + UI) and Track 5 (Infra & Ops) have no OPEN SI dependencies and can advance fully in parallel with the ratifier work. Track 6 is the ratifier track itself — it gates the other Tracks rather than being gated by them. **Note on Track 2**: per the Plan's explicit Track 2 carveout, the Mode 1 chat handler **shipped today (the 21-test-case surface per Implementation State Audit §1)** does NOT wait on any SI ratification. The SI-013 + SI-014 gates apply to the FUTURE Telecheck-Ghana **patient-localization upgrade** of Mode 1 — not the current clinician-test-accessible surface.
 - **Track 1 (Clinical Care) is gated by 3 OPEN SIs** (SI-005 Async-Consult, SI-007 Pharmacy refill/dispense/shipment, SI-012 Med-Interaction) — the highest count of any Track. **Track 1 is the Telecheck-Ghana revenue anchor** per the Plan; the 3 SIs together unblock ~3200-4400 LOC of Clinical Care impl per Implementation State Audit 2026-05-17 §2 LOC-leverage analysis.
-- **Track 6 ratifier ceremony unblocks Tracks 1, 2, 3 simultaneously** — Phase A's "NO PARALLELIZATION YET" rule means all three Tracks' SI dependencies need to ratify in the same ceremony cycle before fan-out begins. Tracks 4 + 5 can already fan out today (no SI dependency).
+- **Track 6 ratifier ceremony at the post-Plan 12-SI / 8-sub-ceremony scope unblocks Tracks 1 + 3 IMPL surfaces simultaneously** (per Plan §"Status pointer" item 1) **+ unlocks the Track 2 patient-localization upgrade pathway** (which the Plan did not separately enumerate because SI-013/014 didn't exist when it was authored). Tracks 4 + 5 can already fan out today (no SI dependency).
 - **One SI (SI-008) spans Tracks 2 AND 3** — it gates Track 2's Mode 2 case-prep scaffolding AND it is an IMPL-readiness gate for Track 3's SI-011d (Mode 2 input contract conformance). Cross-Track ratification leverage.
 
 ---
@@ -41,17 +42,19 @@ For each Track: which SIs gate its advancement, which slices the Track owns, and
 
 **Plan owner:** 2 eng.
 **Slices owned:** AI Service core (Mode 1 + Mode 2 scaffold) + multi-provider abstraction.
-**Phase A gates this Track until Track 6 ratifies:**
 
-| Slice                                 | Gating OPEN SI(s)                                                                | Cluster                                                  | Severity                    | Impact on advancement                                                                                                                                                                                                                                                                                                                                                             |
-| ------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Mode 1 chat handler (patient surface) | **SI-013** CCR crisis-helpline keys + **SI-014** Crisis-detection NLP classifier | D (RECOMMENDED batching — runCrisisGate callsite shared) | SI-013 MEDIUM + SI-014 HIGH | SI-013 unlocks ~150-250 LOC (typed resolvers + Cat B emitter + sentinel localization); SI-014 unlocks ~150-400 LOC per Option A/B/C OR ~20 LOC (gate-only) per Option D. **Telecheck-Ghana Mode 1 patient launch BLOCKED** by SI-014 Rule 6 (multi-language coverage) regardless of Mode 1 chat handler's current 21-test-case Implementation State Audit §1 "IN-PROGRESS" status |
-| Mode 2 case-prep scaffolding          | **SI-008** AiWorkflowExecution CDM                                               | B (Cluster B leaf; parallel to SI-009 + SI-005)          | MEDIUM                      | ~200-300 LOC of Mode 2 case-prep handler scaffolding + protocol-execution audit chain binding unlocked                                                                                                                                                                                                                                                                            |
-| Multi-provider abstraction            | (none — already canonical per ADR-020)                                           | —                                                        | —                           | Advanceable today                                                                                                                                                                                                                                                                                                                                                                 |
+**Plan §"Status pointer" item 4 explicitly says:** Track 2 Mode 1 chat handler wire-up is "Buildable now without ratification gates." The current 21-test-case Mode 1 chat handler surface (per Implementation State Audit §1 IN-PROGRESS classification) is the realization of that buildable-now scope. The SIs below gate POST-current-surface advancement, not the current surface itself:
 
-**Total Track 2 LOC unlocked by Phase A ratification:** ~500-950 LOC.
+| Slice / surface                                                                                        | Gating OPEN SI(s)                                                                | Cluster                                                  | Severity                    | Impact on advancement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Mode 1 chat handler current surface (clinician-test access; 21 test cases per Impl State Audit §1)** | (none — Plan §"Status pointer" item 4 carveout)                                  | —                                                        | —                           | **Already shipped + advanceable today.** No SI ratification gates this surface — it already serves clinician-test patient JWTs end-to-end with the regex-stub crisis-detection floor + null-escalation_destination crisis gate.                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Mode 1 patient-localization upgrade (Telecheck-Ghana patient launch)                                   | **SI-013** CCR crisis-helpline keys + **SI-014** Crisis-detection NLP classifier | D (RECOMMENDED batching — runCrisisGate callsite shared) | SI-013 MEDIUM + SI-014 HIGH | SI-013 unlocks ~150-250 LOC (typed resolvers + Cat B emitter + sentinel localization); SI-014 unlocks ~150-400 LOC per Option A/B/C OR ~20 LOC (gate-only) per Option D. **Telecheck-Ghana Mode 1 patient launch is BLOCKED** by SI-014 Rule 6 (multi-language coverage). NOT a blocker on the Plan's "Buildable now" Track 2 scope — only on the FUTURE patient-localization upgrade. The SI-013/SI-014 SIs were filed AFTER the Plan was authored 2026-05-15 (per the Plan-vs-current-state baseline note in the TL;DR), so the Plan's Track 2 framing doesn't separately enumerate them — that's the post-Plan refinement this doc adds. |
+| Mode 2 case-prep scaffolding                                                                           | **SI-008** AiWorkflowExecution CDM                                               | B (Cluster B leaf; parallel to SI-009 + SI-005)          | MEDIUM                      | ~200-300 LOC of Mode 2 case-prep handler scaffolding + protocol-execution audit chain binding unlocked                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Multi-provider abstraction                                                                             | (none — already canonical per ADR-020)                                           | —                                                        | —                           | Advanceable today                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
-**Independent of OPEN SI gates (already advanceable):** Mode 1 chat handler current 21-test-case surface (continues to serve clinician-test access regardless of SI-014 ratification outcome).
+**Total Track 2 LOC unlocked by Phase A ratification (POST-current-surface):** ~500-950 LOC.
+
+**Independent of OPEN SI gates (already advanceable per Plan §"Status pointer" item 4):** Mode 1 chat handler current 21-test-case surface (already shipped; serves clinician-test access; SI-014 patient-localization SIs do not gate this scope per the Plan's explicit Buildable-now carveout).
 
 ### Track 3 — Consent + Forms-Intake Completion
 
@@ -133,9 +136,13 @@ Mirror of §1 in SI-keyed form, so a reader who knows the SI but not the Track c
 
 ## 3. Phase A critical path
 
-Per Master Completion Plan v1.0 §"NO PARALLELIZATION YET" rule, Tracks 1 + 2 + 3 cannot fan out until Phase A's batched ratification ceremony closes. Track 4 + Track 5 already fan out today.
+Per Master Completion Plan v1.0 §"NO PARALLELIZATION YET" rule, Tracks 1 + 3 cannot fan out until Phase A's batched ratification ceremony closes. **Track 2 has a Plan-explicit Buildable-now carveout for Mode 1 chat handler wire-up** (Plan §"Status pointer" item 4) — that work was already underway pre-Plan and shipped as the current 21-test-case surface per Implementation State Audit §1. SI-013 + SI-014 gate the FUTURE Telecheck-Ghana patient-localization upgrade, NOT the Plan's Track 2 Buildable-now scope. Track 4 + Track 5 already fan out today.
 
-**Phase A ratification deliverables (Track 6 ceremony):** all 12 OPEN SIs + CDM §4 MarketingCopy + FORMS_ENGINE §I-030 detection rules.
+**Plan §"Phase A scope" (authored 2026-05-15):** 4 deliverables — (1) authContextPlugin wiring for SI-010, (2) Identity slice routes, (3) Tenant-Config CCR resolver completion, (4) ratifier ceremony for **7 pending SIs** (SI-003/004/005/008/009/010/011) + CDM §4 MarketingCopy + FORMS_ENGINE §I-030 detection rules.
+
+**Post-Plan refinement (this doc + Implementation State Audit 2026-05-17 + Ratifier Ceremony Agenda Patch 2026-05-17):** the ratifier ceremony scope expanded to **12 OPEN SIs** because 5 more SIs surfaced since the Plan was authored (SI-002 + SI-007 rediscovered as OPEN per cross-doc-drift audit; SI-012 + SI-013 + SI-014 filed during the autonomous run 2026-05-16). **The Plan should be patched in a future cycle to reflect the 12-SI scope** (see §5 Plan-patch recommendation below). Pending that patch, this doc treats the 12-SI / 8-sub-ceremony model as a POST-PLAN refinement, not a Plan mandate — a Track lead working from the Plan directly will see 7 SIs; a Track lead working from this doc + the Ratifier Ceremony Agenda will see 12.
+
+**Phase A ratification deliverables (Track 6 ceremony, post-Plan scope):** all 12 OPEN SIs + CDM §4 MarketingCopy + FORMS_ENGINE §I-030 detection rules. (Plan-original scope was 7 SIs + the same 2 non-SI ratifications; SI-002 + SI-007 + SI-012 + SI-013 + SI-014 are the 5 post-Plan additions.)
 
 **Critical-path sequencing within the ceremony** (per Ratifier Ceremony Agenda §3 sub-ceremony order):
 
@@ -153,7 +160,7 @@ Per Master Completion Plan v1.0 §"NO PARALLELIZATION YET" rule, Tracks 1 + 2 + 
 **Track-by-Track Phase-A-completion unblocking** (assuming Phase A closes all 8 sub-ceremonies in one cycle):
 
 - **Track 1 advanceable post-Phase-A:** ~3200-4800 LOC across Async-Consult + Pharmacy refill/dispense/shipment + Med-Interaction
-- **Track 2 advanceable post-Phase-A:** ~500-950 LOC across Mode 1 patient-surface localization + Mode 2 scaffolding (or 20 LOC under Option D defer + Mode 2 scaffolding only)
+- **Track 2 advanceable post-Phase-A:** ~500-950 LOC across Mode 1 patient-surface **localization upgrade** (the FUTURE Telecheck-Ghana scope, NOT the Plan's Buildable-now current surface which already shipped) + Mode 2 scaffolding (or 20 LOC under Option D defer + Mode 2 scaffolding only). **Plan's Buildable-now Track 2 scope is already advanced — NOT part of "post-Phase-A" LOC accounting.**
 - **Track 3 advanceable post-Phase-A:** ~600-1000 LOC of Forms-Intake publish-gate IMPL + production-deploy gate replacement
 - **Track 4 already advanceable** today (no SI dependency)
 - **Track 5 already advanceable** today (no SI dependency)
@@ -191,7 +198,31 @@ Tracks 4 + 5 are NOT subject to the Phase A no-fan-out rule (they have no SI dep
 
 ---
 
-## 5. What this doc is NOT
+## 5. Recommended Plan patch (cross-doc-drift surfacing)
+
+Per Codex R2 H1 closure 2026-05-17, this doc's analysis surfaced **two source-of-truth drifts** between Master Completion Plan v1.0 (authored 2026-05-15) and the current ratifier-queue state (post the 2026-05-16/17 autonomous-run SI filings + cross-doc audit). These drifts should be patched in a future Plan revision; pending that, this doc treats them as documented-and-flagged rather than silently overriding the Plan.
+
+**Drift 1 — Phase A ratifier scope count: 7 SIs (Plan) vs 12 SIs (current state):** Plan §"Phase A scope" item 4 lists 7 pending SIs (SI-003/004/005/008/009/010/011). Five more SIs have been filed or surfaced since:
+
+- **SI-002** (rediscovered as OPEN per Implementation State Audit 2026-05-17 cross-doc-drift surfacing — Plan was authored before the audit caught the stale "SI-002 closed earlier" framing in the previous Ratifier Ceremony Agenda; SI-002 source file still says OPEN v0.5 DRAFT target P-014)
+- **SI-007** (rediscovered as OPEN — same surfacing; SI-007 source file says OPEN v0.19 DRAFT target P-013)
+- **SI-012** (filed during autonomous run 2026-05-16; Med Interaction Engine CDM expansion; pilot-launch blocker per the Plan's own §Track-1 "Med-Interaction first" critical-path positioning)
+- **SI-013** (filed 2026-05-16; CCR crisis-helpline keys; Mode 1 chat patient-localization upgrade scope)
+- **SI-014** (filed 2026-05-16; Crisis-detection clinical-grade NLP classifier upgrade; Mode 1 chat patient-localization upgrade scope; requires new ADR-030)
+
+**Recommended Plan patch (Drift 1):** update Plan §"Phase A scope" item 4 + §"Status pointer" item 1 to reflect the 12-SI scope. The 4 Plan structural deliverables (authContext wiring + Identity slice + CCR resolver + ratifier ceremony) remain unchanged; only the ratifier ceremony's SI inventory expands.
+
+**Drift 2 — Track 2 ratifier-blocking framing:** Plan §"Status pointer" item 4 says Track 2 Mode 1 chat handler wire-up is "Buildable now without ratification gates." This was accurate at Plan-authoring time (2026-05-15) and remains accurate for the **CURRENT** Mode 1 chat handler surface — that work shipped as the 21-test-case surface per Implementation State Audit §1 IN-PROGRESS classification. However, SI-013 + SI-014 (both filed 2026-05-16) gate a FUTURE patient-localization upgrade of Mode 1 that the Plan doesn't separately enumerate.
+
+**Recommended Plan patch (Drift 2):** add a Plan §Track-2 sub-bullet distinguishing "Mode 1 chat handler wire-up — Buildable now (per current §Status-pointer item 4)" from "Mode 1 patient-localization upgrade for Telecheck-Ghana — ratifier-gated on SI-013 + SI-014 (post-Plan SIs)." This preserves the original Plan's accurate framing of the buildable-now scope while documenting the post-Plan SI gates on the future upgrade.
+
+**This Plan patch is documentary work, not ratifier-ceremony work.** It can land independently of the Phase A ratifier ceremony. Estimated effort: 1 small PR against the spec-corpus repo (`arthurmenson/telecheckONE`); ~20 LOC of Plan edits + a Plan revision-history bump.
+
+**Scoping note:** this doc cannot unilaterally patch the Plan — the Plan is a spec-corpus artifact requiring ratifier sign-off per Promotion Ledger discipline. This §5 surfaces the drift + recommends the patch path; actual Plan editing happens via a separate PR cycle with appropriate ratifier sign-off.
+
+---
+
+## 6. What this doc is NOT
 
 - **Not a re-derivation of `Telecheck_Master_Completion_Plan_v1_0.md`**: the Plan remains the authoritative source for Track structure, team sizes, deliverable lists, and timeline. This doc is a SI → Track cross-reference, not a re-statement of the Plan.
 - **Not a binding sprint plan**: the LOC estimates per Track in §1 + §4 are bounded-volume estimates for sequencing visibility, not Sprint commitments. Actual Sprint planning happens at Sprint kickoff per `docs/SCRUM_OPERATING_MODEL.md`.
@@ -202,7 +233,7 @@ Tracks 4 + 5 are NOT subject to the Phase A no-fan-out rule (they have no SI dep
 
 ---
 
-## 6. Cross-references
+## 7. Cross-references
 
 - Master Completion Plan v1.0 (authoritative Track structure): `Telecheck_Master_Completion_Plan_v1_0.md` (spec corpus, sibling repo at `arthurmenson/telecheckONE`)
 - Ratifier Ceremony Agenda Q2 2026 (authoritative sub-ceremony order): `docs/Ratifier-Ceremony-Agenda-Q2-2026.md` (post 2026-05-17 patch per PR #169)
