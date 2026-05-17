@@ -152,11 +152,12 @@ Migrations 006 + 007 + 008 + 009 + 010 + 011. The base schema landed in `006_for
 
 Migration 008 enforces "at most one `in_progress` forms_submission per `(tenant_id, deployment_id, patient_id)`" (the I-022-adjacent intake ergonomic invariant). Migration 009 enforces "at most one forms_snapshot per `(tenant_id, submission_id)`" — snapshots are append-only at submit-time, not amendment-style. Migrations 010 + 011 widen `program_id` and actor-id columns from `VARCHAR(26)` to `TEXT` so non-ULID identifiers from upstream brands and B2B partners don't break ingestion.
 
-### HTTP API surface — 19 routes mounted under `/v0/forms`
+### HTTP API surface — 18 routes mounted under `/v0/forms`
+
+(Codex R2 M1 closure 2026-05-17: route count corrected from 19 → 18 + the nonexistent `GET /health` row removed. The Forms-Intake plugin does NOT register a module health probe per `src/modules/forms-intake/routes.ts`; the 18-route count is verified by `grep -E "app\.(get|post|put|patch|delete)" src/modules/forms-intake/routes.ts | wc -l`.)
 
 | Method | Path                                                 | Purpose                                                                 |
 | ------ | ---------------------------------------------------- | ----------------------------------------------------------------------- |
-| GET    | `/health`                                            | Module health probe                                                     |
 | POST   | `/templates`                                         | Author a new form template (operator)                                   |
 | GET    | `/templates`                                         | List templates for the tenant                                           |
 | GET    | `/templates/:templateId`                             | Read a template + its versions                                          |
@@ -237,7 +238,7 @@ Plus the schema-level migration tests in the foundation set (000-005 + 006-011) 
 - **I-022** consent-clarity / single-active-submission — DB-level partial unique index in migration 008; service-layer surfaces a 409 envelope when a patient tries to start a second `in_progress` submission against the same deployment.
 - **I-023** — three-layer tenant isolation: RLS layer-1 + app-layer tenant filter in every repo SELECT + per-tenant KMS via `tenant.kms_key_alias` for resume-state encryption.
 - **I-024** — cross-actor / break-glass: delegate-cross-tenant attempts return 404 tenant-blind via `submission-delegate-ownership.test.ts`. The slice does NOT support break-glass at v1.0; that lands with the Admin Backend slice.
-- **I-025** — tenant-blind error envelopes: every 4xx envelope across the 19 routes carries no tenant identifier or DBA substring (verified by the canonical `tests/integration/error-envelope-http.test.ts`, which targets the forms-intake surface specifically).
+- **I-025** — tenant-blind error envelopes: every 4xx envelope across the 18 routes carries no tenant identifier or DBA substring (verified by the canonical `tests/integration/error-envelope-http.test.ts`, which targets the forms-intake surface specifically).
 - **I-027** every audit row carries `tenant_id` (DB-enforced NOT NULL on `audit_records.tenant_id` per migration 002).
 - **I-003** audit append-only — same-tx emission via `txCallback`; idempotent endpoint replay (per IDEMPOTENCY v5.1) emits NO spurious audit on cache hit (the cached response is returned without re-running the handler).
 - **Master PRD v1.10 §17 + Glossary v5.2 C3** — `tenant_id` stripped from every patient-surface response (deployments, submissions, snapshots, resume-state views).
