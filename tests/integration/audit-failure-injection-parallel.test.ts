@@ -89,11 +89,8 @@ import { config } from '../../src/lib/config.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import { issueAccessToken } from '../../src/lib/jwt.ts';
 import { ulid } from '../../src/lib/ulid.ts';
-import {
-  type AuditFailureInjector,
-  AuditInjectedFailure,
-  createAuditFailureInjector,
-} from '../helpers/audit-failure-injection.ts';
+import { AuditInjectedFailure } from '../helpers/audit-failure-injection.ts';
+import { auditPlaceholderInjector } from '../helpers/audit-placeholder-injection.ts';
 import {
   Mode1AuditInjectedFailure,
   mode1ChatResponseAuditInjector,
@@ -103,17 +100,17 @@ import { TENANT_US } from '../helpers/tenant-fixtures.ts';
 // ---------------------------------------------------------------------------
 // Second injector — for aiServiceAuditPlaceholder
 // ---------------------------------------------------------------------------
-
-/**
- * Second injector instance bound to `aiServiceAuditPlaceholder`.
- * Constructed at module-load time so the vi.mock factory below can
- * reference it. NOT exported to any helper file — this is purely
- * test-local because the underlying function is a type-cast helper,
- * not a production audit emitter.
- */
-const auditPlaceholderInjector: AuditFailureInjector = createAuditFailureInjector(
-  'aiServiceAuditPlaceholder',
-);
+//
+// The second injector `auditPlaceholderInjector` is imported from a
+// dedicated helper module (`tests/helpers/audit-placeholder-injection.ts`)
+// — NOT declared inline in this test file — because Vitest hoists
+// vi.mock factories ABOVE top-level const declarations in the
+// containing module. An inline `const auditPlaceholderInjector = ...`
+// would trip a TDZ error when the mocked module is first imported.
+// Imports ARE hoisted in the same pass as vi.mock factories, so an
+// injector exported from a helper module is safely available when
+// the factory below runs. Codex R1 H1 closure on PR #170 (2026-05-17)
+// caught this hazard in an earlier draft.
 
 // ---------------------------------------------------------------------------
 // vi.mock — wrap BOTH emitMode1ChatResponseAudit AND aiServiceAuditPlaceholder
