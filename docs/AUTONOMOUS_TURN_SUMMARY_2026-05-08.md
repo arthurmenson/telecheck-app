@@ -1,5 +1,19 @@
 # Autonomous Turn — Cumulative Summary (2026-05-08)
 
+> **Historical-record framing (added 2026-05-17 per PR #174 §5 patch 10):**
+> This is an explicitly-dated 2026-05-08 turn summary. The body below captures state at the time it was written and is **preserved unedited** for traceability. Several body claims are stale relative to current state (2026-05-17):
+>
+> - **"SI-001 / SI-002 / SI-003 / SI-004 / SI-005 remain open"** is stale. SI-001 RATIFIED P-011 2026-05-11. SI-006 CLOSED Sprint 33-34. Current OPEN inventory: **12 SIs** (SI-002/003/004/005/007/008/009/010/011/012/013/014); the 8 SIs SI-007 through SI-014 were filed after this doc was written.
+> - **"pharmacy can adopt these from day 1 when SI-001 unblocks"** (PR #79 description) — SI-001 unblocked P-011 2026-05-11; Pharmacy module did adopt the audit-dedupe + reserve-then-execute primitives. The Pharmacy MedicationRequest/prescribe surface is now IMPLEMENTED (12 routes per `src/modules/pharmacy/routes.ts`).
+> - **"Spec Issues open: 5"** is stale (current: 12).
+> - **"If SI-001 closes:"** forward-looking branch — the branch was taken.
+>
+> For the current state of the autonomous run + closure-debt list, see `Telecheck_v1_10_PRD_Update/AI_Service_Rollout_24h_Status_2026-05-14.md` Addendum 36+ (most recent at top).
+>
+> **Body below preserved unedited.**
+
+---
+
 **Final PR merged:** #81 (this amendment)
 **CI status:** ✅ Green
 **Total PRs this autonomous turn:** 23 (#59 through #81)

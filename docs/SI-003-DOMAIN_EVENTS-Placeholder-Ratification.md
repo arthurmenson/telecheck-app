@@ -91,7 +91,7 @@ The 28 placeholder event-type strings emitted by the 3 slices are listed below. 
 2. Pick canonical naming convention (note Forms/Intake mixes `forms_template.created` with `intake_response.submitted` — both work; this corpus might benefit from picking `<aggregate>.<lifecycle_event>` uniformly)
 3. Author the DOMAIN_EVENTS v5.2 enumeration block adding all 28 ratified event-type strings (or v5.3 amendment)
 4. Define the mandatory `payload` shape per event (field names, types, nullability)
-5. Promotion Ledger entry P-013 closes this SI
+5. Next-available Promotion Ledger entry after P-018/SI-008 closes this SI (originally planned for P-013 but P-013 was claimed by SI-007 v0.19 merged 2026-05-14; P-014 by SI-002; P-017 by SI-005; P-018 by SI-008; see the "Resolution expectations" block below for the full chain — updated 2026-05-17 per PR #175 R3 MEDIUM closure to align Step 1's close-out instruction with the Resolution-expectations block)
 
 ### Step 2 (this code repo, owned by Engineering)
 
@@ -138,5 +138,5 @@ Same autonomous-turn discipline as SI-002: **never invent new canonical contract
 
 ## Resolution expectations
 
-- **Target close-out:** Promotion Ledger entry **P-013** (next available P-NUM after P-012 closes SI-002 audit-side gap).
+- **Target close-out:** Promotion Ledger entry **next-available after P-014/SI-002 closes** (originally P-013 per the v0.1 plan, but **P-013 was claimed by SI-007 v0.19 merged 2026-05-14** for Refill/Dispensing/Shipment schema closure; **P-014 was claimed by SI-002 v0.5** for AUDIT_EVENTS placeholder ratification). SI-003's effective slot is now **next-available after P-018/SI-008** (since SI-005 → P-017 and SI-008 → P-018 also intervene per their Status blocks), pending the next ratification ceremony's queue ordering. **Retargeting added 2026-05-17 per PR #175 R2 MEDIUM closure** to make this SI's P-NUM situation authoritative on its own Status block rather than presenting a stale P-013 target the matrix r7 OPEN list had to flag as drifted.
 - **Until then:** SI-003 stays open in this file; all slices use inline event-type strings; tests pin the strings as assertion predicates so out-of-band rename surfaces as test failure.
