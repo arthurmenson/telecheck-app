@@ -62,13 +62,27 @@ The autonomous run has reached a **natural milestone**. Two things converged at 
 
 ### §2.2 — Ratifier ceremony agenda (PR #167 + PR #169)
 
-The Q2 2026 Ratifier Ceremony Agenda is filed at `docs/Q2-2026-Ratifier-Ceremony-Agenda.md`. The 3-patch from PR #169 brought it current. The ceremony's recommended sequencing:
+The Q2 2026 Ratifier Ceremony Agenda is filed at **`docs/Ratifier-Ceremony-Agenda-Q2-2026.md`** (3-patch from PR #169 brought it current per the Implementation State Audit). The agenda's authoritative model — which this status-reflection doc defers to rather than restates — uses **5 clusters + 8 sub-ceremonies + 3 constraint classes**:
 
-1. **First batch** (decoupled, no dependencies): SI-002 (P-014); SI-007 (P-013, already pre-ratification-gate-complete via 18 Codex rounds).
-2. **Second batch** (waits on first): SI-005 (P-017); SI-003 (next-available after P-018).
-3. **Third batch** (large cluster, ratifier judgment-heavy): SI-008/009/010 (P-018/019/020) — should be ratified together due to the SI-010 cascade.
-4. **Fourth batch** (umbrella + sub-SIs): SI-011 (P-021 + P-022..P-025) — per-sub-SI ledger entries.
-5. **Fifth batch** (post-ratifier-judgment): SI-012/013/014 (P-022) — SI-014 requires the ADR-030 classifier-choice STOP-decision separately.
+**Constraint classes (per agenda TL;DR + §5):**
+- **HARD ratification-correctness** — ONE chain only: **Cluster B (SI-008 + SI-009 must ratify BEFORE SI-005)** because SI-005's row shape names FKs into SI-008/009 row shapes. Partial ratification would force SI-005 to record FK targets pointing at unratified row shapes.
+- **IMPLEMENTATION-readiness gates** (do NOT gate SI ratification; gate the engineering work landing per the ratified contract) — Cluster C: SI-011 has 4 IMPL prereqs (SI-010 + SI-008 + MarketingCopy CDM + I-030 detection rules); SI-011 itself can ratify at any time.
+- **RECOMMENDED batching** (savings on re-test cost; ratifications can split) — Cluster D: SI-013 + SI-014 pairing.
+
+**Recommended sub-ceremony order (per agenda §3; not a strict sequence — several can run in parallel):**
+
+| Sub-ceremony | SIs | Est. ratifier time |
+| --- | --- | --- |
+| 1. Cluster E batch (pilot-launch standalone blockers) | SI-012 + SI-007 | 60-90 min |
+| 3. Placeholder-namespace sibling pair | SI-002 + SI-003 | 30-45 min |
+| 4. Cluster B batch (HARD-sequenced) | SI-008 + SI-009 + SI-005 | 60-90 min |
+| 5. SI-004 ratification (4-of-11 scope) | SI-004 | 30-45 min |
+| 6. SI-011 ratification (with prerequisite confirmation) | SI-011 (+ MarketingCopy CDM + I-030 decision) | 90-120 min |
+| (remaining) | SI-010 + SI-013 + SI-014 (SI-014 conditional on ADR-030 STOP-decision) | per agenda §3 |
+
+**Total estimated ratifier time: 8-12 hours across the 8 sub-ceremonies.** SI-014's outcome depends on the ADR-030 classifier-choice STOP-decision separately (per CLAUDE.md hard-floor).
+
+**Critical pre-empted ratification-correctness violation:** an earlier draft of this status-reflection doc proposed a 5-batch sequencing that put SI-005 in batch 2 before SI-008/009 in batch 3, which would have violated Cluster B's HARD constraint. The agenda's Cluster B sequencing (SI-008 + SI-009 → SI-005, batched into sub-ceremony 4) is the authoritative ordering — Codex R1 H1 closure 2026-05-17 caught the violation in this doc's draft.
 
 ### §2.3 — Hard-floor STOP-conditioned items
 
@@ -85,18 +99,19 @@ Per CLAUDE.md §"Autonomous-work authorization" hard floor:
 
 ## §3 — What the next ratifier ceremony unlocks
 
-If the Q2 2026 ceremony ratifies **even just the first two batches** (SI-002 + SI-007 + SI-005 + SI-003), the autonomous-scope code-only work surface re-expands significantly:
+Per the agenda §3 sub-ceremony estimates (see `docs/Ratifier-Ceremony-Agenda-Q2-2026.md` for authoritative timing), and ranked by **autonomous-scope unblock magnitude**:
 
-| Unblock | Estimated autonomous-scope surface |
-| --- | --- |
-| **SI-002 / SI-003 closure** | ~31 + ~28 = ~59 placeholder cast-site removals across forms-intake/identity/consent slices (mechanical refactor; Codex-bounded) |
-| **SI-007 closure** | Pharmacy refill + dispense + shipment slice authoring (~3 modules × ~8-12 routes each = ~30 routes + ~3 state machines + tests). Substantial code-only surface. |
-| **SI-005 closure** | Async Consult ConsultEvent schema fixed (the engineering-authored placeholder in migrations 020/021 → canonical); test coverage already exists (PR #51) |
-| **SI-004 closure** | 4 placeholder event names → ratified strings (mechanical) |
+| Sub-ceremony | SIs ratified | LOC / sprint surface unblocked |
+| --- | --- | --- |
+| **1. Cluster E batch** | SI-012 + SI-007 | ~2000-3000 LOC Med Interaction Engine impl + ~800-1200 LOC pharmacy refill/dispense/shipment HTTP surface + handlers + state machines. **Highest single-sub-ceremony LOC unblock per the agenda §5 Cluster E rationale.** |
+| **3. Placeholder-namespace sibling pair** | SI-002 + SI-003 | ~31 + ~28 = ~59 placeholder cast-site removals across forms-intake/identity/consent slices (mechanical refactor; Codex-bounded) |
+| **4. Cluster B batch** (HARD-sequenced) | SI-008 + SI-009 + SI-005 | Mode 2 case-prep scaffolding ratifies (Track 2 anchor); LiveKit-backed sync session schema (Slice 5+); Async Consult ConsultEvent schema fixed (engineering-authored placeholder in migrations 020/021 → canonical) — ~3-4 sprints of scaffolding work unlocked across Tracks 1 + 2 + 5 |
+| **5. SI-004 ratification** | SI-004 | 4 placeholder event names → ratified strings (mechanical) |
+| **6. SI-011 ratification** | SI-011 (+ MarketingCopy CDM + I-030 decision) | Forms-Intake publish-time governance gates ship; tenant-admin publish workflow unblocked; 4 audit events + 4 IMPL-readiness gate satisfactions |
 
-**Combined first-two-batch unblock:** roughly **~3-5 sprints of bounded autonomous-scope code-only work** waiting on the spec corpus closure.
+**Combined ceremony unblock:** if all 8 sub-ceremonies ratify, **roughly ~7-12 sprints of bounded autonomous-scope code-only work** unlocks. The single highest-leverage sub-ceremony is **#1 (Cluster E: SI-012 + SI-007)** — it alone unblocks the largest LOC surface and is independent (no inter-cluster dependencies).
 
-If the ceremony also ratifies **SI-008/009/010** (the third batch), an additional ~4-6 sprints of work unlocks (Mode 2 case-prep scaffolding; LiveKit-backed sync sessions; session actor-context wiring).
+**SI-014's outcome depends separately on the ADR-030 STOP-decision** per CLAUDE.md hard-floor — not autonomous-scope.
 
 ---
 
@@ -116,28 +131,32 @@ If the ceremony also ratifies **SI-008/009/010** (the third batch), an additiona
 
 **If the loop continues anyway,** the safest bounded-scope code-only choice is **a 4th cross-validation pass on PROJECT_CONVENTIONS.md + SCRUM_OPERATING_MODEL.md + the per-slice STATUS docs not refreshed in PR #173 (CONSENT_SLICE_STATUS + IDENTITY_SLICE_STATUS)** — though the diminishing-value warning is real.
 
+**Authority for this recommendation:** Per the spec-repo `CLAUDE.md` §"Autonomous-work authorization (Evans standing directive, 2026-05-16+)" — that section authorizes Claude to "work continuously through the Codex-per-PR adversarial-review cycle" with explicit STOP conditions enumerated. The pause-at-milestone recommendation here is consistent with the spirit of that directive (continue when there is critical-path autonomous-scope work; pause when only ratifier-blocked or STOP-conditioned items remain). It is NOT itself an explicit stop directive in CLAUDE.md — Evans retains final say on whether to continue or pause.
+
 ---
 
 ## §5 — What this doc is NOT
 
 - **Not a Spec Issue.** Reflective only.
-- **Not a ratifier agenda.** The agenda lives at `docs/Q2-2026-Ratifier-Ceremony-Agenda.md` (PR #167 + 3-patch from PR #169). This doc cross-references but does not duplicate.
-- **Not a per-Track SI navigation map.** That lives at the doc from PR #171.
-- **Not authorization to cease all autonomous work.** It is authorization (per Evans's CLAUDE.md autonomous-work directive) to pause the loop at this natural milestone, surface this doc, and resume when ratifier closures land.
+- **Not a ratifier agenda.** The agenda lives at `docs/Ratifier-Ceremony-Agenda-Q2-2026.md` (PR #167 + 3-patch from PR #169). This doc cross-references but does not duplicate.
+- **Not a per-Track SI navigation map.** That lives at `docs/Per-Track-SI-Navigation-2026-05-17.md` (PR #171).
+- **Not authorization to cease all autonomous work.** It is a *recommendation* informed by Evans's spec-repo CLAUDE.md autonomous-work directive — Evans can override and continue, accepting the diminishing-marginal-value tradeoff.
 
 ---
 
 ## §6 — Cross-references
 
-- **`Telecheck_v1_10_PRD_Update/AI_Service_Rollout_24h_Status_2026-05-14.md`** Addendums 25–37 — the per-PR autonomous-run trail.
-- **`Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_Master_Completion_Plan_v1_0.md`** — 6-track decomposition (Track 1 Clinical Care, Track 2 AI Service, Track 3 Consent + Forms-Intake, Track 4 Mobile + UI, Track 5 Infra & Ops, Track 6 Spec-corpus ratification).
+- **Spec-repo `Telecheck_v1_10_PRD_Update/AI_Service_Rollout_24h_Status_2026-05-14.md`** Addendums 25–37 — the per-PR autonomous-run trail.
+- **Spec-repo `Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_Master_Completion_Plan_v1_0.md`** — 6-track decomposition (Track 1 Clinical Care, Track 2 AI Service, Track 3 Consent + Forms-Intake, Track 4 Mobile + UI, Track 5 Infra & Ops, Track 6 Spec-corpus ratification).
 - **`docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md`** r7 — current "what's implemented / what's blocked / on which SI" state.
-- **`docs/Q2-2026-Ratifier-Ceremony-Agenda.md`** — the ratifier-side action surface.
-- **`docs/Per-Track-SI-Navigation.md`** (PR #171) — SI → Track → Cluster mapping.
-- **`docs/Sibling-Doc-Cross-Validation-Audit-Round-{1,2,3}-2026-05-17.md`** (PRs #168/172/174) — the drift-closure audit trail.
+- **`docs/Ratifier-Ceremony-Agenda-Q2-2026.md`** — the ratifier-side action surface (5 clusters + 8 sub-ceremonies + 3 constraint classes).
+- **`docs/Per-Track-SI-Navigation-2026-05-17.md`** (PR #171) — SI → Track → Cluster mapping.
+- **`docs/Implementation-State-Audit-2026-05-17.md`** (PR #168) — 1st R3-class sibling-doc audit (this repo's implementation state).
+- **`docs/Sibling-Doc-Cross-Validation-Audit-2026-05-17.md`** (PR #172) — 2nd R3-class sibling-doc audit (Promotion Ledger + per-slice STATUS docs).
+- **`docs/Sibling-Doc-Cross-Validation-Audit-Round-3-2026-05-17.md`** (PR #174) — 3rd R3-class sibling-doc audit (matrix r6 + AUTONOMOUS_TURN_SUMMARY series).
 - **`docs/SI-*.md`** — 14 SI source files (2 effectively closed: SI-001 RATIFIED P-011 + SI-006 CLOSED Sprint 33-34; 12 OPEN).
-- **CLAUDE.md** — autonomous-work authorization directive + STOP conditions.
+- **Spec-repo `CLAUDE.md`** (at `C:\Menson Special\Telecheck Project\CLAUDE.md`) — contains the §"Autonomous-work authorization (Evans standing directive, 2026-05-16+)" section with the explicit STOP-conditions taxonomy this doc's §2.3 + §4 cites. Note: the code-repo `telecheck-app/CLAUDE.md` does NOT contain this directive — only the hard implementation rules (I-003 / I-019 / I-023 / I-024 / I-025 / I-027 etc.) and the EHBG §13-derived bootstrap content. The autonomous-work directive lives only in the spec-repo CLAUDE.md.
 
 ---
 
-— Claude (Opus 4.7, 1M context), 2026-05-17 loop-pause status-reflection authored at the surface-then-patch R3-class drift-closure milestone (39 PRs MERGED in cycle window; 179+ Codex closures; 12 OPEN SIs in ratifier queue; recommendation: pause until Q2 ratifier ceremony lands).
+— Claude (Opus 4.7, 1M context), 2026-05-17 loop-pause status-reflection authored at the surface-then-patch R3-class drift-closure milestone (**41 PRs** MERGED in cycle window 2026-05-14 → 2026-05-17 per §1; 179+ Codex closures; 12 OPEN SIs in ratifier queue; recommendation: pause until Q2 ratifier ceremony lands).
