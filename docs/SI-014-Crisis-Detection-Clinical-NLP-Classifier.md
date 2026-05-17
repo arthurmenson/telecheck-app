@@ -255,13 +255,20 @@ This SI's resolution materially changes the platform-floor safety posture. Until
 - Telecheck-US (Heros Health DBA) launch on Mode 1 chat carries the EN-only stub limitation. Acceptable IF the ratifier explicitly judges so (most US patients write EN; the false-negative gap is paraphrase coverage, not language).
 - Telecheck-Ghana (Heros Health Ghana DBA) launch on Mode 1 chat is BLOCKED by Rule 6 — the stub does not satisfy I-019 for the Ghana tenant's expected language mix.
 
-The Master Completion Plan v1.0 Phase B "Clinical Care" track depends on this SI's resolution. The plan's exit gate for Phase B includes I-019 verified end-to-end; "verified" requires a non-stub classifier per the docstring's own production-readiness criteria.
+The Master Completion Plan v1.0 Phase B "Clinical Care" track depends on this SI's resolution. Phase B I-019 verification semantics are OPTION-SCOPED (Codex R3 H1 v2 closure 2026-05-16; previous unqualified language created a governance-blocking contradiction with Closure path B's Phase B reconciliation):
+
+- **Under Options A/B/C ratified**: Phase B I-019 verification REQUIRES the shipped non-stub classifier (per the docstring's own production-readiness criteria) + the two AUDIT_EVENTS amendments + the I-022 amendment + Tier 1+2 test obligations passing. SI-014 closes; Phase B can mark I-019 verified end-to-end.
+- **Under Option D ratified**: Phase B I-019 verification is CONDITIONALLY satisfied while AND ONLY WHILE (a) the Mode 1 patient-access gate from Closure path B is in force, AND (b) the SI-014.1-dependent governance block on gate-removal is in force, AND (c) no other patient-facing surface routes free-text through `crisisDetector.detect()` at v1.0 (per the Forms-Engine slice scoping carve-out documented in Closure path B's Phase B reconciliation). If any of (a)/(b)/(c) lapses, Phase B I-019 verification reverts to "not satisfied" until SI-014.1 ratifies a classifier choice via Closure path A. The Master Completion Plan v1.0 §Phase-B-exit-gate doc MUST cross-reference these three conditions explicitly so the conditional-satisfaction semantics is auditable.
+
+A previous draft made the Phase B language unqualified ("verified requires a non-stub classifier") which contradicted Closure path B's claim that Option D satisfies Phase B via the patient-access gate. The option-scoped framing above reconciles the two by acknowledging that I-019's verification surface is the SET OF PATIENT-ACCESSIBLE SURFACES THAT ROUTE FREE-TEXT THROUGH CRISIS DETECTION — under Option D that set is empty for Mode 1 (gated off) and out-of-scope for v1.0 Forms (carve-out), so the verification obligation has no surface to attach to.
 
 ## Status
 
 - **Filed:** 2026-05-16 (autonomous run; Addendum 27 next-entry-point identification)
 - **Target Promotion Ledger entry:** P-022 (alongside the other 9 pending SIs in the next ratification ceremony — SI-003/004/005/008/009/010/011/012/013/014)
-- **Blocks:** Telecheck-Ghana Mode 1 chat patient launch (per Rule 6); Master Completion Plan Phase B exit gate (per Cross-cutting impact below)
+- **Blocks (OPTION-SCOPED per Codex R3 H1 v2 closure 2026-05-16):**
+  - Telecheck-Ghana Mode 1 chat patient launch (per Rule 6) — blocks UNLESS Option D ratifies (in which case the patient-access gate from Closure path B IS the blocking mechanism, by design)
+  - Master Completion Plan Phase B exit gate — blocks under Options A/B/C until classifier ships; under Option D, conditionally satisfied while the three Closure-path-B conditions hold (gate in force + SI-014.1 dependency in force + no other patient surface routes free-text through crisisDetector.detect)
 - **Blocked by:** ratifier availability for ADR-030 classifier-choice decision (Evans + Engineering Lead + Platform Clinical Governance + Platform AI Safety)
 - **Closure semantics (Codex R3 H1 closure 2026-05-16):**
   - **Options A/B/C ratified** → SI-014 CLOSES via Closure path A; Phase B I-019 verification satisfied by the shipped classifier + the two AUDIT_EVENTS amendments + the I-022 amendment + Tier 1+2 test obligations
