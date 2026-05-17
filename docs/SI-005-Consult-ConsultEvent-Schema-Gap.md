@@ -197,6 +197,7 @@ BEGIN
        OR NEW.clinician_decision_rationale_schema_version IS DISTINCT FROM OLD.clinician_decision_rationale_schema_version
        OR NEW.clinician_decision_rationale_encrypted_at IS DISTINCT FROM OLD.clinician_decision_rationale_encrypted_at
        OR NEW.clinician_decision_rationale_dek_ciphertext IS DISTINCT FROM OLD.clinician_decision_rationale_dek_ciphertext
+       OR NEW.clinician_decision_idempotency_key IS DISTINCT FROM OLD.clinician_decision_idempotency_key  -- R1 HIGH-1 closure: idempotency key is Tier 1 immutable post-decision
     THEN
       RAISE EXCEPTION 'consults(% / %): clinician-decision payload columns are immutable post-decision (Tier 1 append-only per SI-005 v0.2 sub-decision #4 ratification 2026-05-17). Only state + updated_at + (TBD) current_program_catalog_entry_id may transition.', NEW.tenant_id, NEW.id;
     END IF;
@@ -221,37 +222,148 @@ CREATE TRIGGER consults_two_tier_append_only
   EXECUTE FUNCTION consults_reject_post_decision_payload_update();
 ```
 
-### `record_consult_clinician_decision()` SECURITY DEFINER procedure (sub-decision #5)
+### `record_consult_clinician_decision()` SECURITY DEFINER procedure (sub-decision #5; R1 idempotency + R1 audit-binding closures applied)
 
-The ONLY write path to `consults` clinician-decision columns. Application code's role has NO direct UPDATE privilege. Mirrors SI-008's `record_workflow_pointer_swap()` + SI-009's `record_consult_escalation_target_swap()` patterns.
+The ONLY write path to `consults` clinician-decision columns. Application code's role has NO direct UPDATE privilege. Mirrors SI-008's `record_workflow_pointer_swap()` + SI-009's `record_consult_escalation_target_swap()` patterns, with **idempotent retry semantics added per Codex R1 HIGH-1 closure** (one-shot clinical decisions cannot tolerate the "duplicate success vs conflicting second decision" ambiguity that a non-idempotent procedure would create under timeout/lost-response retry conditions).
 
-**Procedure signature:**
+**Procedure signature (R1 closure — adds `p_idempotency_key` parameter):**
 ```sql
 record_consult_clinician_decision(
     p_consult_id                                VARCHAR(26),
     p_tenant_id                                 TEXT,
     p_clinician_decision_class                  VARCHAR(40),
     p_rationale_encrypted_payload               JSONB,  -- 8 envelope columns as nested JSONB
-    p_audit_event_id                            VARCHAR(26)  -- pre-emitted I-012 evidence audit row
-) RETURNS (success: BOOLEAN, rejection_code: TEXT, rejection_detail: JSONB)
+    p_audit_event_id                            VARCHAR(26),  -- pre-emitted I-012 evidence audit row
+    p_idempotency_key                           VARCHAR(64)   -- R1 HIGH-1 closure: client-supplied deterministic request identity
+) RETURNS (success: BOOLEAN, rejection_code: TEXT, rejection_detail: JSONB, prior_outcome: JSONB)
 ```
+
+The `prior_outcome` return field (R1 closure) is populated when an idempotent retry hits an already-recorded decision with the matching `p_idempotency_key` — it returns the original `(decision_class, decided_at, audit_id)` tuple so the caller sees the prior success rather than a hard rejection.
 
 **SECURITY DEFINER + SET LOCAL actor binding:** procedure derives caller identity from `current_actor_account_id()` / `current_actor_account_tenant_id()` / `current_actor_role()` (DEFERRED to SI-010 landing per IMPL-readiness gate). No caller-supplied actor identity.
 
-**Validation steps (in order):**
-1. Row-locks `consults` row + `audit_records` row by `p_audit_event_id` (canonical id-order to prevent deadlocks)
-2. Validates `current_actor_role() ∈ {clinician, tenant_admin, platform_admin}` (else `rejection_code='unauthenticated'`)
-3. Validates `current_actor_account_tenant_id() = p_tenant_id` for non-platform-admin (else `rejection_code='cross_tenant_attempt'`)
-4. Validates `consults.state ∈ {'clinician_review'}` (else `rejection_code='consult_state_invalid'`)
-5. Validates `consults.clinician_decision_class IS NULL` — one-shot decision per consult (else `rejection_code='decision_already_recorded'`)
-6. Validates `p_clinician_decision_class IN ('approved', 'declined', 'requires_more_info', 'escalated_to_sync', 'deferred')` (else `rejection_code='invalid_decision_class'`)
-7. Validates `audit_records.action_id = 'consult.clinician_decision_recorded'` AND `audit_records.actor_id = current_actor_account_id()` (else `rejection_code='audit_mismatch'`)
-8. Performs atomic UPDATE on `consults` (sets all 5 clinician-decision column groups; sets `decided_by_clinician_account_id = current_actor_account_id()`; sets `state` per the decision-class transition map) + INSERTs paired `consult_events` row capturing the transition
-9. Returns `(success=true)` tuple
+**Idempotency persistence (R1 closure):** the `consults` table adds `clinician_decision_idempotency_key VARCHAR(64) NULL` column (NULL until decision is recorded; set atomically with the rest of the clinician-decision payload). UNIQUE partial index `(tenant_id, clinician_decision_idempotency_key) WHERE clinician_decision_idempotency_key IS NOT NULL` enforces that a given idempotency key produces at most one decision per tenant — duplicate keys on different consults are also rejected (prevents idempotency-key reuse across consults).
+
+**Validation steps (in order; R1 closure adds steps 1+8 + reorganizes step 7):**
+1. **(NEW R1 closure)** First — idempotency lookup: `SELECT * FROM consults WHERE tenant_id = $p_tenant_id AND clinician_decision_idempotency_key = $p_idempotency_key`. If found AND `id = p_consult_id` AND decision payload matches `p_clinician_decision_class` + audit_id matches `p_audit_event_id`: return `(success=true, prior_outcome={decision_class, decided_at, audit_id})` immediately (idempotent replay). If found but for a different consult OR with different payload: reject with `rejection_code='idempotency_key_conflict'`.
+2. Row-locks `consults` row + `audit_records` row by `p_audit_event_id` (canonical id-order to prevent deadlocks)
+3. Validates `current_actor_role() ∈ {clinician, tenant_admin, platform_admin}` (else `rejection_code='unauthenticated'`)
+4. Validates `current_actor_account_tenant_id() = p_tenant_id` for non-platform-admin (else `rejection_code='cross_tenant_attempt'`)
+5. Validates `consults.state ∈ {'clinician_review'}` (else `rejection_code='consult_state_invalid'`)
+6. Validates `consults.clinician_decision_class IS NULL` — one-shot decision per consult, idempotency-key check above already handled the legitimate-retry case (else `rejection_code='decision_already_recorded'` — only fires for a TRULY conflicting second decision attempt with a different idempotency key)
+7. Validates `p_clinician_decision_class IN ('approved', 'declined', 'requires_more_info', 'escalated_to_sync', 'deferred')` (else `rejection_code='invalid_decision_class'`)
+8. **(R1 closure — audit-row consult binding)** Validates the audit row is bound to THIS consult: `audit_records.action_id = 'consult.clinician_decision_recorded'` AND `audit_records.actor_id = current_actor_account_id()` AND `audit_records.subject_table = 'consults'` AND `audit_records.subject_id = p_consult_id` AND `audit_records.detail->>'idempotency_key' = p_idempotency_key` (else `rejection_code='audit_mismatch'`). The `subject_table` + `subject_id` validation closes the Codex R1 MEDIUM finding: previously a caller with a same-tenant audit row for the same actor/action could attach unrelated evidence to a different consult decision; now the audit row's subject column MUST bind to this exact consult. The detail JSONB idempotency_key match ensures the audit was emitted under the same idempotent request.
+9. Performs atomic UPDATE on `consults` (sets all 5 clinician-decision column groups + `clinician_decision_idempotency_key = p_idempotency_key`; sets `decided_by_clinician_account_id = current_actor_account_id()`; sets `state` per the decision-class → state transition map defined in §"Decision-class → state transition map" below) + INSERTs paired `consult_events` row capturing the transition
+10. Returns `(success=true, prior_outcome=NULL)` tuple
 
 **Failure behavior:** SAVEPOINT-rollback + autonomous-transaction rejection log + caller-required-commit-boundary (three-tier audit durability mirroring SI-008 R14 closure). Shared `audit_swap_rejection_log` table; discriminator `target_table='consults'`.
 
-**6 rejection codes:** `unauthenticated | cross_tenant_attempt | consult_state_invalid | decision_already_recorded | invalid_decision_class | audit_mismatch`
+**7 rejection codes:** `unauthenticated | cross_tenant_attempt | consult_state_invalid | decision_already_recorded | invalid_decision_class | audit_mismatch | idempotency_key_conflict` (last one added per R1 closure)
+
+### Decision-class → state transition map (R1 HIGH-2 closure — DB-enforced consistency)
+
+R1 HIGH-2 closure: previously the Tier 2 invariant allowed direct UPDATE on `state` post-decision via service-layer guards only, leaving impossible `(state, clinician_decision_class)` combinations reachable via privileged paths / maintenance scripts / compromised definer routines / future service bugs. The DB layer must enforce the decision-class → state transition map.
+
+**Authoritative transition map (consults state machine §3 + sub-decision #3 5-value enum):**
+
+| `clinician_decision_class` (post-decision) | Allowed `state` values post-decision | Forbidden combinations |
+| --- | --- | --- |
+| `approved` | `clinician_approved` → (downstream) `fulfillment_dispatched`, `completed`, `cancelled_post_decision` | NOT `clinician_review`, NOT `declined`, NOT `escalated_to_sync`, NOT `requires_more_info` |
+| `declined` | `clinician_declined` (terminal-on-decision; no further state transitions from decision side) | NOT `clinician_approved`, NOT `escalated_to_sync`, NOT `requires_more_info`, NOT `fulfillment_*` |
+| `requires_more_info` | `awaiting_patient_info` → (later) back to `clinician_review` once info provided | NOT terminal states; NOT `clinician_approved`, NOT `clinician_declined` |
+| `escalated_to_sync` | `escalated_to_sync` → (downstream via SI-009 sync_session flow) `sync_consult_started`, `sync_consult_completed`, `sync_consult_cancelled` | NOT `clinician_approved`, NOT `declined`, NOT `requires_more_info` |
+| `deferred` | `deferred` (clinician explicitly deferred decision; consult waits for re-review) → back to `clinician_review` when re-opened | NOT terminal states; NOT `clinician_approved`, NOT `clinician_declined` |
+
+**DB-layer CHECK constraint** (enforces the post-decision row-state consistency):
+
+```sql
+ALTER TABLE consults ADD CONSTRAINT consult_decision_state_consistency CHECK (
+  clinician_decision_class IS NULL
+  OR (
+    -- Once a decision is recorded, the state MUST match the decision class's allowed set
+    (clinician_decision_class = 'approved' AND state IN ('clinician_approved', 'fulfillment_dispatched', 'completed', 'cancelled_post_decision'))
+    OR (clinician_decision_class = 'declined' AND state = 'clinician_declined')
+    OR (clinician_decision_class = 'requires_more_info' AND state IN ('awaiting_patient_info', 'clinician_review'))
+    OR (clinician_decision_class = 'escalated_to_sync' AND state IN ('escalated_to_sync', 'sync_consult_started', 'sync_consult_completed', 'sync_consult_cancelled'))
+    OR (clinician_decision_class = 'deferred' AND state IN ('deferred', 'clinician_review'))
+  )
+);
+```
+
+**Transition trigger** (BEFORE UPDATE — enforces allowed state-machine transitions for downstream post-decision UPDATEs):
+
+```sql
+CREATE OR REPLACE FUNCTION consults_validate_state_transition()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Pre-decision transitions handled by the service-layer state machine
+  IF OLD.clinician_decision_class IS NULL AND NEW.clinician_decision_class IS NULL THEN
+    RETURN NEW;  -- pre-decision lifecycle; service-layer manages
+  END IF;
+  -- Decision recording transition (handled by record_consult_clinician_decision)
+  IF OLD.clinician_decision_class IS NULL AND NEW.clinician_decision_class IS NOT NULL THEN
+    RETURN NEW;  -- the procedure already validated; CHECK constraint above enforces consistency
+  END IF;
+  -- Post-decision state transitions: validate against the decision-class allowed-state map
+  IF OLD.clinician_decision_class IS NOT NULL THEN
+    CASE OLD.clinician_decision_class
+      WHEN 'approved' THEN
+        IF NEW.state NOT IN ('clinician_approved', 'fulfillment_dispatched', 'completed', 'cancelled_post_decision') THEN
+          RAISE EXCEPTION 'consults(% / %): post-approved state must be in approved-class allowed set; got %', NEW.tenant_id, NEW.id, NEW.state;
+        END IF;
+        -- Also validate the forward direction (no backsliding from completed to clinician_approved):
+        IF (OLD.state = 'completed' AND NEW.state != 'completed') THEN
+          RAISE EXCEPTION 'consults(% / %): cannot transition out of completed state', NEW.tenant_id, NEW.id;
+        END IF;
+      WHEN 'declined' THEN
+        IF NEW.state != 'clinician_declined' THEN
+          RAISE EXCEPTION 'consults(% / %): declined consults are terminal-on-decision; state must remain clinician_declined', NEW.tenant_id, NEW.id;
+        END IF;
+      WHEN 'requires_more_info' THEN
+        IF NEW.state NOT IN ('awaiting_patient_info', 'clinician_review') THEN
+          RAISE EXCEPTION 'consults(% / %): requires_more_info allows only awaiting_patient_info or clinician_review (re-entry)', NEW.tenant_id, NEW.id;
+        END IF;
+      WHEN 'escalated_to_sync' THEN
+        IF NEW.state NOT IN ('escalated_to_sync', 'sync_consult_started', 'sync_consult_completed', 'sync_consult_cancelled') THEN
+          RAISE EXCEPTION 'consults(% / %): escalated_to_sync allows only sync_consult_* downstream states', NEW.tenant_id, NEW.id;
+        END IF;
+      WHEN 'deferred' THEN
+        IF NEW.state NOT IN ('deferred', 'clinician_review') THEN
+          RAISE EXCEPTION 'consults(% / %): deferred allows only deferred or clinician_review (re-entry)', NEW.tenant_id, NEW.id;
+        END IF;
+    END CASE;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER consults_state_transition_validator
+  BEFORE UPDATE ON consults
+  FOR EACH ROW
+  WHEN (OLD.state IS DISTINCT FROM NEW.state)
+  EXECUTE FUNCTION consults_validate_state_transition();
+```
+
+**Why this closes R1 HIGH-2:** combination of CHECK constraint (rejects any INSERT/UPDATE that produces an inconsistent `(state, clinician_decision_class)` tuple) + transition trigger (rejects any UPDATE that violates the post-decision state-machine progression) means impossible lifecycle combinations cannot persist regardless of which code path mutates the row. Privileged paths / maintenance scripts / compromised definer routines / future service bugs all hit the DB-layer enforcement.
+
+### Idempotency key schema addition (R1 HIGH-1 closure)
+
+Add to `consults` column set:
+
+```sql
+clinician_decision_idempotency_key  VARCHAR(64)  NULL  -- R1 HIGH-1 closure: client-supplied deterministic request identity for retry-safe one-shot decision
+```
+
+Add UNIQUE partial index:
+```sql
+CREATE UNIQUE INDEX consult_idempotency_key_partial
+    ON consults (tenant_id, clinician_decision_idempotency_key)
+    WHERE clinician_decision_idempotency_key IS NOT NULL;
+```
+
+Add to Tier 1 immutability set (clinician_decision_idempotency_key is set atomically with rest of payload + frozen thereafter via BEFORE UPDATE trigger).
+
+**Revised total `consults` column count: 25 → 26 (added `clinician_decision_idempotency_key`).**
 
 ### Cross-tenant safety constraints (consolidated; sub-decision #1/2 add 2 new composite FKs)
 
@@ -303,9 +415,9 @@ The 6 Evans-ratified decisions close the major design surface. Remaining open qu
 | **OQ2** | Tier 2 mutability of `current_program_catalog_entry_id` post-clinician-decision — does program re-assignment by downstream slice work require an immutability carve-out, OR is the column frozen with the rest of the payload? | R1-R2 |
 | **OQ3** | `consult.escalation_target_swapped` audit action ID — already in SI-009 P-019 scope, OR new in SI-005? | R1 |
 | **OQ4** | `consult.ai_workflow_execution_swapped` audit action ID — already in SI-008 P-018 scope, OR new in SI-005? | R1 |
-| **OQ5** | State-machine consistency CHECK enumerating valid `(state, clinician_decision_class)` tuples — needed at DB layer, OR sufficient to enforce at service layer? | R2-R3 likely |
+| **OQ5** | ~~State-machine consistency CHECK~~ — **CLOSED at R1 HIGH-2** via DB-layer CHECK constraint + transition trigger (see §"Decision-class → state transition map"). |
 | **OQ6** | Multi-clinician scenarios (consult re-assigned mid-decision OR co-clinician decision) — does the schema need a `clinician_decision_co_signers` table, OR is single-clinician sufficient at v1.0? | R3-R4 |
-| **OQ7** | Idempotency on `record_consult_clinician_decision()` — does the procedure need an Idempotency-Key parameter to guard against retried decision-submission requests? Mirrors SI-008's reserve-then-execute pattern but for a one-shot transition rather than supersession chain. | R2-R3 |
+| **OQ7** | ~~Idempotency on `record_consult_clinician_decision()`~~ — **CLOSED at R1 HIGH-1** via `p_idempotency_key` parameter + `clinician_decision_idempotency_key` column + UNIQUE partial index + idempotent-replay validation in procedure step 1 + `prior_outcome` return tuple. |
 
 ### Acceptance regression-test criteria
 
