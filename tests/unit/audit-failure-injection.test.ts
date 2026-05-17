@@ -73,9 +73,7 @@ afterEach(() => {
 
 describe('createAuditFailureInjector — construction', () => {
   it('A1 throws on empty emitterName', () => {
-    expect(() => createAuditFailureInjector('')).toThrow(
-      /emitterName must be a non-empty string/i,
-    );
+    expect(() => createAuditFailureInjector('')).toThrow(/emitterName must be a non-empty string/i);
   });
 
   it('A2 returns distinct injectors with the requested name', () => {

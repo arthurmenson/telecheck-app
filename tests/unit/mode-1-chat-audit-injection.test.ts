@@ -64,9 +64,7 @@ describe('Mode 1 wrapper — sentinel error contract (PR #163 backwards compat)'
       // name-string assertions continue to match.
       expect((err as Mode1AuditInjectedFailure).name).toBe('Mode1AuditInjectedFailure');
       // emitterName carries through to the subclass.
-      expect((err as Mode1AuditInjectedFailure).emitterName).toBe(
-        'emitMode1ChatResponseAudit',
-      );
+      expect((err as Mode1AuditInjectedFailure).emitterName).toBe('emitMode1ChatResponseAudit');
     }
   });
 
@@ -150,9 +148,7 @@ describe('Mode 1 wrapper — sentinel error contract (PR #163 backwards compat)'
       expect((err as Mode1AuditInjectedFailure).message).toBe(
         'test: emitMode1ChatResponseAudit forced failure',
       );
-      expect((err as Mode1AuditInjectedFailure).message).not.toBe(
-        'emitMode1ChatResponseAudit',
-      );
+      expect((err as Mode1AuditInjectedFailure).message).not.toBe('emitMode1ChatResponseAudit');
     }
   });
 

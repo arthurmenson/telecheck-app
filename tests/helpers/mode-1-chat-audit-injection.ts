@@ -143,10 +143,12 @@ class Mode1AuditInjectedFailureFactoryAdapter extends Mode1AuditInjectedFailure 
  * adapter would produce), AND the dual `instanceof
  * AuditInjectedFailure` chain holds for generic catch paths.
  */
-export const mode1ChatResponseAuditInjector: AuditFailureInjector =
-  createAuditFailureInjector('emitMode1ChatResponseAudit', {
+export const mode1ChatResponseAuditInjector: AuditFailureInjector = createAuditFailureInjector(
+  'emitMode1ChatResponseAudit',
+  {
     errorCtor: Mode1AuditInjectedFailureFactoryAdapter,
-  });
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Backwards-compatible named API (PR #163 surface)
