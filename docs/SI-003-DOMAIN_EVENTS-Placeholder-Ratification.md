@@ -138,5 +138,5 @@ Same autonomous-turn discipline as SI-002: **never invent new canonical contract
 
 ## Resolution expectations
 
-- **Target close-out:** Promotion Ledger entry **P-013** (next available P-NUM after P-012 closes SI-002 audit-side gap).
+- **Target close-out:** Promotion Ledger entry **next-available after P-014/SI-002 closes** (originally P-013 per the v0.1 plan, but **P-013 was claimed by SI-007 v0.19 merged 2026-05-14** for Refill/Dispensing/Shipment schema closure; **P-014 was claimed by SI-002 v0.5** for AUDIT_EVENTS placeholder ratification). SI-003's effective slot is now **next-available after P-018/SI-008** (since SI-005 → P-017 and SI-008 → P-018 also intervene per their Status blocks), pending the next ratification ceremony's queue ordering. **Retargeting added 2026-05-17 per PR #175 R2 MEDIUM closure** to make this SI's P-NUM situation authoritative on its own Status block rather than presenting a stale P-013 target the matrix r7 OPEN list had to flag as drifted.
 - **Until then:** SI-003 stays open in this file; all slices use inline event-type strings; tests pin the strings as assertion predicates so out-of-band rename surfaces as test failure.

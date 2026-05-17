@@ -6,6 +6,7 @@
 **Status:** Open — awaiting CDM v1.2 §4 row-shape expansion
 **Target spec doc:** `Telecheck_Canonical_Data_Model_v1_2.md`
 **Target slice PRD:** `Telecheck_Async_Consult_Slice_PRD_v1_0.md`
+**Target Promotion Ledger entry:** **P-017** (per the P-014/SI-002 → P-017/SI-005 sequencing chain established at SI-008 status block 2026-05-15; added here 2026-05-17 per PR #175 R2 HIGH closure to make this SI's P-NUM target authoritative on its own Status block rather than inferred from SI-008's dependency note)
 
 ---
 
