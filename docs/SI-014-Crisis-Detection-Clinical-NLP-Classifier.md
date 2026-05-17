@@ -152,27 +152,52 @@ The downstream impl MUST emit a Spec Issue against AUDIT_EVENTS for BOTH surface
 
 ## Resolution path
 
-When SI-014 closes:
+The resolution path is SPLIT by ratifier-chosen option family because Options A/B/C all ship a classifier (and therefore need AUDIT_EVENTS + I-022 amendments + implementation + tests) while Option D ships NO classifier (and therefore has fundamentally different closure obligations). A single-track resolution path that unconditionally required classifier-audit amendments was a Codex R3 M1 internal-inconsistency finding (2026-05-16) — under Option D, those amendments would force schemas for a non-existent invocation surface; under A/B/C they're load-bearing.
 
-1. **Ratifier decision** (Evans + Engineering Lead + Platform Clinical Governance + Platform AI Safety) on Option A / B / C / D. The decision is recorded as the new ADR-030 (one of: "Crisis-detection classifier — Claude" / "— on-prem fine-tuned" / "— hybrid" / "— deferred for Mode 1 v1.0").
-2. **AUDIT_EVENTS amendment** to add Rule 5's classifier-provenance fields to the `crisis_detection_trigger` Category A detail schema (purely additive; existing consumers of the schema are unaffected if they ignore the new fields).
-3. **INVARIANTS amendment** to I-022 (PHI processing posture) with the chosen classifier's deployment location row.
-4. **Engineering authors** the downstream impl checklist matching the chosen option (MUST preserve Rules 1–6 above):
+### Shared first step (all options)
+
+1. **Ratifier decision** (Evans + Engineering Lead + Platform Clinical Governance + Platform AI Safety) on Option A / B / C / D. The decision is recorded as the new ADR-030 (one of: "Crisis-detection classifier — Claude" / "— on-prem fine-tuned" / "— hybrid" / "— deferred for Mode 1 v1.0"). ADR-030 documents the WHY of the chosen posture + (for A/B/C) the chosen Rule 2 fail-closed posture (a)+(b) or (c) + (for A/B/C) the chosen Tier 2 cadence and ratifier sign-off process.
+
+### Closure path A — Options A/B/C ratified (classifier ships)
+
+When SI-014 closes under Options A/B/C:
+
+2. **AUDIT_EVENTS amendment — Surface 1**: add Rule 5 Surface 1's classifier-provenance fields to the `crisis_detection_trigger` Category A detail schema (purely additive; existing consumers of the schema are unaffected if they ignore the new fields).
+3. **AUDIT_EVENTS amendment — Surface 2**: add the new `crisis.classifier_invocation` Category B action ID + its detail schema + its fail-soft emission policy per Rule 5 Surface 2.
+4. **INVARIANTS amendment** to I-022 (PHI processing posture) with the chosen classifier's deployment location row (Anthropic API per existing BAA / AWS VPC per ADR-024 / hybrid both).
+5. **Engineering authors** the downstream impl checklist matching the chosen option (MUST preserve Rules 1–6 above):
    - `src/lib/crisis-detection.ts` — extend `CrisisDetector` with the chosen classifier; preserve the constructor argument-count fail-closed gate
    - `src/lib/crisis-detection.ts` — `detect()` returns the same `CrisisDetectionOutcome` type but the implementation calls the chosen classifier; latency-instrumented; provenance fields populated
-   - `src/modules/ai-service/internal/runCrisisGate.ts` (or equivalent) — Category A audit detail now includes the four provenance fields from Rule 5
-   - Multi-language test corpus — at minimum 50 ratifier-approved Twi crisis utterances + 50 EN paraphrase crisis utterances + 50 negative-control (clinical-context discussion of crisis topics that MUST NOT detect) covering the full language matrix
+   - `src/modules/ai-service/internal/runCrisisGate.ts` (or equivalent) — Category A audit detail now includes the four provenance fields from Rule 5 Surface 1
+   - `src/modules/ai-service/internal/audit.ts` (or equivalent) — NEW emitter `emitCrisisClassifierInvocation` for Rule 5 Surface 2 with fail-soft callsite (mirrors SI-013 PR #164 Rule 4)
+   - Multi-language test corpus — see Tier 2 obligations (NOT a CI artifact)
    - If Option C (hybrid): the parallel-execution combiner + the per-classifier audit-detail capture
    - If Option B (on-prem): the model service deployment + the latency-floor regression test + the model-drift monitoring dashboard
    - If Option A or C (Claude): the AI-RESIL-001 adapter wiring per ADR-020. **The fail-closed posture is NOT "fall back to regex if the API fails."** It is whichever of Rule 2's three postures ADR-030 ratifies — (a)+(b) coverage-scoped split (in-coverage → regex fallback; out-of-coverage → typed `CrisisClassifierUnavailableError` → 503), or (c) uniform hard-fail (every classifier failure → 503 regardless of language). The downstream impl MUST implement WHICHEVER posture ADR-030 chose; it must NOT default to blanket regex fallback (which would silently regress to today's Twi/paraphrase miss exposure that this SI was filed to close). Codex R2 H1 closure 2026-05-16.
-5. **Regression tests** — see the obligation list below
-6. **Promotion Ledger entry** documenting the ADR-030 + classifier ratification
+6. **Regression tests** — Tier 1 + Tier 2 per the split obligation list below
+7. **Promotion Ledger entry** documenting ADR-030 + classifier ratification + the two AUDIT_EVENTS amendments + the I-022 amendment
 
-Code change is bounded to the chosen option's scope. Option A: ~150 LOC + 1 new module for the Claude classifier client. Option B: ~400 LOC + the model-service deployment infra. Option C: ~250 LOC + both. Option D: 0 LOC (the chat handler's route guard becomes the SI's resolution).
+Code-change scope: Option A ~150 LOC + 1 new module for the Claude classifier client. Option B ~400 LOC + the model-service deployment infra. Option C ~250 LOC + both.
+
+### Closure path B — Option D ratified (classifier deferred)
+
+When SI-014 closes under Option D, the deliverables are FUNDAMENTALLY DIFFERENT — no classifier ships, no AUDIT_EVENTS amendments are needed (the new Cat B `crisis.classifier_invocation` would have no producer at v1.0), no I-022 amendment is needed (no new PHI-processing surface exists). The closure path is:
+
+2. **Mode 1 patient-access gate**: configure the Mode 1 chat handler's route guard so patient JWTs cannot access `/v0/ai/chat` at v1.0. Clinician-test JWTs may retain access for internal QA. This is a small handler-level change (~20 LOC + a feature-flag check) — NOT a classifier change.
+3. **Patient-facing surface communication**: any documentation or marketing copy that promised Mode 1 chat to patients at v1.0 launch MUST be updated to reflect the deferred posture. The Master PRD v1.10 §17 engagement KPI projections may need a footnote acknowledging the Mode 1 deferral.
+4. **Ghana pilot reaffirmation**: confirm with the Telecheck-Ghana operations team that the chronic-care surfaces (forms, async-consult, prescription/refill) are sufficient for revenue-bearing pilot launch WITHOUT Mode 1 chat — this is a stakeholder-alignment step, not a code change.
+5. **Promotion Ledger entry** documenting the deferral decision (NOT a classifier ratification — explicitly an "SI-014 closed by deferring the question; classifier choice rescoped to v1.1 or later"). The next SI in this lineage (SI-014.1 / SI-015) re-opens the classifier-choice when the platform is ready to revisit.
+6. **NO** AUDIT_EVENTS amendments. **NO** I-022 amendment. **NO** Tier 1 / Tier 2 test deliverables (the regression-test obligation list applies ONLY to Options A/B/C — see the preamble of that section). **NO** changes to `src/lib/crisis-detection.ts` (the regex stub remains for the clinician-test patient surface where Mode 1 is still reachable).
+
+Code-change scope: ~20 LOC (the patient-access gate). The "expensive" deliverables are governance + stakeholder-communication, not engineering.
+
+ADR-030 under Option D MUST explicitly state the rescoping mechanism (which future SI re-opens classifier choice; what trigger event opens it — a new tenant onboarding, a new partnership requirement, etc.) so the deferral cannot become silent permanent neglect.
 
 ## Regression test obligations (downstream impl)
 
-When the code change lands (Options A/B/C — Option D is a non-deliverable), the test surface MUST be SPLIT into two distinct gates per the discipline floor (Codex R1 M1 closure 2026-05-16): **deterministic CI tests** that gate every PR merge, and **clinical-acceptance gates** that gate promotion-to-production. Conflating the two — running a 50-utterance Twi corpus against the live Claude API on every CI run — would make CI flaky, model-version-dependent, and cost-leaky, AND would not actually block clinical regressions because PR authors would simply re-run flaky CI until it passed.
+**Applicability**: this entire regression-test section applies ONLY to closure paths under Options A/B/C. Option D ships no classifier and therefore has no Tier 1 / Tier 2 obligations from this SI (Codex R3 M1 closure 2026-05-16). Option D's closure verification is the patient-access-gate change described in "Closure path B" above, which is exercised by the existing Mode 1 chat handler integration tests (auth+role gates from PR #162) at the route-guard level — no new tests are needed beyond confirming the gate denies patient JWTs.
+
+When the code change lands under Options A/B/C, the test surface MUST be SPLIT into two distinct gates per the discipline floor (Codex R1 M1 closure 2026-05-16): **deterministic CI tests** that gate every PR merge, and **clinical-acceptance gates** that gate promotion-to-production. Conflating the two — running a 50-utterance Twi corpus against the live Claude API on every CI run — would make CI flaky, model-version-dependent, and cost-leaky, AND would not actually block clinical regressions because PR authors would simply re-run flaky CI until it passed.
 
 ### Tier 1 — Deterministic CI contract tests (gate every PR merge)
 
