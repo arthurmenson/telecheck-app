@@ -47,7 +47,7 @@ This is the largest drift surface in the repo. The matrix's revision-history blo
 
 The matrix's claims about the SI inventory + Pharmacy state pre-date all of this and are now factually incorrect.
 
-### §1.1 — HIGH-1: §4 OPEN-list is missing 8 SIs
+### §1.1 — HIGH-1: §4 OPEN-list is missing 10 OPEN SIs (8 newly-filed + 2 misclassified-as-CLOSED)
 
 **Matrix r6 §4 OPEN list (lines 150-154):**
 
@@ -59,6 +59,12 @@ The matrix's claims about the SI inventory + Pharmacy state pre-date all of this
 ```
 
 **Actual OPEN SIs per source files in `docs/SI-*.md`:** SI-002, SI-003, SI-004, SI-005, SI-007, SI-008, SI-009, SI-010, SI-011, SI-012, SI-013, SI-014 — **12 OPEN SIs**, not 2.
+
+This finding subsumes **two distinct drift surfaces**:
+- **8 newly-filed SIs absent entirely from §4** (SI-007/008/009/010/011/012/013/014, all filed 2026-05-14 through 2026-05-16 — after matrix r6 was written 2026-05-12).
+- **2 pre-existing OPEN SIs (SI-004 + SI-005) misclassified as CLOSED** in §4 (audited as HIGH-2 below).
+
+Net rows missing from the §4 OPEN table: **10**.
 
 **Cross-reference:** PR #171 (Per-Track SI Navigation doc, merged `cbb8a16`) explicitly enumerates the 12-OPEN-SI inventory in its §0 inventory table. PR #169 Ratifier Agenda 3-patch (merged `cc2d41d`) lists 14 SIs filed / 2 effectively closed / 12 OPEN.
 
@@ -180,7 +186,7 @@ This is an explicitly dated historical artifact. The file's own framing ("2026-0
 
 | Line | Stale claim | Current ground truth |
 | --- | --- | --- |
-| 107 | "PR #95 remains DRAFT pending SI-001 ratification" | SI-001 ratified P-011 2026-05-11 (one day after this doc was written). PR #95 was superseded by the Sprint 35 scaffold-rebuild branch (`feat/slice-4-pharmacy-scaffold-rebuild-p011`). |
+| 107 | "PR #95 remains DRAFT pending SI-001 ratification" | SI-001 ratified P-011 later on 2026-05-11 (same calendar date as this doc but after the snapshot was captured). PR #95 was superseded by the Sprint 35 scaffold-rebuild branch (`feat/slice-4-pharmacy-scaffold-rebuild-p011`). |
 | 126 | "PRs DRAFT-open: 1 (#95 — Codex Finding 1 closed; SI-001 ratification still pending)" | SI-001 ratified; PR #95 superseded. |
 | 138 | "PR #95 disposition — Codex Finding 1 now closed; primary blocker is SI-001 ratification" | Same — superseded by Sprint 35 rebuild. |
 | 266 | "Open Spec Issues with DRAFT closure proposals ready for Evans: 5 (SI-001 through SI-005)" | SI-001 ratified P-011 leaving 4 DRAFT closure proposals (SI-002/003/004/005); SI-007/008/009/010/011/012/013/014 filed after this doc was written and don't yet have DRAFT closure proposals — they remain in "filed but not yet proposed" state. |
@@ -196,7 +202,7 @@ This audit doc is staged separately from the patches (PR #168 + PR #172 R3-class
 | # | Severity | Target file | Change |
 | --- | --- | --- | --- |
 | 1 | HIGH | `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` | §4 OPEN-list: expand from 2 rows (SI-002/003) to 12 rows (SI-002/003/004/005/007/008/009/010/011/012/013/014). Pull row content from the SI source files' Status blocks + Resolution Expectations sections. |
-| 2 | HIGH | `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` | §4 CLOSED-list: remove SI-004 + SI-005 rows entirely (both are OPEN per source files). Add SI-001 row (RATIFIED 2026-05-11 P-011). SI-006 row already present and accurate. |
+| 2 | HIGH | `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` | §4 CLOSED-list: remove SI-004 + SI-005 rows entirely (both are OPEN per source files). Retain the existing SI-001 RATIFIED 2026-05-11 P-011 row (already at line 161). Retain the existing SI-006 CLOSED Sprint 33-34 row (already at line 162). No new CLOSED rows are needed — the table should just shrink from 4 rows to 2. |
 | 3 | HIGH | `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` | §3 Async Consult row: replace "(start-intake gated on Payment SI-006, process gated on AI Service SI-007)" with accurate citations. Best replacement: "(start-intake branch gated on Payment integration not-yet-filed; process branch gated on Mode 2 AI surface not-yet-filed)" or strike the parenthetical if no SI carries those specific blockers. |
 | 4 | MEDIUM | `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` | §2 BLOCKED-aware-skeletons table Pharmacy row: change blocker column from "SI-001 (MedicationRequest schema)" to "SI-007 (Refill/Dispensing/Shipment schema)" — and reclassify the Pharmacy row out of "BLOCKED-aware skeletons" into a new "Partially-implemented slices" group OR add a note column noting SI-001 P-011 closure with prescribe surface live. |
 | 5 | MEDIUM | `docs/BUILD_VS_SPEC_TRACEABILITY_MATRIX.md` | §1 I-012 row: replace "functional BLOCKED on SI-001 — no MedicationRequest schema yet" with "functional path active post-P-011 via `src/modules/pharmacy/internal/state-machine.ts` State Machines v1.2 §19 discriminated-union I-012 guard". |
