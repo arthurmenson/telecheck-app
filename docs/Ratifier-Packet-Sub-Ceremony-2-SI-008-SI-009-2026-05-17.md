@@ -33,7 +33,7 @@ The `ai_workflow_executions` row records every Mode 2 case-prep AI workflow run 
 
 The 14-round Codex trajectory closed these as architectural invariants:
 
-- **22-column placeholder schema** (id, tenant_id, consult_id, workload_type, ai_mode, protocol_id, protocol_version, model_version, guardrail_template_id, autonomy_level, state, supersedes_execution_id, created_at, started_at, completed_at + 7-column KMS envelope for `recommendation_encrypted`)
+- **23-column placeholder schema** (15 base columns: id, tenant_id, consult_id, workload_type, ai_mode, protocol_id, protocol_version, model_version, guardrail_template_id, autonomy_level, state, supersedes_execution_id, created_at, started_at, completed_at + **8-column KMS envelope** for `recommendation_encrypted`: recommendation_encrypted, recommendation_kms_key_id, recommendation_kms_key_version, recommendation_nonce, recommendation_aad, recommendation_schema_version, recommendation_encrypted_at, recommendation_dek_ciphertext)
 - **Triple-composite UNIQUE** `(tenant_id, consult_id, id)` — required so SI-005's FK 6 forward pointer (triple-composite) can REFERENCE this entity
 - **Same-tenant + same-consult lineage** enforced via composite FK `(tenant_id, consult_id) → consults(tenant_id, id)` (backward) + SI-005's FK 6 `(tenant_id, id, ai_workflow_execution_id) → ai_workflow_executions(tenant_id, consult_id, id)` (forward triple-composite)
 - **Bidirectional pointer invariant** — non-unique backward pointer (consult can have multiple workflow rows over time) + supersession-aware forward pointer (consult's forward pointer points at the CURRENT authoritative execution; `supersedes_execution_id` links the chain)
@@ -51,7 +51,7 @@ The 14-round Codex trajectory closed these as architectural invariants:
 | 1 | **State vocabulary:** is `pending | running | completed | failed | cancelled` the canonical 5-state set, OR does Mode 2 case-prep need additional states (e.g., `requires_clinician_review`, `clinician_approved`, `clinician_declined`)? | **Keep the 5-state set.** Clinician-decision states belong on the Consult entity (per SI-005's `clinician_decision_class` column set), not on the AI workflow execution. Clean separation: `ai_workflow_executions.state` = AI lifecycle; `consults.state` = clinician lifecycle. |
 | 2 | **Protocol versioning:** what's the relationship between `ai_workflow_executions.protocol_version` and the `protocols` table's version-immutability? Pattern A semantics suggest a version is captured at execution time + immutable thereafter. | **Ratify Pattern A pin:** `protocol_version` captured at workflow START time + INSERT-time-immutable (mirrors `supersedes_execution_id` immutability via BEFORE UPDATE trigger). Re-execution against a newer protocol version creates a NEW workflow row with the new version pinned; supersession chain links them. |
 | 3 | **Recommendation storage size:** KMS-encrypted Mode 2 recommendations could grow large (multi-page clinician-facing rationale). Use TOAST-stored BYTEA, OR move recommendation to S3 with only pointer in DB? | **NEEDS DISCUSSION** — operational judgment call. Recommend: TOAST-stored BYTEA at v1.0 (simpler; KMS envelope semantics straightforward; TOAST handles multi-MB cleanly). Revisit if recommendations exceed ~1 MB regularly. S3-pointer pattern can be a future SI when scale warrants. |
-| 4 | **KMS envelope consolidation:** the 7-column envelope (`recommendation_encrypted` + `recommendation_kms_key_id` + `recommendation_kms_key_version` + `recommendation_nonce` + `recommendation_aad` + `recommendation_schema_version` + `recommendation_encrypted_at` + `recommendation_dek_ciphertext`) is duplicated from SI-005 Decision 8. Should the column set consolidate via a shared `EncryptedPayload` composite type when SI-008 closes? | **Defer to future SI.** Ratify the 7-column flat layout at SI-008 closure (mirrors SI-005 precedent verbatim; minimizes ratification surface). The composite-type refactor can be a separate housekeeping SI when other entities (e.g., audit row payloads) adopt the same envelope. |
+| 4 | **KMS envelope consolidation:** the **8-column envelope** (`recommendation_encrypted` + `recommendation_kms_key_id` + `recommendation_kms_key_version` + `recommendation_nonce` + `recommendation_aad` + `recommendation_schema_version` + `recommendation_encrypted_at` + `recommendation_dek_ciphertext`) is duplicated from SI-005 Decision 8 (which the SI-008 source explicitly cites as "8-column envelope including DEK ciphertext"). Should the column set consolidate via a shared `EncryptedPayload` composite type when SI-008 closes? | **Defer to future SI.** Ratify the **8-column flat layout** at SI-008 closure (mirrors SI-005 Decision 8 precedent verbatim; minimizes ratification surface). The composite-type refactor can be a separate housekeeping SI when other entities (e.g., audit row payloads) adopt the same envelope. |
 
 ### What ships if Evans ratifies
 
@@ -129,7 +129,7 @@ The 6-round Codex trajectory closed these:
 ## Ratification checklist (one page; sign-off surface)
 
 **SI-008:**
-- [ ] 22-column placeholder schema (id, tenant_id, consult_id, workload_type, ai_mode, protocol_id, protocol_version, model_version, guardrail_template_id, autonomy_level, state, supersedes_execution_id, created_at, started_at, completed_at + 7-column KMS envelope) — APPROVE / REJECT / DISCUSS
+- [ ] **23-column placeholder schema** (15 base columns + 8-column KMS envelope including `recommendation_dek_ciphertext`) — APPROVE / REJECT / DISCUSS
 - [ ] Triple-composite UNIQUE `(tenant_id, consult_id, id)` + same-tenant + same-consult lineage FKs — APPROVE / REJECT
 - [ ] Bidirectional pointer invariant (non-unique backward; supersession-aware forward) + supersession chain via `supersedes_execution_id` self-referential triple-composite FK — APPROVE / REJECT
 - [ ] CAS-and-supersession protocol + `record_workflow_pointer_swap()` SECURITY DEFINER procedure + GRANT model — APPROVE / REJECT
@@ -138,7 +138,7 @@ The 6-round Codex trajectory closed these:
 - [ ] **State vocabulary: keep 5-state set (`pending | running | completed | failed | cancelled`); clinician-decision states live on Consult** — APPROVE / REJECT
 - [ ] **Protocol versioning: Pattern A pin (`protocol_version` captured at workflow START + INSERT-time-immutable)** — APPROVE / REJECT
 - [ ] **Recommendation storage: TOAST-stored BYTEA at v1.0; defer S3-pointer to future SI when scale warrants** — APPROVE / REJECT / DISCUSS
-- [ ] **KMS envelope: ratify 7-column flat layout at SI-008 closure; defer composite-type refactor** — APPROVE / REJECT
+- [ ] **KMS envelope: ratify 8-column flat layout at SI-008 closure (mirrors SI-005 Decision 8 precedent); defer composite-type refactor** — APPROVE / REJECT
 - [ ] AUDIT_EVENTS v5.5 amendments (7 net-new Category A action IDs) — APPROVE
 - [ ] DOMAIN_EVENTS v5.2 in-place amendment (2 net-new event types) — APPROVE
 - [ ] IMPL-readiness gate on SI-010 acknowledged (procedure cannot land until SI-010's `_session_actor_context` infrastructure ratifies + lands; SI-010 sub-ceremony 7 in Evans's ordering) — ACKNOWLEDGED

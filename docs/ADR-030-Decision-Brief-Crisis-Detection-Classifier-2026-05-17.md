@@ -78,12 +78,12 @@ Per Master Completion Plan §"Hard sequencing rules", Phase B (anchor slices) ex
 
 | Dimension | Value |
 | --- | --- |
-| **Clinical efficacy** | Same as Option A (Claude carries the multi-language + paraphrase + negation surface) + regex floor as graceful-degradation fallback for EN. **Highest measured-accuracy of all options** (both classifiers' false-negative rates compound multiplicatively for crisis confirmation). |
+| **Clinical efficacy** | Same as Option A (Claude carries the multi-language + paraphrase + negation surface) + regex floor as graceful-degradation fallback for EN. Side-by-side classifier-accuracy measurement is built in (per SI-014 §3 Option C: every Claude detection the regex did NOT detect is a measurable "Twi or paraphrase save" that justifies the OPEX). The source does NOT claim quantified accuracy superiority over Options A or B; the value is the measurement surface + graceful degradation, not a sourced accuracy delta. |
 | **Regulatory posture (HIPAA)** | Same as Option A (Anthropic BAA). |
 | **Regulatory posture (FDA)** | Same as Option A (Quality System), plus dual-classifier audit-row complexity. |
 | **Regulatory posture (GDPR)** | Same as Option A. |
 | **Latency budget** | Same as Option A (regex runs in parallel; doesn't reduce wall-clock). |
-| **Cost order-of-magnitude (recurring)** | **2× Option A** (still pays per-call to Claude) + the regex maintenance burden. ~$90–$180/quarter pilot; ~$146k–$292k/year full scale. |
+| **Cost order-of-magnitude (recurring)** | **Same Claude per-call cost as Option A** (one Claude call per detection; regex runs in parallel locally with no API cost) + ongoing regex maintenance burden. Per SI-014 §3 Option C: "Same as Option A + maintenance of the regex floor." Pilot scale ≈ Option A's $45–90/quarter + regex maintenance time; full scale ≈ Option A's $73–146k/year + regex maintenance time. The "2× Option A" framing some earlier drafts used was unsourced — the source explicitly says one Claude call, parallel to regex. |
 | **Failure mode** | **Graceful degradation.** If Claude is down, the regex floor still detects EN crisis content (Twi + paraphrase coverage is lost during the outage but EN crisis is preserved). Side-by-side classifier-accuracy measurement is built in. |
 | **Engineering complexity** | MEDIUM — ~250 LOC (Option A scope + parallel-execution combiner + per-classifier audit-detail capture). |
 | **Time to launch-ready** | Same as Option A (2-4 weeks). |
@@ -130,8 +130,8 @@ Per SI-014 §4 (verified across 5 Codex review rounds; immutable requirements):
 | **Time-to-launch** | ✅ 2-4 wk | ❌ 6-12 mo | ✅ 2-4 wk | ✅ chronic-care now; chat: ≥60-90 days |
 | **Latency** | ⚠️ ~400ms P50; risk of exceeding 500ms P95 | ✅ <50ms P95 | ⚠️ Same as A (parallel) | N/A — defers |
 | **PHI surface (HIPAA)** | ⚠️ External API (BAA) | ✅ VPC-internal | ⚠️ Same as A | ✅ N/A |
-| **Recurring cost (pilot)** | ✅ ~$45-90/qtr | ⚠️ $2-8k/mo GPU + 0.5-1 FTE | ⚠️ 2× A | ✅ Zero |
-| **Recurring cost (full scale)** | ⚠️ $73-146k/yr | ✅ Stable GPU lease + FTE | ❌ ~$146-292k/yr | ✅ Zero |
+| **Recurring cost (pilot)** | ✅ ~$45-90/qtr | ⚠️ $2-8k/mo GPU + 0.5-1 FTE | ✅ Same as A + regex maintenance time | ✅ Zero |
+| **Recurring cost (full scale)** | ⚠️ $73-146k/yr | ✅ Stable GPU lease + FTE | ⚠️ Same as A + regex maintenance time | ✅ Zero |
 | **Engineering complexity** | ✅ ~150 LOC | ❌ ~400 LOC + infra + drift mgmt | ⚠️ ~250 LOC | ✅ Minimal (access gate) |
 | **Graceful degradation under outage** | ⚠️ Requires Rule 2 (a)+(b) or (c) | ✅ Local; no external dep | ✅ Regex floor preserves EN crisis detection | N/A |
 | **SI-014 closes at ratification** | ✅ Yes (Closure path A) | ✅ Yes (Closure path A) | ✅ Yes (Closure path A) | ❌ No — stays open per §5 (Closure path B) |
