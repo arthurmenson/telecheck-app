@@ -1,6 +1,27 @@
 /**
- * mode-1-chat-audit-injection.ts — test harness for forcing
- * emitMode1ChatResponseAudit to fail on demand.
+ * mode-1-chat-audit-injection.ts — Mode 1 chat handler audit-failure
+ * injection harness.
+ *
+ * Thin Mode-1-specific wrapper around the generic
+ * createAuditFailureInjector factory in
+ * `tests/helpers/audit-failure-injection.ts`. Preserved as a
+ * named, single-purpose helper so the existing PR #163 test file
+ * imports (consumeMode1AuditFailureOrThrow / setMode1AuditFailure /
+ * resetMode1AuditFailure) keep their semantics unchanged while the
+ * underlying mechanism is now sharable with any future emitter's
+ * injector.
+ *
+ * Future emitter harnesses should follow the same pattern:
+ *
+ *   import { createAuditFailureInjector } from './audit-failure-injection.ts';
+ *
+ *   export const fooAuditInjector =
+ *     createAuditFailureInjector('emitFooAudit');
+ *
+ *   // Optional thin re-exports if a per-emitter named API is
+ *   // preferred (matches the Mode 1 precedent below):
+ *   export const setFooAuditFailure = (m) => fooAuditInjector.set(m);
+ *   // ...
  *
  * Purpose: closes the R7 finding deferred from PR #160 (Mode 1 chat
  * handler) — the round-trip "audit fails → cache rolls back → retry
@@ -9,126 +30,168 @@
  * cannot be exercised without an audit-emission failure injection
  * point.
  *
- * Pattern: vitest `vi.mock` factory replaces the module-level
- * `emitMode1ChatResponseAudit` binding with a stub that consults a
- * shared mutable flag (`mode1AuditFailureMode`) at call time and
- * either delegates to the real implementation or throws.
- *
- * Usage from a test file:
- *
- *     import {
- *       resetMode1AuditFailure,
- *       setMode1AuditFailure,
- *     } from '../helpers/mode-1-chat-audit-injection.ts';
- *
- *     // (the test file MUST also wire the vi.mock factory — see
- *     // tests/integration/ai-service-mode-1-chat-audit-injection.test.ts
- *     // for the canonical example.)
- *
- *     beforeEach(() => resetMode1AuditFailure());
- *
- *     it('audit failure → 503', async () => {
- *       setMode1AuditFailure('fail-always');
- *       // ... POST /v0/ai/chat → expect 503 ...
- *     });
- *
- * The shared state lives in THIS file (not the test file) so the
- * vi.mock factory and the test code can both import + mutate the
- * same module-level variable. vi.hoisted() works for narrower cases
- * but multi-mode state needs an external module the factory can
- * reference.
- *
  * Spec references:
  *   - PR #160 Codex R4 H1 closure (deterministic ID derivation)
  *   - PR #162 Codex R1 H1 finding (the deferred round-trip test)
+ *   - PR #163 (this harness's original single-emitter implementation)
  *   - AI_LAYERING v5.2 §6 (FLOOR-020 audit envelope) — the audit
  *     being injected is the Category C `ai_chat_response_emitted`
  *     emission, not the Category A `crisis_detection_trigger`
  *     emission (the latter has its own crisis-gate dedupe protection)
  */
 
+import {
+  type AuditFailureMode,
+  type AuditFailureInjector,
+  AuditInjectedFailure,
+  createAuditFailureInjector,
+} from './audit-failure-injection.ts';
+
+// ---------------------------------------------------------------------------
+// Backwards-compatible sentinel error class (declared FIRST so it can be
+// passed to the injector constructor below; the deprecation note still
+// applies)
+// ---------------------------------------------------------------------------
+//
+// The PR #163 implementation exported a `Mode1AuditInjectedFailure`
+// class. The generic harness consolidates on a single
+// `AuditInjectedFailure` whose `emitterName` field disambiguates
+// which emitter failed (more useful when a test exercises multiple
+// injectors). The class below is retained ONLY for `instanceof
+// Mode1AuditInjectedFailure` assertions that may exist in the
+// PR #163 test file or downstream — it is a thin subclass of
+// `AuditInjectedFailure` so both `instanceof` checks succeed.
+//
+// New test files should `instanceof AuditInjectedFailure` and read
+// `err.emitterName` to identify the emitter — that pattern scales
+// to any number of injectors.
+//
+// IMPORTANT (Codex R1 closure on PR #165): the injector below MUST
+// be constructed with `errorCtor: Mode1AuditInjectedFailure` so the
+// `consumeOrThrow` path throws THIS subclass, not the generic base.
+// Without the errorCtor wiring, `consumeMode1AuditFailureOrThrow`
+// would throw `AuditInjectedFailure` and silently break any
+// `err instanceof Mode1AuditInjectedFailure` assertion downstream.
+
 /**
- * Failure modes for the Mode 1 chat response audit.
+ * @deprecated for new test files — use `AuditInjectedFailure` from
+ * `./audit-failure-injection.ts` and check `err.emitterName ===
+ * 'emitMode1ChatResponseAudit'`. Retained as a thin subclass for
+ * backwards compatibility with any `instanceof
+ * Mode1AuditInjectedFailure` assertions in the PR #163 test file or
+ * downstream callers.
  *
- *   'normal'      — the real `emitMode1ChatResponseAudit` runs
- *                   (default; reset at the start of each test).
- *   'fail-once'   — the next invocation throws; subsequent invocations
- *                   revert to 'normal'. Useful for round-trip retry
- *                   tests where attempt 1 must fail and attempt 2 must
- *                   succeed.
- *   'fail-always' — every invocation throws. Useful for asserting
- *                   the handler's tenant-blind 503 response shape.
+ * Public constructor signature preserves the original PR #163
+ * contract: `(message?: string)` (Codex R2 M1 closure on PR #165;
+ * the previous interim signature `(_emitterName?: string)` regressed
+ * legacy direct-construction with a custom message). The factory's
+ * `AuditInjectedFailureCtor` signature — which requires
+ * `(emitterName: string)` — is satisfied by a private adapter
+ * subclass below, so both surfaces work without compromise.
  */
-export type Mode1AuditFailureMode = 'normal' | 'fail-once' | 'fail-always';
-
-let mode1AuditFailureMode: Mode1AuditFailureMode = 'normal';
-
-/**
- * Read the current failure-injection mode. Called from the vi.mock
- * factory's stub before deciding whether to throw or delegate to the
- * real implementation. Exported so the test file can also assert on
- * state transitions (e.g., assert mode === 'normal' after a fail-once
- * attempt consumed itself).
- */
-export function getMode1AuditFailure(): Mode1AuditFailureMode {
-  return mode1AuditFailureMode;
-}
-
-/**
- * Set the failure-injection mode. Called from a test before issuing
- * the request that should trigger the failure path.
- */
-export function setMode1AuditFailure(mode: Mode1AuditFailureMode): void {
-  mode1AuditFailureMode = mode;
-}
-
-/**
- * Reset to 'normal' mode. Tests MUST call this in beforeEach +
- * afterEach to prevent mode bleed across test cases — fail-once is
- * self-resetting but fail-always is not, and any test that fails
- * partway through could leave the mode in a non-normal state.
- */
-export function resetMode1AuditFailure(): void {
-  mode1AuditFailureMode = 'normal';
-}
-
-/**
- * The sentinel error class the stub throws when failure is injected.
- * Exported so test assertions can use `instanceof` rather than
- * brittle message-string matching.
- */
-export class Mode1AuditInjectedFailure extends Error {
-  constructor(message = 'test: emitMode1ChatResponseAudit forced failure') {
-    super(message);
+export class Mode1AuditInjectedFailure extends AuditInjectedFailure {
+  constructor(message?: string) {
+    // emitterName is always 'emitMode1ChatResponseAudit' for this
+    // class; the optional `message` parameter is the legacy PR #163
+    // surface so `new Mode1AuditInjectedFailure('custom diagnostic')`
+    // still carries the custom string into Error.message.
+    super(
+      'emitMode1ChatResponseAudit',
+      message ?? 'test: emitMode1ChatResponseAudit forced failure',
+    );
     this.name = 'Mode1AuditInjectedFailure';
   }
 }
 
 /**
- * Consume the failure mode (if any) and throw the sentinel error.
- * Used by the vi.mock factory's stub:
+ * Private adapter class used solely by the factory's `errorCtor`
+ * option (Codex R2 M1 closure on PR #165). The factory passes the
+ * emitter name to its `errorCtor`, but `Mode1AuditInjectedFailure`'s
+ * public constructor takes a `message` instead — so a direct pass
+ * would put the literal string 'emitMode1ChatResponseAudit' into
+ * the error's message field.
  *
- *     vi.mock('../../src/modules/ai-service/audit.ts', async () => {
- *       const actual = await vi.importActual<...>(...);
- *       return {
- *         ...actual,
- *         emitMode1ChatResponseAudit: async (args, tx) => {
- *           consumeMode1AuditFailureOrThrow();
- *           return actual.emitMode1ChatResponseAudit(args, tx);
- *         },
- *       };
- *     });
+ * This adapter satisfies `AuditInjectedFailureCtor`'s
+ * `(emitterName: string)` signature by ignoring the passed name
+ * (the class is already bound to it) and calling the parent's
+ * no-argument constructor, which yields the default sentinel
+ * message. Instances satisfy `instanceof Mode1AuditInjectedFailure`
+ * AND `instanceof AuditInjectedFailure` so all downstream
+ * assertions continue to pass.
  *
- * Encapsulates the fail-once self-reset logic so it lives in one
- * place (not duplicated across every test file that uses the
- * harness).
+ * Not exported — direct callers who want a custom message use the
+ * public `Mode1AuditInjectedFailure` constructor; the factory uses
+ * this adapter internally.
  */
-export function consumeMode1AuditFailureOrThrow(): void {
-  if (mode1AuditFailureMode === 'fail-once') {
-    mode1AuditFailureMode = 'normal';
-    throw new Mode1AuditInjectedFailure();
-  }
-  if (mode1AuditFailureMode === 'fail-always') {
-    throw new Mode1AuditInjectedFailure();
+class Mode1AuditInjectedFailureFactoryAdapter extends Mode1AuditInjectedFailure {
+  constructor(_emitterName: string) {
+    super();
   }
 }
+
+/**
+ * The single injector instance bound to
+ * `emitMode1ChatResponseAudit`. Tests + the vi.mock factory both
+ * reach the same injector via the named re-exports below (or
+ * directly via this handle for new test files).
+ *
+ * Wired with `errorCtor: Mode1AuditInjectedFailureFactoryAdapter`
+ * per the Codex R1 + R2 closures on PR #165 so `consumeOrThrow`
+ * throws an `instanceof Mode1AuditInjectedFailure` (preserving
+ * PR #163 compatibility), the error's message is the canonical
+ * default sentinel string (not the literal emitter name a naïve
+ * adapter would produce), AND the dual `instanceof
+ * AuditInjectedFailure` chain holds for generic catch paths.
+ */
+export const mode1ChatResponseAuditInjector: AuditFailureInjector = createAuditFailureInjector(
+  'emitMode1ChatResponseAudit',
+  {
+    errorCtor: Mode1AuditInjectedFailureFactoryAdapter,
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Backwards-compatible named API (PR #163 surface)
+// ---------------------------------------------------------------------------
+//
+// These named re-exports preserve the API the existing PR #163 test
+// file imports so the refactor is non-breaking. New test files should
+// prefer the generic injector handle above; the named API below is
+// retained to avoid churning the existing call sites in a refactor
+// that is otherwise purely additive.
+
+/**
+ * @deprecated for new test files — prefer the generic
+ * `mode1ChatResponseAuditInjector` handle and call its methods
+ * directly. Retained for backwards compatibility with the PR #163
+ * test file.
+ *
+ * Re-typed as `AuditFailureMode` (the generic alias) since the
+ * underlying enum is identical.
+ */
+export type Mode1AuditFailureMode = AuditFailureMode;
+
+/** Read the current Mode 1 audit-failure mode. */
+export const getMode1AuditFailure = (): Mode1AuditFailureMode =>
+  mode1ChatResponseAuditInjector.get();
+
+/** Set the Mode 1 audit-failure mode. */
+export const setMode1AuditFailure = (mode: Mode1AuditFailureMode): void =>
+  mode1ChatResponseAuditInjector.set(mode);
+
+/** Reset the Mode 1 audit-failure mode to 'normal'. */
+export const resetMode1AuditFailure = (): void => mode1ChatResponseAuditInjector.reset();
+
+/**
+ * Consume the Mode 1 audit-failure mode (if any) and throw
+ * `AuditInjectedFailure` with `emitterName ===
+ * 'emitMode1ChatResponseAudit'`. Called from the vi.mock factory
+ * wrapping `emitMode1ChatResponseAudit`.
+ */
+export const consumeMode1AuditFailureOrThrow = (): void =>
+  mode1ChatResponseAuditInjector.consumeOrThrow();
+
+// Mode1AuditInjectedFailure declared above (must precede the injector
+// instantiation that passes it via errorCtor). Re-exporting nothing
+// here intentionally — the class is already exported from its
+// declaration site.
