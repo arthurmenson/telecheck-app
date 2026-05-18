@@ -308,6 +308,24 @@ CREATE TRIGGER ai_workflow_handler_registry_status_state_machine_guard
   FOR EACH ROW
   EXECUTE FUNCTION ai_workflow_handler_registry_status_state_machine();
 
+-- ai_workflow_handler_registry: BEFORE DELETE trigger rejects ALL DELETEs.
+-- Registry rows are forensic evidence; retired-status is the terminal state, not deletion.
+-- (R2 MEDIUM-1 closure 2026-05-18: previously the v0.1 only withheld DELETE from
+-- platform_admin_role via REVOKE; a table owner / migration role / future role
+-- change could still delete registry rows and leave audit_log composite-FK
+-- references dangling. DB-layer trigger enforcement closes this backdoor.)
+CREATE OR REPLACE FUNCTION ai_workflow_handler_registry_reject_delete()
+RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'ai_workflow_handler_registry(% / %): registry rows are forensic evidence; DELETE forbidden (retired-status is the terminal state, not deletion); R2 MEDIUM-1 closure', OLD.handler_id, OLD.version;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER ai_workflow_handler_registry_append_only_delete
+  BEFORE DELETE ON ai_workflow_handler_registry
+  FOR EACH ROW
+  EXECUTE FUNCTION ai_workflow_handler_registry_reject_delete();
+
 -- ai_workflow_handler_audit_log: full append-only enforcement
 CREATE OR REPLACE FUNCTION ai_workflow_handler_audit_log_reject_mutation()
 RETURNS TRIGGER AS $$
@@ -343,27 +361,230 @@ CREATE TRIGGER ai_workflow_handler_audit_log_insert_db_time_guard
 
 ---
 
-## GRANT model (platform-scope discipline)
+## GRANT model + SECURITY DEFINER write paths (platform-scope discipline + atomic audit emission)
+
+**Codex-Gate R1 HIGH closure 2026-05-18:** the original v0.1 GRANT model granted `platform_admin_role` direct INSERT/UPDATE on the registry + separate INSERT on the audit_log. An operator could mutate registry lifecycle state and simply omit the audit insert, breaking the stated evidence-grade audit trail. Closure: registry mutations now flow through SECURITY DEFINER procedures that atomically (a) mutate the registry row + (b) emit the corresponding audit_log row in the same transaction. Direct registry INSERT/UPDATE is REVOKED from `platform_admin_role`. The audit emission becomes structurally guaranteed.
 
 ```sql
--- ai_workflow_handler_registry: app-role has SELECT only; INSERT/UPDATE restricted
--- to platform_admin_role. Application code reads the registry but never writes;
--- writes are restricted to operator workflow via the platform admin console.
+-- ai_workflow_handler_registry: app-role has SELECT only; direct INSERT/UPDATE/DELETE
+-- REVOKED from ALL roles. Writes go ONLY through the SECURITY DEFINER procedures below.
 REVOKE ALL ON ai_workflow_handler_registry FROM telecheck_app_role;
+REVOKE ALL ON ai_workflow_handler_registry FROM platform_admin_role;
 GRANT SELECT ON ai_workflow_handler_registry TO telecheck_app_role;
-
--- platform_admin_role gets full CRUD on registry (with state-machine trigger
--- enforcement preventing forbidden transitions or Tier 0/1 violations).
-GRANT SELECT, INSERT, UPDATE ON ai_workflow_handler_registry TO platform_admin_role;
--- DELETE NOT granted — retired-status is the terminal state, not deletion;
--- registry rows are forensic evidence.
+GRANT SELECT ON ai_workflow_handler_registry TO platform_admin_role;
 
 -- ai_workflow_handler_audit_log: app-role has SELECT only (read for audit walks);
--- INSERT restricted to a privileged audit-emission role (similar to audit_records).
--- UPDATE/DELETE never granted (enforced by triggers above).
+-- direct INSERT/UPDATE/DELETE REVOKED from ALL roles. INSERTs happen via the
+-- SECURITY DEFINER registry-mutation procedures in the SAME transaction as the
+-- corresponding registry row mutation.
 REVOKE ALL ON ai_workflow_handler_audit_log FROM telecheck_app_role;
+REVOKE ALL ON ai_workflow_handler_audit_log FROM platform_admin_role;
 GRANT SELECT ON ai_workflow_handler_audit_log TO telecheck_app_role;
-GRANT INSERT ON ai_workflow_handler_audit_log TO platform_admin_role;
+GRANT SELECT ON ai_workflow_handler_audit_log TO platform_admin_role;
+```
+
+### SECURITY DEFINER write-path procedures (R1 HIGH closure 2026-05-18)
+
+Registry mutations occur ONLY through the four procedures below. Each procedure:
+1. Mutates the registry row (INSERT or UPDATE) under the SECURITY DEFINER function-owner role (which retains INSERT/UPDATE privileges).
+2. INSERTS the corresponding audit_log row in the SAME transaction.
+3. Uses `current_actor_account_id()` + `current_actor_role()` helpers (SI-010 dependency) to derive actor identity — caller cannot spoof.
+
+**IMPL-readiness gate:** these procedures depend on SI-010 (`current_actor_account_id()` + helpers) being implemented. Same gate that SI-005/008/009 procedures wait on. SI-010 is ratified at P-023 SC6; implementation port unblocks SI-016 procedures + SI-005/008/009 procedures simultaneously.
+
+```sql
+-- register_handler: INSERT a new (handler_id, version) registry row + emit
+-- handler.registered audit_log row atomically.
+CREATE OR REPLACE PROCEDURE register_handler(
+  p_handler_id            TEXT,
+  p_version               TEXT,
+  p_ai_workload_type      TEXT,
+  p_autonomy_level        TEXT,
+  p_display_name          TEXT,
+  p_description           TEXT,
+  p_input_validator_schema JSONB
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_actor_account_id TEXT := current_actor_account_id();  -- SI-010 helper
+  v_actor_role       TEXT := current_actor_role();         -- SI-010 helper
+  v_audit_log_id     TEXT;
+BEGIN
+  -- Tier 0: only platform_admin can register handlers
+  IF v_actor_role NOT IN ('platform_admin') THEN
+    RAISE EXCEPTION 'register_handler: insufficient privilege (role=% required platform_admin)', v_actor_role;
+  END IF;
+  -- Registry INSERT (the INSERT trigger forces registered_at + updated_at + signature_hash to DB-computed values; rejects pre-seeded lifecycle timestamps)
+  INSERT INTO ai_workflow_handler_registry
+    (handler_id, version, ai_workload_type, autonomy_level, display_name, description,
+     input_validator_schema, signature_hash, status)
+  VALUES
+    (p_handler_id, p_version, p_ai_workload_type, p_autonomy_level, p_display_name, p_description,
+     p_input_validator_schema, 'placeholder-overridden-by-trigger', 'registered');
+  -- Atomic audit emission
+  v_audit_log_id := 'wha_' || encode(gen_random_bytes(16), 'hex');
+  INSERT INTO ai_workflow_handler_audit_log
+    (audit_log_id, handler_id, handler_version, event_type, event_payload, actor_account_id, actor_role_at_event)
+  VALUES
+    (v_audit_log_id, p_handler_id, p_version, 'handler.registered',
+     jsonb_build_object('ai_workload_type', p_ai_workload_type, 'autonomy_level', p_autonomy_level),
+     v_actor_account_id, v_actor_role);
+END;
+$$;
+
+-- activate_handler: UPDATE status registered → active + emit handler.activated audit
+CREATE OR REPLACE PROCEDURE activate_handler(
+  p_handler_id  TEXT,
+  p_version     TEXT
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_actor_account_id TEXT := current_actor_account_id();
+  v_actor_role       TEXT := current_actor_role();
+  v_audit_log_id     TEXT;
+  v_prior_status     TEXT;
+BEGIN
+  IF v_actor_role NOT IN ('platform_admin') THEN
+    RAISE EXCEPTION 'activate_handler: insufficient privilege (role=% required platform_admin)', v_actor_role;
+  END IF;
+  -- Read prior status for audit payload
+  SELECT status INTO v_prior_status FROM ai_workflow_handler_registry
+   WHERE handler_id = p_handler_id AND version = p_version;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'activate_handler: registry row not found (handler_id=%, version=%)', p_handler_id, p_version;
+  END IF;
+  -- Registry UPDATE (state-machine trigger enforces registered → active arc + sets activated_at via NEW.activated_at := NOW())
+  UPDATE ai_workflow_handler_registry
+     SET status = 'active'
+   WHERE handler_id = p_handler_id AND version = p_version;
+  -- Atomic audit emission
+  v_audit_log_id := 'wha_' || encode(gen_random_bytes(16), 'hex');
+  INSERT INTO ai_workflow_handler_audit_log
+    (audit_log_id, handler_id, handler_version, event_type, event_payload, actor_account_id, actor_role_at_event)
+  VALUES
+    (v_audit_log_id, p_handler_id, p_version, 'handler.activated',
+     jsonb_build_object('prior_status', v_prior_status, 'new_status', 'active'),
+     v_actor_account_id, v_actor_role);
+END;
+$$;
+
+-- deprecate_handler: UPDATE status active → deprecated + emit handler.deprecated audit
+-- Optionally binds a successor (handler_id, version) — validated existence + active-or-deprecated status.
+CREATE OR REPLACE PROCEDURE deprecate_handler(
+  p_handler_id                        TEXT,
+  p_version                           TEXT,
+  p_deprecation_successor_handler_id  TEXT DEFAULT NULL,
+  p_deprecation_successor_version     TEXT DEFAULT NULL
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_actor_account_id TEXT := current_actor_account_id();
+  v_actor_role       TEXT := current_actor_role();
+  v_audit_log_id     TEXT;
+  v_prior_status     TEXT;
+  v_successor_status TEXT;
+BEGIN
+  IF v_actor_role NOT IN ('platform_admin') THEN
+    RAISE EXCEPTION 'deprecate_handler: insufficient privilege (role=% required platform_admin)', v_actor_role;
+  END IF;
+  -- Read prior status
+  SELECT status INTO v_prior_status FROM ai_workflow_handler_registry
+   WHERE handler_id = p_handler_id AND version = p_version;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'deprecate_handler: registry row not found (handler_id=%, version=%)', p_handler_id, p_version;
+  END IF;
+  -- Successor validation (R2 MEDIUM-2 closure 2026-05-18): if successor specified,
+  -- verify the successor row exists AND is in a dispatchable state (active or deprecated;
+  -- retired successors are rejected — pointing to a retired successor leaves consumers
+  -- without a valid migration target).
+  IF p_deprecation_successor_handler_id IS NOT NULL OR p_deprecation_successor_version IS NOT NULL THEN
+    IF p_deprecation_successor_handler_id IS NULL OR p_deprecation_successor_version IS NULL THEN
+      RAISE EXCEPTION 'deprecate_handler: successor handler_id + version must both be supplied or both NULL';
+    END IF;
+    SELECT status INTO v_successor_status FROM ai_workflow_handler_registry
+     WHERE handler_id = p_deprecation_successor_handler_id AND version = p_deprecation_successor_version;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'deprecate_handler: successor not found (handler_id=%, version=%)', p_deprecation_successor_handler_id, p_deprecation_successor_version;
+    END IF;
+    IF v_successor_status NOT IN ('active', 'deprecated') THEN
+      RAISE EXCEPTION 'deprecate_handler: successor must be in active or deprecated status (got %); cannot point to retired successor', v_successor_status;
+    END IF;
+  END IF;
+  -- Registry UPDATE (state-machine trigger enforces active → deprecated arc + sets deprecated_at)
+  UPDATE ai_workflow_handler_registry
+     SET status = 'deprecated',
+         deprecation_successor_handler_id = p_deprecation_successor_handler_id,
+         deprecation_successor_version = p_deprecation_successor_version
+   WHERE handler_id = p_handler_id AND version = p_version;
+  -- Atomic audit emission
+  v_audit_log_id := 'wha_' || encode(gen_random_bytes(16), 'hex');
+  INSERT INTO ai_workflow_handler_audit_log
+    (audit_log_id, handler_id, handler_version, event_type, event_payload, actor_account_id, actor_role_at_event)
+  VALUES
+    (v_audit_log_id, p_handler_id, p_version, 'handler.deprecated',
+     jsonb_build_object(
+       'prior_status', v_prior_status,
+       'new_status', 'deprecated',
+       'deprecation_successor_handler_id', p_deprecation_successor_handler_id,
+       'deprecation_successor_version', p_deprecation_successor_version
+     ),
+     v_actor_account_id, v_actor_role);
+END;
+$$;
+
+-- retire_handler: UPDATE status to retired + emit handler.retired audit
+CREATE OR REPLACE PROCEDURE retire_handler(
+  p_handler_id  TEXT,
+  p_version     TEXT
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_actor_account_id TEXT := current_actor_account_id();
+  v_actor_role       TEXT := current_actor_role();
+  v_audit_log_id     TEXT;
+  v_prior_status     TEXT;
+BEGIN
+  IF v_actor_role NOT IN ('platform_admin') THEN
+    RAISE EXCEPTION 'retire_handler: insufficient privilege (role=% required platform_admin)', v_actor_role;
+  END IF;
+  SELECT status INTO v_prior_status FROM ai_workflow_handler_registry
+   WHERE handler_id = p_handler_id AND version = p_version;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'retire_handler: registry row not found (handler_id=%, version=%)', p_handler_id, p_version;
+  END IF;
+  -- Registry UPDATE (state-machine trigger enforces registered/deprecated → retired arc + sets retired_at)
+  UPDATE ai_workflow_handler_registry
+     SET status = 'retired'
+   WHERE handler_id = p_handler_id AND version = p_version;
+  -- Atomic audit emission
+  v_audit_log_id := 'wha_' || encode(gen_random_bytes(16), 'hex');
+  INSERT INTO ai_workflow_handler_audit_log
+    (audit_log_id, handler_id, handler_version, event_type, event_payload, actor_account_id, actor_role_at_event)
+  VALUES
+    (v_audit_log_id, p_handler_id, p_version, 'handler.retired',
+     jsonb_build_object('prior_status', v_prior_status, 'new_status', 'retired'),
+     v_actor_account_id, v_actor_role);
+END;
+$$;
+
+-- EXECUTE privilege on the procedures: granted only to platform_admin_role
+-- (which has no direct INSERT/UPDATE on registry — must go through these procedures).
+REVOKE ALL ON PROCEDURE register_handler FROM PUBLIC;
+REVOKE ALL ON PROCEDURE activate_handler FROM PUBLIC;
+REVOKE ALL ON PROCEDURE deprecate_handler FROM PUBLIC;
+REVOKE ALL ON PROCEDURE retire_handler FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE register_handler TO platform_admin_role;
+GRANT EXECUTE ON PROCEDURE activate_handler TO platform_admin_role;
+GRANT EXECUTE ON PROCEDURE deprecate_handler TO platform_admin_role;
+GRANT EXECUTE ON PROCEDURE retire_handler TO platform_admin_role;
 ```
 
 ---
@@ -417,9 +638,10 @@ When SI-016 closes:
 
 1. **Future PR-A2/A3-class commit** (at SI-016's own ratification SC) lands:
    - CDM v1.X → v1.Y with §3.14 NEW category "AI Workflow Registry — 2 entities" + §4.29 ai_workflow_handler_registry + §4.30 ai_workflow_handler_audit_log canonical row shapes
-   - 8 BEFORE INSERT/UPDATE/DELETE triggers (6 for registry + 2 for audit_log)
+   - **9 BEFORE INSERT/UPDATE/DELETE triggers** (7 for registry: insert_guard + tier0_immutability + tier1_schema_immutability + status_state_machine + reject_delete + recompute_fingerprint-equivalent fold into tier1; 2 for audit_log: append_only_update_delete + insert_db_time_guard)
+   - **4 SECURITY DEFINER procedures** (`register_handler` / `activate_handler` / `deprecate_handler` / `retire_handler`) — the ONLY write paths to registry; atomic registry-mutation + audit_log emission; IMPL-readiness-gated on SI-010 helpers (mirror SI-005/008/009 gate)
    - 1 composite FK + 2 composite UNIQUEs + 6+ CHECK constraints
-   - GRANT model: `telecheck_app_role` SELECT only; `platform_admin_role` INSERT/UPDATE on registry + INSERT only on audit_log
+   - GRANT model: `telecheck_app_role` SELECT only on both tables; `platform_admin_role` SELECT only on both tables + EXECUTE on the 4 procedures; direct INSERT/UPDATE/DELETE REVOKED from all roles on both tables
    - `compute_ai_workflow_handler_signature_hash()` DB function for canonical hashing
 2. **SI-011.1d L4 Mode 2 input contract conformance gate canonical content port** is now unblocked (per SC7 P-024 Sub-decision #5 dependency caveat — SI-011.1d requires SI-016 ratification landing first; this SI-016 closure clears that gate)
 3. **AI Workflow Engine slice PRD** (when authored) can author against canonical handler-registry row shapes
@@ -430,9 +652,14 @@ When SI-016 closes:
    - DB-owned signature_hash test: INSERT with caller-supplied signature_hash → MUST be silently overridden to DB-computed value
    - Signature_hash tamper-resistance test: UPDATE attempting to change signature_hash → MUST be re-derived from current input_validator_schema (defense-in-depth)
    - Partial UNIQUE test: INSERT a second row with same signature_hash but different (handler_id, version) while first is active → MUST fail
-   - GRANT lockdown test: `telecheck_app_role` attempting INSERT/UPDATE/DELETE on registry or audit_log MUST fail with permission denied
+   - GRANT lockdown test: `telecheck_app_role` AND `platform_admin_role` BOTH attempting direct INSERT/UPDATE/DELETE on registry or audit_log MUST fail with permission denied (R1 HIGH closure: direct writes REVOKED from all roles)
+   - SECURITY DEFINER procedure-only-write test: `platform_admin_role` calling `register_handler` / `activate_handler` / `deprecate_handler` / `retire_handler` MUST succeed; calling these procedures from any other role MUST fail with permission denied OR with `insufficient privilege` error
+   - Atomic audit emission test: `register_handler` mutating registry MUST always emit a paired `handler.registered` audit_log row in the same transaction; manual rollback of audit_log INSERT alone (impossible via grants, but verify trigger-driven safety) MUST be structurally prevented (R1 HIGH closure)
    - Append-only audit_log test: UPDATE or DELETE on audit_log row MUST fail with trigger exception
+   - Append-only registry test: DELETE on registry row MUST fail with `registry rows are forensic evidence` trigger exception (R2 MEDIUM-1 closure)
    - Cross-version FK test: INSERT into audit_log referencing a non-existent (handler_id, version) → MUST fail at composite FK
+   - Successor-existence test: `deprecate_handler` with successor (handler_id, version) that doesn't exist → MUST fail with `successor not found` (R2 MEDIUM-2 closure)
+   - Retired-successor-rejection test: `deprecate_handler` with successor whose status is `retired` → MUST fail with `cannot point to retired successor` (R2 MEDIUM-2 closure)
    - DB-time forcing test: INSERT with caller-supplied registered_at = past MUST be silently overridden to NOW()
 
 ---
