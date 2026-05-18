@@ -319,6 +319,16 @@ BEGIN
       IF NEW.governance_review_reference_id IS NULL OR NEW.approver_account_id IS NULL OR NEW.approver_role_at_approval IS NULL OR NEW.review_cadence_months IS NULL THEN
         RAISE EXCEPTION 'marketing_copy(% / %): under_review to approved requires full approval evidence quartet (governance_review_reference_id + approver_account_id + approver_role_at_approval + review_cadence_months)', NEW.tenant_id, NEW.id;
       END IF;
+      -- R3 MEDIUM closure 2026-05-18: cross-validate approver_role_at_approval
+      -- against current accounts.role (same discipline as suspended → approved
+      -- branch; prevents stale role snapshots at initial approval too).
+      PERFORM 1 FROM accounts a
+       WHERE a.tenant_id = NEW.tenant_id
+         AND a.account_id = NEW.approver_account_id
+         AND a.role = NEW.approver_role_at_approval;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'marketing_copy(% / %): under_review to approved approver_role_at_approval=% does not match current accounts.role for account_id=% — role snapshot must reflect provably-current authorization state (R3 MEDIUM closure)', NEW.tenant_id, NEW.id, NEW.approver_role_at_approval, NEW.approver_account_id;
+      END IF;
       -- Evidence-freshness check (Codex-Gate R2 HIGH-2 closure 2026-05-18):
       -- the referenced evidence row's recorded_at MUST be within the
       -- review_cadence_months window of NOW(). Without this, an old evidence
@@ -361,6 +371,30 @@ BEGIN
       IF NEW.approver_account_id IS NULL OR NEW.approver_role_at_approval IS NULL OR NEW.review_cadence_months IS NULL THEN
         RAISE EXCEPTION 'marketing_copy(% / %): suspended to approved requires full fresh approval evidence quartet (approver_account_id + approver_role_at_approval + review_cadence_months all NOT NULL — R2 MEDIUM-1 closure)', NEW.tenant_id, NEW.id;
       END IF;
+      -- R3 MEDIUM closure 2026-05-18: cross-validate approver_role_at_approval
+      -- against the actual current role on the accounts row. Without this, a
+      -- caller could supply a stale role snapshot (the approver's old role
+      -- before they lost authorization) and the trigger would accept it. Cross-
+      -- validating against accounts.role at trigger-fire time guarantees the
+      -- snapshot reflects current authorization state — if the approver's role
+      -- has changed since OLD approval, NEW.approver_role_at_approval MUST
+      -- match the new role; if it has not changed, it MUST equal the same
+      -- value. Either way, the snapshot is provably-current.
+      PERFORM 1 FROM accounts a
+       WHERE a.tenant_id = NEW.tenant_id
+         AND a.account_id = NEW.approver_account_id
+         AND a.role = NEW.approver_role_at_approval;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'marketing_copy(% / %): suspended to approved approver_role_at_approval=% does not match current accounts.role for account_id=% — role snapshot must reflect provably-current authorization state (R3 MEDIUM closure: prevents stale role snapshots from hiding loss-of-authorization)', NEW.tenant_id, NEW.id, NEW.approver_role_at_approval, NEW.approver_account_id;
+      END IF;
+      -- Note: review_cadence_months is enforced by service-layer binding to
+      -- the current CCR `marketing_governance_review_cadence_months` value at
+      -- re-approval time. The DB-layer trigger cannot easily query CCR (which
+      -- lives outside the DB-tables surface), so the contract is: service layer
+      -- MUST fetch the CCR cadence at re-approval and use that value. The
+      -- service layer is the single source-of-truth for CCR-derived approval
+      -- inputs; the DB enforces the structural invariants (NOT NULL + valid
+      -- enum value 6|12 per row-shape CHECK).
       -- Evidence-freshness check (R2 HIGH-2 closure 2026-05-18, also applied
       -- to re-approval path): the fresh evidence row's recorded_at MUST be
       -- within the review_cadence_months window of NOW().
