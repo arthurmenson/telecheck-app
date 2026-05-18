@@ -69,8 +69,12 @@ UNIQUE (tenant_id, content_fingerprint) WHERE status = 'approved'  -- partial UN
 
 FOREIGN KEY (tenant_id, country_of_care) REFERENCES tenants (id, country_of_care)
   -- Cross-tenant safety: country_of_care MUST match tenant's country (no cross-jurisdiction copy publishing)
-FOREIGN KEY (tenant_id, governance_review_reference_id) REFERENCES marketing_copy_governance_evidence (tenant_id, evidence_id)
-  -- Defer to §4.28 expansion; composite FK ensures evidence is from the same tenant
+FOREIGN KEY (tenant_id, country_of_care, governance_review_reference_id) REFERENCES marketing_copy_governance_evidence (tenant_id, country_of_care, evidence_id)
+  -- TRIPLE-composite FK (Codex-Gate R2 HIGH-1 closure 2026-05-18): includes
+  -- country_of_care to enforce that approval evidence must match the copy's
+  -- jurisdiction. Without this, a multi-country tenant could approve CA copy
+  -- against US evidence (satisfying tenant_id but bypassing jurisdiction).
+  -- Defers to §4.28 expansion's UNIQUE (tenant_id, country_of_care, evidence_id).
 FOREIGN KEY (tenant_id, approver_account_id) REFERENCES accounts (tenant_id, account_id)
 
 -- Classification consistency CHECK:
@@ -123,6 +127,7 @@ created_at                                  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 
 -- Cross-tenant safety constraints (NOT placeholders; permanent)
 UNIQUE (tenant_id, evidence_id)  -- composite UNIQUE for cross-entity composite FK safety
+UNIQUE (tenant_id, country_of_care, evidence_id)  -- TRIPLE-composite UNIQUE (R2 HIGH-1 closure 2026-05-18): target of marketing_copy's triple-composite FK that includes country_of_care for jurisdiction-binding enforcement
 
 FOREIGN KEY (tenant_id, country_of_care) REFERENCES tenants (id, country_of_care)
 
@@ -312,7 +317,20 @@ BEGIN
       -- timestamps forced to DB time
       NEW.approved_at := NOW();
       IF NEW.governance_review_reference_id IS NULL OR NEW.approver_account_id IS NULL OR NEW.approver_role_at_approval IS NULL OR NEW.review_cadence_months IS NULL THEN
-        RAISE EXCEPTION 'marketing_copy(% / %): under_review → approved requires full approval evidence quartet (governance_review_reference_id + approver_account_id + approver_role_at_approval + review_cadence_months)', NEW.tenant_id, NEW.id;
+        RAISE EXCEPTION 'marketing_copy(% / %): under_review to approved requires full approval evidence quartet (governance_review_reference_id + approver_account_id + approver_role_at_approval + review_cadence_months)', NEW.tenant_id, NEW.id;
+      END IF;
+      -- Evidence-freshness check (Codex-Gate R2 HIGH-2 closure 2026-05-18):
+      -- the referenced evidence row's recorded_at MUST be within the
+      -- review_cadence_months window of NOW(). Without this, an old evidence
+      -- row could be reused to approve new copy indefinitely, defeating the
+      -- §13.2 governance review cadence requirement.
+      PERFORM 1 FROM marketing_copy_governance_evidence e
+       WHERE e.tenant_id = NEW.tenant_id
+         AND e.country_of_care = NEW.country_of_care
+         AND e.evidence_id = NEW.governance_review_reference_id
+         AND e.recorded_at > (NOW() - (NEW.review_cadence_months || ' months')::INTERVAL);
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'marketing_copy(% / %): under_review to approved rejected — referenced governance_review_reference_id=% evidence is older than the % month review cadence window (R2 HIGH-2 closure: stale evidence cannot approve fresh copy per §13.2)', NEW.tenant_id, NEW.id, NEW.governance_review_reference_id, NEW.review_cadence_months;
       END IF;
       -- Compute approval_validity_until from approved_at + review_cadence_months
       NEW.approval_validity_until := NEW.approved_at + (NEW.review_cadence_months || ' months')::INTERVAL;
@@ -330,13 +348,29 @@ BEGIN
     RETURN NEW;
   ELSIF OLD.status = 'suspended' AND NEW.status IN ('approved', 'retired') THEN
     IF NEW.status = 'approved' THEN
-      -- Re-approval after suspension: requires fresh governance_review_reference_id
-      -- (old one stays as historical reference via versioning; a NEW MarketingCopy
-      -- row with bumped version is the canonical re-approval path; in-place
-      -- suspended → approved on the SAME row is permitted only if the SAME
-      -- content_fingerprint passes re-review)
+      -- Re-approval after suspension: requires the FULL fresh approval evidence
+      -- quartet, not just a fresh governance_review_reference_id (Codex-Gate
+      -- R2 MEDIUM-1 closure 2026-05-18: previous version only required fresh
+      -- evidence reference; an approver could swap evidence but keep stale
+      -- approver_account_id + approver_role_at_approval + review_cadence_months,
+      -- defeating the §13.2 fresh-review discipline). All four approval-evidence
+      -- fields MUST be non-NULL AND fresh.
       IF NEW.governance_review_reference_id IS NULL OR NEW.governance_review_reference_id = OLD.governance_review_reference_id THEN
-        RAISE EXCEPTION 'marketing_copy(% / %): suspended → approved requires fresh governance_review_reference_id (cannot reuse OLD=% per §13.2 re-review discipline)', NEW.tenant_id, NEW.id, OLD.governance_review_reference_id;
+        RAISE EXCEPTION 'marketing_copy(% / %): suspended to approved requires fresh governance_review_reference_id (cannot reuse OLD=% per §13.2 re-review discipline)', NEW.tenant_id, NEW.id, OLD.governance_review_reference_id;
+      END IF;
+      IF NEW.approver_account_id IS NULL OR NEW.approver_role_at_approval IS NULL OR NEW.review_cadence_months IS NULL THEN
+        RAISE EXCEPTION 'marketing_copy(% / %): suspended to approved requires full fresh approval evidence quartet (approver_account_id + approver_role_at_approval + review_cadence_months all NOT NULL — R2 MEDIUM-1 closure)', NEW.tenant_id, NEW.id;
+      END IF;
+      -- Evidence-freshness check (R2 HIGH-2 closure 2026-05-18, also applied
+      -- to re-approval path): the fresh evidence row's recorded_at MUST be
+      -- within the review_cadence_months window of NOW().
+      PERFORM 1 FROM marketing_copy_governance_evidence e
+       WHERE e.tenant_id = NEW.tenant_id
+         AND e.country_of_care = NEW.country_of_care
+         AND e.evidence_id = NEW.governance_review_reference_id
+         AND e.recorded_at > (NOW() - (NEW.review_cadence_months || ' months')::INTERVAL);
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'marketing_copy(% / %): suspended to approved rejected — fresh governance_review_reference_id=% evidence is older than the % month review cadence window (R2 HIGH-2 closure: stale evidence cannot approve fresh copy per §13.2)', NEW.tenant_id, NEW.id, NEW.governance_review_reference_id, NEW.review_cadence_months;
       END IF;
       NEW.approved_at := NOW();
       NEW.suspended_at := NULL;
