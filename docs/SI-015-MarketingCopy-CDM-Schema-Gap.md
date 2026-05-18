@@ -22,11 +22,11 @@ SI-015 closes the MarketingCopy CDM schema gap. Two entities are scoped together
 | Surface | Existing at v5.2 contracts (TYPES + AUDIT_EVENTS + DOMAIN_EVENTS) | SI-015 CDM §4 expansion |
 | --- | --- | --- |
 | TYPES `MarketingCopy` definition | 16 fields with semver `version` + `status` enum | **CDM §4.27 row shape — formalize as table** with composite UNIQUE for cross-entity FK safety + content fingerprint column + Tier 0/1/2 invariants |
-| TYPES `MarketingCopyGovernanceEvidence` definition | 9 fields with FK-shape `governance_lead_designation_artifact_id` | **CDM §4.28 row shape — formalize as table** with append-only enforcement + FK to MarketingCopy |
+| TYPES `MarketingCopyGovernanceEvidence` definition | 9 fields with FK-shape `governance_lead_designation_artifact_id` | **CDM §4.28 row shape — formalize as table** with append-only enforcement (Tier 0 fully immutable post-INSERT) |
 | AUDIT_EVENTS `marketing.surface_rendered` + `.surface_drift` | Already in AUDIT_EVENTS v5.2 §6 | NO new audit events at SI-015 — table-lifecycle events (`marketing_copy.drafted/submitted/approved/rejected/suspended/retired`) fold into SI-011.1c per the SC7 umbrella |
 | DOMAIN_EVENTS `marketing.surface_published` + `.surface_suspended` | Already in DOMAIN_EVENTS v5.2 | NO new domain events at SI-015 |
 | CCR_RUNTIME marketing block | Existing `molecule_level_marketing_permitted` 3-state enum + `marketing_copy_governance_evidence` + `marketing_governance_review_cadence_months` + `marketing_governance_lead_designation_artifact_id` | NO new CCR keys at SI-015 — marketing block already complete at v5.2 |
-| Composite FKs | None (entity not in CDM) | **+3 NEW** (MarketingCopy ↔ governance_review artifact via `governance_review_reference_id`; MarketingCopyGovernanceEvidence ↔ MarketingCopy via `marketing_copy_id`; MarketingCopy ↔ tenants via `tenant_id`) |
+| Composite FKs | None (entity not in CDM) | **+5 NEW** (MarketingCopy ↔ tenants via `tenant_id`; MarketingCopy ↔ tenants composite via `(tenant_id, country_of_care)`; MarketingCopy ↔ MarketingCopyGovernanceEvidence via `(tenant_id, governance_review_reference_id)` — **evidence is intentionally 1:N reusable across copies within the same regulatory interpretation window**, R1 MEDIUM-2 clarification 2026-05-18; MarketingCopy ↔ accounts via `(tenant_id, approver_account_id)`; MarketingCopyGovernanceEvidence ↔ tenants via `(tenant_id, country_of_care)`) |
 
 **Scope narrowness vs SI-009.1 / SI-011 family:** SI-015 is intentionally narrower than the SC2-SC7 expansions because the marketing surface's runtime events + CCR config already landed at v1.10 (ADR-027 cycle). SI-015 is **CDM-only** — adds the §4 row shapes + §3 inventory entries + Tier 0/1/2 enforcement triggers. No new AUDIT_EVENTS, no new DOMAIN_EVENTS, no new CCR keys.
 
@@ -113,7 +113,8 @@ country_of_care                             VARCHAR(2)   NOT NULL  -- ISO 3166-1
 regulatory_jurisdiction                     TEXT         NOT NULL  -- jurisdiction code
 regulatory_authority                        TEXT         NOT NULL  -- regulatory body name
 regulatory_interpretation_artifact_id       VARCHAR(26)  NOT NULL  -- ULID of the artifact storing the regulatory interpretation
-interpretation_date                         TIMESTAMPTZ  NOT NULL
+interpretation_date                         TIMESTAMPTZ  NOT NULL  -- caller-supplied external regulatory event date; CHECK ensures NOT in future relative to recorded_at
+recorded_at                                 TIMESTAMPTZ  NOT NULL DEFAULT NOW()  -- R2 MEDIUM-1 closure 2026-05-18: DB-clock anchor for evidence ordering + approval validity decisions; forced to NOW() in INSERT trigger; caller-supplied value silently overridden. interpretation_date is the EXTERNAL regulator event date; recorded_at is WHEN the system observed/recorded the evidence. Approval-validity timing decisions reference recorded_at, not interpretation_date, to prevent backdate bypasses.
 scope                                       TEXT         NOT NULL  -- scope of permitted molecule-level marketing per this interpretation
 prohibited_claim_classes                    TEXT[]       NOT NULL  -- claim taxonomy classes the regulator has explicitly prohibited
 governance_lead_designation_artifact_id     VARCHAR(26)  NOT NULL  -- ULID of the artifact designating the marketing-copy-governance-lead role assignment
@@ -124,6 +125,17 @@ created_at                                  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 UNIQUE (tenant_id, evidence_id)  -- composite UNIQUE for cross-entity composite FK safety
 
 FOREIGN KEY (tenant_id, country_of_care) REFERENCES tenants (id, country_of_care)
+
+-- Evidence temporal sanity CHECK (R2 MEDIUM-1 closure 2026-05-18):
+-- interpretation_date represents an external regulatory event; it may be in the
+-- past (regulatory interpretation issued before the system observed it) but
+-- MUST NOT be in the future relative to when the system recorded it. A future-
+-- dated interpretation is structurally impossible (the regulator cannot issue
+-- a future interpretation; if recorded, it's caller-supplied bad data).
+-- Without this CHECK, a bad/compromised caller could backdate or future-date
+-- regulatory interpretation evidence and make an approval appear timely or valid
+-- when it was not.
+CHECK (interpretation_date <= recorded_at)
 
 -- Append-only invariant: MarketingCopyGovernanceEvidence rows are evidence artifacts;
 -- they capture the regulatory + governance-lead-designation context at the moment of
@@ -196,24 +208,73 @@ CREATE TRIGGER marketing_copy_tier0_immutability_guard
 
 -- Tier 1 payload + governance-evidence binding immutability AFTER approval
 -- (BEFORE UPDATE trigger; runs after Tier 0 trigger):
+--
+-- R1 HIGH-1 closure 2026-05-18: previous version blocked the legitimate
+-- suspended → approved transition because Tier 1 froze the entire approval-
+-- evidence quartet whenever OLD.status ∈ {approved, suspended, retired},
+-- but the state-machine allow-list requires fresh governance_review_reference_id
+-- + new approved_at + new approval_validity_until on suspended → approved
+-- re-approval per §13.2. Self-contradictory: suspended copy could only be
+-- retired, never re-approved.
+--
+-- Refactored to transition-aware Tier 1 immutability:
+--   1. Content fields (molecule_references / program_references /
+--      rendered_claim_classes / content_body / content_fingerprint) are FROZEN
+--      after first approval regardless of transition target — any content change
+--      requires a NEW version (a NEW row) per I-013.
+--   2. Approval-evidence fields (governance_review_reference_id / approved_at /
+--      approver_account_id / approver_role_at_approval / approval_validity_until /
+--      review_cadence_months) are FROZEN on:
+--        - same-state UPDATEs at status='approved' (no rewrite of evidence)
+--        - approved → suspended (suspension preserves the original approval lineage)
+--        - approved → retired
+--        - suspended → retired
+--        - any transition out of retired (terminal — no transitions out)
+--      But are PERMITTED to change on:
+--        - suspended → approved (fresh §13.2 re-review per ratified design;
+--          governance_review_reference_id MUST be NEW, not equal to OLD;
+--          state-machine trigger enforces this further)
+--   3. Content is also FROZEN on suspended → approved because re-approval is
+--      of the SAME content_fingerprint per ratified design (a NEW fingerprint
+--      means a NEW version row).
 CREATE OR REPLACE FUNCTION marketing_copy_tier1_post_approval_immutability()
 RETURNS TRIGGER AS $$
+DECLARE
+  v_content_changed BOOLEAN;
+  v_evidence_changed BOOLEAN;
 BEGIN
-  IF OLD.status IN ('approved', 'suspended', 'retired') THEN
-    -- Tier 1 frozen-column check:
-    IF NEW.molecule_references IS DISTINCT FROM OLD.molecule_references
-       OR NEW.program_references IS DISTINCT FROM OLD.program_references
-       OR NEW.rendered_claim_classes IS DISTINCT FROM OLD.rendered_claim_classes
-       OR NEW.content_body IS DISTINCT FROM OLD.content_body
-       OR NEW.content_fingerprint IS DISTINCT FROM OLD.content_fingerprint
-       OR NEW.governance_review_reference_id IS DISTINCT FROM OLD.governance_review_reference_id
-       OR NEW.approved_at IS DISTINCT FROM OLD.approved_at
-       OR NEW.approver_account_id IS DISTINCT FROM OLD.approver_account_id
-       OR NEW.approver_role_at_approval IS DISTINCT FROM OLD.approver_role_at_approval
-       OR NEW.approval_validity_until IS DISTINCT FROM OLD.approval_validity_until
-       OR NEW.review_cadence_months IS DISTINCT FROM OLD.review_cadence_months THEN
-      RAISE EXCEPTION 'marketing_copy(% / %): Tier 1 payload/governance-evidence binding immutability violated (state=% requires payload + approval evidence frozen; I-013 published-content-version-immutability + ADR-027 §13.2 evidence-chain integrity)', NEW.tenant_id, NEW.id, OLD.status;
+  v_content_changed := NEW.molecule_references IS DISTINCT FROM OLD.molecule_references
+                    OR NEW.program_references IS DISTINCT FROM OLD.program_references
+                    OR NEW.rendered_claim_classes IS DISTINCT FROM OLD.rendered_claim_classes
+                    OR NEW.content_body IS DISTINCT FROM OLD.content_body
+                    OR NEW.content_fingerprint IS DISTINCT FROM OLD.content_fingerprint;
+  v_evidence_changed := NEW.governance_review_reference_id IS DISTINCT FROM OLD.governance_review_reference_id
+                     OR NEW.approved_at IS DISTINCT FROM OLD.approved_at
+                     OR NEW.approver_account_id IS DISTINCT FROM OLD.approver_account_id
+                     OR NEW.approver_role_at_approval IS DISTINCT FROM OLD.approver_role_at_approval
+                     OR NEW.approval_validity_until IS DISTINCT FROM OLD.approval_validity_until
+                     OR NEW.review_cadence_months IS DISTINCT FROM OLD.review_cadence_months;
+
+  -- Content FROZEN after first approval regardless of transition target
+  -- (any content change requires a NEW version row per I-013):
+  IF OLD.status IN ('approved', 'suspended', 'retired') AND v_content_changed THEN
+    RAISE EXCEPTION 'marketing_copy(% / %): Tier 1 content immutability violated (state=% requires content + content_fingerprint frozen; any content change requires a NEW version row per I-013 published-content-version-immutability)', NEW.tenant_id, NEW.id, OLD.status;
+  END IF;
+
+  -- Approval-evidence permitted to change ONLY on suspended → approved
+  -- re-approval transition (per ratified design; state-machine trigger enforces
+  -- the freshness requirement on governance_review_reference_id):
+  IF v_evidence_changed THEN
+    IF OLD.status = 'suspended' AND NEW.status = 'approved' THEN
+      -- Re-approval transition: evidence changes permitted (state-machine
+      -- trigger enforces freshness of governance_review_reference_id)
+      NULL;
+    ELSIF OLD.status IN ('approved', 'suspended', 'retired') THEN
+      RAISE EXCEPTION 'marketing_copy(% / %): Tier 1 approval-evidence immutability violated (transition % → % does not permit approval-evidence changes; only suspended → approved re-review per §13.2 may update evidence)', NEW.tenant_id, NEW.id, OLD.status, NEW.status;
     END IF;
+    -- OLD.status IN ('draft', 'under_review'): evidence is being populated
+    -- for the FIRST time at the under_review → approved transition; this is
+    -- handled at the state-machine trigger; Tier 1 does not block.
   END IF;
   RETURN NEW;
 END;
@@ -296,14 +357,67 @@ CREATE TRIGGER marketing_copy_status_state_machine_guard
   FOR EACH ROW
   EXECUTE FUNCTION marketing_copy_status_state_machine();
 
--- BEFORE INSERT trigger for MarketingCopy: force created_at + updated_at to DB time
--- + reject pre-seeded status-transition timestamps (rows must start at status='draft'
--- with all status-transition timestamps NULL).
+-- DB-owned canonical content fingerprint computation (R1 HIGH-2 closure 2026-05-18):
+-- Previously content_fingerprint was caller-supplied. An attacker could INSERT
+-- a draft with an arbitrary fingerprint not matching the content, then approve;
+-- the partial UNIQUE only deduplicated the attacker-chosen value but never proved
+-- it represented the approved content. This broke I-013 immutability semantics
+-- because the immutable fingerprint may never have represented the approved content.
+--
+-- Closure: a DB function computes the canonical fingerprint from
+-- (surface_type, classification, molecule_references, program_references,
+--  rendered_claim_classes, content_body); both INSERT and UPDATE triggers
+-- OVERRIDE NEW.content_fingerprint with the computed value — caller-supplied
+-- fingerprint is silently ignored. This makes content_fingerprint a DB-derived
+-- value, not caller-controlled data, and guarantees that any approval reference
+-- to a fingerprint points to the actual canonical content.
+CREATE OR REPLACE FUNCTION compute_marketing_copy_content_fingerprint(
+  p_surface_type TEXT,
+  p_classification TEXT,
+  p_molecule_references JSONB,
+  p_program_references TEXT[],
+  p_rendered_claim_classes TEXT[],
+  p_content_body JSONB
+) RETURNS TEXT
+LANGUAGE plpgsql IMMUTABLE
+AS $$
+DECLARE
+  v_canonical_json TEXT;
+BEGIN
+  -- Canonical JSON serialization with sorted keys + sorted array elements
+  -- ensures the same content always produces the same fingerprint regardless
+  -- of caller's JSON key/array ordering.
+  v_canonical_json := jsonb_build_object(
+    'surface_type', p_surface_type,
+    'classification', p_classification,
+    'molecule_references', COALESCE(p_molecule_references, 'null'::jsonb),
+    'program_references', COALESCE(to_jsonb(ARRAY(SELECT unnest(p_program_references) ORDER BY 1)), 'null'::jsonb),
+    'rendered_claim_classes', to_jsonb(ARRAY(SELECT unnest(p_rendered_claim_classes) ORDER BY 1)),
+    'content_body', p_content_body
+  )::TEXT;
+  RETURN encode(digest(v_canonical_json, 'sha256'), 'hex');
+END;
+$$;
+
+-- BEFORE INSERT trigger for MarketingCopy: force created_at + updated_at + content_fingerprint
+-- to DB-computed values + reject pre-seeded status-transition timestamps (rows must start
+-- at status='draft' with all status-transition timestamps NULL).
 CREATE OR REPLACE FUNCTION marketing_copy_insert_guard()
 RETURNS TRIGGER AS $$
 BEGIN
   NEW.created_at := NOW();
   NEW.updated_at := NOW();
+  -- R1 HIGH-2 closure 2026-05-18: force content_fingerprint to DB-computed value
+  -- regardless of caller-supplied input. Eliminates the arbitrary-fingerprint
+  -- attack surface.
+  NEW.content_fingerprint := compute_marketing_copy_content_fingerprint(
+    NEW.surface_type,
+    NEW.classification,
+    NEW.molecule_references,
+    NEW.program_references,
+    NEW.rendered_claim_classes,
+    NEW.content_body
+  );
   IF NEW.status IS DISTINCT FROM 'draft' THEN
     RAISE EXCEPTION 'marketing_copy(% / %): direct INSERT must start at status=''draft'' (got %); status progression via the guarded state-machine transitions only', NEW.tenant_id, NEW.id, NEW.status;
   END IF;
@@ -320,6 +434,49 @@ CREATE TRIGGER marketing_copy_insert_lifecycle_guard
   BEFORE INSERT ON marketing_copy
   FOR EACH ROW
   EXECUTE FUNCTION marketing_copy_insert_guard();
+
+-- BEFORE UPDATE trigger for MarketingCopy: re-compute content_fingerprint when any
+-- content field changes (R1 HIGH-2 closure 2026-05-18; runs BEFORE the Tier 1
+-- post-approval immutability trigger to ensure fingerprint correctness regardless
+-- of caller input).
+CREATE OR REPLACE FUNCTION marketing_copy_recompute_content_fingerprint()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Recompute fingerprint based on NEW content fields; this overrides any
+  -- caller-supplied content_fingerprint value. If the content fields haven't
+  -- changed, the recomputed fingerprint equals OLD.content_fingerprint (safe).
+  -- If they have changed, the fingerprint reflects the actual new content.
+  -- Tier 1 immutability trigger (which runs after this one alphabetically:
+  -- marketing_copy_recompute_content_fingerprint vs
+  -- marketing_copy_tier1_post_approval_immutability_guard) then catches the
+  -- post-approval content-change attempt via the v_content_changed branch.
+  NEW.content_fingerprint := compute_marketing_copy_content_fingerprint(
+    NEW.surface_type,
+    NEW.classification,
+    NEW.molecule_references,
+    NEW.program_references,
+    NEW.rendered_claim_classes,
+    NEW.content_body
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER marketing_copy_aaa_recompute_fingerprint
+  BEFORE UPDATE ON marketing_copy
+  FOR EACH ROW
+  EXECUTE FUNCTION marketing_copy_recompute_content_fingerprint();
+-- Trigger named with "aaa" prefix to guarantee it fires FIRST alphabetically
+-- (BEFORE Tier 0 / Tier 1 / state-machine triggers), so that downstream triggers
+-- compare against the DB-computed fingerprint, not the caller-supplied value.
+
+-- Note on GRANT model: in addition to the trigger enforcement above, the column
+-- content_fingerprint should be REVOKEd from direct UPDATE by app role at the
+-- migration level (similar to audit_records discipline). Triggers are defense-
+-- in-depth; the REVOKE is the GRANT-model belt to complement the trigger
+-- suspenders. App-role UPDATEs that try to set content_fingerprint directly
+-- will fail at the GRANT layer; UPDATEs that don't touch the column will have
+-- the column recomputed-from-content via this trigger.
 
 -- MarketingCopyGovernanceEvidence full append-only enforcement:
 -- App role has only SELECT + INSERT privileges; UPDATE + DELETE REVOKED.
@@ -341,10 +498,15 @@ CREATE TRIGGER marketing_copy_governance_evidence_append_only_delete
   FOR EACH ROW
   EXECUTE FUNCTION marketing_copy_governance_evidence_reject_mutation();
 
--- BEFORE INSERT trigger for MarketingCopyGovernanceEvidence: force created_at to DB time.
+-- BEFORE INSERT trigger for MarketingCopyGovernanceEvidence: force recorded_at
+-- + created_at to DB time (R2 MEDIUM-1 closure 2026-05-18 — DB-clock anchor
+-- for evidence ordering + approval validity decisions; caller-supplied
+-- recorded_at silently overridden so external interpretation_date can never
+-- be trusted as the evidence anchor).
 CREATE OR REPLACE FUNCTION marketing_copy_governance_evidence_insert_guard()
 RETURNS TRIGGER AS $$
 BEGIN
+  NEW.recorded_at := NOW();
   NEW.created_at := NOW();
   RETURN NEW;
 END;
@@ -370,6 +532,8 @@ CREATE TRIGGER marketing_copy_governance_evidence_insert_db_time_guard
 | 6 | `marketing_copy_governance_evidence.(tenant_id, country_of_care)` | `tenants.(id, country_of_care)` | composite | Country matches tenant's country |
 
 **Cross-tenant attack surface:** structurally impossible per composite FKs (a copy in tenant A cannot reference evidence in tenant B because the composite FK enforces both columns match). Mirrors the SI-005/008/009/009.1 cross-tenant safety pattern.
+
+**Evidence-to-copy cardinality (R1 MEDIUM-2 closure 2026-05-18):** the relationship is **1:N** — one `MarketingCopyGovernanceEvidence` row MAY be referenced by N `MarketingCopy` rows within the same tenant + same country_of_care, as long as all referencing copies fall under the regulatory interpretation window the evidence row captures. This is intentional: a single quarterly §13.2 governance review issuing one regulatory interpretation legitimately approves multiple copies (different surfaces, classifications, claim classes) under the same evidence anchor. The §13.2 governance review process treats one `evidence_id` as one review pass; copies approved under that review pass reference it without each requiring their own evidence row. The earlier draft prose suggesting `MarketingCopyGovernanceEvidence ↔ MarketingCopy via marketing_copy_id` was inaccurate — there is NO such column on the evidence row + NO such FK in the canonical model. Cross-tenant reuse is structurally prevented by FK 3's composite tenant binding. Re-approval-after-suspension state-machine rule (state-machine trigger §) ADDITIONALLY enforces freshness of `governance_review_reference_id` on the SAME copy (cannot reuse OLD evidence on the same copy across the suspension boundary), so within-tenant evidence reuse is also bounded at the same-copy lineage level.
 
 ---
 
