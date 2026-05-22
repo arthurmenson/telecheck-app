@@ -23,8 +23,13 @@ DROP VIEW IF EXISTS crisis_event_current_state_v;
 --    migration's rollback handles them).
 -- -----------------------------------------------------------------------------
 
-REVOKE SELECT ON crisis_event_lifecycle_transition  FROM crisis_event_patient_reader;
-REVOKE SELECT ON crisis_event                       FROM crisis_event_patient_reader;
+-- Column-level REVOKE on patient_reader (matches column-level GRANTs in §3)
+REVOKE SELECT (id, tenant_id, crisis_event_id, to_state, transition_at)
+    ON crisis_event_lifecycle_transition FROM crisis_event_patient_reader;
+REVOKE SELECT (id, tenant_id, patient_id, crisis_type, severity, detected_at)
+    ON crisis_event FROM crisis_event_patient_reader;
+
+-- Table-level REVOKE on staff_reader (matches table-level GRANTs in §3)
 REVOKE SELECT ON crisis_event_lifecycle_transition  FROM crisis_event_staff_reader;
 REVOKE SELECT ON crisis_event                       FROM crisis_event_staff_reader;
 

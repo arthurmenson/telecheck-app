@@ -233,14 +233,36 @@ COMMENT ON VIEW crisis_event_patient_summary_v IS
 -- + view predicates for security. We follow that pattern here.
 -- =============================================================================
 
--- Staff reader needs SELECT on crisis_event + crisis_event_lifecycle_transition
+-- Staff reader gets FULL table SELECT — the staff view exposes most fields and
+-- staff role legitimately needs operator-side diagnostic columns. Tenant
+-- isolation enforced by RLS + view body predicate.
 GRANT SELECT ON crisis_event                       TO crisis_event_staff_reader;
 GRANT SELECT ON crisis_event_lifecycle_transition  TO crisis_event_staff_reader;
 
--- Patient reader needs SELECT on crisis_event + crisis_event_lifecycle_transition
--- (view body LATERAL JOIN reads both)
-GRANT SELECT ON crisis_event                       TO crisis_event_patient_reader;
-GRANT SELECT ON crisis_event_lifecycle_transition  TO crisis_event_patient_reader;
+-- R1 HIGH-1 closure 2026-05-22 (PR 2 Codex review): patient reader gets
+-- COLUMN-LEVEL SELECT grants matching the patient view's minimization boundary
+-- exactly. Without column-level grants, the table-level grant would let the
+-- patient_reader directly query SELECT actor_principal_id, transition_reason,
+-- intake_payload_*, server_signal_id, etc. from the base tables — bypassing
+-- the data-minimization boundary the view defines. With column-level grants,
+-- direct base-table queries against the omitted columns fail with
+-- "permission denied for column ..." regardless of whether the caller goes
+-- through the view or the base table.
+--
+-- patient_reader minimized column set on crisis_event:
+--   id, tenant_id, patient_id, crisis_type, severity, detected_at
+-- (OMITTED: server_signal_id, regulatory_reporting_enabled, all intake_payload_*
+--  KMS envelope columns)
+GRANT SELECT (id, tenant_id, patient_id, crisis_type, severity, detected_at)
+    ON crisis_event TO crisis_event_patient_reader;
+
+-- patient_reader minimized column set on crisis_event_lifecycle_transition:
+--   id, tenant_id, crisis_event_id, to_state, transition_at
+-- (Note: id needed for LATERAL ORDER BY tiebreak; tenant_id + crisis_event_id
+--  for join predicate; to_state + transition_at for the projection.
+--  OMITTED: from_state, transition_reason, actor_principal_id, transition_payload)
+GRANT SELECT (id, tenant_id, crisis_event_id, to_state, transition_at)
+    ON crisis_event_lifecycle_transition TO crisis_event_patient_reader;
 
 -- =============================================================================
 -- §4 — Verification
@@ -342,5 +364,36 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION
             'migration-034-grant-missing: crisis_event_patient_reader is missing SELECT on crisis_event_patient_summary_v';
+    END IF;
+
+    -- R1 HIGH-1 closure 2026-05-22: NEGATIVE assertions proving the data-
+    -- minimization boundary holds at the privilege layer. patient_reader MUST NOT
+    -- have SELECT on staff-only columns of either base table; direct queries
+    -- against those columns will fail with permission_denied.
+    --
+    -- crisis_event omitted-column assertions:
+    PERFORM 1 FROM information_schema.role_column_grants
+     WHERE grantee = 'crisis_event_patient_reader'
+       AND table_name = 'crisis_event'
+       AND column_name IN ('server_signal_id', 'regulatory_reporting_enabled',
+                           'intake_payload_ciphertext', 'intake_payload_dek_id',
+                           'intake_payload_dek_version', 'intake_payload_iv',
+                           'intake_payload_auth_tag', 'intake_payload_kek_id',
+                           'intake_payload_kek_version', 'intake_payload_algorithm')
+       AND privilege_type = 'SELECT';
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'migration-034-grant-leak: crisis_event_patient_reader has SELECT on one or more staff-only columns of crisis_event (server_signal_id / regulatory_reporting_enabled / intake_payload_*); data-minimization boundary violated';
+    END IF;
+    --
+    -- crisis_event_lifecycle_transition omitted-column assertions:
+    PERFORM 1 FROM information_schema.role_column_grants
+     WHERE grantee = 'crisis_event_patient_reader'
+       AND table_name = 'crisis_event_lifecycle_transition'
+       AND column_name IN ('from_state', 'transition_reason', 'actor_principal_id', 'transition_payload')
+       AND privilege_type = 'SELECT';
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'migration-034-grant-leak: crisis_event_patient_reader has SELECT on one or more operator-internal columns of crisis_event_lifecycle_transition (from_state / transition_reason / actor_principal_id / transition_payload); data-minimization boundary violated';
     END IF;
 END $$;
