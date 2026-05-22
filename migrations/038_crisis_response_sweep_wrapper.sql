@@ -160,6 +160,28 @@ BEGIN
     -- - If no row exists: INSERT a new claim with fencing_token = 1.
     -- =====================================================================
 
+    -- R1 HIGH-1 closure 2026-05-22: idempotent replay guard for already-
+    -- completed sweep. A retry after successful completion (or a scheduler
+    -- redelivery of the same generation) must NOT mint a new open row that
+    -- would emit a duplicate escalation. Return the existing completed
+    -- sweep's info with outcome='already_completed' instead.
+    SELECT cse.sweep_execution_id, cse.fencing_token
+      INTO v_existing_sweep_id, v_returning_fencing
+      FROM public.crisis_sweep_execution cse
+     WHERE cse.tenant_id = p_tenant_id
+       AND cse.crisis_event_id = p_crisis_event_id
+       AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+       AND cse.completed_at IS NOT NULL
+     ORDER BY cse.completed_at DESC, cse.sweep_execution_id DESC
+     LIMIT 1;
+    IF v_existing_sweep_id IS NOT NULL THEN
+        sweep_execution_id := v_existing_sweep_id;
+        fencing_token      := v_returning_fencing;
+        outcome            := 'already_completed';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
     SELECT sweep_execution_id, claimed_by_worker_id, claim_expires_at, fencing_token, completed_at
       INTO v_sweep_row
       FROM public.crisis_sweep_execution
