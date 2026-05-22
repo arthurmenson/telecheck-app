@@ -290,6 +290,52 @@ CREATE INDEX notification_crisis_provider_attempt_tenant_event_attempted_idx
 CREATE INDEX notification_crisis_provider_attempt_tenant_dispatch_idx
     ON notification_crisis_provider_attempt (tenant_id, dispatch_ledger_id);
 
+-- R5 HIGH-1 closure 2026-05-22: BEFORE INSERT trigger enforces
+-- provider_attempt.sweep_cycle_id matches parent dispatch_ledger.sweep_cycle_id
+-- per the parent's dispatch_origin semantics. Without this, a caller bug or
+-- partial failure could insert provider_attempt rows with a drift sweep_cycle_id
+-- vs parent — corrupting the audit trail even though R3+R4 made the ledger row
+-- itself unique per cycle. A composite FK that included sweep_cycle_id would not
+-- work cleanly because PG FK NULL semantics with MATCH SIMPLE allow partial nulls
+-- (initial_detection parent has sweep_cycle_id IS NULL); trigger expresses the
+-- intended cross-row invariant correctly.
+CREATE OR REPLACE FUNCTION notification_crisis_provider_attempt_assert_cycle_matches_ledger()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_parent_cycle  INTEGER;
+    v_parent_origin TEXT;
+BEGIN
+    SELECT sweep_cycle_id, dispatch_origin
+      INTO v_parent_cycle, v_parent_origin
+      FROM public.notification_crisis_dispatch_ledger
+     WHERE tenant_id = NEW.tenant_id AND id = NEW.dispatch_ledger_id;
+
+    -- For initial_detection + sweep_escalation parents: child.sweep_cycle_id
+    -- MUST exactly match parent.sweep_cycle_id (the parent's R4 coherence CHECK
+    -- already enforces parent's own origin/cycle pairing).
+    -- For manual_replay parents: parent.sweep_cycle_id is permissive, but child
+    -- MUST still match whatever parent set (audit integrity).
+    IF NEW.sweep_cycle_id IS DISTINCT FROM v_parent_cycle THEN
+        RAISE EXCEPTION
+            'notification_crisis_provider_attempt.sweep_cycle_id (%) does not match parent dispatch_ledger.sweep_cycle_id (%) for dispatch_ledger_id % (dispatch_origin=%); '
+            'child attempt MUST inherit parent ledger cycle to preserve audit-trail coherence per R5 HIGH-1 closure',
+            NEW.sweep_cycle_id, v_parent_cycle, NEW.dispatch_ledger_id, v_parent_origin
+            USING ERRCODE = '23514';    -- check_violation
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER notification_crisis_provider_attempt_cycle_matches_ledger
+    BEFORE INSERT ON notification_crisis_provider_attempt
+    FOR EACH ROW
+    EXECUTE FUNCTION notification_crisis_provider_attempt_assert_cycle_matches_ledger();
+
 -- =============================================================================
 -- §3 — P-027 §4.68 baseline: notification_crisis_escalation_obligation
 --
