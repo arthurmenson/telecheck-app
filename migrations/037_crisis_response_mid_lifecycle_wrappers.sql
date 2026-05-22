@@ -483,5 +483,20 @@ BEGIN
         IF NOT has_table_privilege(v_target.column2, 'public.crisis_event_lifecycle_transition', 'SELECT') THEN
             RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks SELECT on crisis_event_lifecycle_transition', v_target.column2;
         END IF;
+
+        -- R2 HIGH-1 closure 2026-05-22: defensive cross-migration assertion.
+        -- Migration 035 §3 grants EXECUTE on the raw writer to all 5 wrapper-owner
+        -- roles (including the 3 used by this migration). Verify the grant is
+        -- still present — catches schema drift if 035's grant matrix was
+        -- accidentally narrowed by a downstream migration.
+        IF NOT has_function_privilege(
+            v_target.column2,
+            'public.record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb)',
+            'EXECUTE'
+        ) THEN
+            RAISE EXCEPTION
+                'migration-037-raw-writer-grant-missing: % lacks EXECUTE on record_crisis_event_lifecycle_transition() — migration 035 §3 grant matrix may have drifted',
+                v_target.column2;
+        END IF;
     END LOOP;
 END $$;
