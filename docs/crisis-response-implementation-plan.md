@@ -1,8 +1,46 @@
 # Crisis Response (SI-022) Implementation Plan
 
-**Status:** PR 1 in progress (migration 032 RBAC roles merged); foundation prerequisites identified 2026-05-22.
+**Status:** PR 1 in progress (migration 032 RBAC roles + this plan doc committed; migration 033 entities authoring next).
 **Spec source:** `../telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_SI_022_Crisis_Response_v1_0.md` + `Telecheck_CDM_v1_9_to_v1_10_Amendment.md` (P-039 + P-040 RATIFIED 2026-05-21).
 **Branch:** `feat/crisis-response-pr1-foundation` (this branch; subsequent migrations land as separate PRs).
+**Ratifier decision 2026-05-22 — Option 2 (adapt to existing code-repo patterns):** Evans chose to adapt the spec to existing code-repo patterns rather than land the spec-canonical foundation first. Rationale: pilot timeline pressure; foundation rework can be paid back in a later hygiene cycle (the canonical `jwt_migration_entity_status` tracking the spec built specifically for this is the right vehicle when foundation work resumes). See "Adapted plan (Option 2)" section below — the Option 1 prerequisite sequence in the original plan is SUPERSEDED.
+
+---
+
+## ADAPTED PLAN (Option 2 ratified 2026-05-22)
+
+Migration sequence under Option 2:
+
+| Migration | Purpose | Status |
+|---|---|---|
+| 032 | Crisis Response RBAC roles (15 roles, NOLOGIN + non-BYPASSRLS) | ✅ MERGED at `ca44925` (foundation-independent; works for either option) |
+| **033** | **Crisis Response entities + notification baseline (inline) + RLS + per-table append-only triggers + monotonic-ordering trigger** | **NEXT** |
+| 034 | Crisis Response derived views (R1 HIGH-2 staff/patient split) | After 033 |
+| 035+ | SECDEF wrappers (adapted to SI-010 `current_actor_*()` helpers + `current_tenant_id()` GUC; spec uses SI-024.1 helpers — divergence documented inline) | After 034 |
+| 036+ | Fastify `src/modules/crisis-response/` module + routes + audit emitters + integration tests | After 035 |
+
+**Option 2 adaptations from spec:**
+- **RLS predicate:** `tenant_id = current_tenant_id()` (code-repo pattern from migration 003) — NOT spec's `current_tenant_id_strict('entity_name')` (SI-024.1)
+- **Actor identity in wrappers:** `current_actor_account_id()` + `current_actor_role()` + `current_actor_account_tenant_id()` (SI-010 from migration 031) — NOT spec's `verify_session_jwt_and_extract_claims().verified_principal_id`
+- **Append-only triggers:** per-table inline trigger functions (audit_chain pattern from migration 002) — NOT spec's generic `enforce_append_only()`
+- **Terminal-row-immutable:** per-table inline trigger function for `crisis_sweep_execution` — NOT spec's generic `enforce_terminal_row_immutable()`
+- **`patient_id` FK:** column kept as `UUID NOT NULL` but FK constraint to `patient(tenant_id, id)` SKIPPED (no patient table exists; logical reference only; TODO documented inline for future migration when patient lands)
+- **`server_signal_id` FK:** column kept as `UUID NOT NULL` but FK constraint to Mode 1 conversation envelope SKIPPED (Mode 1 entities not in code repo; logical reference only; TODO documented inline)
+- **`notification_crisis_*` 3 tables:** inline-created in migration 033 as part of this slice (rather than as a separate P-027 baseline migration; SI-022 is the first slice that needs them)
+- **`jwt_migration_entity_status` seed:** SKIPPED at v1.0 (the migration-tracker table itself doesn't exist; will be added in the future foundation hygiene cycle alongside the SI-024.1 trust-anchor migration)
+
+**Recorded divergences from spec (to be reconciled in future hygiene cycle):**
+- Crisis Response uses `current_tenant_id()` + SI-010 actor helpers — spec uses `current_tenant_id_strict()` + SI-024.1 JWT helpers. Both are tenant-binding mechanisms; the SI-010 pattern is GUC-based (legacy) and the SI-024.1 pattern is JWT-claim-based (canonical). Migration to SI-024.1 happens in a future hygiene cycle when foundation work resumes.
+- Append-only trigger functions are per-table inline (not generic). When generic helpers land, individual triggers can be replaced with generic-helper invocations.
+- `patient_id` + `server_signal_id` FKs are unenforced. When `patient` table + Mode 1 entities land, ALTER TABLE statements add the FK constraints + backfill validation.
+
+---
+
+## ORIGINAL PLAN (Option 1 — SUPERSEDED 2026-05-22 by ratifier decision)
+
+The text below is preserved for traceability of what was considered + rejected. Option 1 would have required ~6 foundation migrations (033-038) BEFORE Crisis Response entities could land. Total timeline 12-28 days. Ratifier chose pilot-timeline-pressure path (Option 2) above.
+
+---
 
 ## Foundation gap discovered 2026-05-22
 
