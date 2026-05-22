@@ -16,6 +16,9 @@ DROP FUNCTION IF EXISTS record_crisis_initiation(
 );
 
 REVOKE INSERT, SELECT ON crisis_event FROM crisis_initiation_wrapper_owner;
+-- R2 HIGH-1 closure 2026-05-22: revoke the SI-010 helper grants
+REVOKE EXECUTE ON FUNCTION current_actor_account_tenant_id() FROM crisis_initiation_wrapper_owner;
+REVOKE EXECUTE ON FUNCTION current_actor_account_id() FROM crisis_initiation_wrapper_owner;
 
 DO $$
 BEGIN

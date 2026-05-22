@@ -237,8 +237,15 @@ ALTER FUNCTION record_crisis_initiation(
 -- initiation_wrapper_owner needs:
 -- - INSERT + SELECT on crisis_event (for the new-row INSERT + idempotency check)
 -- - EXECUTE on record_crisis_event_lifecycle_transition (granted at migration 035 §3)
--- - EXECUTE on current_actor_account_tenant_id() helper (granted at migration 031)
+-- - EXECUTE on current_actor_account_id() + current_actor_account_tenant_id() SI-010
+--   helpers (migration 031 only grants these to telecheck_app_role; wrapper-owner
+--   needs explicit grants for SECURITY DEFINER execution under its own identity).
+--   R2 HIGH-1 closure 2026-05-22 (PR 4 Codex review): without these grants the
+--   internal-actor-binding from R1 HIGH-1 closure would fail at runtime with
+--   permission_denied for function ... on every legitimate caller.
 GRANT INSERT, SELECT ON crisis_event TO crisis_initiation_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_id() TO crisis_initiation_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id() TO crisis_initiation_wrapper_owner;
 
 -- =============================================================================
 -- §3 — Anti-bypass EXECUTE grant matrix: ONLY crisis_initiator application role
@@ -347,5 +354,21 @@ BEGIN
     IF FOUND THEN
         RAISE EXCEPTION
             'migration-036-anti-bypass-violation: PUBLIC has EXECUTE on record_crisis_initiation()';
+    END IF;
+
+    -- R2 HIGH-1 closure 2026-05-22: assert wrapper-owner has EXECUTE on the
+    -- 2 SI-010 helpers the wrapper body calls. Without these, the SECDEF
+    -- function fails at runtime for every legitimate caller.
+    IF NOT has_function_privilege(
+        'crisis_initiation_wrapper_owner', 'public.current_actor_account_id()', 'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'migration-036-helper-grant-missing: crisis_initiation_wrapper_owner lacks EXECUTE on current_actor_account_id() — R2 HIGH-1 closure broken';
+    END IF;
+    IF NOT has_function_privilege(
+        'crisis_initiation_wrapper_owner', 'public.current_actor_account_tenant_id()', 'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'migration-036-helper-grant-missing: crisis_initiation_wrapper_owner lacks EXECUTE on current_actor_account_tenant_id() — wrapper LAYER C check broken';
     END IF;
 END $$;
