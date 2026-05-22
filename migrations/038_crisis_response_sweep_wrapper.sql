@@ -239,31 +239,53 @@ BEGIN
             v_returning_outcome := 'claimed_new';
         EXCEPTION
             WHEN unique_violation THEN
-                -- Race-loser. Re-read the row that won. If it's now completed,
-                -- treat as already_completed (winner finished in the gap before
-                -- we caught the violation); if open + leased to another worker,
-                -- raise controlled 40001 retry-safe error.
-                SELECT cse.sweep_execution_id, cse.fencing_token, cse.completed_at, cse.claimed_by_worker_id, cse.claim_expires_at
+                -- R3 HIGH-1 closure 2026-05-22: race-loser re-read. The partial
+                -- UNIQUE constraint only enforces uniqueness on OPEN rows, so the
+                -- winning row that just caused our unique_violation MUST be open.
+                -- Re-read OPEN row FIRST + return 40001 lease-conflict if found.
+                -- ONLY if no open row exists (winner finished in the gap before
+                -- we caught the violation) do we fall back to the most-recent
+                -- completed row + return already_completed.
+                SELECT cse.sweep_execution_id, cse.fencing_token, cse.claimed_by_worker_id, cse.claim_expires_at
                   INTO v_returning_sweep_id, v_returning_fencing,
-                       v_sweep_row.completed_at, v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                       v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
                   FROM public.crisis_sweep_execution cse
                  WHERE cse.tenant_id = p_tenant_id
                    AND cse.crisis_event_id = p_crisis_event_id
                    AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
-                 ORDER BY cse.sweep_execution_id DESC  -- prefer the winning open row OR most-recent completed
-                 LIMIT 1;
+                   AND cse.completed_at IS NULL;
+                IF FOUND THEN
+                    -- Winner still holds the open lease — return controlled 40001.
+                    RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: concurrent first-claim race lost; sweep_execution_id % currently leased by worker % until %; retry after expiry',
+                        v_returning_sweep_id, v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                        USING ERRCODE = '40001';
+                END IF;
 
-                IF v_sweep_row.completed_at IS NOT NULL THEN
+                -- No open row — winner finished completion in the gap. Find
+                -- the most-recent COMPLETED row (ordered by completed_at DESC,
+                -- not by sweep_execution_id which is UUID and not a recency
+                -- signal) and return already_completed.
+                SELECT cse.sweep_execution_id, cse.fencing_token
+                  INTO v_returning_sweep_id, v_returning_fencing
+                  FROM public.crisis_sweep_execution cse
+                 WHERE cse.tenant_id = p_tenant_id
+                   AND cse.crisis_event_id = p_crisis_event_id
+                   AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+                   AND cse.completed_at IS NOT NULL
+                 ORDER BY cse.completed_at DESC, cse.sweep_execution_id DESC
+                 LIMIT 1;
+                IF v_returning_sweep_id IS NOT NULL THEN
                     sweep_execution_id := v_returning_sweep_id;
                     fencing_token      := v_returning_fencing;
                     outcome            := 'already_completed';
                     RETURN NEXT;
                     RETURN;
-                ELSE
-                    RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: concurrent first-claim race lost; sweep_execution_id % currently leased by worker % until %; retry after expiry',
-                        v_returning_sweep_id, v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
-                        USING ERRCODE = '40001';
                 END IF;
+
+                -- Should be unreachable — unique_violation implies a colliding
+                -- row exists, and we just searched all states.
+                RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: unique_violation re-read found no colliding row — invariant violation; investigate sweep_execution data integrity'
+                    USING ERRCODE = 'XX000';  -- internal_error
         END;
     END IF;
 
