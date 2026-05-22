@@ -94,7 +94,12 @@ CREATE TABLE notification_crisis_dispatch_ledger (
     sweep_cycle_id  INTEGER NULL,    -- non-null for sweep_escalation; null for initial_detection
     payload_jsonb   JSONB   NULL,
     -- Composite UNIQUE for tenant-coherent FKs from child tables
-    CONSTRAINT notification_crisis_dispatch_ledger_tenant_id_unique UNIQUE (tenant_id, id)
+    CONSTRAINT notification_crisis_dispatch_ledger_tenant_id_unique UNIQUE (tenant_id, id),
+    -- R1 HIGH-2 closure 2026-05-22: composite UNIQUE (tenant_id, id, crisis_event_id)
+    -- so child tables can compose a 3-column FK that prevents binding a dispatch ledger
+    -- from crisis_event A to a provider_attempt claiming crisis_event B.
+    CONSTRAINT notification_crisis_dispatch_ledger_tenant_id_event_unique
+        UNIQUE (tenant_id, id, crisis_event_id)
 );
 
 ALTER TABLE notification_crisis_dispatch_ledger ENABLE ROW LEVEL SECURITY;
@@ -164,16 +169,42 @@ CREATE TABLE notification_crisis_provider_attempt (
             recipient_principal_id IS NOT NULL
             OR recipient_role = 'emergency_contact'
         ),
-    -- R28 canonical idempotency UNIQUE (named so ON CONFLICT can target it explicitly)
-    CONSTRAINT notification_crisis_provider_attempt_idempotency_uk
-        UNIQUE (tenant_id, dispatch_ledger_id, recipient_role, recipient_principal_id, sweep_cycle_id),
-    -- Composite tenant-scoped FK to dispatch_ledger
-    CONSTRAINT notification_crisis_provider_attempt_dispatch_ledger_tenant_fk
-        FOREIGN KEY (tenant_id, dispatch_ledger_id)
-        REFERENCES notification_crisis_dispatch_ledger(tenant_id, id),
+    -- R1 HIGH-2 closure 2026-05-22: composite FK to dispatch_ledger includes
+    -- crisis_event_id so a provider_attempt cannot reference a dispatch ledger
+    -- for crisis event A while claiming crisis event B (cross-binding defect).
+    -- Parent UNIQUE (tenant_id, id, crisis_event_id) on dispatch_ledger guarantees
+    -- the bound dispatch_ledger.crisis_event_id matches this row's crisis_event_id.
+    CONSTRAINT notification_crisis_provider_attempt_dispatch_ledger_event_tenant_fk
+        FOREIGN KEY (tenant_id, dispatch_ledger_id, crisis_event_id)
+        REFERENCES notification_crisis_dispatch_ledger(tenant_id, id, crisis_event_id),
     -- Composite UNIQUE for tenant-coherent FKs from child tables
     CONSTRAINT notification_crisis_provider_attempt_tenant_id_unique UNIQUE (tenant_id, id)
+    -- R1 HIGH-1 closure 2026-05-22: idempotency UNIQUE moved out of inline constraint
+    -- and reimplemented as TWO partial unique indexes (below, after the table CREATE).
+    -- This is required because PostgreSQL UNIQUE constraints treat NULLs as DISTINCT,
+    -- which would let multiple retries with recipient_principal_id=NULL (the canonical
+    -- emergency_contact case) all succeed and create duplicate notification attempts
+    -- for the highest-risk crisis path.
 );
+
+-- R1 HIGH-1 closure 2026-05-22: TWO partial unique indexes replacing the inline UNIQUE
+-- constraint. PostgreSQL `UNIQUE NULLS NOT DISTINCT` would also work (PG15+ required;
+-- code-repo CLAUDE.md tech stack says PostgreSQL 15+) but partial indexes make the
+-- intent explicit + are more portable across PG versions if the floor drops in future.
+--
+-- Index 1 — addressable roles: recipient_principal_id MUST be non-null + included in key
+CREATE UNIQUE INDEX notification_crisis_provider_attempt_idempotency_addressable_uk
+    ON notification_crisis_provider_attempt
+    (tenant_id, dispatch_ledger_id, recipient_role, recipient_principal_id, sweep_cycle_id)
+    WHERE recipient_principal_id IS NOT NULL;
+--
+-- Index 2 — emergency_contact: recipient_principal_id is null; key omits it.
+-- Retries for the same (tenant, dispatch_ledger, recipient_role='emergency_contact', sweep_cycle)
+-- now collide on this partial UNIQUE.
+CREATE UNIQUE INDEX notification_crisis_provider_attempt_idempotency_emergency_contact_uk
+    ON notification_crisis_provider_attempt
+    (tenant_id, dispatch_ledger_id, sweep_cycle_id)
+    WHERE recipient_principal_id IS NULL AND recipient_role = 'emergency_contact';
 
 ALTER TABLE notification_crisis_provider_attempt ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notification_crisis_provider_attempt FORCE ROW LEVEL SECURITY;
@@ -437,9 +468,13 @@ ALTER TABLE notification_crisis_dispatch_ledger
     ADD CONSTRAINT notification_crisis_dispatch_ledger_event_tenant_fk
     FOREIGN KEY (tenant_id, crisis_event_id) REFERENCES crisis_event(tenant_id, id);
 
-ALTER TABLE notification_crisis_provider_attempt
-    ADD CONSTRAINT notification_crisis_provider_attempt_event_tenant_fk
-    FOREIGN KEY (tenant_id, crisis_event_id) REFERENCES crisis_event(tenant_id, id);
+-- R1 HIGH-2 closure 2026-05-22: notification_crisis_provider_attempt's
+-- crisis_event_id is structurally bound via the composite 3-column FK to
+-- dispatch_ledger(tenant_id, id, crisis_event_id) declared inline at table
+-- CREATE in §2 above. A separate direct FK from provider_attempt to crisis_event
+-- would be redundant (dispatch_ledger's append-only nature guarantees
+-- crisis_event_id immutability + the composite parent UNIQUE forces match)
+-- and would obscure the canonical binding chain. NOT added here.
 
 ALTER TABLE notification_crisis_escalation_obligation
     ADD CONSTRAINT notification_crisis_escalation_obligation_event_tenant_fk
@@ -541,7 +576,21 @@ AS $$
 DECLARE
     v_max_prior_transition_at TIMESTAMPTZ;
     v_max_clock_skew CONSTANT INTERVAL := INTERVAL '5 seconds';
+    v_lock_key BIGINT;
 BEGIN
+    -- R1 MED-1 closure 2026-05-22: serialize concurrent inserts per
+    -- (tenant_id, crisis_event_id) via a transaction-scoped advisory lock so the
+    -- MAX(prior.transition_at) read sees only committed-before-this-tx rows.
+    -- Without this lock, two concurrent inserts for the same crisis_event can
+    -- both read the same prior MAX before either commits, letting a later-
+    -- arriving transaction insert a backdated transition_at and pass the
+    -- monotonic check anyway — corrupting current-state derivation by
+    -- ORDER BY transition_at DESC, id DESC. Advisory lock is auto-released
+    -- at tx commit/rollback. Matches the P-042 SI-023 lifecycle-invariants
+    -- closure pattern (R14 HIGH-1 / R16 HIGH-1 in spec corpus).
+    v_lock_key := ('x' || substr(md5(NEW.tenant_id::text || ':' || NEW.crisis_event_id::text), 1, 16))::bit(64)::bigint;
+    PERFORM pg_advisory_xact_lock(v_lock_key);
+
     -- Future-dating bounded by 5s clock-skew tolerance
     IF NEW.transition_at > now() + v_max_clock_skew THEN
         RAISE EXCEPTION
@@ -551,6 +600,7 @@ BEGIN
     END IF;
 
     -- Backdating rejected (NEW.transition_at >= MAX(prior.transition_at))
+    -- Read happens UNDER the advisory lock so the MAX is the committed-predecessor value.
     SELECT MAX(transition_at) INTO v_max_prior_transition_at
       FROM public.crisis_event_lifecycle_transition
      WHERE tenant_id = NEW.tenant_id AND crisis_event_id = NEW.crisis_event_id;
