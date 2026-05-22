@@ -93,6 +93,19 @@ CREATE TABLE notification_crisis_dispatch_ledger (
     )),
     sweep_cycle_id  INTEGER NULL,    -- non-null for sweep_escalation; null for initial_detection
     payload_jsonb   JSONB   NULL,
+    -- R4 HIGH-1 closure 2026-05-22: dispatch_origin / sweep_cycle_id coherence enforced
+    -- as a CHECK so the partial unique indexes below are airtight. Without this,
+    -- a caller bug or partial failure could insert a sweep_escalation row with
+    -- sweep_cycle_id IS NULL, which the unique index would treat as distinct from
+    -- other NULL-keyed rows — reopening R3 HIGH-1.
+    -- - initial_detection: sweep_cycle_id MUST be NULL (no sweep context at FLOOR-020 detection)
+    -- - sweep_escalation: sweep_cycle_id MUST be NOT NULL (deterministic per-sweep value)
+    -- - manual_replay: either; intentionally permissive (HTTP-layer idempotency key handles dedup)
+    CONSTRAINT notification_crisis_dispatch_ledger_origin_sweep_cycle_coherence CHECK (
+        (dispatch_origin = 'initial_detection' AND sweep_cycle_id IS NULL)
+        OR (dispatch_origin = 'sweep_escalation' AND sweep_cycle_id IS NOT NULL)
+        OR dispatch_origin = 'manual_replay'
+    ),
     -- Composite UNIQUE for tenant-coherent FKs from child tables
     CONSTRAINT notification_crisis_dispatch_ledger_tenant_id_unique UNIQUE (tenant_id, id),
     -- R1 HIGH-2 closure 2026-05-22: composite UNIQUE (tenant_id, id, crisis_event_id)
