@@ -153,31 +153,30 @@ COMMENT ON FUNCTION record_crisis_event_lifecycle_transition(
 
 DO $$
 DECLARE
-    v_function_exists           BOOLEAN;
+    -- R1 MED-2 closure 2026-05-22: resolve the EXACT target signature OID so
+    -- all verification queries scope to record_crisis_event_lifecycle_transition
+    -- (TEXT, UUID, TEXT, TEXT, TEXT, UUID, JSONB) only — no overload drift hazard.
+    v_target_oid                OID := to_regprocedure(
+        'public.record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb)'
+    );
     v_function_owner            TEXT;
     v_function_security_definer BOOLEAN;
-    v_execute_grantees          TEXT[];
-    v_expected_grantees CONSTANT TEXT[] := ARRAY[
-        'crisis_initiation_wrapper_owner',
-        'crisis_acknowledgement_wrapper_owner',
-        'crisis_response_wrapper_owner',
-        'crisis_resolution_wrapper_owner',
-        'crisis_sweep_wrapper_owner'
-    ];
-    v_unauthorized_grantee TEXT;
+    v_function_specific_name    TEXT;
+    v_function_proconfig        TEXT[];
+    v_execute_grantee_count     INTEGER;
+    v_unauthorized_grantee      TEXT;
 BEGIN
-    -- Function exists + is SECURITY DEFINER + owned by the canonical role
-    SELECT TRUE, r.rolname, p.prosecdef
-      INTO v_function_exists, v_function_owner, v_function_security_definer
-      FROM pg_proc p
-      JOIN pg_namespace n ON n.oid = p.pronamespace
-      JOIN pg_roles r ON r.oid = p.proowner
-     WHERE n.nspname = 'public'
-       AND p.proname = 'record_crisis_event_lifecycle_transition';
-
-    IF NOT v_function_exists THEN
-        RAISE EXCEPTION 'migration-035-function-missing: record_crisis_event_lifecycle_transition() not created';
+    IF v_target_oid IS NULL THEN
+        RAISE EXCEPTION
+            'migration-035-function-missing: record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb) not found by signature';
     END IF;
+
+    -- Resolve owner + SECDEF flag + proconfig (search_path lock) for the EXACT OID
+    SELECT r.rolname, p.prosecdef, p.proconfig
+      INTO v_function_owner, v_function_security_definer, v_function_proconfig
+      FROM pg_proc p
+      JOIN pg_roles r ON r.oid = p.proowner
+     WHERE p.oid = v_target_oid;
 
     IF v_function_owner <> 'crisis_event_lifecycle_transition_writer_owner' THEN
         RAISE EXCEPTION
@@ -190,25 +189,43 @@ BEGIN
             'migration-035-security-definer-missing: record_crisis_event_lifecycle_transition() MUST be SECURITY DEFINER';
     END IF;
 
-    -- EXECUTE grant matrix: exactly the 5 wrapper-owner roles. NO other grantees.
-    SELECT array_agg(g.grantee ORDER BY g.grantee)
-      INTO v_execute_grantees
-      FROM information_schema.role_routine_grants g
-     WHERE g.routine_name = 'record_crisis_event_lifecycle_transition'
-       AND g.privilege_type = 'EXECUTE'
-       AND g.grantee <> 'crisis_event_lifecycle_transition_writer_owner';  -- exclude owner-self self-grant
-
-    IF v_execute_grantees IS NULL OR array_length(v_execute_grantees, 1) <> 5 THEN
+    -- R1 MED-1 closure 2026-05-22: assert proconfig contains the canonical
+    -- locked search_path. A SECDEF function without a locked search_path is
+    -- vulnerable to search-path injection by a caller controlling SET (or by
+    -- role-default search_path drift). The migration creates the function
+    -- with SET search_path = pg_catalog, public; this assertion catches any
+    -- future replacement or drift that removes the SET.
+    IF v_function_proconfig IS NULL
+       OR NOT (v_function_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
         RAISE EXCEPTION
-            'migration-035-execute-grant-count: expected exactly 5 wrapper-owner EXECUTE grants (excluding owner-self), found %',
-            COALESCE(array_length(v_execute_grantees, 1), 0);
+            'migration-035-search-path-not-locked: record_crisis_event_lifecycle_transition() MUST have proconfig containing "search_path=pg_catalog, public"; found %',
+            v_function_proconfig;
     END IF;
 
-    -- Verify each grantee is in the canonical wrapper-owner set
+    -- Resolve the function's specific_name to scope information_schema grant queries
+    -- by OID-equivalent identifier (information_schema doesn't expose OID directly,
+    -- but specific_name uniquely identifies the function row in routines/role_routine_grants).
+    SELECT p.proname || '_' || p.oid::TEXT INTO v_function_specific_name
+      FROM pg_proc p WHERE p.oid = v_target_oid;
+
+    -- R1 MED-2 closure: signature-scoped EXECUTE grant assertions via specific_name
+    -- (information_schema's canonical OID-equivalent identifier; no overload drift).
+    SELECT COUNT(*) INTO v_execute_grantee_count
+      FROM information_schema.role_routine_grants g
+     WHERE g.specific_name = v_function_specific_name
+       AND g.privilege_type = 'EXECUTE'
+       AND g.grantee <> 'crisis_event_lifecycle_transition_writer_owner';
+
+    IF v_execute_grantee_count <> 5 THEN
+        RAISE EXCEPTION
+            'migration-035-execute-grant-count: expected exactly 5 wrapper-owner EXECUTE grants (excluding owner-self), found %',
+            v_execute_grantee_count;
+    END IF;
+
     FOR v_unauthorized_grantee IN
         SELECT g.grantee
           FROM information_schema.role_routine_grants g
-         WHERE g.routine_name = 'record_crisis_event_lifecycle_transition'
+         WHERE g.specific_name = v_function_specific_name
            AND g.privilege_type = 'EXECUTE'
            AND g.grantee NOT IN ('crisis_event_lifecycle_transition_writer_owner',
                                  'crisis_initiation_wrapper_owner',
@@ -222,10 +239,10 @@ BEGIN
             v_unauthorized_grantee;
     END LOOP;
 
-    -- Negative anti-bypass: PUBLIC must NOT have EXECUTE
+    -- Negative anti-bypass: PUBLIC must NOT have EXECUTE (signature-scoped)
     PERFORM 1
       FROM information_schema.role_routine_grants
-     WHERE routine_name = 'record_crisis_event_lifecycle_transition'
+     WHERE specific_name = v_function_specific_name
        AND privilege_type = 'EXECUTE'
        AND grantee = 'PUBLIC';
     IF FOUND THEN
