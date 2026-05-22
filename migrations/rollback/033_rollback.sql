@@ -43,25 +43,43 @@ DROP FUNCTION IF EXISTS crisis_event_lifecycle_transition_block_mutation();
 DROP FUNCTION IF EXISTS crisis_event_block_mutation();
 DROP FUNCTION IF EXISTS notification_crisis_escalation_obligation_block_delete();
 DROP FUNCTION IF EXISTS notification_crisis_escalation_obligation_terminal_immutable();
+-- R5 HIGH-1 closure 2026-05-22: drop the cycle-coherence assertion trigger function
+DROP FUNCTION IF EXISTS notification_crisis_provider_attempt_assert_cycle_matches_ledger();
 DROP FUNCTION IF EXISTS notification_crisis_provider_attempt_block_mutation();
 DROP FUNCTION IF EXISTS notification_crisis_dispatch_ledger_block_mutation();
 
 -- =============================================================================
--- Post-rollback verification: no crisis_* or notification_crisis_* tables remain.
+-- Post-rollback verification: no crisis_* or notification_crisis_* tables OR
+-- standalone trigger functions remain (R6 MED-1 closure 2026-05-22 — extended
+-- the verification to catch orphaned functions, not just tables).
 -- =============================================================================
 DO $$
 DECLARE
-    v_remaining_count INTEGER;
+    v_remaining_tables    INTEGER;
+    v_remaining_functions INTEGER;
 BEGIN
-    SELECT COUNT(*) INTO v_remaining_count
+    SELECT COUNT(*) INTO v_remaining_tables
       FROM pg_tables
      WHERE schemaname = 'public'
        AND (tablename LIKE 'crisis_%' OR tablename LIKE 'notification_crisis_%');
 
-    IF v_remaining_count > 0 THEN
+    SELECT COUNT(*) INTO v_remaining_functions
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND (p.proname LIKE 'crisis_%' OR p.proname LIKE 'notification_crisis_%');
+
+    IF v_remaining_tables > 0 THEN
         RAISE WARNING
             'migration-033-rollback-incomplete: % crisis/notification_crisis table(s) remain. '
             'DROP TABLE CASCADE may have failed due to remaining dependent objects. '
-            'Roll back later migrations (034+) first.', v_remaining_count;
+            'Roll back later migrations (034+) first.', v_remaining_tables;
+    END IF;
+
+    IF v_remaining_functions > 0 THEN
+        RAISE WARNING
+            'migration-033-rollback-incomplete: % crisis/notification_crisis function(s) remain in public schema. '
+            'Add explicit DROP FUNCTION statements above for any orphaned trigger functions.',
+            v_remaining_functions;
     END IF;
 END $$;
