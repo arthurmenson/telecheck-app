@@ -163,7 +163,13 @@ $$;
 
 ALTER FUNCTION record_crisis_acknowledgement_claim(TEXT, UUID, JSONB)
     OWNER TO crisis_acknowledgement_wrapper_owner;
-GRANT SELECT ON crisis_event                       TO crisis_acknowledgement_wrapper_owner;
+-- R1 HIGH-1 closure 2026-05-22 (PR 5 Codex review): SELECT + UPDATE on crisis_event.
+-- PostgreSQL SELECT ... FOR UPDATE requires UPDATE privilege on the locked table
+-- (even if the append-only trigger from migration 033 blocks any actual UPDATE at
+-- runtime — the GRANT prerequisite is checked separately). Without UPDATE, every
+-- wrapper call fails at runtime with permission_denied on the row-lock acquisition.
+-- Matches the canonical P-042 R8 HIGH-1 closure pattern from the spec corpus.
+GRANT SELECT, UPDATE ON crisis_event               TO crisis_acknowledgement_wrapper_owner;
 GRANT SELECT ON crisis_event_lifecycle_transition  TO crisis_acknowledgement_wrapper_owner;
 GRANT EXECUTE ON FUNCTION current_actor_account_id()         TO crisis_acknowledgement_wrapper_owner;
 GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id()  TO crisis_acknowledgement_wrapper_owner;
@@ -269,7 +275,7 @@ $$;
 
 ALTER FUNCTION record_crisis_response(TEXT, UUID, JSONB)
     OWNER TO crisis_response_wrapper_owner;
-GRANT SELECT ON crisis_event                       TO crisis_response_wrapper_owner;
+GRANT SELECT, UPDATE ON crisis_event               TO crisis_response_wrapper_owner;  -- UPDATE required for SELECT FOR UPDATE (R1 HIGH-1)
 GRANT SELECT ON crisis_event_lifecycle_transition  TO crisis_response_wrapper_owner;
 GRANT EXECUTE ON FUNCTION current_actor_account_id()         TO crisis_response_wrapper_owner;
 GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id()  TO crisis_response_wrapper_owner;
@@ -376,7 +382,7 @@ $$;
 
 ALTER FUNCTION record_crisis_resolution(TEXT, UUID, JSONB)
     OWNER TO crisis_resolution_wrapper_owner;
-GRANT SELECT ON crisis_event                       TO crisis_resolution_wrapper_owner;
+GRANT SELECT, UPDATE ON crisis_event               TO crisis_resolution_wrapper_owner;  -- UPDATE required for SELECT FOR UPDATE (R1 HIGH-1)
 GRANT SELECT ON crisis_event_lifecycle_transition  TO crisis_resolution_wrapper_owner;
 GRANT EXECUTE ON FUNCTION current_actor_account_id()         TO crisis_resolution_wrapper_owner;
 GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id()  TO crisis_resolution_wrapper_owner;
@@ -465,6 +471,17 @@ BEGIN
         END IF;
         IF NOT has_function_privilege(v_target.column2, 'public.current_actor_account_tenant_id()', 'EXECUTE') THEN
             RAISE EXCEPTION 'migration-037-helper-grant-missing: % lacks EXECUTE on current_actor_account_tenant_id()', v_target.column2;
+        END IF;
+
+        -- R1 HIGH-1 closure 2026-05-22: SELECT + UPDATE on crisis_event for SELECT FOR UPDATE row-lock
+        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event', 'SELECT') THEN
+            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks SELECT on crisis_event', v_target.column2;
+        END IF;
+        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event', 'UPDATE') THEN
+            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks UPDATE on crisis_event (required for SELECT FOR UPDATE row-lock)', v_target.column2;
+        END IF;
+        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event_lifecycle_transition', 'SELECT') THEN
+            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks SELECT on crisis_event_lifecycle_transition', v_target.column2;
         END IF;
     END LOOP;
 END $$;

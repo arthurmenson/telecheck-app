@@ -11,17 +11,17 @@ DROP FUNCTION IF EXISTS record_crisis_acknowledgement_claim(TEXT, UUID, JSONB);
 REVOKE EXECUTE ON FUNCTION current_actor_account_tenant_id() FROM crisis_resolution_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION current_actor_account_id()        FROM crisis_resolution_wrapper_owner;
 REVOKE SELECT  ON crisis_event_lifecycle_transition          FROM crisis_resolution_wrapper_owner;
-REVOKE SELECT  ON crisis_event                               FROM crisis_resolution_wrapper_owner;
+REVOKE SELECT, UPDATE ON crisis_event                        FROM crisis_resolution_wrapper_owner;
 
 REVOKE EXECUTE ON FUNCTION current_actor_account_tenant_id() FROM crisis_response_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION current_actor_account_id()        FROM crisis_response_wrapper_owner;
 REVOKE SELECT  ON crisis_event_lifecycle_transition          FROM crisis_response_wrapper_owner;
-REVOKE SELECT  ON crisis_event                               FROM crisis_response_wrapper_owner;
+REVOKE SELECT, UPDATE ON crisis_event                        FROM crisis_response_wrapper_owner;
 
 REVOKE EXECUTE ON FUNCTION current_actor_account_tenant_id() FROM crisis_acknowledgement_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION current_actor_account_id()        FROM crisis_acknowledgement_wrapper_owner;
 REVOKE SELECT  ON crisis_event_lifecycle_transition          FROM crisis_acknowledgement_wrapper_owner;
-REVOKE SELECT  ON crisis_event                               FROM crisis_acknowledgement_wrapper_owner;
+REVOKE SELECT, UPDATE ON crisis_event                        FROM crisis_acknowledgement_wrapper_owner;
 
 DO $$
 BEGIN
