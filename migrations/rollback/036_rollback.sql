@@ -11,7 +11,7 @@
 -- =============================================================================
 
 DROP FUNCTION IF EXISTS record_crisis_initiation(
-    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN, UUID,
+    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN,
     BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
 );
 

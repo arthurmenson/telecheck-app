@@ -78,6 +78,12 @@
 -- `crisis.detected` audit using this id as the resource_id.
 -- =============================================================================
 
+-- R1 HIGH-1 closure 2026-05-22 (PR 4 Codex review): p_actor_principal_id
+-- parameter REMOVED. The actor identity for the lifecycle transition is now
+-- BOUND from SI-010 trust anchor (current_actor_account_id()) internally —
+-- caller cannot forge the principal_id. This is the canonical SECDEF
+-- defense-in-depth pattern: wrapper trusts ONLY the verified actor context,
+-- not caller-supplied identity parameters.
 CREATE OR REPLACE FUNCTION record_crisis_initiation(
     p_tenant_id                    TEXT,
     p_patient_id                   UUID,
@@ -85,7 +91,6 @@ CREATE OR REPLACE FUNCTION record_crisis_initiation(
     p_crisis_type                  TEXT,
     p_severity                     TEXT,
     p_regulatory_reporting_enabled BOOLEAN,
-    p_actor_principal_id           UUID,
     -- KMS envelope for intake_payload PHI (all 8 columns or all NULL per
     -- the table's CHECK constraint at migration 033 §4)
     p_intake_payload_ciphertext    BYTEA   DEFAULT NULL,
@@ -105,7 +110,34 @@ DECLARE
     v_crisis_event_id        UUID;
     v_existing_event_id      UUID;
     v_actor_tenant_id        TEXT;
+    v_actor_account_id_text  TEXT;
+    v_actor_principal_id     UUID;
 BEGIN
+    -- ---------------------------------------------------------------------
+    -- LAYER B — bind actor identity from SI-010 trust anchor; caller cannot
+    -- supply or forge the principal_id. current_actor_account_id() returns
+    -- the verified-bound account identity for the current PG backend, or
+    -- NULL if no actor context bound (fail-closed per SI-010 pattern).
+    -- ---------------------------------------------------------------------
+    v_actor_account_id_text := current_actor_account_id();
+    IF v_actor_account_id_text IS NULL THEN
+        RAISE EXCEPTION
+            'record_crisis_initiation: no actor account bound for current backend; authContextPlugin must bind before SECDEF wrapper invocation'
+            USING ERRCODE = '42501';
+    END IF;
+    -- account_id is stored as TEXT in SI-010 _session_actor_context (variable-shape
+    -- identifier per code-repo convention); the lifecycle_transition.actor_principal_id
+    -- column is UUID. Cast with explicit error message on malformed input.
+    BEGIN
+        v_actor_principal_id := v_actor_account_id_text::UUID;
+    EXCEPTION
+        WHEN invalid_text_representation THEN
+            RAISE EXCEPTION
+                'record_crisis_initiation: bound actor account_id % is not a valid UUID; cannot record as lifecycle actor_principal_id',
+                v_actor_account_id_text
+                USING ERRCODE = '42501';
+    END;
+
     -- ---------------------------------------------------------------------
     -- LAYER C — tenant scope match (defense-in-depth alongside LAYER A
     -- EXECUTE grant which restricts to crisis_initiator role members).
@@ -116,8 +148,8 @@ BEGIN
     v_actor_tenant_id := current_actor_account_tenant_id();
     IF v_actor_tenant_id IS NULL THEN
         RAISE EXCEPTION
-            'record_crisis_initiation: no actor context bound for current backend; authContextPlugin must bind before SECDEF wrapper invocation'
-            USING ERRCODE = '42501';  -- insufficient_privilege
+            'record_crisis_initiation: no actor tenant bound for current backend'
+            USING ERRCODE = '42501';
     END IF;
     IF v_actor_tenant_id IS DISTINCT FROM p_tenant_id THEN
         RAISE EXCEPTION
@@ -185,7 +217,7 @@ BEGIN
         'none',
         'detected',
         'initial_detection',
-        p_actor_principal_id,
+        v_actor_principal_id,  -- bound from SI-010 (R1 HIGH-1 closure); caller cannot forge
         NULL  -- transition_payload — caller's audit emission carries the descriptive payload
     );
 
@@ -198,7 +230,7 @@ $$;
 -- =============================================================================
 
 ALTER FUNCTION record_crisis_initiation(
-    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN, UUID,
+    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN,
     BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
 ) OWNER TO crisis_initiation_wrapper_owner;
 
@@ -213,17 +245,17 @@ GRANT INSERT, SELECT ON crisis_event TO crisis_initiation_wrapper_owner;
 -- =============================================================================
 
 REVOKE EXECUTE ON FUNCTION record_crisis_initiation(
-    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN, UUID,
+    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN,
     BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
 ) FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION record_crisis_initiation(
-    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN, UUID,
+    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN,
     BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
 ) TO crisis_initiator;
 
 COMMENT ON FUNCTION record_crisis_initiation(
-    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN, UUID,
+    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN,
     BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
 ) IS
     'P-040 §3.2 + SI-022 Sub-decision 4 record_crisis_initiation wrapper. '
@@ -241,7 +273,7 @@ COMMENT ON FUNCTION record_crisis_initiation(
 DO $$
 DECLARE
     v_target_oid OID := to_regprocedure(
-        'public.record_crisis_initiation(text, uuid, uuid, text, text, boolean, uuid, bytea, uuid, integer, bytea, bytea, uuid, integer, text)'
+        'public.record_crisis_initiation(text, uuid, uuid, text, text, boolean, bytea, uuid, integer, bytea, bytea, uuid, integer, text)'
     );
     v_function_owner            TEXT;
     v_function_security_definer BOOLEAN;
