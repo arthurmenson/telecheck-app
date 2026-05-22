@@ -160,16 +160,41 @@ BEGIN
 
     -- ---------------------------------------------------------------------
     -- Idempotency check: FLOOR-020 retries land on the existing crisis_event
-    -- via UNIQUE(tenant_id, server_signal_id). Return existing id without
-    -- inserting a duplicate or emitting a duplicate lifecycle transition.
+    -- via UNIQUE(tenant_id, server_signal_id). R3 HIGH-1 closure 2026-05-22:
+    -- a canonical idempotent replay must verify that the immutable initiation
+    -- payload (patient_id + crisis_type + severity + regulatory_reporting_enabled
+    -- + KMS envelope) matches the existing row exactly. A duplicate server
+    -- signal with different patient or classification is NOT a valid replay
+    -- — it's a caller bug or attempted misattribution and must fail closed.
+    -- IS NOT DISTINCT FROM handles the all-NULL KMS envelope case (table CHECK
+    -- at migration 033 §4 allows all-NULL or all-set).
     -- ---------------------------------------------------------------------
     SELECT id INTO v_existing_event_id
       FROM public.crisis_event
      WHERE tenant_id = p_tenant_id
-       AND server_signal_id = p_server_signal_id;
+       AND server_signal_id = p_server_signal_id
+       AND patient_id = p_patient_id
+       AND crisis_type = p_crisis_type
+       AND severity = p_severity
+       AND regulatory_reporting_enabled = p_regulatory_reporting_enabled
+       AND intake_payload_ciphertext  IS NOT DISTINCT FROM p_intake_payload_ciphertext
+       AND intake_payload_dek_id      IS NOT DISTINCT FROM p_intake_payload_dek_id
+       AND intake_payload_dek_version IS NOT DISTINCT FROM p_intake_payload_dek_version
+       AND intake_payload_iv          IS NOT DISTINCT FROM p_intake_payload_iv
+       AND intake_payload_auth_tag    IS NOT DISTINCT FROM p_intake_payload_auth_tag
+       AND intake_payload_kek_id      IS NOT DISTINCT FROM p_intake_payload_kek_id
+       AND intake_payload_kek_version IS NOT DISTINCT FROM p_intake_payload_kek_version
+       AND intake_payload_algorithm   IS NOT DISTINCT FROM p_intake_payload_algorithm;
     IF v_existing_event_id IS NOT NULL THEN
-        RETURN v_existing_event_id;  -- canonical idempotent replay
+        -- All immutable fields match — canonical idempotent replay.
+        RETURN v_existing_event_id;
     END IF;
+    -- If a row with the same (tenant_id, server_signal_id) exists but DOES NOT
+    -- match all immutable fields, the next INSERT will hit unique_violation +
+    -- the EXCEPTION handler below performs the same field-match check + raises
+    -- idempotency-mismatch if the existing row doesn't match. This catches both
+    -- the pre-INSERT-lookup race (server_signal exists but fields differ) and
+    -- the concurrent-INSERT race (two callers race; loser's handler runs).
 
     -- ---------------------------------------------------------------------
     -- Insert new crisis_event row. CHECK constraints at table layer
@@ -195,13 +220,37 @@ BEGIN
         RETURNING id INTO v_crisis_event_id;
     EXCEPTION
         WHEN unique_violation THEN
-            -- Concurrent FLOOR-020 retry won the race; re-read the now-committed
-            -- row + return its id (same canonical idempotent replay path as the
-            -- pre-INSERT check above).
+            -- Concurrent FLOOR-020 retry won the race OR caller submitted a
+            -- duplicate server_signal_id with different immutable fields.
+            -- R3 HIGH-1 closure 2026-05-22: re-read with FULL immutable-field
+            -- match (same predicate as pre-INSERT check); if no match found
+            -- the existing row diverges from this caller's payload — raise
+            -- idempotency-mismatch + roll back the transaction.
             SELECT id INTO v_crisis_event_id
               FROM public.crisis_event
              WHERE tenant_id = p_tenant_id
-               AND server_signal_id = p_server_signal_id;
+               AND server_signal_id = p_server_signal_id
+               AND patient_id = p_patient_id
+               AND crisis_type = p_crisis_type
+               AND severity = p_severity
+               AND regulatory_reporting_enabled = p_regulatory_reporting_enabled
+               AND intake_payload_ciphertext  IS NOT DISTINCT FROM p_intake_payload_ciphertext
+               AND intake_payload_dek_id      IS NOT DISTINCT FROM p_intake_payload_dek_id
+               AND intake_payload_dek_version IS NOT DISTINCT FROM p_intake_payload_dek_version
+               AND intake_payload_iv          IS NOT DISTINCT FROM p_intake_payload_iv
+               AND intake_payload_auth_tag    IS NOT DISTINCT FROM p_intake_payload_auth_tag
+               AND intake_payload_kek_id      IS NOT DISTINCT FROM p_intake_payload_kek_id
+               AND intake_payload_kek_version IS NOT DISTINCT FROM p_intake_payload_kek_version
+               AND intake_payload_algorithm   IS NOT DISTINCT FROM p_intake_payload_algorithm;
+
+            IF v_crisis_event_id IS NULL THEN
+                RAISE EXCEPTION
+                    'record_crisis_initiation: idempotency-mismatch — existing crisis_event for (tenant_id=%, server_signal_id=%) has different immutable fields than the supplied payload; caller MUST resolve the conflict before retrying',
+                    p_tenant_id, p_server_signal_id
+                    USING ERRCODE = '23505';  -- unique_violation (canonical for idempotency conflict)
+            END IF;
+
+            -- Field-match confirmed; canonical idempotent replay.
             RETURN v_crisis_event_id;
     END;
 
