@@ -139,6 +139,32 @@ CREATE INDEX notification_crisis_dispatch_ledger_tenant_dispatched_idx
 CREATE INDEX notification_crisis_dispatch_ledger_tenant_event_idx
     ON notification_crisis_dispatch_ledger (tenant_id, crisis_event_id);
 
+-- R3 HIGH-1 closure 2026-05-22: logical idempotency at the dispatch ledger boundary.
+-- Without these, a retry-induced duplicate dispatch_ledger row (new UUID, same logical
+-- detection or sweep) would bypass the provider_attempt partial unique indexes — those
+-- only dedupe WITHIN a single dispatch_ledger_id. By making the dispatch_ledger row
+-- itself logically unique per (tenant, crisis_event, origin, sweep_cycle) for the
+-- auto-emitted origins, retries collide at the ledger layer before they can mint a
+-- new ledger_id under which to slip duplicate provider_attempt rows.
+--
+-- initial_detection: at most ONE per (tenant, crisis_event). sweep_cycle_id IS NULL
+-- (no sweep context). Driven by FLOOR-020 detection; retries collide here.
+CREATE UNIQUE INDEX notification_crisis_dispatch_ledger_initial_detection_uk
+    ON notification_crisis_dispatch_ledger (tenant_id, crisis_event_id)
+    WHERE dispatch_origin = 'initial_detection';
+--
+-- sweep_escalation: at most ONE per (tenant, crisis_event, sweep_cycle_id). Each
+-- sweep cycle produces its own ledger row; retries within a sweep collide here.
+CREATE UNIQUE INDEX notification_crisis_dispatch_ledger_sweep_escalation_uk
+    ON notification_crisis_dispatch_ledger (tenant_id, crisis_event_id, sweep_cycle_id)
+    WHERE dispatch_origin = 'sweep_escalation';
+--
+-- manual_replay: intentionally repeatable per the dispatch_origin CHECK enum semantic
+-- (replay path for incident-response retroactive dispatch). NO unique constraint —
+-- each manual_replay invocation is a distinct ledger row with its own UUID. Callers
+-- must verify intent via the application layer; idempotency is delegated to the
+-- HTTP-level idempotency-key contract.
+
 -- =============================================================================
 -- §2 — P-027 §4.67 baseline: notification_crisis_provider_attempt
 --
