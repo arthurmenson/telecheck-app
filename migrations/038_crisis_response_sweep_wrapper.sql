@@ -239,6 +239,25 @@ BEGIN
             v_returning_outcome := 'claimed_new';
         EXCEPTION
             WHEN unique_violation THEN
+                -- R4 HIGH-1 closure 2026-05-22: discriminate the violated
+                -- constraint. Only the partial UNIQUE index from migration 033
+                -- §7 (`crisis_sweep_execution_open_uk`) represents a first-claim
+                -- race; any other unique_violation indicates schema drift,
+                -- corruption, or an unrelated integrity failure that MUST be
+                -- re-raised to preserve the real diagnostic — silently
+                -- swallowing it could mask a real bug + drop a required sweep.
+                DECLARE
+                    v_constraint_name TEXT;
+                BEGIN
+                    GET STACKED DIAGNOSTICS v_constraint_name = CONSTRAINT_NAME;
+                    IF v_constraint_name IS DISTINCT FROM 'crisis_sweep_execution_open_uk' THEN
+                        -- Unrelated unique violation; re-raise with diagnostic.
+                        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: unexpected unique_violation on constraint %; not the canonical first-claim race; preserving original failure',
+                            v_constraint_name
+                            USING ERRCODE = '23505';  -- canonical unique_violation
+                    END IF;
+                END;
+
                 -- R3 HIGH-1 closure 2026-05-22: race-loser re-read. The partial
                 -- UNIQUE constraint only enforces uniqueness on OPEN rows, so the
                 -- winning row that just caused our unique_violation MUST be open.
