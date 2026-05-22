@@ -196,7 +196,12 @@ CREATE TABLE notification_crisis_provider_attempt (
     )),
     -- Nullable for emergency_contact (no principal-id); non-null for all other recipient_roles (R37)
     recipient_principal_id   UUID    NULL,
-    sweep_cycle_id           INTEGER NOT NULL,    -- deterministic per-sweep value (R39)
+    -- R7 HIGH-1 closure 2026-05-22: sweep_cycle_id is NULLABLE on provider_attempt.
+    -- It matches parent dispatch_ledger.sweep_cycle_id (initial_detection → NULL;
+    -- sweep_escalation → non-null per-sweep value R39; manual_replay → either).
+    -- The R5 trigger uses IS DISTINCT FROM which correctly treats NULL=NULL as match.
+    -- Previously NOT NULL blocked the initial_detection delivery path entirely.
+    sweep_cycle_id           INTEGER NULL,
     attempted_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     attempt_outcome          TEXT    NOT NULL CHECK (attempt_outcome IN (
         'delivered', 'failed_retryable', 'failed_permanent', 'undeliverable_no_route'
@@ -235,23 +240,27 @@ CREATE TABLE notification_crisis_provider_attempt (
     -- for the highest-risk crisis path.
 );
 
--- R1 HIGH-1 closure 2026-05-22: TWO partial unique indexes replacing the inline UNIQUE
--- constraint. PostgreSQL `UNIQUE NULLS NOT DISTINCT` would also work (PG15+ required;
--- code-repo CLAUDE.md tech stack says PostgreSQL 15+) but partial indexes make the
--- intent explicit + are more portable across PG versions if the floor drops in future.
+-- R1 HIGH-1 + R7 HIGH-1 closures 2026-05-22: TWO partial unique indexes for idempotency.
+-- sweep_cycle_id is INTENTIONALLY OMITTED from the keys — ledger-level uniqueness
+-- (R3+R4 closures: partial UNIQUE on dispatch_ledger per logical cycle) already
+-- enforces per-cycle dedup transitively. Including sweep_cycle_id in the child key
+-- here would (a) re-introduce R1 HIGH-1 NULL-distinct-treatment bypass for the
+-- initial_detection path now that R7 made child cycle nullable + (b) be redundant
+-- given parent-level uniqueness. The R5 trigger separately enforces child cycle
+-- matches parent cycle for audit-trail coherence.
 --
--- Index 1 — addressable roles: recipient_principal_id MUST be non-null + included in key
+-- Index 1 — addressable roles: recipient_principal_id MUST be non-null + in key
 CREATE UNIQUE INDEX notification_crisis_provider_attempt_idempotency_addressable_uk
     ON notification_crisis_provider_attempt
-    (tenant_id, dispatch_ledger_id, recipient_role, recipient_principal_id, sweep_cycle_id)
+    (tenant_id, dispatch_ledger_id, recipient_role, recipient_principal_id)
     WHERE recipient_principal_id IS NOT NULL;
 --
 -- Index 2 — emergency_contact: recipient_principal_id is null; key omits it.
--- Retries for the same (tenant, dispatch_ledger, recipient_role='emergency_contact', sweep_cycle)
--- now collide on this partial UNIQUE.
+-- Retries for the same (tenant, dispatch_ledger, recipient_role='emergency_contact')
+-- collide on this partial UNIQUE.
 CREATE UNIQUE INDEX notification_crisis_provider_attempt_idempotency_emergency_contact_uk
     ON notification_crisis_provider_attempt
-    (tenant_id, dispatch_ledger_id, sweep_cycle_id)
+    (tenant_id, dispatch_ledger_id)
     WHERE recipient_principal_id IS NULL AND recipient_role = 'emergency_contact';
 
 ALTER TABLE notification_crisis_provider_attempt ENABLE ROW LEVEL SECURITY;
