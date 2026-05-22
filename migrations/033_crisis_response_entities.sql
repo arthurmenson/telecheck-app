@@ -163,11 +163,20 @@ CREATE TABLE notification_crisis_provider_attempt (
         'delivered', 'failed_retryable', 'failed_permanent', 'undeliverable_no_route'
     )),
     provider_response_jsonb  JSONB   NULL,
-    -- R37 recipient_principal_id required for addressable roles
-    CONSTRAINT notification_crisis_provider_attempt_principal_required_for_addressable_roles
+    -- R37 + R2 HIGH-1 closure 2026-05-22: recipient_principal_id IFF non-emergency_contact.
+    -- IFF form (not just "required for non-emergency"): emergency_contact MUST have
+    -- recipient_principal_id NULL; any other role MUST have it non-null. This makes the
+    -- partial-unique-index split watertight — emergency_contact rows ALL go into the
+    -- emergency_contact partial index (which omits principal_id from key); addressable
+    -- rows ALL go into the addressable partial index (which includes principal_id).
+    -- Without the IFF, a caller passing emergency_contact + non-null principal_id would
+    -- fall into the addressable index where the principal_id varies between retries,
+    -- bypassing idempotency dedup.
+    CONSTRAINT notification_crisis_provider_attempt_principal_role_iff
         CHECK (
-            recipient_principal_id IS NOT NULL
-            OR recipient_role = 'emergency_contact'
+            (recipient_role = 'emergency_contact' AND recipient_principal_id IS NULL)
+            OR
+            (recipient_role <> 'emergency_contact' AND recipient_principal_id IS NOT NULL)
         ),
     -- R1 HIGH-2 closure 2026-05-22: composite FK to dispatch_ledger includes
     -- crisis_event_id so a provider_attempt cannot reference a dispatch ledger
