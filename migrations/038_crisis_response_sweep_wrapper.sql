@@ -213,22 +213,58 @@ BEGIN
               INTO v_returning_sweep_id, v_returning_fencing;
         v_returning_outcome := 'claimed_takeover';
     ELSE
-        -- New claim: insert a fresh row.
-        INSERT INTO public.crisis_sweep_execution (
-            tenant_id, crisis_event_id, scheduled_at,
-            scheduled_for_obligation_generation,
-            claimed_by_worker_id, claim_expires_at,
-            fencing_token, heartbeat_at
-        ) VALUES (
-            p_tenant_id, p_crisis_event_id, now(),
-            p_target_obligation_generation,
-            p_worker_id, now() + (p_claim_ttl_seconds || ' seconds')::INTERVAL,
-            1,    -- initial fencing_token
-            now()
-        )
-        RETURNING crisis_sweep_execution.sweep_execution_id, crisis_sweep_execution.fencing_token
-             INTO v_returning_sweep_id, v_returning_fencing;
-        v_returning_outcome := 'claimed_new';
+        -- New claim: insert a fresh row. R2 HIGH-1 closure 2026-05-22:
+        -- two scheduler workers can race for the FIRST claim — both pass the
+        -- completed-row guard + open-row SELECT (no rows exist yet), both
+        -- reach this INSERT. The partial UNIQUE on (tenant, event, generation)
+        -- WHERE completed_at IS NULL allows only one to succeed; the loser
+        -- raises unique_violation. Without a handler, the loser leaks raw
+        -- SQLSTATE 23505. Wrap in EXCEPTION block + re-read winning row to
+        -- determine controlled outcome.
+        BEGIN
+            INSERT INTO public.crisis_sweep_execution (
+                tenant_id, crisis_event_id, scheduled_at,
+                scheduled_for_obligation_generation,
+                claimed_by_worker_id, claim_expires_at,
+                fencing_token, heartbeat_at
+            ) VALUES (
+                p_tenant_id, p_crisis_event_id, now(),
+                p_target_obligation_generation,
+                p_worker_id, now() + (p_claim_ttl_seconds || ' seconds')::INTERVAL,
+                1,    -- initial fencing_token
+                now()
+            )
+            RETURNING crisis_sweep_execution.sweep_execution_id, crisis_sweep_execution.fencing_token
+                 INTO v_returning_sweep_id, v_returning_fencing;
+            v_returning_outcome := 'claimed_new';
+        EXCEPTION
+            WHEN unique_violation THEN
+                -- Race-loser. Re-read the row that won. If it's now completed,
+                -- treat as already_completed (winner finished in the gap before
+                -- we caught the violation); if open + leased to another worker,
+                -- raise controlled 40001 retry-safe error.
+                SELECT cse.sweep_execution_id, cse.fencing_token, cse.completed_at, cse.claimed_by_worker_id, cse.claim_expires_at
+                  INTO v_returning_sweep_id, v_returning_fencing,
+                       v_sweep_row.completed_at, v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                  FROM public.crisis_sweep_execution cse
+                 WHERE cse.tenant_id = p_tenant_id
+                   AND cse.crisis_event_id = p_crisis_event_id
+                   AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+                 ORDER BY cse.sweep_execution_id DESC  -- prefer the winning open row OR most-recent completed
+                 LIMIT 1;
+
+                IF v_sweep_row.completed_at IS NOT NULL THEN
+                    sweep_execution_id := v_returning_sweep_id;
+                    fencing_token      := v_returning_fencing;
+                    outcome            := 'already_completed';
+                    RETURN NEXT;
+                    RETURN;
+                ELSE
+                    RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: concurrent first-claim race lost; sweep_execution_id % currently leased by worker % until %; retry after expiry',
+                        v_returning_sweep_id, v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                        USING ERRCODE = '40001';
+                END IF;
+        END;
     END IF;
 
     -- =====================================================================
