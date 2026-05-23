@@ -258,9 +258,31 @@ export async function getCrisisEventHandler(
       // with `withActorContext` when present so any future SECDEF helper
       // invoked from this read path can resolve the trusted actor —
       // defense in depth for downstream additions.
+      // I-025 envelope-leak defense (Codex Admin Sprint 2 PR 1 R1 HIGH-1
+      // finding 2026-05-23, applied preemptively here; R2 MED-1 finding
+      // task bdx9yneo0 expanded the catch boundary to wrap the entire
+      // withDbRole call):
+      //
+      // PostgreSQL SQLSTATE 42501 ("insufficient_privilege") can be
+      // raised in TWO places:
+      //   (1) Inside withDbRole's SET LOCAL ROLE pre-callback step — if
+      //       the role membership/grant for crisis_event_staff_reader is
+      //       missing or skewed (a foundation-051 drift state).
+      //   (2) Inside the SECDEF wrapper LAYER C tenant-scope guard / RLS
+      //       evaluation — when the SELECT runs.
+      //
+      // The R2 closure moves the try/catch OUTSIDE withDbRole so both
+      // paths are covered. Without this widening, a privilege-acquisition
+      // 42501 would escape past the inner catch and reach the global
+      // envelope as a 500 with a leaky raw PG message (tenant_id
+      // disclosure in non-prod), violating I-025.
+      //
+      // Other PG errors propagate to the global handler unchanged (tx
+      // still rolls back; envelope formats as 500 with default-replaced
+      // message in prod).
       const runRead = async (): Promise<CrisisEventCurrentStateRow | null> => {
-        return withDbRole(tx, 'crisis_event_staff_reader', async () => {
-          try {
+        try {
+          return await withDbRole(tx, 'crisis_event_staff_reader', async () => {
             const result = await tx.query<CrisisEventCurrentStateRow>(
               'SELECT crisis_event_id, tenant_id, patient_id, server_signal_id, ' +
                 'crisis_type, severity, regulatory_reporting_enabled, detected_at, ' +
@@ -271,29 +293,18 @@ export async function getCrisisEventHandler(
               [idParam],
             );
             return result.rows[0] ?? null;
-          } catch (err) {
-            // I-025 envelope-leak defense (Codex Admin Sprint 2 PR 1 R1
-            // HIGH-1 finding 2026-05-23, applied preemptively here):
-            // PostgreSQL SQLSTATE 42501 ("insufficient_privilege") raised
-            // by the SECDEF wrapper (e.g., LAYER C tenant-scope mismatch,
-            // missing actor nonce, role-membership gap) reaches the global
-            // error envelope without a statusCode, defaulting to 500. In
-            // non-prod the raw PG message — which may include tenant_id —
-            // is exposed to the client, violating I-025. Map 42501 to a
-            // 403 with the canonical insufficient_tenant_scope envelope
-            // (no tenant identifiers; tenant-blind) before re-throwing.
-            // Other PG errors propagate to the global handler unchanged.
-            if (
-              typeof err === 'object' &&
-              err !== null &&
-              'code' in err &&
-              (err as { code?: unknown }).code === '42501'
-            ) {
-              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-            }
-            throw err;
+          });
+        } catch (err) {
+          if (
+            typeof err === 'object' &&
+            err !== null &&
+            'code' in err &&
+            (err as { code?: unknown }).code === '42501'
+          ) {
+            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
           }
-        });
+          throw err;
+        }
       };
 
       if (req.actorNonce !== undefined) {
