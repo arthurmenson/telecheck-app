@@ -61,6 +61,8 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { getSignalHandler } from './internal/handlers/get-signal.js';
+
 export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
@@ -71,7 +73,7 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
     status: 'ok',
     module: 'med-interaction',
     blocked:
-      'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1)',
+      'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1; PR 7 of N — first real handler shipped)',
     blocked_message:
       'Spec layer COMPLETE: SI-019 v2.0 RATIFIED 2026-05-21 P-033 + CDM v1.6 → v1.7 ' +
       '+ AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 ' +
@@ -79,44 +81,60 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
       '(PRs 1-5 merged; 21 Codex rounds total): 12 RBAC roles (046) + 4 entities + RLS + ' +
       'triggers (047) + view + MV + SECDEF access function (048) + raw lifecycle writer ' +
       'SECDEF + anti-bypass matrix (049) + 6 reason-specific wrappers (050; 3 ' +
-      'operational + 3 fail-closed pending evidence-source migrations). Subsequent ' +
-      'PRs land Fastify handlers + Cat A audit emission + LAYER B role-membership ' +
-      'check. See src/modules/med-interaction/README.md + ' +
-      'docs/med-interaction-implementation-plan.md.',
+      'operational + 3 fail-closed pending evidence-source migrations). ' +
+      'PR 7 (this commit) ships the FIRST real Fastify handler post-foundation-051: ' +
+      'GET /v0/med-interaction/signals/:id reading via the SECDEF access function from ' +
+      'migration 048 under the canonical withTransaction → withTenantContext → ' +
+      'withActorContext → withDbRole(medication_interaction_signal_viewer) composition. ' +
+      '7 endpoints remain (POST evaluations + 6 signal lifecycle actions); they land in ' +
+      'PRs 8-11 with Cat A audit emission + LAYER B role-membership tightening. See ' +
+      'src/modules/med-interaction/README.md + docs/med-interaction-implementation-plan.md.',
   }));
 
-  // Readiness probe — module is NOT ready to serve traffic at v0.1 because
-  // Fastify handlers haven't landed yet (DB layer is complete; only the
-  // HTTP surface is pending). Returns 503 (Service Unavailable) to
-  // advertise BLOCKED state to load-balancers + deploy gates per the
-  // canonical pharmacy / med-interaction's prior skeleton / subscription
-  // / async-consult / crisis-response / admin-backend pattern.
-  //
-  // NOT a spec-ratification blocker — SI-019 + CDM v1.7 are RATIFIED.
-  // NOT a DB-layer blocker — migrations 046-050 are merged. Purely a
-  // Fastify-route-handler-not-yet-mounted reason. The /ready probe
-  // returns 200 when PR 7+ ships the route handlers + Cat A audit
-  // emission + LAYER B role-membership check + integration tests.
+  // Readiness probe — module is partially serving traffic at PR 7 (the
+  // signal-read endpoint is live) but the slice as a whole is NOT yet
+  // production-ready: 7 of 8 handlers remain, the audit emission helper is
+  // not wired, and Layer B role-membership authorization is still the
+  // deferred-permissive shape per the Option 2 ratifier decision. Returns
+  // 503 with `reason: 'partial_handlers_wired'` to keep load-balancers /
+  // deploy gates from advancing the slice through production rollout
+  // until the full handler set ships. This follows the canonical
+  // Crisis-Response / Admin-Backend scaffold convention where /ready
+  // stays 503 with an updated reason until the slice's PR series closes.
   app.get('/ready', async (_req, reply) => {
     return reply.code(503).send({
       status: 'unavailable',
       module: 'med-interaction',
-      reason: 'handlers_not_yet_implemented',
+      reason: 'partial_handlers_wired',
       reason_message:
-        'Med Interaction Engine Fastify handlers (8 endpoints per SI-019 §5 + CDM §6: ' +
-        'evaluation initiation + signal lifecycle actions + signal read) are not yet ' +
-        'mounted. Spec layer COMPLETE; DB layer COMPLETE through migration 050; ' +
-        'Fastify route handlers land in PR 7+. The /ready probe will return 200 once ' +
-        'the full PR series (Fastify handlers + Cat A audit emission + LAYER B role ' +
-        'check + integration tests) closes. See src/modules/med-interaction/README.md ' +
-        'for the resume path.',
+        '1 of 8 Med Interaction Engine Fastify handlers wired (PR 7: ' +
+        'GET /v0/med-interaction/signals/:id via SECDEF access function from ' +
+        'migration 048 under the canonical withDbRole composition). 7 endpoints ' +
+        'remain: POST /evaluations + POST /signals + POST /signals/:id/{activate, ' +
+        'override, resolve, expire, supersede}. Spec + DB layers COMPLETE through ' +
+        'migration 050 + PR 7 first real handler. The /ready probe returns 200 once ' +
+        'the full PR series (remaining handlers + Cat A audit emission + LAYER B ' +
+        'role-membership check + integration tests) closes. See ' +
+        'src/modules/med-interaction/README.md for the resume path.',
     });
   });
 
-  // Real routes (POST /v1/med-interaction/evaluations, POST .../signals,
-  // POST .../signals/:id/activate, override, resolve, expire, supersede,
-  // GET .../signals/:id) land in PR 7+ when handler / adapter / service
-  // authoring begins. The handler surface is intentionally absent here so
-  // that any premature wiring breaks at typecheck time rather than
-  // reaching production half-built.
+  // ----- Real routes -----
+
+  // PR 7 of N: GET /v0/med-interaction/signals/:id — single-signal
+  // current-state lookup via the SECDEF access function from migration
+  // 048 §3. Read-only; no audit emission (SI-019 §6 catalogs only
+  // write events). See handler file-level docstring for the canonical
+  // composition order + Layer B deferral rationale.
+  app.get('/signals/:id', getSignalHandler);
+
+  // Remaining 7 endpoints (POST /evaluations, POST /signals, POST
+  // /signals/:id/{activate, override, resolve, expire, supersede})
+  // land in PR 8+ when write-handler implementation begins. They will
+  // share the same withTransaction → withTenantContext → withActorContext
+  // → withDbRole composition pattern as the PR 7 read handler; the
+  // write variants additionally wire Cat A audit emission inside the
+  // same DB transaction as the SECDEF wrapper call (so a partial commit
+  // cannot leave a wrapper effect without its audit record, per the
+  // module README's Option 2 carryforward).
 };

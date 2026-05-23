@@ -74,7 +74,49 @@ export function asInteractionRulesetId(s: string): InteractionRulesetId {
 // InteractionSignalOverride, InteractionSignalLifecycleTransition) are
 // intentionally NOT exported here. CDM v1.7 §4.NEW1-NEW4 already RATIFIED
 // (P-034 2026-05-21) the canonical row shapes; the migrations 047-050 DB
-// layer is COMPLETE. The TypeScript interfaces themselves land in PR 7+
-// alongside the matching repository files under internal/repositories/
-// when handler implementation begins (deferring row-shape authoring keeps
-// this scaffold-update PR free of speculative handler-shape decisions).
+// layer is COMPLETE. The TypeScript interfaces themselves land alongside
+// the matching repository files under internal/repositories/ as each
+// write handler in PR 8+ requires them (deferring row-shape authoring keeps
+// PR 7's surface narrow to what the first read handler actually needs).
+
+// ---------------------------------------------------------------------------
+// PR 7 view shape — public response of GET /v0/med-interaction/signals/:id.
+//
+// Mirrors the SECDEF access function's RETURNS TABLE clause (migration
+// 048 §3 + CDM v1.7 §4.NEW5):
+//   - signal_id          VARCHAR(26) — the ULID
+//   - current_state      TEXT        — interaction_signal_state_t once
+//                                      the DOMAIN lands (Option 2
+//                                      carryforward; documented in 048)
+//   - as_of              TIMESTAMPTZ — serialized as ISO-8601 string on
+//                                      the wire (Fastify default Date
+//                                      serializer)
+//   - transition_reason  TEXT        — interaction_signal_transition_
+//                                      reason_t (DOMAIN deferred per
+//                                      Option 2 same as current_state)
+//
+// Field names + types are snake_case + JSON-friendly per OpenAPI v0.3
+// conventions for the `/v1/med-interaction/signals/{id}` endpoint
+// (registered under the code-repo's `/v0/` prefix at v0.1 per the
+// platform-wide path-prefix policy; the prefix bumps to /v1 with the
+// platform-wide cutover and the response shape is unchanged).
+// ---------------------------------------------------------------------------
+export interface InteractionSignalCurrentStateView {
+  /** ULID — 26-char Crockford base32; the interaction_signal_id. */
+  signal_id: string;
+  /**
+   * Current state of the signal, DERIVED from
+   * `interaction_signal_lifecycle_transition` per I-035 Option A.
+   * Realized as TEXT until the `interaction_signal_state_t` DOMAIN lands
+   * in a future TYPES amendment (Option 2 carryforward).
+   */
+  current_state: string;
+  /** Last-transition timestamp serialized as ISO-8601 (UTC). */
+  as_of: string;
+  /**
+   * Reason for the most recent transition that produced `current_state`.
+   * Realized as TEXT until the `interaction_signal_transition_reason_t`
+   * DOMAIN lands (Option 2 carryforward, same as `current_state`).
+   */
+  transition_reason: string;
+}
