@@ -27,6 +27,7 @@ import { verifyBindActorContextPoolOrThrow } from './lib/db.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
+import { adminBackendPlugin } from './modules/admin-backend/index.js';
 import { aiServicePlugin } from './modules/ai-service/index.js';
 import { asyncConsultPlugin } from './modules/async-consult/index.js';
 import { consentPlugin } from './modules/consent/plugin.js';
@@ -216,6 +217,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/async-consult/ready',
       '/v0/crisis-events/health',
       '/v0/crisis-events/ready',
+      '/v0/admin-backend/health',
+      '/v0/admin-backend/ready',
       '/v0/admin/ready',
       '/v0/ai/health',
       '/v0/ai/ready',
@@ -326,6 +329,19 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // src/modules/crisis-response/README.md +
   // docs/crisis-response-implementation-plan.md for the multi-sprint plan.
   await app.register(crisisResponsePlugin);
+
+  // ----------------------------------------------------------
+  // Admin Backend Basics module (SI-023 v1.0 + CDM v1.10 → v1.11
+  // Amendment; ratified P-041 + P-042). DB layer COMPLETE through
+  // migration 044 (4 tables + 2 views + 4 SECDEF procedures + 12 RBAC
+  // roles + 14 rounds of Codex APPROVE across PRs 1-5). Sprint 1
+  // (this commit) registers /health (200) + /ready (503) so app-level
+  // wiring works; Sprint 2+ adds 5 endpoints (3 dashboard reads + 2
+  // template wrappers) + Cat A audit emission + LAYER B role-membership
+  // check. See src/modules/admin-backend/README.md for the multi-sprint
+  // plan + Option 2 carryforward divergences from spec.
+  // ----------------------------------------------------------
+  await app.register(adminBackendPlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
