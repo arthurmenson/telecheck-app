@@ -32,6 +32,7 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { mode2CasePrepHandler } from './internal/handlers/case-prep.js';
 import { mode1ChatHandler } from './internal/handlers/chat.js';
 
 export const registerAIServiceRoutes: FastifyPluginAsync = async (
@@ -43,7 +44,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'ai-service',
-    phase: 'mode_1_chat_mounted',
+    phase: 'crisis_gate_wired_pr_f',
     workload_types_at_v1: ['conversational_assistant', 'protocol_execution'],
     workload_types_reserved: ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'],
     autonomy_levels_at_v1: ['advisory', 'suggestion', 'action_with_confirm'],
@@ -62,18 +63,10 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
       'TLC-AI PR E (Conservative Default hardcoded + immutable per AI-GUARD-003; platform-floor compliance validator per AI-GUARD-002; emergency rollback entry point per AI-GUARD-005; Ghana launch program-specific templates wire in alongside their slices)',
     crisis_gate_wired: true,
     crisis_gate_wired_by:
-      'TLC-AI PR F (runCrisisGate exported from module index; wraps the platform-singleton crisisDetector from src/lib/crisis-detection.ts + emits crisis_detection_trigger Category A audit per AUDIT_EVENTS v5.3; service-callable only — consumed by the Mode 1 chat handler which runs the I-019 input gate per request)',
-    // Per-handler mount state (precise; supersedes the single
-    // `handlers_wired` rollup which only flips true at full-surface
-    // readiness). Mode 1 chat is live; Mode 2 case-prep remains the
-    // sole un-mounted documented handler.
-    mode_1_chat_handler_mounted: true,
-    mode_1_chat_handler_mounted_by:
-      'TLC-AI Mode 1 chat handler MOUNTED 2026-05-15 (POST /v0/ai/chat); full lifecycle wired — I-019 input crisis gate (Cat A audit) → Conservative Default guardrail → provider via NullLLMProvider (AI-RESIL-001 fail-soft) → FLOOR-020 Cat C response audit; patient-only + delegate-reject gates; tenant-blind errors; idempotent execution',
-    mode_2_case_prep_handler_mounted: false,
-    handlers_wired: false,
+      'TLC-AI PR F (runCrisisGate exported from module index; wraps the platform-singleton crisisDetector from src/lib/crisis-detection.ts + emits crisis_detection_trigger Category A audit per AUDIT_EVENTS v5.3; service-callable only — handlers that consume the gate land when Mode 1 chat / Mode 2 case-prep routes go online)',
+    handlers_wired: true,
     handlers_wired_tracking:
-      'Mode 1 chat MOUNTED (see mode_1_chat_handler_mounted); provider abstraction, guardrail templates, and crisis gate all wired (see the respective *_wired flags above). Sole remaining documented handler: PR C (Mode 2 case-prep, POST /v0/ai/case-prep) — gated on the protocol-engine integration that drives the I-012 reject-unless three-clause rule at the downstream prescribing boundary. handlers_wired flips true only when Mode 2 case-prep mounts.',
+      'Mode 1 chat (PR G 2026-05-15) + Mode 2 case-prep (PR H 2026-05-23) MOUNTED; real Anthropic provider integration still pending secrets management resolution (NullLLMProvider routes every workload to AI-RESIL-001 fail-soft at v0.1)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -91,22 +84,23 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'ai-service',
-      phase: 'mode_1_chat_mounted',
-      pending: 'PR C (Mode 2 case-prep, POST /v0/ai/case-prep)',
+      phase: 'crisis_gate_wired_pr_f',
+      pending:
+        'Real Anthropic / Bedrock / Azure OpenAI provider adapters (NullLLMProvider routes ' +
+        'every workload to AI-RESIL-001 fail-soft at v0.1; real adapters block on secrets ' +
+        'management) + clinical-grade NLP crisis classifier (src/lib/crisis-detection.ts ' +
+        'is a v1.0 keyword stub; AI Safety Lead sign-off required) + protocol-engine ' +
+        'integration (downstream I-012 reject-unless three-clause rule binds at the ' +
+        'prescribing boundary, not at case-prep itself)',
       pending_message:
-        'Module is not yet ready to serve traffic — the AI surface is partial. Mode 1 chat ' +
-        '(POST /v0/ai/chat) is MOUNTED, and the provider abstraction, guardrail templates ' +
-        '(Conservative Default), and crisis-detection gate (FLOOR-009 / I-019 platform-floor) ' +
-        'are all wired. The sole remaining documented handler is Mode 2 case-prep ' +
-        '(POST /v0/ai/case-prep), gated on the protocol-engine integration that drives the ' +
-        'I-012 reject-unless three-clause rule at the downstream prescribing boundary. ' +
-        'Per the readiness-flip precedent (async-consult + pharmacy), /ready stays 503 until ' +
-        'the FULL documented surface is live; a partial surface is intentionally not ' +
-        'readiness-acceptable. Separately, real Anthropic / Bedrock / Azure OpenAI adapters ' +
-        'replace the v1.0 NullLLMProvider when secrets management is resolved. Per ' +
-        'AI_LAYERING v5.2 §2 + ADR-029, the v1.0 workload ' +
-        'taxonomy admits exactly two active types: conversational_assistant and ' +
-        'protocol_execution; reserved types (autonomous_agent, multi_agent_supervisor, ' +
+        'Module is NOT yet production-ready — Mode 1 chat (POST /v0/ai/chat) + Mode 2 ' +
+        'case-prep (POST /v0/ai/case-prep) handlers are MOUNTED and exercise the full ' +
+        'I-019 crisis-detection floor, FLOOR-020 audit emission, and AI-RESIL-001 ' +
+        'fail-soft path, but the LLM provider abstraction (per ADR-020) routes every ' +
+        'workload to NullLLMProvider — so every non-crisis response is the documented ' +
+        '"AI temporarily unavailable" envelope. Per AI_LAYERING v5.2 §2 + ADR-029, the ' +
+        'v1.0 workload taxonomy admits exactly two active types: conversational_assistant ' +
+        'and protocol_execution; reserved types (autonomous_agent, multi_agent_supervisor, ' +
         'tool_using_agent) require a successor ADR + activation audit event before code ' +
         'paths exist. Per AI_LAYERING v5.2 §9, conversations are tenant-scoped — ' +
         '(tenant_id, ai_chat_session_id) is the authorization pair. Per ADR-020, the ' +
@@ -134,9 +128,31 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   // crisis sentinel ("contact your care team") — both authored at
   // module level and not subject to runtime classification.
   //
-  // Mode 2 case-prep (POST /v0/ai/case-prep) remains gated pending the
-  // protocol-engine integration that drives the I-012 reject-unless
-  // three-clause rule at the downstream prescribing boundary per
-  // State Machines v1.2 §19 §19.X.
+  // Mode 2 case-prep — MOUNTED 2026-05-23.
+  //
+  // Lifecycle (per AI_LAYERING v5.2 + Slice PRD v1.0 §4.2 + ADR-029):
+  //   1. tenantContext + actorContext
+  //   2. Clinician-only role gate (Mode 2 is clinician-driven; patients
+  //      never interact with Mode 2 directly per Slice PRD v1.0 §4.2)
+  //   3. Two-stage body validation (Zod after crisis-gate per R6 H1)
+  //   4. runCrisisGate on INPUT context (I-019; emits Cat A audit on
+  //      positive; auditDedupeDiscriminator='context_serialized')
+  //   5. On crisis: return crisis-bypass sentinel (no LLM call); route
+  //      to immediate clinician review
+  //   6. On no crisis: call resolveProvider → sendCompletion
+  //      (v0.1 NullProvider always throws → AI-RESIL-001 fail-soft)
+  //   7. Emit Cat A `ai_mode_2_evaluation` audit (AUDIT_EVENTS v5.3
+  //      canonical action ID)
+  //   8. Return Mode2CasePrepResponseView with the recommendation +
+  //      canonical AI envelope (protocol_id + protocol_version stamped;
+  //      guardrail_template_id NOT used — that's Mode 1's field)
+  //
+  // The I-012 reject-unless three-clause rule binds at the downstream
+  // prescribing boundary (protocol-engine slice per State Machines
+  // v1.2 §19 §19.X) — case-prep itself does NOT execute prescribing,
+  // so the rule does not bind here. The case-prep envelope is the
+  // audit anchor the downstream `prescribing.protocol_authorization_granted`
+  // event references via ai_workflow_execution_id.
   app.post('/chat', mode1ChatHandler);
+  app.post('/case-prep', mode2CasePrepHandler);
 };
