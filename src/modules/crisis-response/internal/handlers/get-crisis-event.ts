@@ -260,16 +260,39 @@ export async function getCrisisEventHandler(
       // defense in depth for downstream additions.
       const runRead = async (): Promise<CrisisEventCurrentStateRow | null> => {
         return withDbRole(tx, 'crisis_event_staff_reader', async () => {
-          const result = await tx.query<CrisisEventCurrentStateRow>(
-            'SELECT crisis_event_id, tenant_id, patient_id, server_signal_id, ' +
-              'crisis_type, severity, regulatory_reporting_enabled, detected_at, ' +
-              'current_state, current_state_transition_at, ' +
-              'current_state_transition_reason, current_state_actor_principal_id ' +
-              'FROM crisis_event_current_state_v ' +
-              'WHERE crisis_event_id = $1',
-            [idParam],
-          );
-          return result.rows[0] ?? null;
+          try {
+            const result = await tx.query<CrisisEventCurrentStateRow>(
+              'SELECT crisis_event_id, tenant_id, patient_id, server_signal_id, ' +
+                'crisis_type, severity, regulatory_reporting_enabled, detected_at, ' +
+                'current_state, current_state_transition_at, ' +
+                'current_state_transition_reason, current_state_actor_principal_id ' +
+                'FROM crisis_event_current_state_v ' +
+                'WHERE crisis_event_id = $1',
+              [idParam],
+            );
+            return result.rows[0] ?? null;
+          } catch (err) {
+            // I-025 envelope-leak defense (Codex Admin Sprint 2 PR 1 R1
+            // HIGH-1 finding 2026-05-23, applied preemptively here):
+            // PostgreSQL SQLSTATE 42501 ("insufficient_privilege") raised
+            // by the SECDEF wrapper (e.g., LAYER C tenant-scope mismatch,
+            // missing actor nonce, role-membership gap) reaches the global
+            // error envelope without a statusCode, defaulting to 500. In
+            // non-prod the raw PG message — which may include tenant_id —
+            // is exposed to the client, violating I-025. Map 42501 to a
+            // 403 with the canonical insufficient_tenant_scope envelope
+            // (no tenant identifiers; tenant-blind) before re-throwing.
+            // Other PG errors propagate to the global handler unchanged.
+            if (
+              typeof err === 'object' &&
+              err !== null &&
+              'code' in err &&
+              (err as { code?: unknown }).code === '42501'
+            ) {
+              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+            }
+            throw err;
+          }
         });
       };
 
