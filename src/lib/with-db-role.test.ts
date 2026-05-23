@@ -206,12 +206,19 @@ describe('with-db-role §4 — callback throw propagation + restore-on-throw', (
     ).rejects.toThrow('original-fn-error'); // NOT 'simulated restore failure'
   });
 
-  it('on successful fn, restore failure does NOT propagate (swallowed)', async () => {
+  it('on successful fn, restore failure PROPAGATES (R3 HIGH-1: privilege-boundary defense)', async () => {
+    // R3 HIGH-1 closure 2026-05-23: when fn succeeds but the role restore
+    // fails, the helper MUST surface the failure. Silently returning
+    // success would let later code in the same transaction execute under
+    // the slice role's privileges — the exact privilege boundary this
+    // helper is designed to enforce. (When fn throws, swallow is correct
+    // to preserve the original error per the test above.)
     const { tx } = mockTx({ failOnRestore: true });
-    const result = await withDbRole(tx, 'admin_basic_operator', async () => {
-      return 'ok';
-    });
-    expect(result).toBe('ok'); // fn returned cleanly; restore error swallowed
+    await expect(
+      withDbRole(tx, 'admin_basic_operator', async () => {
+        return 'ok';
+      }),
+    ).rejects.toThrow(/prior-role restoration failed after successful callback/);
   });
 });
 

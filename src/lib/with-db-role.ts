@@ -246,30 +246,42 @@ export async function withDbRole<T>(
   // needed.
   await tx.query(`SET LOCAL ROLE ${role}`);
 
+  // Track whether fn threw so the finally block can distinguish:
+  //   - fn threw + restore threw → swallow restore error, preserve fn error
+  //     (don't let finally-throw shadow the real failure)
+  //   - fn succeeded + restore threw → PROPAGATE restore error (R3 HIGH-1
+  //     closure 2026-05-23: silently returning success after a failed
+  //     role restore would let later code in the same transaction execute
+  //     under the slice role's privileges, defeating the privilege
+  //     boundary this helper exists to enforce)
+  let fnThrew = false;
   try {
     return await fn();
+  } catch (fnError) {
+    fnThrew = true;
+    throw fnError;
   } finally {
-    // Restore prior role even if fn throws. If the transaction is
-    // rolling back (which it will if fn threw and the throw propagates
-    // past withTransaction), the SET LOCAL is irrelevant — but if the
-    // caller catches the exception and continues the tx, the restore
-    // prevents accidental privilege escalation in the catch path.
-    //
-    // Wrap in try/catch + swallow because: (a) JavaScript finally-throw
-    // would SHADOW the original fn error, destroying observability of
-    // the real failure; (b) if the tx is already in aborted state
-    // (common when fn threw with a PG error: "current transaction is
-    // aborted, commands ignored until end of transaction block"), the
-    // SET LOCAL ROLE call itself will throw, but the tx will roll back
-    // anyway, clearing all role state. Preserving the fn error is more
-    // important than capturing the restore failure here. If you need
-    // observability into restore failures, instrument at the db.ts
-    // layer (e.g., a query hook that counts SET LOCAL ROLE failures by
-    // SQLSTATE 25P02 "in_failed_sql_transaction").
     try {
       await tx.query(`SET LOCAL ROLE ${priorRole}`);
-    } catch {
-      // Swallow — see comment above.
+    } catch (restoreError) {
+      if (!fnThrew) {
+        // fn succeeded but restore failed: this is the privilege-boundary
+        // failure we must NOT swallow. Caller (or surrounding tx) must
+        // see the failure so they don't continue work under the elevated
+        // role. Annotate the error so operators understand the scenario.
+        throw new Error(
+          `withDbRole: prior-role restoration failed after successful ` +
+            `callback. The transaction may still hold the elevated slice ` +
+            `role; surrounding code MUST roll back to prevent privilege ` +
+            `leakage. Original restore error: ${(restoreError as Error)?.message ?? String(restoreError)}`,
+        );
+      }
+      // fn already threw: swallow restore error to preserve original fn
+      // error per JS finally-throw shadowing rules. The tx will roll back
+      // when the fn error propagates past withTransaction, clearing all
+      // role state. Observability into this branch can be added via a
+      // db.ts query hook counting SET LOCAL ROLE failures by SQLSTATE
+      // 25P02 "in_failed_sql_transaction" if needed.
     }
   }
 }
