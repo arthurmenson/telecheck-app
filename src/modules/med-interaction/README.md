@@ -1,77 +1,86 @@
-# Med Interaction Engine module — BLOCKED ON Med Interaction Engine slice PRD ratification
+# `src/modules/med-interaction/` — Medication Interaction & Validation Engine module
 
-## Status (v0.1 skeleton)
+Implementation of **SI-019 Medication Interaction & Validation Engine Slice PRD v2.0** (RATIFIED 2026-05-21 P-033) + the canonical follow-on **CDM v1.6 → v1.7 Amendment** (RATIFIED 2026-05-21 P-034 — co-bumped AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 + RBAC v1.1 → v1.2).
 
-This module is a **directory skeleton** authored at Sprint 3 (TLC-007). The interaction-checking surface (POST /signals/check, override workflow, ruleset resolver, adapter abstraction to vendor interaction databases) is **BLOCKED** until the Med Interaction Engine slice PRD is ratified.
+## Status: Sprint 1 (PR 1 — this commit) — **SKELETON + RBAC ROLES**
 
-## What ships at v0.1
+Spec layer is **complete + ratified**. DB layer is at **PR 1 of ~6**: migration 046 ships the 12 net-new RBAC roles. Subsequent PRs add the 4 entities + the MV + access function + the raw lifecycle writer + the 6 reason-specific wrappers + the Fastify handler implementation across the remaining PRs.
+
+Med-Interaction is the **Master Completion Plan v1.0 "new critical path"** per the 2026-05-15 implementation audit — the I-002 hard rule (interaction engine runs BEFORE clinician commits `medication_request`) gates Pharmacy clinician-commit + refill-release + Mode 2 protocol-execution paths. Pilot launch (Telecheck-Ghana revenue anchor) does not progress past clinician-commit until this slice's signal lifecycle is live.
+
+### DB layer PR progression
+
+| PR | Migration | What |
+|---|---|---|
+| 1 | 046 | **12 RBAC roles** — 4 application + 6 wrapper-owner + 2 service-level-owner. NOLOGIN + non-BYPASSRLS. No grants. |
+| 2 | 047 | **4 entities** — `interaction_engine_evaluation` + `interaction_signal` + `interaction_signal_override` + `interaction_signal_lifecycle_transition` (Option A append-only per I-035). RLS + per-table append-only triggers + composite tenant-scoped FKs. |
+| 3 | 048 | **1 SECURITY BARRIER view** (`interaction_signal_current_state_v`) + **1 optional MV** (`interaction_signal_current_state_mv`) + **SECURITY DEFINER access function** for single-signal lookups. |
+| 4 | 049 | **Raw lifecycle writer SECDEF** (`record_interaction_signal_lifecycle_transition`) + anti-bypass EXECUTE matrix to the 6 wrapper-owner roles only. |
+| 5 | 050 | **6 reason-specific lifecycle wrappers** — emission + activation + supersession + resolution + expiry + override. LAYER C tenant-scope match via SI-010 trust anchor; internal actor binding via `current_actor_account_id()`. |
+| 6+ | n/a | **Fastify handler implementation** — 8 endpoints per SI-019 §5 + CDM §6 OpenAPI v0.3 (signal-check, override-record, lifecycle actions). Cat A audit emission (6 events: 4 Cat A + 2 Cat B). LAYER B role-membership check at route layer. Integration tests for tenant isolation + I-002 ordering invariant. |
+
+### What ships at PR 1 (this commit)
 
 - Module directory boundary (per ADR-001 modular monolith)
 - Fastify plugin shell registering `/v0/med-interaction`
-- Liveness probe (`GET /health` → 200) with informational `blocked` metadata
-- Readiness probe (`GET /ready` → 503) — Kubernetes/LB will keep traffic off the module
-- Branded ID types (`InteractionSignalId`, `InteractionOverrideId`, `InteractionRulesetId`) — identifier hygiene only, not schema
-- Plugin smoke test (`tests/integration/med-interaction-plugin-wiring.test.ts`)
+- Liveness probe (`GET /health` → 200) with Sprint 1 skeleton metadata describing the post-ratification PR progression
+- Readiness probe (`GET /ready` → 503) — Kubernetes/LB will keep traffic off the module; `reason: 'handlers_not_yet_implemented'` (NOT a spec-ratification blocker — SI-019 + CDM v1.7 are RATIFIED)
+- Branded ID types in `internal/types.ts` for cross-module typed-import (Pharmacy clinician-commit gate; Async Consult; Mode 2 protocol agents)
+- Plugin smoke test (`tests/integration/med-interaction-plugin-wiring.test.ts`) asserting the skeleton contract + the allowlist coverage
+- Migration 046: 12 net-new RBAC roles per CDM §8 + rollback 046 with operator pre-rollback guidance
 
-## What does NOT ship at v0.1
+### What does NOT ship at PR 1
 
-- Row-shape interfaces for InteractionSignal / InteractionOverride / InteractionRuleset
-- Repository files
-- Service files (signal evaluator, override workflow)
-- Real HTTP handlers (POST /signals/check, etc.)
-- Vendor adapter abstraction (interaction databases like First Databank, Lexicomp)
-- Database migrations
-- Audit / domain event emitters
+- Row-shape interfaces / repository files / service files for the 4 entities (lands PR 2+ when entities exist)
+- Real HTTP handlers (POST /signals/check, POST /overrides, GET /rulesets/:id, etc.) — land PR 6+
+- Vendor adapter abstraction (interaction databases like First Databank, Lexicomp) — per ADR-022 native-first / open-source-first preference; lands when handler implementation begins
+- Audit / domain event emitters — land PR 6+ when handlers are wired
 
-## Why this is intentionally a skeleton
+## Module structure (per `src/modules/README.md` template)
 
-Per EHBG §7, engineering does not author canonical schema; the slice PRD owns it. The CDM v1.2 entity inventory does not yet expand Med Interaction signal/override/ruleset row shapes — authoring schemas now would silently fork the spec corpus (per the "do NOT silently fork" hard rule in CLAUDE.md).
+```
+med-interaction/
+├── index.ts              ← public interface (cross-module-safe exports)
+├── plugin.ts             ← Fastify plugin entry point (registered in src/app.ts under /v0/med-interaction)
+├── routes.ts             ← Sprint 1: health + ready only; PR 6+ adds handlers
+├── README.md             ← this file
+└── internal/             ← module-private; no cross-module imports allowed
+    └── types.ts          ← branded IDs + canonical state/severity/check-class vocabularies
+    └── handlers/         ← (PR 6+) endpoint handler files
+    └── services/         ← (PR 6+) signal evaluator, override workflow
+    └── repositories/     ← (PR 2+) tenant-scoped DB access
+    └── adapters/         ← (PR 6+) vendor interaction-database abstractions
+```
 
-The skeleton lands now so that:
+## Option 2 ratifier decision (carryforward from Crisis Response + Admin Backend)
 
-1. **Module boundary is established** under ADR-001 — the public-interface surface is fixed, even if it's mostly types
-2. **App-level wiring is stable** — `src/app.ts` registers `medInteractionPlugin` once; plugin internals can evolve without re-touching `app.ts`
-3. **Downstream slices can typed-import branded IDs** — Pharmacy + Refill (TLC-010+), Async Consult, and Mode 2 protocol agents will all hold typed references to `InteractionSignalId` / `InteractionOverrideId` ahead of full schema ratification
-4. **Liveness/readiness pattern is consistent** — applies the Sprint 1 Codex MEDIUM finding (`pharmacy-blocked-handler`) a-priori: `/health` 200 with metadata for operator monitoring, `/ready` 503 to signal "not production-ready"
+Per ratifier Option 2 (`docs/crisis-response-implementation-plan.md` + `docs/med-interaction-implementation-plan.md`): adapt to existing code-repo patterns rather than land the SI-024.1 / strict-helper foundation prerequisites first. Recorded divergences from spec (to be reconciled in future hygiene cycle):
 
-## Hard rule (platform-floor)
+- **Trust anchor:** SQL wrappers will use SI-010 `current_actor_*()` helpers (migration 031), not SI-024.1 `verify_session_jwt_and_extract_claims()` (lands PR 5).
+- **RLS predicate:** `current_tenant_id()` (code-repo pattern from migration 003), NOT spec's `current_tenant_id_strict(entity_name)` (lands PR 2).
+- **Trigger functions:** per-table inline functions (audit_chain pattern from migration 002), NOT spec's generic `enforce_append_only()` (lands PR 2).
+- **Role naming:** the two dotted application-role names in P-034 §8 (`medication_interaction.override_recorder` + `.knowledge_base_updater`) are realized as their underscore forms — unquoted dotted identifiers are not valid PG roles. The verification block in migration 046 asserts the dotted forms are absent (anti-drift). Documented in migration 046 inline.
+- **Audit emission:** Cat A audit emission deferred from SQL wrappers to the application layer (the Fastify route handler MUST wrap the SECDEF wrapper call + `audit_records` INSERT in a single DB transaction so a partial commit cannot leave a SECDEF effect without its audit record). Lands PR 6+.
+- **LAYER B (role-membership) authorization:** deferred from SQL wrappers to Fastify route layer (spec calls `tenant_account_membership` which doesn't exist in code repo). Lands PR 6+.
+- **`medication_interaction_resolution_subscriber`** referenced by P-034 §8 as "defined elsewhere — Async Consult slice domain-event subscriber RBAC"; NOT created in migration 046. Will land with the Async Consult slice if not already present.
 
-Per CLAUDE.md and Master PRD v1.10 §7, the interaction engine **runs BEFORE the clinician commits a prescription**. Not after, not in parallel. This binds independent of slice ratification — when real handlers land, they enforce this ordering at the prescription-commit boundary.
+See `docs/med-interaction-implementation-plan.md` for the full PR-by-PR plan + ratifier rationale.
 
-## On-resume notes (when slice PRD ratifies)
+## Hard rules (platform-floor)
 
-When the Med Interaction Engine slice PRD is ratified:
-
-1. Author CDM §4 row-shape expansions for InteractionSignal / InteractionOverride / InteractionRuleset (spec-side change; not in this repo)
-2. Add row-shape interfaces to `src/modules/med-interaction/internal/types.ts`
-3. Author `internal/repositories/` with tenant-scoped repos
-4. Author `internal/services/signal-evaluator.ts` (the engine itself)
-5. Author `internal/adapters/` for vendor interaction databases (per ADR-022 native-first / open-source-first preference)
-6. Replace `routes.ts` skeleton with real handler surface
-7. Flip `/ready` to 200
-8. Wire the engine into prescription-commit paths (Pharmacy module + Async Consult clinician-commit path)
-9. Add audit + domain event emitters per Contracts Pack v5.2 AUDIT_EVENTS / DOMAIN_EVENTS (slice PRD will name the event types)
-10. Author migration files (sequentially numbered)
-
-## Branded ID type names (PROVISIONAL)
-
-The branded type names anticipate the slice PRD's entity naming. If the ratified slice PRD picks different names, treat as a Sprint 4+ rename task (find-and-replace + import-path update across downstream consumers). Do not block the slice on the rename.
-
-| Branded type            | Anticipated CDM entity   |
-| ----------------------- | ------------------------ |
-| `InteractionSignalId`   | `InteractionSignal`      |
-| `InteractionOverrideId` | `InteractionOverride`    |
-| `InteractionRulesetId`  | `InteractionRuleset`     |
+- **I-002**: interaction engine **runs BEFORE the clinician commits a `medication_request`**. Not after, not in parallel. This binds at the Pharmacy + Async Consult clinician-commit boundaries; the Med-Interaction module exposes the synchronous signal-check surface that those boundaries call.
+- **I-015**: knowledge-base version updates are **dual-control** (admin role gated by Admin Backend approval workflow).
+- **I-023**: every PHI-touching query is tenant-filtered (RLS + app-layer + per-tenant KMS three-layer enforcement).
+- **I-025**: error responses do not leak cross-tenant existence (tenant-blind envelopes).
+- **I-027**: audit records carry `tenant_id` always (append-only per I-003).
+- **I-035**: `interaction_signal_lifecycle_transition` is append-only (Option A per SI-019 OQ7 ratification at P-033).
 
 ## Spec references
 
-- ADR-001 modular monolith
-- ADR-029 AI workload taxonomy (interaction signals = `clinical_decision_support` workload class)
-- Master PRD v1.10 §7 (interaction engine as platform-floor)
-- I-019 (crisis detection adjacent — both are platform-floor)
-- CLAUDE.md "Interaction engine runs BEFORE clinician commits prescription" hard rule
-- EHBG §7 (engineering implements per CDM, does not author)
-
-## Sprint reference
-
-Authored Sprint 3 (TLC-007) on the autonomous Scrum cycle while SI-001 / SI-002 / SI-003 remain open upstream. Mirrors the pharmacy module skeleton pattern (TLC-001 in Sprint 1) with the readiness/liveness split applied a-priori (TLC-001 fix-forward at `5615feb` post-Codex MEDIUM finding `pharmacy-blocked-handler`).
+- `Telecheck_Medication_Interaction_Engine_Slice_PRD_v2_0.md` (RATIFIED 2026-05-21 P-033)
+- `Telecheck_CDM_v1_6_to_v1_7_Amendment.md` (RATIFIED 2026-05-21 P-034)
+- `Telecheck_State_Machines_v1_2.md` §interaction_signal_lifecycle (derived-from-append-only)
+- `Telecheck_OpenAPI_v0_3.md` (8 new endpoints under `/v1/med-interaction/*`)
+- I-002 platform-floor (interaction-before-commit)
+- I-015, I-023, I-027, I-035
+- ADR-001 (modular monolith — public-interface-only cross-module access)
