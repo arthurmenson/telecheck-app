@@ -343,14 +343,18 @@ CREATE TRIGGER interaction_signal_override_block_delete
     FOR EACH ROW
     EXECUTE FUNCTION interaction_signal_override_block_mutation();
 
--- Per CDM §4.NEW3 GRANT block (Option 2: dotted role name normalized;
--- wrapper-owner name prefixed per migration 046 §2 recorded divergence).
+-- Per CDM §4.NEW3 GRANT block. Owner-role names are the BARE canonical forms
+-- created by migration 046 (P-034 §8 names the wrapper-owner roles bare, NOT
+-- slice-prefixed). The earlier `interaction_signal_override_wrapper_owner`
+-- prefixed reference was a defect — that role is never created by any migration,
+-- so a fresh 000→047 apply aborted here with `role "..." does not exist`. Fixed
+-- to `override_wrapper_owner` (migration 046 §wrapper-owner) per PR 3 unblock.
 REVOKE INSERT ON interaction_signal_override FROM PUBLIC;
 GRANT INSERT ON interaction_signal_override
-    TO interaction_signal_override_wrapper_owner;
+    TO override_wrapper_owner;
 GRANT SELECT ON interaction_signal_override
     TO medication_interaction_signal_viewer,
-       interaction_signal_override_wrapper_owner;
+       override_wrapper_owner;
 
 -- =============================================================================
 -- §4 — interaction_signal_lifecycle_transition (CDM §4.NEW4; Option A
@@ -663,17 +667,22 @@ CREATE TRIGGER interaction_signal_lifecycle_transition_monotonic_ordering
     FOR EACH ROW
     EXECUTE FUNCTION interaction_signal_lifecycle_transition_enforce_monotonic_ordering();
 
--- Per CDM §4.NEW4 GRANT block (Option 2: wrapper-owner + writer-owner role
--- names prefixed per migration 046 §2 recorded divergence).
+-- Per CDM §4.NEW4 GRANT block. Owner-role names are the BARE canonical forms
+-- created by migration 046 (P-034 §8 service-level + wrapper-owner roles are
+-- bare, NOT slice-prefixed). The earlier prefixed references
+-- (`interaction_signal_lifecycle_transition_writer_owner`,
+-- `interaction_signal_override_wrapper_owner`, `interaction_signal_mv_refresh_owner`)
+-- were a defect — those roles are never created by any migration, so a fresh
+-- 000→047 apply aborted here. Fixed to the bare forms created by migration 046.
 REVOKE INSERT ON interaction_signal_lifecycle_transition FROM PUBLIC;
 GRANT INSERT ON interaction_signal_lifecycle_transition
-    TO interaction_signal_lifecycle_transition_writer_owner;
+    TO lifecycle_transition_writer_owner;
 GRANT SELECT ON interaction_signal_lifecycle_transition
     TO medication_interaction_engine_evaluator,
        medication_interaction_signal_viewer,
-       interaction_signal_override_wrapper_owner,
-       interaction_signal_lifecycle_transition_writer_owner,
-       interaction_signal_mv_refresh_owner;
+       override_wrapper_owner,
+       lifecycle_transition_writer_owner,
+       mv_refresh_owner;
 
 -- =============================================================================
 -- §5 — Verification: count of net-new interaction_* tables = 4
