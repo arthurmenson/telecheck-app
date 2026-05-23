@@ -70,42 +70,59 @@
 -- ---------------------------------------------------------------------------
 
 -- =============================================================================
--- R3 HIGH-1 closure 2026-05-23 (Codex R3): explicit BEGIN forces atomicity
--- across the whole migration. Under autocommit migration-runner mode, each
--- statement commits independently — CREATE MATERIALIZED VIEW would commit
--- with whatever default ACLs were in effect, exposing the all-tenant MV to
--- broadly-granted SELECT roles before the immediate REVOKE could run. By
--- wrapping with BEGIN/COMMIT, we guarantee that the migration runs as one
--- transaction regardless of runner default — CREATE + REVOKE PUBLIC +
--- aclexplode-cleanup + canonical GRANT all commit atomically.
+-- R4 HIGH-1 closure 2026-05-23 (Codex R4): explicit BEGIN/COMMIT REMOVED.
+-- The R3 wrap was unsafe — PostgreSQL does not support nested top-level
+-- BEGIN/COMMIT; if a migration runner wraps the file in its own transaction
+-- (e.g., Flyway default, Liquibase default, sqitch), the embedded BEGIN
+-- only warns + the embedded COMMIT commits the RUNNER'S outer transaction,
+-- separating the DDL from the runner's bookkeeping + creating exactly the
+-- partial-application hazard the closure was meant to prevent.
 --
--- Migration runners that already wrap each file in a transaction will
--- treat this BEGIN as nested + benign; runners in autocommit mode will
--- treat it as the start of an explicit transaction.
+-- Atomicity contract is now delegated to the migration runner via
+-- documented runner-configuration requirement (see docs/
+-- med-interaction-implementation-plan.md): apply this migration in a
+-- transactional runner (Flyway default, Liquibase default, sqitch). The
+-- code-repo's existing migrations (032-047) already assume this contract;
+-- no migration in the corpus uses explicit BEGIN/COMMIT.
+--
+-- Defense-in-depth REMAINS in place even without explicit transaction
+-- wrapping:
+--   - §0 preflight FAILS migration BEFORE CREATE MV if dangerous default
+--     ACLs exist (filtered to current_user + public schema per R4 MED-1)
+--   - Post-CREATE: immediate REVOKE PUBLIC + aclexplode loop +
+--     canonical GRANT (R1 + R2)
+--   - §5 final verifier asserts canonical end state
 -- =============================================================================
-BEGIN;
 
 -- =============================================================================
--- §0 — Pre-CREATE preflight (R3 HIGH-1 closure 2026-05-23, defense-in-depth):
--- Even with BEGIN/COMMIT atomicity, the explicit-transaction guarantee can
--- still be defeated if (a) the migration runner explicitly disables transaction
--- wrapping for this file, or (b) the database has dangerous default ACL grants
--- pre-configured. This preflight FAILS the migration BEFORE CREATE MATERIALIZED
--- VIEW runs if the public schema has any default ACL granting SELECT on
--- tables/sequences/functions to PUBLIC or to any non-canonical role for new
--- objects created by the current migration role.
+-- §0 — Pre-CREATE preflight (R3 HIGH-1 closure 2026-05-23; R4 MED-1 scope
+-- tightening 2026-05-23):
+-- FAILS the migration BEFORE CREATE MATERIALIZED VIEW runs if the database
+-- has ALTER DEFAULT PRIVILEGES granting SELECT on relations to non-canonical
+-- roles for objects that would be created by the CURRENT migration user in
+-- the PUBLIC schema.
+--
+-- R4 MED-1 scope tightening: filter pg_default_acl rows by
+--   defaclrole IN (current migration role's OID, 0 for global defaults)
+--   AND defaclnamespace IN (public schema OID, 0 for schema-independent)
+-- so unrelated default ACLs in other schemas or for other roles do not
+-- spuriously block this migration. Without this filter, an
+-- ALTER DEFAULT PRIVILEGES FOR ROLE <unrelated_role> IN SCHEMA <unrelated>
+-- would abort migration 048 even though it cannot affect the MV being
+-- created here.
 --
 -- Operators that hit this preflight must FIRST run:
---   ALTER DEFAULT PRIVILEGES FOR ROLE <migrator>
+--   ALTER DEFAULT PRIVILEGES FOR ROLE <current_migration_role>
 --     IN SCHEMA public REVOKE SELECT ON TABLES FROM PUBLIC;
---   ALTER DEFAULT PRIVILEGES FOR ROLE <migrator>
+--   ALTER DEFAULT PRIVILEGES FOR ROLE <current_migration_role>
 --     IN SCHEMA public REVOKE SELECT ON TABLES FROM <broad_role>;
--- ... and then retry this migration. The remediation is a one-time database-
--- configuration fix, not a per-migration workaround.
+-- ... and then retry this migration.
 -- =============================================================================
 DO $$
 DECLARE
-    v_offending_grantee TEXT;
+    v_current_role_oid     OID  := (SELECT oid FROM pg_roles WHERE rolname = CURRENT_USER);
+    v_public_schema_oid    OID  := 'public'::regnamespace;
+    v_offending_grantee    TEXT;
 BEGIN
     SELECT DISTINCT
         CASE
@@ -117,6 +134,12 @@ BEGIN
       JOIN aclexplode(da.defaclacl) acl ON TRUE
       LEFT JOIN pg_roles r ON r.oid = acl.grantee
      WHERE da.defaclobjtype = 'r'              -- relations (tables, MVs, views)
+       -- R4 MED-1: scope to defaults that can actually affect the MV
+       -- created below: either the current migration role's defaults, OR
+       -- the global default (defaclrole = 0); AND either the public schema's
+       -- defaults, OR the global default (defaclnamespace = 0).
+       AND (da.defaclrole = v_current_role_oid OR da.defaclrole = 0)
+       AND (da.defaclnamespace = v_public_schema_oid OR da.defaclnamespace = 0)
        AND acl.privilege_type = 'SELECT'
        AND (
               acl.grantee = 0                  -- PUBLIC
@@ -131,12 +154,13 @@ BEGIN
     IF v_offending_grantee IS NOT NULL THEN
         RAISE EXCEPTION
             'migration-048-preflight-default-acl-violation: '
-            'database has ALTER DEFAULT PRIVILEGES granting SELECT on relations '
-            'to non-canonical role %; this would expose the all-tenant '
+            'database has ALTER DEFAULT PRIVILEGES (scoped to current migration '
+            'role + public schema) granting SELECT on relations to non-canonical '
+            'role %; this would expose the all-tenant '
             'interaction_signal_current_state_mv at CREATE time before the '
             'migration''s REVOKE statements run. Operator MUST run: '
-            'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES '
-            'FROM <offending-role>; AND any equivalent for other schemas/roles; '
+            'ALTER DEFAULT PRIVILEGES FOR ROLE <current-migration-role> '
+            'IN SCHEMA public REVOKE SELECT ON TABLES FROM <offending-role>; '
             'THEN retry this migration. Remediation is a one-time database-'
             'configuration fix, not a per-migration workaround.',
             v_offending_grantee;
@@ -489,8 +513,9 @@ BEGIN
     END IF;
 END $$;
 
--- =============================================================================
--- R3 HIGH-1 closure (continued): explicit COMMIT closes the BEGIN above.
--- Together they guarantee migration atomicity under autocommit runner mode.
--- =============================================================================
-COMMIT;
+-- R4 HIGH-1 closure 2026-05-23 (Codex R4): R3 explicit COMMIT REMOVED.
+-- See R4 HIGH-1 rationale at top of file: explicit BEGIN/COMMIT is unsafe
+-- for transactional migration runners. Atomicity now contracted via runner
+-- configuration (documented in docs/med-interaction-implementation-plan.md);
+-- defense-in-depth via pre-CREATE preflight + immediate REVOKE + aclexplode
+-- loop + §5 final verifier remains in place.
