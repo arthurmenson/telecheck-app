@@ -43,7 +43,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'ai-service',
-    phase: 'crisis_gate_wired_pr_f',
+    phase: 'mode_1_chat_mounted',
     workload_types_at_v1: ['conversational_assistant', 'protocol_execution'],
     workload_types_reserved: ['autonomous_agent', 'multi_agent_supervisor', 'tool_using_agent'],
     autonomy_levels_at_v1: ['advisory', 'suggestion', 'action_with_confirm'],
@@ -62,10 +62,18 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
       'TLC-AI PR E (Conservative Default hardcoded + immutable per AI-GUARD-003; platform-floor compliance validator per AI-GUARD-002; emergency rollback entry point per AI-GUARD-005; Ghana launch program-specific templates wire in alongside their slices)',
     crisis_gate_wired: true,
     crisis_gate_wired_by:
-      'TLC-AI PR F (runCrisisGate exported from module index; wraps the platform-singleton crisisDetector from src/lib/crisis-detection.ts + emits crisis_detection_trigger Category A audit per AUDIT_EVENTS v5.3; service-callable only — handlers that consume the gate land when Mode 1 chat / Mode 2 case-prep routes go online)',
+      'TLC-AI PR F (runCrisisGate exported from module index; wraps the platform-singleton crisisDetector from src/lib/crisis-detection.ts + emits crisis_detection_trigger Category A audit per AUDIT_EVENTS v5.3; service-callable only — consumed by the Mode 1 chat handler which runs the I-019 input gate per request)',
+    // Per-handler mount state (precise; supersedes the single
+    // `handlers_wired` rollup which only flips true at full-surface
+    // readiness). Mode 1 chat is live; Mode 2 case-prep remains the
+    // sole un-mounted documented handler.
+    mode_1_chat_handler_mounted: true,
+    mode_1_chat_handler_mounted_by:
+      'TLC-AI Mode 1 chat handler MOUNTED 2026-05-15 (POST /v0/ai/chat); full lifecycle wired — I-019 input crisis gate (Cat A audit) → Conservative Default guardrail → provider via NullLLMProvider (AI-RESIL-001 fail-soft) → FLOOR-020 Cat C response audit; patient-only + delegate-reject gates; tenant-blind errors; idempotent execution',
+    mode_2_case_prep_handler_mounted: false,
     handlers_wired: false,
     handlers_wired_tracking:
-      'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
+      'Mode 1 chat MOUNTED (see mode_1_chat_handler_mounted); provider abstraction, guardrail templates, and crisis gate all wired (see the respective *_wired flags above). Sole remaining documented handler: PR C (Mode 2 case-prep, POST /v0/ai/case-prep) — gated on the protocol-engine integration that drives the I-012 reject-unless three-clause rule at the downstream prescribing boundary. handlers_wired flips true only when Mode 2 case-prep mounts.',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -83,16 +91,20 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     return reply.code(503).send({
       status: 'not_ready',
       module: 'ai-service',
-      phase: 'crisis_gate_wired_pr_f',
-      pending:
-        'PR C (Mode 2 case-prep stub) + PR D (Anthropic provider) + PR E (guardrail templates) + PR F (crisis detection)',
+      phase: 'mode_1_chat_mounted',
+      pending: 'PR C (Mode 2 case-prep, POST /v0/ai/case-prep)',
       pending_message:
-        'Module is not yet ready to serve traffic — only the scaffold + branded ID types ' +
-        '(AIChatSessionId / AIWorkflowExecutionId / GuardrailTemplateId) are wired at PR A. ' +
-        'Mode 1 chat (POST /v0/ai/chat), Mode 2 case-prep (POST /v0/ai/case-prep), real ' +
-        'Anthropic provider integration, guardrail-template repo + Conservative Default ' +
-        'enforcement, and crisis-detection scaffold (FLOOR-009 / I-019 platform-floor) all ' +
-        'land in subsequent PRs. Per AI_LAYERING v5.2 §2 + ADR-029, the v1.0 workload ' +
+        'Module is not yet ready to serve traffic — the AI surface is partial. Mode 1 chat ' +
+        '(POST /v0/ai/chat) is MOUNTED, and the provider abstraction, guardrail templates ' +
+        '(Conservative Default), and crisis-detection gate (FLOOR-009 / I-019 platform-floor) ' +
+        'are all wired. The sole remaining documented handler is Mode 2 case-prep ' +
+        '(POST /v0/ai/case-prep), gated on the protocol-engine integration that drives the ' +
+        'I-012 reject-unless three-clause rule at the downstream prescribing boundary. ' +
+        'Per the readiness-flip precedent (async-consult + pharmacy), /ready stays 503 until ' +
+        'the FULL documented surface is live; a partial surface is intentionally not ' +
+        'readiness-acceptable. Separately, real Anthropic / Bedrock / Azure OpenAI adapters ' +
+        'replace the v1.0 NullLLMProvider when secrets management is resolved. Per ' +
+        'AI_LAYERING v5.2 §2 + ADR-029, the v1.0 workload ' +
         'taxonomy admits exactly two active types: conversational_assistant and ' +
         'protocol_execution; reserved types (autonomous_agent, multi_agent_supervisor, ' +
         'tool_using_agent) require a successor ADR + activation audit event before code ' +

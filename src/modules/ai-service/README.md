@@ -1,26 +1,28 @@
-# AI Service module — crisis_gate_wired_pr_f
+# AI Service module — mode_1_chat_mounted
 
-## Status (post-PR F merge: 2026-05-14)
+## Status (Mode 1 chat mounted: 2026-05-15; post-PR F crisis-gate merge: 2026-05-14)
 
-This module hosts the Telecheck platform's two-mode AI surface per **AI Clinical Assistant Slice PRD v1.0** + **AI_LAYERING v5.2**. After PRs A–F, every safety primitive needed for live AI handlers is in place; **handlers are NOT mounted** pending three external dependencies (see "What's NOT live" below).
+This module hosts the Telecheck platform's two-mode AI surface per **AI Clinical Assistant Slice PRD v1.0** + **AI_LAYERING v5.2**. After PRs A–F, every safety primitive needed for live AI handlers is in place. **Mode 1 chat (`POST /v0/ai/chat`) is MOUNTED**; **Mode 2 case-prep (`POST /v0/ai/case-prep`) is NOT mounted** pending the protocol-engine integration that drives the I-012 reject-unless rule (see "What's NOT live" below).
 
-### `/v0/ai/health` reports `phase: 'crisis_gate_wired_pr_f'`
+### `/v0/ai/health` reports `phase: 'mode_1_chat_mounted'`
 
 ```json
 {
   "status": "ok",
   "module": "ai-service",
-  "phase": "crisis_gate_wired_pr_f",
+  "phase": "mode_1_chat_mounted",
   "workload_types_at_v1": ["conversational_assistant", "protocol_execution"],
   "workload_types_reserved": ["autonomous_agent", "multi_agent_supervisor", "tool_using_agent"],
   "autonomy_levels_at_v1": ["advisory", "suggestion", "action_with_confirm"],
   "autonomy_levels_reserved": ["action_with_audit_only", "fully_autonomous"],
+  "mode_1_chat_handler_mounted": true,
+  "mode_2_case_prep_handler_mounted": false,
   "handlers_wired": false,
-  "handlers_wired_tracking": "see /ready body for the unblockers"
+  "handlers_wired_tracking": "Mode 1 chat mounted; provider/guardrails/crisis-gate wired. Sole remaining handler: Mode 2 case-prep (PR C)."
 }
 ```
 
-`/v0/ai/ready` returns **503** with structured unblocker fields until a future PR mounts handlers.
+`/v0/ai/ready` returns **503** with structured unblocker fields until the FULL documented surface (Mode 2 case-prep included) is live — per the async-consult + pharmacy readiness-flip precedent, a partial surface is intentionally not readiness-acceptable.
 
 ## What's live (PRs A–F)
 
@@ -46,7 +48,7 @@ This module hosts the Telecheck platform's two-mode AI surface per **AI Clinical
 
 ## What's NOT live (deliberately, by design)
 
-The `POST /v0/ai/chat` (Mode 1) and `POST /v0/ai/case-prep` (Mode 2) routes return **404** by design. Mounting them is the Codex PR B R2 CRITICAL closure — handlers cannot validate-and-reject before crisis detection fires. Mounting blocks on:
+The `POST /v0/ai/case-prep` (Mode 2) route returns **404** by design. (`POST /v0/ai/chat` — Mode 1 — is now MOUNTED as of 2026-05-15; it runs the I-019 input crisis gate before any LLM call per the Codex PR B R2 CRITICAL closure.) Mode 1 chat currently degrades to the AI-RESIL-001 fail-soft envelope on every non-crisis request because the only registered provider is `NullLLMProvider`. Mounting Mode 2 case-prep, and replacing the Null provider with real adapters, blocks on:
 
 1. **Anthropic SDK + secrets management** — `NullLLMProvider` is the only registered provider. Real adapters (Anthropic primary, Bedrock + Azure OpenAI for resilience per ADR-020) need AWS Secrets Manager setup + per-tenant KMS key derivation contract.
 2. **Clinical-grade NLP crisis classifier** — `src/lib/crisis-detection.ts` is a v1.0 keyword stub. The file-level open-question requires AI Safety Lead sign-off before patient-facing deployment.
@@ -171,6 +173,6 @@ src/modules/ai-service/
 
 ## Integration tests
 
-- `tests/integration/ai-service-plugin-wiring.test.ts` — `/health`, `/ready`, `/chat`/`/case-prep` 404, tenant-blind probes
+- `tests/integration/ai-service-plugin-wiring.test.ts` — `/health`, `/ready`, `/chat` MOUNTED (401 unauth, not 404), `/case-prep` 404, tenant-blind probes
 - `tests/integration/ai-service-guardrails.test.ts` — Conservative Default immutability + platform-floor validator
 - `tests/integration/ai-service-crisis-gate.test.ts` — 30+ test cases covering all 16 R-closures: no-crisis path, positive Mode 1/Mode 2 emissions, workload-envelope correctness, idempotency dedupe (single + multi-resource + multi-segment), wiring-error fallback, PHI-leak protection across audit + log, tenant equality, discriminator shape validation, required-field substitution, operational signaling
