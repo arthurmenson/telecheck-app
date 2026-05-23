@@ -99,8 +99,18 @@ function makeFakeTx(): FakeTx {
 }
 
 function makeReq(opts?: { actorNonce?: string | undefined }): FastifyRequest {
+  // Minimal Fastify httpErrors mock — only the methods the handler calls
+  // are populated; each returns a typed Error with statusCode set per
+  // @fastify/sensible convention (the production plugin is registered in
+  // src/app.ts; tests don't bootstrap the full Fastify instance).
+  const httpErrors = {
+    forbidden: (msg?: string) => Object.assign(new Error(msg ?? 'Forbidden'), { statusCode: 403 }),
+    notFound: (msg?: string) => Object.assign(new Error(msg ?? 'Not Found'), { statusCode: 404 }),
+    badRequest: (msg?: string) => Object.assign(new Error(msg ?? 'Bad Request'), { statusCode: 400 }),
+  };
   return {
     actorNonce: opts?.actorNonce,
+    server: { httpErrors },
   } as unknown as FastifyRequest;
 }
 
@@ -228,11 +238,17 @@ describe('getCrisisOperationalHealthHandler §3 — admin-role guard precedes tx
 });
 
 // ---------------------------------------------------------------------------
-// §4 — wrapper raise propagates (tenant-scope-mismatch / 42501)
+// §4 — wrapper raise propagates as tenant-blind 403 (42501 mapping)
+//      R1 HIGH-1 closure 2026-05-23: previously this test asserted the raw
+//      tenant-scope-mismatch message propagated to the global envelope,
+//      which violated I-025 by leaking tenant IDs in the response body in
+//      non-prod. Updated to assert 42501 is mapped to a tenant-blind 403
+//      via req.server.httpErrors.forbidden() with a generic message that
+//      contains no tenant identifiers.
 // ---------------------------------------------------------------------------
 
-describe('getCrisisOperationalHealthHandler §4 — wrapper error propagation', () => {
-  it('§4a wrapper-side tenant-scope-mismatch (42501) propagates so withTransaction rolls back', async () => {
+describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501 → 403)', () => {
+  it('§4a wrapper-side 42501 (tenant-scope mismatch / missing actor) maps to 403 tenant-blind; raw PG message + tenant IDs are NOT leaked', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
@@ -245,12 +261,46 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error propagation', 
     );
     tx.query.mockRejectedValueOnce(wrapperError);
 
+    let thrown: unknown;
+    try {
+      await getCrisisOperationalHealthHandler(
+        makeReq({ actorNonce: 'fake-nonce' }),
+        makeReply(),
+      );
+    } catch (e) {
+      thrown = e;
+    }
+
+    expect(thrown).toBeDefined();
+    // Asserted as Fastify forbidden — statusCode 403, generic message.
+    const errObj = thrown as { statusCode?: number; message?: string };
+    expect(errObj.statusCode).toBe(403);
+    // Critical I-025 invariant: message must NOT contain tenant identifiers
+    // or raw SQLSTATE/wrapper details from the upstream PG error.
+    expect(errObj.message ?? '').not.toContain('Telecheck-US');
+    expect(errObj.message ?? '').not.toContain('Telecheck-Ghana');
+    expect(errObj.message ?? '').not.toContain('tenant scope mismatch');
+    expect(errObj.message ?? '').not.toContain('42501');
+    // The generic message can mention "scope" but no tenant ids.
+    expect(errObj.message ?? '').toMatch(/scope|forbidden|insufficient/i);
+  });
+
+  it('§4b non-42501 PG errors propagate unchanged (so withTransaction rolls back + global envelope formats as 500)', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+
+    const otherPgError = Object.assign(
+      new Error('connection terminated unexpectedly'),
+      { code: '57P01' }, // admin_shutdown
+    );
+    tx.query.mockRejectedValueOnce(otherPgError);
+
     await expect(
       getCrisisOperationalHealthHandler(
         makeReq({ actorNonce: 'fake-nonce' }),
         makeReply(),
       ),
-    ).rejects.toThrow(/tenant scope mismatch/);
+    ).rejects.toThrow(/connection terminated/);
   });
 });
 

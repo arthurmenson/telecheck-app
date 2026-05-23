@@ -178,10 +178,20 @@ export async function getCrisisOperationalHealthHandler(
       //
       // For the v0.1 handler we treat the missing-nonce case as fail-
       // closed: the wrapper itself enforces "no actor → reject", so we
-      // simply let it raise; the global error envelope translates 42501
-      // into a tenant-blind 401/403 per I-025. Skipping the
-      // withActorContext call when the nonce is undefined leaves the
-      // GUC unset — which is the correct fail-closed posture.
+      // let it raise + this handler maps 42501 to a tenant-blind 403
+      // per I-025 (see R1 HIGH-1 closure below).
+      //
+      // **R1 HIGH-1 closure 2026-05-23:** an earlier comment here claimed
+      // "the global error envelope translates 42501 into a tenant-blind
+      // 401/403 per I-025" — that was incorrect. The global error envelope
+      // (src/lib/error-envelope.ts buildErrorEnvelope) derives statusCode
+      // from `error.statusCode ?? 500`; pg errors do not carry statusCode,
+      // so an uncaught 42501 became a 500. In non-prod the raw PG message
+      // — which may include tenant_id — was exposed to the client,
+      // violating I-025. Fix: catch SQLSTATE 42501 around the SECDEF call
+      // and throw a 403 via req.server.httpErrors.forbidden(), which the
+      // envelope formats as a canonical insufficient-scope response
+      // without tenant identifiers. Other PG errors propagate unchanged.
       const runWrapper = async (): Promise<CrisisOperationalHealthRow[]> => {
         return withDbRole(tx, 'admin_basic_operator', async () => {
           // The wrapper signature is
@@ -191,11 +201,23 @@ export async function getCrisisOperationalHealthHandler(
           // body persists this into admin_dashboard_query_execution.
           // Future iterations may surface query filters from URL query
           // string (e.g., ?severity=high) and forward them here.
-          const result = await tx.query<CrisisOperationalHealthRow>(
-            'SELECT * FROM read_admin_crisis_operational_health($1, $2)',
-            [ctx.tenantId, {}],
-          );
-          return result.rows;
+          try {
+            const result = await tx.query<CrisisOperationalHealthRow>(
+              'SELECT * FROM read_admin_crisis_operational_health($1, $2)',
+              [ctx.tenantId, {}],
+            );
+            return result.rows;
+          } catch (err) {
+            if (
+              typeof err === 'object' &&
+              err !== null &&
+              'code' in err &&
+              (err as { code?: unknown }).code === '42501'
+            ) {
+              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+            }
+            throw err;
+          }
         });
       };
 
