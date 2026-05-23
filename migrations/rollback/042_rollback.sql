@@ -57,16 +57,16 @@ BEGIN
         );
     END IF;
 
-    -- Verify the function is actually gone. If still present, abort before
-    -- revoking writer-owner's table-level grants (those grants are required
-    -- for the still-installed function's body to execute).
-    SELECT EXISTS (
-        SELECT 1
-          FROM pg_proc p
-          JOIN pg_namespace n ON n.oid = p.pronamespace
-         WHERE n.nspname = 'public'
-           AND p.proname = 'record_forms_template_admin_review_transition'
-    ) INTO v_function_still_present;
+    -- Verify the EXACT target signature is actually gone. R2 MED-1 closure
+    -- 2026-05-22 (Codex R2): use signature-exact to_regprocedure check, NOT
+    -- a name-only pg_proc predicate. A name-only check would treat the
+    -- rollback as blocked under a same-name overload that is unrelated to
+    -- our target signature, stranding writer-owner table grants. The
+    -- forward migration uses to_regprocedure for the canonical OID
+    -- invariant; the rollback must use the same shape.
+    v_function_still_present := to_regprocedure(
+        'public.record_forms_template_admin_review_transition(text, uuid, text, text, text, text, jsonb)'
+    ) IS NOT NULL;
 
     IF v_function_still_present THEN
         RAISE EXCEPTION
@@ -88,25 +88,25 @@ BEGIN
 END $$;
 
 -- =============================================================================
--- Post-rollback verification: function should be absent.
+-- Post-rollback verification: EXACT target signature should be absent.
+-- R2 MED-1 closure 2026-05-22 (Codex R2): signature-exact check via
+-- to_regprocedure, NOT name-only pg_proc predicate, so unrelated same-name
+-- overloads do not produce spurious warnings.
 -- =============================================================================
 DO $$
 DECLARE
     v_function_present BOOLEAN;
 BEGIN
-    SELECT EXISTS (
-        SELECT 1
-          FROM pg_proc p
-          JOIN pg_namespace n ON n.oid = p.pronamespace
-         WHERE n.nspname = 'public'
-           AND p.proname = 'record_forms_template_admin_review_transition'
-    ) INTO v_function_present;
+    v_function_present := to_regprocedure(
+        'public.record_forms_template_admin_review_transition(text, uuid, text, text, text, text, jsonb)'
+    ) IS NOT NULL;
 
     IF v_function_present THEN
         RAISE WARNING
             'migration-042-rollback-incomplete: '
-            'record_forms_template_admin_review_transition() unexpectedly '
-            'remains in public schema. The DO-block guard above should have '
-            'aborted before reaching this verification — investigate.';
+            'record_forms_template_admin_review_transition(text, uuid, text, '
+            'text, text, text, jsonb) unexpectedly remains in public schema. '
+            'The DO-block guard above should have aborted before reaching '
+            'this verification — investigate.';
     END IF;
 END $$;
