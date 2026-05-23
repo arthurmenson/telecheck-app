@@ -61,7 +61,7 @@ afterAll(async () => {
 });
 
 describe('crisis-response slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/crisis-events/health returns 200 (liveness — module alive) with Sprint 2 v0.4 metadata', async () => {
+  it('§1a GET /v0/crisis-events/health returns 200 (liveness — module alive) with Sprint 2 v0.5 metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/crisis-events/health',
@@ -76,7 +76,7 @@ describe('crisis-response slice — §1 plugin wiring', () => {
     };
     expect(body.status).toBe('ok');
     expect(body.module).toBe('crisis-response');
-    expect(body.blocked).toContain('Sprint 2 of 4 at v0.4');
+    expect(body.blocked).toContain('Sprint 2 of 4 at v0.5');
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 038');
   });
 
