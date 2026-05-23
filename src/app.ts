@@ -280,16 +280,21 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
 
   // Medication Interaction & Validation Engine (SI-019 v2.0 + CDM v1.6 → v1.7
   // Amendment; RATIFIED P-033 + P-034 2026-05-21). Spec layer COMPLETE; DB
-  // layer at PR 1 of ~6: migration 046 has shipped the 12 net-new RBAC roles
-  // (4 application + 6 wrapper-owner + 2 service-level-owner). Sprint 1
-  // (this commit) registers /health (200) + /ready (503) so app-level wiring
-  // works as subsequent PRs land; PR 2 adds 4 entities + RLS + triggers,
-  // PR 3 adds 1 SECURITY BARRIER view + 1 optional MV + SECDEF access
-  // function, PR 4 adds raw lifecycle writer SECDEF, PR 5 adds 6 reason-
-  // specific lifecycle wrappers, PR 6+ adds Fastify handlers (8 endpoints
-  // per SI-019 §5 + CDM §6 OpenAPI v0.3) + Cat A audit emission + LAYER B
-  // role-membership check. See src/modules/med-interaction/README.md +
-  // docs/med-interaction-implementation-plan.md.
+  // layer COMPLETE through migration 050 (PRs 1-5 merged; 21 Codex
+  // adversarial-review rounds total): 12 RBAC roles (046) + 4 entities + RLS
+  // + per-table append-only + server-assigned monotonic-ordering triggers
+  // (047) + 1 SECURITY BARRIER view + 1 optional MV + SECDEF access function
+  // with MV access-discipline (048) + raw lifecycle writer SECDEF + anti-
+  // bypass EXECUTE matrix + STEP-3.5 advisory-locked activation-override-
+  // evidence check (049) + 6 reason-specific wrappers (050; 3 operational
+  // emission/activation/supersession + 3 fail-closed resolution/expiry/
+  // override pending evidence-source migrations from Async Consult / Pharmacy
+  // / LAYER B). Sprint 1 PR 6 of 6 (current scaffold-update commit) registers
+  // /health (200) + /ready (503) reflecting the post-DB-layer state; PR 7+
+  // adds Fastify handlers (8 endpoints per SI-019 §5 + CDM §6 OpenAPI v0.3)
+  // + Cat A audit emission + LAYER B role-membership check. See
+  // src/modules/med-interaction/README.md + docs/med-interaction-
+  // implementation-plan.md.
   // Platform-floor hard rule (I-002): the interaction engine runs BEFORE
   // clinician commits a medication_request (Master PRD v1.10 §7).
   await app.register(medInteractionPlugin);

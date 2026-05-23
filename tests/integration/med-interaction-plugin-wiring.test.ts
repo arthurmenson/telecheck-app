@@ -1,14 +1,22 @@
 /**
  * med-interaction slice — plugin wiring smoke test.
  *
- * Sprint 1 / PR 1 of the post-P-033/P-034 ratified Med-Interaction Engine
- * implementation series (RBAC roles + scaffold update).
+ * Sprint 1 / PR 6 of 6 (the final DB-layer scaffold-update PR) of the
+ * post-P-033/P-034 ratified Med-Interaction Engine implementation series.
  *
  * Spec layer COMPLETE: SI-019 Med-Interaction Engine Slice PRD v2.0
  * RATIFIED 2026-05-21 P-033 + CDM v1.6 → v1.7 + AUDIT_EVENTS v5.8 → v5.9
  * + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 + RBAC v1.1 → v1.2
- * RATIFIED P-034. DB layer at PR 1 of ~6: migration 046 ships 12 net-new
- * RBAC roles (4 application + 6 wrapper-owner + 2 service-level-owner).
+ * RATIFIED P-034. DB layer COMPLETE through migration 050 (PRs 1-5 merged;
+ * 21 Codex adversarial-review rounds total): 12 RBAC roles (046) +
+ * 4 entities + RLS + per-table append-only + server-assigned monotonic-
+ * ordering triggers (047) + SECURITY BARRIER view + optional MV + SECDEF
+ * access function with MV access-discipline (048) + raw lifecycle writer
+ * SECDEF + anti-bypass EXECUTE matrix + STEP-3.5 advisory-locked
+ * activation-override-evidence check (049) + 6 reason-specific wrappers
+ * (050; 3 operational + 3 fail-closed pending evidence-source migrations).
+ * Subsequent PRs (7+) land Fastify handler implementation + Cat A audit
+ * emission + LAYER B role-membership check + integration tests.
  *
  * At this PR we ship the directory + plugin shell so that:
  *   1. The module boundary (per ADR-001) is established
@@ -75,6 +83,14 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     expect(body.blocked_message).toContain('Spec layer COMPLETE');
     expect(body.blocked_message).toContain('P-033');
     expect(body.blocked_message).toContain('P-034');
+    // Post-PR-5: DB layer COMPLETE through migration 050. Anti-drift guard
+    // for the merged-PR count (Codex R1 finding 2026-05-23): only PRs 1-5
+    // of the DB-layer series are merged; PR 6 IS the scaffold-update
+    // commit that ships this payload, so it cannot also assert itself
+    // merged. The forbidden-substring check below catches that drift.
+    expect(body.blocked_message).toContain('DB layer COMPLETE through migration 050');
+    expect(body.blocked_message).toContain('PRs 1-5 merged');
+    expect(body.blocked_message).not.toContain('6 PRs merged');
   });
 
   it('§1b GET /v0/med-interaction/ready returns 503 (handlers not yet mounted) with implementation-pending reason', async () => {
@@ -95,6 +111,9 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     // Post-P-033/P-034 ratification — distinct from a hypothetical
     // ratification-blocked reason.
     expect(body.reason).toBe('handlers_not_yet_implemented');
-    expect(body.reason_message).toContain('PR 6+');
+    expect(body.reason_message).toContain('PR 7+');
+    // Post-PR-5: DB layer COMPLETE through migration 050; the only
+    // remaining gap is the Fastify HTTP surface.
+    expect(body.reason_message).toContain('DB layer COMPLETE through migration 050');
   });
 });

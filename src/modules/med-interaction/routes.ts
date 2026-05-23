@@ -1,28 +1,50 @@
 /**
  * med-interaction/routes.ts — Fastify route registration (Sprint 1 skeleton).
  *
- * Status at v0.1 (Sprint 1 — this commit): SKELETON — only `/health` (200) +
- * `/ready` (503) are mounted. Liveness/readiness split applies the canonical
- * BLOCKED-aware pattern from pharmacy / med-interaction's own prior skeleton /
- * subscription / async-consult / crisis-response / admin-backend modules.
+ * Status at v0.1 (post-PR-1-5 DB-layer COMPLETE; this commit = PR 6 of 6
+ * for the Med-Interaction DB-layer series): SKELETON — only `/health`
+ * (200) + `/ready` (503) are mounted. Liveness/readiness split applies
+ * the canonical BLOCKED-aware pattern from pharmacy / med-interaction's
+ * own prior skeleton / subscription / async-consult / crisis-response /
+ * admin-backend modules.
  *
- * Post-P-033/P-034 ratified state (2026-05-21): the Med-Interaction slice
- * PRD is RATIFIED at v2.0 + CDM v1.6 → v1.7 + AUDIT_EVENTS v5.8 → v5.9 +
- * OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 + RBAC v1.1 → v1.2
- * are all RATIFIED. PR 1 (this commit) lands the 12 net-new RBAC roles
- * (migration 046). Subsequent PRs land:
- *   PR 2: 4 entities (interaction_engine_evaluation +
- *         interaction_signal + interaction_signal_override +
- *         interaction_signal_lifecycle_transition) + RLS + per-table
- *         append-only triggers
- *   PR 3: 1 SECURITY BARRIER view + 1 optional materialized view +
- *         SECURITY DEFINER access function
- *   PR 4: raw lifecycle writer SECDEF + anti-bypass EXECUTE matrix
- *   PR 5: 5 reason-specific lifecycle wrappers (emission + activation +
- *         supersession + resolution + expiry) + 1 override wrapper
- *   PR 6+: Fastify handler implementation (8 endpoints per SI-019 §5 +
- *          CDM §6 OpenAPI v0.3) + Cat A audit emission + LAYER B
- *          role-membership check + integration tests
+ * Post-P-033/P-034 ratified + DB-layer-implemented state (2026-05-23):
+ * SI-019 Slice PRD v2.0 RATIFIED P-033 + CDM v1.6 → v1.7 + AUDIT_EVENTS
+ * v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 + RBAC
+ * v1.1 → v1.2 RATIFIED P-034 (both 2026-05-21). DB layer COMPLETE through
+ * migration 050:
+ *   - migration 046: 12 net-new RBAC roles (4 application + 6 wrapper-
+ *     owner + 2 service-level-owner)
+ *   - migration 047: 4 entities (interaction_engine_evaluation +
+ *     interaction_signal + interaction_signal_override +
+ *     interaction_signal_lifecycle_transition) + RLS + per-table append-
+ *     only triggers + server-assigned monotonic-ordering trigger with
+ *     state-continuity check + caller-tenant guard (7 Codex rounds)
+ *   - migration 048: 1 SECURITY BARRIER view + 1 optional MV + SECDEF
+ *     access function + MV access-discipline (preflight + immediate
+ *     REVOKE + aclexplode loop + final verifier; 5 Codex rounds)
+ *   - migration 049: raw lifecycle writer SECDEF + anti-bypass EXECUTE
+ *     matrix (6 wrapper-owners) + STEP 3.5 advisory-locked activation-
+ *     override-evidence check (3 Codex rounds)
+ *   - migration 050: 6 reason-specific wrappers (3 operational: emission
+ *     + activation + supersession; 3 fail-closed: resolution + expiry +
+ *     override pending evidence-source migrations) (3 Codex rounds)
+ *
+ * Subsequent PRs (PR 7+) land Fastify handler implementation:
+ *   - POST /v1/med-interaction/evaluations         — initiate evaluation
+ *   - POST /v1/med-interaction/signals             — emit signal
+ *   - POST /v1/med-interaction/signals/:id/activate
+ *   - POST /v1/med-interaction/signals/:id/override
+ *   - POST /v1/med-interaction/signals/:id/resolve  (gated; fail-closed
+ *                                                    wrapper in 050)
+ *   - POST /v1/med-interaction/signals/:id/expire   (gated; fail-closed)
+ *   - POST /v1/med-interaction/signals/:id/supersede
+ *   - GET  /v1/med-interaction/signals/:id          — read via SECDEF
+ *                                                    access function or
+ *                                                    SECURITY BARRIER view
+ *   + Cat A audit emission (6 audit events under medication_interaction.*)
+ *   + LAYER B role-membership check at route layer (SI-024.1 JWT-binding
+ *     deferred per Option 2)
  *
  * Spec references:
  *   - Master PRD v1.10 §7 (interaction engine as platform-floor)
@@ -53,39 +75,48 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
     blocked_message:
       'Spec layer COMPLETE: SI-019 v2.0 RATIFIED 2026-05-21 P-033 + CDM v1.6 → v1.7 ' +
       '+ AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 ' +
-      '+ RBAC v1.1 → v1.2 RATIFIED P-034. DB layer at PR 1 of ~6: migration 046 has ' +
-      'shipped the 12 net-new RBAC roles (4 application + 6 wrapper-owner + 2 ' +
-      'service-level-owner). Subsequent migrations land 4 entities + RLS + triggers ' +
-      '(PR 2), MV + view + access function (PR 3), raw lifecycle writer (PR 4), 5 ' +
-      'reason-specific lifecycle wrappers + override wrapper (PR 5), Fastify handlers ' +
-      '+ Cat A audit emission + LAYER B role-membership check (PR 6+). See ' +
-      'src/modules/med-interaction/README.md + docs/med-interaction-implementation-plan.md.',
+      '+ RBAC v1.1 → v1.2 RATIFIED P-034. DB layer COMPLETE through migration 050 ' +
+      '(PRs 1-5 merged; 21 Codex rounds total): 12 RBAC roles (046) + 4 entities + RLS + ' +
+      'triggers (047) + view + MV + SECDEF access function (048) + raw lifecycle writer ' +
+      'SECDEF + anti-bypass matrix (049) + 6 reason-specific wrappers (050; 3 ' +
+      'operational + 3 fail-closed pending evidence-source migrations). Subsequent ' +
+      'PRs land Fastify handlers + Cat A audit emission + LAYER B role-membership ' +
+      'check. See src/modules/med-interaction/README.md + ' +
+      'docs/med-interaction-implementation-plan.md.',
   }));
 
   // Readiness probe — module is NOT ready to serve traffic at v0.1 because
-  // entities + procedures + handlers haven't landed yet. Returns 503
-  // (Service Unavailable) to advertise BLOCKED state to load-balancers +
-  // deploy gates per the canonical pharmacy / med-interaction's prior
-  // skeleton / subscription / async-consult / crisis-response / admin-
-  // backend pattern. NOT a spec-ratification blocker — SI-019 + CDM v1.7
-  // are RATIFIED — purely an implementation-not-yet-shipped reason.
+  // Fastify handlers haven't landed yet (DB layer is complete; only the
+  // HTTP surface is pending). Returns 503 (Service Unavailable) to
+  // advertise BLOCKED state to load-balancers + deploy gates per the
+  // canonical pharmacy / med-interaction's prior skeleton / subscription
+  // / async-consult / crisis-response / admin-backend pattern.
+  //
+  // NOT a spec-ratification blocker — SI-019 + CDM v1.7 are RATIFIED.
+  // NOT a DB-layer blocker — migrations 046-050 are merged. Purely a
+  // Fastify-route-handler-not-yet-mounted reason. The /ready probe
+  // returns 200 when PR 7+ ships the route handlers + Cat A audit
+  // emission + LAYER B role-membership check + integration tests.
   app.get('/ready', async (_req, reply) => {
     return reply.code(503).send({
       status: 'unavailable',
       module: 'med-interaction',
       reason: 'handlers_not_yet_implemented',
       reason_message:
-        'Med Interaction Engine handlers (8 endpoints per SI-019 §5 + CDM §6: signal-check ' +
-        '+ override-record + lifecycle-action endpoints) are not yet mounted. Spec layer ' +
-        'COMPLETE; Fastify route handlers land in PR 6+. The /ready probe will return 200 ' +
-        'once the full PR series (entities → views → raw writer → wrappers → handlers + ' +
-        'audit emission + LAYER B role check + integration tests) closes. See ' +
-        'src/modules/med-interaction/README.md for the resume path.',
+        'Med Interaction Engine Fastify handlers (8 endpoints per SI-019 §5 + CDM §6: ' +
+        'evaluation initiation + signal lifecycle actions + signal read) are not yet ' +
+        'mounted. Spec layer COMPLETE; DB layer COMPLETE through migration 050; ' +
+        'Fastify route handlers land in PR 7+. The /ready probe will return 200 once ' +
+        'the full PR series (Fastify handlers + Cat A audit emission + LAYER B role ' +
+        'check + integration tests) closes. See src/modules/med-interaction/README.md ' +
+        'for the resume path.',
     });
   });
 
-  // Real routes (POST /signals/check, POST /overrides, GET /rulesets/:id, etc.)
-  // land in PR 6+ when handler / adapter / service authoring begins. The
-  // handler surface is intentionally absent here so that any premature wiring
-  // breaks at typecheck time rather than reaching production half-built.
+  // Real routes (POST /v1/med-interaction/evaluations, POST .../signals,
+  // POST .../signals/:id/activate, override, resolve, expire, supersede,
+  // GET .../signals/:id) land in PR 7+ when handler / adapter / service
+  // authoring begins. The handler surface is intentionally absent here so
+  // that any premature wiring breaks at typecheck time rather than
+  // reaching production half-built.
 };
