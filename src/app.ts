@@ -30,6 +30,7 @@ import { tenantContextPlugin } from './lib/tenant-context.js';
 import { aiServicePlugin } from './modules/ai-service/index.js';
 import { asyncConsultPlugin } from './modules/async-consult/index.js';
 import { consentPlugin } from './modules/consent/plugin.js';
+import { crisisResponsePlugin } from './modules/crisis-response/index.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
 import {
   assertNoPublishGateBypassAtBoot,
@@ -313,6 +314,16 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // full integration + audit + domain event emitters. See
   // src/modules/async-consult/README.md for the multi-sprint sequencing.
   await app.register(asyncConsultPlugin);
+
+  // Crisis Response Slice (SI-022) — routes mounted under /v0/crisis-events.
+  // DB layer COMPLETE through migration 038 (6 tables + 2 views + 6 SECDEF
+  // procedures + 15 RBAC roles + 18 rounds of Codex APPROVE). Sprint 1
+  // (this commit) registers /health (200) + /ready (503) so app-level
+  // wiring works; Sprint 2+ adds initiate/acknowledge/respond/resolve/sweep
+  // handlers + Cat A audit emission + KMS envelope for intake_payload. See
+  // src/modules/crisis-response/README.md +
+  // docs/crisis-response-implementation-plan.md for the multi-sprint plan.
+  await app.register(crisisResponsePlugin);
 
   // ----------------------------------------------------------
   // Health endpoint (only real route at bootstrap)
