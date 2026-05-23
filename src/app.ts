@@ -214,6 +214,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/subscription/ready',
       '/v0/async-consult/health',
       '/v0/async-consult/ready',
+      '/v0/crisis-events/health',
+      '/v0/crisis-events/ready',
       '/v0/admin/ready',
       '/v0/ai/health',
       '/v0/ai/ready',

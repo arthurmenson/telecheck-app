@@ -100,4 +100,27 @@ describe('crisis-response slice — §1 plugin wiring', () => {
     });
     expect(r.statusCode).toBe(404);
   });
+
+  // R1 MED closure 2026-05-22 (PR 7 Codex review): probe paths must reach
+  // the handler WITHOUT relying on a resolvable Host header. tenantContextPlugin
+  // rejects unresolvable Hosts before the handler runs — so the probe must be
+  // in `allowlistedPaths`. These tests assert the allowlist actually bypasses
+  // tenant resolution for the new probes (would fail with 400 otherwise).
+  it('§1d GET /v0/crisis-events/health works without a resolvable Host header (allowlisted)', async () => {
+    const r = await app!.inject({
+      method: 'GET',
+      url: '/v0/crisis-events/health',
+      headers: { host: 'unresolved.load-balancer.invalid' },
+    });
+    expect(r.statusCode).toBe(200);
+  });
+
+  it('§1e GET /v0/crisis-events/ready works without a resolvable Host header (allowlisted)', async () => {
+    const r = await app!.inject({
+      method: 'GET',
+      url: '/v0/crisis-events/ready',
+      headers: { host: 'unresolved.load-balancer.invalid' },
+    });
+    expect(r.statusCode).toBe(503);
+  });
 });
