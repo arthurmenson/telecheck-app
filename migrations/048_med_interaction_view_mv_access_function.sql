@@ -91,12 +91,23 @@ SELECT DISTINCT ON (tenant_id, signal_id)
 FROM interaction_signal_lifecycle_transition
 ORDER BY tenant_id, signal_id, transition_at DESC, id DESC;
 
-CREATE UNIQUE INDEX interaction_signal_current_state_mv_pk
-    ON interaction_signal_current_state_mv (tenant_id, signal_id);
-
+-- R1 HIGH-1 closure 2026-05-23 (Codex R1): REVOKE PUBLIC immediately after
+-- CREATE, BEFORE creating the unique index or any other statement. In
+-- autocommit migration-runner mode, each statement commits independently;
+-- if the database has permissive ALTER DEFAULT PRIVILEGES granting SELECT
+-- on tables/views to PUBLIC (or to broad app roles), the MV created in the
+-- prior statement would carry those defaults until this REVOKE runs.
+-- Because PG MVs do not enforce source-table RLS, that intermediate state
+-- would briefly expose every tenant's current state to any session with
+-- the default-granted SELECT. Tightening the REVOKE to fire immediately
+-- after CREATE collapses the leak window to the minimum statement gap
+-- (or eliminates it entirely under transactional migration runners).
 REVOKE ALL ON interaction_signal_current_state_mv FROM PUBLIC;
 GRANT SELECT ON interaction_signal_current_state_mv
     TO interaction_signal_mv_refresh_owner;
+
+CREATE UNIQUE INDEX interaction_signal_current_state_mv_pk
+    ON interaction_signal_current_state_mv (tenant_id, signal_id);
 
 COMMENT ON MATERIALIZED VIEW interaction_signal_current_state_mv IS
     'CDM v1.7 §4.NEW5 optional MV for read-path optimization. Non-authoritative; '
@@ -286,5 +297,87 @@ BEGIN
             'migration-048-access-function-search-path-not-locked: '
             'get_interaction_signal_current_state MUST have proconfig containing '
             '"search_path=pg_catalog, public"; found %', v_function_proconfig;
+    END IF;
+END $$;
+
+-- =============================================================================
+-- §5 — MV access-discipline verification (R1 HIGH-1 closure 2026-05-23)
+--
+-- Codex R1 flagged that the MV creation has a potential window under
+-- autocommit migration-runner mode where default ALTER DEFAULT PRIVILEGES
+-- could briefly grant SELECT to PUBLIC or broad roles. The R1 closure
+-- moved the REVOKE FROM PUBLIC to fire immediately after CREATE
+-- MATERIALIZED VIEW (before CREATE UNIQUE INDEX); this block additionally
+-- asserts the post-migration end state: the MV must have NO PUBLIC
+-- grants AND exactly ONE non-self grantee (interaction_signal_mv_refresh_owner).
+-- The verification fails the migration if a permissive default-ACL
+-- environment leaked a grant through to the final state — catching the
+-- worst-case scenario even when the migration-runner ordering doesn't
+-- prevent the transient window.
+-- =============================================================================
+
+DO $$
+DECLARE
+    v_mv_oid                   OID := to_regclass('public.interaction_signal_current_state_mv');
+    v_unexpected_grantee       TEXT;
+    v_unexpected_grantee_count INTEGER;
+    v_mv_owner_name            TEXT;
+BEGIN
+    IF v_mv_oid IS NULL THEN
+        RAISE EXCEPTION
+            'migration-048-mv-verify-missing: '
+            'interaction_signal_current_state_mv not found for access-discipline check';
+    END IF;
+
+    -- Resolve MV owner role (relacl + relowner; relacl encodes grantees
+    -- including the owner-self grant).
+    SELECT r.rolname
+      INTO v_mv_owner_name
+      FROM pg_class c
+      JOIN pg_roles r ON r.oid = c.relowner
+     WHERE c.oid = v_mv_oid;
+
+    -- Assert no PUBLIC grant. ACL encoding: PUBLIC grantee shows as empty
+    -- string in aclexplode(); we check for any grant with grantee role oid 0
+    -- (= PUBLIC).
+    PERFORM 1
+      FROM pg_class c, aclexplode(c.relacl) acl
+     WHERE c.oid = v_mv_oid
+       AND acl.grantee = 0
+       AND acl.privilege_type = 'SELECT';
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'migration-048-mv-public-grant-violation: '
+            'interaction_signal_current_state_mv has SELECT granted to PUBLIC '
+            '(via ALTER DEFAULT PRIVILEGES or otherwise). MV must be REVOKEd '
+            'from PUBLIC per R1 HIGH-1 closure — direct PUBLIC access bypasses '
+            'tenant isolation since MVs do not enforce source-table RLS.';
+    END IF;
+
+    -- Assert exactly ONE non-owner grantee (interaction_signal_mv_refresh_owner).
+    -- Owner-self grant is implicit + does not appear in relacl explicitly when
+    -- the role hasn't been GRANT-modified; we filter to exclude both the owner
+    -- and the PUBLIC pseudo-role.
+    SELECT COUNT(DISTINCT acl.grantee), MIN(r.rolname)
+      INTO v_unexpected_grantee_count, v_unexpected_grantee
+      FROM pg_class c
+      JOIN aclexplode(c.relacl) acl ON TRUE
+      JOIN pg_roles r ON r.oid = acl.grantee
+     WHERE c.oid = v_mv_oid
+       AND acl.privilege_type = 'SELECT'
+       AND acl.grantee <> c.relowner
+       AND acl.grantee <> 0  -- PUBLIC
+       AND r.rolname <> 'interaction_signal_mv_refresh_owner';
+
+    IF v_unexpected_grantee_count > 0 THEN
+        RAISE EXCEPTION
+            'migration-048-mv-unexpected-grantee: '
+            'interaction_signal_current_state_mv has SELECT granted to '
+            'unexpected role(s); first found: %; canonical grantees are '
+            'OWNER (interaction_signal_mv_refresh_owner) + self only. '
+            'App roles must read via interaction_signal_current_state_v '
+            '(SECURITY BARRIER view) or get_interaction_signal_current_state() '
+            '(SECDEF access function), never directly.',
+            v_unexpected_grantee;
     END IF;
 END $$;
