@@ -1,19 +1,24 @@
 /**
  * crisis-response/routes.ts — Fastify route registration.
  *
- * Status at v0.2 (Sprint 2 PR 1 — this commit): FIRST REAL HANDLER lands.
+ * Status at v0.3 (Sprint 2 PR 2 — this commit): FIRST WRITE-PATH HANDLER lands.
  *
  * Mounted under plugin prefix `/v0/crisis-events`:
  *   GET    /health                                 — liveness (200)
  *   GET    /ready                                  — readiness (503; remaining
  *                                                    Sprint 2-3 endpoints not
  *                                                    yet mounted)
+ *   POST   /                                       — initiate via SECDEF wrapper
+ *                                                    record_crisis_initiation()
+ *                                                    + Cat A crisis.detected
+ *                                                    audit emit (same tx;
+ *                                                    FLOOR-020 fail-closed)
+ *                                                    (NEW — Sprint 2 PR 2)
  *   GET    /:id                                    — staff-scoped read via
  *                                                    crisis_event_current_state_v
- *                                                    (NEW — Sprint 2 PR 1)
+ *                                                    (Sprint 2 PR 1)
  *
  * Sprint 2-3 routes (NOT mounted yet; full surface per SI-022):
- *   POST   /                                       — initiate (FLOOR-020 emit)
  *   POST   /:id/acknowledge                        — clinician claim
  *   POST   /:id/respond                            — clinician first-response
  *   POST   /:id/resolve                            — clinician resolution
@@ -36,6 +41,7 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import { getCrisisEventHandler } from './internal/handlers/get-crisis-event.js';
+import { postCrisisEventHandler } from './internal/handlers/post-crisis-event.js';
 
 export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
@@ -46,16 +52,17 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'crisis-response',
-    blocked: 'Crisis Response slice handler implementation (Sprint 2 of 4 at v0.2)',
+    blocked: 'Crisis Response slice handler implementation (Sprint 2 of 4 at v0.3)',
     blocked_message:
       'DB layer COMPLETE through migration 038 (6 tables + 2 views + 6 SECDEF + ' +
-      '15 RBAC roles + 18 Codex APPROVE rounds). Sprint 2 PR 1 (this commit) ' +
-      'lands the FIRST real Fastify handler: GET /v0/crisis-events/:id staff-scoped ' +
-      'read via crisis_event_current_state_v. Remaining Sprint 2-3 handlers ' +
-      '(POST initiate / acknowledge / respond / resolve / sweep; GET patient-scoped) ' +
-      '+ Cat A audit emission + KMS envelope encryption + integration tests land ' +
-      'across follow-up PRs. See src/modules/crisis-response/README.md + ' +
-      'docs/crisis-response-implementation-plan.md.',
+      '15 RBAC roles + 18 Codex APPROVE rounds). Sprint 2 PR 1 landed GET ' +
+      '/v0/crisis-events/:id staff-scoped read. Sprint 2 PR 2 (this commit) ' +
+      'lands the FIRST write-path handler: POST /v0/crisis-events initiate via ' +
+      'record_crisis_initiation() SECDEF wrapper + Cat A crisis.detected audit ' +
+      'emission (same tx; FLOOR-020 fail-closed). Remaining Sprint 2-3 handlers ' +
+      '(acknowledge / respond / resolve / sweep; GET patient-scoped) + KMS envelope ' +
+      'encryption + integration tests land across follow-up PRs. See ' +
+      'src/modules/crisis-response/README.md + docs/crisis-response-implementation-plan.md.',
   }));
 
   // Readiness probe — module is NOT yet fully ready to serve traffic at
@@ -77,6 +84,21 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
         'resume path.',
     });
   });
+
+  // Sprint 2 PR 2 — initiate a crisis event (FIRST write-path handler).
+  //
+  // Composition: requireTenantContext → requireClinicianActorContext →
+  // body validation → resolveActorTenantIdForAudit → withIdempotentExecution
+  // → withTenantContext → (withActorContext when nonce bound) → withDbRole
+  // crisis_initiator → SELECT record_crisis_initiation(...) → emitCrisisDetectedAudit
+  // (same tx; FLOOR-020 fail-closed Cat A).
+  //
+  // Returns 201 + { crisis_event_id } on success, 400 on body validation,
+  // 403 (tenant-blind per I-025; 42501 mapped via R2 MED-1 closure pattern
+  // wrapping ENTIRE withDbRole call) on privilege failure, 409 on
+  // idempotency-mismatch (SQLSTATE 23505 from wrapper) or
+  // Idempotency-Key body-mismatch.
+  app.post('/', postCrisisEventHandler);
 
   // Sprint 2 PR 1 — staff-scoped single-row crisis_event read.
   //
