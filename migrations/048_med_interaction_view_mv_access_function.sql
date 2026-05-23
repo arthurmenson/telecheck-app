@@ -91,18 +91,51 @@ SELECT DISTINCT ON (tenant_id, signal_id)
 FROM interaction_signal_lifecycle_transition
 ORDER BY tenant_id, signal_id, transition_at DESC, id DESC;
 
--- R1 HIGH-1 closure 2026-05-23 (Codex R1): REVOKE PUBLIC immediately after
--- CREATE, BEFORE creating the unique index or any other statement. In
--- autocommit migration-runner mode, each statement commits independently;
--- if the database has permissive ALTER DEFAULT PRIVILEGES granting SELECT
--- on tables/views to PUBLIC (or to broad app roles), the MV created in the
--- prior statement would carry those defaults until this REVOKE runs.
--- Because PG MVs do not enforce source-table RLS, that intermediate state
--- would briefly expose every tenant's current state to any session with
--- the default-granted SELECT. Tightening the REVOKE to fire immediately
--- after CREATE collapses the leak window to the minimum statement gap
--- (or eliminates it entirely under transactional migration runners).
+-- R1 + R2 HIGH-1 closures 2026-05-23 (Codex R1 + R2): REVOKE PUBLIC AND any
+-- non-canonical grantee immediately after CREATE, BEFORE creating the unique
+-- index or any other statement.
+--
+-- R1 (closed first): under autocommit migration-runner mode, default ALTER
+-- DEFAULT PRIVILEGES on tables/views could briefly grant SELECT to PUBLIC
+-- between CREATE MV and a later REVOKE. R1 closure: immediate REVOKE PUBLIC.
+--
+-- R2 (closed alongside R1): ALTER DEFAULT PRIVILEGES can also grant SELECT
+-- to broad NON-PUBLIC roles (e.g., `app_readonly`, deployment-tooling role,
+-- etc.). A simple `REVOKE FROM PUBLIC` does NOT cover those grants. Without
+-- this cleanup, in environments where the migration-applier inherits default-
+-- privilege grants, the MV would retain SELECT for those broad roles —
+-- bypassing tenant isolation since PG MVs don't enforce source-table RLS.
+--
+-- Closure: REVOKE FROM PUBLIC, THEN scan aclexplode(relacl) for any
+-- post-creation grantee that is NOT (a) the MV owner, (b) the intended
+-- mv_refresh_owner, or (c) PUBLIC (already handled), and REVOKE SELECT
+-- from each. THEN add the canonical GRANT. The §5 final verification block
+-- is preserved as a defense-in-depth assertion that the end state matches
+-- the canonical {owner + mv_refresh_owner} grant set.
 REVOKE ALL ON interaction_signal_current_state_mv FROM PUBLIC;
+
+DO $$
+DECLARE
+    v_inherited_grantee TEXT;
+BEGIN
+    FOR v_inherited_grantee IN
+        SELECT DISTINCT r.rolname
+          FROM pg_class c
+          JOIN aclexplode(c.relacl) acl ON TRUE
+          JOIN pg_roles r ON r.oid = acl.grantee
+         WHERE c.oid = to_regclass('public.interaction_signal_current_state_mv')
+           AND acl.privilege_type = 'SELECT'
+           AND acl.grantee <> c.relowner
+           AND acl.grantee <> 0    -- PUBLIC (already revoked above)
+           AND r.rolname <> 'interaction_signal_mv_refresh_owner'
+    LOOP
+        EXECUTE format(
+            'REVOKE SELECT ON interaction_signal_current_state_mv FROM %I',
+            v_inherited_grantee
+        );
+    END LOOP;
+END $$;
+
 GRANT SELECT ON interaction_signal_current_state_mv
     TO interaction_signal_mv_refresh_owner;
 
