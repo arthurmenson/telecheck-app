@@ -1,62 +1,91 @@
 /**
- * crisis-response/routes.ts — Fastify route registration (Sprint 1 skeleton).
+ * crisis-response/routes.ts — Fastify route registration.
  *
- * Status at v0.1 (Sprint 1 — this commit): SKELETON — only `/health` (200) +
- * `/ready` (503) are mounted. Liveness/readiness split applies the
- * canonical BLOCKED-aware pattern from pharmacy / med-interaction /
- * subscription / async-consult modules.
+ * Status at v0.2 (Sprint 2 PR 1 — this commit): FIRST REAL HANDLER lands.
  *
- * Sprint 2-4 routes (NOT mounted yet; full surface):
- *   POST   /v0/crisis-events                      — initiate (FLOOR-020 emit)
- *   POST   /v0/crisis-events/:id/acknowledge      — clinician claim
- *   POST   /v0/crisis-events/:id/respond          — clinician first-response
- *   POST   /v0/crisis-events/:id/resolve          — clinician resolution
- *   POST   /v0/crisis-events/:id/sweep            — operator-initiated sweep
- *   GET    /v0/crisis-events/:id                  — read (staff/patient view)
+ * Mounted under plugin prefix `/v0/crisis-events`:
+ *   GET    /health                                 — liveness (200)
+ *   GET    /ready                                  — readiness (503; remaining
+ *                                                    Sprint 2-3 endpoints not
+ *                                                    yet mounted)
+ *   GET    /:id                                    — staff-scoped read via
+ *                                                    crisis_event_current_state_v
+ *                                                    (NEW — Sprint 2 PR 1)
+ *
+ * Sprint 2-3 routes (NOT mounted yet; full surface per SI-022):
+ *   POST   /                                       — initiate (FLOOR-020 emit)
+ *   POST   /:id/acknowledge                        — clinician claim
+ *   POST   /:id/respond                            — clinician first-response
+ *   POST   /:id/resolve                            — clinician resolution
+ *   POST   /:id/sweep                              — operator-initiated sweep
+ *   GET    /:id (patient-scoped variant)           — uses
+ *                                                    crisis_event_patient_summary_v
+ *                                                    + crisis_event_patient_reader
+ *                                                    role (Sprint 2 PR 1.1
+ *                                                    follow-up)
  *
  * Spec references:
  *   - SI-022 Crisis Response Slice v1.0
  *   - docs/crisis-response-implementation-plan.md
- *   - I-023 (tenant scoping via foundation tenantContext plugin)
- *   - I-025 (tenant-blind error envelopes)
  *   - I-019 (crisis-detection-always-on platform-floor)
+ *   - I-023 (tenant scoping via foundation tenantContext plugin + view +
+ *     base-table RLS)
+ *   - I-025 (tenant-blind error envelopes)
  */
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
+
+import { getCrisisEventHandler } from './internal/handlers/get-crisis-event.js';
 
 export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
   // Liveness probe — process is alive. Returns 200 always (module is
-  // running), with `blocked` carried as informational metadata for operator
-  // monitoring. Allowlisted in tenantContextPlugin.
+  // running), with `blocked` carried as informational metadata for
+  // operator monitoring. Allowlisted in tenantContextPlugin.
   app.get('/health', async () => ({
     status: 'ok',
     module: 'crisis-response',
-    blocked: 'Crisis Response slice handler implementation (Sprint 1 of 4 at v0.1)',
+    blocked: 'Crisis Response slice handler implementation (Sprint 2 of 4 at v0.2)',
     blocked_message:
       'DB layer COMPLETE through migration 038 (6 tables + 2 views + 6 SECDEF + ' +
-      '15 RBAC roles + 18 Codex APPROVE rounds). Application-layer handlers + ' +
-      'audit emission + KMS envelope encryption + integration tests land across ' +
-      'Sprints 2-4. See src/modules/crisis-response/README.md + ' +
+      '15 RBAC roles + 18 Codex APPROVE rounds). Sprint 2 PR 1 (this commit) ' +
+      'lands the FIRST real Fastify handler: GET /v0/crisis-events/:id staff-scoped ' +
+      'read via crisis_event_current_state_v. Remaining Sprint 2-3 handlers ' +
+      '(POST initiate / acknowledge / respond / resolve / sweep; GET patient-scoped) ' +
+      '+ Cat A audit emission + KMS envelope encryption + integration tests land ' +
+      'across follow-up PRs. See src/modules/crisis-response/README.md + ' +
       'docs/crisis-response-implementation-plan.md.',
   }));
 
-  // Readiness probe — module is NOT ready to serve traffic at v0.1 because
-  // handler implementation hasn't landed. Returns 503 (Service Unavailable)
-  // to advertise BLOCKED state to load-balancers + deploy gates per the
-  // canonical pharmacy / med-interaction / subscription / async-consult
-  // pattern (Sprint 1 Codex MED finding `pharmacy-blocked-handler`).
+  // Readiness probe — module is NOT yet fully ready to serve traffic at
+  // v0.2 because write-path handlers + Cat A audit emission haven't
+  // landed. Returns 503 (Service Unavailable) to advertise BLOCKED state
+  // to load-balancers + deploy gates per the canonical pharmacy /
+  // med-interaction / subscription / async-consult pattern.
   app.get('/ready', async (_request, reply) => {
     return reply.code(503).send({
       status: 'unavailable',
       module: 'crisis-response',
-      reason: 'handlers_not_yet_implemented',
+      reason: 'write_path_handlers_not_yet_implemented',
       reason_message:
-        'Crisis Response handlers (POST /v0/crisis-events + acknowledge/respond/resolve/sweep + GET) ' +
-        'are not yet mounted. DB layer COMPLETE; Fastify route handlers land in Sprint 2+. ' +
-        'The /ready probe will return 200 once Sprint 4 (full audit emission + KMS envelope + ' +
-        'cross-tenant tests) closes. See src/modules/crisis-response/README.md for the resume path.',
+        'Crisis Response write-path handlers (POST /v0/crisis-events + acknowledge/respond/' +
+        'resolve/sweep) + Cat A audit emission + KMS envelope are not yet mounted. ' +
+        'Sprint 2 PR 1 landed the staff-scoped read endpoint (GET /v0/crisis-events/:id); ' +
+        'the /ready probe will return 200 once Sprint 4 (full audit emission + KMS envelope + ' +
+        'cross-tenant tests) closes. See src/modules/crisis-response/README.md for the ' +
+        'resume path.',
     });
   });
+
+  // Sprint 2 PR 1 — staff-scoped single-row crisis_event read.
+  //
+  // Composition: requireTenantContext → requireClinicianActorContext →
+  // path-param validation → withTransaction → withTenantContext →
+  // (withActorContext when nonce bound) → withDbRole crisis_event_staff_reader
+  // → SELECT FROM crisis_event_current_state_v.
+  //
+  // Returns 200 + the view's 12-column row shape on hit, 404 (tenant-blind
+  // per I-025) on miss / cross-tenant.
+  app.get('/:id', getCrisisEventHandler);
 };
