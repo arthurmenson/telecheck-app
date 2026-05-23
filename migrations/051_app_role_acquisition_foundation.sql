@@ -233,22 +233,58 @@ BEGIN
             array_to_string(v_missing_roles, ', ');
     END IF;
 
-    -- All 13 roles confirmed present. Now grant memberships (idempotent on
-    -- already-existing memberships).
-    FOREACH v_role IN ARRAY v_slice_roles LOOP
-        IF pg_has_role('telecheck_app_role', v_role::regrole, 'MEMBER') THEN
-            -- Already a member (idempotent re-run).
-            v_skipped_exists := v_skipped_exists + 1;
-            CONTINUE;
-        END IF;
+    -- R2 HIGH-1 closure 2026-05-23: PG 16+ introduced per-membership INHERIT
+    -- options (pg_auth_members.inherit_option) that are NOT controlled by
+    -- ALTER ROLE NOINHERIT. ALTER ROLE NOINHERIT only sets the DEFAULT for
+    -- NEW grants — pre-existing memberships with INHERIT TRUE retain that
+    -- option and would let telecheck_app_role passively inherit slice
+    -- privileges even when its rolinherit is FALSE, defeating Option B.
+    --
+    -- Fix: always issue the GRANT with explicit `WITH INHERIT FALSE,
+    -- SET TRUE` on PG 16+ — this NORMALIZES per-membership options even
+    -- if a prior GRANT exists with INHERIT TRUE. For PG 15, fall back to
+    -- the plain GRANT (PG 15 doesn't have per-membership options; the
+    -- ALTER ROLE NOINHERIT from §1 controls all memberships).
+    --
+    -- "SET TRUE" preserves the ability to `SET LOCAL ROLE <slice_role>`
+    -- (this is the helper's mechanism — without SET privilege the helper
+    -- would fail with "permission denied to set role"). Without "SET",
+    -- members can inherit but cannot become; we need become, not inherit.
+    --
+    -- Idempotency: GRANT ... WITH ... REPLACES the existing options for
+    -- the membership. Safe to re-run.
+    DECLARE
+        v_pg_ver_num INTEGER := current_setting('server_version_num')::INTEGER;
+    BEGIN
+        FOREACH v_role IN ARRAY v_slice_roles LOOP
+            IF v_pg_ver_num >= 160000 THEN
+                -- PG 16+: explicit per-membership INHERIT FALSE + SET TRUE.
+                -- Normalizes any pre-existing membership with INHERIT TRUE.
+                EXECUTE format(
+                    'GRANT %I TO telecheck_app_role WITH INHERIT FALSE, SET TRUE',
+                    v_role
+                );
+                v_granted := v_granted + 1;
+            ELSE
+                -- PG 15: no per-membership options; membership inherits the
+                -- role's default INHERIT (which §1 ALTER ROLE made FALSE).
+                IF pg_has_role('telecheck_app_role', v_role::regrole, 'MEMBER') THEN
+                    v_skipped_exists := v_skipped_exists + 1;
+                    CONTINUE;
+                END IF;
+                EXECUTE format('GRANT %I TO telecheck_app_role', v_role);
+                v_granted := v_granted + 1;
+            END IF;
+        END LOOP;
+    END;
 
-        EXECUTE format('GRANT %I TO telecheck_app_role', v_role);
-        v_granted := v_granted + 1;
-    END LOOP;
-
-    RAISE NOTICE 'migration-051-summary: % grants applied, % already-existed '
-        'skipped (idempotent re-run); all 13 slice roles confirmed present',
-        v_granted, v_skipped_exists;
+    RAISE NOTICE 'migration-051-summary: % grants applied (PG version %), '
+        '% already-existed skipped (PG15 only; PG16+ always re-issues to '
+        'normalize per-membership INHERIT/SET options); all 13 slice roles '
+        'confirmed present',
+        v_granted,
+        current_setting('server_version_num'),
+        v_skipped_exists;
 END $$;
 
 -- -----------------------------------------------------------------------------
@@ -290,9 +326,13 @@ BEGIN
 END $$;
 
 -- §3.2: membership in each of the 13 slice roles. Per R1 MED-1 closure
---       2026-05-23 §2 above already aborts if any role is missing, so by
---       the time this block runs all 13 roles are present and
---       telecheck_app_role MUST be a member of every one. RAISE on any gap.
+--       2026-05-23 §2 above already aborts if any role is missing.
+--
+--       R2 HIGH-1 closure 2026-05-23: additionally verify per-membership
+--       INHERIT option on PG 16+ via pg_auth_members.inherit_option.
+--       Any membership with INHERIT TRUE on PG 16+ defeats Option B
+--       (telecheck_app_role would passively inherit slice privileges
+--       without SET LOCAL ROLE), so RAISE on any such gap.
 DO $$
 DECLARE
     v_slice_roles    TEXT[] := ARRAY[
@@ -310,8 +350,11 @@ DECLARE
         'medication_interaction_override_recorder',
         'medication_interaction_knowledge_base_updater'
     ];
-    v_role           TEXT;
-    v_present_count  INTEGER := 0;
+    v_role             TEXT;
+    v_present_count    INTEGER := 0;
+    v_pg_ver_num       INTEGER := current_setting('server_version_num')::INTEGER;
+    v_inherit_opt      BOOLEAN;
+    v_set_opt          BOOLEAN;
 BEGIN
     FOREACH v_role IN ARRAY v_slice_roles LOOP
         -- §2 precondition already guaranteed the role exists; defense-in-
@@ -328,6 +371,44 @@ BEGIN
                 'have failed silently — investigate.', v_role;
         END IF;
 
+        -- R2 HIGH-1: on PG 16+, the per-membership INHERIT option exists
+        -- and is independent of telecheck_app_role's rolinherit. Verify
+        -- it is FALSE; SET option must be TRUE so the helper can elevate.
+        IF v_pg_ver_num >= 160000 THEN
+            SELECT am.inherit_option, am.set_option
+              INTO v_inherit_opt, v_set_opt
+              FROM pg_auth_members am
+              JOIN pg_roles m ON am.member = m.oid
+              JOIN pg_roles r ON am.roleid = r.oid
+             WHERE m.rolname = 'telecheck_app_role'
+               AND r.rolname = v_role;
+
+            IF v_inherit_opt IS NULL THEN
+                RAISE EXCEPTION 'migration-051-verify-failed: no '
+                    'pg_auth_members row for telecheck_app_role <- %; '
+                    'membership not registered on PG 16+. §2 GRANT may '
+                    'have failed silently.', v_role;
+            END IF;
+
+            IF v_inherit_opt THEN
+                RAISE EXCEPTION 'migration-051-verify-failed: membership '
+                    'telecheck_app_role <- % has INHERIT TRUE on PG 16+. '
+                    'This defeats Option B — telecheck_app_role would '
+                    'passively inherit slice privileges without '
+                    'SET LOCAL ROLE. §2 should have re-issued GRANT WITH '
+                    'INHERIT FALSE to normalize. Investigate or re-run 051.',
+                    v_role;
+            END IF;
+
+            IF NOT v_set_opt THEN
+                RAISE EXCEPTION 'migration-051-verify-failed: membership '
+                    'telecheck_app_role <- % has SET FALSE on PG 16+. '
+                    'The withDbRole helper requires SET TRUE to issue '
+                    'SET LOCAL ROLE. §2 should have granted WITH SET TRUE. '
+                    'Investigate or re-run 051.', v_role;
+            END IF;
+        END IF;
+
         v_present_count := v_present_count + 1;
     END LOOP;
 
@@ -336,8 +417,15 @@ BEGIN
             '13 slice roles; counted %. Loop logic defect.', v_present_count;
     END IF;
 
-    RAISE NOTICE 'migration-051-verify: telecheck_app_role membership '
-        'present in all 13/13 slice roles';
+    IF v_pg_ver_num >= 160000 THEN
+        RAISE NOTICE 'migration-051-verify: telecheck_app_role membership '
+            'present in all 13/13 slice roles with per-membership '
+            'INHERIT=FALSE + SET=TRUE (Option B mechanism intact on PG 16+)';
+    ELSE
+        RAISE NOTICE 'migration-051-verify: telecheck_app_role membership '
+            'present in all 13/13 slice roles (PG 15; Option B mechanism '
+            'enforced via role-default NOINHERIT from §1)';
+    END IF;
 END $$;
 
 -- §3.3: anti-bypass — telecheck_app_role MUST NOT appear as a direct grantee
