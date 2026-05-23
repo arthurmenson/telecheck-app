@@ -2,7 +2,7 @@
 
 Implementation of **SI-019 Medication Interaction & Validation Engine Slice PRD v2.0** (RATIFIED 2026-05-21 P-033) + the canonical follow-on **CDM v1.6 → v1.7 Amendment** (RATIFIED 2026-05-21 P-034 — co-bumped AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 + RBAC v1.1 → v1.2).
 
-## Status: Sprint 1 (PR 6 of 6 DB-layer series — this commit) — **DB LAYER COMPLETE; Fastify scaffold update**
+## Status: Sprint 1 (PR 7 of N handler series — this commit) — **FIRST REAL HANDLER POST-FOUNDATION-051**
 
 Spec layer is **complete + ratified**. **DB layer is COMPLETE through migration 050** (PRs 1-5 merged; 21 Codex adversarial-review rounds total across the series). This PR (6 of 6) is the Fastify scaffold update reflecting the post-DB-layer state — the `/health` blocker payload + `/ready` reason now describe the DB layer as complete with Fastify handler implementation as the sole remaining blocker (lands PR 7+).
 
@@ -17,25 +17,28 @@ Med-Interaction is the **Master Completion Plan v1.0 "new critical path"** per t
 | 3 | 048 | **1 SECURITY BARRIER view** (`interaction_signal_current_state_v`) + **1 optional MV** (`interaction_signal_current_state_mv`) + **SECDEF access function** (`get_interaction_signal_current_state`) + MV access-discipline (preflight + immediate REVOKE PUBLIC + aclexplode loop for inherited grants + final verifier; no BEGIN/COMMIT per transactional-runner safety). | 5 (MV-access-discipline defense-in-depth) |
 | 4 | 049 | **Raw lifecycle writer SECDEF** (`record_interaction_signal_lifecycle_transition`) + anti-bypass EXECUTE matrix to the 6 wrapper-owner roles only + STEP 3.5 activation-override-evidence check under per-(tenant, signal) advisory lock (R1 closure) + writer-owner GRANT SELECT on `interaction_signal_override` for SECDEF read (R2 closure). | 3 |
 | 5 | 050 | **6 reason-specific lifecycle wrappers** — 3 operational (emission + activation + supersession) + 3 **fail-closed** (resolution + expiry + override; RAISE EXCEPTION SQLSTATE `0A000` pending evidence-source migrations from Async Consult / Pharmacy / LAYER B). All wrappers: SECDEF + locked search_path + OWNED BY wrapper-owner + SI-010 tenant guard + per-(tenant, signal) advisory lock matching the raw writer. | 3 (incl. CRITICAL R2 fix on UNREACHABLE-block comment-syntax that would have blocked migration application) |
-| 6 | n/a | **Fastify scaffold update (this commit)** — module-level `README.md` + `routes.ts` `/health` blocker payload + `/ready` reason message + plugin/index/internal-types header doc-blocks + integration-test assertions updated to reflect DB layer COMPLETE through migration 050. No DB or HTTP-handler delta; pure docs/test alignment closing the DB-layer series. | (Sprint 1 PR 6) |
-| 7+ | n/a | **Fastify handler implementation** — 8 endpoints per SI-019 §5 + CDM §6 OpenAPI v0.3 (signal-check, override-record, lifecycle actions). Cat A audit emission (6 events: 4 Cat A + 2 Cat B). LAYER B role-membership check at route layer. Integration tests for tenant isolation + I-002 ordering invariant. |
+| 6 | n/a | **Fastify scaffold update** — module-level `README.md` + `routes.ts` `/health` blocker payload + `/ready` reason message + plugin/index/internal-types header doc-blocks + integration-test assertions updated to reflect DB layer COMPLETE through migration 050. No DB or HTTP-handler delta; pure docs/test alignment closing the DB-layer series. | (Sprint 1 PR 6) |
+| 7 | n/a | **GET /v0/med-interaction/signals/:id — first real handler post-foundation-051 (this commit).** Reads via the SECDEF access function `get_interaction_signal_current_state(VARCHAR(26))` from migration 048 under the canonical `withTransaction → withTenantContext → withActorContext → withDbRole('medication_interaction_signal_viewer')` composition (Option B foundation per `src/lib/with-db-role.ts` + migration 051). Unit-mocked composition + envelope tests. Read-only — no Cat A/B audit emission (SI-019 §6 catalogs only write events). Layer B authorization deferred-permissive per the Option 2 ratifier decision (any authenticated actor passes; production fail-closed on missing actorContext). | (PR 7) |
+| 8-11 | n/a | **Remaining 7 endpoints** — POST `/evaluations` + POST `/signals` + POST `/signals/:id/{activate, override, resolve, expire, supersede}` per SI-019 §5 + CDM §6 OpenAPI v0.3. Cat A audit emission helper lands with PR 8 (first write endpoint; the 6 SI-019 §6 catalog events). LAYER B role-membership tightening lands with the cross-slice integration cycle when `tenant_account_membership` (or per-slice cache equivalent) is available. Integration tests for tenant isolation + I-002 ordering invariant + I-029 reject-unless on terminal-lifecycle wrappers (resolution/expiry/override per migration 050 fail-closed posture). |
 
-### What ships at PR 6 (this commit)
+### What ships at PR 7 (this commit)
 
-- `README.md` Status header + PR-progression table updated to reflect DB layer COMPLETE through migration 050 (21 Codex rounds total)
-- `routes.ts` `/health.blocked_message` rewritten to advertise post-PR-5 state with per-migration Codex-round counts
-- `routes.ts` `/ready.reason_message` updated to describe Fastify handler implementation as the sole remaining DB-layer-to-HTTP gap
-- `plugin.ts` + `index.ts` + `internal/types.ts` header doc-blocks updated to reflect post-PR-5 entities + views + writers + wrappers state
-- Integration test (`tests/integration/med-interaction-plugin-wiring.test.ts`) assertion `PR 6+` → `PR 7+` to match the renumbered handler-PR series
-- No DB delta. No HTTP-handler delta. Pure docs/test alignment closing the DB-layer series.
+- `internal/handlers/get-signal.ts` — Fastify handler implementing GET /v0/med-interaction/signals/:id under the canonical Option B composition (withTransaction → withTenantContext → withActorContext → withDbRole). Calls the SECDEF access function `get_interaction_signal_current_state(VARCHAR(26))` from migration 048. ULID-validated path param. Tenant-blind 404 on miss per I-025. Deferred-permissive Layer B (any authenticated actor passes; production fail-closed when actorContext absent).
+- `internal/handlers/get-signal.test.ts` — unit-mocked tests covering ULID validation, Layer B shape, canonical composition order (withTransaction → withTenantContext [→ withActorContext when nonce bound] → withDbRole(medication_interaction_signal_viewer)), SECDEF SQL + param shape, tenant-blind 404 envelope on 0 rows, 200 + view payload on 1 row.
+- `internal/types.ts` — adds `InteractionSignalCurrentStateView` (signal_id, current_state, as_of ISO-8601, transition_reason) matching the SECDEF function's RETURNS TABLE clause.
+- `routes.ts` — registers `app.get('/signals/:id', getSignalHandler)`; updates `/health.blocked_message` to advertise "1 of 8 handlers wired" + Option B composition reference; updates `/ready.reason_message` to `partial_handlers_wired` with the remaining-7-endpoints list (still 503 until the full PR series closes per the Crisis-Response / Admin-Backend scaffold convention).
+- `README.md` — Status header bumped to "PR 7 of N handler series — FIRST REAL HANDLER POST-FOUNDATION-051"; PR-progression table extended with rows 7 + 8-11.
 
-### What does NOT ship at PR 6
+### What does NOT ship at PR 7
 
-- Row-shape interfaces / repository files / service files for the 4 entities (lands PR 7+ when handlers are wired)
-- Real HTTP handlers (POST /signals/check, POST /overrides, GET /rulesets/:id, etc.) — land PR 7+
-- Vendor adapter abstraction (interaction databases like First Databank, Lexicomp) — per ADR-022 native-first / open-source-first preference; lands when handler implementation begins
-- Audit / domain event emitters — land PR 7+ when handlers are wired
-- Fail-closed wrapper unblock (resolution / expiry / override) — requires Async Consult discontinuation-event log + per-basis cadence config table + active-medication-list view + LAYER B; lands in cross-slice integration cycles after PR 7+
+- Other 7 endpoints (POST /evaluations + POST /signals + POST /signals/:id/{activate, override, resolve, expire, supersede}) — land in PRs 8-11.
+- Cat A audit emission helper — lands with PR 8 (first write endpoint).
+- Cross-slice shared utilities (tenant-blind error mapper, canonical LAYER B membership check) — refactor when Crisis Response + Admin Backend + Med-Interaction each have their first handler in.
+- Domain event emission — lands when write endpoints exist (PR 8+).
+- Integration test against a live PostgreSQL with migrations 046-051 applied + seeded MV row — lands with PR 8 alongside the write-handler integration tests (the harness gains the SI-019 fixture set then).
+- Vendor adapter abstraction (interaction databases like First Databank, Lexicomp) — per ADR-022 native-first / open-source-first preference; lands when evaluation handler implementation begins (PR 8).
+- Fail-closed wrapper unblock (resolution / expiry / override) — requires Async Consult discontinuation-event log + per-basis cadence config table + active-medication-list view + LAYER B; lands in cross-slice integration cycles after the handler series.
+- Layer B tightening from "any authenticated actor" to the SI-019 §5 role/membership matrix (clinician + tenant_admin + platform_admin unconditionally; patient only when the signal's evaluation references their patient_id) — lands with the cross-slice integration cycle when `tenant_account_membership` (or the per-slice cache equivalent) is available.
 
 ## Module structure (per `src/modules/README.md` template)
 

@@ -78,6 +78,8 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     expect(body.status).toBe('ok');
     expect(body.module).toBe('med-interaction');
     expect(body.blocked).toContain('Sprint 1 of N');
+    // PR 7: first real handler shipped post-foundation-051.
+    expect(body.blocked).toContain('PR 7 of N');
     // Post-P-033/P-034 ratification — blocker is implementation, NOT
     // unratified spec.
     expect(body.blocked_message).toContain('Spec layer COMPLETE');
@@ -85,12 +87,20 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     expect(body.blocked_message).toContain('P-034');
     // Post-PR-5: DB layer COMPLETE through migration 050. Anti-drift guard
     // for the merged-PR count (Codex R1 finding 2026-05-23): only PRs 1-5
-    // of the DB-layer series are merged; PR 6 IS the scaffold-update
-    // commit that ships this payload, so it cannot also assert itself
-    // merged. The forbidden-substring check below catches that drift.
+    // of the DB-layer series are merged; PR 6 is the scaffold-update
+    // commit; PR 7 (this commit) is the first real handler post-foundation-
+    // 051. The forbidden-substring check below catches drift on the
+    // DB-layer count.
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 050');
     expect(body.blocked_message).toContain('PRs 1-5 merged');
     expect(body.blocked_message).not.toContain('6 PRs merged');
+    // PR 7 anti-drift: the blocker payload MUST advertise the first real
+    // handler shipped + the Option B composition reference + the
+    // remaining-7-endpoints count. If a future PR ships more handlers
+    // without updating this payload, this assertion fails fast.
+    expect(body.blocked_message).toContain('GET /v0/med-interaction/signals/:id');
+    expect(body.blocked_message).toContain('withDbRole(medication_interaction_signal_viewer)');
+    expect(body.blocked_message).toContain('7 endpoints remain');
   });
 
   it('§1b GET /v0/med-interaction/ready returns 503 (handlers not yet mounted) with implementation-pending reason', async () => {
@@ -108,12 +118,15 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     }>();
     expect(body.status).toBe('unavailable');
     expect(body.module).toBe('med-interaction');
-    // Post-P-033/P-034 ratification — distinct from a hypothetical
-    // ratification-blocked reason.
-    expect(body.reason).toBe('handlers_not_yet_implemented');
-    expect(body.reason_message).toContain('PR 7+');
-    // Post-PR-5: DB layer COMPLETE through migration 050; the only
-    // remaining gap is the Fastify HTTP surface.
-    expect(body.reason_message).toContain('DB layer COMPLETE through migration 050');
+    // PR 7 (this commit) bumps the reason from `handlers_not_yet_implemented`
+    // to `partial_handlers_wired` — 1 of 8 handlers is now live but the
+    // slice as a whole is still not production-ready (audit emission
+    // helper + Layer B tightening + remaining 7 endpoints all pending).
+    // /ready stays 503 until the full PR series closes per the
+    // Crisis-Response / Admin-Backend scaffold convention.
+    expect(body.reason).toBe('partial_handlers_wired');
+    expect(body.reason_message).toContain('1 of 8');
+    expect(body.reason_message).toContain('GET /v0/med-interaction/signals/:id');
+    expect(body.reason_message).toContain('migration 048');
   });
 });
