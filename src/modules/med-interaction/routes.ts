@@ -76,7 +76,7 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
       'Spec layer COMPLETE: SI-019 v2.0 RATIFIED 2026-05-21 P-033 + CDM v1.6 → v1.7 ' +
       '+ AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 ' +
       '+ RBAC v1.1 → v1.2 RATIFIED P-034. DB layer COMPLETE through migration 050 ' +
-      '(6 PRs merged; 21 Codex rounds total): 12 RBAC roles (046) + 4 entities + RLS + ' +
+      '(PRs 1-5 merged; 21 Codex rounds total): 12 RBAC roles (046) + 4 entities + RLS + ' +
       'triggers (047) + view + MV + SECDEF access function (048) + raw lifecycle writer ' +
       'SECDEF + anti-bypass matrix (049) + 6 reason-specific wrappers (050; 3 ' +
       'operational + 3 fail-closed pending evidence-source migrations). Subsequent ' +

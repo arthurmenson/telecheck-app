@@ -83,6 +83,14 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     expect(body.blocked_message).toContain('Spec layer COMPLETE');
     expect(body.blocked_message).toContain('P-033');
     expect(body.blocked_message).toContain('P-034');
+    // Post-PR-5: DB layer COMPLETE through migration 050. Anti-drift guard
+    // for the merged-PR count (Codex R1 finding 2026-05-23): only PRs 1-5
+    // of the DB-layer series are merged; PR 6 IS the scaffold-update
+    // commit that ships this payload, so it cannot also assert itself
+    // merged. The forbidden-substring check below catches that drift.
+    expect(body.blocked_message).toContain('DB layer COMPLETE through migration 050');
+    expect(body.blocked_message).toContain('PRs 1-5 merged');
+    expect(body.blocked_message).not.toContain('6 PRs merged');
   });
 
   it('§1b GET /v0/med-interaction/ready returns 503 (handlers not yet mounted) with implementation-pending reason', async () => {
