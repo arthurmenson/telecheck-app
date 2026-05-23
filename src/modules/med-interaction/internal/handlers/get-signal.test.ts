@@ -89,9 +89,21 @@ vi.mock('../../../../lib/actor-context-binding.js', () => ({
   ),
 }));
 
-vi.mock('../../../../lib/with-db-role.js', () => ({
-  withDbRole: vi.fn(
-    async (_tx: unknown, role: string, fn: () => Promise<unknown>) => {
+// Mock the shared `withDbRoleSafe` helper (src/lib/with-db-role-safe.ts)
+// rather than the underlying `withDbRole`. The handler calls
+// `withDbRoleSafe`; mocking at that boundary keeps the wrapperCalls
+// composition log + the role-elevation assertion shape identical to the
+// pre-refactor test (the elevated role name is still observable).
+//
+// The 42501 → 403 mapping is unit-tested separately in
+// src/lib/with-db-role-safe.test.ts; this handler test does not re-verify
+// that mapping here — coupling the cross-slice 42501 mapping to every
+// handler test was exactly the duplication the cross-slice refactor
+// removed. Handler-level enforcement is implicit: a forgotten
+// `withDbRoleSafe` import would surface as a typecheck failure.
+vi.mock('../../../../lib/with-db-role-safe.js', () => ({
+  withDbRoleSafe: vi.fn(
+    async (_tx: unknown, role: string, _req: unknown, fn: () => Promise<unknown>) => {
       wrapperCalls.push(`withDbRole:${role}`);
       return fn();
     },

@@ -48,8 +48,15 @@ vi.mock('../../../../lib/rls.js', () => ({
 vi.mock('../../../../lib/actor-context-binding.js', () => ({
   withActorContext: vi.fn(),
 }));
-vi.mock('../../../../lib/with-db-role.js', () => ({
-  withDbRole: vi.fn(),
+// Mock the shared `withDbRoleSafe` helper (src/lib/with-db-role-safe.ts)
+// rather than the underlying `withDbRole`. The handler now calls
+// `withDbRoleSafe`, which composes `withDbRole` + the canonical SQLSTATE
+// 42501 → tenant-blind 403 mapping; the mapping is unit-tested in
+// src/lib/with-db-role-safe.test.ts so the §4 wrapper-side 42501 mapping
+// tests below now exercise the path through the real helper boundary
+// (covered indirectly via the unit test of with-db-role-safe).
+vi.mock('../../../../lib/with-db-role-safe.js', () => ({
+  withDbRoleSafe: vi.fn(),
 }));
 
 // Imports AFTER the vi.mock declarations.
@@ -58,7 +65,7 @@ import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { withDbRole } from '../../../../lib/with-db-role.js';
+import { withDbRoleSafe } from '../../../../lib/with-db-role-safe.js';
 
 import { getCrisisOperationalHealthHandler } from './get-crisis-operational-health.js';
 
@@ -141,7 +148,8 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
     fn(tx as unknown as Parameters<typeof fn>[0]),
   );
   vi.mocked(withActorContext).mockImplementation(async (_tx, _nonce, fn) => fn());
-  vi.mocked(withDbRole).mockImplementation(async (_tx, _role, fn) => fn());
+  // withDbRoleSafe signature: (tx, role, req, fn) — see src/lib/with-db-role-safe.ts.
+  vi.mocked(withDbRoleSafe).mockImplementation(async (_tx, _role, _req, fn) => fn());
 }
 
 beforeEach(() => {
@@ -171,8 +179,15 @@ describe('getCrisisOperationalHealthHandler §1 — happy path composition', () 
     );
     expect(withActorContext).toHaveBeenCalledTimes(1);
     expect(withActorContext).toHaveBeenCalledWith(tx, 'fake-uuid-v4-nonce', expect.any(Function));
-    expect(withDbRole).toHaveBeenCalledTimes(1);
-    expect(withDbRole).toHaveBeenCalledWith(tx, 'admin_basic_operator', expect.any(Function));
+    // withDbRoleSafe is called with (tx, role, req, fn) per the shared
+    // helper's signature (src/lib/with-db-role-safe.ts).
+    expect(withDbRoleSafe).toHaveBeenCalledTimes(1);
+    expect(withDbRoleSafe).toHaveBeenCalledWith(
+      tx,
+      'admin_basic_operator',
+      req,
+      expect.any(Function),
+    );
 
     // The wrapper call: SELECT * FROM read_admin_crisis_operational_health($1, $2)
     expect(tx.query).toHaveBeenCalledTimes(1);
@@ -238,28 +253,35 @@ describe('getCrisisOperationalHealthHandler §3 — admin-role guard precedes tx
 });
 
 // ---------------------------------------------------------------------------
-// §4 — wrapper raise propagates as tenant-blind 403 (42501 mapping)
-//      R1 HIGH-1 closure 2026-05-23: previously this test asserted the raw
-//      tenant-scope-mismatch message propagated to the global envelope,
-//      which violated I-025 by leaking tenant IDs in the response body in
-//      non-prod. Updated to assert 42501 is mapped to a tenant-blind 403
-//      via req.server.httpErrors.forbidden() with a generic message that
-//      contains no tenant identifiers.
+// §4 — errors from withDbRoleSafe propagate to the global envelope
+//
+// Pre-refactor (2026-05-23) this section asserted the inline 42501 → 403
+// mapping that lived directly in this handler. The cross-slice refactor
+// 2026-05-24 extracted that mapping into the shared `withDbRoleSafe`
+// helper (src/lib/with-db-role-safe.ts) + tested it there. The handler-
+// level assertion now verifies only the propagation contract: whatever
+// withDbRoleSafe throws is what the handler throws, unchanged.
+//
+// The substantive coverage of "42501 is mapped to a tenant-blind 403
+// with no leaked tenant identifiers" + "non-42501 PG errors propagate
+// with identity preserved" lives in src/lib/with-db-role-safe.test.ts
+// (§2 + §3 + §4 there).
 // ---------------------------------------------------------------------------
 
-describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501 → 403)', () => {
-  it('§4a wrapper-side 42501 (tenant-scope mismatch / missing actor) maps to 403 tenant-blind; raw PG message + tenant IDs are NOT leaked', async () => {
+describe('getCrisisOperationalHealthHandler §4 — error propagation from withDbRoleSafe', () => {
+  it('§4a propagates whatever withDbRoleSafe throws (handler does not wrap, transform, or swallow)', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
-    // Simulate wrapper LAYER C raise: tenant scope mismatch.
-    const wrapperError = Object.assign(
-      new Error(
-        'read_admin_crisis_operational_health: tenant scope mismatch — actor tenant Telecheck-US does not match wrapper p_tenant_id Telecheck-Ghana; cross-tenant read rejected',
-      ),
-      { code: '42501' },
+    // Simulate withDbRoleSafe raising the canonical mapped 403 (this is
+    // what the real helper produces for SQLSTATE 42501).
+    const forbidden = Object.assign(
+      new Error('Insufficient scope for this request.'),
+      { statusCode: 403 },
     );
-    tx.query.mockRejectedValueOnce(wrapperError);
+    vi.mocked(withDbRoleSafe).mockImplementationOnce(async () => {
+      throw forbidden;
+    });
 
     let thrown: unknown;
     try {
@@ -270,22 +292,10 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501
     } catch (e) {
       thrown = e;
     }
-
-    expect(thrown).toBeDefined();
-    // Asserted as Fastify forbidden — statusCode 403, generic message.
-    const errObj = thrown as { statusCode?: number; message?: string };
-    expect(errObj.statusCode).toBe(403);
-    // Critical I-025 invariant: message must NOT contain tenant identifiers
-    // or raw SQLSTATE/wrapper details from the upstream PG error.
-    expect(errObj.message ?? '').not.toContain('Telecheck-US');
-    expect(errObj.message ?? '').not.toContain('Telecheck-Ghana');
-    expect(errObj.message ?? '').not.toContain('tenant scope mismatch');
-    expect(errObj.message ?? '').not.toContain('42501');
-    // The generic message can mention "scope" but no tenant ids.
-    expect(errObj.message ?? '').toMatch(/scope|forbidden|insufficient/i);
+    expect(thrown).toBe(forbidden);
   });
 
-  it('§4b non-42501 PG errors propagate UNCHANGED — identity-preserved, code intact, no 4xx statusCode added (R2 LOW closure)', async () => {
+  it('§4b propagates non-42501 PG errors unchanged (identity-preserved, code intact, no 4xx statusCode added)', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
@@ -293,7 +303,11 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501
       new Error('connection terminated unexpectedly'),
       { code: '57P01' }, // admin_shutdown
     );
-    tx.query.mockRejectedValueOnce(otherPgError);
+    // withDbRoleSafe propagates non-42501 errors unchanged (see its §3
+    // unit tests); simulate that contract here.
+    vi.mocked(withDbRoleSafe).mockImplementationOnce(async () => {
+      throw otherPgError;
+    });
 
     let thrown: unknown;
     try {
@@ -305,16 +319,8 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501
       thrown = e;
     }
 
-    // R2 LOW closure 2026-05-23: assert identity-preservation + code intact,
-    // not just message match. A regression that re-wrapped the error
-    // (losing .code, adding a 4xx statusCode that the global envelope
-    // would then treat as client-facing) would have passed the prior
-    // toThrow(/connection terminated/) assertion. The identity check
-    // catches that class of regression.
     expect(thrown).toBe(otherPgError);
     expect((thrown as { code?: string }).code).toBe('57P01');
-    // Must NOT have a 4xx statusCode added (would defeat 5xx rollback +
-    // tenant-blind 500 default-message replacement in the global envelope).
     expect((thrown as { statusCode?: number }).statusCode).toBeUndefined();
   });
 });
@@ -324,14 +330,14 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501
 // ---------------------------------------------------------------------------
 
 describe('getCrisisOperationalHealthHandler §5 — missing actorNonce path (fail-closed at wrapper LAYER C)', () => {
-  it('§5a undefined actorNonce skips withActorContext but still calls withDbRole + wrapper (the wrapper itself raises if LAYER C cannot resolve actor; tested separately)', async () => {
+  it('§5a undefined actorNonce skips withActorContext but still calls withDbRoleSafe + wrapper (the wrapper itself raises if LAYER C cannot resolve actor; tested separately)', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
     await getCrisisOperationalHealthHandler(makeReq({ actorNonce: undefined }), makeReply());
 
     expect(withActorContext).not.toHaveBeenCalled();
-    expect(withDbRole).toHaveBeenCalledTimes(1);
+    expect(withDbRoleSafe).toHaveBeenCalledTimes(1);
     expect(tx.query).toHaveBeenCalledTimes(1);
   });
 });
@@ -341,7 +347,7 @@ describe('getCrisisOperationalHealthHandler §5 — missing actorNonce path (fai
 // ---------------------------------------------------------------------------
 
 describe('getCrisisOperationalHealthHandler §6 — actor-context wrap order', () => {
-  it('§6a withActorContext is invoked OUTSIDE withDbRole (composition: withActorContext → withDbRole → wrapper)', async () => {
+  it('§6a withActorContext is invoked OUTSIDE withDbRoleSafe (composition: withActorContext → withDbRoleSafe → wrapper)', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
     const callOrder: string[] = [];
@@ -351,7 +357,7 @@ describe('getCrisisOperationalHealthHandler §6 — actor-context wrap order', (
       callOrder.push('withActorContext-exit');
       return out;
     });
-    vi.mocked(withDbRole).mockImplementation(async (_tx, _role, fn) => {
+    vi.mocked(withDbRoleSafe).mockImplementation(async (_tx, _role, _req, fn) => {
       callOrder.push('withDbRole-enter');
       const out = await fn();
       callOrder.push('withDbRole-exit');

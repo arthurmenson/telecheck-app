@@ -120,7 +120,7 @@ import { requireClinicianActorContext } from '../../../../lib/auth-context.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { withDbRole } from '../../../../lib/with-db-role.js';
+import { withDbRoleSafe } from '../../../../lib/with-db-role-safe.js';
 import type {
   CrisisLifecycleState,
   CrisisLifecycleTransitionReason,
@@ -258,53 +258,31 @@ export async function getCrisisEventHandler(
       // with `withActorContext` when present so any future SECDEF helper
       // invoked from this read path can resolve the trusted actor —
       // defense in depth for downstream additions.
-      // I-025 envelope-leak defense (Codex Admin Sprint 2 PR 1 R1 HIGH-1
-      // finding 2026-05-23, applied preemptively here; R2 MED-1 finding
-      // task bdx9yneo0 expanded the catch boundary to wrap the entire
-      // withDbRole call):
-      //
-      // PostgreSQL SQLSTATE 42501 ("insufficient_privilege") can be
-      // raised in TWO places:
-      //   (1) Inside withDbRole's SET LOCAL ROLE pre-callback step — if
-      //       the role membership/grant for crisis_event_staff_reader is
-      //       missing or skewed (a foundation-051 drift state).
-      //   (2) Inside the SECDEF wrapper LAYER C tenant-scope guard / RLS
-      //       evaluation — when the SELECT runs.
-      //
-      // The R2 closure moves the try/catch OUTSIDE withDbRole so both
-      // paths are covered. Without this widening, a privilege-acquisition
-      // 42501 would escape past the inner catch and reach the global
-      // envelope as a 500 with a leaky raw PG message (tenant_id
-      // disclosure in non-prod), violating I-025.
-      //
-      // Other PG errors propagate to the global handler unchanged (tx
-      // still rolls back; envelope formats as 500 with default-replaced
-      // message in prod).
+      // I-025 envelope-leak defense: `withDbRoleSafe` (src/lib/with-db-
+      // role-safe.ts) composes `withDbRole` + the canonical SQLSTATE
+      // 42501 → tenant-blind 403 mapping. The mapping covers BOTH raise
+      // paths — (1) the SET LOCAL ROLE pre-callback step (foundation-051
+      // role-membership drift) and (2) the SECDEF wrapper LAYER C tenant-
+      // scope guard / RLS evaluation — because the wrapper's try/catch
+      // wraps the ENTIRE withDbRole call. Other PG errors propagate to
+      // the global error-envelope handler unchanged (tx still rolls back;
+      // envelope formats as 500 with default-replaced message in prod).
+      // See src/lib/with-db-role-safe.ts for the full rationale + the
+      // cross-slice refactor history (Med-Interaction PR 7.1 / Crisis
+      // Sprint 2 PR 1 R2 / Admin Sprint 2 PR 1 R1 closures).
       const runRead = async (): Promise<CrisisEventCurrentStateRow | null> => {
-        try {
-          return await withDbRole(tx, 'crisis_event_staff_reader', async () => {
-            const result = await tx.query<CrisisEventCurrentStateRow>(
-              'SELECT crisis_event_id, tenant_id, patient_id, server_signal_id, ' +
-                'crisis_type, severity, regulatory_reporting_enabled, detected_at, ' +
-                'current_state, current_state_transition_at, ' +
-                'current_state_transition_reason, current_state_actor_principal_id ' +
-                'FROM crisis_event_current_state_v ' +
-                'WHERE crisis_event_id = $1',
-              [idParam],
-            );
-            return result.rows[0] ?? null;
-          });
-        } catch (err) {
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err &&
-            (err as { code?: unknown }).code === '42501'
-          ) {
-            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-          }
-          throw err;
-        }
+        return withDbRoleSafe(tx, 'crisis_event_staff_reader', req, async () => {
+          const result = await tx.query<CrisisEventCurrentStateRow>(
+            'SELECT crisis_event_id, tenant_id, patient_id, server_signal_id, ' +
+              'crisis_type, severity, regulatory_reporting_enabled, detected_at, ' +
+              'current_state, current_state_transition_at, ' +
+              'current_state_transition_reason, current_state_actor_principal_id ' +
+              'FROM crisis_event_current_state_v ' +
+              'WHERE crisis_event_id = $1',
+            [idParam],
+          );
+          return result.rows[0] ?? null;
+        });
       };
 
       if (req.actorNonce !== undefined) {

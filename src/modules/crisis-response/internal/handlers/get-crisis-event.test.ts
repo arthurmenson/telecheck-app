@@ -52,8 +52,15 @@ vi.mock('../../../../lib/rls.js', () => ({
 vi.mock('../../../../lib/actor-context-binding.js', () => ({
   withActorContext: vi.fn(),
 }));
-vi.mock('../../../../lib/with-db-role.js', () => ({
-  withDbRole: vi.fn(),
+// Mock the shared `withDbRoleSafe` helper (src/lib/with-db-role-safe.ts)
+// rather than the underlying `withDbRole`. The handler now calls
+// `withDbRoleSafe`, which composes `withDbRole` + the canonical SQLSTATE
+// 42501 → tenant-blind 403 mapping; the mapping is unit-tested separately
+// in src/lib/with-db-role-safe.test.ts so this handler test asserts only
+// the composition + the role elevation, NOT the inline 42501 mapping (which
+// was previously per-handler and is now centralized in the helper).
+vi.mock('../../../../lib/with-db-role-safe.js', () => ({
+  withDbRoleSafe: vi.fn(),
 }));
 
 // Imports AFTER the vi.mock declarations.
@@ -62,7 +69,7 @@ import { requireClinicianActorContext } from '../../../../lib/auth-context.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { withDbRole } from '../../../../lib/with-db-role.js';
+import { withDbRoleSafe } from '../../../../lib/with-db-role-safe.js';
 
 import { getCrisisEventHandler } from './get-crisis-event.js';
 
@@ -169,7 +176,8 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
     fn(tx as unknown as Parameters<typeof fn>[0]),
   );
   vi.mocked(withActorContext).mockImplementation(async (_tx, _nonce, fn) => fn());
-  vi.mocked(withDbRole).mockImplementation(async (_tx, _role, fn) => fn());
+  // withDbRoleSafe signature: (tx, role, req, fn) — see src/lib/with-db-role-safe.ts.
+  vi.mocked(withDbRoleSafe).mockImplementation(async (_tx, _role, _req, fn) => fn());
 }
 
 beforeEach(() => {
@@ -200,10 +208,13 @@ describe('getCrisisEventHandler §1 — happy path composition', () => {
     );
     expect(withActorContext).toHaveBeenCalledTimes(1);
     expect(withActorContext).toHaveBeenCalledWith(tx, 'fake-uuid-v4-nonce', expect.any(Function));
-    expect(withDbRole).toHaveBeenCalledTimes(1);
-    expect(withDbRole).toHaveBeenCalledWith(
+    // withDbRoleSafe is called with (tx, role, req, fn) per the shared
+    // helper's signature (src/lib/with-db-role-safe.ts).
+    expect(withDbRoleSafe).toHaveBeenCalledTimes(1);
+    expect(withDbRoleSafe).toHaveBeenCalledWith(
       tx,
       'crisis_event_staff_reader',
+      req,
       expect.any(Function),
     );
 
@@ -369,14 +380,14 @@ describe('getCrisisEventHandler §6 — 0-row result → 404 tenant-blind', () =
 // ---------------------------------------------------------------------------
 
 describe('getCrisisEventHandler §7 — missing actorNonce skips withActorContext', () => {
-  it('§7a undefined actorNonce skips withActorContext but still calls withDbRole + view query', async () => {
+  it('§7a undefined actorNonce skips withActorContext but still calls withDbRoleSafe + view query', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
     await getCrisisEventHandler(makeReq({ actorNonce: undefined }), makeReply());
 
     expect(withActorContext).not.toHaveBeenCalled();
-    expect(withDbRole).toHaveBeenCalledTimes(1);
+    expect(withDbRoleSafe).toHaveBeenCalledTimes(1);
     expect(tx.query).toHaveBeenCalledTimes(1);
   });
 });
@@ -386,7 +397,7 @@ describe('getCrisisEventHandler §7 — missing actorNonce skips withActorContex
 // ---------------------------------------------------------------------------
 
 describe('getCrisisEventHandler §8 — actor-context wrap order', () => {
-  it('§8a withActorContext is invoked OUTSIDE withDbRole (composition: withActorContext → withDbRole → view query)', async () => {
+  it('§8a withActorContext is invoked OUTSIDE withDbRoleSafe (composition: withActorContext → withDbRoleSafe → view query)', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
     const callOrder: string[] = [];
@@ -396,7 +407,7 @@ describe('getCrisisEventHandler §8 — actor-context wrap order', () => {
       callOrder.push('withActorContext-exit');
       return out;
     });
-    vi.mocked(withDbRole).mockImplementation(async (_tx, _role, fn) => {
+    vi.mocked(withDbRoleSafe).mockImplementation(async (_tx, _role, _req, fn) => {
       callOrder.push('withDbRole-enter');
       const out = await fn();
       callOrder.push('withDbRole-exit');

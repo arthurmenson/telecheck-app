@@ -104,7 +104,7 @@ import { withTransaction } from '../../../../lib/db.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { withDbRole } from '../../../../lib/with-db-role.js';
+import { withDbRoleSafe } from '../../../../lib/with-db-role-safe.js';
 import type { InteractionSignalCurrentStateView } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -238,48 +238,31 @@ export async function getSignalHandler(
       // app.request_nonce = $1`; when the nonce is undefined we skip
       // it to avoid binding an empty/invalid GUC value. The SECDEF
       // function this handler calls does not require the nonce.
-      // I-025 envelope-leak defense (PR 7.1 hotfix 2026-05-23 mirroring
-      // sibling Admin Sprint 2 PR 1 R1+R2 + Crisis Sprint 2 PR 1 R2):
-      // PostgreSQL SQLSTATE 42501 ("insufficient_privilege") can be raised
-      // in TWO places:
-      //   (1) Inside withDbRole's SET LOCAL ROLE pre-callback step — if
-      //       the role membership/grant for medication_interaction_signal_viewer
-      //       is missing or skewed (foundation-051 drift state).
-      //   (2) Inside the SECDEF function's body / RLS evaluation when the
-      //       SELECT runs and the actor lacks the tenant scope.
       //
-      // The catch is OUTSIDE withDbRole so both paths are covered.
-      // Without this widening, a 42501 would escape past the inner SELECT
-      // and reach the global envelope (src/lib/error-envelope.ts) as a
-      // 500 with a leaky raw PG message including tenant_id (non-prod
-      // exposure), violating I-025.
-      //
-      // Other PG errors propagate to the global handler unchanged.
+      // I-025 envelope-leak defense: `withDbRoleSafe` (src/lib/with-db-
+      // role-safe.ts) composes `withDbRole` + the canonical SQLSTATE
+      // 42501 → tenant-blind 403 mapping. The mapping covers BOTH raise
+      // paths — (1) the SET LOCAL ROLE pre-callback step (foundation-051
+      // role-membership drift) and (2) the SECDEF function body /
+      // RLS evaluation when the actor lacks tenant scope — because the
+      // wrapper's try/catch wraps the ENTIRE withDbRole call. Other PG
+      // errors propagate to the global error-envelope handler unchanged.
+      // See src/lib/with-db-role-safe.ts for the full rationale + the
+      // cross-slice refactor history (Med-Interaction PR 7.1 / Crisis
+      // Sprint 2 PR 1 R2 / Admin Sprint 2 PR 1 R1 closures).
       const callWrappers = async (): Promise<RawCurrentStateRow | null> => {
-        try {
-          return await withDbRole(tx, 'medication_interaction_signal_viewer', async () => {
-            const result = await tx.query<RawCurrentStateRow>(
-              'SELECT signal_id, current_state, as_of, transition_reason FROM get_interaction_signal_current_state($1)',
-              [signalId],
-            );
-            if (result.rows.length === 0) {
-              return null;
-            }
-            // The function returns at most one row by id; defensive against
-            // any future widening that would surface duplicates.
-            return result.rows[0] ?? null;
-          });
-        } catch (err) {
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err &&
-            (err as { code?: unknown }).code === '42501'
-          ) {
-            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+        return withDbRoleSafe(tx, 'medication_interaction_signal_viewer', req, async () => {
+          const result = await tx.query<RawCurrentStateRow>(
+            'SELECT signal_id, current_state, as_of, transition_reason FROM get_interaction_signal_current_state($1)',
+            [signalId],
+          );
+          if (result.rows.length === 0) {
+            return null;
           }
-          throw err;
-        }
+          // The function returns at most one row by id; defensive against
+          // any future widening that would surface duplicates.
+          return result.rows[0] ?? null;
+        });
       };
       if (typeof actorNonce === 'string' && actorNonce.length > 0) {
         return withActorContext(tx, actorNonce, callWrappers);

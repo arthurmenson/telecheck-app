@@ -82,7 +82,7 @@ import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { withDbRole } from '../../../../lib/with-db-role.js';
+import { withDbRoleSafe } from '../../../../lib/with-db-role-safe.js';
 
 /**
  * Row shape returned by `read_admin_crisis_operational_health(text, jsonb)`.
@@ -175,58 +175,38 @@ export async function getCrisisOperationalHealthHandler(
       // undefined. The wrapper's LAYER C check (current_actor_account_*())
       // requires the nonce to resolve the bound identity row, so without
       // a nonce the wrapper would raise 'no actor tenant bound' (42501).
-      //
       // For the v0.1 handler we treat the missing-nonce case as fail-
-      // closed: the wrapper itself enforces "no actor → reject", so we
-      // let it raise + this handler maps 42501 to a tenant-blind 403
-      // per I-025 (see R1 HIGH-1 closure below).
+      // closed: the wrapper itself enforces "no actor → reject" and
+      // withDbRoleSafe maps the resulting 42501 to a tenant-blind 403.
       //
-      // **R1 HIGH-1 closure 2026-05-23:** an earlier comment here claimed
-      // "the global error envelope translates 42501 into a tenant-blind
-      // 401/403 per I-025" — that was incorrect. The global error envelope
-      // (src/lib/error-envelope.ts buildErrorEnvelope) derives statusCode
-      // from `error.statusCode ?? 500`; pg errors do not carry statusCode,
-      // so an uncaught 42501 became a 500. In non-prod the raw PG message
-      // — which may include tenant_id — was exposed to the client,
-      // violating I-025. Fix: catch SQLSTATE 42501 around the SECDEF call
-      // and throw a 403 via req.server.httpErrors.forbidden(), which the
-      // envelope formats as a canonical insufficient-scope response
-      // without tenant identifiers. Other PG errors propagate unchanged.
-      // R2 MED-1 closure 2026-05-23 (Codex sibling-finding from Crisis
-      // task bdx9yneo0; mechanical fix applied here too): the 42501
-      // catch MUST wrap the ENTIRE withDbRole call, not just the inner
-      // SELECT. withDbRole issues SET LOCAL ROLE BEFORE invoking its
-      // callback; a role-membership gap or grant skew would raise 42501
-      // at that pre-callback boundary, escaping a catch placed inside
-      // the callback. Wrapping the withDbRole(...) Promise covers BOTH
-      // paths (privilege acquisition + SECDEF wrapper LAYER C guard).
+      // I-025 envelope-leak defense: `withDbRoleSafe` (src/lib/with-db-
+      // role-safe.ts) composes `withDbRole` + the canonical SQLSTATE
+      // 42501 → tenant-blind 403 mapping. The mapping covers BOTH raise
+      // paths — (1) the SET LOCAL ROLE pre-callback step (foundation-051
+      // role-membership drift) and (2) the SECDEF wrapper LAYER C tenant-
+      // scope guard / RLS evaluation. Without this mapping, an uncaught
+      // 42501 would reach the global envelope as a 500 with the raw PG
+      // message (which may include tenant_id) exposed to the client in
+      // non-prod, violating I-025. Other PG errors propagate unchanged.
+      //
+      // See src/lib/with-db-role-safe.ts for the full rationale + the
+      // cross-slice refactor history (Med-Interaction PR 7.1 / Crisis
+      // Sprint 2 PR 1 R2 / Admin Sprint 2 PR 1 R1 closures).
       const runWrapper = async (): Promise<CrisisOperationalHealthRow[]> => {
-        try {
-          return await withDbRole(tx, 'admin_basic_operator', async () => {
-            // The wrapper signature is
-            //   read_admin_crisis_operational_health(p_tenant_id TEXT,
-            //                                        p_query_params_jsonb JSONB)
-            // Pass an empty `{}` for query params at v0.1 — the wrapper
-            // body persists this into admin_dashboard_query_execution.
-            // Future iterations may surface query filters from URL query
-            // string (e.g., ?severity=high) and forward them here.
-            const result = await tx.query<CrisisOperationalHealthRow>(
-              'SELECT * FROM read_admin_crisis_operational_health($1, $2)',
-              [ctx.tenantId, {}],
-            );
-            return result.rows;
-          });
-        } catch (err) {
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err &&
-            (err as { code?: unknown }).code === '42501'
-          ) {
-            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-          }
-          throw err;
-        }
+        return withDbRoleSafe(tx, 'admin_basic_operator', req, async () => {
+          // The wrapper signature is
+          //   read_admin_crisis_operational_health(p_tenant_id TEXT,
+          //                                        p_query_params_jsonb JSONB)
+          // Pass an empty `{}` for query params at v0.1 — the wrapper
+          // body persists this into admin_dashboard_query_execution.
+          // Future iterations may surface query filters from URL query
+          // string (e.g., ?severity=high) and forward them here.
+          const result = await tx.query<CrisisOperationalHealthRow>(
+            'SELECT * FROM read_admin_crisis_operational_health($1, $2)',
+            [ctx.tenantId, {}],
+          );
+          return result.rows;
+        });
       };
 
       if (req.actorNonce !== undefined) {
