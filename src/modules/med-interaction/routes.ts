@@ -62,6 +62,7 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import { getSignalHandler } from './internal/handlers/get-signal.js';
+import { postEvaluationHandler } from './internal/handlers/post-evaluation.js';
 
 export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
@@ -73,7 +74,7 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
     status: 'ok',
     module: 'med-interaction',
     blocked:
-      'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1; PR 7 of N — first real handler shipped)',
+      'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1; PR 8 of N — first write handler shipped)',
     blocked_message:
       'Spec layer COMPLETE: SI-019 v2.0 RATIFIED 2026-05-21 P-033 + CDM v1.6 → v1.7 ' +
       '+ AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 ' +
@@ -82,13 +83,14 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
       'triggers (047) + view + MV + SECDEF access function (048) + raw lifecycle writer ' +
       'SECDEF + anti-bypass matrix (049) + 6 reason-specific wrappers (050; 3 ' +
       'operational + 3 fail-closed pending evidence-source migrations). ' +
-      'PR 7 (this commit) ships the FIRST real Fastify handler post-foundation-051: ' +
-      'GET /v0/med-interaction/signals/:id reading via the SECDEF access function from ' +
-      'migration 048 under the canonical withTransaction → withTenantContext → ' +
-      'withActorContext → withDbRole(medication_interaction_signal_viewer) composition. ' +
-      '7 endpoints remain (POST evaluations + 6 signal lifecycle actions); they land in ' +
-      'PRs 8-11 with Cat A audit emission + LAYER B role-membership tightening. See ' +
-      'src/modules/med-interaction/README.md + docs/med-interaction-implementation-plan.md.',
+      'PR 7 shipped the first read handler (GET /v0/med-interaction/signals/:id). ' +
+      'PR 8 (this commit) ships the FIRST write handler: POST /v0/med-interaction/evaluations ' +
+      'INSERTing the append-only interaction_engine_evaluation row under withDbRole(' +
+      'medication_interaction_engine_evaluator) + emitting the Cat A ' +
+      'medication_interaction.engine_evaluation_completed audit event (AUDIT_EVENTS v5.9 / ' +
+      'P-034) in the same transaction. 6 endpoints remain (POST signals + 5 signal lifecycle ' +
+      'actions); they land in PRs 9+ with Cat A/B audit emission + LAYER B role-membership ' +
+      'tightening. See src/modules/med-interaction/README.md + docs/med-interaction-implementation-plan.md.',
   }));
 
   // Readiness probe — module is partially serving traffic at PR 7 (the
@@ -107,14 +109,15 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
       module: 'med-interaction',
       reason: 'partial_handlers_wired',
       reason_message:
-        '1 of 8 Med Interaction Engine Fastify handlers wired (PR 7: ' +
+        '2 of 8 Med Interaction Engine Fastify handlers wired (PR 7: ' +
         'GET /v0/med-interaction/signals/:id via SECDEF access function from ' +
-        'migration 048 under the canonical withDbRole composition). 7 endpoints ' +
-        'remain: POST /evaluations + POST /signals + POST /signals/:id/{activate, ' +
-        'override, resolve, expire, supersede}. Spec + DB layers COMPLETE through ' +
-        'migration 050 + PR 7 first real handler. The /ready probe returns 200 once ' +
-        'the full PR series (remaining handlers + Cat A audit emission + LAYER B ' +
-        'role-membership check + integration tests) closes. See ' +
+        'migration 048; PR 8: POST /v0/med-interaction/evaluations INSERTing the ' +
+        'append-only interaction_engine_evaluation row + emitting the Cat A ' +
+        'medication_interaction.engine_evaluation_completed audit event). 6 endpoints ' +
+        'remain: POST /signals + POST /signals/:id/{activate, override, resolve, expire, ' +
+        'supersede}. Spec + DB layers COMPLETE through migration 050. The /ready probe ' +
+        'returns 200 once the full PR series (remaining handlers + Cat A/B audit emission + ' +
+        'LAYER B role-membership check + integration tests) closes. See ' +
         'src/modules/med-interaction/README.md for the resume path.',
     });
   });
@@ -128,13 +131,23 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   // composition order + Layer B deferral rationale.
   app.get('/signals/:id', getSignalHandler);
 
-  // Remaining 7 endpoints (POST /evaluations, POST /signals, POST
-  // /signals/:id/{activate, override, resolve, expire, supersede})
-  // land in PR 8+ when write-handler implementation begins. They will
-  // share the same withTransaction → withTenantContext → withActorContext
-  // → withDbRole composition pattern as the PR 7 read handler; the
-  // write variants additionally wire Cat A audit emission inside the
-  // same DB transaction as the SECDEF wrapper call (so a partial commit
-  // cannot leave a wrapper effect without its audit record, per the
-  // module README's Option 2 carryforward).
+  // PR 8 of N: POST /v0/med-interaction/evaluations — record an
+  // interaction-engine evaluation (OpenAPI v0.3 endpoint #1). FIRST
+  // write handler: INSERTs the strict-append-only interaction_engine_
+  // evaluation row under withDbRole(medication_interaction_engine_
+  // evaluator) and emits the Cat A medication_interaction.engine_
+  // evaluation_completed audit event inside the same transaction
+  // (I-003 durability). Establishes the canonical write composition for
+  // PR 9+ signal-lifecycle handlers. See handler file-level docstring.
+  app.post('/evaluations', postEvaluationHandler);
+
+  // Remaining 6 endpoints (POST /signals, POST /signals/:id/{activate,
+  // override, resolve, expire, supersede}) land in PR 9+ when signal-
+  // lifecycle write-handler implementation begins. They share the same
+  // withTransaction → withTenantContext → withActorContext → withDbRole
+  // composition; the lifecycle variants additionally call the migration
+  // 050 SECDEF wrappers and wire Cat A/B audit emission inside the same
+  // DB transaction as the wrapper call (so a partial commit cannot leave
+  // a wrapper effect without its audit record, per the module README's
+  // Option 2 carryforward).
 };

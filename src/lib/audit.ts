@@ -101,6 +101,16 @@ type CategoryAAction =
   | 'safety_hold_resolved'
   | 'bridge_supply_authorized'
   | 'interaction_engine_evaluation'
+  // Med-Interaction Engine (SI-019) — 2 Cat A action IDs added under
+  // AUDIT_EVENTS v5.8 → v5.9 (P-034 RATIFIED 2026-05-21; CDM v1.6 → v1.7
+  // Amendment §4). The canonical `medication_interaction.*` namespace
+  // supersedes the legacy bare `interaction_engine_evaluation` id above for
+  // new emissions. NB: the amendment's summary line states "4 Cat A + 2 Cat B"
+  // while its per-row enumeration table (the authoritative form) lists these 2
+  // as Cat A and the other 4 as Cat B — observed spec inconsistency surfaced to
+  // the AUDIT_EVENTS owner; the per-row table governs here.
+  | 'medication_interaction.engine_evaluation_completed' // Cat A — engine evaluator on every evaluation row INSERT (success or no-signals)
+  | 'medication_interaction.signal_emitted' // Cat A — engine evaluator on every signal row INSERT (one per signal)
   | 'herb_drug_engine_evaluation'
   | 'ai_mode_2_evaluation'
   | 'ai_mode_2_physician_approve'
@@ -129,6 +139,13 @@ type CategoryBAction =
   | 'incident_opened'
   | 'incident_resolved'
   | 'signal_enforcement_trigger'
+  // Med-Interaction Engine (SI-019) — 4 Cat B action IDs added under
+  // AUDIT_EVENTS v5.8 → v5.9 (P-034 RATIFIED 2026-05-21; CDM v1.6 → v1.7
+  // Amendment §4 per-row enumeration table).
+  | 'medication_interaction.engine_evaluation_failed' // engine evaluator on evaluation failure (timeout, KB unreachable, schema mismatch)
+  | 'medication_interaction.engine_knowledge_base_updated' // admin endpoint on dual-control KB version bump (per I-015)
+  | 'medication_interaction.engine_signal_enforcement_override' // dual-control safety pathway on critical/major-block override
+  | 'medication_interaction.engine_projection_divergence_detected' // hourly reconciliation cron on MV-vs-transition-table divergence
   // Research events (added v5.2 per ADR-028)
   | 'research.consent_granted'
   | 'research.consent_revoked'
