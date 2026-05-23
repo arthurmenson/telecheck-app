@@ -472,7 +472,10 @@ CREATE TRIGGER interaction_signal_lifecycle_transition_block_delete
 CREATE OR REPLACE FUNCTION interaction_signal_lifecycle_transition_enforce_monotonic_ordering()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SECURITY INVOKER    -- runs under caller's privileges; reads same table caller is inserting into
+SECURITY DEFINER    -- R1 HIGH-1 closure: runs under function-owner privileges so the
+                    -- MAX(prior.transition_at) read bypasses RLS visibility filtering;
+                    -- explicit WHERE tenant_id = NEW.tenant_id predicate below enforces
+                    -- tenant isolation at the query layer instead.
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
@@ -480,15 +483,33 @@ DECLARE
     v_max_clock_skew CONSTANT INTERVAL := INTERVAL '5 seconds';
     v_lock_key BIGINT;
 BEGIN
+    -- R1 HIGH-1 closure 2026-05-23 (Codex R1): trigger is SECURITY DEFINER (NOT
+    -- SECURITY INVOKER as in the original draft). Rationale: under SECURITY
+    -- INVOKER the trigger ran with the caller's RLS visibility — the writer-
+    -- owner role's SELECT on this table is RLS-filtered by the tenant_isolation
+    -- policy `tenant_id = current_tenant_id()`. If `current_tenant_id()` was
+    -- not set or differed from NEW.tenant_id (e.g., a caller path that bypassed
+    -- the standard SI-010 actor-binding wrapper layer), the MAX query would
+    -- return NULL for tenants with existing rows — letting backdated inserts
+    -- pass the monotonic check + corrupt derived current-state by
+    -- ORDER BY transition_at DESC, id DESC. The fix runs the MAX read under
+    -- the function-owner's privileges (postgres in this migration; can be
+    -- ALTER'd to a less-privileged audit-read role in a future hardening
+    -- cycle if needed) so RLS does not filter it; tenant isolation at the
+    -- query layer is preserved by the explicit `WHERE tenant_id = NEW.tenant_id`
+    -- predicate, which scopes the read to the inserted row's tenant. The
+    -- INSERT itself still passes the table's RLS WITH CHECK clause as the
+    -- caller, so the tenant_isolation policy is enforced on the write path
+    -- independently of this trigger's read path.
+
     -- Serialize concurrent inserts per (tenant_id, signal_id) via a
     -- transaction-scoped advisory lock so the MAX(prior.transition_at)
     -- read sees only committed-before-this-tx rows. Without this lock,
     -- two concurrent inserts for the same signal can both read the same
     -- prior MAX before either commits, letting a later-arriving
     -- transaction insert a backdated transition_at and pass the
-    -- monotonic check anyway — corrupting current-state derivation by
-    -- ORDER BY transition_at DESC, id DESC. Advisory lock is
-    -- auto-released at tx commit/rollback.
+    -- monotonic check anyway. Advisory lock is auto-released at tx
+    -- commit/rollback.
     v_lock_key := ('x' || substr(md5(NEW.tenant_id::text || ':' || NEW.signal_id::text), 1, 16))::bit(64)::bigint;
     PERFORM pg_advisory_xact_lock(v_lock_key);
 
@@ -503,7 +524,9 @@ BEGIN
 
     -- Backdating rejected (NEW.transition_at >= MAX(prior.transition_at)).
     -- Read happens UNDER the advisory lock so the MAX is the
-    -- committed-predecessor value.
+    -- committed-predecessor value. WHERE tenant_id = NEW.tenant_id is
+    -- the tenant-isolation predicate (RLS bypassed by SECURITY DEFINER
+    -- per R1 HIGH-1 closure rationale above).
     SELECT MAX(transition_at) INTO v_max_prior_transition_at
       FROM public.interaction_signal_lifecycle_transition
      WHERE tenant_id = NEW.tenant_id AND signal_id = NEW.signal_id;
