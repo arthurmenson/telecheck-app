@@ -161,6 +161,13 @@ function makeReq(opts?: {
           e.statusCode = 401;
           return e;
         },
+        forbidden: (msg?: string) => {
+          const e = new Error(msg ?? 'Forbidden') as Error & {
+            statusCode: number;
+          };
+          e.statusCode = 403;
+          return e;
+        },
         notFound: (msg: string) => {
           const e = new Error(msg) as Error & { statusCode: number };
           e.statusCode = 404;
@@ -425,5 +432,104 @@ describe('getSignalHandler §5 — 200 + view payload', () => {
       as_of: '2026-05-23T12:00:00.000Z',
       transition_reason: 'engine_evaluation',
     });
+  });
+});
+
+// ===========================================================================
+// §6 — wrapper / SECDEF error mapping (42501 → tenant-blind 403 per I-025)
+//
+// PR 7.1 hotfix coverage backfill 2026-05-23: mirrors sibling Admin Sprint 2
+// PR 1 §4a + §4b coverage (`get-crisis-operational-health.test.ts`). The
+// hotfix at commit 7112411 wrapped the withDbRole call in a try/catch that
+// maps PG SQLSTATE 42501 ("insufficient_privilege") to a Fastify forbidden
+// envelope with a tenant-blind message. PostgreSQL can raise 42501 in TWO
+// places (per get-signal.ts §5 docstring):
+//   (1) Inside withDbRole's SET LOCAL ROLE pre-callback step.
+//   (2) Inside the SECDEF function's body or RLS evaluation.
+// The catch is OUTSIDE withDbRole so both paths are covered. Without this
+// mapping, a 42501 with a tenant-id-leaky message would escape past the
+// inner SELECT and reach the global envelope as a 500 with the raw PG
+// message exposed in non-prod — violating I-025.
+//
+// Non-42501 errors MUST propagate UNCHANGED so they (a) flow through the
+// global envelope's 5xx default-message + rollback path and (b) preserve
+// the original `.code` for downstream observability. The identity-preserve
+// assertion catches regressions that would re-wrap the error (losing .code
+// or attaching a 4xx statusCode the global envelope would then treat as
+// client-facing).
+// ===========================================================================
+
+describe('getSignalHandler §6 — wrapper / SECDEF error mapping (42501 → 403)', () => {
+  it('§6a wrapper-side 42501 (tenant-scope mismatch / missing actor) maps to 403 tenant-blind; raw PG message + tenant IDs are NOT leaked', async () => {
+    // Simulate wrapper LAYER C / SECDEF raise: tenant scope mismatch with
+    // a message containing tenant identifiers + the raw '42501' / 'tenant
+    // scope mismatch' strings that I-025 forbids leaking to the client.
+    queryResponder = () => {
+      const wrapperError = Object.assign(
+        new Error(
+          'get_interaction_signal_current_state: tenant scope mismatch — actor tenant Telecheck-US does not match wrapper p_tenant_id Telecheck-Ghana; cross-tenant read rejected',
+        ),
+        { code: '42501' },
+      );
+      throw wrapperError;
+    };
+
+    const req = makeReq({ actorNonce: 'fake-nonce' });
+    const { reply } = makeReply();
+
+    let thrown: unknown;
+    try {
+      await getSignalHandler(req, reply);
+    } catch (e) {
+      thrown = e;
+    }
+
+    expect(thrown).toBeDefined();
+    // Asserted as Fastify forbidden — statusCode 403, tenant-blind message.
+    const errObj = thrown as { statusCode?: number; message?: string };
+    expect(errObj.statusCode).toBe(403);
+    // Critical I-025 invariant: message must NOT contain tenant identifiers
+    // or raw SQLSTATE / wrapper details from the upstream PG error.
+    expect(errObj.message ?? '').not.toContain('Telecheck-US');
+    expect(errObj.message ?? '').not.toContain('Telecheck-Ghana');
+    expect(errObj.message ?? '').not.toContain('tenant scope mismatch');
+    expect(errObj.message ?? '').not.toContain('42501');
+    // The generic message can mention "scope" but no tenant ids.
+    expect(errObj.message ?? '').toMatch(/scope|forbidden|insufficient/i);
+  });
+
+  it('§6b non-42501 PG errors propagate UNCHANGED — identity-preserved, code intact, no 4xx statusCode added', async () => {
+    // Simulate a non-42501 PG error (admin_shutdown) — the handler must
+    // NOT re-wrap or otherwise mutate the error; it must propagate to the
+    // global envelope unchanged so the 5xx default-message + rollback +
+    // tenant-blind 500 replacement path runs as designed.
+    const otherPgError = Object.assign(
+      new Error('connection terminated unexpectedly'),
+      { code: '57P01' }, // admin_shutdown
+    );
+    queryResponder = () => {
+      throw otherPgError;
+    };
+
+    const req = makeReq({ actorNonce: 'fake-nonce' });
+    const { reply } = makeReply();
+
+    let thrown: unknown;
+    try {
+      await getSignalHandler(req, reply);
+    } catch (e) {
+      thrown = e;
+    }
+
+    // Identity-preservation + code intact: a regression that re-wrapped
+    // the error (losing .code, adding a 4xx statusCode that the global
+    // envelope would then treat as client-facing) would have passed a
+    // looser toThrow(/connection terminated/) assertion. The identity
+    // check is what catches that class of regression.
+    expect(thrown).toBe(otherPgError);
+    expect((thrown as { code?: string }).code).toBe('57P01');
+    // Must NOT have a 4xx statusCode added (would defeat the 5xx rollback
+    // + tenant-blind 500 default-message replacement in the global envelope).
+    expect((thrown as { statusCode?: number }).statusCode).toBeUndefined();
   });
 });
