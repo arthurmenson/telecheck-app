@@ -119,6 +119,7 @@ AS $$
 DECLARE
     v_latest_to_state     TEXT;
     v_actor_tenant_id     TEXT;
+    v_lock_key            BIGINT;
 BEGIN
     -- ---------------------------------------------------------------------
     -- Defense-in-depth tenant guard (mirrors Crisis Response migration 035
@@ -147,12 +148,39 @@ BEGIN
     END IF;
 
     -- ---------------------------------------------------------------------
+    -- R1 HIGH-1 closure 2026-05-23 (Codex R1): acquire per-(tenant, signal)
+    -- advisory transaction lock BEFORE the STEP 3.5 override-evidence
+    -- check. Without this lock, a concurrent override INSERT could slip
+    -- between the EXISTS check + the activation INSERT, leaving an
+    -- activation transition committed even though override evidence
+    -- exists — corrupting the SI-019 R5 HIGH-1 invariant + impossible to
+    -- repair since lifecycle rows are append-only.
+    --
+    -- LOCK KEY SHARED ACROSS BOTH WRITE PATHS (CONTRACT FOR PR 5):
+    --   - Raw writer (this function) acquires lock BEFORE STEP 3.5
+    --     activation check
+    --   - PR 5 override_wrapper MUST acquire the SAME lock key BEFORE
+    --     INSERT into interaction_signal_override
+    --   - This serializes activation decisions with override creation
+    --     for the same (tenant, signal), eliminating the race
+    --
+    -- Lock key uses the same md5-of-(tenant_id, signal_id) shape as the
+    -- monotonic-ordering trigger on lifecycle_transition (migration 047
+    -- §3), so the lock domain is consistent across all writes to a single
+    -- (tenant, signal). Concurrent calls serialize; lock is auto-released
+    -- at tx commit/rollback.
+    -- ---------------------------------------------------------------------
+    v_lock_key := ('x' || substr(md5(p_tenant_id::text || ':' || p_signal_id::text), 1, 16))::bit(64)::bigint;
+    PERFORM pg_advisory_xact_lock(v_lock_key);
+
+    -- ---------------------------------------------------------------------
     -- STEP 3.5 — activation-blocked-by-override-evidence check (SI-019
-    -- §6.NEW1 R5 HIGH-1 closure preserved verbatim from spec). If a caller
-    -- attempts an `activation` transition for a signal that already has an
-    -- override record, reject — the override evidence supersedes activation
-    -- semantically. Reason-specific check; could move to the activation
-    -- wrapper (PR 5) in a future refactor but kept here per spec.
+    -- §6.NEW1 R5 HIGH-1 closure preserved verbatim from spec). Now executes
+    -- under the advisory lock acquired above (R1 HIGH-1 closure), so a
+    -- concurrent override INSERT cannot slip between this EXISTS check and
+    -- the activation INSERT below. Reason-specific check; could move to
+    -- the activation wrapper (PR 5) in a future refactor but kept here
+    -- per spec.
     -- ---------------------------------------------------------------------
     IF p_transition_reason = 'activation' THEN
         IF EXISTS (
