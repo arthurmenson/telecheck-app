@@ -473,34 +473,56 @@ CREATE OR REPLACE FUNCTION interaction_signal_lifecycle_transition_enforce_monot
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER    -- R1 HIGH-1 closure: runs under function-owner privileges so the
-                    -- MAX(prior.transition_at) read bypasses RLS visibility filtering;
-                    -- explicit WHERE tenant_id = NEW.tenant_id predicate below enforces
-                    -- tenant isolation at the query layer instead.
+                    -- MAX(prior.transition_at) read bypasses RLS visibility filtering.
+                    -- Tenant scope enforced by R2 HIGH-1 guard below (early caller-
+                    -- tenant-context validation) + R2 HIGH-1 generic-error-message
+                    -- discipline (no MAX timestamp exposure in cross-tenant attempts).
+                    -- Function OWNER pinned to postgres per R2 MED-1 (ALTER FUNCTION
+                    -- below) so the RLS bypass actually fires regardless of who
+                    -- applies the migration.
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_max_prior_transition_at TIMESTAMPTZ;
     v_max_clock_skew CONSTANT INTERVAL := INTERVAL '5 seconds';
     v_lock_key BIGINT;
+    v_caller_tenant_id        TEXT;
 BEGIN
-    -- R1 HIGH-1 closure 2026-05-23 (Codex R1): trigger is SECURITY DEFINER (NOT
-    -- SECURITY INVOKER as in the original draft). Rationale: under SECURITY
-    -- INVOKER the trigger ran with the caller's RLS visibility — the writer-
-    -- owner role's SELECT on this table is RLS-filtered by the tenant_isolation
-    -- policy `tenant_id = current_tenant_id()`. If `current_tenant_id()` was
-    -- not set or differed from NEW.tenant_id (e.g., a caller path that bypassed
-    -- the standard SI-010 actor-binding wrapper layer), the MAX query would
-    -- return NULL for tenants with existing rows — letting backdated inserts
-    -- pass the monotonic check + corrupt derived current-state by
-    -- ORDER BY transition_at DESC, id DESC. The fix runs the MAX read under
-    -- the function-owner's privileges (postgres in this migration; can be
-    -- ALTER'd to a less-privileged audit-read role in a future hardening
-    -- cycle if needed) so RLS does not filter it; tenant isolation at the
-    -- query layer is preserved by the explicit `WHERE tenant_id = NEW.tenant_id`
-    -- predicate, which scopes the read to the inserted row's tenant. The
-    -- INSERT itself still passes the table's RLS WITH CHECK clause as the
-    -- caller, so the tenant_isolation policy is enforced on the write path
-    -- independently of this trigger's read path.
+    -- =====================================================================
+    -- R2 HIGH-1 closure 2026-05-23 (Codex R2): early caller-tenant guard.
+    -- PostgreSQL fires BEFORE INSERT triggers BEFORE evaluating WITH CHECK
+    -- clauses, so the prior R1-closure code could leak cross-tenant timing
+    -- information via the backdated-exception message: a caller with INSERT
+    -- privilege could submit NEW.tenant_id of another tenant + a stale
+    -- transition_at; the SECURITY DEFINER MAX read (correctly scoped to
+    -- the attacker-supplied NEW.tenant_id via explicit WHERE predicate)
+    -- would compute the other tenant's MAX and the backdated-exception
+    -- error message would echo the MAX timestamp + the other tenant's
+    -- signal_id — exposing existence + timing of rows the caller's
+    -- current_tenant_id() does not authorize SELECT on.
+    --
+    -- Fix: validate caller-tenant context BEFORE any privileged read.
+    -- Reject the INSERT early if NEW.tenant_id is not the caller's
+    -- current_tenant_id() (i.e., the value the standard SI-010 trust-
+    -- anchor wrapper layer would have set). This collapses cross-tenant
+    -- INSERT attempts into a generic permission error with no MAX exposure.
+    -- The error message intentionally omits the rejected NEW.tenant_id +
+    -- the caller's bound tenant to prevent enumeration of valid tenants.
+    -- =====================================================================
+    v_caller_tenant_id := current_tenant_id();
+    IF v_caller_tenant_id IS NULL
+       OR v_caller_tenant_id IS DISTINCT FROM NEW.tenant_id THEN
+        RAISE EXCEPTION
+            'interaction_signal_lifecycle_transition: caller tenant context does '
+            'not authorize this INSERT'
+            USING ERRCODE = '42501';    -- insufficient_privilege
+    END IF;
+
+    -- =====================================================================
+    -- R1 HIGH-1 closure 2026-05-23 (Codex R1): SECDEF-bound advisory-locked
+    -- monotonic read. Reaches this point only if the caller-tenant guard
+    -- above passed, so NEW.tenant_id is the caller's authorized tenant.
+    -- =====================================================================
 
     -- Serialize concurrent inserts per (tenant_id, signal_id) via a
     -- transaction-scoped advisory lock so the MAX(prior.transition_at)
@@ -525,24 +547,44 @@ BEGIN
     -- Backdating rejected (NEW.transition_at >= MAX(prior.transition_at)).
     -- Read happens UNDER the advisory lock so the MAX is the
     -- committed-predecessor value. WHERE tenant_id = NEW.tenant_id is
-    -- the tenant-isolation predicate (RLS bypassed by SECURITY DEFINER
-    -- per R1 HIGH-1 closure rationale above).
+    -- the tenant-isolation predicate (RLS bypassed by SECURITY DEFINER).
+    -- The R2 caller-tenant guard above guarantees NEW.tenant_id is the
+    -- caller's authorized tenant, so this read does not cross tenant
+    -- boundaries.
     SELECT MAX(transition_at) INTO v_max_prior_transition_at
       FROM public.interaction_signal_lifecycle_transition
      WHERE tenant_id = NEW.tenant_id AND signal_id = NEW.signal_id;
 
     IF v_max_prior_transition_at IS NOT NULL
        AND NEW.transition_at < v_max_prior_transition_at THEN
+        -- R2 HIGH-1 closure: error message intentionally OMITS MAX timestamp
+        -- + signal_id (defense-in-depth — caller-tenant guard above already
+        -- prevents cross-tenant attempts, but this avoids in-tenant
+        -- timing-side-channel surface for the legitimate-caller case
+        -- where a buggy retry could otherwise read its own prior MAX
+        -- through an error message). The exception still raises with a
+        -- canonical SQLSTATE; the wrapper layer surfaces a tenant-blind
+        -- error envelope to the HTTP client per I-025.
         RAISE EXCEPTION
             'interaction_signal_lifecycle_transition backdated: '
-            'NEW.transition_at (%) is before MAX(prior.transition_at) (%) for signal %',
-            NEW.transition_at, v_max_prior_transition_at, NEW.signal_id
+            'NEW.transition_at is before MAX(prior.transition_at) for the '
+            'target signal in this tenant'
             USING ERRCODE = '22008';
     END IF;
 
     RETURN NEW;
 END;
 $$;
+
+-- R2 MED-1 closure 2026-05-23 (Codex R2): pin function owner to postgres so
+-- the SECURITY DEFINER RLS bypass actually fires regardless of which role
+-- applies the migration. Without this ALTER, a migration-applier that is
+-- itself non-BYPASSRLS would own the function and the SECURITY DEFINER
+-- semantics would inherit its RLS subjection — recreating the R1 failure
+-- mode where MAX returns NULL for tenants with existing rows when
+-- current_tenant_id() is unset or mismatched.
+ALTER FUNCTION interaction_signal_lifecycle_transition_enforce_monotonic_ordering()
+    OWNER TO postgres;
 
 CREATE TRIGGER interaction_signal_lifecycle_transition_monotonic_ordering
     BEFORE INSERT ON interaction_signal_lifecycle_transition
@@ -607,5 +649,54 @@ BEGIN
             'migration-047-rls-enforcement-incomplete: '
             'expected all % tables to have ENABLE + FORCE RLS, found % compliant',
             v_expected_count, v_created_count;
+    END IF;
+END $$;
+
+-- R2 MED-1 closure 2026-05-23 (Codex R2): verify monotonic-ordering trigger
+-- function is SECURITY DEFINER + OWNED BY postgres + has locked search_path.
+-- Without these, the R1 + R2 closure rationale collapses (the SECDEF RLS
+-- bypass + cross-tenant guard depend on the function executing under a
+-- BYPASSRLS owner with a non-injectable search_path).
+DO $$
+DECLARE
+    v_target_oid          OID := to_regprocedure(
+        'public.interaction_signal_lifecycle_transition_enforce_monotonic_ordering()'
+    );
+    v_owner_name          TEXT;
+    v_security_definer    BOOLEAN;
+    v_proconfig           TEXT[];
+BEGIN
+    IF v_target_oid IS NULL THEN
+        RAISE EXCEPTION
+            'migration-047-monotonic-trigger-function-missing: '
+            'interaction_signal_lifecycle_transition_enforce_monotonic_ordering() '
+            'not found by signature';
+    END IF;
+
+    SELECT r.rolname, p.prosecdef, p.proconfig
+      INTO v_owner_name, v_security_definer, v_proconfig
+      FROM pg_proc p
+      JOIN pg_roles r ON r.oid = p.proowner
+     WHERE p.oid = v_target_oid;
+
+    IF v_owner_name <> 'postgres' THEN
+        RAISE EXCEPTION
+            'migration-047-monotonic-trigger-owner-mismatch: '
+            'function owner is % but MUST be postgres for SECURITY DEFINER '
+            'RLS-bypass semantics to fire correctly', v_owner_name;
+    END IF;
+
+    IF NOT v_security_definer THEN
+        RAISE EXCEPTION
+            'migration-047-monotonic-trigger-security-definer-missing: '
+            'function MUST be SECURITY DEFINER per R1 HIGH-1 closure';
+    END IF;
+
+    IF v_proconfig IS NULL
+       OR NOT (v_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
+        RAISE EXCEPTION
+            'migration-047-monotonic-trigger-search-path-not-locked: '
+            'function MUST have proconfig containing '
+            '"search_path=pg_catalog, public"; found %', v_proconfig;
     END IF;
 END $$;
