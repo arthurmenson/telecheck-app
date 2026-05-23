@@ -61,6 +61,8 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { getSignalCurrentStateHandler } from './internal/handlers/signals.js';
+
 export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
@@ -70,8 +72,7 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'med-interaction',
-    blocked:
-      'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1)',
+    blocked: 'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1)',
     blocked_message:
       'Spec layer COMPLETE: SI-019 v2.0 RATIFIED 2026-05-21 P-033 + CDM v1.6 → v1.7 ' +
       '+ AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 ' +
@@ -113,10 +114,22 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
     });
   });
 
-  // Real routes (POST /v1/med-interaction/evaluations, POST .../signals,
-  // POST .../signals/:id/activate, override, resolve, expire, supersede,
-  // GET .../signals/:id) land in PR 7+ when handler / adapter / service
-  // authoring begins. The handler surface is intentionally absent here so
-  // that any premature wiring breaks at typecheck time rather than
-  // reaching production half-built.
+  // PR 7 — first handler of the series: the lowest-risk read endpoint
+  // (cockpit Addendum 81). GET /v0/med-interaction/signals/:id returns the
+  // current-state projection via the SECDEF access function from migration
+  // 048, gated at the route layer (LAYER B) to signal_viewer-entitled roles
+  // and elevated into the `medication_interaction_signal_viewer` slice role
+  // via withDbRole (Option B app-role acquisition; migration 051). Pure
+  // read: NO Cat A audit emission (SI-019 §6 audit catalog has no read
+  // event). Mounted relative to the plugin prefix `/v0/med-interaction`.
+  app.get('/signals/:id', getSignalCurrentStateHandler);
+
+  // Remaining write/lifecycle routes (POST .../evaluations, POST .../signals,
+  // POST .../signals/:id/activate | override | resolve | expire | supersede)
+  // land in PR 8+ together with their Cat A audit emission + the SECDEF
+  // lifecycle wrappers from migrations 049/050. They are intentionally
+  // absent here so that any premature wiring breaks at typecheck time
+  // rather than reaching production half-built. The /ready probe above
+  // continues to advertise 503 until the full surface + its live-DB
+  // integration tests close.
 };

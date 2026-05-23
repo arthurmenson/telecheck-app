@@ -352,6 +352,36 @@ beforeAll(async () => {
   _client = new Client(config);
   await _client.connect();
 
+  // Provision the production application login role BEFORE migrations.
+  //
+  // `telecheck_app_role` is the role the application connects as in
+  // production; in real deployments it is provisioned by infrastructure
+  // (IaC), NOT by a migration. Migrations 002/003/031/036 only reference
+  // it in comments or behind `IF EXISTS (… rolname = 'telecheck_app_role')`
+  // guards, so the 000→head chain applied cleanly without it through
+  // migration 050. Migration 051 (app-role acquisition foundation) added
+  // an UNGUARDED `ALTER ROLE telecheck_app_role NOINHERIT` + GRANT of the
+  // 13 slice roles, so the chain now fails at 051 unless the role exists.
+  // Create it here (idempotent), mirroring the IaC provisioning contract,
+  // so tests + CI apply the full chain. It is NOT the session role tests
+  // run as (that is `telecheck_test_app`, installed below) — it only needs
+  // to exist for 051 to ALTER + GRANT it.
+  //
+  // (Discovered 2026-05-23 during Med-Interaction PR 7: foundation 051 was
+  //  merged without a live-DB chain-apply test, so this provisioning gap —
+  //  and the BOM defect on migrations 047-050, fixed in the same PR — went
+  //  unnoticed. The clean-room 000→head migration-apply CI gate tracked as
+  //  PR #194 is the durable guard for this class of defect.)
+  await _client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'telecheck_app_role') THEN
+        CREATE ROLE telecheck_app_role NOLOGIN NOSUPERUSER NOBYPASSRLS;
+      END IF;
+    END
+    $$;
+  `);
+
   // Apply all migrations idempotently. Runs as superuser — required for
   // CREATE EXTENSION, CREATE FUNCTION ... SECURITY DEFINER, etc.
   await applyMigrations(_client);

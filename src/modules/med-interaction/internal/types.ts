@@ -70,11 +70,43 @@ export function asInteractionRulesetId(s: string): InteractionRulesetId {
   return s as InteractionRulesetId;
 }
 
-// Row-shape interfaces (InteractionEngineEvaluation, InteractionSignal,
+// Full row-shape interfaces (InteractionEngineEvaluation, InteractionSignal,
 // InteractionSignalOverride, InteractionSignalLifecycleTransition) are
 // intentionally NOT exported here. CDM v1.7 §4.NEW1-NEW4 already RATIFIED
 // (P-034 2026-05-21) the canonical row shapes; the migrations 047-050 DB
-// layer is COMPLETE. The TypeScript interfaces themselves land in PR 7+
-// alongside the matching repository files under internal/repositories/
-// when handler implementation begins (deferring row-shape authoring keeps
-// this scaffold-update PR free of speculative handler-shape decisions).
+// layer is COMPLETE. Those interfaces land alongside the write-path
+// repository files (PR 8+) when the lifecycle-action handlers begin; PR 7
+// adds only the read-model projection below.
+
+// ---------------------------------------------------------------------------
+// Read-model projection (PR 7) — current-state hot-path display.
+//
+// This is the OUTPUT shape of the SECDEF access function
+// get_interaction_signal_current_state(p_signal_id) from migration 048,
+// the canonical read path for HOT-PATH DISPLAY consumers per SI-019
+// Sub-decision 9 (clinician dashboard / pharmacy portal / patient mobile
+// summary / admin reporting). It is the non-authoritative current-state
+// projection, NOT the full signal row — the transition table is the source
+// of truth per I-035. STRICT-FRESHNESS enforcement/gating consumers MUST
+// NOT use this read path; they query the transition table directly under
+// advisory lock.
+//
+// Per the Option 2 carryforward documented in migration 048: `current_state`
+// and `transition_reason` are TEXT at the DB layer (the canonical CDM enums
+// interaction_signal_state_t / interaction_signal_transition_reason_t are
+// not yet realized as DOMAIN types in the code repo), so they are typed as
+// `string` here rather than narrowed enums — narrowing would be speculative
+// ahead of the TYPES amendment cycle that formalizes them. There is no
+// `tenant_id` field: the access function does not project it (tenant scope
+// is enforced inside the SECDEF body via current_tenant_id()), and
+// patient-facing surfaces must never receive the operating-tenant
+// identifier (Master PRD §17 + Glossary v5.2 C3).
+// ---------------------------------------------------------------------------
+
+export interface InteractionSignalCurrentState {
+  signal_id: string;
+  current_state: string;
+  /** Transition timestamp of the current-state row (MV `as_of`). */
+  as_of: Date;
+  transition_reason: string;
+}
