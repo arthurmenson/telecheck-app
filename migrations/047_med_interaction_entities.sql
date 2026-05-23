@@ -1,7 +1,7 @@
--- =============================================================================
+﻿-- =============================================================================
 -- File:    migrations/047_med_interaction_entities.sql
 -- Purpose: Create the 4 net-new Med-Interaction entities (SI-019 v2.0 RATIFIED
---          2026-05-21 P-033 + CDM v1.6 → v1.7 Amendment §4.NEW1-NEW4 RATIFIED
+--          2026-05-21 P-033 + CDM v1.6 â†’ v1.7 Amendment Â§4.NEW1-NEW4 RATIFIED
 --          2026-05-21 P-034) with RLS + per-table append-only triggers +
 --          unified monotonic-ordering trigger on the lifecycle log (3
 --          invariants under one advisory lock) + composite tenant-scoped FKs.
@@ -9,50 +9,50 @@
 --          PR 2 of the Med-Interaction Engine implementation series (continued
 --          from migration 046 which created the 12 RBAC roles). Subsequent
 --          migrations: SECURITY BARRIER view + optional MV + SECDEF access
---          function (PR 3) → raw lifecycle writer SECDEF + anti-bypass
---          grants (PR 4) → 6 reason-specific wrappers (PR 5) → Fastify
+--          function (PR 3) â†’ raw lifecycle writer SECDEF + anti-bypass
+--          grants (PR 4) â†’ 6 reason-specific wrappers (PR 5) â†’ Fastify
 --          handler implementation (PR 6+).
 --
 --          PER RATIFIER OPTION 2 (carryforward from Crisis Response + Admin
 --          Backend PRs):
 --          - RLS predicate uses `current_tenant_id()` (code-repo pattern
---            from migration 003) — NOT spec's
+--            from migration 003) â€” NOT spec's
 --            `current_tenant_id_strict(entity_name)` from SI-024.1 v0.8.
 --          - Per-table inline append-only trigger functions (audit_chain
 --            pattern from migration 002 + Crisis Response migration 033 +
---            Admin Backend migration 040) — NOT spec's generic
+--            Admin Backend migration 040) â€” NOT spec's generic
 --            `enforce_append_only()`.
---          - ULID PK type → VARCHAR(26) (code-repo PK type from migrations
---            006/012/024/etc.) — NOT spec's ULID custom type. ULID values
+--          - ULID PK type â†’ VARCHAR(26) (code-repo PK type from migrations
+--            006/012/024/etc.) â€” NOT spec's ULID custom type. ULID values
 --            are 26-char Crockford-base32 strings; VARCHAR(26) enforces
 --            the length constraint at the column layer.
---          - tenant_id_t domain → TEXT (code-repo convention).
+--          - tenant_id_t domain â†’ TEXT (code-repo convention).
 --          - `patient_id` column kept as VARCHAR(26) NOT NULL but FK
 --            constraint to `patients(id)` SKIPPED (no patients table in
 --            code repo; logical reference only; TODO documented inline for
 --            future migration when Identity slice's patient entity lands).
 --            This matches Crisis Response migration 033's identical skip
 --            pattern (see docs/crisis-response-implementation-plan.md).
---          - `override_by_clinician_account_id` FK → composite
+--          - `override_by_clinician_account_id` FK â†’ composite
 --            `accounts(tenant_id, account_id)` per code-repo accounts table
 --            from migration 012 (NOT spec's single-column `accounts(id)`).
 --          - `triggered_by_resource_id` kept as VARCHAR(26) NOT NULL but
---            FK SKIPPED — the resource type depends on `triggered_by`
+--            FK SKIPPED â€” the resource type depends on `triggered_by`
 --            value (medication_request / refill / protocol_id / etc.);
 --            polymorphic FK pattern not enforced at schema layer.
 --          - `medications_involved` array kept as VARCHAR(26)[]; the spec's
 --            ULID[] type behavior is equivalent.
 --          - KMS envelope columns on interaction_signal_override preserved
---            VERBATIM per CDM §4.NEW3 (8-column flat envelope; mirrors
---            SI-005 + Crisis Response migration 033 §4 pattern).
+--            VERBATIM per CDM Â§4.NEW3 (8-column flat envelope; mirrors
+--            SI-005 + Crisis Response migration 033 Â§4 pattern).
 --          - Functions OWNED BY postgres at v0.1 (NOT spec's cdm_owner;
 --            owner-role grants land in PR 3-5 when wrappers/views attach).
---          - Per-table grants from spec §4.NEW1-NEW4 (GRANT INSERT/SELECT
+--          - Per-table grants from spec Â§4.NEW1-NEW4 (GRANT INSERT/SELECT
 --            to medication_interaction_engine_evaluator / signal_viewer /
 --            override_recorder / wrapper_owner / etc.) are CARRIED FORWARD
 --            verbatim, with the dotted spec name
 --            `medication_interaction.override_recorder` realized as the
---            underscore form per migration 046 §2 recorded divergence.
+--            underscore form per migration 046 Â§2 recorded divergence.
 --            Owner-role grants on the lifecycle_transition table (writer
 --            owner INSERT; viewer/wrapper-owner SELECT) are also carried
 --            forward.
@@ -60,15 +60,15 @@
 -- Spec:    - SI-019 Medication Interaction & Validation Engine Slice PRD
 --            v2.0 (RATIFIED 2026-05-21 P-033;
 --            telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/
---            Telecheck_Medication_Interaction_Engine_Slice_PRD_v2_0.md §2
---            Sub-decision 1 normative entity definitions + §5 state machine
---            + §OQ7 Option A append-only-only ratification)
---          - CDM v1.6 → v1.7 Amendment §4.NEW1 + §4.NEW2 + §4.NEW3 + §4.NEW4
+--            Telecheck_Medication_Interaction_Engine_Slice_PRD_v2_0.md Â§2
+--            Sub-decision 1 normative entity definitions + Â§5 state machine
+--            + Â§OQ7 Option A append-only-only ratification)
+--          - CDM v1.6 â†’ v1.7 Amendment Â§4.NEW1 + Â§4.NEW2 + Â§4.NEW3 + Â§4.NEW4
 --            (canonical executable DDL source; RATIFIED 2026-05-21 P-034;
 --            telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/
 --            Telecheck_CDM_v1_6_to_v1_7_Amendment.md)
 --          - I-002 (interaction engine runs BEFORE clinician commits
---            medication_request) — schema layer doesn't enforce the
+--            medication_request) â€” schema layer doesn't enforce the
 --            ordering invariant; the wrappers + Pharmacy/Async Consult
 --            commit-path gates enforce.
 --          - I-023 (three-layer tenant isolation; tenant_id on every PHI
@@ -84,8 +84,8 @@
 -- Summary: Creates 4 net-new tables with RLS + per-table append-only triggers
 --          + monotonic-ordering trigger on lifecycle log + composite tenant-
 --          scoped FKs + indexes + carried-forward GRANT INSERT/SELECT per
---          §4.NEW1-NEW4 spec. No SECDEF procedures, no views, no MV in this
---          migration — those land in PR 3-5.
+--          Â§4.NEW1-NEW4 spec. No SECDEF procedures, no views, no MV in this
+--          migration â€” those land in PR 3-5.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -98,21 +98,21 @@
 -- ---------------------------------------------------------------------------
 
 -- =============================================================================
--- §1 — interaction_engine_evaluation (CDM §4.NEW1)
+-- Â§1 â€” interaction_engine_evaluation (CDM Â§4.NEW1)
 --
 -- One row per engine invocation. Strict append-only per I-035; row records
 -- the engine evaluation context (medication/condition/lab snapshots,
 -- knowledge base version, engine version, trigger source).
 --
 -- Option 2 adaptations from spec:
---   - id ULID → VARCHAR(26)
---   - tenant_id tenant_id_t → TEXT NOT NULL REFERENCES tenants(id)
---   - patient_id ULID NOT NULL REFERENCES patients(id) → VARCHAR(26) NOT NULL
+--   - id ULID â†’ VARCHAR(26)
+--   - tenant_id tenant_id_t â†’ TEXT NOT NULL REFERENCES tenants(id)
+--   - patient_id ULID NOT NULL REFERENCES patients(id) â†’ VARCHAR(26) NOT NULL
 --     (no FK; patients table doesn't exist in code repo)
---   - triggered_by_resource_id ULID → VARCHAR(26) (no FK; polymorphic by
+--   - triggered_by_resource_id ULID â†’ VARCHAR(26) (no FK; polymorphic by
 --     triggered_by value)
---   - RLS predicate current_tenant_id_strict(...) → current_tenant_id()
---   - enforce_append_only() generic → per-table inline trigger
+--   - RLS predicate current_tenant_id_strict(...) â†’ current_tenant_id()
+--   - enforce_append_only() generic â†’ per-table inline trigger
 -- =============================================================================
 
 CREATE TABLE interaction_engine_evaluation (
@@ -126,7 +126,7 @@ CREATE TABLE interaction_engine_evaluation (
         'lab_update', 'adverse_event_investigation'
     )),
     -- triggered_by_resource_id FK SKIPPED per Option 2 (polymorphic by
-    -- triggered_by value — medication_request_id / refill_id / protocol_id /
+    -- triggered_by value â€” medication_request_id / refill_id / protocol_id /
     -- etc.; schema-layer enforcement deferred to wrapper layer).
     triggered_by_resource_id    VARCHAR(26)  NOT NULL,
     evaluated_at                TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -178,8 +178,8 @@ CREATE TRIGGER interaction_engine_evaluation_block_delete
     FOR EACH ROW
     EXECUTE FUNCTION interaction_engine_evaluation_block_mutation();
 
--- Per CDM §4.NEW1 GRANT block (Option 2: dotted role names normalized to
--- underscore form per migration 046 §2 recorded divergence).
+-- Per CDM Â§4.NEW1 GRANT block (Option 2: dotted role names normalized to
+-- underscore form per migration 046 Â§2 recorded divergence).
 REVOKE INSERT ON interaction_engine_evaluation FROM PUBLIC;
 GRANT INSERT ON interaction_engine_evaluation
     TO medication_interaction_engine_evaluator;
@@ -188,10 +188,10 @@ GRANT SELECT ON interaction_engine_evaluation
        medication_interaction_signal_viewer;
 
 -- =============================================================================
--- §2 — interaction_signal (CDM §4.NEW2)
+-- Â§2 â€” interaction_signal (CDM Â§4.NEW2)
 --
 -- One row per signal produced by an evaluation. STRICT append-only per
--- I-035 — NO state column; current lifecycle state is DERIVED from
+-- I-035 â€” NO state column; current lifecycle state is DERIVED from
 -- interaction_signal_lifecycle_transition rows (per SI-019 OQ7 Option A
 -- ratification 2026-05-20).
 -- =============================================================================
@@ -212,7 +212,7 @@ CREATE TABLE interaction_signal (
     )),
     medications_involved    VARCHAR(26)[] NOT NULL,
     evidence_sources        JSONB        NOT NULL,    -- knowledge base citations
-    signal_payload          JSONB        NOT NULL,    -- structured signal per SI-019 v1.0 §5.1
+    signal_payload          JSONB        NOT NULL,    -- structured signal per SI-019 v1.0 Â§5.1
     -- Composite tenant-scoped FK per I-023 layer 2 (canonical pattern).
     CONSTRAINT interaction_signal_evaluation_tenant_fk
         FOREIGN KEY (tenant_id, evaluation_id)
@@ -267,14 +267,14 @@ GRANT SELECT ON interaction_signal
        medication_interaction_override_recorder;
 
 -- =============================================================================
--- §3 — interaction_signal_override (CDM §4.NEW3)
+-- Â§3 â€” interaction_signal_override (CDM Â§4.NEW3)
 --
 -- One row per clinician override of a signal's enforcement action. STRICT
 -- append-only per I-035. KMS-encrypted rationale per same envelope pattern
 -- as SI-005's consult clinician decision rationale (8-column flat envelope).
 --
 -- Option 2 adaptation: override_by_clinician_account_id FK realized as
--- composite (tenant_id, account_id) → accounts(tenant_id, account_id) per
+-- composite (tenant_id, account_id) â†’ accounts(tenant_id, account_id) per
 -- code-repo accounts table convention.
 -- =============================================================================
 
@@ -285,7 +285,7 @@ CREATE TABLE interaction_signal_override (
     override_by_clinician_account_id            VARCHAR(26)  NOT NULL,
     override_at                                 TIMESTAMPTZ  NOT NULL DEFAULT now(),
     -- 8-column flat KMS envelope (mirrors SI-005 record_consult_clinician_decision
-    -- + Crisis Response migration 033 §4 crisis_event.intake_payload pattern).
+    -- + Crisis Response migration 033 Â§4 crisis_event.intake_payload pattern).
     override_rationale_kms_envelope_ciphertext  BYTEA        NOT NULL,
     override_rationale_kms_envelope_dek_id      VARCHAR(26)  NOT NULL,
     override_rationale_kms_envelope_iv          BYTEA        NOT NULL,
@@ -343,17 +343,17 @@ CREATE TRIGGER interaction_signal_override_block_delete
     FOR EACH ROW
     EXECUTE FUNCTION interaction_signal_override_block_mutation();
 
--- Per CDM §4.NEW3 GRANT block (Option 2: dotted role name normalized;
--- wrapper-owner name prefixed per migration 046 §2 recorded divergence).
+-- Per CDM Â§4.NEW3 GRANT block (Option 2: dotted role name normalized;
+-- wrapper-owner name prefixed per migration 046 Â§2 recorded divergence).
 REVOKE INSERT ON interaction_signal_override FROM PUBLIC;
 GRANT INSERT ON interaction_signal_override
-    TO interaction_signal_override_wrapper_owner;
+    TO override_wrapper_owner;
 GRANT SELECT ON interaction_signal_override
     TO medication_interaction_signal_viewer,
-       interaction_signal_override_wrapper_owner;
+       override_wrapper_owner;
 
 -- =============================================================================
--- §4 — interaction_signal_lifecycle_transition (CDM §4.NEW4; Option A
+-- Â§4 â€” interaction_signal_lifecycle_transition (CDM Â§4.NEW4; Option A
 --      append-only-only persistence per I-035; SI-019 OQ7 ratification)
 --
 -- One row per lifecycle state transition. Replaces the UPDATE-on-signal-row
@@ -367,7 +367,7 @@ GRANT SELECT ON interaction_signal_override
 -- at write time per SI-019 Sub-decision 8.5 (lands in PR 4 raw writer).
 --
 -- Per-Option-2: actor_id realized as VARCHAR(26) without FK (polymorphic
--- by actor_role — clinician/system/engine_evaluator/scheduler; the
+-- by actor_role â€” clinician/system/engine_evaluator/scheduler; the
 -- clinician case maps to accounts but system/scheduler don't).
 -- =============================================================================
 
@@ -391,7 +391,7 @@ CREATE TABLE interaction_signal_lifecycle_transition (
     )),
     -- R4 HIGH-1 closure 2026-05-23 (Codex R4): DEFAULT changed from now() to
     -- clock_timestamp(). now() = transaction_timestamp() is transaction-start
-    -- stable — two inserts in the same transaction (e.g., emission + activation
+    -- stable â€” two inserts in the same transaction (e.g., emission + activation
     -- in a wrapper call) would default to identical timestamps + fail the
     -- strict-monotonic trigger. clock_timestamp() returns actual wall time per
     -- call (sub-microsecond on modern Linux), so successive same-tx defaults
@@ -463,8 +463,8 @@ CREATE TRIGGER interaction_signal_lifecycle_transition_block_delete
     EXECUTE FUNCTION interaction_signal_lifecycle_transition_block_mutation();
 
 -- ---------------------------------------------------------------------------
--- Monotonic-ordering invariant (per Crisis Response migration 033 §6 + Admin
--- Backend migration 040 §3 pattern adapted to Option 2):
+-- Monotonic-ordering invariant (per Crisis Response migration 033 Â§6 + Admin
+-- Backend migration 040 Â§3 pattern adapted to Option 2):
 -- BEFORE INSERT trigger enforces NEW.transition_at >= MAX(prior.transition_at)
 -- per (tenant_id, signal_id) to prevent backdated rows from corrupting
 -- current-state derivation. Future-dating tolerated up to 5s clock-skew.
@@ -507,7 +507,7 @@ BEGIN
     -- the attacker-supplied NEW.tenant_id via explicit WHERE predicate)
     -- would compute the other tenant's MAX and the backdated-exception
     -- error message would echo the MAX timestamp + the other tenant's
-    -- signal_id — exposing existence + timing of rows the caller's
+    -- signal_id â€” exposing existence + timing of rows the caller's
     -- current_tenant_id() does not authorize SELECT on.
     --
     -- Fix: validate caller-tenant context BEFORE any privileged read.
@@ -548,7 +548,7 @@ BEGIN
     -- monotonic ordering key" decision. A buggy or compromised writer
     -- could push an emission or later transition several seconds into the
     -- future, and subsequent same-signal transitions would auto-bump
-    -- after that artificial value — making the lifecycle log's ordering
+    -- after that artificial value â€” making the lifecycle log's ordering
     -- caller-influenced rather than truly server-assigned.
     --
     -- Fix: always compute the timestamp server-side via clock_timestamp()
@@ -563,7 +563,7 @@ BEGIN
     --
     -- Backdate rejection: removed. With the trigger overwriting
     -- NEW.transition_at unconditionally, there is no caller-supplied
-    -- value to backdate-attack — the field is effectively trigger-owned.
+    -- value to backdate-attack â€” the field is effectively trigger-owned.
     -- Future-dating bound: also removed for the same reason.
     --
     -- Algorithm:
@@ -572,7 +572,7 @@ BEGIN
     --      always current; never future; never caller-influenced).
     --   3. If prior.MAX IS NULL: NEW.transition_at := v_effective_wall_time.
     --   4. Else: NEW.transition_at := GREATEST(v_effective_wall_time,
-    --      prior.MAX + 1 microsecond) — guarantees strict-monotonic even
+    --      prior.MAX + 1 microsecond) â€” guarantees strict-monotonic even
     --      under microsecond clock collisions or rapid succession.
     -- =====================================================================
 
@@ -606,8 +606,8 @@ BEGIN
     -- state-machine grammar (which (from_state, to_state, transition_reason)
     -- triples are allowed), but does NOT verify NEW.from_state matches the
     -- ACTUAL latest prior to_state. Without this check, a caller could
-    -- insert (none → emitted) on top of an existing (emitted → active →
-    -- overridden) lifecycle — the spec-allowed (none → emitted /
+    -- insert (none â†’ emitted) on top of an existing (emitted â†’ active â†’
+    -- overridden) lifecycle â€” the spec-allowed (none â†’ emitted /
     -- emission) triple would pass the CHECK, but the resulting derived
     -- current-state would silently corrupt (overridden + emitted both
     -- visible; ORDER BY transition_at DESC, id DESC would alternate).
@@ -624,7 +624,7 @@ BEGIN
 
     IF v_latest_to_state IS NULL THEN
         -- No prior rows for this signal; only the initial emission
-        -- triple (none → emitted / emission) is valid as the first row.
+        -- triple (none â†’ emitted / emission) is valid as the first row.
         IF NEW.from_state <> 'none' THEN
             RAISE EXCEPTION
                 'interaction_signal_lifecycle_transition initial-state-violation: '
@@ -652,7 +652,7 @@ $$;
 -- the SECURITY DEFINER RLS bypass actually fires regardless of which role
 -- applies the migration. Without this ALTER, a migration-applier that is
 -- itself non-BYPASSRLS would own the function and the SECURITY DEFINER
--- semantics would inherit its RLS subjection — recreating the R1 failure
+-- semantics would inherit its RLS subjection â€” recreating the R1 failure
 -- mode where MAX returns NULL for tenants with existing rows when
 -- current_tenant_id() is unset or mismatched.
 ALTER FUNCTION interaction_signal_lifecycle_transition_enforce_monotonic_ordering()
@@ -663,20 +663,20 @@ CREATE TRIGGER interaction_signal_lifecycle_transition_monotonic_ordering
     FOR EACH ROW
     EXECUTE FUNCTION interaction_signal_lifecycle_transition_enforce_monotonic_ordering();
 
--- Per CDM §4.NEW4 GRANT block (Option 2: wrapper-owner + writer-owner role
--- names prefixed per migration 046 §2 recorded divergence).
+-- Per CDM Â§4.NEW4 GRANT block (Option 2: wrapper-owner + writer-owner role
+-- names prefixed per migration 046 Â§2 recorded divergence).
 REVOKE INSERT ON interaction_signal_lifecycle_transition FROM PUBLIC;
 GRANT INSERT ON interaction_signal_lifecycle_transition
-    TO interaction_signal_lifecycle_transition_writer_owner;
+    TO lifecycle_transition_writer_owner;
 GRANT SELECT ON interaction_signal_lifecycle_transition
     TO medication_interaction_engine_evaluator,
        medication_interaction_signal_viewer,
-       interaction_signal_override_wrapper_owner,
-       interaction_signal_lifecycle_transition_writer_owner,
-       interaction_signal_mv_refresh_owner;
+       override_wrapper_owner,
+       lifecycle_transition_writer_owner,
+       mv_refresh_owner;
 
 -- =============================================================================
--- §5 — Verification: count of net-new interaction_* tables = 4
+-- Â§5 â€” Verification: count of net-new interaction_* tables = 4
 -- =============================================================================
 
 DO $$
@@ -698,7 +698,7 @@ BEGIN
         RAISE EXCEPTION
             'migration-047-table-count-mismatch: '
             'expected % interaction_* tables created, found %; '
-            'P-034 §4.NEW1-NEW4 require all 4',
+            'P-034 Â§4.NEW1-NEW4 require all 4',
             v_expected_count, v_created_count;
     END IF;
 
