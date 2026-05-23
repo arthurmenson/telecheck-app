@@ -20,11 +20,33 @@ import { SLICE_ROLES, assertSliceRole, withDbRole, type SliceRole } from './with
 import type { DbClient } from './db.js';
 
 // Minimal DbClient mock — exposes `query` only.
-function mockTx(): { tx: DbClient; calls: { sql: string; params: unknown[] | undefined }[] } {
+// `priorRoleResult` controls what the captured `SELECT current_user`
+// returns; default 'telecheck_app_role' simulates an outermost
+// invocation from the Fastify login role.
+function mockTx(opts?: {
+  priorRole?: string;
+  failOnRestore?: boolean;
+}): { tx: DbClient; calls: { sql: string; params: unknown[] | undefined }[] } {
+  const priorRole = opts?.priorRole ?? 'telecheck_app_role';
+  const failOnRestore = opts?.failOnRestore ?? false;
   const calls: { sql: string; params: unknown[] | undefined }[] = [];
+  let restoreSeen = false;
   const tx = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push({ sql, params });
+      // SELECT current_user → return the configured priorRole.
+      if (sql === 'SELECT current_user') {
+        return { rows: [{ current_user: priorRole }], rowCount: 1 };
+      }
+      // Detect the RESTORE SET LOCAL ROLE (always to priorRole).
+      if (sql === `SET LOCAL ROLE ${priorRole}`) {
+        if (!restoreSeen) {
+          restoreSeen = true;
+          if (failOnRestore) {
+            throw new Error('simulated restore failure (e.g., tx aborted)');
+          }
+        }
+      }
       return { rows: [], rowCount: 0 };
     }),
   } as unknown as DbClient;
@@ -70,15 +92,27 @@ describe('with-db-role §1 — allowlist enforcement (assertSliceRole)', () => {
   });
 });
 
-describe('with-db-role §2 — SET LOCAL ROLE issued', () => {
-  it('issues SET LOCAL ROLE with the exact role name (no quoting, no params)', async () => {
+describe('with-db-role §2 — SET LOCAL ROLE issued + restored', () => {
+  it('issues SELECT current_user, SET LOCAL ROLE, then restores prior role (3 statements, in order)', async () => {
     const { tx, calls } = mockTx();
     await withDbRole(tx, 'crisis_initiator', async () => {
       // callback body irrelevant for this test
     });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.sql).toBe('SET LOCAL ROLE crisis_initiator');
-    expect(calls[0]!.params).toBeUndefined();
+    expect(calls).toHaveLength(3);
+    expect(calls[0]!.sql).toBe('SELECT current_user');
+    expect(calls[1]!.sql).toBe('SET LOCAL ROLE crisis_initiator');
+    expect(calls[2]!.sql).toBe('SET LOCAL ROLE telecheck_app_role');
+  });
+
+  it('restores to the captured prior role (not hardcoded telecheck_app_role) — supports nesting', async () => {
+    // Simulate nested invocation: outer call already SET ROLE to
+    // medication_interaction_signal_viewer; inner withDbRole should
+    // restore to that outer role, NOT to telecheck_app_role.
+    const { tx, calls } = mockTx({ priorRole: 'medication_interaction_signal_viewer' });
+    await withDbRole(tx, 'crisis_event_staff_reader', async () => {
+      // inner work
+    });
+    expect(calls[2]!.sql).toBe('SET LOCAL ROLE medication_interaction_signal_viewer');
   });
 
   it('emits the SET LOCAL ROLE BEFORE invoking the callback', async () => {
@@ -86,11 +120,11 @@ describe('with-db-role §2 — SET LOCAL ROLE issued', () => {
     const callbackOrder: string[] = [];
     await withDbRole(tx, 'admin_basic_operator', async () => {
       callbackOrder.push(
-        `after-set: ${calls.length} call(s) so far — last was: ${calls[calls.length - 1]?.sql ?? '(none)'}`,
+        `during-callback: ${calls.length} call(s) so far — last was: ${calls[calls.length - 1]?.sql ?? '(none)'}`,
       );
     });
     expect(callbackOrder).toEqual([
-      'after-set: 1 call(s) so far — last was: SET LOCAL ROLE admin_basic_operator',
+      'during-callback: 2 call(s) so far — last was: SET LOCAL ROLE admin_basic_operator',
     ]);
   });
 
@@ -101,6 +135,24 @@ describe('with-db-role §2 — SET LOCAL ROLE issued', () => {
     await expect(
       withDbRole(tx, tamperedRole, async () => undefined),
     ).rejects.toThrow(/not an allowlisted slice role/);
+  });
+
+  it('aborts elevation if SELECT current_user returns empty (cannot restore safely)', async () => {
+    const tx = {
+      query: vi.fn(async (sql: string) => {
+        if (sql === 'SELECT current_user') {
+          return { rows: [], rowCount: 0 };
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+    } as unknown as DbClient;
+    await expect(
+      withDbRole(tx, 'crisis_initiator', async () => undefined),
+    ).rejects.toThrow(/could not read current_user/);
+    // Critically: SET LOCAL ROLE crisis_initiator was NOT issued.
+    const calls = (tx.query as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls).toHaveLength(1);
+    expect(calls[0]![0]).toBe('SELECT current_user');
   });
 });
 
@@ -120,7 +172,7 @@ describe('with-db-role §3 — callback return propagation', () => {
   });
 });
 
-describe('with-db-role §4 — callback throw propagation (no swallow)', () => {
+describe('with-db-role §4 — callback throw propagation + restore-on-throw', () => {
   it('re-throws errors raised inside the callback', async () => {
     const { tx } = mockTx();
     await expect(
@@ -130,16 +182,36 @@ describe('with-db-role §4 — callback throw propagation (no swallow)', () => {
     ).rejects.toThrow('simulated wrapper failure');
   });
 
-  it('does NOT issue RESET ROLE after callback throw (rely on tx-end auto-reset)', async () => {
+  it('STILL restores prior role after callback throw (R1 HIGH-1: defense against catch-and-continue paths)', async () => {
     const { tx, calls } = mockTx();
     await expect(
       withDbRole(tx, 'crisis_acknowledger', async () => {
         throw new Error('boom');
       }),
     ).rejects.toThrow('boom');
-    // Only the SET LOCAL ROLE should have been issued; no RESET ROLE.
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.sql).toBe('SET LOCAL ROLE crisis_acknowledger');
+    // Expect all 3 statements: SELECT current_user, SET LOCAL ROLE,
+    // restore SET LOCAL ROLE (the finally block ran).
+    expect(calls).toHaveLength(3);
+    expect(calls[0]!.sql).toBe('SELECT current_user');
+    expect(calls[1]!.sql).toBe('SET LOCAL ROLE crisis_acknowledger');
+    expect(calls[2]!.sql).toBe('SET LOCAL ROLE telecheck_app_role');
+  });
+
+  it('preserves the original error if restore itself fails (does NOT shadow with finally-throw)', async () => {
+    const { tx } = mockTx({ failOnRestore: true });
+    await expect(
+      withDbRole(tx, 'crisis_initiator', async () => {
+        throw new Error('original-fn-error');
+      }),
+    ).rejects.toThrow('original-fn-error'); // NOT 'simulated restore failure'
+  });
+
+  it('on successful fn, restore failure does NOT propagate (swallowed)', async () => {
+    const { tx } = mockTx({ failOnRestore: true });
+    const result = await withDbRole(tx, 'admin_basic_operator', async () => {
+      return 'ok';
+    });
+    expect(result).toBe('ok'); // fn returned cleanly; restore error swallowed
   });
 });
 

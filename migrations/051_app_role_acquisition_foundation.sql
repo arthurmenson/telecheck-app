@@ -192,7 +192,7 @@ DECLARE
     v_role         TEXT;
     v_granted      INTEGER := 0;
     v_skipped_exists INTEGER := 0;
-    v_skipped_no_role INTEGER := 0;
+    v_missing_roles TEXT[] := ARRAY[]::TEXT[];
 BEGIN
     -- Recipient must exist; this is a foundation-level invariant, RAISE if not.
     IF to_regrole('telecheck_app_role') IS NULL THEN
@@ -202,20 +202,40 @@ BEGIN
             'creates the application login role) before 051.';
     END IF;
 
+    -- R1 MED-1 closure 2026-05-23: PRECONDITION CHECK — all 13 slice roles
+    -- MUST exist before 051 applies. Previously this block silently skipped
+    -- missing roles (leaving the bridge incomplete while marking 051
+    -- "applied" in schema_migrations), which would let withDbRole fail at
+    -- runtime for an allowlisted role. The fix-closed posture is: 051
+    -- aborts with a precise list of missing roles + the migrations that
+    -- create them, so operators apply the prerequisites and re-run.
+    --
+    -- This is safe under the sequential-migration discipline: 032
+    -- (Crisis RBAC), 039 (Admin RBAC), and 046 (Med-Interaction RBAC)
+    -- all land BEFORE 051 by file ordering. The only way to reach 051
+    -- with a missing role is a hand-curated partial-apply state — which
+    -- the operator must remediate explicitly.
     FOREACH v_role IN ARRAY v_slice_roles LOOP
         IF to_regrole(v_role) IS NULL THEN
-            -- Partial foundation state: slice role not yet created (e.g.,
-            -- some slice's RBAC migration not applied). Skip rather than
-            -- abort; operator must apply the missing slice migration and
-            -- re-run 051 to land the membership.
-            v_skipped_no_role := v_skipped_no_role + 1;
-            RAISE NOTICE 'migration-051-skip: slice role % does not exist '
-                '(slice RBAC migration not yet applied); skipping GRANT to '
-                'telecheck_app_role. Re-run 051 after the slice migration '
-                'lands to complete the bridge.', v_role;
-            CONTINUE;
+            v_missing_roles := array_append(v_missing_roles, v_role);
         END IF;
+    END LOOP;
 
+    IF array_length(v_missing_roles, 1) > 0 THEN
+        RAISE EXCEPTION 'migration-051-precondition-failed: % of 13 slice '
+            'application/reader roles do not exist: %. Apply the relevant '
+            'slice RBAC migrations BEFORE 051: migration 032 creates the '
+            '7 crisis_* roles; migration 039 creates admin_basic_operator + '
+            'admin_template_reviewer; migration 046 creates the 4 '
+            'medication_interaction_* roles. Re-run 051 after the missing '
+            'slice RBAC migrations apply.',
+            array_length(v_missing_roles, 1),
+            array_to_string(v_missing_roles, ', ');
+    END IF;
+
+    -- All 13 roles confirmed present. Now grant memberships (idempotent on
+    -- already-existing memberships).
+    FOREACH v_role IN ARRAY v_slice_roles LOOP
         IF pg_has_role('telecheck_app_role', v_role::regrole, 'MEMBER') THEN
             -- Already a member (idempotent re-run).
             v_skipped_exists := v_skipped_exists + 1;
@@ -227,9 +247,8 @@ BEGIN
     END LOOP;
 
     RAISE NOTICE 'migration-051-summary: % grants applied, % already-existed '
-        'skipped (idempotent), % missing-slice-role skipped (operator action '
-        'required to re-run after slice RBAC lands)',
-        v_granted, v_skipped_exists, v_skipped_no_role;
+        'skipped (idempotent re-run); all 13 slice roles confirmed present',
+        v_granted, v_skipped_exists;
 END $$;
 
 -- -----------------------------------------------------------------------------
@@ -270,9 +289,10 @@ BEGIN
     END IF;
 END $$;
 
--- §3.2: membership in each of the 13 slice roles whose CREATE ROLE has been
---       applied. Skipped (informational) for roles whose slice RBAC migration
---       is not yet present (matches §2 skip-tolerance).
+-- §3.2: membership in each of the 13 slice roles. Per R1 MED-1 closure
+--       2026-05-23 §2 above already aborts if any role is missing, so by
+--       the time this block runs all 13 roles are present and
+--       telecheck_app_role MUST be a member of every one. RAISE on any gap.
 DO $$
 DECLARE
     v_slice_roles    TEXT[] := ARRAY[
@@ -292,26 +312,32 @@ DECLARE
     ];
     v_role           TEXT;
     v_present_count  INTEGER := 0;
-    v_missing_count  INTEGER := 0;
 BEGIN
     FOREACH v_role IN ARRAY v_slice_roles LOOP
+        -- §2 precondition already guaranteed the role exists; defense-in-
+        -- depth re-check here for clean error message on impossible-state.
         IF to_regrole(v_role) IS NULL THEN
-            v_missing_count := v_missing_count + 1;
-            CONTINUE;
+            RAISE EXCEPTION 'migration-051-verify-failed: slice role % '
+                'absent at §3.2 despite §2 precondition gate. Race condition '
+                'or DROP ROLE after §2 completed?', v_role;
         END IF;
 
         IF NOT pg_has_role('telecheck_app_role', v_role::regrole, 'MEMBER') THEN
             RAISE EXCEPTION 'migration-051-verify-failed: telecheck_app_role '
-                'is NOT a member of slice role %, but the role exists. '
-                'Membership grant in §2 may have failed silently.', v_role;
+                'is NOT a member of slice role %. Membership grant in §2 may '
+                'have failed silently — investigate.', v_role;
         END IF;
 
         v_present_count := v_present_count + 1;
     END LOOP;
 
+    IF v_present_count <> 13 THEN
+        RAISE EXCEPTION 'migration-051-verify-failed: expected membership in '
+            '13 slice roles; counted %. Loop logic defect.', v_present_count;
+    END IF;
+
     RAISE NOTICE 'migration-051-verify: telecheck_app_role membership '
-        'present in %/13 slice roles (%, % not-yet-created and skipped)',
-        v_present_count, v_present_count, v_missing_count;
+        'present in all 13/13 slice roles';
 END $$;
 
 -- §3.3: anti-bypass — telecheck_app_role MUST NOT appear as a direct grantee
