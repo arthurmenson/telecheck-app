@@ -23,8 +23,21 @@ REVOKE SELECT ON forms_template_admin_review
 DROP VIEW IF EXISTS forms_template_admin_review_pending_v;
 
 -- -----------------------------------------------------------------------------
--- 2. Crisis operational-health view (no wrapper at v0.1; wrapper lands PR 4).
+-- 2. Crisis operational-health view + wrapper-owner base-table SELECT grants
+--    (R1 HIGH-1 closure 2026-05-22; security_invoker=true requires the
+--    wrapper-owner to hold SELECT on every base table the view body references).
+--    No wrapper at v0.1; wrapper lands PR 4.
 -- -----------------------------------------------------------------------------
+REVOKE SELECT ON audit_records
+    FROM read_admin_crisis_operational_health_wrapper_owner;
+REVOKE SELECT ON crisis_sweep_execution
+    FROM read_admin_crisis_operational_health_wrapper_owner;
+REVOKE SELECT ON notification_crisis_escalation_obligation
+    FROM read_admin_crisis_operational_health_wrapper_owner;
+REVOKE SELECT ON crisis_event_lifecycle_transition
+    FROM read_admin_crisis_operational_health_wrapper_owner;
+REVOKE SELECT ON crisis_event
+    FROM read_admin_crisis_operational_health_wrapper_owner;
 DROP VIEW IF EXISTS admin_crisis_operational_health_v;
 
 -- =============================================================================

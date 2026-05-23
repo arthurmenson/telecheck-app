@@ -162,6 +162,27 @@ REVOKE ALL ON admin_crisis_operational_health_v FROM PUBLIC;
 GRANT SELECT ON admin_crisis_operational_health_v
     TO read_admin_crisis_operational_health_wrapper_owner;
 
+-- R1 HIGH-1 closure 2026-05-22 (Admin Backend PR 2 Codex R1): with
+-- security_invoker=true the view body executes under the CALLER's privileges
+-- (the wrapper-owner when the future SECDEF wrapper calls
+-- SELECT * FROM admin_crisis_operational_health_v). The wrapper-owner role
+-- therefore needs SELECT on every base table referenced by the view body.
+-- This mirrors the Crisis Response migration 034 grant pattern for staff/
+-- patient-reader roles. Tenant isolation is still enforced by each base
+-- table's RLS policy + the wrapper-owner is NOBYPASSRLS (per migration 039
+-- §6 invariant) so the `tenant_id = current_tenant_id()` predicate fires
+-- against the GUC set by the wrapper at invocation time.
+GRANT SELECT ON crisis_event
+    TO read_admin_crisis_operational_health_wrapper_owner;
+GRANT SELECT ON crisis_event_lifecycle_transition
+    TO read_admin_crisis_operational_health_wrapper_owner;
+GRANT SELECT ON notification_crisis_escalation_obligation
+    TO read_admin_crisis_operational_health_wrapper_owner;
+GRANT SELECT ON crisis_sweep_execution
+    TO read_admin_crisis_operational_health_wrapper_owner;
+GRANT SELECT ON audit_records
+    TO read_admin_crisis_operational_health_wrapper_owner;
+
 -- =============================================================================
 -- §2 — admin_consult_queue_health_v  (DEFERRED per Option 2)
 --
