@@ -357,17 +357,45 @@ BEGIN
     v_lock_key := ('x' || substr(md5(p_tenant_id::text || ':' || p_signal_id::text), 1, 16))::bit(64)::bigint;
     PERFORM pg_advisory_xact_lock(v_lock_key);
 
-    -- TODO (Option 2 deferred): discontinuation_event existence + medication-
-    -- affected + washout-elapsed checks (medication-discontinuation domain
-    -- event log not in code repo). Structural complete; evidence-check
-    -- evolution when domain event log lands.
+    -- R1 HIGH-1 closure 2026-05-23 (Codex R1): FAIL-CLOSED. SI-019
+    -- §6.NEW5 normatively requires resolution-specific evidence:
+    -- (a) discontinuation event exists in medication-discontinuation
+    --     domain-event log,
+    -- (b) affects one of medications_involved,
+    -- (c) protocol-specific washout period elapsed.
+    -- None of these data sources exist in code repo at this checkpoint.
+    -- Per Codex R1 recommendation, the wrapper RAISES not-implemented
+    -- here so a stale, malformed, cross-tenant, or unrelated event_id
+    -- cannot produce a terminal `resolved` transition that downstream
+    -- commit gates (Pharmacy clinician-commit per I-002; Async Consult)
+    -- would read as authoritative.
+    --
+    -- The wrapper SIGNATURE + tenant guard + advisory lock + EXECUTE
+    -- grant matrix remain in place for structural completeness +
+    -- downstream-slice typed imports; production callers hit this
+    -- RAISE and must be retried after the future migration that lands
+    -- the medication-discontinuation domain-event log + implements the
+    -- 3-evidence-check predicate.
+    RAISE EXCEPTION
+        'evidence_check_unavailable_resolution: '
+        'SI-019 §6.NEW5 requires discontinuation_event existence + '
+        'medication-affected + washout-elapsed evidence checks; '
+        'medication-discontinuation domain-event log not yet available '
+        'in code repo. Wrapper fail-closed per Codex R1 closure 2026-05-23 '
+        'to prevent terminal-state-without-evidence corruption of '
+        'downstream commit gates.'
+        USING ERRCODE = '0A000';    -- feature_not_supported
 
-    PERFORM record_interaction_signal_lifecycle_transition(
-        p_id, p_tenant_id, p_signal_id,
-        'resolved', 'resolution_event',
-        p_actor_id, 'system',
-        p_metadata || jsonb_build_object('discontinuation_event_id', p_discontinuation_event_id)
-    );
+    -- UNREACHABLE (preserved for structural completeness; PR 6+ or
+    -- future hygiene migration that lands the discontinuation event log
+    -- will replace the RAISE above with the 3-evidence-check predicate
+    -- + then enable this PERFORM call):
+    -- PERFORM record_interaction_signal_lifecycle_transition(
+    --     p_id, p_tenant_id, p_signal_id,
+    --     'resolved', 'resolution_event',
+    --     p_actor_id, 'system',
+    --     p_metadata || jsonb_build_object('discontinuation_event_id', p_discontinuation_event_id)
+    -- );
 END;
 $$;
 
@@ -447,19 +475,44 @@ BEGIN
             USING ERRCODE = '02000';
     END IF;
 
-    -- TODO (Option 2 deferred): full time_window_basis-driven window
-    -- calculation (each basis class — e.g., 'prescription_cycle',
-    -- 'monitoring_interval' — has its own duration formula; structural
-    -- check here ensures emission row exists + basis is set; PR 6+
-    -- evidence-check evolution implements the full formula per
-    -- protocol-specific cadence).
+    -- R1 HIGH-1 closure 2026-05-23 (Codex R1): FAIL-CLOSED. SI-019
+    -- §6.NEW6 normatively requires `now() > emission_time + time_window`
+    -- where time_window is derived per-basis from signal_payload
+    -- (per-basis duration formula: prescription_cycle, monitoring_interval,
+    -- etc.). The per-basis formula table is not yet specified in code
+    -- repo (would require a CCR-driven cadence config table). Without
+    -- the formula, the wrapper cannot prove the window has elapsed —
+    -- so it must fail-closed rather than allow premature expiry.
+    --
+    -- Premature expiry would let any caller with
+    -- medication_interaction_engine_evaluator role mark an active signal
+    -- expired as soon as it has an emission row — a terminal-state
+    -- corruption that downstream Pharmacy clinician-commit + Async
+    -- Consult commit gates would read as "interaction no longer
+    -- relevant" while the underlying clinical risk persists.
+    --
+    -- The structural checks above (time_window_basis non-null + emission
+    -- row exists) remain in place as preflight; PR 6+ or future hygiene
+    -- migration that lands the per-basis cadence config table will
+    -- replace the RAISE below with the actual elapsed-time predicate.
+    RAISE EXCEPTION
+        'evidence_check_unavailable_expiry: '
+        'SI-019 §6.NEW6 requires time_window_basis-driven elapsed-time '
+        'check (now() > emission_time + per_basis_duration); per-basis '
+        'cadence config table not yet available in code repo. Wrapper '
+        'fail-closed per Codex R1 closure 2026-05-23 to prevent premature '
+        'expiry corruption of downstream commit gates. time_window_basis=%, '
+        'emission_time=%',
+        v_time_window_basis, v_emission_time
+        USING ERRCODE = '0A000';    -- feature_not_supported
 
-    PERFORM record_interaction_signal_lifecycle_transition(
-        p_id, p_tenant_id, p_signal_id,
-        'expired', 'time_expiry',
-        p_actor_id, 'scheduler',
-        p_metadata || jsonb_build_object('time_window_basis', v_time_window_basis)
-    );
+    -- UNREACHABLE (preserved for structural completeness):
+    -- PERFORM record_interaction_signal_lifecycle_transition(
+    --     p_id, p_tenant_id, p_signal_id,
+    --     'expired', 'time_expiry',
+    --     p_actor_id, 'scheduler',
+    --     p_metadata || jsonb_build_object('time_window_basis', v_time_window_basis)
+    -- );
 END;
 $$;
 
@@ -549,6 +602,45 @@ BEGIN
         RAISE EXCEPTION 'signal_not_active: current_state=%', COALESCE(v_latest_to_state, '<none>')
             USING ERRCODE = '23514';
     END IF;
+
+    -- R1 HIGH-1 closure 2026-05-23 (Codex R1): FAIL-CLOSED. SI-019
+    -- §6.NEW7 normatively requires evidence that:
+    -- (a) the medication being overridden is STILL on the patient's
+    --     active-medication list (Step 3 of spec 8-step procedure), and
+    -- (b) the calling clinician is RBAC-authorized for the override
+    --     action (LAYER B role-membership check, Step 4 of spec).
+    -- Neither evidence source is available in code repo at this
+    -- checkpoint: (a) active-medication-list view depends on Pharmacy
+    -- slice's medication_request_state derivation not yet implemented,
+    -- and (b) LAYER B role-membership check requires the SI-024.1
+    -- JWT-binding model that is deferred (Option 2 carryforward —
+    -- LAYER B lands at Fastify route handler in PR 6+).
+    --
+    -- Override is a TERMINAL lifecycle state. Without the evidence
+    -- checks, the DB-level SECURITY DEFINER wrapper can be invoked
+    -- by anyone holding the EXECUTE grant (which the spec grants to
+    -- the clinician application role for the WRAPPER, but the spec
+    -- relies on LAYER B + medication-list evidence to make the
+    -- wrapper actually safe). Deferring those checks to Fastify
+    -- means a compromised route + the right EXECUTE grant would
+    -- bypass both, creating an authorized-on-paper-but-unverifiable
+    -- terminal override.
+    --
+    -- Per Codex R1 recommendation, the wrapper fail-closes here. PR 6+
+    -- (Fastify handler) + future Pharmacy + SI-024.1 work removes the
+    -- RAISE below + adds the evidence checks.
+    RAISE EXCEPTION
+        'evidence_check_unavailable_override: '
+        'SI-019 §6.NEW7 requires (a) medication-still-on-active-list '
+        'check (Pharmacy active-medication-list view not yet in code '
+        'repo) AND (b) LAYER B clinician role-membership check '
+        '(SI-024.1 JWT-binding deferred). Wrapper fail-closed per Codex '
+        'R1 closure 2026-05-23 to prevent unverified terminal override '
+        'writes; PR 6+ application-layer evidence checks + LAYER B '
+        'authorization re-enables this wrapper.'
+        USING ERRCODE = '0A000';    -- feature_not_supported
+
+    -- UNREACHABLE (preserved for structural completeness):
 
     -- STEP 5: INSERT override row FIRST (per R4 HIGH-1 closure: write
     -- evidence before terminal transition so a wrapper failure can't
