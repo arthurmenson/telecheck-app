@@ -80,7 +80,12 @@ BEGIN
     END IF;
 
     -- Safe to revoke writer-owner's table grants now (function is gone;
-    -- grants are orphaned).
+    -- grants are orphaned). Also revoke the BIGSERIAL implicit sequence
+    -- USAGE granted by the forward migration's R1 HIGH-1 closure (Codex R3)
+    -- — without this REVOKE the rollback would leave a stale USAGE grant
+    -- on a sequence that no canonical caller needs anymore.
+    REVOKE USAGE ON SEQUENCE forms_template_admin_review_lifecycle_transition_id_seq
+        FROM forms_template_admin_review_transition_writer_owner;
     REVOKE SELECT ON forms_template_admin_review_lifecycle_transition
         FROM forms_template_admin_review_transition_writer_owner;
     REVOKE INSERT ON forms_template_admin_review_lifecycle_transition

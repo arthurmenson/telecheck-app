@@ -144,6 +144,17 @@ GRANT INSERT ON forms_template_admin_review_lifecycle_transition
 GRANT SELECT ON forms_template_admin_review_lifecycle_transition
     TO forms_template_admin_review_transition_writer_owner;
 
+-- R1 HIGH-1 closure 2026-05-22 (Admin Backend PR 3 Codex R3): the BIGSERIAL
+-- primary key on forms_template_admin_review_lifecycle_transition is backed
+-- by an implicit sequence (forms_template_admin_review_lifecycle_transition_id_seq).
+-- The SECDEF raw writer's INSERT omits id, so PostgreSQL calls nextval on
+-- the sequence under the SECDEF owner's privileges (writer_owner). INSERT
+-- on the table does NOT confer sequence USAGE — without an explicit USAGE
+-- grant the first wrapper invocation fails with "permission denied for
+-- sequence" at runtime. Grant USAGE explicitly.
+GRANT USAGE ON SEQUENCE forms_template_admin_review_lifecycle_transition_id_seq
+    TO forms_template_admin_review_transition_writer_owner;
+
 -- =============================================================================
 -- §3 — Anti-bypass EXECUTE grant matrix (P-040 §3.1 + P-038 §3.1 + Crisis
 -- Response migration 035 canonical pattern): the raw writer is callable ONLY
@@ -285,5 +296,22 @@ BEGIN
             'migration-042-anti-bypass-violation: '
             'PUBLIC has EXECUTE on record_forms_template_admin_review_transition() '
             '— anti-bypass discipline broken';
+    END IF;
+
+    -- R1 HIGH-1 closure 2026-05-22 (Admin Backend PR 3 Codex R3): assert
+    -- writer_owner holds USAGE on the BIGSERIAL implicit sequence so the
+    -- SECDEF function's nextval call succeeds at runtime. Without this,
+    -- the first wrapper invocation fails with "permission denied for sequence."
+    IF NOT has_sequence_privilege(
+        'forms_template_admin_review_transition_writer_owner',
+        'public.forms_template_admin_review_lifecycle_transition_id_seq',
+        'USAGE'
+    ) THEN
+        RAISE EXCEPTION
+            'migration-042-sequence-usage-missing: '
+            'forms_template_admin_review_transition_writer_owner does NOT have '
+            'USAGE on forms_template_admin_review_lifecycle_transition_id_seq; '
+            'BIGSERIAL nextval in the SECDEF raw writer will fail at runtime '
+            'with permission denied for sequence';
     END IF;
 END $$;
