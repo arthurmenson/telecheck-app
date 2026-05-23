@@ -484,6 +484,7 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_max_prior_transition_at TIMESTAMPTZ;
+    v_latest_to_state         TEXT;
     v_max_clock_skew CONSTANT INTERVAL := INTERVAL '5 seconds';
     v_lock_key BIGINT;
     v_caller_tenant_id        TEXT;
@@ -544,7 +545,23 @@ BEGIN
             USING ERRCODE = '22008';    -- datetime_field_overflow
     END IF;
 
-    -- Backdating rejected (NEW.transition_at >= MAX(prior.transition_at)).
+    -- R3 HIGH-1 closure 2026-05-23 (Codex R3): trigger now rejects EQUAL
+    -- timestamps (NEW.transition_at <= v_max_prior_transition_at), not just
+    -- strictly-older ones. The original `<` allowed two concurrent or
+    -- retried inserts with identical NEW.transition_at to both pass the
+    -- monotonic check, because the spec-mandated
+    -- `UNIQUE (tenant_id, signal_id, transition_at, id)` constraint
+    -- includes the primary key `id` — making it trivially satisfied (any
+    -- new id makes the row unique regardless of timestamp collision). The
+    -- advisory lock above serializes concurrent inserters, but client-
+    -- supplied or default-now() timestamps can still collide at
+    -- microsecond resolution within the lock window. Rejecting equality
+    -- here gives strict monotonic ordering — no two committed rows for
+    -- the same (tenant, signal) share a transition_at, so the current-
+    -- state derivation `ORDER BY transition_at DESC, id DESC LIMIT 1`
+    -- has a single unambiguous winner.
+
+    -- Backdating + equal-timestamp rejected (NEW.transition_at > MAX(prior.transition_at)).
     -- Read happens UNDER the advisory lock so the MAX is the
     -- committed-predecessor value. WHERE tenant_id = NEW.tenant_id is
     -- the tenant-isolation predicate (RLS bypassed by SECURITY DEFINER).
@@ -556,7 +573,7 @@ BEGIN
      WHERE tenant_id = NEW.tenant_id AND signal_id = NEW.signal_id;
 
     IF v_max_prior_transition_at IS NOT NULL
-       AND NEW.transition_at < v_max_prior_transition_at THEN
+       AND NEW.transition_at <= v_max_prior_transition_at THEN
         -- R2 HIGH-1 closure: error message intentionally OMITS MAX timestamp
         -- + signal_id (defense-in-depth — caller-tenant guard above already
         -- prevents cross-tenant attempts, but this avoids in-tenant
@@ -566,10 +583,54 @@ BEGIN
         -- canonical SQLSTATE; the wrapper layer surfaces a tenant-blind
         -- error envelope to the HTTP client per I-025.
         RAISE EXCEPTION
-            'interaction_signal_lifecycle_transition backdated: '
-            'NEW.transition_at is before MAX(prior.transition_at) for the '
-            'target signal in this tenant'
+            'interaction_signal_lifecycle_transition backdated-or-equal: '
+            'NEW.transition_at is not strictly after MAX(prior.transition_at) '
+            'for the target signal in this tenant'
             USING ERRCODE = '22008';
+    END IF;
+
+    -- =====================================================================
+    -- R3 HIGH-1 closure 2026-05-23 (Codex R3): latest-row continuity check.
+    -- The 6-triple CHECK constraint at the table layer enforces the
+    -- state-machine grammar (which (from_state, to_state, transition_reason)
+    -- triples are allowed), but does NOT verify NEW.from_state matches the
+    -- ACTUAL latest prior to_state. Without this check, a caller could
+    -- insert (none → emitted) on top of an existing (emitted → active →
+    -- overridden) lifecycle — the spec-allowed (none → emitted /
+    -- emission) triple would pass the CHECK, but the resulting derived
+    -- current-state would silently corrupt (overridden + emitted both
+    -- visible; ORDER BY transition_at DESC, id DESC would alternate).
+    -- The R3 lock-protected MAX read above already serializes concurrent
+    -- inserters per (tenant, signal); this continuity check uses the same
+    -- ordering predicate as the canonical current-state derivation to
+    -- read the actual latest to_state under the same lock.
+    -- =====================================================================
+    SELECT to_state INTO v_latest_to_state
+      FROM public.interaction_signal_lifecycle_transition
+     WHERE tenant_id = NEW.tenant_id AND signal_id = NEW.signal_id
+     ORDER BY transition_at DESC, id DESC
+     LIMIT 1;
+
+    IF v_latest_to_state IS NULL THEN
+        -- No prior rows for this signal; only the initial emission
+        -- triple (none → emitted / emission) is valid as the first row.
+        IF NEW.from_state <> 'none' THEN
+            RAISE EXCEPTION
+                'interaction_signal_lifecycle_transition initial-state-violation: '
+                'first transition for a signal MUST have from_state=none'
+                USING ERRCODE = '23514';    -- check_violation
+        END IF;
+    ELSE
+        -- Prior rows exist; NEW.from_state MUST match the latest to_state.
+        -- Generic error message (no v_latest_to_state in the message) for
+        -- defense-in-depth side-channel reduction per R2 HIGH-1 discipline.
+        IF NEW.from_state IS DISTINCT FROM v_latest_to_state THEN
+            RAISE EXCEPTION
+                'interaction_signal_lifecycle_transition state-continuity-violation: '
+                'NEW.from_state does not match the current latest to_state for '
+                'the target signal in this tenant'
+                USING ERRCODE = '23514';
+        END IF;
     END IF;
 
     RETURN NEW;
