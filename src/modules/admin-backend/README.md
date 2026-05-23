@@ -2,9 +2,13 @@
 
 Implementation of **SI-023 Admin Backend Basics Slice v1.0** (RATIFIED 2026-05-22 P-041) + the canonical follow-on **CDM v1.10 → v1.11 Amendment** (RATIFIED 2026-05-22 P-042).
 
-## Status: Sprint 1 (PR 6 — this commit) — **SKELETON**
+## Status: Sprint 2 PR 1 (this commit) — **FIRST HANDLER MOUNTED**
 
-The DB layer is **complete** through migration 044. The TypeScript application layer is at Sprint 1 — module skeleton + public interface + branded ID types + canonical lifecycle-state + decision + dashboard-name vocabularies. Handler implementation + Cat A audit emission + LAYER B role-membership check + integration tests land across Sprints 2-N.
+The DB layer is **complete** through migration 044. Foundation 051 (Option B app-role acquisition via `src/lib/with-db-role.ts`) merged. **Sprint 2 PR 1 mounts the first real Fastify handler**:
+
+- **`GET /v1/admin/dashboards/crisis-operational-health`** — wraps the SECDEF read function `read_admin_crisis_operational_health` (migration 044 §1). Composes `withTransaction → withTenantContext → withActorContext → withDbRole('admin_basic_operator')` → wrapper call. LAYER B uses the legacy `requireAdminRole` shim pending Sprint 4 RBAC v1.1 wiring. I-027 read-trail satisfied by the wrapper's co-transactional `admin_dashboard_query_execution` INSERT. **No Cat A audit emission at this PR** (READ endpoint scope per task brief; `admin.dashboard_query_executed` lands in Sprint 4 hardening).
+
+The remaining 4 of 5 SI-023 §5 endpoints + Cat A audit emission + proper LAYER B role-membership check + cross-tenant isolation tests are tracked in the Sprint 2+ list below.
 
 ### DB layer (PRs 1-5 — already merged on `main`)
 
@@ -25,9 +29,10 @@ The DB layer is **complete** through migration 044. The TypeScript application l
 - `POST /v1/admin/template-reviews/{review_id}/decision` → wraps `record_forms_template_admin_decision()` + Cat A `admin.template_review_decision` + conditional Cat A `admin.template_published_via_review_workflow` (IFF approve)
 - Integration tests for both happy paths + idempotency-replay regression on decision wrapper
 
-**Sprint 3 — Crisis dashboard endpoint**
-- `GET /v1/admin/dashboards/crisis-operational-health` → wraps `read_admin_crisis_operational_health()` + Cat A `admin.dashboard_query_executed` audit
-- Integration tests for tenant-isolation cases (cross-tenant read → tenant-blind 02000 / 42501)
+**Sprint 3 — Crisis dashboard endpoint** ✅ partially shipped (Sprint 2 PR 1)
+- ✅ `GET /v1/admin/dashboards/crisis-operational-health` → handler MOUNTED (wraps `read_admin_crisis_operational_health()` via the canonical context-helper composition + Option B `withDbRole('admin_basic_operator')` elevation; unit tests cover the composition order + guard precedence + wrapper-error propagation).
+- ⏳ Cat A `admin.dashboard_query_executed` audit emission — deferred to Sprint 4 hardening (READ endpoint scope at Sprint 2 PR 1 per task brief).
+- ⏳ Integration tests for tenant-isolation cases (cross-tenant read → tenant-blind 02000 / 42501) — pending the foundation-role-acquisition integration test suite landing alongside the per-slice handler PRs (per migration 051 header §"DEFERRED TO FOLLOW-UP PRS").
 
 **Sprint 4 — Hardening**
 - LAYER B role-membership check at Fastify route layer (admin_basic_operator for submit + dashboard; admin_template_reviewer for decision; deferred from SQL wrappers per Option 2)
