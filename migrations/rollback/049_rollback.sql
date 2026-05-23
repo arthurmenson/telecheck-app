@@ -77,6 +77,16 @@ BEGIN
             'the function in place (dependent wrappers from PR 5 migration 050 '
             'still reference it). Roll back migration 050 first.';
     END IF;
+
+    -- R2 HIGH-1 closure 2026-05-23 (Codex R2): revoke the SELECT-on-override
+    -- grant added by migration 049. Gated on (a) function-absent (we only
+    -- reach here when function is gone) + (b) target table + role both
+    -- exist (defense against partial-rollback states).
+    IF to_regclass('public.interaction_signal_override') IS NOT NULL
+       AND to_regrole('interaction_signal_lifecycle_transition_writer_owner') IS NOT NULL THEN
+        REVOKE SELECT ON interaction_signal_override
+            FROM interaction_signal_lifecycle_transition_writer_owner;
+    END IF;
 END $$;
 
 -- =============================================================================

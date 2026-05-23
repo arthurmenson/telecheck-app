@@ -257,6 +257,22 @@ ALTER FUNCTION record_interaction_signal_lifecycle_transition(
     VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
 ) OWNER TO interaction_signal_lifecycle_transition_writer_owner;
 
+-- R2 HIGH-1 closure 2026-05-23 (Codex R2): grant SELECT on
+-- interaction_signal_override to the writer-owner. STEP 3.5
+-- activation-blocked-by-override-evidence check runs under SECDEF
+-- owner privileges (writer-owner); migration 047 §3 only granted
+-- SELECT on override to medication_interaction_signal_viewer +
+-- interaction_signal_override_wrapper_owner. Without this grant,
+-- activation transitions would fail at runtime with
+-- "permission denied for relation interaction_signal_override"
+-- before STEP 3.5 could produce the intended evidence-rejection
+-- semantic. This grant is the minimal additional privilege needed
+-- for the SECDEF read; writer-owner does NOT receive INSERT/UPDATE/
+-- DELETE on the override table (override writes remain exclusive to
+-- the override wrapper-owner per migration 047 §3 GRANT block).
+GRANT SELECT ON interaction_signal_override
+    TO interaction_signal_lifecycle_transition_writer_owner;
+
 -- =============================================================================
 -- §3 — Anti-bypass EXECUTE grant matrix (SI-019 R4 HIGH-2 closure preserved):
 -- raw writer is callable ONLY by the 6 wrapper-owner roles. Application roles
@@ -395,5 +411,22 @@ BEGIN
     IF FOUND THEN
         RAISE EXCEPTION
             'migration-049-anti-bypass-violation: PUBLIC has EXECUTE on raw writer';
+    END IF;
+
+    -- R2 HIGH-1 closure 2026-05-23 (Codex R2): verify writer-owner has
+    -- SELECT on interaction_signal_override (required by STEP 3.5
+    -- override-evidence check at SECDEF function body). Without this
+    -- grant, activation transitions would fail at runtime with
+    -- permission_denied before STEP 3.5 could execute.
+    IF NOT has_table_privilege(
+        'interaction_signal_lifecycle_transition_writer_owner',
+        'public.interaction_signal_override',
+        'SELECT'
+    ) THEN
+        RAISE EXCEPTION
+            'migration-049-writer-owner-missing-override-select: '
+            'interaction_signal_lifecycle_transition_writer_owner does NOT '
+            'have SELECT on interaction_signal_override; STEP 3.5 activation-'
+            'override-evidence check would fail at runtime with permission_denied';
     END IF;
 END $$;
