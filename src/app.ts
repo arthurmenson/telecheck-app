@@ -278,13 +278,20 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // docs/SI-001-MedicationRequest-Schema-Gap.md for the resume path.
   await app.register(pharmacyPlugin);
 
-  // Med Interaction Engine — routes mounted under /v0/med-interaction.
-  // SKELETON ONLY at v0.1: only /health (200) + /ready (503) are mounted;
-  // full implementation (POST /signals/check, override workflow, ruleset
-  // resolver, vendor adapter abstraction) is BLOCKED on Med Interaction
-  // Engine slice PRD ratification. See src/modules/med-interaction/README.md.
-  // Platform-floor hard rule: the interaction engine runs BEFORE clinician
-  // commits a prescription (Master PRD v1.10 §7).
+  // Medication Interaction & Validation Engine (SI-019 v2.0 + CDM v1.6 → v1.7
+  // Amendment; RATIFIED P-033 + P-034 2026-05-21). Spec layer COMPLETE; DB
+  // layer at PR 1 of ~6: migration 046 has shipped the 12 net-new RBAC roles
+  // (4 application + 6 wrapper-owner + 2 service-level-owner). Sprint 1
+  // (this commit) registers /health (200) + /ready (503) so app-level wiring
+  // works as subsequent PRs land; PR 2 adds 4 entities + RLS + triggers,
+  // PR 3 adds 1 SECURITY BARRIER view + 1 optional MV + SECDEF access
+  // function, PR 4 adds raw lifecycle writer SECDEF, PR 5 adds 6 reason-
+  // specific lifecycle wrappers, PR 6+ adds Fastify handlers (8 endpoints
+  // per SI-019 §5 + CDM §6 OpenAPI v0.3) + Cat A audit emission + LAYER B
+  // role-membership check. See src/modules/med-interaction/README.md +
+  // docs/med-interaction-implementation-plan.md.
+  // Platform-floor hard rule (I-002): the interaction engine runs BEFORE
+  // clinician commits a medication_request (Master PRD v1.10 §7).
   await app.register(medInteractionPlugin);
 
   // AI Service Slice — routes mounted under /v0/ai.

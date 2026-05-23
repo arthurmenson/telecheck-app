@@ -178,7 +178,7 @@ The example bench at `tests/perf/audit/crisis-detect.bench.ts` shows the pattern
 | `emitAudit` (hash chain) | ✅ yes | Sprint 17 / TLC-027 §9 happy-path single-row append landed (`tests/perf/audit/emit-audit.bench.ts`) |
 | `tenant-context` resolution | ✅ yes | Pure function (host-header → tenant lookup); host-header parsing benchable now |
 | `errorEnvelope.buildErrorEnvelope` | ✅ yes | Pure function |
-| Per-slice service handlers | ⛔ no until slice ships | E.g., `med-interaction.signal.check` BLOCKED on Med Interaction Engine slice PRD ratification |
+| Per-slice service handlers | ⛔ no until slice ships | E.g., `med-interaction.signal.check` — spec RATIFIED (SI-019 v2.0 P-033 + CDM v1.6→v1.7 P-034 2026-05-21); handler not mounted until PR 6+ of the Med-Interaction DB-layer series (PR 1 RBAC roles shipped; PR 2 entities + PR 3 views + PR 4 raw writer + PR 5 wrappers pending) |
 | AI lab interpretation accuracy regression (per ADR-019) | ⛔ no until Labs slice ships | Slice not yet authored |
 
 ## Why scaffold over inline-asserts
