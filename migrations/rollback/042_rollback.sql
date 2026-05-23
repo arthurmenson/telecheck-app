@@ -1,0 +1,117 @@
+-- =============================================================================
+-- File:    migrations/rollback/042_rollback.sql
+-- Purpose: Rollback migration 042_admin_backend_raw_lifecycle_writer.sql.
+--
+--          Drops record_forms_template_admin_review_transition() + revokes
+--          writer-owner's INSERT + SELECT grants on
+--          forms_template_admin_review_lifecycle_transition.
+--
+--          PRE-ROLLBACK CHECK (manual / operator):
+--            - Template wrapper SECDEF procedures from later PRs (043+) must
+--              be dropped first if they have been deployed. Per R3 PR 2
+--              closure pattern, we DROP FUNCTION first then REVOKE in a
+--              DO block with verification of function-absent, so a blocked
+--              DROP cannot strand wrapper-owner grants.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Raw lifecycle writer function + writer-owner table grants.
+--    Resolve-OID-first → conditional REVOKE EXECUTE → DROP FUNCTION →
+--    verify-absent → REVOKE table grants, all guarded by single DO block.
+--
+--    R1 MED-1 closure 2026-05-22 (Codex R1): REVOKE ON FUNCTION fails
+--    outright if the function signature does not resolve. Under a
+--    partial-prior-rollback or manual-repair state where the function
+--    was already dropped, an unguarded REVOKE would error BEFORE the
+--    DROP FUNCTION IF EXISTS / table-grant cleanup, leaving migration 042
+--    non-rollbackable. The fix below resolves the exact signature via
+--    to_regprocedure first; REVOKE statements only execute when the
+--    function actually exists.
+-- -----------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_target_oid             OID := to_regprocedure(
+        'public.record_forms_template_admin_review_transition(text, uuid, text, text, text, text, jsonb)'
+    );
+    v_function_still_present BOOLEAN;
+BEGIN
+    -- R1 MED-1 closure: only REVOKE if the function actually exists.
+    -- If a prior partial rollback already dropped the function, skip the
+    -- function-level REVOKE and proceed straight to verify-absent + the
+    -- writer-owner table-grant cleanup.
+    IF v_target_oid IS NOT NULL THEN
+        -- REVOKE EXECUTE grants first (these are on the function itself, so
+        -- dropping the function would drop them anyway, but explicit REVOKE
+        -- documents the anti-bypass cleanup).
+        REVOKE EXECUTE ON FUNCTION record_forms_template_admin_review_transition(
+            TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+        ) FROM forms_template_admin_review_decision_wrapper_owner;
+        REVOKE EXECUTE ON FUNCTION record_forms_template_admin_review_transition(
+            TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+        ) FROM forms_template_admin_review_submit_wrapper_owner;
+
+        -- DROP the function. If dependent template wrappers still reference it,
+        -- this DROP fails (CASCADE intentionally not used).
+        DROP FUNCTION IF EXISTS record_forms_template_admin_review_transition(
+            TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+        );
+    END IF;
+
+    -- Verify the EXACT target signature is actually gone. R2 MED-1 closure
+    -- 2026-05-22 (Codex R2): use signature-exact to_regprocedure check, NOT
+    -- a name-only pg_proc predicate. A name-only check would treat the
+    -- rollback as blocked under a same-name overload that is unrelated to
+    -- our target signature, stranding writer-owner table grants. The
+    -- forward migration uses to_regprocedure for the canonical OID
+    -- invariant; the rollback must use the same shape.
+    v_function_still_present := to_regprocedure(
+        'public.record_forms_template_admin_review_transition(text, uuid, text, text, text, text, jsonb)'
+    ) IS NOT NULL;
+
+    IF v_function_still_present THEN
+        RAISE EXCEPTION
+            'migration-042-rollback-function-blocked: '
+            'DROP FUNCTION record_forms_template_admin_review_transition left '
+            'the function in place (dependent template wrappers from later '
+            'migrations 043+ still reference it). REVOKE of writer-owner''s '
+            'table-level INSERT/SELECT ABORTED to preserve runtime '
+            'executability. Roll back dependent migrations first, then '
+            'retry this rollback.';
+    END IF;
+
+    -- Safe to revoke writer-owner's table grants now (function is gone;
+    -- grants are orphaned). Also revoke the BIGSERIAL implicit sequence
+    -- USAGE granted by the forward migration's R1 HIGH-1 closure (Codex R3)
+    -- — without this REVOKE the rollback would leave a stale USAGE grant
+    -- on a sequence that no canonical caller needs anymore.
+    REVOKE USAGE ON SEQUENCE forms_template_admin_review_lifecycle_transition_id_seq
+        FROM forms_template_admin_review_transition_writer_owner;
+    REVOKE SELECT ON forms_template_admin_review_lifecycle_transition
+        FROM forms_template_admin_review_transition_writer_owner;
+    REVOKE INSERT ON forms_template_admin_review_lifecycle_transition
+        FROM forms_template_admin_review_transition_writer_owner;
+END $$;
+
+-- =============================================================================
+-- Post-rollback verification: EXACT target signature should be absent.
+-- R2 MED-1 closure 2026-05-22 (Codex R2): signature-exact check via
+-- to_regprocedure, NOT name-only pg_proc predicate, so unrelated same-name
+-- overloads do not produce spurious warnings.
+-- =============================================================================
+DO $$
+DECLARE
+    v_function_present BOOLEAN;
+BEGIN
+    v_function_present := to_regprocedure(
+        'public.record_forms_template_admin_review_transition(text, uuid, text, text, text, text, jsonb)'
+    ) IS NOT NULL;
+
+    IF v_function_present THEN
+        RAISE WARNING
+            'migration-042-rollback-incomplete: '
+            'record_forms_template_admin_review_transition(text, uuid, text, '
+            'text, text, text, jsonb) unexpectedly remains in public schema. '
+            'The DO-block guard above should have aborted before reaching '
+            'this verification — investigate.';
+    END IF;
+END $$;
