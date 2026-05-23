@@ -192,33 +192,41 @@ export async function getCrisisOperationalHealthHandler(
       // and throw a 403 via req.server.httpErrors.forbidden(), which the
       // envelope formats as a canonical insufficient-scope response
       // without tenant identifiers. Other PG errors propagate unchanged.
+      // R2 MED-1 closure 2026-05-23 (Codex sibling-finding from Crisis
+      // task bdx9yneo0; mechanical fix applied here too): the 42501
+      // catch MUST wrap the ENTIRE withDbRole call, not just the inner
+      // SELECT. withDbRole issues SET LOCAL ROLE BEFORE invoking its
+      // callback; a role-membership gap or grant skew would raise 42501
+      // at that pre-callback boundary, escaping a catch placed inside
+      // the callback. Wrapping the withDbRole(...) Promise covers BOTH
+      // paths (privilege acquisition + SECDEF wrapper LAYER C guard).
       const runWrapper = async (): Promise<CrisisOperationalHealthRow[]> => {
-        return withDbRole(tx, 'admin_basic_operator', async () => {
-          // The wrapper signature is
-          //   read_admin_crisis_operational_health(p_tenant_id TEXT,
-          //                                        p_query_params_jsonb JSONB)
-          // Pass an empty `{}` for query params at v0.1 — the wrapper
-          // body persists this into admin_dashboard_query_execution.
-          // Future iterations may surface query filters from URL query
-          // string (e.g., ?severity=high) and forward them here.
-          try {
+        try {
+          return await withDbRole(tx, 'admin_basic_operator', async () => {
+            // The wrapper signature is
+            //   read_admin_crisis_operational_health(p_tenant_id TEXT,
+            //                                        p_query_params_jsonb JSONB)
+            // Pass an empty `{}` for query params at v0.1 — the wrapper
+            // body persists this into admin_dashboard_query_execution.
+            // Future iterations may surface query filters from URL query
+            // string (e.g., ?severity=high) and forward them here.
             const result = await tx.query<CrisisOperationalHealthRow>(
               'SELECT * FROM read_admin_crisis_operational_health($1, $2)',
               [ctx.tenantId, {}],
             );
             return result.rows;
-          } catch (err) {
-            if (
-              typeof err === 'object' &&
-              err !== null &&
-              'code' in err &&
-              (err as { code?: unknown }).code === '42501'
-            ) {
-              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-            }
-            throw err;
+          });
+        } catch (err) {
+          if (
+            typeof err === 'object' &&
+            err !== null &&
+            'code' in err &&
+            (err as { code?: unknown }).code === '42501'
+          ) {
+            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
           }
-        });
+          throw err;
+        }
       };
 
       if (req.actorNonce !== undefined) {
