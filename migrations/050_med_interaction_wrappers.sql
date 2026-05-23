@@ -640,7 +640,25 @@ BEGIN
         'authorization re-enables this wrapper.'
         USING ERRCODE = '0A000';    -- feature_not_supported
 
-    -- UNREACHABLE (preserved for structural completeness):
+    /*
+    -- R2 CRITICAL closure 2026-05-23 (Codex R2): UNREACHABLE block wrapped
+    -- in PostgreSQL block comment so that the surrounding RAISE EXCEPTION
+    -- is the only executable statement after the active-state check. The
+    -- prior commit (R1 closure) accidentally left this block as live SQL,
+    -- which (a) PostgreSQL parses at CREATE FUNCTION time + would have
+    -- blocked migration application, AND (b) would silently become live
+    -- if a future PR removes the RAISE without first replacing the
+    -- evidence-deferred TODO sources. Block-comment isolates the code
+    -- so neither hazard applies.
+    --
+    -- When PR 6+ work + Pharmacy active-medication-list view +
+    -- SI-024.1 LAYER B work lands, the closure pattern is:
+    --   1. Remove the RAISE EXCEPTION above
+    --   2. Add the 2 evidence checks where the RAISE was
+    --   3. Remove THIS block comment wrapper to re-enable the INSERT +
+    --      PERFORM below
+    -- All three steps MUST happen in the same migration; partial uncomment
+    -- (just removing the RAISE) would re-introduce the R1 finding.
 
     -- STEP 5: INSERT override row FIRST (per R4 HIGH-1 closure: write
     -- evidence before terminal transition so a wrapper failure can't
@@ -683,6 +701,7 @@ BEGIN
     -- TODO (Option 2 deferred): STEP 3 medication-still-on-active-list
     -- check (active-medication-list view not in code repo); STEP 4 LAYER B
     -- clinician role-membership check (deferred to Fastify route handler).
+    */
 END;
 $$;
 
