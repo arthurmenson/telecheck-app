@@ -62,6 +62,10 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import { getSignalHandler } from './internal/handlers/get-signal.js';
+import { supersedeSignalHandler } from './internal/handlers/supersede-signal.js';
+import { overrideSignalHandler } from './internal/handlers/override-signal.js';
+import { resolveSignalHandler } from './internal/handlers/resolve-signal.js';
+import { expireSignalHandler } from './internal/handlers/expire-signal.js';
 
 export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
@@ -127,6 +131,21 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   // write events). See handler file-level docstring for the canonical
   // composition order + Layer B deferral rationale.
   app.get('/signals/:id', getSignalHandler);
+
+  // PR 9: 4 remaining write endpoints (supersede + override + resolve +
+  // expire). Supersede is OPERATIONAL (calls record_signal_supersession,
+  // migration 050 §3). The other 3 are FAIL-CLOSED at the wrapper layer
+  // (RAISE EXCEPTION SQLSTATE 0A000 per Codex R1 closure 2026-05-23
+  // pending evidence-source migrations — Async Consult discontinuation-
+  // event log for resolve, per-basis cadence config for expire,
+  // SI-024.1 JWT-binding for override). The handler scaffolds map 0A000
+  // → tenant-blind 503 per I-025 and emit Cat A audit on rejection per
+  // I-003 bare-suppression-forbidden (the rejected attempt belongs in
+  // the audit chain).
+  app.post('/signals/:id/supersede', supersedeSignalHandler);
+  app.post('/signals/:id/override', overrideSignalHandler);
+  app.post('/signals/:id/resolve', resolveSignalHandler);
+  app.post('/signals/:id/expire', expireSignalHandler);
 
   // Remaining 7 endpoints (POST /evaluations, POST /signals, POST
   // /signals/:id/{activate, override, resolve, expire, supersede})
