@@ -423,6 +423,23 @@ CREATE TRIGGER forms_template_admin_review_lifecycle_invariants_trigger
 --
 -- LAYER 1 is the parent-template FOR UPDATE serialization point acquired by
 -- BOTH the submit + decision SECDEF wrappers (lands in PR 5).
+--
+-- R1 HIGH-1 closure 2026-05-22 (Admin Backend PR 1 Codex R1):
+--   - Acquire a per-(tenant_id, forms_template_id) advisory transaction lock
+--     at the start of the trigger so concurrent INSERTs into
+--     forms_template_admin_review for the same template serialize. Without
+--     this lock, two concurrent inserts can both pass the existence check
+--     under READ COMMITTED (each sees no competing committed lifecycle row)
+--     and both succeed — defeating the advertised LAYER 2 defense.
+--   - Add a second check (b) for same-template review_roots that have NO
+--     lifecycle row yet (orphan / raw-path-bypass scenario). Even with the
+--     advisory lock, a competitor that inserts the review_root WITHOUT a
+--     paired lifecycle row would otherwise slip through the original
+--     latest-state check (which only matches review_roots that already have
+--     a committed lifecycle row in an active state). The canonical wrapper
+--     pattern inserts review_root + initial_submission lifecycle row in a
+--     single tx so check (a) catches the canonical case; check (b) catches
+--     the bypass case (raw INSERT path or orphan from a partially-failed tx).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION enforce_one_active_review_per_template()
 RETURNS TRIGGER
@@ -432,7 +449,24 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_existing_active_review_id UUID;
+    v_lock_key BIGINT;
 BEGIN
+    -- R1 HIGH-1 closure: serialize concurrent inserts per
+    -- (tenant_id, forms_template_id) so checks (a) + (b) below see a stable,
+    -- committed view of competing review roots. Auto-released at tx
+    -- commit/rollback. Matches the per-(tenant, review_id) advisory-lock
+    -- pattern used by the unified lifecycle-invariants trigger above, scoped
+    -- here to (tenant, template) so concurrent same-template inserts
+    -- serialize at the LAYER 2 schema layer (LAYER 1 in the submit wrapper
+    -- is the canonical serialization point; this is defense-in-depth).
+    v_lock_key := ('x' || substr(md5(NEW.tenant_id::text || ':' || NEW.forms_template_id::text), 1, 16))::bit(64)::bigint;
+    PERFORM pg_advisory_xact_lock(v_lock_key);
+
+    -- Check (a): any OTHER review_root for the same template whose LATEST
+    -- lifecycle row is in an active state (pending_review or
+    -- revision_requested). The original LATERAL-derived latest-state check.
+    -- Catches the canonical wrapper pattern (review_root + initial_submission
+    -- lifecycle row inserted in same tx; competitor sees both after commit).
     SELECT ftar.review_id INTO v_existing_active_review_id
       FROM public.forms_template_admin_review ftar
       JOIN LATERAL (
@@ -453,6 +487,33 @@ BEGIN
             NEW.forms_template_id, v_existing_active_review_id
             USING ERRCODE = '23505';    -- unique_violation
     END IF;
+
+    -- Check (b) R1 HIGH-1 closure: any OTHER review_root for the same
+    -- template that has NO lifecycle row at all. Catches the raw-path-bypass
+    -- / orphan / concurrently-in-flight-without-lifecycle scenario that
+    -- check (a) cannot see (since check (a) requires a committed lifecycle
+    -- row to MATCH). Under the advisory lock held above, this LEFT JOIN
+    -- resolves AFTER any competitor's tx commits or rolls back; if the
+    -- competitor's review_root persists without a lifecycle row, treat it
+    -- as potentially-active and reject this insert.
+    SELECT ftar.review_id INTO v_existing_active_review_id
+      FROM public.forms_template_admin_review ftar
+      LEFT JOIN public.forms_template_admin_review_lifecycle_transition lt
+           ON lt.tenant_id = ftar.tenant_id AND lt.review_id = ftar.review_id
+     WHERE ftar.tenant_id = NEW.tenant_id
+       AND ftar.forms_template_id = NEW.forms_template_id
+       AND ftar.review_id IS DISTINCT FROM NEW.review_id
+       AND lt.id IS NULL
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'admin-template-review-duplicate-active-orphan: '
+            'template % already has review % with no lifecycle row yet '
+            '(concurrently in-flight or orphan)',
+            NEW.forms_template_id, v_existing_active_review_id
+            USING ERRCODE = '23505';    -- unique_violation
+    END IF;
+
     RETURN NEW;
 END;
 $$;
