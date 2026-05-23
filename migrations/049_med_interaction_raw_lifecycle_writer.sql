@@ -1,7 +1,7 @@
--- =============================================================================
+﻿-- =============================================================================
 -- File:    migrations/049_med_interaction_raw_lifecycle_writer.sql
 -- Purpose: Create the canonical raw lifecycle writer SECDEF function
---          record_interaction_signal_lifecycle_transition() — the SOLE INSERT
+--          record_interaction_signal_lifecycle_transition() â€” the SOLE INSERT
 --          path into interaction_signal_lifecycle_transition + the anti-bypass
 --          discipline (EXECUTE granted ONLY to the 6 wrapper-owner roles from
 --          migration 046; application roles never call the raw writer directly).
@@ -9,21 +9,21 @@
 --          PR 4 of the Med-Interaction Engine implementation series. Subsequent
 --          migrations: 6 reason-specific lifecycle wrappers (emission +
 --          activation + supersession + resolution + expiry + override) (PR 5)
---          → Fastify handler implementation (PR 6+) following the Crisis
+--          â†’ Fastify handler implementation (PR 6+) following the Crisis
 --          Response + Admin Backend Option 2 cadence.
 --
 --          PER RATIFIER OPTION 2 (carryforward from PR 1-3 + Crisis Response
 --          migration 035 + Admin Backend migration 042):
---          - PROCEDURE → FUNCTION RETURNS VOID. Spec §6.NEW1 declares
+--          - PROCEDURE â†’ FUNCTION RETURNS VOID. Spec Â§6.NEW1 declares
 --            PROCEDURE; code-repo precedent (Crisis Response migration 035 +
 --            Admin Backend migration 042) uses FUNCTION RETURNS VOID. The
 --            distinction (CALL vs SELECT; tx-control capability) doesn't
 --            matter for this raw writer's body (no embedded COMMIT/ROLLBACK),
 --            and FUNCTION is the established code-repo pattern. Wrappers in
 --            PR 5 will SELECT-invoke instead of CALL-invoke.
---          - tenant_id_t → TEXT; ulid_t → VARCHAR(26); custom DOMAIN enum
+--          - tenant_id_t â†’ TEXT; ulid_t â†’ VARCHAR(26); custom DOMAIN enum
 --            types (interaction_signal_state_t, interaction_signal_transition_reason_t,
---            interaction_signal_actor_role_t) → TEXT (matches table column
+--            interaction_signal_actor_role_t) â†’ TEXT (matches table column
 --            types; CHECK constraints on the table enforce the enum values).
 --          - p_id parameter (caller-supplied ULID): spec uses gen_ulid()
 --            helper which doesn't exist in code repo. Caller (PR 5 wrapper +
@@ -34,24 +34,24 @@
 --            spec uses these for STEP 0 tenant-context validation. Code repo
 --            uses SI-010 trust anchor (current_actor_account_tenant_id()) per
 --            migration 031. The lifecycle_transition table's BEFORE INSERT
---            trigger (migration 047 §3) already enforces
+--            trigger (migration 047 Â§3) already enforces
 --            current_tenant_id() = NEW.tenant_id as caller-tenant guard;
 --            the raw writer adds a defense-in-depth check via SI-010 helper
 --            (matches Crisis Response + Admin Backend raw writer pattern).
 --          - Wrapper-owner role names: prefixed with interaction_signal_*
---            per migration 046 §2 cross-slice-collision-safety convention.
---          - Writer-owner role name: interaction_signal_lifecycle_transition_writer_owner
+--            per migration 046 Â§2 cross-slice-collision-safety convention.
+--          - Writer-owner role name: lifecycle_transition_writer_owner
 --            (Option 2 prefix; spec uses unprefixed
 --            lifecycle_transition_writer_owner).
 --          - STEP 3.5 activation-blocked-by-override-evidence check
---            (SI-019 §6.NEW1 R5 HIGH-1 closure): preserved here per spec
+--            (SI-019 Â§6.NEW1 R5 HIGH-1 closure): preserved here per spec
 --            even though it's reason-specific (could go in PR 5 activation
 --            wrapper instead). Per "do not silently fork" discipline,
 --            preserve spec placement.
 --          - Owner role needs INSERT + SELECT on lifecycle_transition table
 --            (Crisis Response migration 035 + Admin Backend migration 042
 --            pattern; SELECT required by SECURITY INVOKER trigger reading
---            MAX(prior.transition_at)). Migration 047 §4 grant block
+--            MAX(prior.transition_at)). Migration 047 Â§4 grant block
 --            already includes both INSERT + SELECT for writer-owner.
 --          - SECDEF + locked search_path = pg_catalog, public (Option 2;
 --            spec uses pg_catalog, pg_temp).
@@ -59,7 +59,7 @@
 -- Spec:    - SI-019 Medication Interaction & Validation Engine Slice PRD
 --            v2.0 Sub-decision 8.5 (raw canonical lifecycle writer;
 --            anti-bypass discipline)
---          - CDM v1.6 → v1.7 Amendment §6.NEW1 (canonical executable
+--          - CDM v1.6 â†’ v1.7 Amendment Â§6.NEW1 (canonical executable
 --            wrapper-body source; RATIFIED 2026-05-21 P-034)
 --          - I-035 (append-only invariant for audit-bound state machines;
 --            enforced by per-table trigger from migration 047 + this raw
@@ -78,7 +78,7 @@
 -- ---------------------------------------------------------------------------
 
 -- =============================================================================
--- §1 — Raw lifecycle writer SECURITY DEFINER function
+-- Â§1 â€” Raw lifecycle writer SECURITY DEFINER function
 --
 -- Body is intentionally minimal. ALL business invariants live at the table
 -- layer (migration 047):
@@ -92,9 +92,9 @@
 -- procedures perform transitions.
 --
 -- SECURITY DEFINER: runs with writer_owner's privileges. writer_owner has
--- INSERT + SELECT on the table per migration 047 §4 GRANT block. Application
--- roles do NOT have grants on the table — they MUST come through the
--- wrapper → raw writer chain.
+-- INSERT + SELECT on the table per migration 047 Â§4 GRANT block. Application
+-- roles do NOT have grants on the table â€” they MUST come through the
+-- wrapper â†’ raw writer chain.
 --
 -- SET search_path: locks to pg_catalog, public (Option 2; spec uses
 -- pg_catalog, pg_temp). canonical SECDEF hardening per code-repo
@@ -126,7 +126,7 @@ BEGIN
     -- + Admin Backend migration 042 pattern; the table's BEFORE INSERT
     -- monotonic-ordering trigger ALSO performs this check, but doing it
     -- here at the SECDEF function body provides a guarantee independent of
-    -- trigger correctness — a future trigger replacement that misses the
+    -- trigger correctness â€” a future trigger replacement that misses the
     -- check would still be caught here).
     --
     -- SI-010 trust anchor: current_actor_account_tenant_id() returns the
@@ -142,7 +142,7 @@ BEGIN
     END IF;
     IF v_actor_tenant_id IS DISTINCT FROM p_tenant_id THEN
         RAISE EXCEPTION
-            'record_interaction_signal_lifecycle_transition: tenant scope mismatch — '
+            'record_interaction_signal_lifecycle_transition: tenant scope mismatch â€” '
             'actor tenant does not match p_tenant_id; cross-tenant lifecycle write rejected'
             USING ERRCODE = '42501';
     END IF;
@@ -153,7 +153,7 @@ BEGIN
     -- check. Without this lock, a concurrent override INSERT could slip
     -- between the EXISTS check + the activation INSERT, leaving an
     -- activation transition committed even though override evidence
-    -- exists — corrupting the SI-019 R5 HIGH-1 invariant + impossible to
+    -- exists â€” corrupting the SI-019 R5 HIGH-1 invariant + impossible to
     -- repair since lifecycle rows are append-only.
     --
     -- LOCK KEY SHARED ACROSS BOTH WRITE PATHS (CONTRACT FOR PR 5):
@@ -166,7 +166,7 @@ BEGIN
     --
     -- Lock key uses the same md5-of-(tenant_id, signal_id) shape as the
     -- monotonic-ordering trigger on lifecycle_transition (migration 047
-    -- §3), so the lock domain is consistent across all writes to a single
+    -- Â§3), so the lock domain is consistent across all writes to a single
     -- (tenant, signal). Concurrent calls serialize; lock is auto-released
     -- at tx commit/rollback.
     -- ---------------------------------------------------------------------
@@ -174,8 +174,8 @@ BEGIN
     PERFORM pg_advisory_xact_lock(v_lock_key);
 
     -- ---------------------------------------------------------------------
-    -- STEP 3.5 — activation-blocked-by-override-evidence check (SI-019
-    -- §6.NEW1 R5 HIGH-1 closure preserved verbatim from spec). Now executes
+    -- STEP 3.5 â€” activation-blocked-by-override-evidence check (SI-019
+    -- Â§6.NEW1 R5 HIGH-1 closure preserved verbatim from spec). Now executes
     -- under the advisory lock acquired above (R1 HIGH-1 closure), so a
     -- concurrent override INSERT cannot slip between this EXISTS check and
     -- the activation INSERT below. Reason-specific check; could move to
@@ -206,7 +206,7 @@ BEGIN
     -- Note: this read is NOT under the advisory lock that the trigger
     -- acquires. There IS a TOCTOU window between this read + the INSERT,
     -- but the trigger re-reads MAX(prior.transition_at) + latest to_state
-    -- under its own advisory lock — so a concurrent insert between this
+    -- under its own advisory lock â€” so a concurrent insert between this
     -- raw writer's read + the trigger's lock-protected read will be
     -- caught by the trigger's state-continuity check and the trigger will
     -- raise an exception.
@@ -219,7 +219,7 @@ BEGIN
 
     -- ---------------------------------------------------------------------
     -- INSERT the new transition row. CHECK constraint at table layer
-    -- (migration 047 §3) enforces 6 valid transition triples. BEFORE INSERT
+    -- (migration 047 Â§3) enforces 6 valid transition triples. BEFORE INSERT
     -- monotonic-ordering trigger (migration 047) overrides transition_at to
     -- server-assigned strict-monotonic value, validates caller-tenant scope,
     -- and validates state-continuity. Append-only trigger blocks any future
@@ -246,39 +246,39 @@ END;
 $$;
 
 -- =============================================================================
--- §2 — Function ownership (writer_owner)
+-- Â§2 â€” Function ownership (writer_owner)
 --
 -- Owner role already has INSERT + SELECT on lifecycle_transition table
--- (granted at migration 047 §4 GRANT block; carried forward from spec
--- §4.NEW4 GRANT block).
+-- (granted at migration 047 Â§4 GRANT block; carried forward from spec
+-- Â§4.NEW4 GRANT block).
 -- =============================================================================
 
 ALTER FUNCTION record_interaction_signal_lifecycle_transition(
     VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
-) OWNER TO interaction_signal_lifecycle_transition_writer_owner;
+) OWNER TO lifecycle_transition_writer_owner;
 
 -- R2 HIGH-1 closure 2026-05-23 (Codex R2): grant SELECT on
 -- interaction_signal_override to the writer-owner. STEP 3.5
 -- activation-blocked-by-override-evidence check runs under SECDEF
--- owner privileges (writer-owner); migration 047 §3 only granted
+-- owner privileges (writer-owner); migration 047 Â§3 only granted
 -- SELECT on override to medication_interaction_signal_viewer +
--- interaction_signal_override_wrapper_owner. Without this grant,
+-- override_wrapper_owner. Without this grant,
 -- activation transitions would fail at runtime with
 -- "permission denied for relation interaction_signal_override"
 -- before STEP 3.5 could produce the intended evidence-rejection
 -- semantic. This grant is the minimal additional privilege needed
 -- for the SECDEF read; writer-owner does NOT receive INSERT/UPDATE/
 -- DELETE on the override table (override writes remain exclusive to
--- the override wrapper-owner per migration 047 §3 GRANT block).
+-- the override wrapper-owner per migration 047 Â§3 GRANT block).
 GRANT SELECT ON interaction_signal_override
-    TO interaction_signal_lifecycle_transition_writer_owner;
+    TO lifecycle_transition_writer_owner;
 
 -- =============================================================================
--- §3 — Anti-bypass EXECUTE grant matrix (SI-019 R4 HIGH-2 closure preserved):
+-- Â§3 â€” Anti-bypass EXECUTE grant matrix (SI-019 R4 HIGH-2 closure preserved):
 -- raw writer is callable ONLY by the 6 wrapper-owner roles. Application roles
 -- (medication_interaction_engine_evaluator, medication_interaction_signal_viewer,
 -- medication_interaction_override_recorder, medication_interaction_knowledge_base_updater)
--- have NO EXECUTE on this function — they MUST come through the reason-specific
+-- have NO EXECUTE on this function â€” they MUST come through the reason-specific
 -- wrappers (PR 5).
 -- =============================================================================
 
@@ -288,17 +288,17 @@ REVOKE EXECUTE ON FUNCTION record_interaction_signal_lifecycle_transition(
 
 GRANT EXECUTE ON FUNCTION record_interaction_signal_lifecycle_transition(
     VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
-) TO interaction_signal_emission_wrapper_owner,
-     interaction_signal_activation_wrapper_owner,
-     interaction_signal_override_wrapper_owner,
-     interaction_signal_supersession_wrapper_owner,
-     interaction_signal_resolution_wrapper_owner,
-     interaction_signal_expiry_wrapper_owner;
+) TO emission_wrapper_owner,
+     activation_wrapper_owner,
+     override_wrapper_owner,
+     superseded_wrapper_owner,
+     resolution_wrapper_owner,
+     expiry_wrapper_owner;
 
 COMMENT ON FUNCTION record_interaction_signal_lifecycle_transition(
     VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
 ) IS
-    'CDM v1.7 §6.NEW1 + SI-019 Sub-decision 8.5 raw canonical lifecycle writer. '
+    'CDM v1.7 Â§6.NEW1 + SI-019 Sub-decision 8.5 raw canonical lifecycle writer. '
     'SECURITY DEFINER + locked search_path. SOLE INSERT path into '
     'interaction_signal_lifecycle_transition. EXECUTE granted ONLY to the 6 '
     'wrapper-owner roles (anti-bypass per SI-019 R4 HIGH-2 + Crisis Response '
@@ -311,7 +311,7 @@ COMMENT ON FUNCTION record_interaction_signal_lifecycle_transition(
     'activation-blocked-by-override-evidence check preserved verbatim per spec.';
 
 -- =============================================================================
--- §4 — Verification
+-- Â§4 â€” Verification
 -- =============================================================================
 
 DO $$
@@ -341,10 +341,10 @@ BEGIN
       JOIN pg_roles r ON r.oid = p.proowner
      WHERE p.oid = v_target_oid;
 
-    IF v_function_owner <> 'interaction_signal_lifecycle_transition_writer_owner' THEN
+    IF v_function_owner <> 'lifecycle_transition_writer_owner' THEN
         RAISE EXCEPTION
             'migration-049-ownership-mismatch: '
-            'owner is % but MUST be interaction_signal_lifecycle_transition_writer_owner',
+            'owner is % but MUST be lifecycle_transition_writer_owner',
             v_function_owner;
     END IF;
 
@@ -370,7 +370,7 @@ BEGIN
       FROM information_schema.role_routine_grants g
      WHERE g.specific_name = v_function_specific_name
        AND g.privilege_type = 'EXECUTE'
-       AND g.grantee <> 'interaction_signal_lifecycle_transition_writer_owner';
+       AND g.grantee <> 'lifecycle_transition_writer_owner';
 
     IF v_execute_grantee_count <> 6 THEN
         RAISE EXCEPTION
@@ -387,13 +387,13 @@ BEGIN
          WHERE g.specific_name = v_function_specific_name
            AND g.privilege_type = 'EXECUTE'
            AND g.grantee NOT IN (
-               'interaction_signal_lifecycle_transition_writer_owner',
-               'interaction_signal_emission_wrapper_owner',
-               'interaction_signal_activation_wrapper_owner',
-               'interaction_signal_override_wrapper_owner',
-               'interaction_signal_supersession_wrapper_owner',
-               'interaction_signal_resolution_wrapper_owner',
-               'interaction_signal_expiry_wrapper_owner'
+               'lifecycle_transition_writer_owner',
+               'emission_wrapper_owner',
+               'activation_wrapper_owner',
+               'override_wrapper_owner',
+               'superseded_wrapper_owner',
+               'resolution_wrapper_owner',
+               'expiry_wrapper_owner'
            )
     LOOP
         RAISE EXCEPTION
@@ -419,13 +419,13 @@ BEGIN
     -- grant, activation transitions would fail at runtime with
     -- permission_denied before STEP 3.5 could execute.
     IF NOT has_table_privilege(
-        'interaction_signal_lifecycle_transition_writer_owner',
+        'lifecycle_transition_writer_owner',
         'public.interaction_signal_override',
         'SELECT'
     ) THEN
         RAISE EXCEPTION
             'migration-049-writer-owner-missing-override-select: '
-            'interaction_signal_lifecycle_transition_writer_owner does NOT '
+            'lifecycle_transition_writer_owner does NOT '
             'have SELECT on interaction_signal_override; STEP 3.5 activation-'
             'override-evidence check would fail at runtime with permission_denied';
     END IF;

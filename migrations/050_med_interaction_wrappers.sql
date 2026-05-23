@@ -1,30 +1,30 @@
--- =============================================================================
+﻿-- =============================================================================
 -- File:    migrations/050_med_interaction_wrappers.sql
 -- Purpose: Create the 6 reason-specific SECURITY DEFINER wrappers per CDM
---          v1.6 → v1.7 Amendment §6.NEW2-NEW7 (RATIFIED 2026-05-21 P-034).
+--          v1.6 â†’ v1.7 Amendment Â§6.NEW2-NEW7 (RATIFIED 2026-05-21 P-034).
 --
 --          PR 5 of the Med-Interaction Engine implementation series.
 --          Subsequent: Fastify handler implementation + Cat A audit emission
 --          + integration tests (PR 6+).
 --
---          5 LIFECYCLE WRAPPERS (§6.NEW2-NEW6):
---          - record_signal_emission     — initial signal → emitted
---          - record_signal_activation   — emitted → active
---          - record_signal_supersession — active → superseded
---          - record_signal_resolution   — active → resolved
---          - record_signal_expiry       — active → expired
+--          5 LIFECYCLE WRAPPERS (Â§6.NEW2-NEW6):
+--          - record_signal_emission     â€” initial signal â†’ emitted
+--          - record_signal_activation   â€” emitted â†’ active
+--          - record_signal_supersession â€” active â†’ superseded
+--          - record_signal_resolution   â€” active â†’ resolved
+--          - record_signal_expiry       â€” active â†’ expired
 --
---          1 OVERRIDE WRAPPER (§6.NEW7):
---          - record_interaction_signal_override — atomically INSERTs
+--          1 OVERRIDE WRAPPER (Â§6.NEW7):
+--          - record_interaction_signal_override â€” atomically INSERTs
 --            interaction_signal_override row + lifecycle transition
---            (override→active→overridden) under per-(tenant,signal) lock
+--            (overrideâ†’activeâ†’overridden) under per-(tenant,signal) lock
 --            matching PR 4 raw-writer R1 closure contract
 --
 --          Each wrapper:
 --          - SECURITY DEFINER + locked search_path = pg_catalog, public
 --          - OWNED BY interaction_signal_<reason>_wrapper_owner
 --          - REVOKE EXECUTE FROM PUBLIC + GRANT EXECUTE to ONE specific
---            app-role caller per spec §6 table
+--            app-role caller per spec Â§6 table
 --          - SI-010 tenant guard via current_actor_account_tenant_id()
 --          - Per-(tenant, signal) advisory lock (matches raw writer's lock
 --            domain in migration 049 R1 closure + migration 047 monotonic
@@ -35,24 +35,24 @@
 --
 --          PER RATIFIER OPTION 2 (carryforward from PR 1-4 + Crisis Response
 --          + Admin Backend):
---          - PROCEDURE → FUNCTION RETURNS VOID (code-repo precedent)
+--          - PROCEDURE â†’ FUNCTION RETURNS VOID (code-repo precedent)
 --          - SI-024.1 JWT-binding + verify_session_jwt_and_extract_claims +
 --            jwt_migration_entity_status + raw_guc_fallback_audit helpers
---            → SI-010 actor binding only (current_actor_account_id +
+--            â†’ SI-010 actor binding only (current_actor_account_id +
 --            current_actor_account_tenant_id). The spec's elaborate JWT-
 --            phase-B-fallback authorization logic is REPLACED by SI-010
 --            actor binding for the wrapper tenant guard; APP-LAYER
 --            role-membership check (LAYER B) is deferred to the Fastify
 --            route handler in PR 6+, mirroring the Admin Backend wrapper
 --            pattern from migration 043.
---          - tenant_id_t → TEXT; ulid_t → VARCHAR(26); custom DOMAIN enum
---            types → TEXT.
+--          - tenant_id_t â†’ TEXT; ulid_t â†’ VARCHAR(26); custom DOMAIN enum
+--            types â†’ TEXT.
 --          - p_id parameter (caller-supplied ULID) for all wrappers.
 --          - Dotted spec role names normalized to underscore form per
---            migration 046 §2 (medication_interaction.override_recorder
---            → medication_interaction_override_recorder, etc.).
+--            migration 046 Â§2 (medication_interaction.override_recorder
+--            â†’ medication_interaction_override_recorder, etc.).
 --          - Wrapper-owner role names: interaction_signal_<reason>_wrapper_owner
---            per migration 046 §2 cross-slice-collision-safety convention.
+--            per migration 046 Â§2 cross-slice-collision-safety convention.
 --          - Reason-specific evidence checks that reference entities NOT
 --            in code repo (engine_version config table, medication-
 --            discontinuation domain-event log, replacement-evaluation
@@ -64,9 +64,9 @@
 -- happens when the dependent entities/events land.
 --
 -- Spec:    - SI-019 Medication Interaction & Validation Engine Slice PRD
---            v2.0 §Sub-decision 8 (override wrapper STEP 0-8) + §Sub-
+--            v2.0 Â§Sub-decision 8 (override wrapper STEP 0-8) + Â§Sub-
 --            decision 8.5 (raw writer + per-reason wrapper architecture)
---          - CDM v1.6 → v1.7 Amendment §6.NEW2-NEW7 (RATIFIED 2026-05-21
+--          - CDM v1.6 â†’ v1.7 Amendment Â§6.NEW2-NEW7 (RATIFIED 2026-05-21
 --            P-034)
 --          - I-002 (interaction-before-commit; this slice's wrappers are
 --            the SOLE write path into the lifecycle state machine that
@@ -104,7 +104,7 @@
 --   3. Reason-specific evidence check (per-wrapper body below).
 --
 --   4. Call raw writer: PERFORM record_interaction_signal_lifecycle_transition(...).
---      (The raw writer re-acquires the same advisory lock — re-entrant
+--      (The raw writer re-acquires the same advisory lock â€” re-entrant
 --       within the same transaction per pg_advisory_xact_lock semantics.
 --       This is intentional belt-and-suspenders; the wrapper's lock guards
 --       the evidence check, the raw writer's lock guards the trigger's
@@ -112,9 +112,9 @@
 -- =============================================================================
 
 -- =============================================================================
--- §1 — record_signal_emission (CDM §6.NEW2)
+-- Â§1 â€” record_signal_emission (CDM Â§6.NEW2)
 --
--- Transition: none → emitted / emission
+-- Transition: none â†’ emitted / emission
 -- App-role caller: medication_interaction_engine_evaluator
 -- Reason-specific evidence (DEFERRED to app layer per Option 2):
 --   - Paired interaction_signal row exists (validated here: SELECT EXISTS)
@@ -172,15 +172,15 @@ END;
 $$;
 
 ALTER FUNCTION record_signal_emission(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB)
-    OWNER TO interaction_signal_emission_wrapper_owner;
+    OWNER TO emission_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION record_signal_emission(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION record_signal_emission(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB)
     TO medication_interaction_engine_evaluator;
 
 -- =============================================================================
--- §2 — record_signal_activation (CDM §6.NEW3)
+-- Â§2 â€” record_signal_activation (CDM Â§6.NEW3)
 --
--- Transition: emitted → active / activation
+-- Transition: emitted â†’ active / activation
 -- App-role caller: medication_interaction_engine_evaluator
 -- Reason-specific evidence:
 --   - Signal's current state is 'emitted' (validated here via latest-to_state query)
@@ -224,7 +224,7 @@ BEGIN
     END IF;
 
     -- Defense-in-depth: no override recorded (raw writer STEP 3.5 also checks).
-    -- Same advisory lock — override wrapper (§7) acquires same lock, so race is closed.
+    -- Same advisory lock â€” override wrapper (Â§7) acquires same lock, so race is closed.
     IF EXISTS (
         SELECT 1 FROM public.interaction_signal_override
          WHERE tenant_id = p_tenant_id AND signal_id = p_signal_id
@@ -243,19 +243,19 @@ END;
 $$;
 
 ALTER FUNCTION record_signal_activation(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB)
-    OWNER TO interaction_signal_activation_wrapper_owner;
+    OWNER TO activation_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION record_signal_activation(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION record_signal_activation(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB)
     TO medication_interaction_engine_evaluator;
 
 -- Wrapper-owner needs SELECT on lifecycle_transition (for latest-to_state read) + override (for evidence check).
-GRANT SELECT ON interaction_signal_lifecycle_transition TO interaction_signal_activation_wrapper_owner;
-GRANT SELECT ON interaction_signal_override             TO interaction_signal_activation_wrapper_owner;
+GRANT SELECT ON interaction_signal_lifecycle_transition TO activation_wrapper_owner;
+GRANT SELECT ON interaction_signal_override             TO activation_wrapper_owner;
 
 -- =============================================================================
--- §3 — record_signal_supersession (CDM §6.NEW4)
+-- Â§3 â€” record_signal_supersession (CDM Â§6.NEW4)
 --
--- Transition: active → superseded / superseded_by_evaluation
+-- Transition: active â†’ superseded / superseded_by_evaluation
 -- App-role caller: medication_interaction_engine_evaluator
 -- Reason-specific evidence (PARTIAL per Option 2):
 --   - Replacement evaluation_id exists in interaction_engine_evaluation
@@ -313,17 +313,17 @@ END;
 $$;
 
 ALTER FUNCTION record_signal_supersession(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), VARCHAR(26), JSONB)
-    OWNER TO interaction_signal_supersession_wrapper_owner;
+    OWNER TO superseded_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION record_signal_supersession(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), VARCHAR(26), JSONB) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION record_signal_supersession(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), VARCHAR(26), JSONB)
     TO medication_interaction_engine_evaluator;
 
-GRANT SELECT ON interaction_engine_evaluation TO interaction_signal_supersession_wrapper_owner;
+GRANT SELECT ON interaction_engine_evaluation TO superseded_wrapper_owner;
 
 -- =============================================================================
--- §4 — record_signal_resolution (CDM §6.NEW5)
+-- Â§4 â€” record_signal_resolution (CDM Â§6.NEW5)
 --
--- Transition: active → resolved / resolution_event
+-- Transition: active â†’ resolved / resolution_event
 -- App-role caller: medication_interaction_resolution_subscriber (Async Consult)
 -- Reason-specific evidence (DEFERRED per Option 2):
 --   - Discontinuation event exists in medication-discontinuation domain-event log
@@ -358,7 +358,7 @@ BEGIN
     PERFORM pg_advisory_xact_lock(v_lock_key);
 
     -- R1 HIGH-1 closure 2026-05-23 (Codex R1): FAIL-CLOSED. SI-019
-    -- §6.NEW5 normatively requires resolution-specific evidence:
+    -- Â§6.NEW5 normatively requires resolution-specific evidence:
     -- (a) discontinuation event exists in medication-discontinuation
     --     domain-event log,
     -- (b) affects one of medications_involved,
@@ -378,7 +378,7 @@ BEGIN
     -- 3-evidence-check predicate.
     RAISE EXCEPTION
         'evidence_check_unavailable_resolution: '
-        'SI-019 §6.NEW5 requires discontinuation_event existence + '
+        'SI-019 Â§6.NEW5 requires discontinuation_event existence + '
         'medication-affected + washout-elapsed evidence checks; '
         'medication-discontinuation domain-event log not yet available '
         'in code repo. Wrapper fail-closed per Codex R1 closure 2026-05-23 '
@@ -400,10 +400,10 @@ END;
 $$;
 
 -- NOTE: medication_interaction_resolution_subscriber role is "defined elsewhere"
--- per CDM §8 (Async Consult slice domain-event subscriber registry). Migration
--- 046 §0 carve-out preserved that it is NOT created here. Grant deferred.
+-- per CDM Â§8 (Async Consult slice domain-event subscriber registry). Migration
+-- 046 Â§0 carve-out preserved that it is NOT created here. Grant deferred.
 ALTER FUNCTION record_signal_resolution(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), VARCHAR(26), JSONB)
-    OWNER TO interaction_signal_resolution_wrapper_owner;
+    OWNER TO resolution_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION record_signal_resolution(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), VARCHAR(26), JSONB) FROM PUBLIC;
 -- GRANT EXECUTE TO medication_interaction_resolution_subscriber  -- DEFERRED:
 -- role exists only after Async Consult subscriber registry lands. Until then,
@@ -411,9 +411,9 @@ REVOKE EXECUTE ON FUNCTION record_signal_resolution(VARCHAR(26), TEXT, VARCHAR(2
 -- migration that creates the subscriber role will also grant EXECUTE here.
 
 -- =============================================================================
--- §5 — record_signal_expiry (CDM §6.NEW6)
+-- Â§5 â€” record_signal_expiry (CDM Â§6.NEW6)
 --
--- Transition: active → expired / time_expiry
+-- Transition: active â†’ expired / time_expiry
 -- App-role caller: medication_interaction_engine_evaluator (scheduler)
 -- Reason-specific evidence:
 --   - signal_payload.time_window_basis non-NULL
@@ -476,17 +476,17 @@ BEGIN
     END IF;
 
     -- R1 HIGH-1 closure 2026-05-23 (Codex R1): FAIL-CLOSED. SI-019
-    -- §6.NEW6 normatively requires `now() > emission_time + time_window`
+    -- Â§6.NEW6 normatively requires `now() > emission_time + time_window`
     -- where time_window is derived per-basis from signal_payload
     -- (per-basis duration formula: prescription_cycle, monitoring_interval,
     -- etc.). The per-basis formula table is not yet specified in code
     -- repo (would require a CCR-driven cadence config table). Without
-    -- the formula, the wrapper cannot prove the window has elapsed —
+    -- the formula, the wrapper cannot prove the window has elapsed â€”
     -- so it must fail-closed rather than allow premature expiry.
     --
     -- Premature expiry would let any caller with
     -- medication_interaction_engine_evaluator role mark an active signal
-    -- expired as soon as it has an emission row — a terminal-state
+    -- expired as soon as it has an emission row â€” a terminal-state
     -- corruption that downstream Pharmacy clinician-commit + Async
     -- Consult commit gates would read as "interaction no longer
     -- relevant" while the underlying clinical risk persists.
@@ -497,7 +497,7 @@ BEGIN
     -- replace the RAISE below with the actual elapsed-time predicate.
     RAISE EXCEPTION
         'evidence_check_unavailable_expiry: '
-        'SI-019 §6.NEW6 requires time_window_basis-driven elapsed-time '
+        'SI-019 Â§6.NEW6 requires time_window_basis-driven elapsed-time '
         'check (now() > emission_time + per_basis_duration); per-basis '
         'cadence config table not yet available in code repo. Wrapper '
         'fail-closed per Codex R1 closure 2026-05-23 to prevent premature '
@@ -517,41 +517,41 @@ END;
 $$;
 
 ALTER FUNCTION record_signal_expiry(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB)
-    OWNER TO interaction_signal_expiry_wrapper_owner;
+    OWNER TO expiry_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION record_signal_expiry(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION record_signal_expiry(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB)
     TO medication_interaction_engine_evaluator;
 
-GRANT SELECT ON interaction_signal                       TO interaction_signal_expiry_wrapper_owner;
-GRANT SELECT ON interaction_signal_lifecycle_transition  TO interaction_signal_expiry_wrapper_owner;
+GRANT SELECT ON interaction_signal                       TO expiry_wrapper_owner;
+GRANT SELECT ON interaction_signal_lifecycle_transition  TO expiry_wrapper_owner;
 
 -- =============================================================================
--- §6 — record_interaction_signal_override (CDM §6.NEW7)
+-- Â§6 â€” record_interaction_signal_override (CDM Â§6.NEW7)
 --
 -- Atomic INSERT-override-FIRST then lifecycle-transition pattern (per
 -- SI-019 Sub-decision 8 R4 HIGH-1 closure inverted order: override
 -- row written FIRST so a lifecycle-write failure cannot leave a terminal
 -- transition without evidence).
 --
--- Transition: active → overridden / override
+-- Transition: active â†’ overridden / override
 -- App-role caller: medication_interaction_override_recorder (clinician)
 --
--- Steps (adapted from spec §6.NEW7 8-step pattern):
---   STEP 0 — SI-010 tenant guard
---   STEP 1 — auth via EXECUTE grant (LAYER A; LAYER B role-membership
+-- Steps (adapted from spec Â§6.NEW7 8-step pattern):
+--   STEP 0 â€” SI-010 tenant guard
+--   STEP 1 â€” auth via EXECUTE grant (LAYER A; LAYER B role-membership
 --            check deferred to Fastify route handler in PR 6+)
---   STEP 2 — idempotency: caller-supplied idempotency key handled at
+--   STEP 2 â€” idempotency: caller-supplied idempotency key handled at
 --            HTTP layer in PR 6+ (no separate idempotency_key table in
 --            this slice; consistent with Crisis Response pattern)
---   STEP 3 — medication-still-on-active-list check DEFERRED per Option 2
+--   STEP 3 â€” medication-still-on-active-list check DEFERRED per Option 2
 --            (active-medication-list view not in code repo)
---   STEP 4 — clinician role check DEFERRED to Fastify route LAYER B
---   STEP 4.5 — per-(tenant, signal) advisory lock (acquired right after
+--   STEP 4 â€” clinician role check DEFERRED to Fastify route LAYER B
+--   STEP 4.5 â€” per-(tenant, signal) advisory lock (acquired right after
 --              tenant guard; spec STEP 4.5 just before INSERT here too)
---   STEP 5 — INSERT interaction_signal_override row
---   STEP 6 — call raw writer for 'override' transition
---   STEP 7 — unique_violation safety net (composite UNIQUE on (tenant_id, id))
---   STEP 8 — caller-managed COMMIT
+--   STEP 5 â€” INSERT interaction_signal_override row
+--   STEP 6 â€” call raw writer for 'override' transition
+--   STEP 7 â€” unique_violation safety net (composite UNIQUE on (tenant_id, id))
+--   STEP 8 â€” caller-managed COMMIT
 -- =============================================================================
 
 CREATE OR REPLACE FUNCTION record_interaction_signal_override(
@@ -587,7 +587,7 @@ BEGIN
     END IF;
 
     -- STEP 4.5: per-(tenant, signal) advisory lock (MUST match raw writer's
-    -- lock key per PR 4 R1 closure contract — serializes override creation
+    -- lock key per PR 4 R1 closure contract â€” serializes override creation
     -- with activation decisions).
     v_lock_key := ('x' || substr(md5(p_tenant_id::text || ':' || p_signal_id::text), 1, 16))::bit(64)::bigint;
     PERFORM pg_advisory_xact_lock(v_lock_key);
@@ -604,7 +604,7 @@ BEGIN
     END IF;
 
     -- R1 HIGH-1 closure 2026-05-23 (Codex R1): FAIL-CLOSED. SI-019
-    -- §6.NEW7 normatively requires evidence that:
+    -- Â§6.NEW7 normatively requires evidence that:
     -- (a) the medication being overridden is STILL on the patient's
     --     active-medication list (Step 3 of spec 8-step procedure), and
     -- (b) the calling clinician is RBAC-authorized for the override
@@ -613,7 +613,7 @@ BEGIN
     -- checkpoint: (a) active-medication-list view depends on Pharmacy
     -- slice's medication_request_state derivation not yet implemented,
     -- and (b) LAYER B role-membership check requires the SI-024.1
-    -- JWT-binding model that is deferred (Option 2 carryforward —
+    -- JWT-binding model that is deferred (Option 2 carryforward â€”
     -- LAYER B lands at Fastify route handler in PR 6+).
     --
     -- Override is a TERMINAL lifecycle state. Without the evidence
@@ -631,7 +631,7 @@ BEGIN
     -- RAISE below + adds the evidence checks.
     RAISE EXCEPTION
         'evidence_check_unavailable_override: '
-        'SI-019 §6.NEW7 requires (a) medication-still-on-active-list '
+        'SI-019 Â§6.NEW7 requires (a) medication-still-on-active-list '
         'check (Pharmacy active-medication-list view not yet in code '
         'repo) AND (b) LAYER B clinician role-membership check '
         '(SI-024.1 JWT-binding deferred). Wrapper fail-closed per Codex '
@@ -709,7 +709,7 @@ ALTER FUNCTION record_interaction_signal_override(
     VARCHAR(26), VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26),
     BYTEA, VARCHAR(26), BYTEA, BYTEA, TEXT, TEXT, BYTEA, TIMESTAMPTZ,
     JSONB
-) OWNER TO interaction_signal_override_wrapper_owner;
+) OWNER TO override_wrapper_owner;
 REVOKE EXECUTE ON FUNCTION record_interaction_signal_override(
     VARCHAR(26), VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26),
     BYTEA, VARCHAR(26), BYTEA, BYTEA, TEXT, TEXT, BYTEA, TIMESTAMPTZ,
@@ -721,12 +721,12 @@ GRANT EXECUTE ON FUNCTION record_interaction_signal_override(
     JSONB
 ) TO medication_interaction_override_recorder;
 
--- Override wrapper-owner needs INSERT on override table (migration 047 §3
+-- Override wrapper-owner needs INSERT on override table (migration 047 Â§3
 -- already granted this) + SELECT on lifecycle_transition (for current-state check).
-GRANT SELECT ON interaction_signal_lifecycle_transition TO interaction_signal_override_wrapper_owner;
+GRANT SELECT ON interaction_signal_lifecycle_transition TO override_wrapper_owner;
 
 -- =============================================================================
--- §7 — Verification: 6 wrappers exist with correct ownership + SECDEF + grants
+-- Â§7 â€” Verification: 6 wrappers exist with correct ownership + SECDEF + grants
 -- =============================================================================
 
 DO $$
@@ -740,17 +740,17 @@ BEGIN
     FOR v_wrapper IN
         SELECT * FROM (VALUES
             ('record_signal_emission(character varying, text, character varying, character varying, jsonb)',
-             'interaction_signal_emission_wrapper_owner'),
+             'emission_wrapper_owner'),
             ('record_signal_activation(character varying, text, character varying, character varying, jsonb)',
-             'interaction_signal_activation_wrapper_owner'),
+             'activation_wrapper_owner'),
             ('record_signal_supersession(character varying, text, character varying, character varying, character varying, jsonb)',
-             'interaction_signal_supersession_wrapper_owner'),
+             'superseded_wrapper_owner'),
             ('record_signal_resolution(character varying, text, character varying, character varying, character varying, jsonb)',
-             'interaction_signal_resolution_wrapper_owner'),
+             'resolution_wrapper_owner'),
             ('record_signal_expiry(character varying, text, character varying, character varying, jsonb)',
-             'interaction_signal_expiry_wrapper_owner'),
+             'expiry_wrapper_owner'),
             ('record_interaction_signal_override(character varying, character varying, text, character varying, character varying, bytea, character varying, bytea, bytea, text, text, bytea, timestamp with time zone, jsonb)',
-             'interaction_signal_override_wrapper_owner')
+             'override_wrapper_owner')
         ) AS t(sig, expected_owner)
     LOOP
         v_oid := to_regprocedure('public.' || v_wrapper.sig);

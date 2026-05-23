@@ -1,16 +1,16 @@
--- =============================================================================
+﻿-- =============================================================================
 -- File:    migrations/048_med_interaction_view_mv_access_function.sql
 -- Purpose: Create the optional materialized view + SECURITY BARRIER view +
 --          SECURITY DEFINER access function for the interaction signal
---          current-state hot-path display per CDM v1.6 → v1.7 Amendment
---          §4.NEW5 (RATIFIED 2026-05-21 P-034; SI-019 Sub-decision 9).
+--          current-state hot-path display per CDM v1.6 â†’ v1.7 Amendment
+--          Â§4.NEW5 (RATIFIED 2026-05-21 P-034; SI-019 Sub-decision 9).
 --
 --          PR 3 of the Med-Interaction Engine implementation series
 --          (continued from migration 047 which created the 4 entities +
 --          RLS + per-table append-only triggers + monotonic-ordering
 --          trigger). Subsequent migrations: raw lifecycle writer SECDEF +
---          anti-bypass grants (PR 4) → 6 reason-specific wrappers (PR 5)
---          → Fastify handler implementation (PR 6+).
+--          anti-bypass grants (PR 4) â†’ 6 reason-specific wrappers (PR 5)
+--          â†’ Fastify handler implementation (PR 6+).
 --
 --          PER SI-019 SUB-DECISION 9 READ-PATH CLASSIFICATION:
 --          - STRICT-FRESHNESS consumers (override procedure STEP 4,
@@ -27,11 +27,11 @@
 --            (lands when the wrapper layer emits domain events; PR 5+).
 --
 --          PER RATIFIER OPTION 2 (carryforward from PR 1-2):
---          - current_tenant_id_strict('entity_name') →
+--          - current_tenant_id_strict('entity_name') â†’
 --            current_tenant_id() (code-repo pattern from migration 003)
 --          - cdm_owner / mv_refresh_owner naming: mv_refresh_owner spec
---            name realized as interaction_signal_mv_refresh_owner per
---            migration 046 §2 cross-slice-collision-safety convention
+--            name realized as mv_refresh_owner per
+--            migration 046 Â§2 cross-slice-collision-safety convention
 --          - Custom DOMAIN types (ulid_t, interaction_signal_state_t,
 --            interaction_signal_transition_reason_t) are NOT defined in
 --            code repo at this checkpoint; access function uses VARCHAR(26)
@@ -45,13 +45,13 @@
 --            + GRANT SELECT only to mv_refresh_owner (RLS bypass via
 --            non-natively-enforced MV; app roles read via SECURITY BARRIER
 --            view OR SECDEF access function).
---          - SECDEF access function OWNED BY interaction_signal_mv_refresh_owner
---            (mirrors spec) — the role with SELECT on the MV.
+--          - SECDEF access function OWNED BY mv_refresh_owner
+--            (mirrors spec) â€” the role with SELECT on the MV.
 --
 -- Spec:    - SI-019 Medication Interaction & Validation Engine Slice PRD
---            v2.0 (RATIFIED 2026-05-21 P-033) §Sub-decision 9 (read-path
+--            v2.0 (RATIFIED 2026-05-21 P-033) Â§Sub-decision 9 (read-path
 --            consumer classification)
---          - CDM v1.6 → v1.7 Amendment §4.NEW5 (canonical executable DDL
+--          - CDM v1.6 â†’ v1.7 Amendment Â§4.NEW5 (canonical executable DDL
 --            source; RATIFIED 2026-05-21 P-034)
 --          - I-023 (three-layer tenant isolation; SECURITY BARRIER view
 --            + WHERE tenant_id predicate at view body)
@@ -63,7 +63,7 @@
 -- PRECONDITIONS:
 --   003_rls_helpers.sql                              applied (current_tenant_id())
 --   046_med_interaction_rbac_roles.sql               applied (12 roles incl
---                                                      interaction_signal_mv_refresh_owner +
+--                                                      mv_refresh_owner +
 --                                                      medication_interaction_signal_viewer)
 --   047_med_interaction_entities.sql                 applied
 --                                                    (interaction_signal_lifecycle_transition table)
@@ -71,7 +71,7 @@
 
 -- =============================================================================
 -- R4 HIGH-1 closure 2026-05-23 (Codex R4): explicit BEGIN/COMMIT REMOVED.
--- The R3 wrap was unsafe — PostgreSQL does not support nested top-level
+-- The R3 wrap was unsafe â€” PostgreSQL does not support nested top-level
 -- BEGIN/COMMIT; if a migration runner wraps the file in its own transaction
 -- (e.g., Flyway default, Liquibase default, sqitch), the embedded BEGIN
 -- only warns + the embedded COMMIT commits the RUNNER'S outer transaction,
@@ -87,15 +87,15 @@
 --
 -- Defense-in-depth REMAINS in place even without explicit transaction
 -- wrapping:
---   - §0 preflight FAILS migration BEFORE CREATE MV if dangerous default
+--   - Â§0 preflight FAILS migration BEFORE CREATE MV if dangerous default
 --     ACLs exist (filtered to current_user + public schema per R4 MED-1)
 --   - Post-CREATE: immediate REVOKE PUBLIC + aclexplode loop +
 --     canonical GRANT (R1 + R2)
---   - §5 final verifier asserts canonical end state
+--   - Â§5 final verifier asserts canonical end state
 -- =============================================================================
 
 -- =============================================================================
--- §0 — Pre-CREATE preflight (R3 HIGH-1 closure 2026-05-23; R4 MED-1 scope
+-- Â§0 â€” Pre-CREATE preflight (R3 HIGH-1 closure 2026-05-23; R4 MED-1 scope
 -- tightening 2026-05-23):
 -- FAILS the migration BEFORE CREATE MATERIALIZED VIEW runs if the database
 -- has ALTER DEFAULT PRIVILEGES granting SELECT on relations to non-canonical
@@ -146,7 +146,7 @@ BEGIN
            OR (r.rolname IS NOT NULL
                AND r.rolname NOT IN (
                    'postgres',
-                   'interaction_signal_mv_refresh_owner'
+                   'mv_refresh_owner'
                ))
           )
      LIMIT 1;
@@ -168,12 +168,12 @@ BEGIN
 END $$;
 
 -- =============================================================================
--- §1 — interaction_signal_current_state_mv (CDM §4.NEW5; OPTIONAL MV)
+-- Â§1 â€” interaction_signal_current_state_mv (CDM Â§4.NEW5; OPTIONAL MV)
 --
 -- DISTINCT ON projection of the latest transition row per (tenant_id,
 -- signal_id). The ORDER BY tenant_id, signal_id, transition_at DESC, id
 -- DESC mirrors the canonical current-state derivation predicate. Materialized
--- views in PostgreSQL do NOT natively enforce RLS — direct GRANT SELECT on
+-- views in PostgreSQL do NOT natively enforce RLS â€” direct GRANT SELECT on
 -- the MV is a tenant-isolation bypass. So the MV is REVOKEd from PUBLIC and
 -- GRANTed only to mv_refresh_owner (which OWNS the SECURITY BARRIER view
 -- and the SECDEF access function that app roles use to read it).
@@ -201,13 +201,13 @@ ORDER BY tenant_id, signal_id, transition_at DESC, id DESC;
 -- to broad NON-PUBLIC roles (e.g., `app_readonly`, deployment-tooling role,
 -- etc.). A simple `REVOKE FROM PUBLIC` does NOT cover those grants. Without
 -- this cleanup, in environments where the migration-applier inherits default-
--- privilege grants, the MV would retain SELECT for those broad roles —
+-- privilege grants, the MV would retain SELECT for those broad roles â€”
 -- bypassing tenant isolation since PG MVs don't enforce source-table RLS.
 --
 -- Closure: REVOKE FROM PUBLIC, THEN scan aclexplode(relacl) for any
 -- post-creation grantee that is NOT (a) the MV owner, (b) the intended
 -- mv_refresh_owner, or (c) PUBLIC (already handled), and REVOKE SELECT
--- from each. THEN add the canonical GRANT. The §5 final verification block
+-- from each. THEN add the canonical GRANT. The Â§5 final verification block
 -- is preserved as a defense-in-depth assertion that the end state matches
 -- the canonical {owner + mv_refresh_owner} grant set.
 REVOKE ALL ON interaction_signal_current_state_mv FROM PUBLIC;
@@ -225,7 +225,7 @@ BEGIN
            AND acl.privilege_type = 'SELECT'
            AND acl.grantee <> c.relowner
            AND acl.grantee <> 0    -- PUBLIC (already revoked above)
-           AND r.rolname <> 'interaction_signal_mv_refresh_owner'
+           AND r.rolname <> 'mv_refresh_owner'
     LOOP
         EXECUTE format(
             'REVOKE SELECT ON interaction_signal_current_state_mv FROM %I',
@@ -235,13 +235,13 @@ BEGIN
 END $$;
 
 GRANT SELECT ON interaction_signal_current_state_mv
-    TO interaction_signal_mv_refresh_owner;
+    TO mv_refresh_owner;
 
 CREATE UNIQUE INDEX interaction_signal_current_state_mv_pk
     ON interaction_signal_current_state_mv (tenant_id, signal_id);
 
 COMMENT ON MATERIALIZED VIEW interaction_signal_current_state_mv IS
-    'CDM v1.7 §4.NEW5 optional MV for read-path optimization. Non-authoritative; '
+    'CDM v1.7 Â§4.NEW5 optional MV for read-path optimization. Non-authoritative; '
     'the transition table is the source of truth per I-035. STRICT-FRESHNESS '
     'consumers (override / prescribing-gate / refill-release / protocol-gate / '
     'pharmacy-enforcement) MUST query interaction_signal_lifecycle_transition '
@@ -251,7 +251,7 @@ COMMENT ON MATERIALIZED VIEW interaction_signal_current_state_mv IS
     'access function.';
 
 -- =============================================================================
--- §2 — interaction_signal_current_state_v (CDM §4.NEW5; SECURITY BARRIER view)
+-- Â§2 â€” interaction_signal_current_state_v (CDM Â§4.NEW5; SECURITY BARRIER view)
 --
 -- App roles (medication_interaction_signal_viewer) read this view; the WHERE
 -- tenant_id = current_tenant_id() predicate at the view body filters to the
@@ -259,7 +259,7 @@ COMMENT ON MATERIALIZED VIEW interaction_signal_current_state_mv IS
 -- attacks (functions in user-supplied WHERE clauses cannot evaluate against
 -- rows from other tenants before the view's tenant predicate filters them).
 --
--- Option 2 adaptation: current_tenant_id_strict('entity_name') →
+-- Option 2 adaptation: current_tenant_id_strict('entity_name') â†’
 -- current_tenant_id() per the code-repo Option 2 carryforward.
 -- =============================================================================
 
@@ -276,14 +276,14 @@ FROM interaction_signal_current_state_mv
 WHERE tenant_id = current_tenant_id();
 
 ALTER VIEW interaction_signal_current_state_v
-    OWNER TO interaction_signal_mv_refresh_owner;
+    OWNER TO mv_refresh_owner;
 
 REVOKE ALL ON interaction_signal_current_state_v FROM PUBLIC;
 GRANT SELECT ON interaction_signal_current_state_v
     TO medication_interaction_signal_viewer;
 
 COMMENT ON VIEW interaction_signal_current_state_v IS
-    'CDM v1.7 §4.NEW5 SECURITY BARRIER view over interaction_signal_current_state_mv. '
+    'CDM v1.7 Â§4.NEW5 SECURITY BARRIER view over interaction_signal_current_state_mv. '
     'Tenant predicate enforced at view body via current_tenant_id() (Option 2 '
     'carryforward from current_tenant_id_strict). Granted SELECT to '
     'medication_interaction_signal_viewer; SOLE app-role read path for HOT-PATH '
@@ -291,7 +291,7 @@ COMMENT ON VIEW interaction_signal_current_state_v IS
     'app summary, admin reporting) per SI-019 Sub-decision 9.';
 
 -- =============================================================================
--- §3 — get_interaction_signal_current_state (CDM §4.NEW5; SECDEF access function)
+-- Â§3 â€” get_interaction_signal_current_state (CDM Â§4.NEW5; SECDEF access function)
 --
 -- Alternate read path for singleton lookups (e.g., cross-reference from an
 -- audit row's signal_id). SECURITY DEFINER + locked search_path + tenant
@@ -299,12 +299,12 @@ COMMENT ON VIEW interaction_signal_current_state_v IS
 -- declaration permits use in WHERE clauses with query-plan caching.
 --
 -- Option 2 adaptations:
--- - p_signal_id type: spec ulid_t → VARCHAR(26) (matches column type)
+-- - p_signal_id type: spec ulid_t â†’ VARCHAR(26) (matches column type)
 -- - return TABLE column types: spec uses custom DOMAIN types
 --   (interaction_signal_state_t, interaction_signal_transition_reason_t)
 --   not defined in code repo; use TEXT (matches table column types directly).
 --   A future TYPES amendment cycle should formalize as DOMAIN types.
--- - Owner: interaction_signal_mv_refresh_owner (Option 2 prefix per
+-- - Owner: mv_refresh_owner (Option 2 prefix per
 --   migration 046 cross-slice-collision-safety).
 -- =============================================================================
 
@@ -333,7 +333,7 @@ AS $$
 $$;
 
 ALTER FUNCTION get_interaction_signal_current_state(VARCHAR(26))
-    OWNER TO interaction_signal_mv_refresh_owner;
+    OWNER TO mv_refresh_owner;
 
 REVOKE EXECUTE ON FUNCTION get_interaction_signal_current_state(VARCHAR(26))
     FROM PUBLIC;
@@ -341,7 +341,7 @@ GRANT EXECUTE ON FUNCTION get_interaction_signal_current_state(VARCHAR(26))
     TO medication_interaction_signal_viewer;
 
 COMMENT ON FUNCTION get_interaction_signal_current_state(VARCHAR(26)) IS
-    'CDM v1.7 §4.NEW5 SECDEF access function for singleton current-state '
+    'CDM v1.7 Â§4.NEW5 SECDEF access function for singleton current-state '
     'lookups (cross-reference from audit row signal_id). Tenant scope enforced '
     'via current_tenant_id() at function body (Option 2 carryforward). STABLE '
     'permits WHERE-clause use with query-plan caching. Granted EXECUTE to '
@@ -350,7 +350,7 @@ COMMENT ON FUNCTION get_interaction_signal_current_state(VARCHAR(26)) IS
     'consumer classification.';
 
 -- =============================================================================
--- §4 — Verification
+-- Â§4 â€” Verification
 -- =============================================================================
 
 DO $$
@@ -409,10 +409,10 @@ BEGIN
       JOIN pg_roles r ON r.oid = p.proowner
      WHERE p.oid = v_function_oid;
 
-    IF v_function_owner_name <> 'interaction_signal_mv_refresh_owner' THEN
+    IF v_function_owner_name <> 'mv_refresh_owner' THEN
         RAISE EXCEPTION
             'migration-048-access-function-owner-mismatch: '
-            'owner is % but MUST be interaction_signal_mv_refresh_owner',
+            'owner is % but MUST be mv_refresh_owner',
             v_function_owner_name;
     END IF;
 
@@ -432,7 +432,7 @@ BEGIN
 END $$;
 
 -- =============================================================================
--- §5 — MV access-discipline verification (R1 HIGH-1 closure 2026-05-23)
+-- Â§5 â€” MV access-discipline verification (R1 HIGH-1 closure 2026-05-23)
 --
 -- Codex R1 flagged that the MV creation has a potential window under
 -- autocommit migration-runner mode where default ALTER DEFAULT PRIVILEGES
@@ -440,9 +440,9 @@ END $$;
 -- moved the REVOKE FROM PUBLIC to fire immediately after CREATE
 -- MATERIALIZED VIEW (before CREATE UNIQUE INDEX); this block additionally
 -- asserts the post-migration end state: the MV must have NO PUBLIC
--- grants AND exactly ONE non-self grantee (interaction_signal_mv_refresh_owner).
+-- grants AND exactly ONE non-self grantee (mv_refresh_owner).
 -- The verification fails the migration if a permissive default-ACL
--- environment leaked a grant through to the final state — catching the
+-- environment leaked a grant through to the final state â€” catching the
 -- worst-case scenario even when the migration-runner ordering doesn't
 -- prevent the transient window.
 -- =============================================================================
@@ -481,11 +481,11 @@ BEGIN
             'migration-048-mv-public-grant-violation: '
             'interaction_signal_current_state_mv has SELECT granted to PUBLIC '
             '(via ALTER DEFAULT PRIVILEGES or otherwise). MV must be REVOKEd '
-            'from PUBLIC per R1 HIGH-1 closure — direct PUBLIC access bypasses '
+            'from PUBLIC per R1 HIGH-1 closure â€” direct PUBLIC access bypasses '
             'tenant isolation since MVs do not enforce source-table RLS.';
     END IF;
 
-    -- Assert exactly ONE non-owner grantee (interaction_signal_mv_refresh_owner).
+    -- Assert exactly ONE non-owner grantee (mv_refresh_owner).
     -- Owner-self grant is implicit + does not appear in relacl explicitly when
     -- the role hasn't been GRANT-modified; we filter to exclude both the owner
     -- and the PUBLIC pseudo-role.
@@ -498,14 +498,14 @@ BEGIN
        AND acl.privilege_type = 'SELECT'
        AND acl.grantee <> c.relowner
        AND acl.grantee <> 0  -- PUBLIC
-       AND r.rolname <> 'interaction_signal_mv_refresh_owner';
+       AND r.rolname <> 'mv_refresh_owner';
 
     IF v_unexpected_grantee_count > 0 THEN
         RAISE EXCEPTION
             'migration-048-mv-unexpected-grantee: '
             'interaction_signal_current_state_mv has SELECT granted to '
             'unexpected role(s); first found: %; canonical grantees are '
-            'OWNER (interaction_signal_mv_refresh_owner) + self only. '
+            'OWNER (mv_refresh_owner) + self only. '
             'App roles must read via interaction_signal_current_state_v '
             '(SECURITY BARRIER view) or get_interaction_signal_current_state() '
             '(SECDEF access function), never directly.',
@@ -518,4 +518,4 @@ END $$;
 -- for transactional migration runners. Atomicity now contracted via runner
 -- configuration (documented in docs/med-interaction-implementation-plan.md);
 -- defense-in-depth via pre-CREATE preflight + immediate REVOKE + aclexplode
--- loop + §5 final verifier remains in place.
+-- loop + Â§5 final verifier remains in place.

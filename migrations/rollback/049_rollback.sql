@@ -1,11 +1,11 @@
--- =============================================================================
+﻿-- =============================================================================
 -- File:    migrations/rollback/049_rollback.sql
 -- Purpose: Rollback migration 049_med_interaction_raw_lifecycle_writer.sql.
 --
 --          Drops record_interaction_signal_lifecycle_transition() SECDEF
 --          function. Owner-role grants on the lifecycle_transition TABLE
 --          (INSERT + SELECT) belong to migration 047's rollback, not this
---          one — we don't touch them here.
+--          one â€” we don't touch them here.
 --
 --          Same DO-block-guarded discipline as PR 3 + PR 4 rollbacks in
 --          Crisis Response + Admin Backend:
@@ -40,22 +40,22 @@ BEGIN
         -- REVOKE EXECUTE grants from each of the 6 wrapper-owner roles.
         REVOKE EXECUTE ON FUNCTION record_interaction_signal_lifecycle_transition(
             VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
-        ) FROM interaction_signal_expiry_wrapper_owner;
+        ) FROM expiry_wrapper_owner;
         REVOKE EXECUTE ON FUNCTION record_interaction_signal_lifecycle_transition(
             VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
-        ) FROM interaction_signal_resolution_wrapper_owner;
+        ) FROM resolution_wrapper_owner;
         REVOKE EXECUTE ON FUNCTION record_interaction_signal_lifecycle_transition(
             VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
-        ) FROM interaction_signal_supersession_wrapper_owner;
+        ) FROM superseded_wrapper_owner;
         REVOKE EXECUTE ON FUNCTION record_interaction_signal_lifecycle_transition(
             VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
-        ) FROM interaction_signal_override_wrapper_owner;
+        ) FROM override_wrapper_owner;
         REVOKE EXECUTE ON FUNCTION record_interaction_signal_lifecycle_transition(
             VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
-        ) FROM interaction_signal_activation_wrapper_owner;
+        ) FROM activation_wrapper_owner;
         REVOKE EXECUTE ON FUNCTION record_interaction_signal_lifecycle_transition(
             VARCHAR(26), TEXT, VARCHAR(26), TEXT, TEXT, VARCHAR(26), TEXT, JSONB
-        ) FROM interaction_signal_emission_wrapper_owner;
+        ) FROM emission_wrapper_owner;
 
         -- DROP the function. If dependent wrappers from PR 5 still reference
         -- it, this DROP fails (CASCADE intentionally not used).
@@ -83,9 +83,9 @@ BEGIN
     -- reach here when function is gone) + (b) target table + role both
     -- exist (defense against partial-rollback states).
     IF to_regclass('public.interaction_signal_override') IS NOT NULL
-       AND to_regrole('interaction_signal_lifecycle_transition_writer_owner') IS NOT NULL THEN
+       AND to_regrole('lifecycle_transition_writer_owner') IS NOT NULL THEN
         REVOKE SELECT ON interaction_signal_override
-            FROM interaction_signal_lifecycle_transition_writer_owner;
+            FROM lifecycle_transition_writer_owner;
     END IF;
 END $$;
 
@@ -105,6 +105,6 @@ BEGIN
             'migration-049-rollback-incomplete: '
             'record_interaction_signal_lifecycle_transition() unexpectedly '
             'remains. The DO-block guard above should have aborted before '
-            'reaching this verification — investigate.';
+            'reaching this verification â€” investigate.';
     END IF;
 END $$;

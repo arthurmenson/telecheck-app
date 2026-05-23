@@ -1,10 +1,10 @@
--- =============================================================================
+﻿-- =============================================================================
 -- File:    migrations/rollback/050_rollback.sql
 -- Purpose: Rollback migration 050_med_interaction_wrappers.sql.
 --
 --          Drops the 6 SECDEF wrapper functions in reverse-dependency order
 --          (none of them depend on each other, but consistent with the
---          §1-§6 order from forward migration). Per the PR 3-4 rollback
+--          Â§1-Â§6 order from forward migration). Per the PR 3-4 rollback
 --          discipline, uses to_regprocedure-gated DROP with absent-state
 --          safety. After dropping all 6 wrappers, revokes the supplemental
 --          grants added to the wrapper-owners (SELECT on lifecycle_transition
@@ -26,8 +26,8 @@ DROP FUNCTION IF EXISTS record_interaction_signal_override(
 );
 
 -- -----------------------------------------------------------------------------
--- 2. 5 reason-specific lifecycle wrappers (expiry → resolution → supersession
---    → activation → emission; reverse of §1-§5 order in forward migration).
+-- 2. 5 reason-specific lifecycle wrappers (expiry â†’ resolution â†’ supersession
+--    â†’ activation â†’ emission; reverse of Â§1-Â§5 order in forward migration).
 -- -----------------------------------------------------------------------------
 DROP FUNCTION IF EXISTS record_signal_expiry(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), JSONB);
 DROP FUNCTION IF EXISTS record_signal_resolution(VARCHAR(26), TEXT, VARCHAR(26), VARCHAR(26), VARCHAR(26), JSONB);
@@ -42,36 +42,36 @@ DROP FUNCTION IF EXISTS record_signal_emission(VARCHAR(26), TEXT, VARCHAR(26), V
 DO $$
 BEGIN
     IF to_regclass('public.interaction_signal_lifecycle_transition') IS NOT NULL THEN
-        IF to_regrole('interaction_signal_activation_wrapper_owner') IS NOT NULL THEN
+        IF to_regrole('activation_wrapper_owner') IS NOT NULL THEN
             REVOKE SELECT ON interaction_signal_lifecycle_transition
-                FROM interaction_signal_activation_wrapper_owner;
+                FROM activation_wrapper_owner;
         END IF;
-        IF to_regrole('interaction_signal_expiry_wrapper_owner') IS NOT NULL THEN
+        IF to_regrole('expiry_wrapper_owner') IS NOT NULL THEN
             REVOKE SELECT ON interaction_signal_lifecycle_transition
-                FROM interaction_signal_expiry_wrapper_owner;
+                FROM expiry_wrapper_owner;
         END IF;
-        IF to_regrole('interaction_signal_override_wrapper_owner') IS NOT NULL THEN
+        IF to_regrole('override_wrapper_owner') IS NOT NULL THEN
             REVOKE SELECT ON interaction_signal_lifecycle_transition
-                FROM interaction_signal_override_wrapper_owner;
+                FROM override_wrapper_owner;
         END IF;
     END IF;
 
     IF to_regclass('public.interaction_signal') IS NOT NULL
-       AND to_regrole('interaction_signal_expiry_wrapper_owner') IS NOT NULL THEN
+       AND to_regrole('expiry_wrapper_owner') IS NOT NULL THEN
         REVOKE SELECT ON interaction_signal
-            FROM interaction_signal_expiry_wrapper_owner;
+            FROM expiry_wrapper_owner;
     END IF;
 
     IF to_regclass('public.interaction_signal_override') IS NOT NULL
-       AND to_regrole('interaction_signal_activation_wrapper_owner') IS NOT NULL THEN
+       AND to_regrole('activation_wrapper_owner') IS NOT NULL THEN
         REVOKE SELECT ON interaction_signal_override
-            FROM interaction_signal_activation_wrapper_owner;
+            FROM activation_wrapper_owner;
     END IF;
 
     IF to_regclass('public.interaction_engine_evaluation') IS NOT NULL
-       AND to_regrole('interaction_signal_supersession_wrapper_owner') IS NOT NULL THEN
+       AND to_regrole('superseded_wrapper_owner') IS NOT NULL THEN
         REVOKE SELECT ON interaction_engine_evaluation
-            FROM interaction_signal_supersession_wrapper_owner;
+            FROM superseded_wrapper_owner;
     END IF;
 END $$;
 
