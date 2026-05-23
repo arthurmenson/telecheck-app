@@ -1,7 +1,15 @@
 /**
  * crisis-response slice — plugin wiring smoke test.
  *
- * Sprint 1 of 4 for this slice (PR 7 — Fastify module scaffold).
+ * Sprint 2 of 4 for this slice — first real handler merged (Sprint 2 PR 1:
+ * GET /v0/crisis-events/:id staff-scoped read, commit e4cb312). The skeleton
+ * /health + /ready introspection text advanced when that handler landed, so
+ * the §1a/§1b assertions below track the v0.2 wording, and §1c now asserts the
+ * global idempotency guard's 400 (it precedes routing) rather than the v0.1
+ * route-not-mounted 404. Standalone stale-assertion reconciliation in the
+ * spirit of PR #193 (ai-service /health + /ready introspection accuracy);
+ * remaining write-path handlers (acknowledge/respond/resolve/sweep) ride the
+ * May-26 cascade and will advance this introspection again.
  *
  * The DB layer is COMPLETE through migration 038 (PRs 1-6 on `main`; 18
  * rounds of Codex APPROVE; 6 tables + 2 views + 6 SECDEF procedures +
@@ -53,7 +61,7 @@ afterAll(async () => {
 });
 
 describe('crisis-response slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/crisis-events/health returns 200 (liveness — module alive) with Sprint 1 skeleton metadata', async () => {
+  it('§1a GET /v0/crisis-events/health returns 200 (liveness — module alive) with Sprint 2 v0.2 metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/crisis-events/health',
@@ -68,11 +76,11 @@ describe('crisis-response slice — §1 plugin wiring', () => {
     };
     expect(body.status).toBe('ok');
     expect(body.module).toBe('crisis-response');
-    expect(body.blocked).toContain('Sprint 1 of 4');
+    expect(body.blocked).toContain('Sprint 2 of 4 at v0.2');
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 038');
   });
 
-  it('§1b GET /v0/crisis-events/ready returns 503 (readiness — handlers not yet mounted) with BLOCKED reason', async () => {
+  it('§1b GET /v0/crisis-events/ready returns 503 (readiness — write-path handlers not yet mounted) with BLOCKED reason', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/crisis-events/ready',
@@ -87,18 +95,28 @@ describe('crisis-response slice — §1 plugin wiring', () => {
     };
     expect(body.status).toBe('unavailable');
     expect(body.module).toBe('crisis-response');
-    expect(body.reason).toBe('handlers_not_yet_implemented');
+    expect(body.reason).toBe('write_path_handlers_not_yet_implemented');
     expect(body.reason_message).toContain('Sprint 4');
   });
 
-  it('§1c POST /v0/crisis-events returns 404 (route NOT mounted at v0.1; lands in Sprint 2)', async () => {
+  // §1c — the write collection-root POST is still NOT mounted (initiate lands
+  // in the Sprint 2 cascade). At v0.1 this surfaced as a 404 from the router.
+  // It now surfaces as a 400 from the global idempotency preHandler guard
+  // (`internal.idempotency.missing_key`): every state-changing request without
+  // an Idempotency-Key is rejected before routing can produce a 404. This 400
+  // is forward-stable — it holds even after the write handler mounts, because
+  // this probe deliberately sends no Idempotency-Key. The assertion thus still
+  // proves "no mounted write handler served this request".
+  it('§1c POST /v0/crisis-events returns 400 (idempotency guard precedes routing; no Idempotency-Key)', async () => {
     const r = await app!.inject({
       method: 'POST',
       url: '/v0/crisis-events',
       headers: { host: 'localhost', 'content-type': 'application/json' },
       payload: {},
     });
-    expect(r.statusCode).toBe(404);
+    expect(r.statusCode).toBe(400);
+    const body = r.json() as { error: { code: string } };
+    expect(body.error.code).toBe('internal.idempotency.missing_key');
   });
 
   // R1 MED closure 2026-05-22 (PR 7 Codex review): probe paths must reach

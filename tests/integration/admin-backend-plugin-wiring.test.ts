@@ -1,7 +1,15 @@
 /**
  * admin-backend slice — plugin wiring smoke test.
  *
- * Sprint 1 of N for this slice (PR 6 — Fastify module scaffold).
+ * Sprint 2 of N for this slice — first real handler merged (Sprint 2 PR 1:
+ * GET /v1/admin/dashboards/crisis-operational-health, commit e4cb312). The
+ * skeleton /health + /ready introspection text advanced when that handler
+ * landed, so the §1a/§1b assertions below track the v0.2 wording, and §1c now
+ * asserts the global idempotency guard's 400 (it precedes routing) rather than
+ * the v0.1 route-not-mounted 404. Standalone stale-assertion reconciliation in
+ * the spirit of PR #193 (ai-service /health + /ready introspection accuracy);
+ * the remaining template write handlers (submit + decision) ride the May-26
+ * cascade and will advance this introspection again.
  *
  * The DB layer is COMPLETE through migration 044 (PRs 1-5 on `main`; 14
  * rounds of Codex APPROVE; 4 tables + 2 views + 4 SECDEF procedures +
@@ -54,7 +62,7 @@ afterAll(async () => {
 });
 
 describe('admin-backend slice — §1 plugin wiring', () => {
-  it('§1a GET /v1/admin/health returns 200 (liveness — module alive) with Sprint 1 skeleton metadata', async () => {
+  it('§1a GET /v1/admin/health returns 200 (liveness — module alive) with Sprint 2 v0.2 metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v1/admin/health',
@@ -69,11 +77,11 @@ describe('admin-backend slice — §1 plugin wiring', () => {
     };
     expect(body.status).toBe('ok');
     expect(body.module).toBe('admin-backend');
-    expect(body.blocked).toContain('Sprint 1 of N');
+    expect(body.blocked).toContain('Sprint 2 PR 1 of N at v0.2');
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 044');
   });
 
-  it('§1b GET /v1/admin/ready returns 503 (readiness — handlers not yet mounted) with BLOCKED reason', async () => {
+  it('§1b GET /v1/admin/ready returns 503 (readiness — full surface incomplete) with BLOCKED reason', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v1/admin/ready',
@@ -88,18 +96,28 @@ describe('admin-backend slice — §1 plugin wiring', () => {
     };
     expect(body.status).toBe('unavailable');
     expect(body.module).toBe('admin-backend');
-    expect(body.reason).toBe('handlers_not_yet_implemented');
-    expect(body.reason_message).toContain('Sprint 2+');
+    expect(body.reason).toBe('partial_handlers_mounted_full_surface_incomplete');
+    expect(body.reason_message).toContain('Sprint 4');
   });
 
-  it('§1c POST /v1/admin/templates/anything/submit-for-review returns 404 (route NOT mounted at v0.1; lands in Sprint 2)', async () => {
+  // §1c — the template submit-for-review write route is still NOT mounted
+  // (submit + decision land in the Sprint 2 cascade). At v0.1 this surfaced as
+  // a 404 from the router. It now surfaces as a 400 from the global idempotency
+  // preHandler guard (`internal.idempotency.missing_key`): every state-changing
+  // request without an Idempotency-Key is rejected before routing can produce a
+  // 404. This 400 is forward-stable — it holds even after the write handler
+  // mounts, because this probe deliberately sends no Idempotency-Key. The
+  // assertion thus still proves "no mounted write handler served this request".
+  it('§1c POST /v1/admin/templates/:id/submit-for-review returns 400 (idempotency guard precedes routing; no Idempotency-Key)', async () => {
     const r = await app!.inject({
       method: 'POST',
       url: '/v1/admin/templates/01H8Z6QY9V3MF8KR7XJW2NTPDB/submit-for-review',
       headers: { host: 'localhost', 'content-type': 'application/json' },
       payload: {},
     });
-    expect(r.statusCode).toBe(404);
+    expect(r.statusCode).toBe(400);
+    const body = r.json() as { error: { code: string } };
+    expect(body.error.code).toBe('internal.idempotency.missing_key');
   });
 
   // Probe paths must reach the handler WITHOUT relying on a resolvable
