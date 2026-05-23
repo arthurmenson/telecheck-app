@@ -25,7 +25,18 @@ import { registerAdminBackendRoutes } from './routes.js';
 const adminBackendPluginImpl: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
-  await app.register(registerAdminBackendRoutes, { prefix: '/v0/admin-backend' });
+  // R1 MED-1 closure 2026-05-22 (PR 6 Codex R1): use the spec-canonical
+  // `/v1/admin` prefix, NOT `/v0/admin-backend`. The Sprint 2+ endpoint
+  // contract per SI-023 §5 + CDM §4 amendment is `/v1/admin/...` (e.g.,
+  // `/v1/admin/dashboards/crisis-operational-health`,
+  // `/v1/admin/templates/{template_id}/submit-for-review`,
+  // `/v1/admin/template-reviews/{review_id}/decision`). If we mounted under
+  // `/v0/admin-backend` the future Sprint 2 routes would expose at
+  // `/v0/admin-backend/v1/admin/...` — a contract break with the ratified
+  // spec. (The probe URLs are therefore `/v1/admin/health` + `/v1/admin/ready`,
+  // distinct from the tenant-config module's pre-existing `/v0/admin/...`
+  // paths because the version prefix is different.)
+  await app.register(registerAdminBackendRoutes, { prefix: '/v1/admin' });
 };
 
 export const adminBackendPlugin = fp(adminBackendPluginImpl, {

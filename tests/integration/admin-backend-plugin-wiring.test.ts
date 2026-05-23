@@ -54,10 +54,10 @@ afterAll(async () => {
 });
 
 describe('admin-backend slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/admin-backend/health returns 200 (liveness — module alive) with Sprint 1 skeleton metadata', async () => {
+  it('§1a GET /v1/admin/health returns 200 (liveness — module alive) with Sprint 1 skeleton metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
-      url: '/v0/admin-backend/health',
+      url: '/v1/admin/health',
       headers: { host: 'localhost' },
     });
     expect(r.statusCode).toBe(200);
@@ -73,10 +73,10 @@ describe('admin-backend slice — §1 plugin wiring', () => {
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 044');
   });
 
-  it('§1b GET /v0/admin-backend/ready returns 503 (readiness — handlers not yet mounted) with BLOCKED reason', async () => {
+  it('§1b GET /v1/admin/ready returns 503 (readiness — handlers not yet mounted) with BLOCKED reason', async () => {
     const r = await app!.inject({
       method: 'GET',
-      url: '/v0/admin-backend/ready',
+      url: '/v1/admin/ready',
       headers: { host: 'localhost' },
     });
     expect(r.statusCode).toBe(503);
@@ -92,10 +92,10 @@ describe('admin-backend slice — §1 plugin wiring', () => {
     expect(body.reason_message).toContain('Sprint 2+');
   });
 
-  it('§1c POST /v0/admin-backend/templates/anything/submit-for-review returns 404 (route NOT mounted at v0.1; lands in Sprint 2)', async () => {
+  it('§1c POST /v1/admin/templates/anything/submit-for-review returns 404 (route NOT mounted at v0.1; lands in Sprint 2)', async () => {
     const r = await app!.inject({
       method: 'POST',
-      url: '/v0/admin-backend/templates/01H8Z6QY9V3MF8KR7XJW2NTPDB/submit-for-review',
+      url: '/v1/admin/templates/01H8Z6QY9V3MF8KR7XJW2NTPDB/submit-for-review',
       headers: { host: 'localhost', 'content-type': 'application/json' },
       payload: {},
     });
@@ -107,19 +107,19 @@ describe('admin-backend slice — §1 plugin wiring', () => {
   // handler runs — so the probe must be in `allowlistedPaths`. These tests
   // assert the allowlist actually bypasses tenant resolution for the new
   // probes (would fail with 400 otherwise).
-  it('§1d GET /v0/admin-backend/health works without a resolvable Host header (allowlisted)', async () => {
+  it('§1d GET /v1/admin/health works without a resolvable Host header (allowlisted)', async () => {
     const r = await app!.inject({
       method: 'GET',
-      url: '/v0/admin-backend/health',
+      url: '/v1/admin/health',
       headers: { host: 'unresolved.load-balancer.invalid' },
     });
     expect(r.statusCode).toBe(200);
   });
 
-  it('§1e GET /v0/admin-backend/ready works without a resolvable Host header (allowlisted)', async () => {
+  it('§1e GET /v1/admin/ready works without a resolvable Host header (allowlisted)', async () => {
     const r = await app!.inject({
       method: 'GET',
-      url: '/v0/admin-backend/ready',
+      url: '/v1/admin/ready',
       headers: { host: 'unresolved.load-balancer.invalid' },
     });
     expect(r.statusCode).toBe(503);

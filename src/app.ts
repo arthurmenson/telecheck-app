@@ -217,8 +217,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/async-consult/ready',
       '/v0/crisis-events/health',
       '/v0/crisis-events/ready',
-      '/v0/admin-backend/health',
-      '/v0/admin-backend/ready',
+      '/v1/admin/health',
+      '/v1/admin/ready',
       '/v0/admin/ready',
       '/v0/ai/health',
       '/v0/ai/ready',
@@ -335,8 +335,13 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // Amendment; ratified P-041 + P-042). DB layer COMPLETE through
   // migration 044 (4 tables + 2 views + 4 SECDEF procedures + 12 RBAC
   // roles + 14 rounds of Codex APPROVE across PRs 1-5). Sprint 1
-  // (this commit) registers /health (200) + /ready (503) so app-level
-  // wiring works; Sprint 2+ adds 5 endpoints (3 dashboard reads + 2
+  // (this commit) registers /v1/admin/health (200) + /v1/admin/ready
+  // (503) so app-level wiring works under the spec-canonical /v1/admin
+  // prefix (NOT /v0/admin-backend — Codex PR 6 R1 MED-1 closure: the
+  // Sprint 2+ endpoint contract per SI-023 §5 + CDM §4 amendment is
+  // /v1/admin/...; mounting under /v0/admin-backend would expose Sprint 2
+  // routes at /v0/admin-backend/v1/admin/... and break the ratified
+  // contract). Sprint 2+ adds 5 endpoints (3 dashboard reads + 2
   // template wrappers) + Cat A audit emission + LAYER B role-membership
   // check. See src/modules/admin-backend/README.md for the multi-sprint
   // plan + Option 2 carryforward divergences from spec.

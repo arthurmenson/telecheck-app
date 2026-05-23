@@ -2,17 +2,25 @@
  * admin-backend/routes.ts — Fastify route registration (Sprint 1 skeleton).
  *
  * Status at v0.1 (Sprint 1 — this commit): SKELETON — only `/health` (200) +
- * `/ready` (503) are mounted. Liveness/readiness split applies the
- * canonical BLOCKED-aware pattern from pharmacy / med-interaction /
- * subscription / async-consult / crisis-response modules.
+ * `/ready` (503) are mounted (under the spec-canonical `/v1/admin` plugin
+ * prefix, so the absolute URLs are `/v1/admin/health` + `/v1/admin/ready`).
+ * Liveness/readiness split applies the canonical BLOCKED-aware pattern
+ * from pharmacy / med-interaction / subscription / async-consult /
+ * crisis-response modules.
  *
  * Sprint 2+ routes (NOT mounted yet; per SI-023 §5 + CDM v1.10 → v1.11
- * Amendment §4 endpoint list, 5 endpoints total):
- *   GET    /v1/admin/dashboards/crisis-operational-health
- *   GET    /v1/admin/dashboards/consult-queue-health        (deferred per Option 2)
- *   GET    /v1/admin/dashboards/mode1-volume-health         (deferred per Option 2)
- *   POST   /v1/admin/templates/{template_id}/submit-for-review
- *   POST   /v1/admin/template-reviews/{review_id}/decision
+ * Amendment §4 endpoint list, 5 endpoints total under the SAME `/v1/admin`
+ * prefix — paths below are relative to the plugin's prefix):
+ *   GET    /dashboards/crisis-operational-health
+ *   GET    /dashboards/consult-queue-health        (deferred per Option 2)
+ *   GET    /dashboards/mode1-volume-health         (deferred per Option 2)
+ *   POST   /templates/{template_id}/submit-for-review
+ *   POST   /template-reviews/{review_id}/decision
+ *
+ * Absolute URLs visible to clients:
+ *   /v1/admin/dashboards/crisis-operational-health
+ *   /v1/admin/templates/{template_id}/submit-for-review
+ *   /v1/admin/template-reviews/{review_id}/decision
  *
  * Spec references:
  *   - SI-023 Admin Backend Basics Slice v1.0 (RATIFIED 2026-05-22 P-041)
