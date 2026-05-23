@@ -1,4 +1,4 @@
-﻿-- =============================================================================
+-- =============================================================================
 -- File:    migrations/048_med_interaction_view_mv_access_function.sql
 -- Purpose: Create the optional materialized view + SECURITY BARRIER view +
 --          SECURITY DEFINER access function for the interaction signal
