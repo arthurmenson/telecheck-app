@@ -494,8 +494,7 @@ AS $$
 DECLARE
     v_max_prior_transition_at TIMESTAMPTZ;
     v_latest_to_state         TEXT;
-    v_max_clock_skew CONSTANT INTERVAL := INTERVAL '5 seconds';
-    v_lock_key BIGINT;
+    v_lock_key                BIGINT;
     v_caller_tenant_id        TEXT;
 BEGIN
     -- =====================================================================
@@ -536,53 +535,45 @@ BEGIN
 
     -- Serialize concurrent inserts per (tenant_id, signal_id) via a
     -- transaction-scoped advisory lock so the MAX(prior.transition_at)
-    -- read sees only committed-before-this-tx rows. Without this lock,
-    -- two concurrent inserts for the same signal can both read the same
-    -- prior MAX before either commits, letting a later-arriving
-    -- transaction insert a backdated transition_at and pass the
-    -- monotonic check anyway. Advisory lock is auto-released at tx
+    -- read sees only committed-before-this-tx rows. Auto-released at tx
     -- commit/rollback.
     v_lock_key := ('x' || substr(md5(NEW.tenant_id::text || ':' || NEW.signal_id::text), 1, 16))::bit(64)::bigint;
     PERFORM pg_advisory_xact_lock(v_lock_key);
 
-    -- Future-dating bounded by 5s clock-skew tolerance.
-    IF NEW.transition_at > now() + v_max_clock_skew THEN
-        RAISE EXCEPTION
-            'interaction_signal_lifecycle_transition future-dated: '
-            'NEW.transition_at (%) > now() + 5s clock-skew tolerance (%)',
-            NEW.transition_at, now() + v_max_clock_skew
-            USING ERRCODE = '22008';    -- datetime_field_overflow
-    END IF;
-
-    -- R4 HIGH-1 closure 2026-05-23 (Codex R4): combined strict-monotonic +
-    -- auto-resolve trigger. Lifecycle timestamps are SERVER-ASSIGNED
-    -- MONOTONIC ORDERING KEYS (not caller-supplied audit facts). Decision
-    -- rationale: the audit-truthfulness of the transition is captured by
-    -- the wrapper-level Cat A audit emission (which records the call
-    -- timestamp in the audit_records row); transition_at on the lifecycle
-    -- row is purely for current-state-derivation ordering. By making it
-    -- server-assigned + monotonic, we eliminate the R3 same-tx-default
-    -- collision failure mode WITHOUT introducing audit-truth ambiguity
-    -- (the audit log + wrapper-call timestamp is the truth source).
+    -- =====================================================================
+    -- R5 HIGH-1 closure 2026-05-23 (Codex R5): unconditional server-side
+    -- assignment of transition_at. The R4 GREATEST(NEW.transition_at,
+    -- prior.MAX + 1us) approach preserved caller-supplied timestamps
+    -- inside the 5s skew window, contradicting the stated "server-assigned
+    -- monotonic ordering key" decision. A buggy or compromised writer
+    -- could push an emission or later transition several seconds into the
+    -- future, and subsequent same-signal transitions would auto-bump
+    -- after that artificial value — making the lifecycle log's ordering
+    -- caller-influenced rather than truly server-assigned.
+    --
+    -- Fix: always compute the timestamp server-side via clock_timestamp()
+    -- and ignore caller-supplied NEW.transition_at on the ordering-key
+    -- axis. Caller-supplied transition_at is still passed in (the column
+    -- has a DEFAULT clock_timestamp() so callers don't need to supply it),
+    -- but the trigger overwrites it with the canonical server-monotonic
+    -- value before INSERT actually applies. The wrapper-level Cat A
+    -- audit emission (in PR 5 wrappers) is the audit-truth source for
+    -- when the call happened; this column is purely the current-state
+    -- derivation ordering key.
+    --
+    -- Backdate rejection: removed. With the trigger overwriting
+    -- NEW.transition_at unconditionally, there is no caller-supplied
+    -- value to backdate-attack — the field is effectively trigger-owned.
+    -- Future-dating bound: also removed for the same reason.
     --
     -- Algorithm:
-    --   1. Compute the "effective wall time" = clock_timestamp() (per-call
-    --      time, NOT transaction-start time). This gives same-tx multiple
-    --      writes distinct timestamps.
-    --   2. If NEW.transition_at < prior.MAX - 5s clock-skew tolerance →
-    --      REJECT (clear backdate, beyond reasonable clock skew).
-    --   3. Otherwise OVERWRITE NEW.transition_at to
-    --      GREATEST(effective_wall_time, prior.MAX + 1 microsecond).
-    --      This guarantees strict-monotonic ordering even if (a) caller
-    --      supplied an old timestamp (within 5s — gets bumped to current
-    --      wall time), (b) two same-tx writes both default to clock_
-    --      timestamp() but get identical microseconds (extremely rare;
-    --      bumped by 1us), or (c) caller supplied a future-but-reasonable
-    --      timestamp (capped at future-bound check below).
-    --
-    -- Backdating beyond 5s STILL rejected (caller can't hide a row in the
-    -- distant past by submitting a stale transition_at; trigger rejects
-    -- before auto-bump).
+    --   1. Read prior.MAX under the advisory lock.
+    --   2. Compute v_effective_wall_time = clock_timestamp() (per-call;
+    --      always current; never future; never caller-influenced).
+    --   3. If prior.MAX IS NULL: NEW.transition_at := v_effective_wall_time.
+    --   4. Else: NEW.transition_at := GREATEST(v_effective_wall_time,
+    --      prior.MAX + 1 microsecond) — guarantees strict-monotonic even
+    --      under microsecond clock collisions or rapid succession.
     -- =====================================================================
 
     -- Read prior MAX under the advisory lock (RLS bypassed by SECURITY
@@ -592,26 +583,19 @@ BEGIN
       FROM public.interaction_signal_lifecycle_transition
      WHERE tenant_id = NEW.tenant_id AND signal_id = NEW.signal_id;
 
-    -- Reject deliberate backdate (NEW.transition_at < prior.MAX - 5s).
-    -- This is the only path that fails the caller; auto-bump handles
-    -- benign collisions inside the 5s clock-skew window.
-    IF v_max_prior_transition_at IS NOT NULL
-       AND NEW.transition_at < v_max_prior_transition_at - v_max_clock_skew THEN
-        RAISE EXCEPTION
-            'interaction_signal_lifecycle_transition backdated: '
-            'NEW.transition_at is beyond clock-skew tolerance before '
-            'MAX(prior.transition_at) for the target signal in this tenant'
-            USING ERRCODE = '22008';
-    END IF;
-
-    -- Auto-bump to strict-monotonic. If prior MAX exists + NEW timestamp
-    -- isn't strictly later, overwrite NEW.transition_at with
-    -- prior.MAX + 1 microsecond (strict-greater). If no prior, leave the
-    -- caller-supplied or default-clock_timestamp() value alone (it's the
-    -- canonical initial transition).
-    IF v_max_prior_transition_at IS NOT NULL THEN
+    -- Unconditionally server-assign transition_at. Caller-supplied or
+    -- default-clock_timestamp() value is replaced with the canonical
+    -- server-monotonic value.
+    IF v_max_prior_transition_at IS NULL THEN
+        -- Initial transition for this signal: use current server clock.
+        NEW.transition_at := clock_timestamp();
+    ELSE
+        -- Subsequent transition: strict-greater than prior.MAX.
+        -- GREATEST handles the rare microsecond-collision case where
+        -- clock_timestamp() returns a value <= prior.MAX (e.g., two
+        -- rapid-succession inserts within the same microsecond).
         NEW.transition_at := GREATEST(
-            NEW.transition_at,
+            clock_timestamp(),
             v_max_prior_transition_at + INTERVAL '1 microsecond'
         );
     END IF;
