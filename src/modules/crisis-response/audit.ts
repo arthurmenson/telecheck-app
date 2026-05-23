@@ -1,7 +1,11 @@
 /**
- * crisis-response/audit.ts — Cat A audit envelope emitter for the
- * lifecycle-bound `crisis.detected` event (SI-022 §3 normative table line 1
- * + CDM v1.9→v1.10 Amendment §3.1 normative landing).
+ * crisis-response/audit.ts — Cat A audit envelope emitters for the
+ * lifecycle-bound `crisis.*` events (SI-022 §3 normative table + CDM
+ * v1.9→v1.10 Amendment normative landings).
+ *
+ * Emitters landed so far (union accumulates as Sprint 2 PRs merge):
+ *   - `emitCrisisDetectedAudit`     — `crisis.detected`     (Sprint 2 PR 2, §3.1)
+ *   - `emitCrisisAcknowledgedAudit` — `crisis.acknowledged` (Sprint 2 PR 3, §3.3)
  *
  * **Distinction from `crisis_detection_trigger`:**
  *   - `crisis_detection_trigger` (Cat A, baseline AUDIT_EVENTS, emitted
@@ -14,28 +18,34 @@
  *     initiation()` SECDEF wrapper INSERT + the `none → detected` lifecycle
  *     transition) records the lifecycle-bound entry of the crisis into
  *     the response surface — this is THIS module's emission point.
+ *   - `crisis.acknowledged` (Cat A; SI-022 §3 line 2) records the
+ *     lifecycle transition into `acknowledged` by a clinician /
+ *     care-team actor via `record_crisis_acknowledgement_claim()`
+ *     (clinician_acknowledgement transition triples #7 + #8 —
+ *     detected → acknowledged OR escalated → acknowledged).
  *
  * **Placeholder pattern (parity with `forms-intake/audit.ts`):**
- *   The action ID `crisis.detected` is ratified in SI-022 §3 / CDM
- *   v1.9→v1.10 Amendment §3.1 (P-039 + P-040 2026-05-21) but has NOT
- *   yet been landed in `src/lib/audit.ts`'s `AuditAction` enum (which
- *   tracks AUDIT_EVENTS v5.3 — the v5.12 amendment lands in a future
- *   spec-corpus ratification cycle per Track 6). To unblock the Sprint 2
- *   write-path PR without leaning on a non-canonical enum edit, this
- *   helper uses the same single-sanctioned-cast pattern that
- *   `formsAuditPlaceholder()` uses: a typed string literal cast at exactly
- *   ONE call site, grep-discoverable for the future migration that
- *   replaces the placeholder with the canonical enum value.
+ *   The action IDs `crisis.detected` / `crisis.acknowledged` are ratified
+ *   in SI-022 §3 / CDM v1.9→v1.10 Amendment §3.1 + §3.3 (P-039 + P-040
+ *   2026-05-21) but have NOT yet been landed in `src/lib/audit.ts`'s
+ *   `AuditAction` enum (which tracks AUDIT_EVENTS v5.3 — the v5.12
+ *   amendment lands in a future spec-corpus ratification cycle per
+ *   Track 6). To unblock the Sprint 2 write-path PRs without leaning on
+ *   a non-canonical enum edit, this helper uses the same single-
+ *   sanctioned-cast pattern that `formsAuditPlaceholder()` uses: a typed
+ *   string literal cast at exactly ONE call site, grep-discoverable for
+ *   the future migration that replaces the placeholder with the canonical
+ *   enum value.
  *
- *   When the v5.12 amendment ratifies and `lib/audit.ts` adds
- *   `'crisis.detected'` to the `CategoryAAction` union, the migration is
+ *   When the v5.12 amendment ratifies and `lib/audit.ts` adds the
+ *   `crisis.*` members to the `CategoryAAction` union, the migration is
  *   a 1-step grep:
  *     git grep "crisisAuditPlaceholder("
  *   Delete this helper + every call site reverts to passing the canonical
  *   string literal directly.
  *
  * **Hard rules per I-003 / I-019 / I-027:**
- *   - emission MUST run in the SAME tx as the `record_crisis_initiation`
+ *   - emission MUST run in the SAME tx as the corresponding SECDEF
  *     wrapper call (FLOOR-020 fail-closed; ratifier Option 2 deferred
  *     audit emission from SQL wrapper to application layer per
  *     `docs/crisis-response-implementation-plan.md` + README §"Option 2
@@ -44,18 +54,20 @@
  *     re-validates this
  *   - bare suppression on emission failure is FORBIDDEN (I-003); the
  *     handler re-throws so the surrounding transaction rolls back, the
- *     crisis_event INSERT rolls back with it, and the FLOOR-020 contract
- *     holds (no orphan crisis_event row without its audit record)
+ *     lifecycle INSERT / SELECT rolls back with it, and the FLOOR-020
+ *     contract holds (no orphan lifecycle row without its audit record)
  *
- * **Audit_sensitivity_level:** `'standard'` — the crisis lifecycle row
- *   itself does NOT include the intake_payload PHI (that's KMS-encrypted
- *   on the crisis_event table per ADR-021); the audit `detail` carries
- *   classification + identifier fields only.
+ * **Audit_sensitivity_level:** `'standard'` — neither the crisis
+ *   lifecycle row nor the lifecycle_transition row include the
+ *   intake_payload PHI (that's KMS-encrypted on the crisis_event table
+ *   per ADR-021); the audit `detail` carries classification + identifier
+ *   fields only.
  *
  * Spec references:
  *   - SI-022 Crisis Response Slice v1.0 §3 normative AUDIT_EVENTS table
- *     row 1 (`crisis.detected` Cat A, NOT sampled, P1 keyed by patient_id)
- *   - CDM v1.9 → v1.10 Amendment §3.1 normative landing (P-040)
+ *     rows 1 + 2 (`crisis.detected` / `crisis.acknowledged` Cat A, NOT
+ *     sampled, P1 keyed by patient_id)
+ *   - CDM v1.9 → v1.10 Amendment §3.1 + §3.3 normative landing (P-040)
  *   - AUDIT_EVENTS v5.12 amendment (target — currently at v5.3 in
  *     `lib/audit.ts`; v5.12 lands at Track 6 spec-corpus ratification)
  *   - I-019 (crisis detection always-on platform-floor)
@@ -128,12 +140,13 @@ const CRISIS_INITIATOR_ACTOR_TYPE: Readonly<Record<CrisisInitiatorActorIdentity,
  * cast at `crisisAuditPlaceholder()`.
  *
  * As the Crisis Response slice's write-path PRs land (Sprint 2-3:
- * acknowledge / respond / resolve / sweep / no-acknowledgement-
+ * detected / acknowledge / respond / resolve / sweep / no-acknowledgement-
  * escalation), this union accumulates the additional ratified-but-
  * un-landed action IDs from SI-022 §3 (12 total Cat A + Cat C).
- * Sprint 2 PR 2 (this PR) adds only the `crisis.detected` member.
+ * Sprint 2 PR 2 landed `crisis.detected`; Sprint 2 PR 3 adds
+ * `crisis.acknowledged`.
  */
-type CrisisAuditActionPlaceholder = 'crisis.detected';
+type CrisisAuditActionPlaceholder = 'crisis.detected' | 'crisis.acknowledged';
 
 /**
  * crisisAuditPlaceholder — single sanctioned `as AuditAction` cast site
@@ -269,6 +282,111 @@ export async function emitCrisisDetectedAudit(
     // envelope shape.
     ai_workload_type: isAiInitiator ? 'conversational_assistant' : null,
     autonomy_level: isAiInitiator ? 'advisory' : null,
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(input, tx);
+}
+
+/**
+ * emitCrisisAcknowledgedAudit — Cat A fail-closed audit emission for
+ * the lifecycle-bound `crisis.acknowledged` event. MUST be called in
+ * the SAME transaction as the `record_crisis_acknowledgement_claim()`
+ * SECDEF wrapper SELECT per FLOOR-020 (handler ensures this by passing
+ * the same `tx` into both the wrapper-query and this emitter — see
+ * `internal/handlers/post-crisis-acknowledge.ts`).
+ *
+ * **Resource binding:** the wrapper's RETURNS BIGINT is the
+ * `crisis_event_lifecycle_transition.id` of the inserted (or replayed)
+ * `acknowledged` row. The audit envelope's `resource_type` /
+ * `resource_id` is the **crisis_event** itself — the audit's narrative
+ * subject is the lifecycle entity, not the transition row. The
+ * transition_id is carried in `detail.lifecycle_transition_id` so
+ * post-incident reconstruction can join the audit to the specific
+ * transition row without ambiguity.
+ *
+ * **from_state discipline:** two allowed from-states per migration 037
+ * §1 (State Machines v1.1 §3 triples #7 `detected → acknowledged` + #8
+ * `escalated → acknowledged`, both via clinician_acknowledgement). The
+ * wrapper does NOT echo the from_state back; the handler carries it
+ * explicitly on `detail.from_state` from its pre-fetch of
+ * `crisis_event_current_state_v` (which it issues for the `patient_id`
+ * resolution + tenant-scope pre-check anyway), so post-incident
+ * reconstruction can identify which lifecycle path was taken without
+ * re-querying.
+ *
+ * **actor_type discipline:**
+ *   SI-022 §7 binds the `crisis_acknowledger` role to clinician +
+ *   on-call clinician + care-team. Sprint 2 PR 3 (this PR) is gated by
+ *   `requireClinicianActorContext` per Layer B closest-available
+ *   pattern; the audit carries `actor_type: 'clinician'`. When the
+ *   JWT-role → DB-slice-role membership mapping lands (Phase A
+ *   successor to SI-010 / SI-024.1), the call site's actor_type
+ *   derivation expands to distinguish the bound identity-class.
+ *
+ * **ai_workload_type / autonomy_level discipline:**
+ *   `crisis.acknowledged` is NOT in the I-012 action-class set; the
+ *   acknowledgement is by definition a clinician claim (no AI workload
+ *   acknowledges a crisis on the patient's behalf at v1.0). Per
+ *   WORKLOAD_TAXONOMY v5.2 §1 nullability rule, the envelope carries
+ *   `ai_workload_type: null` + `autonomy_level: null`.
+ */
+export async function emitCrisisAcknowledgedAudit(
+  args: {
+    tenantId: TenantId;
+    actorAccountId: string;
+    /** Actor's home tenant per F-4 attribution. For clinician acting in
+     *  own tenant this equals `tenantId`. */
+    actorTenantId: string;
+    countryOfCare: string;
+    crisisEventId: CrisisEventId;
+    targetPatientId: string;
+    /** The wrapper's RETURNS BIGINT, serialized as a string by the pg
+     *  driver. Carried as `detail.lifecycle_transition_id` for
+     *  post-incident join. */
+    lifecycleTransitionId: string;
+    /** The from-state per the handler's pre-fetch — one of `'detected'`
+     *  or `'escalated'` per migration 037 §1 allowed triples. Carried
+     *  explicitly so post-incident reconstruction can identify which
+     *  lifecycle path was taken without re-querying. */
+    fromState: 'detected' | 'escalated';
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const input: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: args.tenantId,
+    actor_type: 'clinician',
+    actor_id: args.actorAccountId,
+    actor_tenant_id: args.actorTenantId,
+    target_patient_id: args.targetPatientId,
+    delegate_context: null,
+    action: crisisAuditPlaceholder('crisis.acknowledged'),
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: 'crisis_event',
+    resource_id: args.crisisEventId,
+    detail: {
+      patient_id: args.targetPatientId,
+      lifecycle_transition_id: args.lifecycleTransitionId,
+      from_state: args.fromState,
+      to_state: 'acknowledged',
+      transition_reason: 'clinician_acknowledgement',
+    },
+    engine_versions: null,
+    ai_workload_type: null,
+    autonomy_level: null,
     agent_id: null,
     agent_version: null,
     tool_call_id: null,
