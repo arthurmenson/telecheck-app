@@ -62,7 +62,9 @@ export function asInteractionRulesetId(s: string): InteractionRulesetId {
   return s as InteractionRulesetId;
 }
 
-// Row-shape interfaces (InteractionSignal, InteractionOverride,
-// InteractionRuleset) are intentionally NOT exported here. They land
-// when the Med Interaction Engine slice PRD is ratified and CDM §4
-// adds the field-level expansion.
+// Row-shape interfaces (InteractionEngineEvaluation, InteractionSignal,
+// InteractionSignalOverride, InteractionSignalLifecycleTransition) are
+// intentionally NOT exported here. CDM v1.7 §4.NEW1-NEW4 already RATIFIED
+// (P-034 2026-05-21) the canonical row shapes; the TypeScript interfaces
+// land in PR 2/3 alongside the entity migrations (047 entities + 048
+// view/MV) + the matching repository files under internal/repositories/.
