@@ -1,18 +1,21 @@
 /**
- * med-interaction/plugin.ts — Fastify plugin entry point (Sprint 1 / PR 1).
+ * med-interaction/plugin.ts — Fastify plugin entry point (Sprint 1 / PR 6 of 6).
  *
  * Per ADR-001 modular monolith: this plugin is the ONLY entry point
  * that registers the module's routes. Cross-module callers consume
  * the Med Interaction module ONLY through `index.ts`.
  *
  * Status: spec layer COMPLETE + RATIFIED (SI-019 v2.0 P-033 +
- * CDM v1.6 → v1.7 P-034 RATIFIED 2026-05-21). DB layer at PR 1 of ~6:
- * plugin registers the module's `/health` (200) + `/ready` (503) probes
- * so app-level wiring works as subsequent PRs land. Full handler
- * implementation (8 endpoints per SI-019 §5 + CDM §6 OpenAPI v0.3:
- * signal-check + override-record + lifecycle actions) lands at PR 6+
- * after entities (PR 2) → views (PR 3) → raw writer (PR 4) → 6
- * reason-specific wrappers (PR 5).
+ * CDM v1.6 → v1.7 P-034 RATIFIED 2026-05-21). **DB layer COMPLETE
+ * through migration 050** (PRs 1-5 merged; 21 Codex rounds total):
+ * 12 RBAC roles (046) + 4 entities + RLS + per-table append-only +
+ * server-assigned monotonic-ordering triggers (047) + SECURITY BARRIER
+ * view + optional MV + SECDEF access function (048) + raw lifecycle
+ * writer SECDEF + anti-bypass EXECUTE matrix (049) + 6 reason-specific
+ * wrappers (050; 3 operational + 3 fail-closed). This commit (PR 6 of 6)
+ * is the Fastify scaffold update closing the DB-layer series. Full
+ * handler implementation (8 endpoints per SI-019 §5 + CDM §6 OpenAPI
+ * v0.3: signal-check + override-record + lifecycle actions) lands at PR 7+.
  *
  * Spec references:
  *   - ADR-001 (modular monolith)
