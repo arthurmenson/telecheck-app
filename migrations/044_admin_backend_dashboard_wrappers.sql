@@ -124,7 +124,16 @@ BEGIN
     -- Capture the view body into a TEMP table so the row count is known at
     -- audit-INSERT time + the same rows are returned to the caller. The
     -- temp table is auto-dropped on commit per ON COMMIT DROP.
+    --
+    -- R1 MED-1 closure 2026-05-22 (Codex R1): the prior CREATE TEMP TABLE
+    -- without a preceding DROP would fail with "relation already exists"
+    -- on a second invocation within the same Fastify-managed transaction
+    -- (ON COMMIT DROP only fires at tx commit, not at function exit).
+    -- Use ON COMMIT DROP + drop pg_temp version IF EXISTS first so repeat
+    -- calls within one tx are safe (Fastify route retry, composed dashboard
+    -- reads, integration tests calling the wrapper twice).
     -- ---------------------------------------------------------------------
+    DROP TABLE IF EXISTS pg_temp._admin_crisis_query_result;
     CREATE TEMP TABLE _admin_crisis_query_result ON COMMIT DROP AS
         SELECT * FROM admin_crisis_operational_health_v
          WHERE tenant_id = p_tenant_id;

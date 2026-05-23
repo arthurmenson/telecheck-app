@@ -47,14 +47,32 @@ BEGIN
     -- Safe to revoke wrapper-owner grants now (function is gone). Note: the
     -- view-level + base-table SELECT grants from migration 041 §1 are NOT
     -- revoked here — they belong to migration 041's rollback, not this one.
-    REVOKE EXECUTE ON FUNCTION current_actor_account_tenant_id()
-        FROM read_admin_crisis_operational_health_wrapper_owner;
-    REVOKE EXECUTE ON FUNCTION current_actor_account_id()
-        FROM read_admin_crisis_operational_health_wrapper_owner;
-    REVOKE USAGE ON SEQUENCE admin_dashboard_query_execution_id_seq
-        FROM read_admin_crisis_operational_health_wrapper_owner;
-    REVOKE INSERT ON admin_dashboard_query_execution
-        FROM read_admin_crisis_operational_health_wrapper_owner;
+    --
+    -- R1 MED-2 closure 2026-05-22 (Codex R1): each REVOKE is existence-gated
+    -- via to_regprocedure / to_regclass / to_regrole so the rollback is
+    -- idempotent against fresh / forward-applied / partially-applied /
+    -- prior-migrations-already-rolled-back states. Without these gates,
+    -- a REVOKE against a missing function/sequence/table/role would abort
+    -- the rollback. Dynamic EXECUTE is used because static REVOKE syntax
+    -- doesn't support IF EXISTS in PostgreSQL 15+.
+    IF to_regrole('read_admin_crisis_operational_health_wrapper_owner') IS NOT NULL THEN
+        IF to_regprocedure('public.current_actor_account_tenant_id()') IS NOT NULL THEN
+            EXECUTE 'REVOKE EXECUTE ON FUNCTION current_actor_account_tenant_id() '
+                 || 'FROM read_admin_crisis_operational_health_wrapper_owner';
+        END IF;
+        IF to_regprocedure('public.current_actor_account_id()') IS NOT NULL THEN
+            EXECUTE 'REVOKE EXECUTE ON FUNCTION current_actor_account_id() '
+                 || 'FROM read_admin_crisis_operational_health_wrapper_owner';
+        END IF;
+        IF to_regclass('public.admin_dashboard_query_execution_id_seq') IS NOT NULL THEN
+            EXECUTE 'REVOKE USAGE ON SEQUENCE admin_dashboard_query_execution_id_seq '
+                 || 'FROM read_admin_crisis_operational_health_wrapper_owner';
+        END IF;
+        IF to_regclass('public.admin_dashboard_query_execution') IS NOT NULL THEN
+            EXECUTE 'REVOKE INSERT ON admin_dashboard_query_execution '
+                 || 'FROM read_admin_crisis_operational_health_wrapper_owner';
+        END IF;
+    END IF;
 END $$;
 
 -- =============================================================================
