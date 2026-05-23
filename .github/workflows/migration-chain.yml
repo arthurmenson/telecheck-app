@@ -1,0 +1,83 @@
+# Telecheck — migration-chain gate
+#
+# Clean-room verification that migrations/000 -> head applies from scratch on a
+# pristine database. tests/setup.ts already applies migrations as a side effect
+# of the integration suite, but it tracks applied files + uses advisory locks
+# across forks, so a cross-migration defect can be masked or surface confusingly.
+#
+# Motivation (Track 5 Infra & Ops): the 2026-05-23 med-interaction role-name
+# defect (migrations 047-050 referenced slice-prefixed role names that 046 never
+# created) reached main latently because no environment had ever applied
+# 000 -> head from a clean slate. This gate closes that gap: a fresh Postgres
+# service container is pristine, so a wrapper referencing a role no prior
+# migration created aborts the apply with a non-zero exit.
+#
+# Scope: FORWARD apply + per-migration rollback-companion existence (see
+# scripts/check-migration-chain.sh for why a full reverse unwind is out of scope).
+
+name: Migration chain
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "migrations/**"
+      - "scripts/check-migration-chain.sh"
+      - ".github/workflows/migration-chain.yml"
+  push:
+    branches: [main]
+    paths:
+      - "migrations/**"
+      - "scripts/check-migration-chain.sh"
+      - ".github/workflows/migration-chain.yml"
+
+concurrency:
+  group: migration-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  forward-chain:
+    name: Apply 000 -> head on a pristine database
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        # Match the main CI workflow's Postgres major version (15-alpine).
+        # The service container is fresh per job, satisfying the gate's
+        # pristine-database precondition (cluster-global roles, several created
+        # without IF NOT EXISTS, would otherwise collide on a reused cluster).
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: telecheck_ci
+          POSTGRES_PASSWORD: telecheck_ci
+          POSTGRES_DB: telecheck_chain
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U telecheck_ci -d telecheck_chain"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CHAIN_DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_chain
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # ubuntu-latest ships the postgresql-client (psql); install only if absent
+      # so the gate is robust to future runner-image changes.
+      - name: Ensure psql is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y postgresql-client
+          fi
+          psql --version
+
+      - name: Verify migration chain (000 -> head, clean-room)
+        run: ./scripts/check-migration-chain.sh
