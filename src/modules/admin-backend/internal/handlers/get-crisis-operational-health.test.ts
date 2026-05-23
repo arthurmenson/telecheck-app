@@ -285,7 +285,7 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501
     expect(errObj.message ?? '').toMatch(/scope|forbidden|insufficient/i);
   });
 
-  it('§4b non-42501 PG errors propagate unchanged (so withTransaction rolls back + global envelope formats as 500)', async () => {
+  it('§4b non-42501 PG errors propagate UNCHANGED — identity-preserved, code intact, no 4xx statusCode added (R2 LOW closure)', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
@@ -295,12 +295,27 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501
     );
     tx.query.mockRejectedValueOnce(otherPgError);
 
-    await expect(
-      getCrisisOperationalHealthHandler(
+    let thrown: unknown;
+    try {
+      await getCrisisOperationalHealthHandler(
         makeReq({ actorNonce: 'fake-nonce' }),
         makeReply(),
-      ),
-    ).rejects.toThrow(/connection terminated/);
+      );
+    } catch (e) {
+      thrown = e;
+    }
+
+    // R2 LOW closure 2026-05-23: assert identity-preservation + code intact,
+    // not just message match. A regression that re-wrapped the error
+    // (losing .code, adding a 4xx statusCode that the global envelope
+    // would then treat as client-facing) would have passed the prior
+    // toThrow(/connection terminated/) assertion. The identity check
+    // catches that class of regression.
+    expect(thrown).toBe(otherPgError);
+    expect((thrown as { code?: string }).code).toBe('57P01');
+    // Must NOT have a 4xx statusCode added (would defeat 5xx rollback +
+    // tenant-blind 500 default-message replacement in the global envelope).
+    expect((thrown as { statusCode?: number }).statusCode).toBeUndefined();
   });
 });
 
