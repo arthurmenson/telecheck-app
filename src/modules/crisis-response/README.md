@@ -2,11 +2,15 @@
 
 Implementation of **SI-022 Crisis Response Slice v1.0** (RATIFIED 2026-05-21 P-039) + the canonical follow-on **CDM v1.9 → v1.10 Amendment** (RATIFIED 2026-05-21 P-040).
 
-## Status: Sprint 2 PR 5 — **PATIENT-SCOPED READ LANDED** (5 of 6 endpoints wired)
+## Status: Sprint 2 PR 6 — **SWEEP HANDLER LANDED — Sprint 2 COMPLETE** (6 of 6 endpoints wired)
 
-The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition). The TypeScript application layer is at Sprint 2 — Sprint 1's skeleton + branded IDs + canonical vocabularies, BOTH read handlers (staff-scoped `GET /v0/crisis-events/:id` PR 1, patient-scoped `GET /v0/crisis-events/:id/patient-summary` PR 5, this commit), and all four write-paths (initiate PR 2, acknowledge PR 3, respond + resolve PR 4 — all merged). **5 of 6 endpoint targets wired** (initiate + acknowledge + respond + resolve + staff-read + patient-read; remaining: sweep PR 6, parked on a sibling `[CODEX-PENDING]` branch). Remaining Cat A audit-event-catalog landing + KMS envelope + integration tests land in follow-up PRs.
+The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition). The TypeScript application layer has all Sprint 2 endpoints mounted — BOTH read handlers (staff-scoped PR 1, patient-scoped PR 5), all four write-paths (initiate PR 2, acknowledge PR 3, respond + resolve PR 4), and now the sweep handler (PR 6, this commit). **6 of 6 endpoint targets wired — Sprint 2 COMPLETE.** Remaining: Cat A audit-event-catalog landing + KMS envelope + integration tests in follow-up PRs.
 
-### Sprint 2 PR 5 (this commit) — patient-scoped read
+### Sprint 2 PR 6 (this commit) — operator-invoked sweep
+
+- `POST /v0/crisis-events/:id/_sweep` — operator-invoked no-acknowledgement escalation sweep, wrapping the SECDEF `execute_crisis_no_acknowledgement_sweep()` from migration 038. Emits Cat A `crisis.no_acknowledgement_escalation` audit in the same transaction when outcome=`completed_escalated`. Fencing-token idempotency prevents double-escalation.
+
+### Sprint 2 PR 5 (merged) — patient-scoped read
 
 - `GET /v0/crisis-events/:id/patient-summary` — patient-scoped (data-minimized) single-row read via `crisis_event_patient_summary_v` (8-column projection: crisis_event_id, tenant_id, patient_id, crisis_type, severity, detected_at, current_state, current_state_transition_at). Omits 4 staff-only columns: `server_signal_id`, `regulatory_reporting_enabled`, `current_state_transition_reason`, `current_state_actor_principal_id`.
 - Composition: `withTransaction → withTenantContext → withActorContext → withDbRole('crisis_event_patient_reader', ...) → SELECT FROM crisis_event_patient_summary_v WHERE crisis_event_id = $1`.
@@ -88,7 +92,7 @@ The DB layer is **complete** through migration 038 + foundation 051 (Option B ap
 
 - `POST /v0/crisis-events/:id/respond` → wraps `record_crisis_response()` + Cat A `crisis.responded` audit. **DONE — Sprint 2 PR 4.**
 - `POST /v0/crisis-events/:id/resolve` → wraps `record_crisis_resolution()` + Cat A `crisis.resolved` audit. **DONE — Sprint 2 PR 4.**
-- `POST /v0/crisis-events/:id/sweep` → operator-initiated; wraps `execute_crisis_no_acknowledgement_sweep()` + Cat A `crisis.no_acknowledgement_escalation` audit when outcome=completed*escalated *(remaining — PR 6)\_
+- `POST /v0/crisis-events/:id/_sweep` → operator-initiated; wraps `execute_crisis_no_acknowledgement_sweep()` + Cat A `crisis.no_acknowledgement_escalation` audit when outcome=completed_escalated. **DONE — Sprint 2 PR 6 (this commit).**
 - Integration tests for state-machine guards (e.g., responding before acknowledging → 409 tenant-blind)
 
 **Sprint 4 — Hardening**

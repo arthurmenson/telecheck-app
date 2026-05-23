@@ -89,6 +89,8 @@ import type { TenantId } from '../../lib/glossary.js';
 import type {
   CrisisEventId,
   CrisisSeverity,
+  CrisisSweepExecutionId,
+  CrisisSweepOutcome,
   CrisisType,
   ServerSignalId,
 } from './internal/types.js';
@@ -151,7 +153,8 @@ type CrisisAuditActionPlaceholder =
   | 'crisis.detected'
   | 'crisis.acknowledged'
   | 'crisis.responded'
-  | 'crisis.resolved';
+  | 'crisis.resolved'
+  | 'crisis.no_acknowledgement_escalation';
 
 /**
  * crisisAuditPlaceholder — single sanctioned `as AuditAction` cast site
@@ -573,6 +576,188 @@ export async function emitCrisisResolvedAudit(
       transition_reason: 'clinician_resolution',
     },
     engine_versions: null,
+    ai_workload_type: null,
+    autonomy_level: null,
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(input, tx);
+}
+
+/**
+ * emitCrisisNoAcknowledgementEscalationAudit — Cat A fail-closed audit
+ * emission for the lifecycle-bound `crisis.no_acknowledgement_escalation`
+ * event. MUST be called in the SAME transaction as the
+ * `execute_crisis_no_acknowledgement_sweep()` SECDEF wrapper SELECT per
+ * FLOOR-020 (handler ensures this by passing the same `tx` into both
+ * the wrapper-query and this emitter — see
+ * `internal/handlers/post-crisis-sweep.ts`).
+ *
+ * **When to call (handler-side discipline):**
+ *   The handler emits this audit ONLY when the sweep wrapper's outcome
+ *   is `'completed_escalated'` — the only outcome where an escalation
+ *   `crisis_event_lifecycle_transition` row was actually inserted. The
+ *   other 4 outcomes do NOT emit `crisis.no_acknowledgement_escalation`:
+ *
+ *     - `'claimed_new'`        — should not be returned from the wrapper
+ *                                 normally (wrapper continues past claim
+ *                                 to emission phase before returning;
+ *                                 reserved-for-future)
+ *     - `'claimed_takeover'`   — same as above
+ *     - `'already_completed'`  — idempotent replay of a previously-
+ *                                 committed sweep; the original sweep's
+ *                                 audit already exists; re-emitting
+ *                                 would create a duplicate audit row
+ *                                 for a single ratified state change
+ *                                 (violates I-003 hash-chain semantics)
+ *     - `'completed_no_op'`    — current state is acknowledged/responded/
+ *                                 resolved; no escalation transition
+ *                                 emitted; nothing to audit per SI-022 §6
+ *                                 (the sweep simply records that it ran
+ *                                 and found nothing to escalate)
+ *
+ *   Bare suppression on emission failure is FORBIDDEN per I-003. If
+ *   `emitAudit()` raises, the handler re-throws so the surrounding tx
+ *   rolls back atomically with the wrapper's lifecycle INSERT + sweep
+ *   completion UPDATE. The next scheduler firing re-claims (or
+ *   takes-over) the sweep row and retries — no escalation evidence is
+ *   silently dropped.
+ *
+ * **actor_type discipline:**
+ *   The sweep endpoint is operator-invoked (cron/scheduler), gated at
+ *   the Fastify layer by `requireAdminActorContext` per closest-
+ *   available role-gate pattern (the canonical `crisis_sweep_scheduler`
+ *   identity has no dedicated JWT role at v0.1 pending SI-024 / Phase A
+ *   role-mapping; admin is the closest-available gate that does NOT
+ *   widen to clinician / patient — see file header in the handler).
+ *   The audit carries `actor_type: 'system'` because the scheduler is a
+ *   non-human background worker; this matches the WORKLOAD_TAXONOMY
+ *   v5.2 §1 nullability rule for non-AI system actors (`ai_workload_type:
+ *   null` + `autonomy_level: null`). When SI-024 lands the canonical
+ *   scheduler-role mapping, the call-site's `actor_type` derivation may
+ *   refine — single-call-site discipline keeps that migration localized.
+ *
+ * **ai_workload_type / autonomy_level discipline:**
+ *   The no-ack escalation is NOT in the I-012 action-class set (I-012
+ *   governs prescribing / refill / medication-order execution
+ *   confirmation per AUDIT_EVENTS v5.3 §I-012 closure rule). The sweep
+ *   scheduler is a non-AI background worker. Per WORKLOAD_TAXONOMY
+ *   v5.2 §1 nullability rule, non-AI emissions from non-AI actors
+ *   carry `ai_workload_type: null` + `autonomy_level: null`.
+ *
+ * **target_patient_id sourcing:**
+ *   The wrapper's RETURNS TABLE does NOT echo patient_id (it returns
+ *   `sweep_execution_id UUID, fencing_token BIGINT, outcome TEXT`). The
+ *   handler resolves patient_id via a side SELECT against
+ *   `crisis_event_current_state_v` under
+ *   `withDbRole('crisis_event_staff_reader', ...)` in the SAME tx
+ *   BEFORE the wrapper call — that read also serves as a tenant-scope
+ *   guard (0 rows on cross-tenant or missing → tenant-blind 404 per
+ *   I-025 before the wrapper is ever invoked). The audit envelope's
+ *   `target_patient_id` is required per the P1 audit partitioning rule
+ *   (SI-022 §3 row 5 + I-027).
+ *
+ * **detail payload:**
+ *   Carries sweep-execution metadata + lifecycle transition correlation
+ *   (no PHI). Fields:
+ *     - patient_id                     UUID (P1 partition mirror)
+ *     - sweep_execution_id             UUID (wrapper RETURNS field)
+ *     - fencing_token                  BIGINT-as-string (wrapper RETURNS
+ *                                       field; serialized as string by
+ *                                       pg driver for safe JSON round-
+ *                                       trip past JS Number.MAX_SAFE_INT)
+ *     - sweep_outcome                  always 'completed_escalated' at
+ *                                       this emit point (the handler
+ *                                       calls this ONLY for that outcome
+ *                                       per the discipline above)
+ *     - target_obligation_generation   INT (input echo for correlation)
+ *     - claim_ttl_seconds              INT (input echo for correlation)
+ *     - worker_id                      TEXT (scheduler worker identity
+ *                                       passed through to wrapper; aids
+ *                                       post-incident reconstruction of
+ *                                       which scheduler fired)
+ */
+export async function emitCrisisNoAcknowledgementEscalationAudit(
+  args: {
+    tenantId: TenantId;
+    /** Actor account id for the scheduler worker. Sprint 2 PR 6 gates
+     *  via `requireAdminActorContext` so this is the admin actor's
+     *  accountId; when SI-024 lands the canonical
+     *  `crisis_sweep_scheduler` JWT-role mapping, this will be the
+     *  scheduler worker's principal id. */
+    actorAccountId: string;
+    /** Actor's home tenant per F-4 attribution. For an admin acting in
+     *  the same tenant this equals `tenantId`; for cross-tenant
+     *  platform-admin invocation this carries the admin's home
+     *  tenant_id explicitly. */
+    actorTenantId: string;
+    countryOfCare: string;
+    crisisEventId: CrisisEventId;
+    targetPatientId: string;
+    sweepExecutionId: CrisisSweepExecutionId;
+    /** BIGINT serialized as string by the pg driver (safe JSON
+     *  round-trip past JS Number.MAX_SAFE_INTEGER). */
+    fencingToken: string;
+    /** Always `'completed_escalated'` at this emit point per the
+     *  emission discipline documented above; carried explicitly so the
+     *  detail payload mirrors the wrapper's full RETURNS shape for
+     *  post-incident correlation. */
+    sweepOutcome: Extract<CrisisSweepOutcome, 'completed_escalated'>;
+    targetObligationGeneration: number;
+    claimTtlSeconds: number;
+    workerId: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const input: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: args.tenantId,
+    // Sweep scheduler is a non-human background worker. When SI-024
+    // lands the canonical `crisis_sweep_scheduler` JWT-role mapping,
+    // the call site MAY branch on bound identity to refine actor_type;
+    // for v0.1 the operator-invoked admin path carries `system`.
+    actor_type: 'system',
+    actor_id: args.actorAccountId,
+    actor_tenant_id: args.actorTenantId,
+    target_patient_id: args.targetPatientId,
+    delegate_context: null,
+    action: crisisAuditPlaceholder('crisis.no_acknowledgement_escalation'),
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: 'crisis_event',
+    resource_id: args.crisisEventId,
+    detail: {
+      patient_id: args.targetPatientId,
+      sweep_execution_id: args.sweepExecutionId,
+      fencing_token: args.fencingToken,
+      sweep_outcome: args.sweepOutcome,
+      target_obligation_generation: args.targetObligationGeneration,
+      claim_ttl_seconds: args.claimTtlSeconds,
+      worker_id: args.workerId,
+      // Single allowed to_state path at this emit point per migration
+      // 038 §1.2: latest state was either `detected` or `escalated`,
+      // and the wrapper escalates to `escalated`. The transition
+      // reason is `no_acknowledgement_timeout` for detected→escalated
+      // OR `tier_progression_no_acknowledgement` for escalated→
+      // escalated. Carried for post-incident correlation; the
+      // canonical row in `crisis_event_lifecycle_transition` is
+      // authoritative.
+      to_state: 'escalated',
+    },
+    engine_versions: null,
+    // Per WORKLOAD_TAXONOMY v5.2 §1 nullability rule, non-AI emissions
+    // from non-AI actors carry null/null.
     ai_workload_type: null,
     autonomy_level: null,
     agent_id: null,
