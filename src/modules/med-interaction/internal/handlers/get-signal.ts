@@ -100,8 +100,8 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { withTransaction } from '../../../../lib/db.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';

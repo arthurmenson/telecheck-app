@@ -37,8 +37,8 @@
  * handlers' integration tests exercise the same Option B composition.
  */
 
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 import { getSignalHandler } from './get-signal.js';
 
@@ -72,30 +72,24 @@ vi.mock('../../../../lib/db.js', () => ({
 }));
 
 vi.mock('../../../../lib/rls.js', () => ({
-  withTenantContext: vi.fn(
-    async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withTenantContext:${tenantId}`);
-      return fn();
-    },
-  ),
+  withTenantContext: vi.fn(async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withTenantContext:${tenantId}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/actor-context-binding.js', () => ({
-  withActorContext: vi.fn(
-    async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withActorContext:${nonce}`);
-      return fn();
-    },
-  ),
+  withActorContext: vi.fn(async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withActorContext:${nonce}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/with-db-role.js', () => ({
-  withDbRole: vi.fn(
-    async (_tx: unknown, role: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withDbRole:${role}`);
-      return fn();
-    },
-  ),
+  withDbRole: vi.fn(async (_tx: unknown, role: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withDbRole:${role}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/tenant-context.js', () => ({

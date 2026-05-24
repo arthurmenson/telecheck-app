@@ -119,7 +119,7 @@ export const SLICE_ROLES = [
   'medication_interaction_knowledge_base_updater',
 ] as const;
 
-export type SliceRole = typeof SLICE_ROLES[number];
+export type SliceRole = (typeof SLICE_ROLES)[number];
 
 const SLICE_ROLES_SET: ReadonlySet<string> = new Set<string>(SLICE_ROLES);
 
@@ -216,9 +216,7 @@ export async function withDbRole<T>(
   // compositions correct — the inner restore returns to the OUTER slice
   // role, not to telecheck_app_role, preserving the outer scope's
   // intended elevation.
-  const priorRoleResult = await tx.query<{ current_user: string }>(
-    'SELECT current_user',
-  );
+  const priorRoleResult = await tx.query<{ current_user: string }>('SELECT current_user');
   const priorRole = priorRoleResult.rows[0]?.current_user;
   if (typeof priorRole !== 'string' || priorRole.length === 0) {
     throw new Error(
@@ -269,6 +267,11 @@ export async function withDbRole<T>(
         // failure we must NOT swallow. Caller (or surrounding tx) must
         // see the failure so they don't continue work under the elevated
         // role. Annotate the error so operators understand the scenario.
+        // The throw-in-finally is intentional and guarded by `!fnThrew` (it
+        // only fires when no in-flight error exists to shadow), closing the
+        // R3 HIGH-1 "restore-failure silent on successful fn" finding; the
+        // no-unsafe-finally rule cannot see the guard, so disable at this site.
+        // eslint-disable-next-line no-unsafe-finally
         throw new Error(
           `withDbRole: prior-role restoration failed after successful ` +
             `callback. The transaction may still hold the elevated slice ` +

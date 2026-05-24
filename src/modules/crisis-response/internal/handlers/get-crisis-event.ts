@@ -143,8 +143,7 @@ import type {
  * drift; the canonical CDM v1.10 §4.NEW1 + migration 033 §4 use UUID.
  * Choosing the DB-aligned validator is the only correct option.
  */
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function isUuidShape(raw: string): boolean {
   return UUID_PATTERN.test(raw);
@@ -227,9 +226,7 @@ export async function getCrisisEventHandler(
     throw req.server.httpErrors.badRequest('Path param `id` is required.');
   }
   if (!isUuidShape(idParam)) {
-    throw req.server.httpErrors.badRequest(
-      'Path param `id` must be a UUID (8-4-4-4-12 hex form).',
-    );
+    throw req.server.httpErrors.badRequest('Path param `id` must be a UUID (8-4-4-4-12 hex form).');
   }
 
   // Phase 4 — open tx + compose context helpers in canonical order

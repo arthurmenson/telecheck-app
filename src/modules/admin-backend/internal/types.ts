@@ -37,16 +37,12 @@ type Brand<T, TBrand extends string> = T & { readonly [__brand]: TBrand };
 // ---------------------------------------------------------------------------
 
 export type AdminDashboardQueryExecutionId = Brand<bigint, 'AdminDashboardQueryExecutionId'>;
-export function asAdminDashboardQueryExecutionId(
-  raw: bigint,
-): AdminDashboardQueryExecutionId {
+export function asAdminDashboardQueryExecutionId(raw: bigint): AdminDashboardQueryExecutionId {
   return raw as AdminDashboardQueryExecutionId;
 }
 
 export type FormsTemplateAdminReviewId = Brand<string, 'FormsTemplateAdminReviewId'>;
-export function asFormsTemplateAdminReviewId(
-  raw: string,
-): FormsTemplateAdminReviewId {
+export function asFormsTemplateAdminReviewId(raw: string): FormsTemplateAdminReviewId {
   return raw as FormsTemplateAdminReviewId;
 }
 
@@ -97,13 +93,14 @@ export type FormsTemplateAdminReviewTransitionReason =
   | 'clinician_decision_request_revision'
   | 'revision_resubmission';
 
-export const FORMS_TEMPLATE_ADMIN_REVIEW_TRANSITION_REASONS: readonly FormsTemplateAdminReviewTransitionReason[] = [
-  'initial_submission',
-  'clinician_decision_approve',
-  'clinician_decision_reject',
-  'clinician_decision_request_revision',
-  'revision_resubmission',
-] as const;
+export const FORMS_TEMPLATE_ADMIN_REVIEW_TRANSITION_REASONS: readonly FormsTemplateAdminReviewTransitionReason[] =
+  [
+    'initial_submission',
+    'clinician_decision_approve',
+    'clinician_decision_reject',
+    'clinician_decision_request_revision',
+    'revision_resubmission',
+  ] as const;
 
 // ---------------------------------------------------------------------------
 // Decision API enum — per CDM §4.NEW8f wrapper signature.

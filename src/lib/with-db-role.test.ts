@@ -16,17 +16,17 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { SLICE_ROLES, assertSliceRole, withDbRole, type SliceRole } from './with-db-role.js';
 import type { DbClient } from './db.js';
+import { SLICE_ROLES, assertSliceRole, withDbRole, type SliceRole } from './with-db-role.js';
 
 // Minimal DbClient mock — exposes `query` only.
 // `priorRoleResult` controls what the captured `SELECT current_user`
 // returns; default 'telecheck_app_role' simulates an outermost
 // invocation from the Fastify login role.
-function mockTx(opts?: {
-  priorRole?: string;
-  failOnRestore?: boolean;
-}): { tx: DbClient; calls: { sql: string; params: unknown[] | undefined }[] } {
+function mockTx(opts?: { priorRole?: string; failOnRestore?: boolean }): {
+  tx: DbClient;
+  calls: { sql: string; params: unknown[] | undefined }[];
+} {
   const priorRole = opts?.priorRole ?? 'telecheck_app_role';
   const failOnRestore = opts?.failOnRestore ?? false;
   const calls: { sql: string; params: unknown[] | undefined }[] = [];
@@ -132,9 +132,9 @@ describe('with-db-role §2 — SET LOCAL ROLE issued + restored', () => {
     const { tx } = mockTx();
     // Cast to SliceRole to simulate a code path that widened the type.
     const tamperedRole = 'postgres' as SliceRole;
-    await expect(
-      withDbRole(tx, tamperedRole, async () => undefined),
-    ).rejects.toThrow(/not an allowlisted slice role/);
+    await expect(withDbRole(tx, tamperedRole, async () => undefined)).rejects.toThrow(
+      /not an allowlisted slice role/,
+    );
   });
 
   it('aborts elevation if SELECT current_user returns empty (cannot restore safely)', async () => {
@@ -146,9 +146,9 @@ describe('with-db-role §2 — SET LOCAL ROLE issued + restored', () => {
         return { rows: [], rowCount: 0 };
       }),
     } as unknown as DbClient;
-    await expect(
-      withDbRole(tx, 'crisis_initiator', async () => undefined),
-    ).rejects.toThrow(/could not read current_user/);
+    await expect(withDbRole(tx, 'crisis_initiator', async () => undefined)).rejects.toThrow(
+      /could not read current_user/,
+    );
     // Critically: SET LOCAL ROLE crisis_initiator was NOT issued.
     const calls = (tx.query as ReturnType<typeof vi.fn>).mock.calls;
     expect(calls).toHaveLength(1);
