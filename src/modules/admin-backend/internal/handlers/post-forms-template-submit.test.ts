@@ -146,6 +146,12 @@ function makeReq(opts?: {
     headers: opts?.headers ?? {},
     id: 'req-test-id-12345',
     server: { httpErrors },
+    log: {
+      warn: vi.fn(),
+      info: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
   } as unknown as FastifyRequest;
 }
 
@@ -545,5 +551,181 @@ describe('postFormsTemplateSubmitHandler §7 — revision_resubmission path', ()
 
     const [auditArgs] = vi.mocked(emitTemplateSubmittedForReviewAudit).mock.calls[0]!;
     expect(auditArgs.path).toBe('revision_resubmission');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §8 — PR #205 Codex R1 Finding 1: draft-only state guard
+//
+//      The wrapper raises 42P17 (invalid_object_state) when the parent
+//      template is not in `draft` status or has been soft-deleted. The
+//      handler:
+//        (a) catches 42P17 inside the same try/catch that wraps the
+//            entire withDbRole call (so the catch sees the raw PG error
+//            BEFORE the role is restored);
+//        (b) logs templateId + tenantId via req.log.warn (server-side
+//            only; never echoed in the response per I-025);
+//        (c) throws TemplateStateConflictError so the
+//            withIdempotentExecution mapServiceError can branch on a
+//            typed discriminator and emit a tenant-blind 409;
+//        (d) does NOT emit the audit (audit emission is downstream of
+//            the wrapper success path; rejected submissions correctly
+//            leave no audit row).
+// ---------------------------------------------------------------------------
+
+import { TemplateStateConflictError } from '../errors.js';
+
+describe('postFormsTemplateSubmitHandler §8 — PR #205 Codex R1 Finding 1: draft-only state guard', () => {
+  it('§8a wrapper-side 42P17 (template not in draft) → TemplateStateConflictError thrown + req.log.warn called with templateId+tenantId (server-side only) + no audit emitted', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+
+    // Simulate wrapper draft-only guard raise (migration 052).
+    const wrapperError = Object.assign(
+      new Error(
+        'admin-template-submit-invalid-state: template 01HFG... is not in draft state (status=published, deleted_at=null)',
+      ),
+      { code: '42P17' },
+    );
+    tx.query.mockRejectedValueOnce(wrapperError);
+
+    const req = makeReq({
+      actorNonce: 'fake-nonce',
+      actorContext: { accountId: ACTOR_ACCOUNT_ID },
+    });
+
+    let thrown: unknown;
+    try {
+      await postFormsTemplateSubmitHandler(req, makeReply());
+    } catch (e) {
+      thrown = e;
+    }
+
+    // The handler MUST wrap the raw PG error in a typed conflict so the
+    // mapper has a stable discriminator (vs. stringly-typed SQLSTATE
+    // comparison only).
+    expect(thrown).toBeInstanceOf(TemplateStateConflictError);
+    const tsce = thrown as TemplateStateConflictError;
+    expect(tsce.code).toBe('template_state_conflict');
+    expect(tsce.templateId).toBe(VALID_TEMPLATE_ID);
+    expect(tsce.tenantId).toBe('Telecheck-US');
+
+    // Internal logging fires with the discriminators (server-side only).
+    const logWarn = (req.log as unknown as { warn: ReturnType<typeof vi.fn> }).warn;
+    expect(logWarn).toHaveBeenCalledTimes(1);
+    const [logCtx, logMsg] = logWarn.mock.calls[0]!;
+    expect(logCtx).toMatchObject({
+      template_id: VALID_TEMPLATE_ID,
+      tenant_id: 'Telecheck-US',
+      pg_sqlstate: '42P17',
+    });
+    expect(String(logMsg)).toContain('draft state');
+
+    // No audit on the rejected submit path. The wrapper raised inside
+    // withDbRole BEFORE the audit emission code runs; the catch
+    // converted the raw error into the typed conflict and propagated.
+    expect(emitTemplateSubmittedForReviewAudit).not.toHaveBeenCalled();
+  });
+
+  it('§8b mapServiceError maps TemplateStateConflictError → 409 with tenant-blind body (no templateId / tenantId leak per I-025)', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+
+    // Capture mapServiceError as in §6b.
+    let capturedMapper: ((err: unknown, reply: FastifyReply, reqId: string) => boolean) | null =
+      null;
+    vi.mocked(withIdempotentExecution).mockImplementation(
+      async (_req, _reply, mapErr, _body) => {
+        capturedMapper = mapErr;
+        return { status: 201, view: { review_id: RETURNED_REVIEW_ID } };
+      },
+    );
+
+    await postFormsTemplateSubmitHandler(
+      makeReq({
+        actorNonce: 'fake-nonce',
+        actorContext: { accountId: ACTOR_ACCOUNT_ID },
+      }),
+      makeReply(),
+    );
+
+    expect(capturedMapper).not.toBeNull();
+
+    // Typed error → 409 envelope.
+    {
+      const reply = makeReply();
+      const typedErr = new TemplateStateConflictError(
+        VALID_TEMPLATE_ID,
+        'Telecheck-US',
+        'is not in draft state',
+      );
+      const handled = capturedMapper!(typedErr, reply, 'req-tsce');
+      expect(handled).toBe(true);
+      expect(reply.code).toHaveBeenCalledWith(409);
+
+      const sendBody = vi.mocked(reply.send).mock.calls[0]![0] as {
+        error?: { code?: string; message?: string };
+      };
+      expect(sendBody.error?.code).toBe('admin.template_state_conflict');
+      // I-025: tenant + template identifiers MUST NOT leak.
+      expect(sendBody.error?.message ?? '').not.toContain(VALID_TEMPLATE_ID);
+      expect(sendBody.error?.message ?? '').not.toContain('Telecheck-US');
+      expect(sendBody.error?.message ?? '').not.toContain('Telecheck-Ghana');
+      expect(sendBody.error?.message ?? '').toMatch(/state|draft|refresh/i);
+    }
+
+    // Raw 42P17 (defense-in-depth — if a future code path lets the PG
+    // error through unwrapped, the mapper still produces the canonical
+    // 409 envelope).
+    {
+      const reply = makeReply();
+      const handled = capturedMapper!({ code: '42P17' }, reply, 'req-raw');
+      expect(handled).toBe(true);
+      expect(reply.code).toHaveBeenCalledWith(409);
+
+      const sendBody = vi.mocked(reply.send).mock.calls[0]![0] as {
+        error?: { code?: string; message?: string };
+      };
+      expect(sendBody.error?.code).toBe('admin.template_state_conflict');
+      expect(sendBody.error?.message ?? '').not.toContain(VALID_TEMPLATE_ID);
+      expect(sendBody.error?.message ?? '').not.toContain('Telecheck-');
+    }
+  });
+
+  it('§8c 42501 catch precedes 42P17 catch in error-discrimination order — a tenant-scope error is NEVER re-classified as a state conflict', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+
+    // 42501 + 42P17 are mutually exclusive at the wrapper, but the
+    // handler discriminator ordering matters for defense-in-depth
+    // against any future code path that conflates them. Pin the
+    // ordering by checking that a 42501 raise still maps to forbidden
+    // (403), NOT to the state-conflict path.
+    const tenantScopeError = Object.assign(
+      new Error('tenant scope mismatch'),
+      { code: '42501' },
+    );
+    tx.query.mockRejectedValueOnce(tenantScopeError);
+
+    const req = makeReq({
+      actorNonce: 'fake-nonce',
+      actorContext: { accountId: ACTOR_ACCOUNT_ID },
+    });
+
+    let thrown: unknown;
+    try {
+      await postFormsTemplateSubmitHandler(req, makeReply());
+    } catch (e) {
+      thrown = e;
+    }
+
+    expect((thrown as { statusCode?: number }).statusCode).toBe(403);
+    expect(thrown).not.toBeInstanceOf(TemplateStateConflictError);
+
+    // The 42P17 logger MUST NOT fire on a 42501 path — pin this so a
+    // future regression that broadens the catch can't silently start
+    // logging templateId/tenantId on every forbidden submit.
+    const logWarn = (req.log as unknown as { warn: ReturnType<typeof vi.fn> }).warn;
+    expect(logWarn).not.toHaveBeenCalled();
   });
 });

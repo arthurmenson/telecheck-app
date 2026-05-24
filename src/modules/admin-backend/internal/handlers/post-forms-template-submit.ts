@@ -48,6 +48,9 @@
  *            409 on idempotency conflicts (body_mismatch / in_flight) per
  *                IDEMPOTENCY v5.1 + on wrapper-side 40001 (in-flight
  *                pending review for same template) per migration 043 §1
+ *                + on wrapper-side 42P17 (template not in `draft` status
+ *                or soft-deleted) per migration 052 (PR #205 Codex R1
+ *                Finding 1)
  *            404 on wrapper-side 02000 (template not found)
  *
  * **Wrapper signature mapped (migration 043 §1):**
@@ -115,6 +118,7 @@ import { withTenantContext } from '../../../../lib/rls.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { emitTemplateSubmittedForReviewAudit } from '../../audit.js';
+import { TemplateStateConflictError } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // ULID validation — `forms_template.template_id` is VARCHAR(26) ULID per
@@ -160,7 +164,8 @@ interface LatestTransitionRow {
 
 /**
  * Service-error mapper for the withIdempotentExecution wrapper. Maps
- * wrapper-raised PG SQLSTATEs to canonical HTTP envelopes:
+ * wrapper-raised PG SQLSTATEs (and the wrapping typed errors thrown from
+ * the handler body) to canonical HTTP envelopes:
  *
  *   42501 → 403 tenant-blind (I-025)        — already handled inside the
  *                                              handler body via the
@@ -173,11 +178,37 @@ interface LatestTransitionRow {
  *                                              for a pending_review or
  *                                              revision_requested review
  *                                              on the same template
+ *   42P17 → 409 (template state conflict)   — wrapper "not in draft state"
+ *                                              raised after the FOR UPDATE
+ *                                              acquires (atomic with the
+ *                                              row lock; no TOCTOU). The
+ *                                              handler body wraps this in
+ *                                              `TemplateStateConflictError`
+ *                                              for typed observability;
+ *                                              the mapper also branches
+ *                                              defensively on the raw
+ *                                              SQLSTATE in case a future
+ *                                              code path lets the raw PG
+ *                                              error through unwrapped.
  *
  * Returns `true` if the error was mapped (handler returns reply); `false`
  * to propagate to Fastify's global error handler.
  */
 function mapServiceError(err: unknown, reply: FastifyReply, _reqId: string): boolean {
+  // Typed conflict from the handler-body 42P17 catch. Mapped FIRST because
+  // it's the canonical signal — the raw 42P17 branch below is defense in
+  // depth.
+  if (err instanceof TemplateStateConflictError) {
+    reply.code(409).send({
+      error: {
+        code: 'admin.template_state_conflict',
+        message:
+          'Template state changed since submission was attempted. Refresh and retry if the template is still in draft.',
+        request_id: _reqId,
+      },
+    });
+    return true;
+  }
   if (typeof err !== 'object' || err === null || !('code' in err)) {
     return false;
   }
@@ -210,6 +241,21 @@ function mapServiceError(err: unknown, reply: FastifyReply, _reqId: string): boo
         code: 'admin.template_review_in_flight',
         message:
           'Template already has an in-flight admin review. Resolve or cancel it before re-submitting.',
+        request_id: _reqId,
+      },
+    });
+    return true;
+  }
+  if (code === '42P17') {
+    // Defensive — primary path is the body try/catch that wraps in
+    // TemplateStateConflictError. This branch catches a future code
+    // path that lets the raw PG error through unwrapped. Tenant-blind
+    // envelope identical to the typed-error path above.
+    reply.code(409).send({
+      error: {
+        code: 'admin.template_state_conflict',
+        message:
+          'Template state changed since submission was attempted. Refresh and retry if the template is still in draft.',
         request_id: _reqId,
       },
     });
@@ -320,10 +366,40 @@ export async function postFormsTemplateSubmitHandler(
           if (
             typeof err === 'object' &&
             err !== null &&
-            'code' in err &&
-            (err as { code?: unknown }).code === '42501'
+            'code' in err
           ) {
-            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+            const errCode = (err as { code?: unknown }).code;
+            if (errCode === '42501') {
+              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+            }
+            // PR #205 Codex R1 Finding 1: wrapper raises 42P17
+            // (invalid_object_state) when the parent template is not in
+            // `draft` status or has been soft-deleted. Wrap the raw PG
+            // error in a typed `TemplateStateConflictError` so the
+            // mapper can branch on a stable discriminator instead of
+            // stringly-typed SQLSTATE comparisons. Log the
+            // template_id / tenant_id internally via req.log.warn
+            // (server-side only); the tenant-blind 409 envelope at the
+            // mapper does NOT echo these IDs per I-025.
+            if (errCode === '42P17') {
+              const errMessageProp = (err as { message?: unknown }).message;
+              const errSummary: string | undefined =
+                typeof errMessageProp === 'string' ? errMessageProp : undefined;
+              req.log.warn(
+                {
+                  template_id: templateId,
+                  tenant_id: ctx.tenantId,
+                  pg_sqlstate: '42P17',
+                  err_summary: errSummary,
+                },
+                'submit-for-review rejected: template not in draft state (PR #205 Codex R1 Finding 1 guard)',
+              );
+              throw new TemplateStateConflictError(
+                templateId,
+                ctx.tenantId,
+                'is not in draft state — submission rejected by SECDEF wrapper draft-only guard',
+              );
+            }
           }
           throw err;
         }
