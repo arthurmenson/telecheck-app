@@ -128,6 +128,29 @@ async function applyMigrations(client: Client): Promise<void> {
       )
     `);
 
+    // Provision the production application login role `telecheck_app_role`
+    // BEFORE the migration loop. In production this role is created by IaC
+    // (the app's DB login principal); migrations assume it already exists.
+    // Migration 051 (Option B app-role acquisition foundation) does an
+    // UNGUARDED `ALTER ROLE telecheck_app_role NOINHERIT` + grants the 13
+    // slice roles to it, so the chain aborts at 051 if the role is absent —
+    // which is why the integration suite could not apply migrations end to
+    // end. Mirror the IaC provisioning here (idempotent, NOLOGIN so no
+    // password is needed in tests). NOTE: this is NOT the session role the
+    // tests run as — that remains `telecheck_test_app` (installTestAppRole
+    // below). telecheck_app_role only needs to EXIST so 051's ALTER/GRANT
+    // succeed under the superuser migration session; the per-handler
+    // SET LOCAL ROLE elevation path is exercised by slice-level opt-in tests.
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'telecheck_app_role') THEN
+          CREATE ROLE telecheck_app_role NOLOGIN NOSUPERUSER NOBYPASSRLS;
+        END IF;
+      END
+      $$;
+    `);
+
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((f) => f.endsWith('.sql') && !f.startsWith('rollback'))
       .sort(); // lexicographic sort → 000, 001, 002 ... is correct
