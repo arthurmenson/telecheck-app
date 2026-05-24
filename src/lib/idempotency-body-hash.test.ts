@@ -33,11 +33,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import {
-  CANONICAL_EMPTY_BODY,
-  canonicalBodyForHash,
-  hashBody,
-} from './idempotency.js';
+import { CANONICAL_EMPTY_BODY, canonicalBodyForHash, hashBody } from './idempotency.js';
 
 describe('canonicalBodyForHash — empty-body equivalence class (PR #205 Codex R1 Finding 2)', () => {
   it('CANONICAL_EMPTY_BODY is the literal empty string (smallest representable input)', () => {
@@ -79,9 +75,7 @@ describe('canonicalBodyForHash — empty-body equivalence class (PR #205 Codex R
     // And specifically, they equal the SHA-256 of the empty string —
     // the documented sentinel value (e3b0c44...). Pin so a future
     // change to CANONICAL_EMPTY_BODY surfaces here.
-    expect(hashes[0]).toBe(
-      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
-    );
+    expect(hashes[0]).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
   });
 });
 

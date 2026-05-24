@@ -68,9 +68,9 @@ vi.mock('../../audit.js', () => ({
 }));
 
 // Imports AFTER vi.mock declarations.
+import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
-import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -129,10 +129,8 @@ function makeReq(opts?: {
   headers?: Record<string, string>;
 }): FastifyRequest {
   const httpErrors = {
-    forbidden: (msg?: string) =>
-      Object.assign(new Error(msg ?? 'Forbidden'), { statusCode: 403 }),
-    notFound: (msg?: string) =>
-      Object.assign(new Error(msg ?? 'Not Found'), { statusCode: 404 }),
+    forbidden: (msg?: string) => Object.assign(new Error(msg ?? 'Forbidden'), { statusCode: 403 }),
+    notFound: (msg?: string) => Object.assign(new Error(msg ?? 'Not Found'), { statusCode: 404 }),
     badRequest: (msg?: string) =>
       Object.assign(new Error(msg ?? 'Bad Request'), { statusCode: 400 }),
     unauthorized: (msg?: string) =>
@@ -174,20 +172,18 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
   );
   vi.mocked(requireAdminRole).mockReturnValue('platform_admin');
   vi.mocked(resolveActorTenantIdForAudit).mockReturnValue(FAKE_TENANT_CTX.tenantId);
-  vi.mocked(withIdempotentExecution).mockImplementation(
-    async (_req, _reply, _mapErr, body) => {
-      // Pass the fake tx into the body callback + return whatever it
-      // returns (mirrors the production helper's success path).
-      const idempotencyCtx = {
-        tenantId: FAKE_TENANT_CTX.tenantId,
-        idempotencyKey: 'fake-idempotency-key',
-        endpoint: '/v1/admin/templates/' + VALID_TEMPLATE_ID + '/submit-for-review',
-        actorId: ACTOR_ACCOUNT_ID,
-        bodyHash: 'fake-body-hash',
-      };
-      return body(tx as unknown as Parameters<typeof body>[0], idempotencyCtx);
-    },
-  );
+  vi.mocked(withIdempotentExecution).mockImplementation(async (_req, _reply, _mapErr, body) => {
+    // Pass the fake tx into the body callback + return whatever it
+    // returns (mirrors the production helper's success path).
+    const idempotencyCtx = {
+      tenantId: FAKE_TENANT_CTX.tenantId,
+      idempotencyKey: 'fake-idempotency-key',
+      endpoint: '/v1/admin/templates/' + VALID_TEMPLATE_ID + '/submit-for-review',
+      actorId: ACTOR_ACCOUNT_ID,
+      bodyHash: 'fake-body-hash',
+    };
+    return body(tx as unknown as Parameters<typeof body>[0], idempotencyCtx);
+  });
   vi.mocked(withTenantContext).mockImplementation(async (_client, _tenantId, fn) =>
     fn(tx as unknown as Parameters<typeof fn>[0]),
   );
@@ -260,9 +256,9 @@ describe('postFormsTemplateSubmitHandler §2 — tenant guard precedes tx', () =
       throw new Error('tenantContext absent — programming error');
     });
 
-    await expect(
-      postFormsTemplateSubmitHandler(makeReq(), makeReply()),
-    ).rejects.toThrow(/tenantContext absent/);
+    await expect(postFormsTemplateSubmitHandler(makeReq(), makeReply())).rejects.toThrow(
+      /tenantContext absent/,
+    );
 
     expect(requireAdminRole).not.toHaveBeenCalled();
     expect(withIdempotentExecution).not.toHaveBeenCalled();
@@ -282,9 +278,9 @@ describe('postFormsTemplateSubmitHandler §3 — admin-role guard precedes tx', 
       throw new Error('forbidden: actor lacks admin role');
     });
 
-    await expect(
-      postFormsTemplateSubmitHandler(makeReq(), makeReply()),
-    ).rejects.toThrow(/forbidden/);
+    await expect(postFormsTemplateSubmitHandler(makeReq(), makeReply())).rejects.toThrow(
+      /forbidden/,
+    );
 
     expect(withIdempotentExecution).not.toHaveBeenCalled();
   });
@@ -346,10 +342,9 @@ describe('postFormsTemplateSubmitHandler §4 — wrapper error mapping (42501 �
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
-    const otherPgError = Object.assign(
-      new Error('connection terminated unexpectedly'),
-      { code: '57P01' },
-    );
+    const otherPgError = Object.assign(new Error('connection terminated unexpectedly'), {
+      code: '57P01',
+    });
     tx.query.mockRejectedValueOnce(otherPgError);
 
     let thrown: unknown;
@@ -463,12 +458,10 @@ describe('postFormsTemplateSubmitHandler §6 — idempotency wrapper integration
     // body callback; here we test the mapper shape independently).
     let capturedMapper: ((err: unknown, reply: FastifyReply, reqId: string) => boolean) | null =
       null;
-    vi.mocked(withIdempotentExecution).mockImplementation(
-      async (_req, _reply, mapErr, _body) => {
-        capturedMapper = mapErr;
-        return { status: 201, view: { review_id: RETURNED_REVIEW_ID } };
-      },
-    );
+    vi.mocked(withIdempotentExecution).mockImplementation(async (_req, _reply, mapErr, _body) => {
+      capturedMapper = mapErr;
+      return { status: 201, view: { review_id: RETURNED_REVIEW_ID } };
+    });
 
     await postFormsTemplateSubmitHandler(
       makeReq({
@@ -634,12 +627,10 @@ describe('postFormsTemplateSubmitHandler §8 — PR #205 Codex R1 Finding 1: dra
     // Capture mapServiceError as in §6b.
     let capturedMapper: ((err: unknown, reply: FastifyReply, reqId: string) => boolean) | null =
       null;
-    vi.mocked(withIdempotentExecution).mockImplementation(
-      async (_req, _reply, mapErr, _body) => {
-        capturedMapper = mapErr;
-        return { status: 201, view: { review_id: RETURNED_REVIEW_ID } };
-      },
-    );
+    vi.mocked(withIdempotentExecution).mockImplementation(async (_req, _reply, mapErr, _body) => {
+      capturedMapper = mapErr;
+      return { status: 201, view: { review_id: RETURNED_REVIEW_ID } };
+    });
 
     await postFormsTemplateSubmitHandler(
       makeReq({
@@ -701,10 +692,7 @@ describe('postFormsTemplateSubmitHandler §8 — PR #205 Codex R1 Finding 1: dra
     // against any future code path that conflates them. Pin the
     // ordering by checking that a 42501 raise still maps to forbidden
     // (403), NOT to the state-conflict path.
-    const tenantScopeError = Object.assign(
-      new Error('tenant scope mismatch'),
-      { code: '42501' },
-    );
+    const tenantScopeError = Object.assign(new Error('tenant scope mismatch'), { code: '42501' });
     tx.query.mockRejectedValueOnce(tenantScopeError);
 
     const req = makeReq({

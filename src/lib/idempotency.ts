@@ -214,7 +214,7 @@ export function hashBody(body: string): string {
  * any future helper that needs to reason about the empty-body
  * equivalence class.
  */
-export const CANONICAL_EMPTY_BODY = '' as const;
+export const CANONICAL_EMPTY_BODY = '';
 
 /**
  * Normalize a Fastify `request.body` value to the canonical string used
