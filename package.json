@@ -21,6 +21,7 @@
     "format": "prettier --write \"src/**/*.{ts,tsx,json}\" \"tests/**/*.{ts,tsx}\" \"*.{json,md}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,json}\" \"tests/**/*.{ts,tsx}\" \"*.{json,md}\"",
     "typecheck": "tsc --noEmit",
+    "check:migration-bom": "node scripts/check-migration-bom.mjs",
     "openapi:validate": "echo 'TODO: wire swagger-cli validate against ../telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_OpenAPI_v0_2.md'",
     "migrate:diff": "echo 'TODO: wire prisma migrate diff against current schema'",
     "prepare": "echo 'TODO: husky install once first slice begins'"

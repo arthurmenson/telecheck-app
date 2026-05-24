@@ -7,6 +7,7 @@
 - **RLS policies are mandatory** on every PHI-touching table. The `post-edit-tenant-scoped-table` hook (per EHBG §13) validates that any new tenant-scoped table has an RLS policy attached before allowing commit.
 - **Audit table is append-only.** Migrations affecting `audit_records` MUST NOT introduce DELETE / UPDATE paths. Pre-write audit-table-protection hook (per EHBG §13) blocks such migrations.
 - **Every migration has a rollback companion** at `migrations/rollback/<N>_rollback.sql`. Rollback is reviewed alongside the migration.
+- **Clean-room forward apply is gated in CI.** `scripts/check-migration-chain.sh` applies `000 → head` on a pristine database (and asserts every migration has a rollback companion); `.github/workflows/migration-chain.yml` runs it against a fresh Postgres service container on any change under `migrations/`. Run locally with `CHAIN_DATABASE_URL=postgres://… ./scripts/check-migration-chain.sh`.
 - **Schema changes are additive where possible.** Destructive changes (DROP, ALTER COLUMN narrowing) require Engineering Lead + Product Lead sign-off.
 
 ## Layout
