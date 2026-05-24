@@ -102,5 +102,26 @@ jobs:
           $$;
           SQL
 
+      # Migration 047 pins SECURITY DEFINER function ownership to `OWNER TO
+      # postgres` (R2 MED-1 closure 2026-05-23; locked-search-path security
+      # model). Local dev's postgres:15 image creates the `postgres` superuser
+      # by default; the GitHub service container uses POSTGRES_USER=telecheck_ci
+      # so the role doesn't exist by default and 047's ALTER FUNCTION ... OWNER
+      # TO postgres aborts with `role "postgres" does not exist`. Idempotent
+      # bootstrap below mirrors the ci.yml fix.
+      - name: Bootstrap postgres role (cluster-global; consumed by 047 SECURITY DEFINER owner)
+        env:
+          PGPASSWORD: telecheck_ci
+        run: |
+          psql -h localhost -U telecheck_ci -d telecheck_chain -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres') THEN
+              CREATE ROLE postgres SUPERUSER;
+            END IF;
+          END
+          $$;
+          SQL
+
       - name: Verify migration chain (000 -> head, clean-room)
         run: ./scripts/check-migration-chain.sh

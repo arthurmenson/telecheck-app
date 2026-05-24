@@ -165,10 +165,13 @@ export default defineConfig({
      * confidence.
      */
     pool: 'forks',
-    poolOptions: {
-      forks: {
-        singleFork: true,
-      },
+    // Vitest 4 migration (per migration guide § pool-rework):
+    // `poolOptions.<pool>` was promoted to a top-level `<pool>` option.
+    // Before:  poolOptions: { forks: { singleFork: true } }
+    // After:   forks: { singleFork: true }
+    // Semantics unchanged; only the config-key shape moved one level up.
+    forks: {
+      singleFork: true,
     },
 
     /**
