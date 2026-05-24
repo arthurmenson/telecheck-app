@@ -152,6 +152,118 @@ export function hashBody(body: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// canonicalBodyForHash — deterministic body-string normalization
+//
+// PR #205 Codex R1 Finding 2 closure (2026-05-23). The idempotency-key
+// hash is computed from the request body string. The original inline
+// expression at the two call sites (`buildIdempotencyCtx` + the
+// preHandler hook) was:
+//
+//     typeof request.body === 'string' ? request.body : JSON.stringify(request.body ?? '')
+//
+// For an EMPTY POST body, that expression produces THREE different
+// canonical forms depending on how the body arrived at the server:
+//
+//   undefined → JSON.stringify(undefined ?? '') = '""'   (length-2 string)
+//   null      → JSON.stringify(null ?? '')      = '""'   (length-2 string)
+//   ''        → request.body === 'string' branch returns ''  (empty string)
+//   {}        → JSON.stringify({})              = '{}'   (length-2 string)
+//
+// Three different hashes for four semantically-equivalent inputs (all
+// representing "no application-layer body fields"). The IDEMPOTENCY v5.1
+// contract specifies same-key + same-body → idempotent replay; if a
+// retry uses a slightly different on-the-wire representation of "no
+// body" the 4-tuple cache lookup matches but the body-hash diverges,
+// surfacing as a spurious 409 `internal.idempotency.body_mismatch`.
+//
+// For endpoints whose application contract is "empty body" (PR #205
+// submit-for-review is the canonical example — the wrapper signature
+// is fixed; the body is present only for IDEMPOTENCY contract
+// conformance), this is a hard correctness defect: a retry by a
+// well-behaved client could body-mismatch its own original request.
+//
+// Fix: collapse all four "empty body" representations to a single
+// canonical string before hashing. We keep non-empty bodies on their
+// existing path (JSON.stringify for objects, raw string for strings)
+// so the body-hash semantics for endpoints with real payloads are
+// unchanged. Only the empty-body equivalence class is normalized.
+//
+// The canonical sentinel chosen is the literal string '' (empty string)
+// — the smallest representable input, with a stable SHA-256 prefix
+// (e3b0c44...). This is interchangeable with any of '""' / '{}' / etc.
+// for the discrimination purpose; we pick '' because the empty-string
+// case already lives on the no-stringify branch, so this normalization
+// is the smallest behavioral change vs. the prior expression.
+//
+// Forward-compatibility: a future endpoint that legitimately
+// discriminates between `{}` (an explicit empty object) and `null` /
+// undefined (no body sent at all) would break under this
+// normalization. None exist in this codebase; if one is introduced,
+// the contract should be: such endpoints set a `strict_body_hash`
+// flag (TBD) that opts out of the empty-body equivalence class. Until
+// then the canonical contract is documented here: empty-body endpoints
+// derive idempotency from (Idempotency-Key, tenant_id, endpoint,
+// actor_id) only; the body-hash contributes nothing for the empty
+// equivalence class.
+// ---------------------------------------------------------------------------
+
+/**
+ * The canonical empty-body sentinel. Any of `undefined`, `null`, `''`,
+ * `{}`, or `'{}'` (string form of the literal empty object) all map to
+ * this sentinel before hashing. Exported for test assertions and for
+ * any future helper that needs to reason about the empty-body
+ * equivalence class.
+ */
+export const CANONICAL_EMPTY_BODY = '' as const;
+
+/**
+ * Normalize a Fastify `request.body` value to the canonical string used
+ * for SHA-256 hashing in the idempotency 4-tuple cache.
+ *
+ * Behavior:
+ *   - `undefined`, `null` → CANONICAL_EMPTY_BODY (`''`).
+ *   - `''` (empty string)  → CANONICAL_EMPTY_BODY (`''`).
+ *   - `{}` (empty object)  → CANONICAL_EMPTY_BODY (`''`).
+ *     Detected via Object.keys(body).length === 0 + body's prototype
+ *     being Object.prototype (so non-plain objects with no own keys
+ *     don't accidentally collapse).
+ *   - Any string `s`        → `s` verbatim (no JSON.stringify).
+ *   - Any non-empty object   → `JSON.stringify(body)`.
+ *
+ * The empty-array case (`[]`) is NOT folded into the empty-body
+ * equivalence class — an empty array IS a meaningful payload at the
+ * application layer (it represents "an explicit empty collection")
+ * even though it serializes to `[]` (2 bytes). Keep the prior behavior:
+ * `JSON.stringify([])` = `'[]'`.
+ *
+ * Per PR #205 Codex R1 Finding 2 closure. Used by both
+ * `buildIdempotencyCtx` (handler-side pre-compute) and the
+ * `idempotencyPlugin` preHandler hook (cache-lookup body-hash check).
+ * Both call sites MUST use this helper — drift between them would
+ * cause cache misses (preHandler computes hash A, handler computes
+ * hash B, lookup fails → spurious first-request execution + cache
+ * row for hash B).
+ */
+export function canonicalBodyForHash(body: unknown): string {
+  if (body === undefined || body === null) return CANONICAL_EMPTY_BODY;
+  if (typeof body === 'string') {
+    return body.length === 0 ? CANONICAL_EMPTY_BODY : body;
+  }
+  // Empty plain object (`{}`) collapses to the canonical empty-body
+  // sentinel. We restrict the collapse to plain objects so a
+  // class-instance with no enumerable keys (defensive) does NOT
+  // accidentally hash-match an empty `{}`.
+  if (
+    typeof body === 'object' &&
+    Object.getPrototypeOf(body) === Object.prototype &&
+    Object.keys(body as Record<string, unknown>).length === 0
+  ) {
+    return CANONICAL_EMPTY_BODY;
+  }
+  return JSON.stringify(body);
+}
+
+// ---------------------------------------------------------------------------
 // resolveActorId + buildIdempotencyCtx — handler-side helpers.
 // ---------------------------------------------------------------------------
 
@@ -218,8 +330,14 @@ export function buildIdempotencyCtx(request: FastifyRequest): IdempotencyCtx {
   const tenantId = request.tenantContext?.tenantId ?? 'unknown';
   const actorId = resolveActorId(request);
   const endpoint = (request.url.split('?')[0] ?? '') || request.url;
-  const rawBody =
-    typeof request.body === 'string' ? request.body : JSON.stringify(request.body ?? '');
+  // PR #205 Codex R1 Finding 2: route the body through
+  // `canonicalBodyForHash` so all four empty-body representations
+  // (undefined / null / '' / {}) collapse to the same hash. Prior
+  // inline expression produced 3 different hashes for these
+  // semantically-equivalent inputs, breaking IDEMPOTENCY v5.1
+  // same-key + same-body → replay for endpoints whose payload is
+  // empty (PR #205 submit-for-review is the canonical example).
+  const rawBody = canonicalBodyForHash(request.body);
   return {
     tenantId,
     idempotencyKey,
@@ -788,8 +906,14 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
       actorId,
     );
 
-    const rawBody =
-      typeof request.body === 'string' ? request.body : JSON.stringify(request.body ?? '');
+    // PR #205 Codex R1 Finding 2: shared `canonicalBodyForHash` ensures
+    // the preHandler cache-lookup body-hash matches the handler-side
+    // `buildIdempotencyCtx` body-hash for the empty-body equivalence
+    // class. Drift between these two call sites would cause cache
+    // misses (preHandler computes hash A, handler computes hash B,
+    // lookup fails → spurious first-request execution + duplicate
+    // side effects).
+    const rawBody = canonicalBodyForHash(request.body);
     const bodyHash = hashBody(rawBody);
 
     if (existing !== null) {
