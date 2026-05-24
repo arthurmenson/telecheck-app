@@ -154,6 +154,15 @@ Master PRD **v1.10** · Artifact Registry **v2.10** · System Architecture v1.2 
 5. `npm run dev` to start the Fastify app shell
 6. Skills, hooks, and MCP servers configured per EHBG §13 (after first slice begins)
 
-## No code yet
+## Implementation status — read the live continuity sources, not this footer
 
-This repo is the **bootstrap commit only** — no slice implementation has begun. The first slice per EHBG §10 build sequence is **Forms/Intake Engine Slice PRD v2.1** (foundational; many downstream slices depend on it).
+This repo is **well past bootstrap.** Multiple slices are implemented under `src/modules/` and the migration chain runs `000 → 051+`. Because the build advances every firing, **this file does not track current progress** — the authoritative, always-fresh state lives in:
+
+1. **The Addendum trail** — `../telecheckONE/Telecheck_v1_10_PRD_Update/AI_Service_Rollout_24h_Status_2026-05-14.md` (read the LAST addendum first). This is the canonical cross-session continuity mechanism: what shipped, commit SHAs, Codex outcome, next critical-path item.
+2. **`git log --oneline` on `main`** — the merged-PR record.
+3. **The open-PR queue** — `gh`/GitHub-MCP `list_pull_requests`. A standing `[CODEX-PENDING]` queue holds PRs authored but not yet Codex-reviewed/merged; **re-authoring queued work is duplication and is forbidden by the discipline floor.**
+4. **`migrations/`** — the highest-numbered migration is the DB-layer high-water mark.
+
+**Stale-tracking-ref trap (recurring, costly):** a fresh container's local `origin/main` ref can lag the true remote, making the repo look stranded at an old migration. When continuity is in doubt, trust `git ls-remote origin refs/heads/main`, **not** the local tracking ref — then `git fetch origin main` to correct it. This single trap has repeatedly made firings misread the project as far behind its actual state.
+
+The first slice per EHBG §10 build sequence was **Forms/Intake Engine Slice PRD v2.1**; that and subsequent slices (Identity, Consent, Tenant-Config, Async-Consult, Pharmacy, Crisis-Response, Admin-Backend, Med-Interaction, AI-Service) now have implemented module surfaces. Consult the live sources above for per-slice completeness.
