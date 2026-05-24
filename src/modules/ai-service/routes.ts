@@ -129,7 +129,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
       'still blocks on the three Day-3+ prerequisites per Codex PR #210 R1 closure)'
     : 'Mode 2 case-prep (POST /v0/ai/case-prep) is DEFINED but NOT mounted — ' +
       'AI_MODE2_ENABLED=false gates the route registration per Codex PR #210 R1 ' +
-      'NEEDS-WORK closure. POST requests return Fastify\'s documented 404. The flag ' +
+      "NEEDS-WORK closure. POST requests return Fastify's documented 404. The flag " +
       'is held off until clinical-anchor authorization + real protocol-engine ' +
       'provider execution + verified end-to-end audit-emission discipline land in ' +
       'lockstep';

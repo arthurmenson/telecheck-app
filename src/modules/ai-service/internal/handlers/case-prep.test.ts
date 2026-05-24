@@ -120,10 +120,6 @@ vi.mock('../crisis/gate.js', () => ({
 
 // Provider mock — by default the real NullLLMProvider's behavior
 // (always throws LLMProviderUnavailableError). Tests can swap.
-import {
-  LLMProviderUnavailableError,
-  LLMRequestValidationError,
-} from '../providers/types.js';
 
 let providerBehavior: 'unavailable' | 'success' | 'unknown_throw' = 'unavailable';
 vi.mock('../providers/null-provider.js', async () => {
@@ -185,6 +181,8 @@ vi.mock('../../../../lib/glossary.js', () => ({
 // ---------------------------------------------------------------------------
 
 import { requireActorContext } from '../../../../lib/auth-context.js';
+
+// eslint-disable-next-line import/order -- import deliberately placed after vi.mock() hoisting block
 import { mode2CasePrepHandler } from './case-prep.js';
 
 const requireActorContextMock = vi.mocked(requireActorContext);
@@ -195,6 +193,7 @@ const requireActorContextMock = vi.mocked(requireActorContext);
 
 import type { ActorContext } from '../../../../lib/auth-context.js';
 import type { TenantId } from '../../../../lib/glossary.js';
+import { LLMProviderUnavailableError, LLMRequestValidationError } from '../providers/types.js';
 
 function makeClinicianActor(): ActorContext {
   return {

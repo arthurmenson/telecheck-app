@@ -166,7 +166,9 @@ describe('AI Service routes — §M1 Mode 2 case-prep mount gate (OFF)', () => {
     expect(body.mode2_case_prep_mount_gate).toBe('AI_MODE2_ENABLED');
     expect(body.mode2_case_prep_day3_prerequisites).toHaveLength(3);
     expect(body.mode2_case_prep_day3_prerequisites[0]).toContain('clinical_anchor_authorization');
-    expect(body.mode2_case_prep_day3_prerequisites[1]).toContain('real_protocol_provider_execution');
+    expect(body.mode2_case_prep_day3_prerequisites[1]).toContain(
+      'real_protocol_provider_execution',
+    );
     expect(body.mode2_case_prep_day3_prerequisites[2]).toContain(
       'verified_audit_emission_discipline',
     );

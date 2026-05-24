@@ -699,10 +699,7 @@ describe('config — AI_MODE2_ENABLED (Mode 2 case-prep mount gate)', () => {
     // — set them all so the AI_MODE2_ENABLED gate is what surfaces, not
     // a different production-only fail-fast.
     vi.stubEnv('DATABASE_SSL_MODE', 'require');
-    vi.stubEnv(
-      'BIND_ACTOR_CONTEXT_DATABASE_URL',
-      'postgres://bind:bind@localhost:5432/z',
-    );
+    vi.stubEnv('BIND_ACTOR_CONTEXT_DATABASE_URL', 'postgres://bind:bind@localhost:5432/z');
     vi.stubEnv('RESUME_TOKEN_SECRET', 'x'.repeat(48));
     vi.stubEnv('JWT_SIGNING_KEY', 'y'.repeat(48));
     vi.stubEnv('AI_MODE2_ENABLED', 'true');
@@ -713,10 +710,7 @@ describe('config — AI_MODE2_ENABLED (Mode 2 case-prep mount gate)', () => {
     applyBaseline();
     vi.stubEnv('NODE_ENV', 'production');
     vi.stubEnv('DATABASE_SSL_MODE', 'require');
-    vi.stubEnv(
-      'BIND_ACTOR_CONTEXT_DATABASE_URL',
-      'postgres://bind:bind@localhost:5432/z',
-    );
+    vi.stubEnv('BIND_ACTOR_CONTEXT_DATABASE_URL', 'postgres://bind:bind@localhost:5432/z');
     vi.stubEnv('RESUME_TOKEN_SECRET', 'x'.repeat(48));
     vi.stubEnv('JWT_SIGNING_KEY', 'y'.repeat(48));
     vi.stubEnv('AI_MODE2_ENABLED', 'false');

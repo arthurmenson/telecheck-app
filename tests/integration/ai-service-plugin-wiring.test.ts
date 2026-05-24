@@ -140,7 +140,9 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     // mode2_case_prep_mounted=false (no "Mode 2 ... MOUNTED" claim).
     // It MUST say the route is DEFINED but not mounted.
     expect(body.pending_message).toContain('DEFINED but NOT mounted');
-    expect(body.pending_message).not.toMatch(/Mode 2 case-prep \(POST \/v0\/ai\/case-prep\) is MOUNTED/);
+    expect(body.pending_message).not.toMatch(
+      /Mode 2 case-prep \(POST \/v0\/ai\/case-prep\) is MOUNTED/,
+    );
     // Per CLAUDE.md hard-rule: post-P-011 the schema is ratified;
     // pending_message must not claim otherwise.
     expect(body.pending_message).not.toContain('schema not yet ratified');
