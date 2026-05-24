@@ -61,7 +61,7 @@ afterAll(async () => {
 });
 
 describe('crisis-response slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/crisis-events/health returns 200 (liveness — module alive) with Sprint 2 v0.2 metadata', async () => {
+  it('§1a GET /v0/crisis-events/health returns 200 (liveness — module alive) with Sprint 2 v0.3 metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/crisis-events/health',
@@ -76,7 +76,7 @@ describe('crisis-response slice — §1 plugin wiring', () => {
     };
     expect(body.status).toBe('ok');
     expect(body.module).toBe('crisis-response');
-    expect(body.blocked).toContain('Sprint 2 of 4 at v0.2');
+    expect(body.blocked).toContain('Sprint 2 of 4 at v0.3');
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 038');
   });
 
@@ -100,31 +100,28 @@ describe('crisis-response slice — §1 plugin wiring', () => {
   });
 
   // §1c — paired-probe coverage proving the write collection-root POST is
-  // still NOT mounted (initiate lands in PR #201 of the Sprint 2 cascade).
-  // Codex R1 follow-up (2026-05-24): the single 400 assertion was forward-
-  // stable (would keep passing even after the handler mounts, because it
-  // deliberately omits Idempotency-Key) and thus stopped proving "no mounted
-  // write handler." Replaced with a PAIR of probes that together hold the
-  // wiring honest:
+  // now MOUNTED (initiate landed in PR #201 of the Sprint 2 cascade) and that
+  // the global idempotency guard fires before routing. The §1c-route assertion
+  // was the deliberate forward-CHANGING wiring-honesty signal: it asserted 404
+  // ("route not mounted") until #201 landed, at which point it was advanced to
+  // the next chain link's status code per the comment's own instruction. With
+  // #201 merged, POST /v0/crisis-events reaches postCrisisEventHandler;
+  // requireCrisisInitiatorActorContext (SI-022 §7 slice-role gate) rejects the
+  // unauthenticated probe → 401.
   //
   //   §1c-guard: POST WITHOUT Idempotency-Key → 400
   //     Exercises the global idempotency preHandler guard
   //     (`internal.idempotency.missing_key`). The guard fires before routing.
-  //     Forward-stable (will keep passing post-handler-mount).
+  //     Forward-stable across the Sprint 2 cascade.
   //
-  //   §1c-route: POST WITH Idempotency-Key → 404
-  //     Bypasses the idempotency guard and lets the request reach the router,
-  //     which currently has no matching write route. Forward-CHANGING: when
-  //     PR #201 lands and mounts the actual initiate handler, this assertion
-  //     will start failing — at which point this §1c-route block gets
-  //     advanced to the next chain link's status code (probably 401
-  //     unauthenticated or 422 schema-invalid, depending on what fires next).
-  //     That failure is the wiring-honesty signal we want.
+  //   §1c-route: POST WITH Idempotency-Key → 401
+  //     Bypasses the idempotency guard and reaches the now-mounted initiate
+  //     route; the crisis_initiator slice-role gate rejects the actorless
+  //     probe with 401 (tenant-blind). Advance this assertion again only if a
+  //     future PR reorders the composition chain ahead of the actor gate.
   //
   // Together the pair proves BOTH (a) the global idempotency guard fires
-  // before routing AND (b) the router currently lands on no-such-route. This
-  // is route-specific coverage that holds the wiring honest across the
-  // Sprint 2 cascade.
+  // before routing AND (b) the mounted write route enforces its actor gate.
   it('§1c-guard POST /v0/crisis-events returns 400 (idempotency guard precedes routing; no Idempotency-Key)', async () => {
     const r = await app!.inject({
       method: 'POST',
@@ -137,7 +134,7 @@ describe('crisis-response slice — §1 plugin wiring', () => {
     expect(body.error.code).toBe('internal.idempotency.missing_key');
   });
 
-  it('§1c-route POST /v0/crisis-events with Idempotency-Key returns 404 (route still not mounted)', async () => {
+  it('§1c-route POST /v0/crisis-events with Idempotency-Key returns 401 (route mounted; crisis_initiator gate rejects unauthenticated probe)', async () => {
     const r = await app!.inject({
       method: 'POST',
       url: '/v0/crisis-events',
@@ -148,7 +145,7 @@ describe('crisis-response slice — §1 plugin wiring', () => {
       },
       payload: {},
     });
-    expect(r.statusCode).toBe(404);
+    expect(r.statusCode).toBe(401);
   });
 
   // R1 MED closure 2026-05-22 (PR 7 Codex review): probe paths must reach
