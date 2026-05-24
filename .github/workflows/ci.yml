@@ -136,6 +136,38 @@ jobs:
       - name: Typecheck (tsc --noEmit)
         run: npm run typecheck
 
+      # Provision the `postgres` role in the service container.
+      #
+      # Migration 047 (R2 MED-1 closure 2026-05-23) pins SECURITY DEFINER
+      # function ownership to `OWNER TO postgres` and CHECKs `v_owner_name
+      # = 'postgres'` per the locked-search-path security model. Local dev
+      # uses postgres:15 with the default `postgres` superuser; GitHub
+      # service container uses POSTGRES_USER=telecheck_ci instead, so the
+      # role doesn't exist by default — migrations fail at apply time
+      # with `role "postgres" does not exist` and every test file appears
+      # as FAIL (142 file-level FAILs / 2058 tests SKIPPED / 0 ran).
+      #
+      # Fix: create the role idempotently before tests run, granting
+      # SUPERUSER so it satisfies the migration's owner-ALTER. CI is the
+      # only environment that needs this provisioning — local dev + prod
+      # already have the role from the postgres image default.
+      #
+      # Idempotency: the DO block guards against retry (role already
+      # exists on a previous workflow rerun within the same container —
+      # unlikely with services: { postgres: } but defensive).
+      - name: Provision `postgres` role for migration 047 SECURITY DEFINER owner
+        env:
+          PGPASSWORD: telecheck_ci
+        run: |
+          psql -h localhost -U telecheck_ci -d telecheck_test -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres') THEN
+              CREATE ROLE postgres SUPERUSER;
+            END IF;
+          END $$;
+          SQL
+
       # Tests run against the Postgres service container.
       # vitest setup applies migrations + seeds two tenants per tests/README.md.
       - name: Test (vitest)
