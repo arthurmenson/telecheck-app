@@ -199,6 +199,22 @@ const ConfigSchema = z.object({
   // Research data partnership (per ADR-028) — Stage 2 gate
   RESEARCH_DATA_PARTNERSHIP_ACTIVE: z.enum(['active', 'inactive']).default('inactive'),
 
+  // Mode 2 case-prep route mount gate. Default OFF in every environment
+  // until (a) clinical-anchor authorization is implemented (clinician
+  // must be on the consult's care team for the named protocol — not
+  // just JWT-role gating); (b) real protocol-engine provider execution
+  // wires the I-012 reject-unless three-clause rule at the downstream
+  // prescribing boundary per State Machines v1.2 §19 §19.X; (c) the
+  // audit-emission discipline per I-019 / I-027 is verified end-to-end
+  // against a live Postgres + real LLM provider. Flipping this to
+  // `'true'` in production WITHOUT all three Day-3+ prerequisites is a
+  // platform-floor violation per Codex PR #210 R1 NEEDS-WORK closure.
+  //
+  // Honest-failure-until-wiring-lands pattern matching the C1 cockpit
+  // precedent: ship the route DEFINED but BEHIND A FLAG so prod can't
+  // reach it; Day-3+ wiring flips the flag.
+  AI_MODE2_ENABLED: z.enum(['false', 'true']).default('false'),
+
   // Resume-token signing secret (Forms/Intake save-and-resume per Slice PRD §8).
   // The forms-intake module's resume-token.ts derives an HMAC-SHA-256 signature
   // over (resume_state_id, tenant_id, expires_at_ms) so a leaked token is
@@ -370,6 +386,7 @@ function loadConfig() {
       ENABLE_FULLY_AUTONOMOUS: false as const,
     },
     researchDataPartnershipActive: parsed.RESEARCH_DATA_PARTNERSHIP_ACTIVE === 'active',
+    aiMode2Enabled: parsed.AI_MODE2_ENABLED === 'true',
     resumeTokenSecret,
   } as const;
 }

@@ -1,8 +1,24 @@
 # AI Service module — mode_2_case_prep_mounted
 
-## Status (post-Mode-2-case-prep mount: 2026-05-23)
+## Status (post-Mode-2-case-prep mount: 2026-05-23; gated 2026-05-24)
 
-This module hosts the Telecheck platform's two-mode AI surface per **AI Clinical Assistant Slice PRD v1.0** + **AI_LAYERING v5.2**. As of the Mode 2 case-prep handler mount (PR H 2026-05-23), **both Mode 1 chat (POST /v0/ai/chat) and Mode 2 case-prep (POST /v0/ai/case-prep) handlers are LIVE** — both exercise the full I-019 crisis-detection floor, FLOOR-020 audit emission, and AI-RESIL-001 fail-soft path. Every non-crisis response is currently the documented "AI temporarily unavailable" envelope because the LLM provider abstraction routes every workload to NullLLMProvider until real adapters (Anthropic primary + Bedrock + Azure OpenAI per ADR-020) ship with secrets-management resolution.
+This module hosts the Telecheck platform's two-mode AI surface per **AI Clinical Assistant Slice PRD v1.0** + **AI_LAYERING v5.2**. As of the Mode 2 case-prep handler mount (PR H 2026-05-23), **Mode 1 chat (POST /v0/ai/chat) is LIVE; Mode 2 case-prep (POST /v0/ai/case-prep) is DEFINED but CONFIG-GATED behind `AI_MODE2_ENABLED` (default `false`)** per Codex PR #210 R1 NEEDS-WORK closure (2026-05-24). Mode 1 exercises the full I-019 crisis-detection floor, FLOOR-020 audit emission, and AI-RESIL-001 fail-soft path; every non-crisis response is currently the documented "AI temporarily unavailable" envelope because the LLM provider abstraction routes every workload to NullLLMProvider until real adapters (Anthropic primary + Bedrock + Azure OpenAI per ADR-020) ship with secrets-management resolution.
+
+## Mode 2 case-prep route mount gate (`AI_MODE2_ENABLED`)
+
+`POST /v0/ai/case-prep` is **DEFINED but NOT mounted by default**. Set `AI_MODE2_ENABLED=true` in the environment to mount the route.
+
+**Production rollout requires ALL THREE Day-3+ prerequisites before flipping the flag to `true`:**
+
+1. **Clinical-anchor authorization** — the JWT-role gate (`actor.role === 'clinician'`) is not sufficient. The handler must additionally verify the clinician is on the consult's care team for the named protocol. Until this lands, any clinician with a valid JWT can prepare a case for any patient under any protocol — a tenant-isolation-adjacent risk surface that the platform-floor does not yet enforce at the case-prep boundary.
+2. **Real protocol-engine provider execution** — at v0.1 the route resolves to `NullLLMProvider` (which always throws `LLMProviderUnavailableError` → AI-RESIL-001 fail-soft envelope). The downstream protocol-engine slice + the I-012 reject-unless three-clause rule at the prescribing boundary (State Machines v1.2 §19 §19.X) must ship before the route is allowed to return a real AI recommendation. The case-prep envelope is the audit anchor the downstream `prescribing.protocol_authorization_granted` event references via `ai_workflow_execution_id`; until the downstream binding is live, the case-prep envelope is an orphan reference.
+3. **Verified audit-emission discipline** — the unit-test mock confirms the `ai_mode_2_evaluation` Category A audit emits on every response path (crisis, success, fail-soft), and `mode2_case_prep_audit_emission_failed` maps to a tenant-blind 503 via `mapServiceError`. The end-to-end verification (live Postgres + I-027 tenant_id stamping + audit-chain hash continuity across the case-prep lifecycle) is pending the protocol-engine integration test harness.
+
+Until all three land, **production MUST keep `AI_MODE2_ENABLED=false`**. This is the honest-failure-until-wiring-lands pattern, matching the C1 cockpit precedent — ship the route DEFINED but BEHIND A FLAG so prod can't reach it; Day-3+ wiring flips the flag.
+
+**Operator-facing introspection:** both `/v0/ai/health` and `/v0/ai/ready` report `mode2_case_prep_mounted` honestly (true / false) along with the `mode2_case_prep_mount_gate` env-var name and (on `/health`) the three Day-3+ prerequisites. An operator who pings `/health` immediately sees whether the route is reachable in the active config.
+
+**Startup-log signal:** when `AI_MODE2_ENABLED=false`, the route registrar logs a structured `warn` (`gate: 'AI_MODE2_ENABLED'`) at boot so an operator inspecting startup logs sees the gate explicitly. Silent unmount would be a worse trade than a noisy startup line.
 
 ### `/v0/ai/health` reports `phase: 'crisis_gate_wired_pr_f'`
 
@@ -15,12 +31,19 @@ This module hosts the Telecheck platform's two-mode AI surface per **AI Clinical
   "workload_types_reserved": ["autonomous_agent", "multi_agent_supervisor", "tool_using_agent"],
   "autonomy_levels_at_v1": ["advisory", "suggestion", "action_with_confirm"],
   "autonomy_levels_reserved": ["action_with_audit_only", "fully_autonomous"],
-  "handlers_wired": false,
-  "handlers_wired_tracking": "see /ready body for the unblockers"
+  "handlers_wired": true,
+  "handlers_wired_tracking": "Mode 1 chat (PR G) MOUNTED; Mode 2 case-prep (PR H) DEFINED + config-gated behind AI_MODE2_ENABLED (default false) per Codex PR #210 R1 NEEDS-WORK closure",
+  "mode2_case_prep_mounted": false,
+  "mode2_case_prep_mount_gate": "AI_MODE2_ENABLED",
+  "mode2_case_prep_day3_prerequisites": [
+    "clinical_anchor_authorization (clinician-on-care-team-for-named-protocol)",
+    "real_protocol_provider_execution (I-012 reject-unless three-clause at prescribing boundary)",
+    "verified_audit_emission_discipline (I-019 + I-027 end-to-end against live Postgres + real LLM provider)"
+  ]
 }
 ```
 
-`/v0/ai/ready` returns **503** with structured unblocker fields until a future PR mounts handlers.
+`/v0/ai/ready` returns **503** with structured unblocker fields — including `mode2_case_prep_mounted` and `mode2_case_prep_mount_gate` — until production rollout completes.
 
 ## What's live (PRs A–F)
 
@@ -46,7 +69,9 @@ This module hosts the Telecheck platform's two-mode AI surface per **AI Clinical
 
 ## What's NOT live (deliberately, by design)
 
-The `POST /v0/ai/chat` (Mode 1) and `POST /v0/ai/case-prep` (Mode 2) routes return **404** by design. Mounting them is the Codex PR B R2 CRITICAL closure — handlers cannot validate-and-reject before crisis detection fires. Mounting blocks on:
+`POST /v0/ai/chat` (Mode 1) is now MOUNTED (PR G 2026-05-15). `POST /v0/ai/case-prep` (Mode 2) is DEFINED but **config-gated** behind `AI_MODE2_ENABLED` (default `false`) per Codex PR #210 R1 NEEDS-WORK closure (2026-05-24) — the route returns **404** in any environment that has not flipped the flag. See the "Mode 2 case-prep route mount gate" section above for the three Day-3+ prerequisites before the flag may be flipped in production.
+
+Even when the Mode 2 flag is on, the documented "AI temporarily unavailable" envelope is the dominant response path — the handler still surfaces the AI-RESIL-001 fail-soft envelope because `NullLLMProvider` is the only registered provider. Real provider integration blocks on:
 
 1. **Anthropic SDK + secrets management** — `NullLLMProvider` is the only registered provider. Real adapters (Anthropic primary, Bedrock + Azure OpenAI for resilience per ADR-020) need AWS Secrets Manager setup + per-tenant KMS key derivation contract.
 2. **Clinical-grade NLP crisis classifier** — `src/lib/crisis-detection.ts` is a v1.0 keyword stub. The file-level open-question requires AI Safety Lead sign-off before patient-facing deployment.
