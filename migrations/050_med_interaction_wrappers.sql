@@ -1,4 +1,4 @@
-﻿-- =============================================================================
+-- =============================================================================
 -- File:    migrations/050_med_interaction_wrappers.sql
 -- Purpose: Create the 6 reason-specific SECURITY DEFINER wrappers per CDM
 --          v1.6 â†’ v1.7 Amendment Â§6.NEW2-NEW7 (RATIFIED 2026-05-21 P-034).
