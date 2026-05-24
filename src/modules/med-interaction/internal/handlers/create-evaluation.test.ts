@@ -26,8 +26,8 @@
  * a live PostgreSQL.
  */
 
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 import { createEvaluationHandler } from './create-evaluation.js';
 
@@ -82,21 +82,17 @@ vi.mock('../../../../lib/idempotent-handler.js', () => ({
 }));
 
 vi.mock('../../../../lib/rls.js', () => ({
-  withTenantContext: vi.fn(
-    async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withTenantContext:${tenantId}`);
-      return fn();
-    },
-  ),
+  withTenantContext: vi.fn(async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withTenantContext:${tenantId}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/actor-context-binding.js', () => ({
-  withActorContext: vi.fn(
-    async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withActorContext:${nonce}`);
-      return fn();
-    },
-  ),
+  withActorContext: vi.fn(async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withActorContext:${nonce}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/with-db-role.js', () => ({
@@ -382,7 +378,9 @@ describe('createEvaluationHandler §4 — INSERT + audit same-tx', () => {
       expect(sql).toContain(col);
     }
     // 12 positional parameters $1..$12, in the canonical order.
-    expect(sql).toMatch(/\$1, \$2, \$3, \$4, \$5,\s*\$6, \$7, \$8, \$9,\s*\$10::jsonb, \$11::jsonb, \$12::jsonb/);
+    expect(sql).toMatch(
+      /\$1, \$2, \$3, \$4, \$5,\s*\$6, \$7, \$8, \$9,\s*\$10::jsonb, \$11::jsonb, \$12::jsonb/,
+    );
     // evaluation_window_ms is param index 6 (0-indexed: 6 → $7), server-computed,
     // must be a non-negative integer per the schema CHECK constraint.
     const evaluationWindowMs = params?.[6];

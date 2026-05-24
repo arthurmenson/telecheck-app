@@ -187,128 +187,115 @@ export async function activateSignalHandler(
   const actorId = req.actorContext?.accountId ?? 'system';
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
-  return withIdempotentExecution<ActivateSignalView>(
-    req,
-    reply,
-    mapServiceError,
-    async (tx) => {
-      const transitionId = ulid();
-      const activatedAt = new Date();
+  return withIdempotentExecution<ActivateSignalView>(req, reply, mapServiceError, async (tx) => {
+    const transitionId = ulid();
+    const activatedAt = new Date();
 
-      const callWrappers = async (): Promise<void> => {
-        try {
-          await withDbRole(
-            tx,
-            'medication_interaction_engine_evaluator',
-            async () => {
-              // §1 — Call the SECDEF wrapper to perform the activation.
-              // The wrapper acquires the per-(tenant, signal) advisory
-              // lock, validates current state == 'emitted', validates
-              // no override is recorded (defense-in-depth), then
-              // delegates to the raw lifecycle writer.
-              await tx.query(
-                'SELECT record_signal_activation($1, $2, $3, $4, $5::jsonb)',
-                [transitionId, ctx.tenantId, signalId, actorId, JSON.stringify(metadata)],
-              );
+    const callWrappers = async (): Promise<void> => {
+      try {
+        await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
+          // §1 — Call the SECDEF wrapper to perform the activation.
+          // The wrapper acquires the per-(tenant, signal) advisory
+          // lock, validates current state == 'emitted', validates
+          // no override is recorded (defense-in-depth), then
+          // delegates to the raw lifecycle writer.
+          await tx.query('SELECT record_signal_activation($1, $2, $3, $4, $5::jsonb)', [
+            transitionId,
+            ctx.tenantId,
+            signalId,
+            actorId,
+            JSON.stringify(metadata),
+          ]);
 
-              // §2 — Derive the audit `target_patient_id` from the
-              // durable `interaction_signal -> interaction_engine_evaluation`
-              // join in the same tx (R2 HIGH-2 closure 2026-05-24).
-              // The prior version accepted a body-supplied patient_id
-              // (optional, defaulting to null) which landed the audit
-              // record on the platform hash-chain partition instead of
-              // the patient partition for the normal "no body" case,
-              // and allowed forgery to an arbitrary patient ULID when
-              // a value WAS supplied. Deriving from the durable
-              // relationship eliminates both failure modes.
-              //
-              // The lookup runs AFTER record_signal_activation succeeds —
-              // the wrapper already validated the signal exists in the
-              // current tenant (raising 42501 or 23514 on mismatch);
-              // a missing row here is therefore an unexpected race
-              // (e.g. concurrent DELETE between activation and lookup)
-              // and is mapped to a tenant-blind 404.
-              const patientRow = await tx.query(
-                `SELECT e.patient_id
+          // §2 — Derive the audit `target_patient_id` from the
+          // durable `interaction_signal -> interaction_engine_evaluation`
+          // join in the same tx (R2 HIGH-2 closure 2026-05-24).
+          // The prior version accepted a body-supplied patient_id
+          // (optional, defaulting to null) which landed the audit
+          // record on the platform hash-chain partition instead of
+          // the patient partition for the normal "no body" case,
+          // and allowed forgery to an arbitrary patient ULID when
+          // a value WAS supplied. Deriving from the durable
+          // relationship eliminates both failure modes.
+          //
+          // The lookup runs AFTER record_signal_activation succeeds —
+          // the wrapper already validated the signal exists in the
+          // current tenant (raising 42501 or 23514 on mismatch);
+          // a missing row here is therefore an unexpected race
+          // (e.g. concurrent DELETE between activation and lookup)
+          // and is mapped to a tenant-blind 404.
+          const patientRow = await tx.query(
+            `SELECT e.patient_id
                    FROM interaction_signal AS s
                    JOIN interaction_engine_evaluation AS e
                      ON e.tenant_id = s.tenant_id
                     AND e.id        = s.evaluation_id
                   WHERE s.tenant_id = $1 AND s.id = $2`,
-                [ctx.tenantId, signalId],
-              );
-              const patientRows = patientRow.rows as Array<{ patient_id: string }>;
-              const derivedPatientId = patientRows[0]?.patient_id;
-              if (
-                typeof derivedPatientId !== 'string' ||
-                derivedPatientId.length === 0
-              ) {
-                throw req.server.httpErrors.notFound('Interaction signal not found.');
-              }
-
-              // §3 — Cat A audit `interaction_signal_lifecycle_transition_emitted`
-              // in the SAME tx. Per Option A (SI-019 Sub-decision 3 item 5
-              // 2026-05-20), every INSERT into
-              // interaction_signal_lifecycle_transition emits this audit
-              // event (subscribed by the projection refresher + patient-
-              // facing lifecycle-change push surfaces).
-              await emitSignalLifecycleTransitionAudit(
-                {
-                  tenantId: ctx.tenantId,
-                  signalId,
-                  transitionId,
-                  patientId: derivedPatientId,
-                  actorId,
-                  actorTenantId,
-                  countryOfCare: ctx.countryOfCare,
-                  fromState: 'emitted',
-                  toState: 'active',
-                  transitionReason: 'activation',
-                },
-                tx,
-              );
-            },
+            [ctx.tenantId, signalId],
           );
-        } catch (err) {
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err
-          ) {
-            const code = (err as { code?: unknown }).code;
-            // 42501 → tenant-blind 403 (I-025).
-            if (code === '42501') {
-              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-            }
-            // 23514 (check_violation) is the wrapper's signal_not_emitted
-            // / activation_blocked_by_override rejection path; map to
-            // tenant-blind 404 so the wire response does not differentiate
-            // "wrong state" / "blocked by override" from "doesn't exist
-            // in this tenant" (I-025).
-            if (code === '23514') {
-              throw req.server.httpErrors.notFound('Interaction signal not found.');
-            }
+          const patientRows = patientRow.rows as Array<{ patient_id: string }>;
+          const derivedPatientId = patientRows[0]?.patient_id;
+          if (typeof derivedPatientId !== 'string' || derivedPatientId.length === 0) {
+            throw req.server.httpErrors.notFound('Interaction signal not found.');
           }
-          throw err;
-        }
-      };
 
-      await withTenantContext(tx, ctx.tenantId, async () => {
-        if (typeof actorNonce === 'string' && actorNonce.length > 0) {
-          await withActorContext(tx, actorNonce, callWrappers);
-        } else {
-          await callWrappers();
+          // §3 — Cat A audit `interaction_signal_lifecycle_transition_emitted`
+          // in the SAME tx. Per Option A (SI-019 Sub-decision 3 item 5
+          // 2026-05-20), every INSERT into
+          // interaction_signal_lifecycle_transition emits this audit
+          // event (subscribed by the projection refresher + patient-
+          // facing lifecycle-change push surfaces).
+          await emitSignalLifecycleTransitionAudit(
+            {
+              tenantId: ctx.tenantId,
+              signalId,
+              transitionId,
+              patientId: derivedPatientId,
+              actorId,
+              actorTenantId,
+              countryOfCare: ctx.countryOfCare,
+              fromState: 'emitted',
+              toState: 'active',
+              transitionReason: 'activation',
+            },
+            tx,
+          );
+        });
+      } catch (err) {
+        if (typeof err === 'object' && err !== null && 'code' in err) {
+          const code = (err as { code?: unknown }).code;
+          // 42501 → tenant-blind 403 (I-025).
+          if (code === '42501') {
+            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+          }
+          // 23514 (check_violation) is the wrapper's signal_not_emitted
+          // / activation_blocked_by_override rejection path; map to
+          // tenant-blind 404 so the wire response does not differentiate
+          // "wrong state" / "blocked by override" from "doesn't exist
+          // in this tenant" (I-025).
+          if (code === '23514') {
+            throw req.server.httpErrors.notFound('Interaction signal not found.');
+          }
         }
-      });
+        throw err;
+      }
+    };
 
-      return {
-        status: 200,
-        view: {
-          signal_id: signalId,
-          transition_id: transitionId,
-          activated_at: activatedAt.toISOString(),
-        },
-      };
-    },
-  );
+    await withTenantContext(tx, ctx.tenantId, async () => {
+      if (typeof actorNonce === 'string' && actorNonce.length > 0) {
+        await withActorContext(tx, actorNonce, callWrappers);
+      } else {
+        await callWrappers();
+      }
+    });
+
+    return {
+      status: 200,
+      view: {
+        signal_id: signalId,
+        transition_id: transitionId,
+        activated_at: activatedAt.toISOString(),
+      },
+    };
+  });
 }

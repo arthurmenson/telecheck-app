@@ -263,34 +263,27 @@ export async function createEvaluationHandler(
   // monotonic-time delta.
   const evaluationStartedAt = Date.now();
 
-  return withIdempotentExecution<CreateEvaluationView>(
-    req,
-    reply,
-    mapServiceError,
-    async (tx) => {
-      const evaluationId = ulid();
-      const evaluatedAt = new Date();
+  return withIdempotentExecution<CreateEvaluationView>(req, reply, mapServiceError, async (tx) => {
+    const evaluationId = ulid();
+    const evaluatedAt = new Date();
 
-      const callWrappers = async (): Promise<void> => {
-        try {
-          await withDbRole(
-            tx,
-            'medication_interaction_engine_evaluator',
-            async () => {
-              // §3a — Direct INSERT into interaction_engine_evaluation
-              // (per SI-019 spec: NOT via a SECDEF wrapper; the wrappers
-              // in migration 050 are scoped to signal-lifecycle state
-              // transitions, not evaluation creation).
-              //
-              // 12-column INSERT — matches migration 047 §1 schema exactly:
-              //   id, tenant_id, patient_id, triggered_by,
-              //   triggered_by_resource_id, evaluated_at,
-              //   evaluation_window_ms, engine_version,
-              //   knowledge_base_version, medication_set_snapshot,
-              //   condition_set_snapshot, lab_set_snapshot.
-              const evaluationWindowMs = Math.max(0, Date.now() - evaluationStartedAt);
-              await tx.query(
-                `INSERT INTO interaction_engine_evaluation (
+    const callWrappers = async (): Promise<void> => {
+      try {
+        await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
+          // §3a — Direct INSERT into interaction_engine_evaluation
+          // (per SI-019 spec: NOT via a SECDEF wrapper; the wrappers
+          // in migration 050 are scoped to signal-lifecycle state
+          // transitions, not evaluation creation).
+          //
+          // 12-column INSERT — matches migration 047 §1 schema exactly:
+          //   id, tenant_id, patient_id, triggered_by,
+          //   triggered_by_resource_id, evaluated_at,
+          //   evaluation_window_ms, engine_version,
+          //   knowledge_base_version, medication_set_snapshot,
+          //   condition_set_snapshot, lab_set_snapshot.
+          const evaluationWindowMs = Math.max(0, Date.now() - evaluationStartedAt);
+          await tx.query(
+            `INSERT INTO interaction_engine_evaluation (
                    id, tenant_id, patient_id, triggered_by, triggered_by_resource_id,
                    evaluated_at, evaluation_window_ms, engine_version, knowledge_base_version,
                    medication_set_snapshot, condition_set_snapshot, lab_set_snapshot
@@ -299,89 +292,87 @@ export async function createEvaluationHandler(
                    $6, $7, $8, $9,
                    $10::jsonb, $11::jsonb, $12::jsonb
                  )`,
-                [
-                  evaluationId,
-                  ctx.tenantId,
-                  patientId,
-                  triggeredBy,
-                  triggeredByResourceId,
-                  evaluatedAt.toISOString(),
-                  evaluationWindowMs,
-                  engineVersion,
-                  knowledgeBaseVersion,
-                  JSON.stringify(medicationSetSnapshot),
-                  JSON.stringify(conditionSetSnapshot),
-                  JSON.stringify(labSetSnapshot),
-                ],
-              );
-
-              // §3b — Cat A audit emission in the SAME tx (I-003 +
-              // Option 2 carryforward atomicity). Signals_produced_count
-              // is 0 at evaluation create time — signals are INSERTed
-              // by the separate POST /signals endpoint and attested via
-              // interaction_signal_emitted (the engine evaluator may
-              // call /signals 1..N times after this evaluation row).
-              //
-              // Canonical lifecycle audit rule (R1 Finding 2 closure
-              // 2026-05-23): this handler emits EXACTLY ONE audit event:
-              //   1. interaction_engine_evaluation_completed (Cat A)
-              // No other audit events fire from this handler. The
-              // signal-lifecycle events (interaction_signal_emitted,
-              // interaction_signal_lifecycle_transition_emitted) belong
-              // to the /signals and /signals/:id/activate handlers
-              // respectively. See `audit.ts` file-level docstring for
-              // the cross-handler audit-emission contract.
-              await emitEvaluationCompletedAudit(
-                {
-                  tenantId: ctx.tenantId,
-                  evaluationId,
-                  patientId,
-                  actorId,
-                  actorTenantId,
-                  countryOfCare: ctx.countryOfCare,
-                  triggeredBy,
-                  triggeredByResourceId,
-                  engineVersion,
-                  knowledgeBaseVersion,
-                  evaluationWindowMs,
-                  signalsProducedCount: 0,
-                },
-                tx,
-              );
-            },
+            [
+              evaluationId,
+              ctx.tenantId,
+              patientId,
+              triggeredBy,
+              triggeredByResourceId,
+              evaluatedAt.toISOString(),
+              evaluationWindowMs,
+              engineVersion,
+              knowledgeBaseVersion,
+              JSON.stringify(medicationSetSnapshot),
+              JSON.stringify(conditionSetSnapshot),
+              JSON.stringify(labSetSnapshot),
+            ],
           );
-        } catch (err) {
-          // 42501 → 403 per I-025 (mirrors get-signal.ts §5 pattern).
-          // Both the SET LOCAL ROLE pre-callback step AND the inner
-          // INSERT's RLS policy can raise 42501; the outer catch covers
-          // both.
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err &&
-            (err as { code?: unknown }).code === '42501'
-          ) {
-            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-          }
-          throw err;
-        }
-      };
 
-      await withTenantContext(tx, ctx.tenantId, async () => {
-        if (typeof actorNonce === 'string' && actorNonce.length > 0) {
-          await withActorContext(tx, actorNonce, callWrappers);
-        } else {
-          await callWrappers();
+          // §3b — Cat A audit emission in the SAME tx (I-003 +
+          // Option 2 carryforward atomicity). Signals_produced_count
+          // is 0 at evaluation create time — signals are INSERTed
+          // by the separate POST /signals endpoint and attested via
+          // interaction_signal_emitted (the engine evaluator may
+          // call /signals 1..N times after this evaluation row).
+          //
+          // Canonical lifecycle audit rule (R1 Finding 2 closure
+          // 2026-05-23): this handler emits EXACTLY ONE audit event:
+          //   1. interaction_engine_evaluation_completed (Cat A)
+          // No other audit events fire from this handler. The
+          // signal-lifecycle events (interaction_signal_emitted,
+          // interaction_signal_lifecycle_transition_emitted) belong
+          // to the /signals and /signals/:id/activate handlers
+          // respectively. See `audit.ts` file-level docstring for
+          // the cross-handler audit-emission contract.
+          await emitEvaluationCompletedAudit(
+            {
+              tenantId: ctx.tenantId,
+              evaluationId,
+              patientId,
+              actorId,
+              actorTenantId,
+              countryOfCare: ctx.countryOfCare,
+              triggeredBy,
+              triggeredByResourceId,
+              engineVersion,
+              knowledgeBaseVersion,
+              evaluationWindowMs,
+              signalsProducedCount: 0,
+            },
+            tx,
+          );
+        });
+      } catch (err) {
+        // 42501 → 403 per I-025 (mirrors get-signal.ts §5 pattern).
+        // Both the SET LOCAL ROLE pre-callback step AND the inner
+        // INSERT's RLS policy can raise 42501; the outer catch covers
+        // both.
+        if (
+          typeof err === 'object' &&
+          err !== null &&
+          'code' in err &&
+          (err as { code?: unknown }).code === '42501'
+        ) {
+          throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
         }
-      });
+        throw err;
+      }
+    };
 
-      return {
-        status: 201,
-        view: {
-          evaluation_id: evaluationId,
-          evaluated_at: evaluatedAt.toISOString(),
-        },
-      };
-    },
-  );
+    await withTenantContext(tx, ctx.tenantId, async () => {
+      if (typeof actorNonce === 'string' && actorNonce.length > 0) {
+        await withActorContext(tx, actorNonce, callWrappers);
+      } else {
+        await callWrappers();
+      }
+    });
+
+    return {
+      status: 201,
+      view: {
+        evaluation_id: evaluationId,
+        evaluated_at: evaluatedAt.toISOString(),
+      },
+    };
+  });
 }

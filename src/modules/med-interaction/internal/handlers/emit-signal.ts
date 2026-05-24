@@ -223,64 +223,54 @@ export async function emitSignalHandler(
   const actorId = req.actorContext?.accountId ?? 'system';
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
-  return withIdempotentExecution<EmitSignalView>(
-    req,
-    reply,
-    mapServiceError,
-    async (tx) => {
-      const signalId = ulid();
-      const transitionId = ulid();
-      const emittedAt = new Date();
+  return withIdempotentExecution<EmitSignalView>(req, reply, mapServiceError, async (tx) => {
+    const signalId = ulid();
+    const transitionId = ulid();
+    const emittedAt = new Date();
 
-      const callWrappers = async (): Promise<void> => {
-        try {
-          await withDbRole(
-            tx,
-            'medication_interaction_engine_evaluator',
-            async () => {
-              // §1 — Derive the canonical patient_id from the persisted
-              // interaction_engine_evaluation row, in the SAME tx, BEFORE
-              // the audit emission. The body-supplied patient_id is
-              // validated against this derived value; on mismatch the
-              // handler fails closed with a tenant-blind 404 (the wire
-              // response does not differentiate "wrong patient" from
-              // "evaluation does not exist in this tenant" per I-025).
-              //
-              // R2 HIGH-1 closure (Codex 2026-05-24): the prior version
-              // passed the body-supplied patient_id straight into the
-              // audit emitter without validation, so a bad client or
-              // compromised same-tenant caller could emit a signal under
-              // evaluation A but place the Cat A audit record under
-              // patient B — corrupting per-patient audit reconstruction
-              // and the patient-scoped hash-chain partition.
-              const evalRow = await tx.query(
-                `SELECT patient_id
+    const callWrappers = async (): Promise<void> => {
+      try {
+        await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
+          // §1 — Derive the canonical patient_id from the persisted
+          // interaction_engine_evaluation row, in the SAME tx, BEFORE
+          // the audit emission. The body-supplied patient_id is
+          // validated against this derived value; on mismatch the
+          // handler fails closed with a tenant-blind 404 (the wire
+          // response does not differentiate "wrong patient" from
+          // "evaluation does not exist in this tenant" per I-025).
+          //
+          // R2 HIGH-1 closure (Codex 2026-05-24): the prior version
+          // passed the body-supplied patient_id straight into the
+          // audit emitter without validation, so a bad client or
+          // compromised same-tenant caller could emit a signal under
+          // evaluation A but place the Cat A audit record under
+          // patient B — corrupting per-patient audit reconstruction
+          // and the patient-scoped hash-chain partition.
+          const evalRow = await tx.query(
+            `SELECT patient_id
                    FROM interaction_engine_evaluation
                   WHERE tenant_id = $1 AND id = $2`,
-                [ctx.tenantId, evaluationId],
-              );
-              const evalRows = evalRow.rows as Array<{ patient_id: string }>;
-              const derivedPatientId = evalRows[0]?.patient_id;
-              if (
-                typeof derivedPatientId !== 'string' ||
-                derivedPatientId.length === 0
-              ) {
-                // Missing evaluation row → tenant-blind 404 (I-025).
-                throw req.server.httpErrors.notFound('Interaction signal not found.');
-              }
-              if (derivedPatientId !== patientId) {
-                // Body-supplied patient_id does not match the durable
-                // evaluation row → tenant-blind 404. Do NOT differentiate
-                // "wrong patient" from "wrong tenant" / "doesn't exist."
-                throw req.server.httpErrors.notFound('Interaction signal not found.');
-              }
+            [ctx.tenantId, evaluationId],
+          );
+          const evalRows = evalRow.rows as Array<{ patient_id: string }>;
+          const derivedPatientId = evalRows[0]?.patient_id;
+          if (typeof derivedPatientId !== 'string' || derivedPatientId.length === 0) {
+            // Missing evaluation row → tenant-blind 404 (I-025).
+            throw req.server.httpErrors.notFound('Interaction signal not found.');
+          }
+          if (derivedPatientId !== patientId) {
+            // Body-supplied patient_id does not match the durable
+            // evaluation row → tenant-blind 404. Do NOT differentiate
+            // "wrong patient" from "wrong tenant" / "doesn't exist."
+            throw req.server.httpErrors.notFound('Interaction signal not found.');
+          }
 
-              // §2 — INSERT the interaction_signal row. The SECDEF
-              // wrapper's evidence check (`SELECT EXISTS FROM
-              // interaction_signal WHERE id = $1`) requires this to be
-              // present before the wrapper runs.
-              await tx.query(
-                `INSERT INTO interaction_signal (
+          // §2 — INSERT the interaction_signal row. The SECDEF
+          // wrapper's evidence check (`SELECT EXISTS FROM
+          // interaction_signal WHERE id = $1`) requires this to be
+          // present before the wrapper runs.
+          await tx.query(
+            `INSERT INTO interaction_signal (
                    id, tenant_id, evaluation_id, check_class, severity,
                    recommended_action, medications_involved, evidence_sources,
                    signal_payload
@@ -288,121 +278,112 @@ export async function emitSignalHandler(
                    $1, $2, $3, $4, $5,
                    $6, $7::varchar(26)[], $8::jsonb, $9::jsonb
                  )`,
-                [
-                  signalId,
-                  ctx.tenantId,
-                  evaluationId,
-                  checkClass,
-                  severity,
-                  recommendedAction,
-                  medicationsInvolved,
-                  JSON.stringify(evidenceSources),
-                  JSON.stringify(signalPayload),
-                ],
-              );
-
-              // §3 — Call the SECDEF wrapper to INSERT the initial
-              // `none → emitted` lifecycle transition row atomically.
-              // The wrapper acquires the per-(tenant, signal) advisory
-              // lock + re-validates the signal row exists + delegates
-              // to record_interaction_signal_lifecycle_transition (raw
-              // writer from migration 049).
-              await tx.query(
-                'SELECT record_signal_emission($1, $2, $3, $4, $5::jsonb)',
-                [
-                  transitionId,
-                  ctx.tenantId,
-                  signalId,
-                  actorId,
-                  JSON.stringify({ evaluation_id: evaluationId }),
-                ],
-              );
-
-              // §4 — Cat A audit `interaction_signal_emitted` in the
-              // SAME tx as the wrapper call. Per I-003 the audit write
-              // is non-suppressible; an audit-INSERT failure rolls back
-              // the entire transaction (including the signal INSERT +
-              // lifecycle transition INSERT). This is the Option 2
-              // carryforward atomicity guarantee.
-              //
-              // The patient_id passed to the audit emitter is the
-              // DB-derived value, NOT the body-supplied value (R2
-              // HIGH-1 closure). They are validated equal above, so
-              // this is a defense-in-depth use of the derived value.
-              await emitSignalEmittedAudit(
-                {
-                  tenantId: ctx.tenantId,
-                  signalId,
-                  evaluationId,
-                  patientId: derivedPatientId,
-                  actorId,
-                  actorTenantId,
-                  countryOfCare: ctx.countryOfCare,
-                  checkClass,
-                  severity,
-                  recommendedAction,
-                },
-                tx,
-              );
-            },
+            [
+              signalId,
+              ctx.tenantId,
+              evaluationId,
+              checkClass,
+              severity,
+              recommendedAction,
+              medicationsInvolved,
+              JSON.stringify(evidenceSources),
+              JSON.stringify(signalPayload),
+            ],
           );
-        } catch (err) {
-          // 42501 → tenant-blind 403 (I-025). Covers SET LOCAL ROLE +
-          // INSERT RLS denial + SECDEF wrapper's tenant-scope guard
-          // (record_signal_emission raises 42501 via the SI-010
-          // current_actor_account_tenant_id() check on tenant mismatch).
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err
-          ) {
-            const code = (err as { code?: unknown }).code;
-            if (code === '42501') {
-              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-            }
-            // The wrapper raises SQLSTATE 02000 (`no_data`) with
-            // message `paired_signal_not_found` when the evidence
-            // check finds no signal row — defensive coverage since
-            // the handler INSERTs the row above (this would only fire
-            // if a future race / different code path called the
-            // wrapper directly). Map to a tenant-blind 404.
-            if (code === '02000') {
-              throw req.server.httpErrors.notFound('Interaction signal not found.');
-            }
-            // R2 HIGH-3 closure (Codex 2026-05-24): interaction_signal
-            // has a composite FK to (tenant_id, evaluation_id), so an
-            // unknown or cross-tenant evaluation_id fails on the INSERT
-            // with SQLSTATE 23503 (foreign_key_violation) BEFORE the
-            // SECDEF wrapper runs. The §1 pre-INSERT evaluation lookup
-            // catches the well-formed-but-missing case (and the
-            // patient-mismatch case) and maps to 404 cleanly, but if a
-            // concurrent DELETE / RLS-policy-rejected lookup somehow
-            // races between §1 and §2 the INSERT can still raise 23503.
-            // Map to tenant-blind 404 per I-025 — same wire response as
-            // "evaluation does not exist in this tenant."
-            if (code === '23503') {
-              throw req.server.httpErrors.notFound('Interaction signal not found.');
-            }
+
+          // §3 — Call the SECDEF wrapper to INSERT the initial
+          // `none → emitted` lifecycle transition row atomically.
+          // The wrapper acquires the per-(tenant, signal) advisory
+          // lock + re-validates the signal row exists + delegates
+          // to record_interaction_signal_lifecycle_transition (raw
+          // writer from migration 049).
+          await tx.query('SELECT record_signal_emission($1, $2, $3, $4, $5::jsonb)', [
+            transitionId,
+            ctx.tenantId,
+            signalId,
+            actorId,
+            JSON.stringify({ evaluation_id: evaluationId }),
+          ]);
+
+          // §4 — Cat A audit `interaction_signal_emitted` in the
+          // SAME tx as the wrapper call. Per I-003 the audit write
+          // is non-suppressible; an audit-INSERT failure rolls back
+          // the entire transaction (including the signal INSERT +
+          // lifecycle transition INSERT). This is the Option 2
+          // carryforward atomicity guarantee.
+          //
+          // The patient_id passed to the audit emitter is the
+          // DB-derived value, NOT the body-supplied value (R2
+          // HIGH-1 closure). They are validated equal above, so
+          // this is a defense-in-depth use of the derived value.
+          await emitSignalEmittedAudit(
+            {
+              tenantId: ctx.tenantId,
+              signalId,
+              evaluationId,
+              patientId: derivedPatientId,
+              actorId,
+              actorTenantId,
+              countryOfCare: ctx.countryOfCare,
+              checkClass,
+              severity,
+              recommendedAction,
+            },
+            tx,
+          );
+        });
+      } catch (err) {
+        // 42501 → tenant-blind 403 (I-025). Covers SET LOCAL ROLE +
+        // INSERT RLS denial + SECDEF wrapper's tenant-scope guard
+        // (record_signal_emission raises 42501 via the SI-010
+        // current_actor_account_tenant_id() check on tenant mismatch).
+        if (typeof err === 'object' && err !== null && 'code' in err) {
+          const code = (err as { code?: unknown }).code;
+          if (code === '42501') {
+            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
           }
-          throw err;
+          // The wrapper raises SQLSTATE 02000 (`no_data`) with
+          // message `paired_signal_not_found` when the evidence
+          // check finds no signal row — defensive coverage since
+          // the handler INSERTs the row above (this would only fire
+          // if a future race / different code path called the
+          // wrapper directly). Map to a tenant-blind 404.
+          if (code === '02000') {
+            throw req.server.httpErrors.notFound('Interaction signal not found.');
+          }
+          // R2 HIGH-3 closure (Codex 2026-05-24): interaction_signal
+          // has a composite FK to (tenant_id, evaluation_id), so an
+          // unknown or cross-tenant evaluation_id fails on the INSERT
+          // with SQLSTATE 23503 (foreign_key_violation) BEFORE the
+          // SECDEF wrapper runs. The §1 pre-INSERT evaluation lookup
+          // catches the well-formed-but-missing case (and the
+          // patient-mismatch case) and maps to 404 cleanly, but if a
+          // concurrent DELETE / RLS-policy-rejected lookup somehow
+          // races between §1 and §2 the INSERT can still raise 23503.
+          // Map to tenant-blind 404 per I-025 — same wire response as
+          // "evaluation does not exist in this tenant."
+          if (code === '23503') {
+            throw req.server.httpErrors.notFound('Interaction signal not found.');
+          }
         }
-      };
+        throw err;
+      }
+    };
 
-      await withTenantContext(tx, ctx.tenantId, async () => {
-        if (typeof actorNonce === 'string' && actorNonce.length > 0) {
-          await withActorContext(tx, actorNonce, callWrappers);
-        } else {
-          await callWrappers();
-        }
-      });
+    await withTenantContext(tx, ctx.tenantId, async () => {
+      if (typeof actorNonce === 'string' && actorNonce.length > 0) {
+        await withActorContext(tx, actorNonce, callWrappers);
+      } else {
+        await callWrappers();
+      }
+    });
 
-      return {
-        status: 201,
-        view: {
-          signal_id: signalId,
-          emitted_at: emittedAt.toISOString(),
-        },
-      };
-    },
-  );
+    return {
+      status: 201,
+      view: {
+        signal_id: signalId,
+        emitted_at: emittedAt.toISOString(),
+      },
+    };
+  });
 }

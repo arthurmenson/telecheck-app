@@ -7,8 +7,8 @@
  * signal_not_emitted / activation_blocked_by_override rejection path.
  */
 
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 import { activateSignalHandler } from './activate-signal.js';
 
@@ -64,21 +64,17 @@ vi.mock('../../../../lib/idempotent-handler.js', () => ({
 }));
 
 vi.mock('../../../../lib/rls.js', () => ({
-  withTenantContext: vi.fn(
-    async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withTenantContext:${tenantId}`);
-      return fn();
-    },
-  ),
+  withTenantContext: vi.fn(async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withTenantContext:${tenantId}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/actor-context-binding.js', () => ({
-  withActorContext: vi.fn(
-    async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withActorContext:${nonce}`);
-      return fn();
-    },
-  ),
+  withActorContext: vi.fn(async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withActorContext:${nonce}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/with-db-role.js', () => ({
@@ -217,9 +213,7 @@ describe('activateSignalHandler §1 — path/body validation', () => {
     expect(sent.code).toBe(200);
     // Audit must use the DB-derived patient_id, NOT the body value.
     expect(auditCalls).toHaveLength(1);
-    expect((auditCalls[0]!.args as Record<string, unknown>)['patientId']).toBe(
-      DERIVED_PATIENT_ID,
-    );
+    expect((auditCalls[0]!.args as Record<string, unknown>)['patientId']).toBe(DERIVED_PATIENT_ID);
   });
 
   it('rejects non-object metadata with 400', async () => {

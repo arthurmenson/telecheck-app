@@ -8,8 +8,8 @@
  * for cross-tenant evaluation_id rejection.
  */
 
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 import { emitSignalHandler } from './emit-signal.js';
 
@@ -67,21 +67,17 @@ vi.mock('../../../../lib/idempotent-handler.js', () => ({
 }));
 
 vi.mock('../../../../lib/rls.js', () => ({
-  withTenantContext: vi.fn(
-    async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withTenantContext:${tenantId}`);
-      return fn();
-    },
-  ),
+  withTenantContext: vi.fn(async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withTenantContext:${tenantId}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/actor-context-binding.js', () => ({
-  withActorContext: vi.fn(
-    async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
-      wrapperCalls.push(`withActorContext:${nonce}`);
-      return fn();
-    },
-  ),
+  withActorContext: vi.fn(async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
+    wrapperCalls.push(`withActorContext:${nonce}`);
+    return fn();
+  }),
 }));
 
 vi.mock('../../../../lib/with-db-role.js', () => ({
@@ -346,7 +342,7 @@ describe('emitSignalHandler §4 — eval lookup + INSERT + wrapper + audit same-
     expect(queryPrefixes[0]).toContain('SELECT');
     expect(recordedQueries[0]!.sql).toContain('FROM interaction_engine_evaluation');
     expect(queryPrefixes[1]).toBe('INSERT INTO interaction_signal');
-    expect(queryPrefixes[2]).toBe('SELECT record_signal_emission($1,');
+    expect(queryPrefixes[2]).toBe('SELECT record_signal_emission($1, $2,');
     // Audit fires AFTER all DB writes; assert auditCalls length is 1.
     expect(auditCalls).toHaveLength(1);
   });
