@@ -79,5 +79,28 @@ jobs:
           fi
           psql --version
 
+      # `telecheck_app_role` is a CLUSTER-GLOBAL Postgres role consumed by
+      # migrations 047-050 (GRANT TO clauses) but only CREATED by foundation
+      # 051. On a pristine CI database the role does not exist when 047 runs,
+      # so its GRANT TO fails before 051's CREATE ROLE executes. The bootstrap
+      # below mirrors the runtime provisioning in `tests/setup.ts` (per PR
+      # #197 now on main) so the chain apply reflects the application's
+      # actual runtime topology rather than relying on migration-internal
+      # sequencing. Idempotent: the IF NOT EXISTS guard means re-runs and
+      # 051's own role creation are both safe.
+      - name: Bootstrap telecheck_app_role (cluster-global; consumed by 047-050)
+        env:
+          PGPASSWORD: telecheck_ci
+        run: |
+          psql -h localhost -U telecheck_ci -d telecheck_chain -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'telecheck_app_role') THEN
+              CREATE ROLE telecheck_app_role NOINHERIT NOLOGIN;
+            END IF;
+          END
+          $$;
+          SQL
+
       - name: Verify migration chain (000 -> head, clean-room)
         run: ./scripts/check-migration-chain.sh
