@@ -62,7 +62,7 @@ afterAll(async () => {
 });
 
 describe('admin-backend slice — §1 plugin wiring', () => {
-  it('§1a GET /v1/admin/health returns 200 (liveness — module alive) with Sprint 2 v0.2 metadata', async () => {
+  it('§1a GET /v1/admin/health returns 200 (liveness — module alive) with Sprint 2 v0.3 metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v1/admin/health',
@@ -77,7 +77,7 @@ describe('admin-backend slice — §1 plugin wiring', () => {
     };
     expect(body.status).toBe('ok');
     expect(body.module).toBe('admin-backend');
-    expect(body.blocked).toContain('Sprint 2 PR 1 of N at v0.2');
+    expect(body.blocked).toContain('Sprint 2 PR 2 of N at v0.3');
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 044');
   });
 
@@ -101,31 +101,28 @@ describe('admin-backend slice — §1 plugin wiring', () => {
   });
 
   // §1c — paired-probe coverage proving the template submit-for-review write
-  // route is still NOT mounted (submit + decision land in PR #205 of the
-  // Sprint 2 cascade). Codex R1 follow-up (2026-05-24): the single 400
-  // assertion was forward-stable (would keep passing even after the handler
-  // mounts, because it deliberately omits Idempotency-Key) and thus stopped
-  // proving "no mounted write handler." Replaced with a PAIR of probes that
-  // together hold the wiring honest:
+  // route is now MOUNTED (submit landed in PR #205 of the Sprint 2 cascade)
+  // and that the global idempotency guard fires before routing. The §1c-route
+  // assertion was the deliberate forward-CHANGING wiring-honesty signal: it
+  // asserted 404 ("route not mounted") until #205 landed, at which point it was
+  // advanced to the next chain link's status code per the comment's own
+  // instruction. With #205 merged, POST .../submit-for-review reaches
+  // postFormsTemplateSubmitHandler; requireAdminRole (legacy platform admin
+  // shim, pending RBAC v1.1 wiring) rejects the role-less probe → 403.
   //
   //   §1c-guard: POST WITHOUT Idempotency-Key → 400
   //     Exercises the global idempotency preHandler guard
   //     (`internal.idempotency.missing_key`). The guard fires before routing.
-  //     Forward-stable (will keep passing post-handler-mount).
+  //     Forward-stable across the Sprint 2 cascade.
   //
-  //   §1c-route: POST WITH Idempotency-Key → 404
-  //     Bypasses the idempotency guard and lets the request reach the router,
-  //     which currently has no matching write route. Forward-CHANGING: when
-  //     PR #205 lands and mounts the actual submit-for-review handler, this
-  //     assertion will start failing — at which point this §1c-route block
-  //     gets advanced to the next chain link's status code (probably 401
-  //     unauthenticated or 422 schema-invalid, depending on what fires next).
-  //     That failure is the wiring-honesty signal we want.
+  //   §1c-route: POST WITH Idempotency-Key → 403
+  //     Bypasses the idempotency guard and reaches the now-mounted submit
+  //     route; the admin-role gate rejects the role-less probe with 403
+  //     (tenant-blind per I-025). Advance this assertion again only if a future
+  //     PR reorders the composition chain ahead of the admin-role gate.
   //
   // Together the pair proves BOTH (a) the global idempotency guard fires
-  // before routing AND (b) the router currently lands on no-such-route. This
-  // is route-specific coverage that holds the wiring honest across the
-  // Sprint 2 cascade.
+  // before routing AND (b) the mounted write route enforces its admin-role gate.
   it('§1c-guard POST /v1/admin/templates/:id/submit-for-review returns 400 (idempotency guard precedes routing; no Idempotency-Key)', async () => {
     const r = await app!.inject({
       method: 'POST',
@@ -138,7 +135,7 @@ describe('admin-backend slice — §1 plugin wiring', () => {
     expect(body.error.code).toBe('internal.idempotency.missing_key');
   });
 
-  it('§1c-route POST /v1/admin/templates/:id/submit-for-review with Idempotency-Key returns 404 (route still not mounted)', async () => {
+  it('§1c-route POST /v1/admin/templates/:id/submit-for-review with Idempotency-Key returns 403 (route mounted; admin-role gate rejects role-less probe)', async () => {
     const r = await app!.inject({
       method: 'POST',
       url: '/v1/admin/templates/01H8Z6QY9V3MF8KR7XJW2NTPDB/submit-for-review',
@@ -149,7 +146,7 @@ describe('admin-backend slice — §1 plugin wiring', () => {
       },
       payload: {},
     });
-    expect(r.statusCode).toBe(404);
+    expect(r.statusCode).toBe(403);
   });
 
   // Probe paths must reach the handler WITHOUT relying on a resolvable
