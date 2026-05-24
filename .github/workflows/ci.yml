@@ -117,6 +117,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Migration encoding guard — DB-free file scan that fails if any migration
+      # SQL file begins with a UTF-8 BOM. Runs first (fastest, no deps) because a
+      # BOM silently aborts the migration-chain apply in the test step below; this
+      # surfaces the defect class in seconds instead of as a confusing mid-suite
+      # Postgres syntax error. See scripts/check-migration-bom.mjs for the why.
+      - name: Migration encoding guard (no UTF-8 BOM)
+        run: npm run check:migration-bom
+
       # Format check before lint — prettier failures are usually quick fixes;
       # surfacing them first reduces churn on the PR.
       - name: Format check (prettier)

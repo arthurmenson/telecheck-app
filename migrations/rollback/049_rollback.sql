@@ -1,4 +1,4 @@
-﻿-- =============================================================================
+-- =============================================================================
 -- File:    migrations/rollback/049_rollback.sql
 -- Purpose: Rollback migration 049_med_interaction_raw_lifecycle_writer.sql.
 --

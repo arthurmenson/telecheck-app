@@ -1,4 +1,4 @@
-﻿-- =============================================================================
+-- =============================================================================
 -- File:    migrations/047_med_interaction_entities.sql
 -- Purpose: Create the 4 net-new Med-Interaction entities (SI-019 v2.0 RATIFIED
 --          2026-05-21 P-033 + CDM v1.6 â†’ v1.7 Amendment Â§4.NEW1-NEW4 RATIFIED

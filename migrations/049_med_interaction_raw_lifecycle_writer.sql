@@ -1,4 +1,4 @@
-﻿-- =============================================================================
+-- =============================================================================
 -- File:    migrations/049_med_interaction_raw_lifecycle_writer.sql
 -- Purpose: Create the canonical raw lifecycle writer SECDEF function
 --          record_interaction_signal_lifecycle_transition() â€” the SOLE INSERT
