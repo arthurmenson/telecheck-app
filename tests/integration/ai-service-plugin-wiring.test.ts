@@ -61,10 +61,12 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
       autonomy_levels_reserved: string[];
       handlers_wired: boolean;
       handlers_wired_tracking: string;
+      mode_1_chat_handler_mounted: boolean;
+      mode_2_case_prep_handler_mounted: boolean;
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('crisis_gate_wired_pr_f');
+    expect(body.phase).toBe('mode_1_chat_mounted');
     // Per AI_LAYERING v5.2 §10.2 + WORKLOAD_TAXONOMY v5.2 §2, the v1.0
     // active workload types are exactly `conversational_assistant` +
     // `protocol_execution`. Reserved types must be enumerated so a
@@ -80,9 +82,20 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     ]);
     expect(body.autonomy_levels_at_v1).toEqual(['advisory', 'suggestion', 'action_with_confirm']);
     expect(body.autonomy_levels_reserved).toEqual(['action_with_audit_only', 'fully_autonomous']);
+    // Mode 1 chat is mounted; Mode 2 case-prep is the sole un-mounted
+    // documented handler, so the full-surface rollup stays false.
+    expect(body.mode_1_chat_handler_mounted).toBe(true);
+    expect(body.mode_2_case_prep_handler_mounted).toBe(false);
     expect(body.handlers_wired).toBe(false);
+    // Tracking must point at the genuinely-remaining work (PR C / Mode 2
+    // case-prep) only — provider (PR D), guardrails (PR E), and the
+    // crisis gate (PR F) are all wired, so they must NOT be listed as
+    // pending. This is the anti-drift assertion.
     expect(body.handlers_wired_tracking).toContain('PR C');
-    expect(body.handlers_wired_tracking).toContain('PR F');
+    expect(body.handlers_wired_tracking).toContain('Mode 2 case-prep');
+    expect(body.handlers_wired_tracking).not.toContain('PR D');
+    expect(body.handlers_wired_tracking).not.toContain('PR E');
+    expect(body.handlers_wired_tracking).not.toContain('PR F');
   });
 
   it('§1b GET /v0/ai/ready returns 503 (not ready for traffic) while scaffold PR A is the latest', async () => {
@@ -101,8 +114,13 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     }>();
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('crisis_gate_wired_pr_f');
+    expect(body.phase).toBe('mode_1_chat_mounted');
     expect(body.pending).toContain('PR C');
+    // Anti-drift: Mode 2 case-prep (PR C) is the only pending handler;
+    // provider/guardrails/crisis (PR D/E/F) are wired and must not be
+    // listed as pending.
+    expect(body.pending).not.toContain('PR D');
+    expect(body.pending).not.toContain('PR F');
     expect(body.pending_message).toContain('not yet ready');
     expect(body.pending_message).toContain('conversational_assistant');
     expect(body.pending_message).toContain('protocol_execution');
