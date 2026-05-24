@@ -103,9 +103,7 @@ type AdminBackendAuditActionPlaceholder = 'admin.template_submitted_for_review';
  * The compile-time `AdminBackendAuditActionPlaceholder` union prevents
  * typos.
  */
-export function adminBackendAuditPlaceholder(
-  id: AdminBackendAuditActionPlaceholder,
-): AuditAction {
+export function adminBackendAuditPlaceholder(id: AdminBackendAuditActionPlaceholder): AuditAction {
   return id as AuditAction;
 }
 
