@@ -80,7 +80,7 @@ The **`slice-implementation` skill** (per EHBG §13, configured under `.claude/s
 |---|---|---|
 | **Pharmacy + Refill** | `pharmacy/` | SI-001 (MedicationRequest schema gap) |
 | **Subscription** | `subscription/` | SI-001 (binds to MedicationRequest via `medication_request_id`) |
-| **Medication Interaction Engine** | `med-interaction/` | Med Interaction Engine slice PRD ratification |
+| **Medication Interaction Engine** | `med-interaction/` | Spec RATIFIED (SI-019 v2.0 P-033 + CDM v1.6→v1.7 P-034 2026-05-21); DB+handler implementation in progress (PR 1 of ~6 — migration 046 RBAC roles shipped; PR 2 entities + PR 3 views + PR 4 raw writer + PR 5 wrappers + PR 6+ Fastify handlers pending) |
 
 Each skeleton ships `routes.ts` returning `{ status: 503 }` on slice-specific endpoints + `{ status: 200 }` on `/health`. Ready to flip to real implementation as soon as the upstream blocker closes.
 

@@ -278,13 +278,25 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // docs/SI-001-MedicationRequest-Schema-Gap.md for the resume path.
   await app.register(pharmacyPlugin);
 
-  // Med Interaction Engine — routes mounted under /v0/med-interaction.
-  // SKELETON ONLY at v0.1: only /health (200) + /ready (503) are mounted;
-  // full implementation (POST /signals/check, override workflow, ruleset
-  // resolver, vendor adapter abstraction) is BLOCKED on Med Interaction
-  // Engine slice PRD ratification. See src/modules/med-interaction/README.md.
-  // Platform-floor hard rule: the interaction engine runs BEFORE clinician
-  // commits a prescription (Master PRD v1.10 §7).
+  // Medication Interaction & Validation Engine (SI-019 v2.0 + CDM v1.6 → v1.7
+  // Amendment; RATIFIED P-033 + P-034 2026-05-21). Spec layer COMPLETE; DB
+  // layer COMPLETE through migration 050 (PRs 1-5 merged; 21 Codex
+  // adversarial-review rounds total): 12 RBAC roles (046) + 4 entities + RLS
+  // + per-table append-only + server-assigned monotonic-ordering triggers
+  // (047) + 1 SECURITY BARRIER view + 1 optional MV + SECDEF access function
+  // with MV access-discipline (048) + raw lifecycle writer SECDEF + anti-
+  // bypass EXECUTE matrix + STEP-3.5 advisory-locked activation-override-
+  // evidence check (049) + 6 reason-specific wrappers (050; 3 operational
+  // emission/activation/supersession + 3 fail-closed resolution/expiry/
+  // override pending evidence-source migrations from Async Consult / Pharmacy
+  // / LAYER B). Sprint 1 PR 6 of 6 (current scaffold-update commit) registers
+  // /health (200) + /ready (503) reflecting the post-DB-layer state; PR 7+
+  // adds Fastify handlers (8 endpoints per SI-019 §5 + CDM §6 OpenAPI v0.3)
+  // + Cat A audit emission + LAYER B role-membership check. See
+  // src/modules/med-interaction/README.md + docs/med-interaction-
+  // implementation-plan.md.
+  // Platform-floor hard rule (I-002): the interaction engine runs BEFORE
+  // clinician commits a medication_request (Master PRD v1.10 §7).
   await app.register(medInteractionPlugin);
 
   // AI Service Slice — routes mounted under /v0/ai.

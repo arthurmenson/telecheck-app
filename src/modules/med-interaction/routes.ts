@@ -1,23 +1,67 @@
 /**
- * med-interaction/routes.ts — Fastify route registration (skeleton).
+ * med-interaction/routes.ts — Fastify route registration (Sprint 1 skeleton).
  *
- * Status at v0.1: BLOCKED on Med Interaction Engine slice PRD
- * ratification. Only `/health` (200) + `/ready` (503) are mounted;
- * every other path under `/v0/med-interaction` will return the
- * canonical tenant-blind error envelope when the slice PRD lands
- * and real handlers are authored.
+ * Status at v0.1 (post-PR-1-5 DB-layer COMPLETE; this commit = PR 6 of 6
+ * for the Med-Interaction DB-layer series): SKELETON — only `/health`
+ * (200) + `/ready` (503) are mounted. Liveness/readiness split applies
+ * the canonical BLOCKED-aware pattern from pharmacy / med-interaction's
+ * own prior skeleton / subscription / async-consult / crisis-response /
+ * admin-backend modules.
  *
- * Pharmacy `/health` + `/ready` split applied a-priori to avoid the
- * Codex MEDIUM finding from Sprint 1 (`pharmacy-blocked-handler` —
- * conflating liveness with readiness).
+ * Post-P-033/P-034 ratified + DB-layer-implemented state (2026-05-23):
+ * SI-019 Slice PRD v2.0 RATIFIED P-033 + CDM v1.6 → v1.7 + AUDIT_EVENTS
+ * v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 + RBAC
+ * v1.1 → v1.2 RATIFIED P-034 (both 2026-05-21). DB layer COMPLETE through
+ * migration 050:
+ *   - migration 046: 12 net-new RBAC roles (4 application + 6 wrapper-
+ *     owner + 2 service-level-owner)
+ *   - migration 047: 4 entities (interaction_engine_evaluation +
+ *     interaction_signal + interaction_signal_override +
+ *     interaction_signal_lifecycle_transition) + RLS + per-table append-
+ *     only triggers + server-assigned monotonic-ordering trigger with
+ *     state-continuity check + caller-tenant guard (7 Codex rounds)
+ *   - migration 048: 1 SECURITY BARRIER view + 1 optional MV + SECDEF
+ *     access function + MV access-discipline (preflight + immediate
+ *     REVOKE + aclexplode loop + final verifier; 5 Codex rounds)
+ *   - migration 049: raw lifecycle writer SECDEF + anti-bypass EXECUTE
+ *     matrix (6 wrapper-owners) + STEP 3.5 advisory-locked activation-
+ *     override-evidence check (3 Codex rounds)
+ *   - migration 050: 6 reason-specific wrappers (3 operational: emission
+ *     + activation + supersession; 3 fail-closed: resolution + expiry +
+ *     override pending evidence-source migrations) (3 Codex rounds)
+ *
+ * Subsequent PRs (PR 7+) land Fastify handler implementation:
+ *   - POST /v1/med-interaction/evaluations         — initiate evaluation
+ *   - POST /v1/med-interaction/signals             — emit signal
+ *   - POST /v1/med-interaction/signals/:id/activate
+ *   - POST /v1/med-interaction/signals/:id/override
+ *   - POST /v1/med-interaction/signals/:id/resolve  (gated; fail-closed
+ *                                                    wrapper in 050)
+ *   - POST /v1/med-interaction/signals/:id/expire   (gated; fail-closed)
+ *   - POST /v1/med-interaction/signals/:id/supersede
+ *   - GET  /v1/med-interaction/signals/:id          — read via SECDEF
+ *                                                    access function or
+ *                                                    SECURITY BARRIER view
+ *   + Cat A audit emission (6 audit events under medication_interaction.*)
+ *   + LAYER B role-membership check at route layer (SI-024.1 JWT-binding
+ *     deferred per Option 2)
  *
  * Spec references:
  *   - Master PRD v1.10 §7 (interaction engine as platform-floor)
+ *   - SI-019 Med-Interaction Engine Slice PRD v2.0 (RATIFIED 2026-05-21
+ *     P-033)
+ *   - CDM v1.6 → v1.7 Amendment (RATIFIED 2026-05-21 P-034)
+ *   - I-002 (interaction engine runs BEFORE clinician commits
+ *     medication_request)
  *   - I-023 (tenant scoping via foundation tenantContext plugin)
  *   - I-025 (tenant-blind error envelopes)
+ *   - src/modules/med-interaction/README.md
+ *   - docs/med-interaction-implementation-plan.md
  */
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
+
+import { getSignalHandler } from './internal/handlers/get-signal.js';
 
 export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
@@ -28,36 +72,69 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'med-interaction',
-    blocked: 'Med Interaction Engine slice ratification',
+    blocked:
+      'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1; PR 7 of N — first real handler shipped)',
     blocked_message:
-      'Med Interaction Engine slice PRD has not been ratified. Branded ID types ' +
-      'are exported for downstream slice consumption; signal/override/ruleset ' +
-      'row schemas + handlers + adapter abstraction land when the slice PRD is ratified. ' +
-      'See src/modules/med-interaction/README.md.',
+      'Spec layer COMPLETE: SI-019 v2.0 RATIFIED 2026-05-21 P-033 + CDM v1.6 → v1.7 ' +
+      '+ AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 ' +
+      '+ RBAC v1.1 → v1.2 RATIFIED P-034. DB layer COMPLETE through migration 050 ' +
+      '(PRs 1-5 merged; 21 Codex rounds total): 12 RBAC roles (046) + 4 entities + RLS + ' +
+      'triggers (047) + view + MV + SECDEF access function (048) + raw lifecycle writer ' +
+      'SECDEF + anti-bypass matrix (049) + 6 reason-specific wrappers (050; 3 ' +
+      'operational + 3 fail-closed pending evidence-source migrations). ' +
+      'PR 7 (this commit) ships the FIRST real Fastify handler post-foundation-051: ' +
+      'GET /v0/med-interaction/signals/:id reading via the SECDEF access function from ' +
+      'migration 048 under the canonical withTransaction → withTenantContext → ' +
+      'withActorContext → withDbRole(medication_interaction_signal_viewer) composition. ' +
+      '7 endpoints remain (POST evaluations + 6 signal lifecycle actions); they land in ' +
+      'PRs 8-11 with Cat A audit emission + LAYER B role-membership tightening. See ' +
+      'src/modules/med-interaction/README.md + docs/med-interaction-implementation-plan.md.',
   }));
 
-  // Readiness probe — module is READY to serve traffic. Returns 503
-  // while the slice PRD is unratified: the module is intentionally not
-  // production-ready, so a Kubernetes/load-balancer readiness probe
-  // will keep traffic away from this module's real routes (which don't
-  // exist yet). Distinguishes liveness ("process up") from readiness
-  // ("traffic-acceptable") per the canonical k8s pattern.
-  //
-  // When the slice PRD is ratified and the real handler surface lands,
-  // this returns 200 unconditionally + the blocked field is removed.
+  // Readiness probe — module is partially serving traffic at PR 7 (the
+  // signal-read endpoint is live) but the slice as a whole is NOT yet
+  // production-ready: 7 of 8 handlers remain, the audit emission helper is
+  // not wired, and Layer B role-membership authorization is still the
+  // deferred-permissive shape per the Option 2 ratifier decision. Returns
+  // 503 with `reason: 'partial_handlers_wired'` to keep load-balancers /
+  // deploy gates from advancing the slice through production rollout
+  // until the full handler set ships. This follows the canonical
+  // Crisis-Response / Admin-Backend scaffold convention where /ready
+  // stays 503 with an updated reason until the slice's PR series closes.
   app.get('/ready', async (_req, reply) => {
     return reply.code(503).send({
-      status: 'not_ready',
+      status: 'unavailable',
       module: 'med-interaction',
-      blocked: 'Med Interaction Engine slice ratification',
-      blocked_message:
-        'Module is not ready to serve traffic — Med Interaction Engine slice PRD ' +
-        'has not been ratified. See src/modules/med-interaction/README.md.',
+      reason: 'partial_handlers_wired',
+      reason_message:
+        '1 of 8 Med Interaction Engine Fastify handlers wired (PR 7: ' +
+        'GET /v0/med-interaction/signals/:id via SECDEF access function from ' +
+        'migration 048 under the canonical withDbRole composition). 7 endpoints ' +
+        'remain: POST /evaluations + POST /signals + POST /signals/:id/{activate, ' +
+        'override, resolve, expire, supersede}. Spec + DB layers COMPLETE through ' +
+        'migration 050 + PR 7 first real handler. The /ready probe returns 200 once ' +
+        'the full PR series (remaining handlers + Cat A audit emission + LAYER B ' +
+        'role-membership check + integration tests) closes. See ' +
+        'src/modules/med-interaction/README.md for the resume path.',
     });
   });
 
-  // Real routes (POST /signals/check, POST /overrides, GET /rulesets/:id, etc.)
-  // land when the slice PRD is ratified and handler/adapter authoring begins.
-  // The handler surface is intentionally absent here so that any premature
-  // wiring breaks at typecheck time rather than reaching production half-built.
+  // ----- Real routes -----
+
+  // PR 7 of N: GET /v0/med-interaction/signals/:id — single-signal
+  // current-state lookup via the SECDEF access function from migration
+  // 048 §3. Read-only; no audit emission (SI-019 §6 catalogs only
+  // write events). See handler file-level docstring for the canonical
+  // composition order + Layer B deferral rationale.
+  app.get('/signals/:id', getSignalHandler);
+
+  // Remaining 7 endpoints (POST /evaluations, POST /signals, POST
+  // /signals/:id/{activate, override, resolve, expire, supersede})
+  // land in PR 8+ when write-handler implementation begins. They will
+  // share the same withTransaction → withTenantContext → withActorContext
+  // → withDbRole composition pattern as the PR 7 read handler; the
+  // write variants additionally wire Cat A audit emission inside the
+  // same DB transaction as the SECDEF wrapper call (so a partial commit
+  // cannot leave a wrapper effect without its audit record, per the
+  // module README's Option 2 carryforward).
 };

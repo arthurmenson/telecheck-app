@@ -2,9 +2,22 @@
 
 Implementation of **SI-022 Crisis Response Slice v1.0** (RATIFIED 2026-05-21 P-039) + the canonical follow-on **CDM v1.9 → v1.10 Amendment** (RATIFIED 2026-05-21 P-040).
 
-## Status: Sprint 1 of 4 (PR 7 — this commit) — **SKELETON**
+## Status: Sprint 2 PR 1 — **FIRST REAL HANDLER LANDED**
 
-The DB layer is **complete** through migration 038. The TypeScript application layer is at Sprint 1 — module skeleton + public interface + branded ID types + canonical state/classification vocabularies. Handler implementation + audit emission + KMS envelope + integration tests land across Sprints 2-4.
+The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition). The TypeScript application layer is at Sprint 2 — Sprint 1's skeleton + branded IDs + canonical vocabularies, plus the FIRST real Fastify handler (`GET /v0/crisis-events/:id` staff-scoped read) landed this commit. Remaining Sprint 2-3 write-path handlers + Cat A audit emission + KMS envelope + integration tests land in follow-up PRs.
+
+### Sprint 2 PR 1 (this commit)
+
+- `GET /v0/crisis-events/:id` — staff-scoped single-row read via `crisis_event_current_state_v` (12-column projection: crisis_event_id, tenant_id, patient_id, server_signal_id, crisis_type, severity, regulatory_reporting_enabled, detected_at, current_state, current_state_transition_at, current_state_transition_reason, current_state_actor_principal_id).
+- Composition: `withTransaction → withTenantContext → withActorContext → withDbRole('crisis_event_staff_reader', ...) → SELECT FROM crisis_event_current_state_v WHERE crisis_event_id = $1`.
+- Layer B authorization: closest-available `requireClinicianActorContext` role-gate (TODO: replace with explicit JWT-role → DB-slice-role membership check when Identity slice publishes role-to-membership mapping).
+- 404 envelope is tenant-blind per I-025 — same shape whether the row genuinely doesn't exist or exists in another tenant (RLS-filtered).
+- Path-param validation: UUID shape (`crisis_event.id` is `UUID` per migration 033 §4 line 472; **NOT** ULID despite some brief references).
+- Unit tests cover happy path, 4 guard-precedes-tx cases, 404 tenant-blind envelope, and both actorNonce-bound + actorNonce-undefined composition paths.
+
+### Sprint 2 PR 1 follow-up scope (NOT in this commit)
+
+- `GET /v0/crisis-events/:id` patient-scoped variant — uses `crisis_event_patient_summary_v` + `crisis_event_patient_reader` role; requires `requirePatientActorContext` role-gate. Patient view's self-scoping predicate (`patient_id = current_actor_account_id()::UUID`) requires `req.actorNonce` to be bound (unlike the staff view), so the patient handler MUST fail-closed on missing nonce.
 
 ### DB layer (PRs 1-6 — already merged on `main`)
 
@@ -22,10 +35,11 @@ The DB layer is **complete** through migration 038. The TypeScript application l
 ### Sprint 2-4 remaining work (NOT yet implemented)
 
 **Sprint 2 — Initiation + acknowledgement + read**
-- `POST /v0/crisis-events` → wraps `record_crisis_initiation()` + emits Cat A `crisis.detected` audit + KMS-envelope-encrypts the intake_payload
-- `POST /v0/crisis-events/:id/acknowledge` → wraps `record_crisis_acknowledgement_claim()` + Cat A `crisis.acknowledged` audit
-- `GET /v0/crisis-events/:id` → reads `crisis_event_current_state_v` (staff) or `crisis_event_patient_summary_v` (patient) depending on caller role (the SQL views' SELECT grants enforce the split)
-- Integration tests for the initiation + acknowledgement happy paths
+- `POST /v0/crisis-events` → wraps `record_crisis_initiation()` + emits Cat A `crisis.detected` audit + KMS-envelope-encrypts the intake_payload  *(remaining)*
+- `POST /v0/crisis-events/:id/acknowledge` → wraps `record_crisis_acknowledgement_claim()` + Cat A `crisis.acknowledged` audit  *(remaining)*
+- `GET /v0/crisis-events/:id` staff-scoped — reads `crisis_event_current_state_v`. **DONE — Sprint 2 PR 1 (this commit).**
+- `GET /v0/crisis-events/:id` patient-scoped — reads `crisis_event_patient_summary_v` via `crisis_event_patient_reader` role; the two views' SELECT grants enforce the staff/patient split  *(follow-up: Sprint 2 PR 1.1)*
+- Integration tests for the initiation + acknowledgement happy paths  *(remaining)*
 
 **Sprint 3 — Response + resolution + sweep**
 - `POST /v0/crisis-events/:id/respond` → wraps `record_crisis_response()` + Cat A `crisis.responded` audit
@@ -46,13 +60,13 @@ The DB layer is **complete** through migration 038. The TypeScript application l
 crisis-response/
 ├── index.ts              ← public interface (cross-module-safe exports)
 ├── plugin.ts             ← Fastify plugin entry point (registered in src/app.ts under /v0/crisis-events)
-├── routes.ts             ← Sprint 1: health + ready only; Sprint 2+ adds handlers
+├── routes.ts             ← Sprint 2 PR 1: health + ready + GET /:id (staff-scoped)
 ├── README.md             ← this file
 └── internal/             ← module-private; no cross-module imports allowed
-    └── types.ts          ← branded IDs + state/classification vocabularies (Sprint 1)
-    └── handlers/         ← (Sprint 2+) 5 handler files
-    └── services/         ← (Sprint 2+) crisis-service.ts
-    └── repositories/     ← (Sprint 2+) tenant-scoped DB access
+    ├── types.ts          ← branded IDs + state/classification vocabularies (Sprint 1)
+    └── handlers/
+        ├── get-crisis-event.ts       ← Sprint 2 PR 1 (this commit) — staff-scoped read
+        └── get-crisis-event.test.ts  ← unit tests (composition, validation, 404)
 ```
 
 ## Option 2 ratifier decision (2026-05-22)

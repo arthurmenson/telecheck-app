@@ -73,7 +73,7 @@ Composite UNIQUE + composite FK pattern per PROJECT_CONVENTIONS r5 §1.1.
 | Forms/Intake Engine | ✅ wired | intake form rendering + submission |
 | Consent & Delegation | ✅ wired | delegate context + scope-grant matrix |
 | AI Clinical Assistant Mode 2 | ⏳ deferred | awaits AI Service slice authoring |
-| Med Interaction Engine | ⏳ skeleton-only | awaits Med Interaction Engine slice PRD ratification |
+| Med Interaction Engine | ⏳ DB-layer in progress | spec RATIFIED (SI-019 v2.0 P-033 + CDM v1.6→v1.7 P-034 2026-05-21); awaits Med-Interaction handler implementation (PR 1 of ~6 — RBAC roles shipped; entities + views + raw writer + wrappers + Fastify handlers pending) |
 | Pharmacy + Refill | ⛔ BLOCKED | SI-001 (MedicationRequest schema gap) |
 | Subscription | ⛔ BLOCKED | SI-001 |
 
