@@ -2,11 +2,23 @@
 
 Implementation of **SI-022 Crisis Response Slice v1.0** (RATIFIED 2026-05-21 P-039) + the canonical follow-on **CDM v1.9 → v1.10 Amendment** (RATIFIED 2026-05-21 P-040).
 
-## Status: Sprint 2 PR 1 — **FIRST REAL HANDLER LANDED**
+## Status: Sprint 2 PR 2 — **FIRST WRITE-PATH HANDLER LANDED**
 
-The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition). The TypeScript application layer is at Sprint 2 — Sprint 1's skeleton + branded IDs + canonical vocabularies, plus the FIRST real Fastify handler (`GET /v0/crisis-events/:id` staff-scoped read) landed this commit. Remaining Sprint 2-3 write-path handlers + Cat A audit emission + KMS envelope + integration tests land in follow-up PRs.
+The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition). The TypeScript application layer is at Sprint 2 — Sprint 1's skeleton + branded IDs + canonical vocabularies, plus the Sprint 2 PR 1 staff-scoped read handler, plus the FIRST write-path handler (`POST /v0/crisis-events` initiate via SECDEF wrapper + Cat A audit) landed this commit. Remaining Sprint 2-3 write-path handlers (acknowledge / respond / resolve / sweep) + KMS envelope + integration tests land in follow-up PRs.
 
-### Sprint 2 PR 1 (this commit)
+### Sprint 2 PR 2 (this commit) — POST /v0/crisis-events
+
+- Initiates a crisis event by calling the SECDEF wrapper `record_crisis_initiation()` from migration 036 (granted EXECUTE to `crisis_initiator` role) and emitting the replay-aware Cat A `crisis.detected` audit in the SAME atomic transaction (FLOOR-020 fail-closed + Codex R1 #201 findings 1+2 closure 2026-05-24; if any of marker INSERT / wrapper INSERT / audit emit fails the whole tx rolls back so no orphan crisis_event row exists without its audit record AND no audit record exists without its companion marker).
+- Composition: `requireTenantContext → requireCrisisInitiatorActorContext (SI-022 §7 slice-role gate; returns bound crisisInitiatorIdentity) → body validation → resolveActorTenantIdForAudit → withIdempotentExecution (which opens tx + binds tenant context for idempotency_keys RLS) → withTenantContext (rls.ts private binding for parity with PR 1) → (withActorContext when req.actorNonce bound) → withDbRole('crisis_initiator', ...) → SELECT record_crisis_initiation(...) → claimResourceLifecycleAuditSlot (resource-keyed dedupe; same tx) → emitCrisisDetectedAudit(tx) (only when claimed=true)`.
+- Body: `{ patient_id (UUID), server_signal_id (UUID), crisis_type (6-value enum), severity (3-value enum), regulatory_reporting_enabled (boolean), source_surface (mode_1_chat|community|forms|messaging) }`. All 8 KMS envelope params on the wrapper signature are passed NULL at v0 wire surface — Sprint 4 lands KMS envelope encryption per ADR-024.
+- Idempotency: `Idempotency-Key` header via canonical `withIdempotentExecution` helper (SI-006 PR-C extraction). DB-layer idempotency via wrapper's UNIQUE(tenant_id, server_signal_id) constraint — canonical replays return the existing crisis_event_id; mismatched immutable fields with same server_signal_id surface as SQLSTATE 23505 → tenant-blind 409.
+- 42501 mapping: try/catch wraps the **ENTIRE** `withDbRole` call (per PR 1 R2 MED-1 closure pattern at `get-crisis-event.ts` lines 261-296) so 42501 is mapped to tenant-blind 403 whether it surfaces from (1) SET LOCAL ROLE pre-callback elevation or (2) the wrapper's internal LAYER B/C tenant-scope guards (SI-010 actor-not-bound or tenant-scope-mismatch per migration 036 lines 122-159).
+- Layer B authorization: SI-022 §7 `requireCrisisInitiatorActorContext` slice-role gate (Codex R1 #201 finding 2 closure 2026-05-24). The gate's `crisisInitiatorIdentity` field carries the bound slice-role identity (today: always `'clinician'`; future: `+ 'on_call_clinician' + 'ai_mode1_service'` when the JWT-role → DB-slice-role mapping lands per Phase A successor to SI-010 / SI-024.1). The audit emitter's `CRISIS_INITIATOR_ACTOR_TYPE` map derives the canonical `actor_type` from this identity (clinician + on_call_clinician → `'clinician'`; ai_mode1_service → `'ai_workload'`) — no hard-coded literal; the future expansion is a one-line gate change.
+- `crisis.detected` action ID placeholder: ratified in SI-022 §3 / CDM v1.9→v1.10 Amendment §3.1 (P-039 + P-040 2026-05-21) but NOT yet landed in `src/lib/audit.ts`'s `AuditAction` enum (which tracks AUDIT_EVENTS v5.3; the v5.12 amendment lands at a future Track 6 spec-corpus ratification). Used the same single-sanctioned-cast pattern that `forms-intake/audit.ts`'s `formsAuditPlaceholder()` uses — see `audit.ts` for the migration-on-ratification path.
+- Crisis-specific platform-floor discipline (I-019): rejection paths (Layer B 403, validation 400, idempotency mismatch 409, audit-emit failure) do NOT emit `crisis.detected` because no crisis_event row was actually created — the surface-side detection record (`crisis_detection_trigger` Cat A from Mode 1 / forms-intake) is the canonical pre-initiation detection signal. Per SI-022 §3 the spec deliberately separates the two: there is no `crisis.initiation_rejected` audit action in the v5.12 amendment.
+- Unit tests cover: §1 happy path composition (incl. claim + emit-with-identity), §2 tenant guard precedes wrap, §3 crisis_initiator slice-role gate precedes wrap, §4 13-case body validation matrix, §5 audit emitted in same tx after withDbRole returns + claim → emit ordering + audit-emit failure propagates (I-003) + claim-failure propagates with same atomicity, §6 42501 → 403 for both SET LOCAL ROLE failure and wrapper LAYER C failure + non-42501 PG errors propagate unchanged, §7 actorNonce undefined skips withActorContext, §8 SQLSTATE 23505 → tenant-blind 409 with no tenant_id / server_signal_id leak, §9 replay-aware audit dedupe (claim returns false → emit SKIPPED → 201 + same crisis_event_id; positive companion; claim-after-wrapper ordering).
+
+### Sprint 2 PR 1 (already merged on `main` — e4cb312)
 
 - `GET /v0/crisis-events/:id` — staff-scoped single-row read via `crisis_event_current_state_v` (12-column projection: crisis_event_id, tenant_id, patient_id, server_signal_id, crisis_type, severity, regulatory_reporting_enabled, detected_at, current_state, current_state_transition_at, current_state_transition_reason, current_state_actor_principal_id).
 - Composition: `withTransaction → withTenantContext → withActorContext → withDbRole('crisis_event_staff_reader', ...) → SELECT FROM crisis_event_current_state_v WHERE crisis_event_id = $1`.
@@ -15,7 +27,7 @@ The DB layer is **complete** through migration 038 + foundation 051 (Option B ap
 - Path-param validation: UUID shape (`crisis_event.id` is `UUID` per migration 033 §4 line 472; **NOT** ULID despite some brief references).
 - Unit tests cover happy path, 4 guard-precedes-tx cases, 404 tenant-blind envelope, and both actorNonce-bound + actorNonce-undefined composition paths.
 
-### Sprint 2 PR 1 follow-up scope (NOT in this commit)
+### Sprint 2 PR 2 follow-up scope (NOT in this commit)
 
 - `GET /v0/crisis-events/:id` patient-scoped variant — uses `crisis_event_patient_summary_v` + `crisis_event_patient_reader` role; requires `requirePatientActorContext` role-gate. Patient view's self-scoping predicate (`patient_id = current_actor_account_id()::UUID`) requires `req.actorNonce` to be bound (unlike the staff view), so the patient handler MUST fail-closed on missing nonce.
 
@@ -35,9 +47,9 @@ The DB layer is **complete** through migration 038 + foundation 051 (Option B ap
 ### Sprint 2-4 remaining work (NOT yet implemented)
 
 **Sprint 2 — Initiation + acknowledgement + read**
-- `POST /v0/crisis-events` → wraps `record_crisis_initiation()` + emits Cat A `crisis.detected` audit + KMS-envelope-encrypts the intake_payload  *(remaining)*
+- `POST /v0/crisis-events` → wraps `record_crisis_initiation()` + emits Cat A `crisis.detected` audit (KMS-envelope-encrypted intake_payload deferred to Sprint 4 per ADR-024). **DONE — Sprint 2 PR 2 (this commit).**
 - `POST /v0/crisis-events/:id/acknowledge` → wraps `record_crisis_acknowledgement_claim()` + Cat A `crisis.acknowledged` audit  *(remaining)*
-- `GET /v0/crisis-events/:id` staff-scoped — reads `crisis_event_current_state_v`. **DONE — Sprint 2 PR 1 (this commit).**
+- `GET /v0/crisis-events/:id` staff-scoped — reads `crisis_event_current_state_v`. **DONE — Sprint 2 PR 1 (e4cb312).**
 - `GET /v0/crisis-events/:id` patient-scoped — reads `crisis_event_patient_summary_v` via `crisis_event_patient_reader` role; the two views' SELECT grants enforce the staff/patient split  *(follow-up: Sprint 2 PR 1.1)*
 - Integration tests for the initiation + acknowledgement happy paths  *(remaining)*
 
@@ -60,13 +72,16 @@ The DB layer is **complete** through migration 038 + foundation 051 (Option B ap
 crisis-response/
 ├── index.ts              ← public interface (cross-module-safe exports)
 ├── plugin.ts             ← Fastify plugin entry point (registered in src/app.ts under /v0/crisis-events)
-├── routes.ts             ← Sprint 2 PR 1: health + ready + GET /:id (staff-scoped)
+├── routes.ts             ← Sprint 2 PR 2: health + ready + POST / (initiate) + GET /:id (staff-scoped)
+├── audit.ts              ← Sprint 2 PR 2 — module-local Cat A `crisis.detected` emitter (placeholder pattern; will simplify on AUDIT_EVENTS v5.12 landing)
 ├── README.md             ← this file
 └── internal/             ← module-private; no cross-module imports allowed
     ├── types.ts          ← branded IDs + state/classification vocabularies (Sprint 1)
     └── handlers/
-        ├── get-crisis-event.ts       ← Sprint 2 PR 1 (this commit) — staff-scoped read
-        └── get-crisis-event.test.ts  ← unit tests (composition, validation, 404)
+        ├── get-crisis-event.ts       ← Sprint 2 PR 1 (e4cb312) — staff-scoped read
+        ├── get-crisis-event.test.ts  ← unit tests (composition, validation, 404)
+        ├── post-crisis-event.ts      ← Sprint 2 PR 2 (this commit) — initiate via SECDEF wrapper + Cat A audit emit
+        └── post-crisis-event.test.ts ← unit tests (composition, validation, audit ordering, 42501, idempotency-mismatch)
 ```
 
 ## Option 2 ratifier decision (2026-05-22)
