@@ -20,10 +20,16 @@
  *   - withDbRole('crisis_initiator', ...) elevation around the wrapper
  *     SELECT (the wrapper is GRANTed EXECUTE ONLY to crisis_initiator
  *     per migration 036 §3)
- *   - same-tx Cat A `crisis.detected` audit emission via
- *     `emitCrisisDetectedAudit()` (FLOOR-020 fail-closed; same tx as
- *     wrapper INSERT — handler MUST NOT swallow audit-emit errors per
- *     I-003)
+ *   - replay-aware same-tx Cat A `crisis.detected` audit emission via
+ *     `emitCrisisDetectedAudit()` gated by
+ *     `claimResourceLifecycleAuditSlot` (Codex R1 #201 finding 1
+ *     closure 2026-05-24; FLOOR-020 fail-closed; same tx as wrapper
+ *     INSERT — handler MUST NOT swallow audit-emit errors per I-003).
+ *     The marker keys on `(tenant_id, crisis_event_id, 'crisis.detected')`
+ *     so the wrapper's idempotent-replay path (different
+ *     Idempotency-Keys against the same server_signal_id) does NOT
+ *     re-emit the audit; the first successful tx's marker prevents
+ *     duplicate audit rows for one canonical crisis_event.
  *   - 42501 → tenant-blind 403 mapping wrapping the ENTIRE withDbRole
  *     call (mirrors PR 1's R2 MED-1 closure pattern at lines 261-296
  *     of get-crisis-event.ts; the catch boundary must wrap withDbRole
@@ -146,6 +152,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { claimResourceLifecycleAuditSlot } from '../../../../lib/audit-dedupe.js';
 import {
   requireClinicianActorContext,
   resolveActorTenantIdForAudit,
@@ -305,9 +312,14 @@ interface PostCrisisEventResponseView {
  *   7. Map 42501 (SET LOCAL ROLE or wrapper LAYER C guard) to
  *      tenant-blind 403 via the canonical PR 1 R2 MED-1 closure
  *      pattern (catch wraps ENTIRE withDbRole call).
- *   8. Emit Cat A `crisis.detected` audit in the same tx
- *      (FLOOR-020 fail-closed; any throw rolls back wrapper INSERT
- *      atomically).
+ *   8. Replay-aware Cat A `crisis.detected` audit emission in the
+ *      same tx: `claimResourceLifecycleAuditSlot` gates the emit.
+ *      First-attempt path: claim succeeds → emit. Replay path
+ *      (different Idempotency-Key, same server_signal_id; wrapper
+ *      returned existing crisis_event_id): claim returns false →
+ *      emit SKIPPED (audit row already durable from prior tx).
+ *      FLOOR-020 fail-closed: any throw rolls back wrapper INSERT +
+ *      marker INSERT atomically.
  *
  * Returns 201 + `{ crisis_event_id }` on success; 400 / 403 / 409 on
  * mapped failures; 500 (with default envelope) on unmapped failures
@@ -461,31 +473,98 @@ export async function postCrisisEventHandler(
         },
       );
 
-      // Phase 8 — Cat A `crisis.detected` audit emission in the SAME
-      // transaction as the wrapper INSERT. Per FLOOR-020 + I-003 the
-      // throw on any audit-emit failure MUST propagate (do NOT
-      // try/catch around this call): a partial commit that leaves a
-      // crisis_event row without its audit record is a platform-floor
-      // violation, and the surrounding tx rolling back is the
-      // canonical recovery (the client's retry — with same
-      // Idempotency-Key — replays cleanly when the underlying issue
-      // is resolved).
-      await emitCrisisDetectedAudit(
-        {
-          tenantId: ctx.tenantId,
-          actorAccountId: actor.accountId,
-          actorTenantId,
-          countryOfCare: actor.countryOfCare,
-          crisisEventId: asCrisisEventId(crisisEventIdRaw),
-          targetPatientId: patientId,
-          serverSignalId: asServerSignalId(serverSignalId),
-          crisisType,
-          severity,
-          regulatoryReportingEnabled,
-          sourceSurface,
-        },
-        tx,
-      );
+      // Phase 8 — replay-aware Cat A `crisis.detected` audit emission
+      // in the SAME transaction as the wrapper INSERT (Codex R1 #201
+      // finding 1 closure 2026-05-24).
+      //
+      // **The replay hazard the marker closes:**
+      //   `record_crisis_initiation()` has its own DB-layer idempotency
+      //   keyed on `(tenant_id, server_signal_id)` per migration 036 §1
+      //   — when the SAME server_signal_id reaches the wrapper from a
+      //   NEW HTTP Idempotency-Key (or from an Idempotency-Key-less
+      //   path that wouldn't reach the cache-replay short-circuit)
+      //   the wrapper returns the existing crisis_event_id WITHOUT
+      //   INSERTing a new row. Without dedupe at the audit boundary,
+      //   each such replay would re-emit `crisis.detected` Cat A,
+      //   leaving the audit table with duplicate lifecycle rows for
+      //   one canonical crisis_event. The audit_records hash chain
+      //   would still validate (it's append-only), but downstream
+      //   compliance + clinical-alerting consumers would see N audit
+      //   rows where N=1 is the lifecycle-bound truth.
+      //
+      // **Why a resource-lifecycle marker (not the standard request-
+      // shape marker):**
+      //   `claimAuditDedupeSlot`'s 6-tuple key includes the HTTP
+      //   Idempotency-Key — so different Idempotency-Keys for the
+      //   same server_signal_id produce DIFFERENT marker keys + each
+      //   gets a fresh slot, which doesn't dedupe. The replay-hazard
+      //   anchor here is the RESOURCE (crisis_event_id, derived from
+      //   the wrapper-level server_signal_id idempotency), not the
+      //   request envelope. `claimResourceLifecycleAuditSlot` keys on
+      //   `(tenant_id, resource_type='crisis_event', resource_id,
+      //   action='crisis.detected')` so the SAME crisis_event always
+      //   maps to exactly one durable audit row.
+      //
+      // **Same-tx atomicity contract (FLOOR-020 + I-003):**
+      //   The marker INSERT + the audit emit + the wrapper INSERT all
+      //   live in the same `tx`. Three possible outcomes:
+      //
+      //   1. NEW resource path: wrapper INSERTs; marker INSERT
+      //      succeeds (first attempt); audit emit succeeds; all 3
+      //      rows commit atomically. Future replays see the marker
+      //      and skip the emit.
+      //   2. REPLAY path (different Idempotency-Key, same
+      //      server_signal_id; or no-Idempotency-Key path reaching
+      //      the wrapper): wrapper SELECT returns existing
+      //      crisis_event_id; marker INSERT hits ON CONFLICT (a prior
+      //      successful tx already committed the marker for this
+      //      resource) → claimed=false → audit emit SKIPPED. The
+      //      handler still returns 201 + the canonical
+      //      crisis_event_id (the wrapper's idempotent-replay value).
+      //   3. FAILURE path: any of marker INSERT / audit emit / wrapper
+      //      INSERT throws → entire tx rolls back atomically → no
+      //      marker, no audit, no resource row committed → retry can
+      //      cleanly re-attempt (any of the three is INSERTable
+      //      again).
+      //
+      // **Bare suppression discipline (I-003):**
+      //   The `await emitCrisisDetectedAudit(...)` inside the
+      //   `if (claimed)` branch is NOT wrapped in a try/catch — a
+      //   throw propagates so the surrounding tx rolls back. Per
+      //   FLOOR-020 a partial commit leaving a crisis_event row
+      //   without its audit record is forbidden; the same atomic
+      //   rollback that protects the resource row also protects the
+      //   marker (no marker survives a failed emit).
+      const claimed = await claimResourceLifecycleAuditSlot(tx, {
+        tenantId: ctx.tenantId,
+        resourceType: 'crisis_event',
+        resourceId: crisisEventIdRaw,
+        auditAction: 'crisis.detected',
+      });
+      if (claimed) {
+        await emitCrisisDetectedAudit(
+          {
+            tenantId: ctx.tenantId,
+            actorAccountId: actor.accountId,
+            actorTenantId,
+            countryOfCare: actor.countryOfCare,
+            crisisEventId: asCrisisEventId(crisisEventIdRaw),
+            targetPatientId: patientId,
+            serverSignalId: asServerSignalId(serverSignalId),
+            crisisType,
+            severity,
+            regulatoryReportingEnabled,
+            sourceSurface,
+          },
+          tx,
+        );
+      }
+      // claimed=false ⇒ a prior committed tx already emitted the
+      // `crisis.detected` audit for this canonical crisis_event_id —
+      // the audit is durable from that earlier attempt. The handler
+      // returns 201 + the same crisis_event_id the wrapper's
+      // idempotent-replay path returned, matching the originating
+      // tx's response shape.
 
       return {
         status: 201,

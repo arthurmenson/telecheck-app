@@ -188,6 +188,138 @@ export async function claimAuditDedupeSlot(
 }
 
 /**
+ * The 4-tuple identifying a RESOURCE-LIFECYCLE audit dedupe slot.
+ *
+ *   tenantId       — tenant scope
+ *   resourceType   — canonical resource type (e.g., 'crisis_event')
+ *   resourceId     — canonical resource ID (e.g., the wrapper-returned UUID)
+ *   auditAction    — AUDIT_EVENTS catalog action ID (e.g., 'crisis.detected')
+ *
+ * Distinct from `AuditDedupeIdentity` (the HTTP-request-shape 6-tuple).
+ * Used when the dedupe anchor is the RESOURCE itself, not the request
+ * envelope — i.e., when:
+ *   - A lifecycle-bound Category A audit MUST emit exactly once per
+ *     (tenant, resource_id, action) regardless of how many distinct
+ *     HTTP Idempotency-Keys (or no Idempotency-Key at all) reach the
+ *     same resource via a wrapper-level idempotent-replay path.
+ *   - The audit emit is co-transactional with the resource INSERT
+ *     (FLOOR-020 same-tx fail-closed) — so the marker rolls back with
+ *     the resource on failure (correct) and only persists when both
+ *     resource INSERT + audit emit committed atomically.
+ *
+ * Canonical caller: `POST /v0/crisis-events` handler. The
+ * `record_crisis_initiation()` SECDEF wrapper has its own internal
+ * idempotency keyed on `(tenant_id, server_signal_id)` — it returns
+ * the existing crisis_event_id on duplicate-server-signal retries
+ * WITHOUT INSERTing a new row. Different HTTP Idempotency-Keys
+ * against the same server_signal_id would each reach the wrapper +
+ * each re-emit the `crisis.detected` Cat A audit → duplicate audit
+ * rows. The resource-lifecycle marker prevents the duplicate at the
+ * audit boundary.
+ *
+ * Co-transactional safety: unlike `claimAuditDedupeSlot` (which
+ * REQUIRES an independent-tx commit for I-019 durability of
+ * `crisis_detection_trigger` Cat A pre-INSERT signals), this slot
+ * lives in the SAME tx as the lifecycle audit it gates. The
+ * atomicity is the dedupe contract:
+ *   - First successful tx: marker INSERT + audit emit + resource
+ *     INSERT all commit together. Future replays see the marker and
+ *     skip the emit.
+ *   - First-attempt rollback (audit emit fails, wrapper throws, etc.):
+ *     marker also rolls back; retry runs cleanly + the marker is
+ *     RE-INSERTABLE because no row was committed.
+ *
+ * Per FLOOR-020 + I-003: the audit row IS the canonical record. The
+ * marker only EXISTS when the audit row exists.
+ */
+export interface ResourceLifecycleAuditDedupeIdentity {
+  tenantId: string;
+  /** Canonical resource type (e.g., 'crisis_event'). */
+  resourceType: string;
+  /** Canonical resource ID (UUID of the lifecycle resource). */
+  resourceId: string;
+  /** AUDIT_EVENTS catalog action ID (e.g., 'crisis.detected'). */
+  auditAction: string;
+}
+
+/**
+ * Compute the deterministic dedupe key for a RESOURCE-LIFECYCLE audit.
+ * SHA-256 hex of the 4-tuple joined by ASCII unit separator (\x1F).
+ *
+ * Key shape is intentionally distinct from `computeAuditDedupeKey`'s
+ * 6-tuple — the inputs are different (resource_id replaces the
+ * idempotency 4-tuple + bodyHash) so collisions across the two key
+ * spaces are not possible. A `resource_audit:` prefix on the input
+ * makes the key namespace explicit in the hash domain.
+ *
+ * Exported for tests + observability.
+ */
+export function computeResourceLifecycleAuditDedupeKey(
+  identity: ResourceLifecycleAuditDedupeIdentity,
+): string {
+  const SEP = '\x1F';
+  const NAMESPACE = 'resource_audit';
+  const input = [
+    NAMESPACE,
+    identity.tenantId,
+    identity.resourceType,
+    identity.resourceId,
+    identity.auditAction,
+  ].join(SEP);
+  return crypto.createHash('sha256').update(input).digest('hex');
+}
+
+/**
+ * Try to claim a RESOURCE-LIFECYCLE audit dedupe slot. Returns true if
+ * this is the first attempt (caller MUST proceed to emit the actual
+ * audit in the same transaction). Returns false if a prior committed
+ * attempt already claimed (caller MUST skip the emit — the audit row
+ * is already durable from the prior commit).
+ *
+ * **CRITICAL: MUST run in the SAME transaction as the audit emission
+ * AND the resource INSERT it gates** — the OPPOSITE invariant from
+ * `claimAuditDedupeSlot`. See `ResourceLifecycleAuditDedupeIdentity`
+ * doc-comment for the rationale; one-line summary: lifecycle audits
+ * are co-transactional with their resource INSERT per FLOOR-020, so
+ * the marker MUST share the resource's atomicity envelope.
+ *
+ * Canonical caller: `POST /v0/crisis-events` handler
+ * (`postCrisisEventHandler`). The wrapper-level idempotent-replay
+ * path returns the existing crisis_event_id when the same
+ * server_signal_id reaches it from a NEW Idempotency-Key (or no
+ * Idempotency-Key); without this dedupe, the handler would re-emit
+ * `crisis.detected` Cat A on every such replay.
+ *
+ * TTL: hard-coded to 30 days (matches the migration-022 column
+ * default). Unlike `claimAuditDedupeSlot` (where TTL aligns with the
+ * idempotency cache TTL since the marker IS the cache row's audit
+ * companion), this marker's anchor is the RESOURCE — which is
+ * durable indefinitely. The marker only needs to outlive any
+ * realistic retry window for the same `server_signal_id` (FLOOR-020
+ * retries from Mode 1 / forms / community + clinician-initiated
+ * misclicks within the same operational period). 30 days is
+ * generous; the marker becomes a no-op for genuinely-late retries.
+ */
+export async function claimResourceLifecycleAuditSlot(
+  client: DbClient,
+  identity: ResourceLifecycleAuditDedupeIdentity,
+): Promise<boolean> {
+  const dedupeKey = computeResourceLifecycleAuditDedupeKey(identity);
+  // 30 days — matches migration-022 column default for the markers
+  // table. See the function doc-comment for the rationale (the
+  // marker's lifetime is anchored to the resource, not the request).
+  const ttlSeconds = 30 * 24 * 60 * 60;
+  const result = await client.query<{ tenant_id: string }>(
+    `INSERT INTO audit_dedupe_markers (tenant_id, dedupe_key, expires_at)
+     VALUES ($1, $2, NOW() + ($3 || ' seconds')::interval)
+     ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+     RETURNING tenant_id`,
+    [identity.tenantId, dedupeKey, ttlSeconds],
+  );
+  return result.rows.length > 0;
+}
+
+/**
  * Purge expired markers for the given tenant. Returns the count
  * deleted. Intended for a periodic background job (cron-style) but
  * exported so tests can exercise the cleanup path explicitly.

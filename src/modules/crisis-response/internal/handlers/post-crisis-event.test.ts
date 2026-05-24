@@ -6,8 +6,9 @@
  * Covers the handler's composition discipline at unit scope (no real DB):
  *   §1 happy path: tenant + clinician role-gate + body validation +
  *      withIdempotentExecution composes withTenantContext → withActorContext
- *      → withDbRole('crisis_initiator', ...) → wrapper SELECT → audit emit;
- *      response is 201 + { crisis_event_id }.
+ *      → withDbRole('crisis_initiator', ...) → wrapper SELECT →
+ *      claimResourceLifecycleAuditSlot → audit emit; response is 201 +
+ *      { crisis_event_id }.
  *   §2 tenant guard fires before idempotency wrap / tx open.
  *   §3 clinician role-gate fires before idempotency wrap / tx open.
  *   §4 body validation: missing / non-UUID / non-enum / non-boolean fields
@@ -15,7 +16,10 @@
  *   §5 Cat A `crisis.detected` audit emitted in the same withDbRole-
  *      wrapping tx as the wrapper SELECT, with correct envelope fields
  *      (tenant_id, actor_tenant_id, target_patient_id, resource_id,
- *      detail.source_surface, action, category).
+ *      detail.source_surface, action, category) AND correct ordering
+ *      (wrapper SELECT → dedupe claim → audit emit). Includes §5c
+ *      asserting dedupe-claim failures propagate atomically with the
+ *      same I-003 discipline as audit-emit failures.
  *   §6 42501 from withDbRole → tenant-blind 403 via the canonical R2
  *      MED-1 closure pattern (catch wraps ENTIRE withDbRole call);
  *      covers both SET LOCAL ROLE elevation failure AND wrapper LAYER C
@@ -25,6 +29,13 @@
  *   §8 idempotency-mismatch (wrapper raises SQLSTATE 23505) →
  *      tenant-blind 409 via mapServiceError; envelope does not echo
  *      tenant_id or server_signal_id.
+ *   §9 replay-aware audit emission via resource-lifecycle dedupe
+ *      (Codex R1 #201 finding 1 closure): wrapper idempotent-replay
+ *      returning existing crisis_event_id → claim returns false →
+ *      audit emit SKIPPED → 201 + same crisis_event_id. Closes the
+ *      duplicate-audit hazard where a new HTTP Idempotency-Key
+ *      against the same server_signal_id would otherwise re-emit
+ *      `crisis.detected` Cat A.
  *
  * Mocking strategy mirrors get-crisis-event.test.ts §1-§4 pattern: vi.mock
  * the lib/* helpers + the audit emitter so handler composition is
@@ -67,12 +78,16 @@ vi.mock('../../../../lib/actor-context-binding.js', () => ({
 vi.mock('../../../../lib/with-db-role.js', () => ({
   withDbRole: vi.fn(),
 }));
+vi.mock('../../../../lib/audit-dedupe.js', () => ({
+  claimResourceLifecycleAuditSlot: vi.fn(),
+}));
 vi.mock('../../audit.js', () => ({
   emitCrisisDetectedAudit: vi.fn(),
 }));
 
 // Imports AFTER the vi.mock declarations.
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { claimResourceLifecycleAuditSlot } from '../../../../lib/audit-dedupe.js';
 import {
   requireClinicianActorContext,
   resolveActorTenantIdForAudit,
@@ -224,6 +239,10 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
   );
   vi.mocked(withActorContext).mockImplementation(async (_tx, _nonce, fn) => fn());
   vi.mocked(withDbRole).mockImplementation(async (_tx, _role, fn) => fn());
+  // Default: marker claim succeeds (first-attempt path) → audit emits.
+  // Replay-aware test cases override to return false to assert the
+  // dedupe short-circuit per Codex R1 #201 finding 1 closure.
+  vi.mocked(claimResourceLifecycleAuditSlot).mockResolvedValue(true);
   vi.mocked(emitCrisisDetectedAudit).mockResolvedValue(
     { audit_id: 'aud_fake' } as unknown as Awaited<
       ReturnType<typeof emitCrisisDetectedAudit>
@@ -279,7 +298,20 @@ describe('postCrisisEventHandler §1 — happy path composition', () => {
       true,
     ]);
 
-    // Audit emitted in the same tx.
+    // Replay-aware audit dedupe (Codex R1 #201 finding 1 closure): the
+    // marker claim happens in the same tx as the audit emit + wrapper
+    // INSERT. Keyed on the canonical resource (crisis_event_id) so
+    // wrapper-level idempotent replays from different Idempotency-Keys
+    // against the same server_signal_id do NOT duplicate the audit row.
+    expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledTimes(1);
+    expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledWith(tx, {
+      tenantId: 'Telecheck-US',
+      resourceType: 'crisis_event',
+      resourceId: RETURNED_CRISIS_EVENT_ID,
+      auditAction: 'crisis.detected',
+    });
+
+    // Audit emitted in the same tx (claim succeeded → first-attempt path).
     expect(emitCrisisDetectedAudit).toHaveBeenCalledTimes(1);
     const [auditArgs, auditTx] = vi.mocked(emitCrisisDetectedAudit).mock.calls[0]!;
     expect(auditTx).toBe(tx);
@@ -381,7 +413,7 @@ describe('postCrisisEventHandler §4 — body validation precedes idempotency wr
 // ---------------------------------------------------------------------------
 
 describe('postCrisisEventHandler §5 — Cat A audit emission in same tx', () => {
-  it('§5a emitCrisisDetectedAudit is called AFTER withDbRole returns (same tx; canonical FLOOR-020 ordering)', async () => {
+  it('§5a emitCrisisDetectedAudit is called AFTER withDbRole returns AND AFTER claimResourceLifecycleAuditSlot (same tx; canonical FLOOR-020 ordering)', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
     const callOrder: string[] = [];
@@ -390,6 +422,10 @@ describe('postCrisisEventHandler §5 — Cat A audit emission in same tx', () =>
       const out = await fn();
       callOrder.push('withDbRole-exit');
       return out;
+    });
+    vi.mocked(claimResourceLifecycleAuditSlot).mockImplementation(async () => {
+      callOrder.push('dedupe-claim');
+      return true;
     });
     vi.mocked(emitCrisisDetectedAudit).mockImplementation(async () => {
       callOrder.push('audit-emit');
@@ -400,7 +436,12 @@ describe('postCrisisEventHandler §5 — Cat A audit emission in same tx', () =>
 
     await postCrisisEventHandler(makeReq({ actorNonce: 'fake-nonce' }), makeReply());
 
-    expect(callOrder).toEqual(['withDbRole-enter', 'withDbRole-exit', 'audit-emit']);
+    expect(callOrder).toEqual([
+      'withDbRole-enter',
+      'withDbRole-exit',
+      'dedupe-claim',
+      'audit-emit',
+    ]);
   });
 
   it('§5b audit emit failure propagates (I-003 bare suppression forbidden); response never reaches 201', async () => {
@@ -416,6 +457,22 @@ describe('postCrisisEventHandler §5 — Cat A audit emission in same tx', () =>
     ).rejects.toThrow(/durable INSERT failed/);
 
     // 201 must NEVER have been sent on the audit-failure path.
+    expect(reply.code).not.toHaveBeenCalledWith(201);
+  });
+
+  it('§5c dedupe-claim failure propagates (same atomicity contract as audit-emit failure); response never reaches 201', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    vi.mocked(claimResourceLifecycleAuditSlot).mockRejectedValueOnce(
+      new Error('audit_dedupe_markers INSERT failed'),
+    );
+
+    const reply = makeReply();
+    await expect(
+      postCrisisEventHandler(makeReq({ actorNonce: 'fake-nonce' }), reply),
+    ).rejects.toThrow(/audit_dedupe_markers INSERT failed/);
+
+    expect(emitCrisisDetectedAudit).not.toHaveBeenCalled();
     expect(reply.code).not.toHaveBeenCalledWith(201);
   });
 });
@@ -534,5 +591,83 @@ describe('postCrisisEventHandler §8 — idempotency-mismatch → tenant-blind 4
     const serializedBody = JSON.stringify(sentBody);
     expect(serializedBody).not.toContain('Telecheck-US');
     expect(serializedBody).not.toContain(VALID_SERVER_SIGNAL_ID);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §9 — replay-aware audit emission via resource-lifecycle dedupe (Codex R1
+// #201 finding 1 closure 2026-05-24)
+// ---------------------------------------------------------------------------
+
+describe('postCrisisEventHandler §9 — replay-aware audit emission', () => {
+  it('§9a wrapper idempotent-replay returning existing crisis_event_id: claim returns false (marker already committed by prior successful tx) → audit emit is SKIPPED → handler still returns 201 + the same crisis_event_id', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    // Marker INSERT hits ON CONFLICT (a prior successful tx for this
+    // canonical crisis_event_id already committed the marker) →
+    // claimed=false → audit emit SKIPPED. This is the replay-hazard
+    // path: a NEW HTTP Idempotency-Key against the SAME
+    // server_signal_id reaches the wrapper, the wrapper returns the
+    // existing crisis_event_id via its internal idempotency, and the
+    // handler MUST NOT re-emit the lifecycle audit (which would
+    // duplicate the audit row in the chain).
+    vi.mocked(claimResourceLifecycleAuditSlot).mockResolvedValueOnce(false);
+
+    const reply = makeReply();
+    await postCrisisEventHandler(makeReq({ actorNonce: 'fake-nonce' }), reply);
+
+    // Wrapper SELECT still ran (returning the existing event ID).
+    expect(tx.query).toHaveBeenCalledTimes(1);
+    // Marker claim ran (returned false).
+    expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledTimes(1);
+    expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledWith(tx, {
+      tenantId: 'Telecheck-US',
+      resourceType: 'crisis_event',
+      resourceId: RETURNED_CRISIS_EVENT_ID,
+      auditAction: 'crisis.detected',
+    });
+    // Audit emit SKIPPED on the dedupe path.
+    expect(emitCrisisDetectedAudit).not.toHaveBeenCalled();
+    // 201 + same crisis_event_id (matches the originating tx's
+    // response shape — wrapper-level idempotent-replay value).
+    expect(reply.code).toHaveBeenCalledWith(201);
+    expect(reply.send).toHaveBeenCalledWith({
+      crisis_event_id: RETURNED_CRISIS_EVENT_ID,
+    });
+  });
+
+  it('§9b first-attempt path: claim returns true → audit emits once → 201 + crisis_event_id (positive companion of §9a)', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    // Default mock returns true; assert the canonical path explicitly
+    // so a regression that flips the default would break this test.
+    vi.mocked(claimResourceLifecycleAuditSlot).mockResolvedValueOnce(true);
+
+    const reply = makeReply();
+    await postCrisisEventHandler(makeReq({ actorNonce: 'fake-nonce' }), reply);
+
+    expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledTimes(1);
+    expect(emitCrisisDetectedAudit).toHaveBeenCalledTimes(1);
+    expect(reply.code).toHaveBeenCalledWith(201);
+  });
+
+  it('§9c claim is invoked AFTER the wrapper SELECT completes (the resource_id is the wrapper-returned UUID, not a caller-supplied value)', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    const callOrder: string[] = [];
+    tx.query.mockImplementationOnce(async () => {
+      callOrder.push('wrapper-select');
+      return { rows: [{ crisis_event_id: RETURNED_CRISIS_EVENT_ID }], rowCount: 1 };
+    });
+    vi.mocked(claimResourceLifecycleAuditSlot).mockImplementation(async () => {
+      callOrder.push('dedupe-claim');
+      return true;
+    });
+
+    await postCrisisEventHandler(makeReq({ actorNonce: 'fake-nonce' }), makeReply());
+
+    // Wrapper SELECT MUST run first (the marker's resource_id is the
+    // wrapper-returned crisis_event_id, not a caller-supplied UUID).
+    expect(callOrder).toEqual(['wrapper-select', 'dedupe-claim']);
   });
 });
