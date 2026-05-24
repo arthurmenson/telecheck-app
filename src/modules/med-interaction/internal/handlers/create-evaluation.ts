@@ -50,6 +50,17 @@
  *            403 if 42501 surfaces from SQL (insufficient scope)
  *            409 on idempotency replay / in-flight / body mismatch
  *
+ * **Canonical lifecycle audit rule for this handler (R1 Finding 2 closure
+ * 2026-05-23):**
+ *   This handler emits EXACTLY ONE audit event per successful request:
+ *     1. `interaction_engine_evaluation_completed` (Cat A)
+ *   It does NOT emit any signal-lifecycle events (`interaction_signal_emitted`
+ *   or `interaction_signal_lifecycle_transition_emitted`) — those belong
+ *   to the /signals and /signals/:id/activate handlers respectively. The
+ *   unit test below asserts the exact emitter call sequence (`auditCalls`
+ *   mock log shape). See `audit.ts` file-level docstring `CANONICAL
+ *   LIFECYCLE AUDIT RULE` for the full cross-handler contract.
+ *
  * **Why no SECDEF wrapper for the INSERT:**
  *   Per the SI-019 spec §5 + CDM v1.7 §4.NEW1, `interaction_engine_evaluation`
  *   is INSERTed directly by the engine-evaluator role (no SECDEF wrapper;
@@ -237,6 +248,21 @@ export async function createEvaluationHandler(
   // the tx — the inner withTenantContext is a no-op but the explicit
   // wrapping preserves the canonical composition shape from get-signal.ts
   // and pins the wrapperCalls order in unit tests).
+  // §3 — Evaluation-window timer. Captured BEFORE entering the idempotency
+  // body so the latency observability metric covers the engine's evaluation
+  // window from request acceptance through commit. The column is
+  // `interaction_engine_evaluation.evaluation_window_ms INTEGER NOT NULL
+  // CHECK (>= 0)` per SI-019 Slice PRD v2.0 §CDM and migration 047 §1.
+  // Server-computed (not body-supplied) per SI-019 spec ("latency
+  // observability" attribute — handler responsibility).
+  //
+  // R1 Finding 1 closure (Codex 2026-05-23): the prior INSERT omitted
+  // evaluation_window_ms entirely, which would have raised a NOT NULL
+  // constraint violation against the schema on first integration test
+  // against live PostgreSQL. The column is now populated from this
+  // monotonic-time delta.
+  const evaluationStartedAt = Date.now();
+
   return withIdempotentExecution<CreateEvaluationView>(
     req,
     reply,
@@ -255,15 +281,23 @@ export async function createEvaluationHandler(
               // (per SI-019 spec: NOT via a SECDEF wrapper; the wrappers
               // in migration 050 are scoped to signal-lifecycle state
               // transitions, not evaluation creation).
+              //
+              // 12-column INSERT — matches migration 047 §1 schema exactly:
+              //   id, tenant_id, patient_id, triggered_by,
+              //   triggered_by_resource_id, evaluated_at,
+              //   evaluation_window_ms, engine_version,
+              //   knowledge_base_version, medication_set_snapshot,
+              //   condition_set_snapshot, lab_set_snapshot.
+              const evaluationWindowMs = Math.max(0, Date.now() - evaluationStartedAt);
               await tx.query(
                 `INSERT INTO interaction_engine_evaluation (
                    id, tenant_id, patient_id, triggered_by, triggered_by_resource_id,
-                   evaluated_at, engine_version, knowledge_base_version,
+                   evaluated_at, evaluation_window_ms, engine_version, knowledge_base_version,
                    medication_set_snapshot, condition_set_snapshot, lab_set_snapshot
                  ) VALUES (
                    $1, $2, $3, $4, $5,
-                   $6, $7, $8,
-                   $9::jsonb, $10::jsonb, $11::jsonb
+                   $6, $7, $8, $9,
+                   $10::jsonb, $11::jsonb, $12::jsonb
                  )`,
                 [
                   evaluationId,
@@ -272,6 +306,7 @@ export async function createEvaluationHandler(
                   triggeredBy,
                   triggeredByResourceId,
                   evaluatedAt.toISOString(),
+                  evaluationWindowMs,
                   engineVersion,
                   knowledgeBaseVersion,
                   JSON.stringify(medicationSetSnapshot),
@@ -286,6 +321,16 @@ export async function createEvaluationHandler(
               // by the separate POST /signals endpoint and attested via
               // interaction_signal_emitted (the engine evaluator may
               // call /signals 1..N times after this evaluation row).
+              //
+              // Canonical lifecycle audit rule (R1 Finding 2 closure
+              // 2026-05-23): this handler emits EXACTLY ONE audit event:
+              //   1. interaction_engine_evaluation_completed (Cat A)
+              // No other audit events fire from this handler. The
+              // signal-lifecycle events (interaction_signal_emitted,
+              // interaction_signal_lifecycle_transition_emitted) belong
+              // to the /signals and /signals/:id/activate handlers
+              // respectively. See `audit.ts` file-level docstring for
+              // the cross-handler audit-emission contract.
               await emitEvaluationCompletedAudit(
                 {
                   tenantId: ctx.tenantId,
@@ -298,6 +343,7 @@ export async function createEvaluationHandler(
                   triggeredByResourceId,
                   engineVersion,
                   knowledgeBaseVersion,
+                  evaluationWindowMs,
                   signalsProducedCount: 0,
                 },
                 tx,

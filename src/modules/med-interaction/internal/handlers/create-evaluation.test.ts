@@ -352,6 +352,45 @@ describe('createEvaluationHandler §4 — INSERT + audit same-tx', () => {
     expect(recordedQueries[0]!.params?.[1]).toBe('Telecheck-US');
   });
 
+  // R1 Finding 1 closure (Codex 2026-05-23): the INSERT now matches the
+  // 12-column schema in migration 047 §1, including evaluation_window_ms
+  // (NOT NULL CHECK >= 0). The prior 11-column INSERT would have failed
+  // on first integration test against live PostgreSQL with a NOT NULL
+  // constraint violation on this column.
+  it('INSERT column list matches migration 047 §1 schema (12 columns incl. evaluation_window_ms)', async () => {
+    const req = makeReq();
+    const { reply } = makeReply();
+    await createEvaluationHandler(req, reply);
+
+    expect(recordedQueries).toHaveLength(1);
+    const { sql, params } = recordedQueries[0]!;
+    // All 12 NOT NULL columns from migration 047 §1 named in the INSERT.
+    for (const col of [
+      'id',
+      'tenant_id',
+      'patient_id',
+      'triggered_by',
+      'triggered_by_resource_id',
+      'evaluated_at',
+      'evaluation_window_ms',
+      'engine_version',
+      'knowledge_base_version',
+      'medication_set_snapshot',
+      'condition_set_snapshot',
+      'lab_set_snapshot',
+    ]) {
+      expect(sql).toContain(col);
+    }
+    // 12 positional parameters $1..$12, in the canonical order.
+    expect(sql).toMatch(/\$1, \$2, \$3, \$4, \$5,\s*\$6, \$7, \$8, \$9,\s*\$10::jsonb, \$11::jsonb, \$12::jsonb/);
+    // evaluation_window_ms is param index 6 (0-indexed: 6 → $7), server-computed,
+    // must be a non-negative integer per the schema CHECK constraint.
+    const evaluationWindowMs = params?.[6];
+    expect(typeof evaluationWindowMs).toBe('number');
+    expect(Number.isInteger(evaluationWindowMs)).toBe(true);
+    expect(evaluationWindowMs as number).toBeGreaterThanOrEqual(0);
+  });
+
   it('emits the interaction_engine_evaluation_completed Cat A audit in the same tx', async () => {
     const req = makeReq();
     const { reply } = makeReply();
@@ -363,6 +402,27 @@ describe('createEvaluationHandler §4 — INSERT + audit same-tx', () => {
     expect(args['tenantId']).toBe('Telecheck-US');
     expect(args['triggeredBy']).toBe('prescribing');
     expect(args['actorTenantId']).toBe('Telecheck-US');
+    // R1 Finding 1 closure: evaluation_window_ms also threaded into the
+    // audit detail (mirrors the canonical `interaction_engine_evaluation`
+    // event's `duration_ms` field per AUDIT_EVENTS v5.3 line 162).
+    expect(typeof args['evaluationWindowMs']).toBe('number');
+    expect(args['evaluationWindowMs'] as number).toBeGreaterThanOrEqual(0);
+  });
+
+  // R1 Finding 2 closure (Codex 2026-05-23): assert the EXACT per-handler
+  // audit-event emission set per the canonical lifecycle audit rule in
+  // `audit.ts` file-level docstring. create-evaluation emits EXACTLY ONE
+  // event: interaction_engine_evaluation_completed. Any future regression
+  // that (a) drops this emission or (b) adds a signal-lifecycle event
+  // (interaction_signal_emitted, interaction_signal_lifecycle_transition_emitted)
+  // here MUST update this assertion AND the canonical rule docstring; drift
+  // between rule and test is a defect.
+  it('emits EXACTLY ONE audit event (the canonical lifecycle rule for this handler)', async () => {
+    const req = makeReq();
+    const { reply } = makeReply();
+    await createEvaluationHandler(req, reply);
+
+    expect(auditCalls.map((c) => c.fn)).toEqual(['emitEvaluationCompletedAudit']);
   });
 });
 

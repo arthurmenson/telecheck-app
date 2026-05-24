@@ -13,6 +13,73 @@
  *     every lifecycle transition (activation, supersession, etc.) per
  *     SI-019 Sub-decision 3 item 5 (Option A add 2026-05-20)
  *
+ * **CANONICAL LIFECYCLE AUDIT RULE (R1 Finding 2 closure 2026-05-23):**
+ *
+ *   The SI-019 lifecycle has multiple write surfaces. The rule below pins
+ *   which audit events fire from which handler, in what order, so future
+ *   handlers (override, resolve, expire, supersede) follow the same
+ *   pattern and tests assert the exact event-emitter call sequence.
+ *
+ *   Per-handler audit-emission contract:
+ *
+ *     POST /v0/med-interaction/evaluations         (create-evaluation):
+ *       emits EXACTLY ONE audit event:
+ *         1. interaction_engine_evaluation_completed
+ *       — fires AFTER the INSERT INTO interaction_engine_evaluation
+ *         succeeds, in the same transaction. No other audit events.
+ *
+ *     POST /v0/med-interaction/signals              (emit-signal):
+ *       emits EXACTLY ONE audit event:
+ *         1. interaction_signal_emitted
+ *       — fires AFTER the SECDEF wrapper `record_signal_emission` returns,
+ *         in the same transaction. The initial `none → emitted` lifecycle
+ *         transition row that `record_signal_emission` INSERTs is NOT
+ *         separately attested by an `interaction_signal_lifecycle_transition_emitted`
+ *         event — the `interaction_signal_emitted` event carries the same
+ *         evidence (signal_id, evaluation_id, severity, check_class).
+ *         Double-attesting the initial transition would inflate the audit
+ *         chain without adding evidence. (See `emitSignalLifecycleTransitionAudit`
+ *         docstring below for the formal statement of this carve-out.)
+ *
+ *     POST /v0/med-interaction/signals/:id/activate (activate-signal):
+ *       emits EXACTLY ONE audit event:
+ *         1. interaction_signal_lifecycle_transition_emitted
+ *            (from_state='emitted', to_state='active', reason='activation')
+ *       — fires AFTER the SECDEF wrapper `record_signal_activation` returns,
+ *         in the same transaction.
+ *
+ *   **Future handlers (PRs 9-11) follow the same one-event-per-handler rule:**
+ *
+ *     POST /v0/med-interaction/signals/:id/supersede:
+ *         1. interaction_signal_lifecycle_transition_emitted
+ *            (from_state='active', to_state='superseded', reason='superseded_by_evaluation')
+ *
+ *     POST /v0/med-interaction/signals/:id/resolve:
+ *         1. interaction_signal_lifecycle_transition_emitted
+ *            (from_state='active', to_state='resolved', reason='resolution_event')
+ *
+ *     POST /v0/med-interaction/signals/:id/expire:
+ *         1. interaction_signal_lifecycle_transition_emitted
+ *            (from_state='active', to_state='expired', reason='time_expiry')
+ *
+ *     POST /v0/med-interaction/signals/:id/override:
+ *         1. interaction_signal_override
+ *            (canonical AUDIT_EVENTS v5.3 line 151 event — NOT a placeholder)
+ *         2. interaction_signal_lifecycle_transition_emitted
+ *            (from_state='active', to_state='overridden', reason='override')
+ *       — the override handler is the ONLY handler that emits TWO audit
+ *         events: the override-rationale attestation (existing canonical
+ *         event) + the lifecycle transition. Both fire in the same tx;
+ *         emission order: override first (it documents the cause), then
+ *         lifecycle transition (it documents the effect on the state
+ *         machine).
+ *
+ *   Tests in this PR assert the exact emitter-function call sequence per
+ *   handler (`auditCalls` mock log shape). Subsequent PRs that touch
+ *   these handlers MUST update both the rule above + the assertion test
+ *   if the per-handler audit-event set changes; drift between the rule
+ *   and the tests is a defect.
+ *
  * The `interaction_signal_override` action ID is already enumerated in the
  * canonical Category A audit catalog (`src/lib/audit.ts`) and is consumed by
  * the override handler when PR 10 lands. The 3 IDs above are NOT yet
@@ -170,6 +237,15 @@ export async function emitEvaluationCompletedAudit(
     triggeredByResourceId: string;
     engineVersion: string;
     knowledgeBaseVersion: string;
+    /**
+     * Latency observability — milliseconds between handler entry and
+     * evaluation row commit. Mirrors the `duration_ms` field on the
+     * canonical `interaction_engine_evaluation` Cat A event in
+     * AUDIT_EVENTS v5.3 line 162. Server-computed; not body-supplied.
+     * Required (>= 0) per migration 047 §1 CHECK constraint on the
+     * column this audit attests to.
+     */
+    evaluationWindowMs: number;
     signalsProducedCount: number;
   },
   tx: AuditDbClient,
@@ -192,6 +268,7 @@ export async function emitEvaluationCompletedAudit(
           triggered_by_resource_id: args.triggeredByResourceId,
           engine_version: args.engineVersion,
           knowledge_base_version: args.knowledgeBaseVersion,
+          evaluation_window_ms: args.evaluationWindowMs,
           signals_produced_count: args.signalsProducedCount,
         },
       },
@@ -255,12 +332,27 @@ export async function emitSignalEmittedAudit(
 //   - POST /v0/med-interaction/signals/:id/supersede (active → superseded)
 //   - POST /v0/med-interaction/signals/:id/resolve (active → resolved) (gated)
 //   - POST /v0/med-interaction/signals/:id/expire (active → expired) (gated)
+//   - POST /v0/med-interaction/signals/:id/override (active → overridden)
 //
-// The initial `none → emitted` transition is NOT separately attested here
-// (it is INSERTed atomically with the signal row by the emission wrapper;
-// the `interaction_signal_emitted` event above carries the same evidence).
-// The override-driven `active → overridden` transition is attested by the
-// existing canonical `interaction_signal_override` event when PR 10 lands.
+// **Formal initial-emission carve-out (R1 Finding 2 closure 2026-05-23):**
+//   The initial `none → emitted` transition row INSERTed atomically by
+//   `record_signal_emission` (migration 050 §1) is NOT separately attested
+//   by this event. The `interaction_signal_emitted` event above carries
+//   the same evidence (signal_id, evaluation_id, severity, check_class)
+//   AND is the canonical surface that downstream consumers (projection
+//   refresher; patient-facing signal-list push surface) read for
+//   "this signal exists." Emitting a paired `..._lifecycle_transition_emitted`
+//   event on initial emission would (a) double-attest the same business
+//   evidence in the audit chain and (b) force every consumer to dedupe
+//   the (interaction_signal_emitted, lifecycle_transition_emitted) pair
+//   on every emission. The carve-out is enforced by the per-handler
+//   audit-emission contract — emit-signal.ts emits ONLY
+//   interaction_signal_emitted; only the *non-initial* lifecycle
+//   transitions (activate, supersede, resolve, expire, override) emit
+//   this event. The override-driven `active → overridden` transition
+//   is ALSO attested by the canonical `interaction_signal_override`
+//   event (AUDIT_EVENTS v5.3 line 151) per the override-handler two-event
+//   rule documented in the file-level CANONICAL LIFECYCLE AUDIT RULE.
 // ---------------------------------------------------------------------------
 
 export async function emitSignalLifecycleTransitionAudit(
