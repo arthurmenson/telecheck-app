@@ -2,13 +2,14 @@
 
 Implementation of **SI-023 Admin Backend Basics Slice v1.0** (RATIFIED 2026-05-22 P-041) + the canonical follow-on **CDM v1.10 → v1.11 Amendment** (RATIFIED 2026-05-22 P-042).
 
-## Status: Sprint 2 PR 1 (this commit) — **FIRST HANDLER MOUNTED**
+## Status: Sprint 2 PR 2 (this commit) — **SECOND HANDLER MOUNTED; FIRST WRITE HANDLER**
 
-The DB layer is **complete** through migration 044. Foundation 051 (Option B app-role acquisition via `src/lib/with-db-role.ts`) merged. **Sprint 2 PR 1 mounts the first real Fastify handler**:
+The DB layer is **complete** through migration 044. Foundation 051 (Option B app-role acquisition via `src/lib/with-db-role.ts`) merged. **Sprint 2 PR 2 mounts the first WRITE handler + establishes the canonical write composition for the slice**:
 
-- **`GET /v1/admin/dashboards/crisis-operational-health`** — wraps the SECDEF read function `read_admin_crisis_operational_health` (migration 044 §1). Composes `withTransaction → withTenantContext → withActorContext → withDbRole('admin_basic_operator')` → wrapper call. LAYER B uses the legacy `requireAdminRole` shim pending Sprint 4 RBAC v1.1 wiring. I-027 read-trail satisfied by the wrapper's co-transactional `admin_dashboard_query_execution` INSERT. **No Cat A audit emission at this PR** (READ endpoint scope per task brief; `admin.dashboard_query_executed` lands in Sprint 4 hardening).
+- **`GET /v1/admin/dashboards/crisis-operational-health`** (Sprint 2 PR 1) — wraps the SECDEF read function `read_admin_crisis_operational_health` (migration 044 §1). Composes `withTransaction → withTenantContext → withActorContext → withDbRole('admin_basic_operator')` → wrapper call. LAYER B uses the legacy `requireAdminRole` shim pending Sprint 4 RBAC v1.1 wiring. I-027 read-trail satisfied by the wrapper's co-transactional `admin_dashboard_query_execution` INSERT. **No Cat A audit emission** (READ endpoint scope per task brief; `admin.dashboard_query_executed` lands in Sprint 4 hardening).
+- **`POST /v1/admin/templates/:template_id/submit-for-review`** (NEW Sprint 2 PR 2) — wraps the SECDEF write function `submit_forms_template_for_admin_review` (migration 043 §1). Composes `withIdempotentExecution → withTenantContext → withActorContext → withDbRole('admin_basic_operator')` → wrapper call → **same-tx Cat A audit emission under the restored `telecheck_app_role`** (the admin_basic_operator slice role does NOT hold INSERT on audit_records; restoration via withDbRole's finally-block at foundation-051 §R1 HIGH-1 closure is the bridge). Cat A action `admin.template_submitted_for_review` per SI-023 §3 row 2 is emitted via the module-local `adminBackendAuditPlaceholder()` cast helper (action ID is not yet ratified in the canonical AUDIT_EVENTS catalog — see SPEC ISSUE in `admin-backend/audit.ts`). Idempotency-protected via `withIdempotentExecution` per IDEMPOTENCY v5.1 + SI-006 reserve-then-execute. 42501 → tenant-blind 403 mapping wraps the entire `withDbRole` call (R2 MED-1 closure parity with the GET handler).
 
-The remaining 4 of 5 SI-023 §5 endpoints + Cat A audit emission + proper LAYER B role-membership check + cross-tenant isolation tests are tracked in the Sprint 2+ list below.
+The remaining 3 of 5 SI-023 §5 endpoints + Cat A audit emission for the other 3 admin.* action IDs + proper LAYER B role-membership check + cross-tenant isolation tests + AUDIT_EVENTS catalog ratification of `admin.*` IDs are tracked in the Sprint 2+ list below.
 
 ### DB layer (PRs 1-5 — already merged on `main`)
 
@@ -25,9 +26,9 @@ The remaining 4 of 5 SI-023 §5 endpoints + Cat A audit emission + proper LAYER 
 ### Sprint 2+ remaining work (NOT yet implemented)
 
 **Sprint 2 — Template submit + decision endpoints**
-- `POST /v1/admin/templates/{template_id}/submit-for-review` → wraps `submit_forms_template_for_admin_review()` + Cat A `admin.template_submitted_for_review` audit
-- `POST /v1/admin/template-reviews/{review_id}/decision` → wraps `record_forms_template_admin_decision()` + Cat A `admin.template_review_decision` + conditional Cat A `admin.template_published_via_review_workflow` (IFF approve)
-- Integration tests for both happy paths + idempotency-replay regression on decision wrapper
+- ✅ `POST /v1/admin/templates/:template_id/submit-for-review` → handler MOUNTED (Sprint 2 PR 2). Wraps `submit_forms_template_for_admin_review()` + emits Cat A `admin.template_submitted_for_review` audit same-tx under the restored app role + idempotency-protected via `withIdempotentExecution`. Unit tests cover composition order + guard precedence + 42501 → tenant-blind 403 mapping + audit payload shape (initial_submission + revision_resubmission paths) + idempotency-wrapper integration.
+- ⏳ `POST /v1/admin/template-reviews/{review_id}/decision` → wraps `record_forms_template_admin_decision()` + Cat A `admin.template_review_decision` + conditional Cat A `admin.template_published_via_review_workflow` (IFF approve)
+- ⏳ Integration tests for both happy paths + idempotency-replay regression on decision wrapper
 
 **Sprint 3 — Crisis dashboard endpoint** ✅ partially shipped (Sprint 2 PR 1)
 - ✅ `GET /v1/admin/dashboards/crisis-operational-health` → handler MOUNTED (wraps `read_admin_crisis_operational_health()` via the canonical context-helper composition + Option B `withDbRole('admin_basic_operator')` elevation; unit tests cover the composition order + guard precedence + wrapper-error propagation).
