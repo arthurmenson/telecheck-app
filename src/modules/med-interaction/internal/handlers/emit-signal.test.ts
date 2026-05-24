@@ -17,13 +17,24 @@ const wrapperCalls: string[] = [];
 const recordedQueries: { sql: string; params: unknown[] | undefined }[] = [];
 const auditCalls: { fn: string; args: unknown }[] = [];
 
+// Default query responder. The handler issues 3 queries:
+//   1. SELECT patient_id FROM interaction_engine_evaluation ... → derived patient_id
+//   2. INSERT INTO interaction_signal ...                       → succeeds
+//   3. SELECT record_signal_emission(...)                        → succeeds
+// VALID_ULID_B is the canonical body patient_id; the default lookup
+// returns the same value so the equality check passes. Tests that
+// exercise mismatch / missing-eval override this responder.
+const VALID_ULID_B = '01HFG6Z3Q8B7H9P2W4V5K6N7TA';
+
 let queryResponder: (
   sql: string,
   params?: unknown[],
-) => Promise<{ rows: unknown[]; rowCount: number | null }> = async () => ({
-  rows: [],
-  rowCount: 1,
-});
+) => Promise<{ rows: unknown[]; rowCount: number | null }> = async (sql) => {
+  if (sql.includes('FROM interaction_engine_evaluation')) {
+    return { rows: [{ patient_id: VALID_ULID_B }], rowCount: 1 };
+  }
+  return { rows: [], rowCount: 1 };
+};
 
 const mockTx = {
   query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -108,7 +119,8 @@ vi.mock('../../audit.js', () => ({
 }));
 
 const VALID_ULID_A = '01HFG6Z3Q8B7H9P2W4V5K6N7T9';
-const VALID_ULID_B = '01HFG6Z3Q8B7H9P2W4V5K6N7TA';
+// VALID_ULID_B is declared at the top of the file (shared with the
+// default queryResponder).
 const VALID_ULID_C = '01HFG6Z3Q8B7H9P2W4V5K6N7TB';
 
 function makeValidBody(): Record<string, unknown> {
@@ -179,7 +191,12 @@ beforeEach(() => {
   wrapperCalls.length = 0;
   recordedQueries.length = 0;
   auditCalls.length = 0;
-  queryResponder = async () => ({ rows: [], rowCount: 1 });
+  queryResponder = async (sql) => {
+    if (sql.includes('FROM interaction_engine_evaluation')) {
+      return { rows: [{ patient_id: VALID_ULID_B }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 1 };
+  };
   delete process.env['NODE_ENV'];
 });
 
@@ -260,15 +277,20 @@ describe('emitSignalHandler §3 — canonical composition', () => {
   });
 });
 
-describe('emitSignalHandler §4 — INSERT + wrapper + audit same-tx', () => {
-  it('issues the interaction_signal INSERT, then the SECDEF wrapper, then the audit (in order)', async () => {
+describe('emitSignalHandler §4 — eval lookup + INSERT + wrapper + audit same-tx', () => {
+  // R2 HIGH-1 closure (Codex 2026-05-24): the handler now derives the
+  // canonical patient_id from interaction_engine_evaluation in the
+  // SAME tx before audit emission, so the query count is 3 (lookup +
+  // signal INSERT + SECDEF wrapper).
+  it('issues eval-lookup → signal INSERT → SECDEF wrapper → audit (in order)', async () => {
     const req = makeReq();
     const { reply } = makeReply();
     await emitSignalHandler(req, reply);
 
-    expect(recordedQueries).toHaveLength(2);
-    expect(recordedQueries[0]!.sql).toContain('INSERT INTO interaction_signal');
-    expect(recordedQueries[1]!.sql).toContain('record_signal_emission');
+    expect(recordedQueries).toHaveLength(3);
+    expect(recordedQueries[0]!.sql).toContain('FROM interaction_engine_evaluation');
+    expect(recordedQueries[1]!.sql).toContain('INSERT INTO interaction_signal');
+    expect(recordedQueries[2]!.sql).toContain('record_signal_emission');
     expect(auditCalls).toHaveLength(1);
     expect(auditCalls[0]!.fn).toBe('emitSignalEmittedAudit');
   });
@@ -302,25 +324,112 @@ describe('emitSignalHandler §4 — INSERT + wrapper + audit same-tx', () => {
     expect(auditCalls.map((c) => c.fn)).toEqual(['emitSignalEmittedAudit']);
   });
 
-  // R1 Finding 2 closure (Codex 2026-05-23): assert the EXACT inner-query
-  // sequence per the SI-019 Sub-decision 8 wrapper-arbitration pattern:
-  //   1. INSERT INTO interaction_signal  (paired-row pre-INSERT)
-  //   2. SELECT record_signal_emission(...) (SECDEF wrapper call)
+  // R1 Finding 2 closure (Codex 2026-05-23) + R2 HIGH-1 update
+  // (2026-05-24): assert the EXACT inner-query sequence per the SI-019
+  // Sub-decision 8 wrapper-arbitration pattern + derived-attribution
+  // discipline:
+  //   1. SELECT patient_id FROM interaction_engine_evaluation (eval lookup)
+  //   2. INSERT INTO interaction_signal                       (paired-row pre-INSERT)
+  //   3. SELECT record_signal_emission(...)                   (SECDEF wrapper)
   // The wrapper internally INSERTs the initial lifecycle transition row;
-  // the handler then emits the single audit event. Subsequent regressions
-  // that reorder these MUST update the order assertion.
-  it('issues queries in canonical order: signal INSERT → record_signal_emission → audit', async () => {
+  // the handler then emits the single audit event with the DB-derived
+  // patient_id. Subsequent regressions that reorder these MUST update
+  // the order assertion.
+  it('issues queries in canonical order: eval lookup → signal INSERT → record_signal_emission → audit', async () => {
     const req = makeReq();
     const { reply } = makeReply();
     await emitSignalHandler(req, reply);
 
-    expect(recordedQueries.map((q) => q.sql.trim().split(/\s+/).slice(0, 3).join(' '))).toEqual([
-      'INSERT INTO interaction_signal',
-      'SELECT record_signal_emission($1,',
-    ]);
-    // Audit fires AFTER both DB writes; assert auditCalls length is 1 and
-    // followed (not preceded) by any further DB writes.
+    const queryPrefixes = recordedQueries.map((q) =>
+      q.sql.trim().split(/\s+/).slice(0, 3).join(' '),
+    );
+    expect(queryPrefixes[0]).toContain('SELECT');
+    expect(recordedQueries[0]!.sql).toContain('FROM interaction_engine_evaluation');
+    expect(queryPrefixes[1]).toBe('INSERT INTO interaction_signal');
+    expect(queryPrefixes[2]).toBe('SELECT record_signal_emission($1,');
+    // Audit fires AFTER all DB writes; assert auditCalls length is 1.
     expect(auditCalls).toHaveLength(1);
+  });
+
+  // R2 HIGH-1 regression (Codex 2026-05-24): the audit emitter MUST
+  // receive the DB-derived patient_id, NOT the body-supplied value.
+  it('passes DB-derived patient_id to the audit emitter (not body-supplied)', async () => {
+    const req = makeReq();
+    const { reply } = makeReply();
+    await emitSignalHandler(req, reply);
+
+    expect(auditCalls).toHaveLength(1);
+    expect((auditCalls[0]!.args as Record<string, unknown>)['patientId']).toBe(VALID_ULID_B);
+  });
+
+  // R2 HIGH-1 regression (Codex 2026-05-24): when the body-supplied
+  // patient_id does NOT match the durable evaluation row, the handler
+  // MUST fail closed with a tenant-blind 404 (no audit emitted).
+  it('rejects body patient_id mismatch with tenant-blind 404 (no audit)', async () => {
+    // Body sends VALID_ULID_B; DB returns a different patient_id.
+    const FORGED_PATIENT_ID = '01HFG6Z3Q8B7H9P2W4V5K6N7TZ';
+    queryResponder = async (sql) => {
+      if (sql.includes('FROM interaction_engine_evaluation')) {
+        return { rows: [{ patient_id: FORGED_PATIENT_ID }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 1 };
+    };
+    const req = makeReq();
+    const { reply } = makeReply();
+    await expect(emitSignalHandler(req, reply)).rejects.toMatchObject({
+      statusCode: 404,
+      message: 'Interaction signal not found.',
+    });
+    expect(auditCalls).toHaveLength(0);
+  });
+
+  // R2 HIGH-1 regression (Codex 2026-05-24): when the evaluation row
+  // does not exist in this tenant, the lookup returns no rows and the
+  // handler MUST fail closed with a tenant-blind 404 (no audit).
+  it('maps missing evaluation row to tenant-blind 404 (no audit)', async () => {
+    queryResponder = async (sql) => {
+      if (sql.includes('FROM interaction_engine_evaluation')) {
+        return { rows: [], rowCount: 0 };
+      }
+      return { rows: [], rowCount: 1 };
+    };
+    const req = makeReq();
+    const { reply } = makeReply();
+    await expect(emitSignalHandler(req, reply)).rejects.toMatchObject({
+      statusCode: 404,
+      message: 'Interaction signal not found.',
+    });
+    expect(auditCalls).toHaveLength(0);
+  });
+
+  // R2 HIGH-3 regression (Codex 2026-05-24): the interaction_signal
+  // INSERT has a composite FK to (tenant_id, evaluation_id). A
+  // concurrent DELETE / RLS-policy-rejected lookup between §1 and §2
+  // could raise SQLSTATE 23503 (foreign_key_violation); map to
+  // tenant-blind 404 per I-025 (same wire response as "doesn't exist").
+  it('maps SQLSTATE 23503 from the signal INSERT to a tenant-blind 404', async () => {
+    let callCount = 0;
+    queryResponder = async (sql) => {
+      callCount += 1;
+      if (callCount === 1 && sql.includes('FROM interaction_engine_evaluation')) {
+        return { rows: [{ patient_id: VALID_ULID_B }], rowCount: 1 };
+      }
+      if (callCount === 2 && sql.includes('INSERT INTO interaction_signal')) {
+        const err = new Error('insert or update violates foreign key') as Error & {
+          code: string;
+        };
+        err.code = '23503';
+        throw err;
+      }
+      return { rows: [], rowCount: 1 };
+    };
+    const req = makeReq();
+    const { reply } = makeReply();
+    await expect(emitSignalHandler(req, reply)).rejects.toMatchObject({
+      statusCode: 404,
+      message: 'Interaction signal not found.',
+    });
+    expect(auditCalls).toHaveLength(0);
   });
 });
 
@@ -340,12 +449,15 @@ describe('emitSignalHandler §5 — error mapping (I-025)', () => {
   });
 
   it('maps wrapper SQLSTATE 02000 (no_data; paired_signal_not_found) to tenant-blind 404', async () => {
-    let callCount = 0;
-    queryResponder = async () => {
-      callCount += 1;
-      if (callCount === 1) {
-        return { rows: [], rowCount: 1 }; // INSERT succeeds
+    // Eval-lookup returns patient_id, INSERT succeeds, wrapper raises 02000.
+    queryResponder = async (sql) => {
+      if (sql.includes('FROM interaction_engine_evaluation')) {
+        return { rows: [{ patient_id: VALID_ULID_B }], rowCount: 1 };
       }
+      if (sql.includes('INSERT INTO interaction_signal')) {
+        return { rows: [], rowCount: 1 };
+      }
+      // SELECT record_signal_emission(...) → 02000
       const err = new Error('paired_signal_not_found') as Error & { code: string };
       err.code = '02000';
       throw err;

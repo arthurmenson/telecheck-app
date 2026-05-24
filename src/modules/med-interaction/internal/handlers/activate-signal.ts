@@ -21,10 +21,13 @@
  *   Path     /v0/med-interaction/signals/:id/activate
  *   Params   id — VARCHAR(26) ULID — the interaction_signal_id
  *   Body     {
- *              patient_id?: ULID,  // optional, for audit-target attribution
  *              metadata?:   JSON   // forwarded into the SECDEF wrapper's
  *                                  // p_metadata JSONB
  *            }
+ *            (R2 HIGH-2 closure 2026-05-24: patient_id REMOVED from
+ *             the body — derived server-side from
+ *             interaction_signal -> interaction_engine_evaluation in
+ *             same tx.)
  *   Returns  200 + { signal_id, transition_id, activated_at } on success
  *            400 on malformed :id / body
  *            401 if no authenticated actor (production fail-closed)
@@ -99,8 +102,26 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/**
+ * Activate-signal request body.
+ *
+ * **R2 HIGH-2 closure (Codex 2026-05-24):** `patient_id` is no longer
+ * accepted as request input. The audit `target_patient_id` is derived
+ * server-side from the durable `interaction_signal -> interaction_engine_evaluation`
+ * join in the same transaction. Body-supplied `patient_id` was a
+ * forgery vector — a caller could activate signal A but emit the
+ * lifecycle audit under patient B, corrupting the patient-scoped
+ * audit hash-chain partition AND misrouting any patient-facing
+ * lifecycle-change consumer that filters by `target_patient_id`.
+ * Per AUDIT_EVENTS v5.3 hash-chain partition rule, an audit row
+ * whose `target_patient_id` does not match the durable record
+ * lands in the wrong partition.
+ *
+ * If a future API contract requires accepting `patient_id` for
+ * idempotency-replay disambiguation, it MUST be validated equal to
+ * the DB-derived value (fail-closed 404 on mismatch per I-025).
+ */
 interface ActivateSignalBody {
-  patient_id?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -147,17 +168,10 @@ export async function activateSignalHandler(
   }
   const signalId = rawId;
 
-  // §2 — Body validation (both fields optional; an empty {} body is OK).
+  // §2 — Body validation. Only `metadata` is body-supplied; the audit
+  // target patient_id is DB-derived in the wrapper-call body below
+  // (R2 HIGH-2 closure 2026-05-24).
   const body = (req.body ?? {}) as ActivateSignalBody;
-  if (body.patient_id !== undefined && !isUlid(body.patient_id)) {
-    return reply.code(400).send({
-      error: {
-        code: 'internal.request.invalid',
-        message: 'patient_id, when supplied, must be a 26-character Crockford-base32 ULID.',
-        request_id: req.id,
-      },
-    });
-  }
   if (body.metadata !== undefined && !isObject(body.metadata)) {
     return reply.code(400).send({
       error: {
@@ -167,7 +181,6 @@ export async function activateSignalHandler(
       },
     });
   }
-  const patientId = body.patient_id ?? null;
   const metadata = body.metadata ?? {};
 
   const actorNonce = req.actorNonce;
@@ -198,7 +211,42 @@ export async function activateSignalHandler(
                 [transitionId, ctx.tenantId, signalId, actorId, JSON.stringify(metadata)],
               );
 
-              // §2 — Cat A audit `interaction_signal_lifecycle_transition_emitted`
+              // §2 — Derive the audit `target_patient_id` from the
+              // durable `interaction_signal -> interaction_engine_evaluation`
+              // join in the same tx (R2 HIGH-2 closure 2026-05-24).
+              // The prior version accepted a body-supplied patient_id
+              // (optional, defaulting to null) which landed the audit
+              // record on the platform hash-chain partition instead of
+              // the patient partition for the normal "no body" case,
+              // and allowed forgery to an arbitrary patient ULID when
+              // a value WAS supplied. Deriving from the durable
+              // relationship eliminates both failure modes.
+              //
+              // The lookup runs AFTER record_signal_activation succeeds —
+              // the wrapper already validated the signal exists in the
+              // current tenant (raising 42501 or 23514 on mismatch);
+              // a missing row here is therefore an unexpected race
+              // (e.g. concurrent DELETE between activation and lookup)
+              // and is mapped to a tenant-blind 404.
+              const patientRow = await tx.query(
+                `SELECT e.patient_id
+                   FROM interaction_signal AS s
+                   JOIN interaction_engine_evaluation AS e
+                     ON e.tenant_id = s.tenant_id
+                    AND e.id        = s.evaluation_id
+                  WHERE s.tenant_id = $1 AND s.id = $2`,
+                [ctx.tenantId, signalId],
+              );
+              const patientRows = patientRow.rows as Array<{ patient_id: string }>;
+              const derivedPatientId = patientRows[0]?.patient_id;
+              if (
+                typeof derivedPatientId !== 'string' ||
+                derivedPatientId.length === 0
+              ) {
+                throw req.server.httpErrors.notFound('Interaction signal not found.');
+              }
+
+              // §3 — Cat A audit `interaction_signal_lifecycle_transition_emitted`
               // in the SAME tx. Per Option A (SI-019 Sub-decision 3 item 5
               // 2026-05-20), every INSERT into
               // interaction_signal_lifecycle_transition emits this audit
@@ -209,7 +257,7 @@ export async function activateSignalHandler(
                   tenantId: ctx.tenantId,
                   signalId,
                   transitionId,
-                  patientId,
+                  patientId: derivedPatientId,
                   actorId,
                   actorTenantId,
                   countryOfCare: ctx.countryOfCare,

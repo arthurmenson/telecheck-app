@@ -16,13 +16,22 @@ const wrapperCalls: string[] = [];
 const recordedQueries: { sql: string; params: unknown[] | undefined }[] = [];
 const auditCalls: { fn: string; args: unknown }[] = [];
 
+// Default query responder. The handler issues 2 queries:
+//   1. SELECT record_signal_activation(...)      → succeeds (no rows)
+//   2. SELECT e.patient_id FROM interaction_signal s JOIN
+//      interaction_engine_evaluation e ON ... → derived patient_id
+// Tests that exercise a specific failure path override this responder.
+const DERIVED_PATIENT_ID = '01HFG6Z3Q8B7H9P2W4V5K6N7TU';
+
 let queryResponder: (
   sql: string,
   params?: unknown[],
-) => Promise<{ rows: unknown[]; rowCount: number | null }> = async () => ({
-  rows: [],
-  rowCount: 1,
-});
+) => Promise<{ rows: unknown[]; rowCount: number | null }> = async (sql) => {
+  if (sql.includes('FROM interaction_signal') && sql.includes('JOIN')) {
+    return { rows: [{ patient_id: DERIVED_PATIENT_ID }], rowCount: 1 };
+  }
+  return { rows: [], rowCount: 1 };
+};
 
 const mockTx = {
   query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -165,7 +174,12 @@ beforeEach(() => {
   wrapperCalls.length = 0;
   recordedQueries.length = 0;
   auditCalls.length = 0;
-  queryResponder = async () => ({ rows: [], rowCount: 1 });
+  queryResponder = async (sql) => {
+    if (sql.includes('FROM interaction_signal') && sql.includes('JOIN')) {
+      return { rows: [{ patient_id: DERIVED_PATIENT_ID }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 1 };
+  };
   delete process.env['NODE_ENV'];
 });
 
@@ -191,11 +205,21 @@ describe('activateSignalHandler §1 — path/body validation', () => {
     });
   });
 
-  it('rejects invalid patient_id in body with 400', async () => {
-    const req = makeReq({ body: { patient_id: 'not-ulid' } });
+  // R2 HIGH-2 closure (Codex 2026-05-24): patient_id is no longer
+  // accepted from the request body — derived server-side from the
+  // signal/evaluation join. A body that supplies patient_id is simply
+  // ignored (no 400 — extra body fields are not rejected); the audit
+  // is still emitted under the DB-derived patient_id.
+  it('ignores body-supplied patient_id (extra fields are not rejected; audit uses DB-derived id)', async () => {
+    const req = makeReq({ body: { patient_id: '01HFG6Z3Q8B7H9P2W4V5K6N7TZ' } });
     const { reply, sent } = makeReply();
     await activateSignalHandler(req, reply);
-    expect(sent.code).toBe(400);
+    expect(sent.code).toBe(200);
+    // Audit must use the DB-derived patient_id, NOT the body value.
+    expect(auditCalls).toHaveLength(1);
+    expect((auditCalls[0]!.args as Record<string, unknown>)['patientId']).toBe(
+      DERIVED_PATIENT_ID,
+    );
   });
 
   it('rejects non-object metadata with 400', async () => {
@@ -205,7 +229,7 @@ describe('activateSignalHandler §1 — path/body validation', () => {
     expect(sent.code).toBe(400);
   });
 
-  it('accepts empty {} body (both fields optional)', async () => {
+  it('accepts empty {} body (metadata is optional)', async () => {
     const req = makeReq({ body: {} });
     const { reply, sent } = makeReply();
     await activateSignalHandler(req, reply);
@@ -252,20 +276,31 @@ describe('activateSignalHandler §3 — canonical composition', () => {
 });
 
 describe('activateSignalHandler §4 — SECDEF wrapper + audit same-tx', () => {
-  it('issues record_signal_activation under the role + emits lifecycle audit', async () => {
+  it('issues record_signal_activation + patient lookup + emits lifecycle audit', async () => {
     const req = makeReq();
     const { reply } = makeReply();
     await activateSignalHandler(req, reply);
 
-    expect(recordedQueries).toHaveLength(1);
+    // R2 HIGH-2 closure (Codex 2026-05-24): the handler now issues 2
+    // queries — the SECDEF wrapper call FIRST, then the DB-derived
+    // patient_id lookup via the signal/evaluation join. Audit fires
+    // AFTER both DB writes with the derived patient_id.
+    expect(recordedQueries).toHaveLength(2);
     expect(recordedQueries[0]!.sql).toContain('record_signal_activation');
-    // Parameters: [transitionId, tenantId, signalId, actorId, metadata]
+    // Parameters on wrapper call: [transitionId, tenantId, signalId, actorId, metadata]
     expect(recordedQueries[0]!.params?.[1]).toBe('Telecheck-US');
     expect(recordedQueries[0]!.params?.[2]).toBe(VALID_SIGNAL_ID);
+    // Patient lookup is the second query.
+    expect(recordedQueries[1]!.sql).toContain('FROM interaction_signal');
+    expect(recordedQueries[1]!.sql).toContain('JOIN interaction_engine_evaluation');
+    expect(recordedQueries[1]!.params?.[0]).toBe('Telecheck-US');
+    expect(recordedQueries[1]!.params?.[1]).toBe(VALID_SIGNAL_ID);
 
     expect(auditCalls).toHaveLength(1);
     expect(auditCalls[0]!.fn).toBe('emitSignalLifecycleTransitionAudit');
     const args = auditCalls[0]!.args as Record<string, unknown>;
+    // Audit target patient_id is the DB-derived value, not body-supplied.
+    expect(args['patientId']).toBe(DERIVED_PATIENT_ID);
     expect(args['fromState']).toBe('emitted');
     expect(args['toState']).toBe('active');
     expect(args['transitionReason']).toBe('activation');
@@ -286,6 +321,26 @@ describe('activateSignalHandler §4 — SECDEF wrapper + audit same-tx', () => {
     await activateSignalHandler(req, reply);
 
     expect(auditCalls.map((c) => c.fn)).toEqual(['emitSignalLifecycleTransitionAudit']);
+  });
+
+  // R2 HIGH-2 regression (Codex 2026-05-24): if the post-activation
+  // patient-lookup returns no rows (concurrent DELETE / RLS-denied
+  // lookup race), the handler MUST map to tenant-blind 404 and MUST
+  // NOT emit the audit with a missing/null patient_id.
+  it('maps missing patient-lookup result to 404 and emits no audit', async () => {
+    queryResponder = async (sql) => {
+      if (sql.includes('FROM interaction_signal') && sql.includes('JOIN')) {
+        return { rows: [], rowCount: 0 };
+      }
+      return { rows: [], rowCount: 1 };
+    };
+    const req = makeReq();
+    const { reply } = makeReply();
+    await expect(activateSignalHandler(req, reply)).rejects.toMatchObject({
+      statusCode: 404,
+      message: 'Interaction signal not found.',
+    });
+    expect(auditCalls).toHaveLength(0);
   });
 });
 
