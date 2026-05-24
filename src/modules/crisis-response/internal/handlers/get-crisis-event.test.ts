@@ -193,19 +193,11 @@ describe('getCrisisEventHandler §1 — happy path composition', () => {
     expect(requireClinicianActorContext).toHaveBeenCalledWith(req);
     expect(withTransaction).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledTimes(1);
-    expect(withTenantContext).toHaveBeenCalledWith(
-      tx,
-      'Telecheck-US',
-      expect.any(Function),
-    );
+    expect(withTenantContext).toHaveBeenCalledWith(tx, 'Telecheck-US', expect.any(Function));
     expect(withActorContext).toHaveBeenCalledTimes(1);
     expect(withActorContext).toHaveBeenCalledWith(tx, 'fake-uuid-v4-nonce', expect.any(Function));
     expect(withDbRole).toHaveBeenCalledTimes(1);
-    expect(withDbRole).toHaveBeenCalledWith(
-      tx,
-      'crisis_event_staff_reader',
-      expect.any(Function),
-    );
+    expect(withDbRole).toHaveBeenCalledWith(tx, 'crisis_event_staff_reader', expect.any(Function));
 
     // The view query.
     expect(tx.query).toHaveBeenCalledTimes(1);
@@ -266,9 +258,9 @@ describe('getCrisisEventHandler §4 — path-param validation precedes tx', () =
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
-    await expect(
-      getCrisisEventHandler(makeReq({ params: {} }), makeReply()),
-    ).rejects.toThrow(/`id` is required/);
+    await expect(getCrisisEventHandler(makeReq({ params: {} }), makeReply())).rejects.toThrow(
+      /`id` is required/,
+    );
 
     expect(withTransaction).not.toHaveBeenCalled();
   });

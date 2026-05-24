@@ -170,10 +170,7 @@ import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
-import {
-  emitCrisisDetectedAudit,
-  type CrisisDetectionSourceSurface,
-} from '../../audit.js';
+import { emitCrisisDetectedAudit, type CrisisDetectionSourceSurface } from '../../audit.js';
 import {
   asCrisisEventId,
   asServerSignalId,
@@ -224,8 +221,7 @@ const VALID_SEVERITIES: ReadonlySet<string> = new Set(CRISIS_SEVERITIES);
  * brief drift). Boundary validation catches malformed input before the
  * DB type-cast error path (which would otherwise surface as 500).
  */
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function isUuidShape(raw: string): boolean {
   return UUID_PATTERN.test(raw);
@@ -417,85 +413,79 @@ export async function postCrisisEventHandler(
       // connection; binding helpers run on the canonical DbTransaction
       // handle from db.ts — see PR 1 lines 238-248 for the type-boundary
       // note that applies here unchanged).
-      const crisisEventIdRaw = await withTenantContext<string>(
-        tx,
-        ctx.tenantId,
-        async () => {
-          // SI-010 actor nonce: present when authContextPlugin's
-          // bind-pool wiring is configured (production); undefined in
-          // dev/test deployments that opt out. The
-          // record_crisis_initiation() wrapper requires SI-010 actor
-          // context (it calls current_actor_account_id() and raises
-          // 42501 if no actor bound — see migration 036 lines 122-127
-          // + 148-153). When the nonce is undefined the wrapper will
-          // fail with 42501 → tenant-blind 403, which is the correct
-          // behavior in deployments lacking the SI-010 binding (the
-          // initiation path is unavailable without actor attribution).
-          //
-          // I-025 envelope-leak defense (per PR 1 R2 MED-1 closure
-          // 2026-05-23): the try/catch wraps the ENTIRE withDbRole
-          // call so 42501 is mapped whether it surfaces from:
-          //   (1) withDbRole's SET LOCAL ROLE pre-callback elevation
-          //       (e.g., crisis_initiator membership drift)
-          //   (2) the wrapper's internal LAYER B/C guards
-          //       (SI-010 actor-not-bound or tenant-scope-mismatch
-          //       per migration 036 lines 122-159)
-          // Without the wide catch, a privilege-acquisition 42501 from
-          // path (1) would escape past an inner catch and reach the
-          // global envelope as 500 with leaky raw PG message.
-          const runInitiate = async (): Promise<string> => {
-            try {
-              return await withDbRole(tx, 'crisis_initiator', async () => {
-                // Call the SECDEF wrapper. All 8 KMS envelope params
-                // are NULL at v0 wire surface; Sprint 4 lands KMS
-                // envelope encryption per README + ADR-024. The
-                // wrapper accepts NULLs for those columns under the
-                // table CHECK's "all-or-none" constraint.
-                const result = await tx.query<{ crisis_event_id: string }>(
-                  'SELECT record_crisis_initiation($1, $2, $3, $4, $5, $6) AS crisis_event_id',
-                  [
-                    ctx.tenantId,
-                    patientId,
-                    serverSignalId,
-                    crisisType,
-                    severity,
-                    regulatoryReportingEnabled,
-                  ],
-                );
-                const row = result.rows[0];
-                if (row === undefined) {
-                  // Defensive: wrapper RETURNS UUID NOT NULL by
-                  // contract — but if a future wrapper amendment
-                  // ever returns 0 rows this would surface as 500
-                  // (rather than undefined behavior on a downstream
-                  // emit). Re-throw for the global envelope.
-                  throw new Error(
-                    'record_crisis_initiation returned no row; wrapper-contract violation.',
-                  );
-                }
-                return row.crisis_event_id;
-              });
-            } catch (err) {
-              if (
-                typeof err === 'object' &&
-                err !== null &&
-                'code' in err &&
-                (err as { code?: unknown }).code === '42501'
-              ) {
-                throw req.server.httpErrors.forbidden(
-                  'Insufficient scope for this request.',
+      const crisisEventIdRaw = await withTenantContext<string>(tx, ctx.tenantId, async () => {
+        // SI-010 actor nonce: present when authContextPlugin's
+        // bind-pool wiring is configured (production); undefined in
+        // dev/test deployments that opt out. The
+        // record_crisis_initiation() wrapper requires SI-010 actor
+        // context (it calls current_actor_account_id() and raises
+        // 42501 if no actor bound — see migration 036 lines 122-127
+        // + 148-153). When the nonce is undefined the wrapper will
+        // fail with 42501 → tenant-blind 403, which is the correct
+        // behavior in deployments lacking the SI-010 binding (the
+        // initiation path is unavailable without actor attribution).
+        //
+        // I-025 envelope-leak defense (per PR 1 R2 MED-1 closure
+        // 2026-05-23): the try/catch wraps the ENTIRE withDbRole
+        // call so 42501 is mapped whether it surfaces from:
+        //   (1) withDbRole's SET LOCAL ROLE pre-callback elevation
+        //       (e.g., crisis_initiator membership drift)
+        //   (2) the wrapper's internal LAYER B/C guards
+        //       (SI-010 actor-not-bound or tenant-scope-mismatch
+        //       per migration 036 lines 122-159)
+        // Without the wide catch, a privilege-acquisition 42501 from
+        // path (1) would escape past an inner catch and reach the
+        // global envelope as 500 with leaky raw PG message.
+        const runInitiate = async (): Promise<string> => {
+          try {
+            return await withDbRole(tx, 'crisis_initiator', async () => {
+              // Call the SECDEF wrapper. All 8 KMS envelope params
+              // are NULL at v0 wire surface; Sprint 4 lands KMS
+              // envelope encryption per README + ADR-024. The
+              // wrapper accepts NULLs for those columns under the
+              // table CHECK's "all-or-none" constraint.
+              const result = await tx.query<{ crisis_event_id: string }>(
+                'SELECT record_crisis_initiation($1, $2, $3, $4, $5, $6) AS crisis_event_id',
+                [
+                  ctx.tenantId,
+                  patientId,
+                  serverSignalId,
+                  crisisType,
+                  severity,
+                  regulatoryReportingEnabled,
+                ],
+              );
+              const row = result.rows[0];
+              if (row === undefined) {
+                // Defensive: wrapper RETURNS UUID NOT NULL by
+                // contract — but if a future wrapper amendment
+                // ever returns 0 rows this would surface as 500
+                // (rather than undefined behavior on a downstream
+                // emit). Re-throw for the global envelope.
+                throw new Error(
+                  'record_crisis_initiation returned no row; wrapper-contract violation.',
                 );
               }
-              throw err;
+              return row.crisis_event_id;
+            });
+          } catch (err) {
+            if (
+              typeof err === 'object' &&
+              err !== null &&
+              'code' in err &&
+              (err as { code?: unknown }).code === '42501'
+            ) {
+              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
             }
-          };
-
-          if (req.actorNonce !== undefined) {
-            return withActorContext(tx, req.actorNonce, runInitiate);
+            throw err;
           }
-          return runInitiate();
-        },
-      );
+        };
+
+        if (req.actorNonce !== undefined) {
+          return withActorContext(tx, req.actorNonce, runInitiate);
+        }
+        return runInitiate();
+      });
 
       // Phase 8 — replay-aware Cat A `crisis.detected` audit emission
       // in the SAME transaction as the wrapper INSERT (Codex R1 #201

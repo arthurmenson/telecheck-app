@@ -55,8 +55,7 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'admin-backend',
-    blocked:
-      'Admin Backend Basics handler implementation (Sprint 2 PR 2 of N at v0.3)',
+    blocked: 'Admin Backend Basics handler implementation (Sprint 2 PR 2 of N at v0.3)',
     blocked_message:
       'DB layer COMPLETE through migration 044 (12 RBAC roles + 4 entities + ' +
       '2 derived views + 2 deferred + raw lifecycle writer + 2 template ' +
@@ -117,10 +116,7 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   //     Sprint 4 hardening per task brief (READ endpoint — no Cat A/B audit
   //     emission at this PR; only template submit + decision emit audit).
   // -------------------------------------------------------------------------
-  app.get(
-    '/dashboards/crisis-operational-health',
-    getCrisisOperationalHealthHandler,
-  );
+  app.get('/dashboards/crisis-operational-health', getCrisisOperationalHealthHandler);
 
   // -------------------------------------------------------------------------
   // Sprint 2 PR 2 — FIRST WRITE HANDLER (post-foundation-051).
@@ -143,8 +139,5 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   //   - Idempotency via withIdempotentExecution (IDEMPOTENCY v5.1 +
   //     SI-006 reserve-then-execute).
   // -------------------------------------------------------------------------
-  app.post(
-    '/templates/:template_id/submit-for-review',
-    postFormsTemplateSubmitHandler,
-  );
+  app.post('/templates/:template_id/submit-for-review', postFormsTemplateSubmitHandler);
 };

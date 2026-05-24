@@ -109,14 +109,14 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { requireAdminRole } from '../../../../lib/admin-role.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
-import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withTenantContext } from '../../../../lib/rls.js';
+import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
-import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { emitTemplateSubmittedForReviewAudit } from '../../audit.js';
 import { TemplateStateConflictError } from '../errors.js';
 
@@ -199,7 +199,7 @@ function mapServiceError(err: unknown, reply: FastifyReply, _reqId: string): boo
   // it's the canonical signal — the raw 42P17 branch below is defense in
   // depth.
   if (err instanceof TemplateStateConflictError) {
-    reply.code(409).send({
+    void reply.code(409).send({
       error: {
         code: 'admin.template_state_conflict',
         message:
@@ -216,7 +216,7 @@ function mapServiceError(err: unknown, reply: FastifyReply, _reqId: string): boo
   // All envelopes are GENERIC — they MUST NOT echo tenant ids or wrapper
   // detail text per I-025 tenant-blind discipline.
   if (code === '42501') {
-    reply.code(403).send({
+    void reply.code(403).send({
       error: {
         code: 'admin.forbidden',
         message: 'Insufficient scope for this request.',
@@ -226,7 +226,7 @@ function mapServiceError(err: unknown, reply: FastifyReply, _reqId: string): boo
     return true;
   }
   if (code === '02000') {
-    reply.code(404).send({
+    void reply.code(404).send({
       error: {
         code: 'admin.template_not_found',
         message: 'Template not found.',
@@ -236,7 +236,7 @@ function mapServiceError(err: unknown, reply: FastifyReply, _reqId: string): boo
     return true;
   }
   if (code === '40001') {
-    reply.code(409).send({
+    void reply.code(409).send({
       error: {
         code: 'admin.template_review_in_flight',
         message:
@@ -251,7 +251,7 @@ function mapServiceError(err: unknown, reply: FastifyReply, _reqId: string): boo
     // TemplateStateConflictError. This branch catches a future code
     // path that lets the raw PG error through unwrapped. Tenant-blind
     // envelope identical to the typed-error path above.
-    reply.code(409).send({
+    void reply.code(409).send({
       error: {
         code: 'admin.template_state_conflict',
         message:
@@ -316,9 +316,7 @@ export async function postFormsTemplateSubmitHandler(
   // when present, falling back to the x-actor-id legacy header shim
   // per the admin-role.ts Tier 2 retirement pattern.
   const actorId =
-    req.actorContext?.accountId ??
-    (req.headers['x-actor-id'] as string | undefined) ??
-    'unknown';
+    req.actorContext?.accountId ?? (req.headers['x-actor-id'] as string | undefined) ?? 'unknown';
   // Audit-attribution tenant: F-4 R5+R6 closure (auth-context.ts) — must be
   // a usable tenant identifier; rejects platform_admin header-shim path
   // outright; safe to fall back to ctx.tenantId for non-platform-admin
@@ -363,11 +361,7 @@ export async function postFormsTemplateSubmitHandler(
             return row.review_id;
           });
         } catch (err) {
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err
-          ) {
+          if (typeof err === 'object' && err !== null && 'code' in err) {
             const errCode = (err as { code?: unknown }).code;
             if (errCode === '42501') {
               throw req.server.httpErrors.forbidden('Insufficient scope for this request.');

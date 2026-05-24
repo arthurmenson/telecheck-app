@@ -22,9 +22,7 @@ import fp from 'fastify-plugin';
 
 import { registerAdminBackendRoutes } from './routes.js';
 
-const adminBackendPluginImpl: FastifyPluginAsync = async (
-  app: FastifyInstance,
-): Promise<void> => {
+const adminBackendPluginImpl: FastifyPluginAsync = async (app: FastifyInstance): Promise<void> => {
   // R1 MED-1 closure 2026-05-22 (PR 6 Codex R1): use the spec-canonical
   // `/v1/admin` prefix, NOT `/v0/admin-backend`. The Sprint 2+ endpoint
   // contract per SI-023 §5 + CDM §4 amendment is `/v1/admin/...` (e.g.,

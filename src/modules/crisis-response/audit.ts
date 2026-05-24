@@ -87,11 +87,7 @@ import type {
  * Identifies where on the platform the detection originated, BEFORE
  * routing into the Crisis Response slice's initiation wrapper.
  */
-export type CrisisDetectionSourceSurface =
-  | 'mode_1_chat'
-  | 'community'
-  | 'forms'
-  | 'messaging';
+export type CrisisDetectionSourceSurface = 'mode_1_chat' | 'community' | 'forms' | 'messaging';
 
 /**
  * SI-022 §7 ratified `crisis_initiator` slice-role membership maps
@@ -116,14 +112,9 @@ export type CrisisDetectionSourceSurface =
  * `emitCrisisDetectedAudit` envelope construction. The slice-role
  * → ActorType derivation is now centralized at this site.
  */
-export type CrisisInitiatorActorIdentity =
-  | 'clinician'
-  | 'on_call_clinician'
-  | 'ai_mode1_service';
+export type CrisisInitiatorActorIdentity = 'clinician' | 'on_call_clinician' | 'ai_mode1_service';
 
-const CRISIS_INITIATOR_ACTOR_TYPE: Readonly<
-  Record<CrisisInitiatorActorIdentity, ActorType>
-> = {
+const CRISIS_INITIATOR_ACTOR_TYPE: Readonly<Record<CrisisInitiatorActorIdentity, ActorType>> = {
   clinician: 'clinician',
   on_call_clinician: 'clinician',
   ai_mode1_service: 'ai_workload',

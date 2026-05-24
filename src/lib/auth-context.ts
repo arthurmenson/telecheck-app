@@ -579,10 +579,7 @@ export function requireClinicianActorContext(
  * derivation lives at the emitter; this gate's job is asserting the
  * caller's eligibility + returning the bound identity.
  */
-export type CrisisInitiatorIdentity =
-  | 'clinician'
-  | 'on_call_clinician'
-  | 'ai_mode1_service';
+export type CrisisInitiatorIdentity = 'clinician' | 'on_call_clinician' | 'ai_mode1_service';
 
 /**
  * Narrowed ActorContext extension for callers of

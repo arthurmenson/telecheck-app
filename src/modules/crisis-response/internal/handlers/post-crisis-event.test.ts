@@ -219,29 +219,23 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
     FAKE_CLINICIAN_ACTOR as unknown as ReturnType<typeof requireCrisisInitiatorActorContext>,
   );
   vi.mocked(resolveActorTenantIdForAudit).mockReturnValue('Telecheck-US');
-  vi.mocked(withIdempotentExecution).mockImplementation(
-    async (req, reply, _mapErr, body) => {
-      try {
-        const result = await body(
-          tx as unknown as Parameters<typeof body>[0],
-          { tenant_id: 'Telecheck-US' } as unknown as Parameters<typeof body>[1],
-        );
-        return reply.code(result.status).send(result.view);
-      } catch (err) {
-        // Forward via the same shape as the real helper's catch-with-
-        // mapServiceError path — pull mapServiceError out of the call
-        // and invoke it manually since this mock doesn't replicate the
-        // full library control flow.
-        const map = _mapErr as (
-          e: unknown,
-          r: FastifyReply,
-          reqId: string,
-        ) => boolean;
-        if (map(err, reply, req.id)) return reply;
-        throw err;
-      }
-    },
-  );
+  vi.mocked(withIdempotentExecution).mockImplementation(async (req, reply, _mapErr, body) => {
+    try {
+      const result = await body(
+        tx as unknown as Parameters<typeof body>[0],
+        { tenant_id: 'Telecheck-US' } as unknown as Parameters<typeof body>[1],
+      );
+      return reply.code(result.status).send(result.view);
+    } catch (err) {
+      // Forward via the same shape as the real helper's catch-with-
+      // mapServiceError path — pull mapServiceError out of the call
+      // and invoke it manually since this mock doesn't replicate the
+      // full library control flow.
+      const map = _mapErr as (e: unknown, r: FastifyReply, reqId: string) => boolean;
+      if (map(err, reply, req.id)) return reply;
+      throw err;
+    }
+  });
   vi.mocked(withTenantContext).mockImplementation(async (_client, _tenantId, fn) =>
     fn(tx as unknown as Parameters<typeof fn>[0]),
   );
@@ -251,11 +245,9 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
   // Replay-aware test cases override to return false to assert the
   // dedupe short-circuit per Codex R1 #201 finding 1 closure.
   vi.mocked(claimResourceLifecycleAuditSlot).mockResolvedValue(true);
-  vi.mocked(emitCrisisDetectedAudit).mockResolvedValue(
-    { audit_id: 'aud_fake' } as unknown as Awaited<
-      ReturnType<typeof emitCrisisDetectedAudit>
-    >,
-  );
+  vi.mocked(emitCrisisDetectedAudit).mockResolvedValue({
+    audit_id: 'aud_fake',
+  } as unknown as Awaited<ReturnType<typeof emitCrisisDetectedAudit>>);
 }
 
 beforeEach(() => {
@@ -279,17 +271,9 @@ describe('postCrisisEventHandler §1 — happy path composition', () => {
     expect(requireCrisisInitiatorActorContext).toHaveBeenCalledWith(req);
     expect(withIdempotentExecution).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledTimes(1);
-    expect(withTenantContext).toHaveBeenCalledWith(
-      tx,
-      'Telecheck-US',
-      expect.any(Function),
-    );
+    expect(withTenantContext).toHaveBeenCalledWith(tx, 'Telecheck-US', expect.any(Function));
     expect(withActorContext).toHaveBeenCalledTimes(1);
-    expect(withActorContext).toHaveBeenCalledWith(
-      tx,
-      'fake-uuid-v4-nonce',
-      expect.any(Function),
-    );
+    expect(withActorContext).toHaveBeenCalledWith(tx, 'fake-uuid-v4-nonce', expect.any(Function));
     expect(withDbRole).toHaveBeenCalledTimes(1);
     expect(withDbRole).toHaveBeenCalledWith(tx, 'crisis_initiator', expect.any(Function));
 
@@ -370,14 +354,10 @@ describe('postCrisisEventHandler §3 — crisis_initiator slice-role gate preced
       FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
     );
     vi.mocked(requireCrisisInitiatorActorContext).mockImplementation(() => {
-      throw new Error(
-        'forbidden: actor role=patient does not satisfy crisis_initiator gate',
-      );
+      throw new Error('forbidden: actor role=patient does not satisfy crisis_initiator gate');
     });
 
-    await expect(postCrisisEventHandler(makeReq(), makeReply())).rejects.toThrow(
-      /forbidden/,
-    );
+    await expect(postCrisisEventHandler(makeReq(), makeReply())).rejects.toThrow(/forbidden/);
 
     expect(withIdempotentExecution).not.toHaveBeenCalled();
   });

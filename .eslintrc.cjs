@@ -96,6 +96,23 @@ module.exports = {
         '@typescript-eslint/no-floating-promises': 'off',
         '@typescript-eslint/require-await': 'off',
         '@typescript-eslint/no-misused-promises': 'off',
+        // The vitest mock + matcher API is `any`-typed by design: `vi.fn()`
+        // mocks expose `.mock.calls` as `any[]`, `expect.stringContaining()` /
+        // `expect.any()` return `any`, and `app.inject().json()` is generic-
+        // `any`. The type-aware `no-unsafe-*` family + `unbound-method`
+        // (mock-method assertions like `expect(reply.send).toHaveBeenCalled`)
+        // therefore fire on idiomatic, safe test code with no real safety
+        // signal. Same rationale as the no-floating-promises relaxation above;
+        // source files keep the full strict set. `no-unnecessary-type-assertion`
+        // is relaxed for the same reason (response-shape `as {...}` narrowings
+        // off an `any` body are harmless test ergonomics).
+        '@typescript-eslint/no-unsafe-assignment': 'off',
+        '@typescript-eslint/no-unsafe-member-access': 'off',
+        '@typescript-eslint/no-unsafe-call': 'off',
+        '@typescript-eslint/no-unsafe-argument': 'off',
+        '@typescript-eslint/no-unsafe-return': 'off',
+        '@typescript-eslint/unbound-method': 'off',
+        '@typescript-eslint/no-unnecessary-type-assertion': 'off',
         // The id-denylist (prescription/chatbot/customer) is the LINT-LEVEL
         // glossary enforcement; tests intentionally reference these aliases
         // to assert the static-analysis test catches them. Allow in test files.

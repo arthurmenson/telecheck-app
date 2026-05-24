@@ -77,8 +77,8 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';

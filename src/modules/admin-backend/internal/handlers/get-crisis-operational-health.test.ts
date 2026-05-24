@@ -53,8 +53,8 @@ vi.mock('../../../../lib/with-db-role.js', () => ({
 }));
 
 // Imports AFTER the vi.mock declarations.
-import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -106,7 +106,8 @@ function makeReq(opts?: { actorNonce?: string | undefined }): FastifyRequest {
   const httpErrors = {
     forbidden: (msg?: string) => Object.assign(new Error(msg ?? 'Forbidden'), { statusCode: 403 }),
     notFound: (msg?: string) => Object.assign(new Error(msg ?? 'Not Found'), { statusCode: 404 }),
-    badRequest: (msg?: string) => Object.assign(new Error(msg ?? 'Bad Request'), { statusCode: 400 }),
+    badRequest: (msg?: string) =>
+      Object.assign(new Error(msg ?? 'Bad Request'), { statusCode: 400 }),
   };
   return {
     actorNonce: opts?.actorNonce,
@@ -164,11 +165,7 @@ describe('getCrisisOperationalHealthHandler §1 — happy path composition', () 
     expect(requireAdminRole).toHaveBeenCalledWith(req);
     expect(withTransaction).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledTimes(1);
-    expect(withTenantContext).toHaveBeenCalledWith(
-      tx,
-      'Telecheck-US',
-      expect.any(Function),
-    );
+    expect(withTenantContext).toHaveBeenCalledWith(tx, 'Telecheck-US', expect.any(Function));
     expect(withActorContext).toHaveBeenCalledTimes(1);
     expect(withActorContext).toHaveBeenCalledWith(tx, 'fake-uuid-v4-nonce', expect.any(Function));
     expect(withDbRole).toHaveBeenCalledTimes(1);
@@ -207,9 +204,9 @@ describe('getCrisisOperationalHealthHandler §2 — tenant guard precedes tx', (
       throw new Error('tenantContext absent — programming error');
     });
 
-    await expect(
-      getCrisisOperationalHealthHandler(makeReq(), makeReply()),
-    ).rejects.toThrow(/tenantContext absent/);
+    await expect(getCrisisOperationalHealthHandler(makeReq(), makeReply())).rejects.toThrow(
+      /tenantContext absent/,
+    );
 
     expect(requireAdminRole).not.toHaveBeenCalled();
     expect(withTransaction).not.toHaveBeenCalled();
@@ -229,9 +226,9 @@ describe('getCrisisOperationalHealthHandler §3 — admin-role guard precedes tx
       throw new Error('forbidden: actor lacks admin role');
     });
 
-    await expect(
-      getCrisisOperationalHealthHandler(makeReq(), makeReply()),
-    ).rejects.toThrow(/forbidden/);
+    await expect(getCrisisOperationalHealthHandler(makeReq(), makeReply())).rejects.toThrow(
+      /forbidden/,
+    );
 
     expect(withTransaction).not.toHaveBeenCalled();
   });
@@ -263,10 +260,7 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501
 
     let thrown: unknown;
     try {
-      await getCrisisOperationalHealthHandler(
-        makeReq({ actorNonce: 'fake-nonce' }),
-        makeReply(),
-      );
+      await getCrisisOperationalHealthHandler(makeReq({ actorNonce: 'fake-nonce' }), makeReply());
     } catch (e) {
       thrown = e;
     }
@@ -297,10 +291,7 @@ describe('getCrisisOperationalHealthHandler §4 — wrapper error mapping (42501
 
     let thrown: unknown;
     try {
-      await getCrisisOperationalHealthHandler(
-        makeReq({ actorNonce: 'fake-nonce' }),
-        makeReply(),
-      );
+      await getCrisisOperationalHealthHandler(makeReq({ actorNonce: 'fake-nonce' }), makeReply());
     } catch (e) {
       thrown = e;
     }
@@ -362,10 +353,7 @@ describe('getCrisisOperationalHealthHandler §6 — actor-context wrap order', (
       return { rows: SAMPLE_ROWS, rowCount: SAMPLE_ROWS.length };
     });
 
-    await getCrisisOperationalHealthHandler(
-      makeReq({ actorNonce: 'fake-nonce' }),
-      makeReply(),
-    );
+    await getCrisisOperationalHealthHandler(makeReq({ actorNonce: 'fake-nonce' }), makeReply());
 
     expect(callOrder).toEqual([
       'withActorContext-enter',
