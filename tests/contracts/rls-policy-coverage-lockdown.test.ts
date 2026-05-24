@@ -19,12 +19,12 @@
  * cross-cutting wiring" — is identical.
  *
  * What this lockdown asserts:
- *   §1 Per-table assertions for each of the 21 tenant-scoped tables:
+ *   §1 Per-table assertions for each of the 39 tenant-scoped tables:
  *     - relrowsecurity = true (RLS is enabled)
  *     - relforcerowsecurity = true (RLS bypasses are forbidden — even
  *       superusers / table owners must satisfy policy)
  *     - ≥1 row in pg_policies (at least one policy is attached)
- *   §2 Count assertion: exactly 21 tenant-scoped tables have RLS
+ *   §2 Count assertion: exactly 39 tenant-scoped tables have RLS
  *     POLICY entries; if a future migration drops a policy without
  *     updating the count, the test fires.
  *   §3 Platform-level table exclusion: `tenants` table is platform-
@@ -60,7 +60,7 @@ import { describe, expect, it } from 'vitest';
 import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
-// The 25 tenant-scoped tables that MUST have RLS enabled + a tenant policy.
+// The 39 tenant-scoped tables that MUST have RLS enabled + a tenant policy.
 //
 // Initial inventory (21 tables): verified at the Sprint 6 PM kickoff via
 // `grep "CREATE POLICY.*ON " migrations/*.sql`.
@@ -77,6 +77,28 @@ import { getTestClient } from '../setup.ts';
 // Engine slice is via the medication_request.interaction_safety_hold_triggered
 // domain event per ADR-001 clean module-boundary separation.
 //
+// I-023 RLS-lockdown reconciliation (+14 tables): the Crisis Response (033),
+// Admin Backend (040), and Med-Interaction (047) DB-layer migrations each
+// added tenant-scoped tables but predated their addition to this list, so the
+// live DB carried 39 RLS-policied tables while this lockdown asserted 25 — the
+// §2 count drift correctly fired (it could not run until the migration-chain
+// applied end-to-end). Reconciled here after per-table verification against a
+// live PostgreSQL 16 (000→051 applied) that each of the 14 has:
+// relrowsecurity=true + relforcerowsecurity=true + a `tenant_isolation` policy
+// + a real `tenant_id` column (i.e., genuinely tenant-scoped, not rogue RLS).
+//   - Crisis Response, migration 033_crisis_response_entities.sql (+6):
+//       crisis_event, crisis_event_lifecycle_transition, crisis_sweep_execution,
+//       notification_crisis_dispatch_ledger,
+//       notification_crisis_escalation_obligation,
+//       notification_crisis_provider_attempt
+//   - Admin Backend, migration 040_admin_backend_entities.sql (+4):
+//       admin_dashboard_query_execution, admin_template_decision_idempotency_key,
+//       forms_template_admin_review,
+//       forms_template_admin_review_lifecycle_transition
+//   - Med-Interaction, migration 047_med_interaction_entities.sql (+4):
+//       interaction_engine_evaluation, interaction_signal,
+//       interaction_signal_lifecycle_transition, interaction_signal_override
+//
 // If a future migration adds a tenant-scoped table, it MUST be added here
 // AND the migration MUST attach a tenant-isolation policy. The §2 count
 // assertion catches the latter; this list catches the former at the
@@ -85,6 +107,8 @@ import { getTestClient } from '../setup.ts';
 const TENANT_SCOPED_TABLES = [
   'accounts',
   'adapter_configs',
+  'admin_dashboard_query_execution', // migration 040 — Admin Backend slice
+  'admin_template_decision_idempotency_key', // migration 040 — Admin Backend slice
   'audit_records',
   'auth_devices',
   'ccr_configs',
@@ -92,6 +116,9 @@ const TENANT_SCOPED_TABLES = [
   'consent_versions',
   'consult_events',
   'consults',
+  'crisis_event', // migration 033 — Crisis Response slice
+  'crisis_event_lifecycle_transition', // migration 033 — Crisis Response slice
+  'crisis_sweep_execution', // migration 033 — Crisis Response slice
   'delegation_scopes',
   'delegations',
   'domain_events_outbox',
@@ -100,9 +127,18 @@ const TENANT_SCOPED_TABLES = [
   'forms_snapshot',
   'forms_submission',
   'forms_template',
+  'forms_template_admin_review', // migration 040 — Admin Backend slice
+  'forms_template_admin_review_lifecycle_transition', // migration 040 — Admin Backend slice
   'forms_variant',
   'idempotency_keys',
+  'interaction_engine_evaluation', // migration 047 — Med-Interaction slice
+  'interaction_signal', // migration 047 — Med-Interaction slice
+  'interaction_signal_lifecycle_transition', // migration 047 — Med-Interaction slice
+  'interaction_signal_override', // migration 047 — Med-Interaction slice
   'medication_requests', // migration 025 — per CDM v1.3 §4.16 (P-011 / SI-001 closure 2026-05-11)
+  'notification_crisis_dispatch_ledger', // migration 033 — Crisis Response slice
+  'notification_crisis_escalation_obligation', // migration 033 — Crisis Response slice
+  'notification_crisis_provider_attempt', // migration 033 — Crisis Response slice
   'otp_challenges',
   'product_catalog', // migration 024 — per CDM v1.2 §4.9 ProductCatalog
   'sessions',
@@ -162,13 +198,15 @@ describe('I-023 RLS policy coverage lockdown — §1 per-table structural assert
 
   it.each(TENANT_SCOPED_TABLES)('§1.%s has at least one RLS policy attached', async (tableName) => {
     const client = getTestClient();
-    // Do NOT assert on policyname — three name conventions exist in
+    // Do NOT assert on policyname — five name conventions exist in
     // production migrations:
-    //   - `tenant_isolation`        (19 tables; default convention)
-    //   - `audit_tenant_isolation`  (audit_records only)
-    //   - `tenant_users_visibility` (tenant_users only — special-cased
-    //                                 for platform-admin cross-tenant
-    //                                 visibility per TLC-005)
+    //   - `tenant_isolation`                    (35 tables; default convention)
+    //   - `audit_tenant_isolation`              (audit_records only)
+    //   - `tenant_users_visibility`             (tenant_users only — special-cased
+    //                                            for platform-admin cross-tenant
+    //                                            visibility per TLC-005)
+    //   - `medication_requests_tenant_isolation` (medication_requests only)
+    //   - `product_catalog_tenant_isolation`     (product_catalog only)
     // Asserting a fixed name would silently pass-for-wrong-reason on
     // the exceptions OR fail when those exceptions are correct.
     // This lockdown asserts policy PRESENCE only; functional behavior
