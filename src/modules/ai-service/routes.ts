@@ -92,8 +92,17 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     crisis_gate_wired_by:
       'TLC-AI PR F (runCrisisGate exported from module index; wraps the platform-singleton crisisDetector from src/lib/crisis-detection.ts + emits crisis_detection_trigger Category A audit per AUDIT_EVENTS v5.3; service-callable only — handlers that consume the gate land when Mode 1 chat / Mode 2 case-prep routes go online)',
     handlers_wired: true,
-    handlers_wired_tracking:
-      'Mode 1 chat (PR G 2026-05-15) + Mode 2 case-prep (PR H 2026-05-23) MOUNTED; real Anthropic provider integration still pending secrets management resolution (NullLLMProvider routes every workload to AI-RESIL-001 fail-soft at v0.1)',
+    // Codex PR #210 R2 MEDIUM closure: tracking text must agree with
+    // mode2_case_prep_mounted. The boolean is source-of-truth.
+    handlers_wired_tracking: mode2CasePrepMounted
+      ? 'Mode 1 chat (PR G 2026-05-15) + Mode 2 case-prep (PR H 2026-05-23) MOUNTED; ' +
+        'real Anthropic provider integration still pending secrets management resolution ' +
+        '(NullLLMProvider routes every workload to AI-RESIL-001 fail-soft at v0.1)'
+      : 'Mode 1 chat (PR G 2026-05-15) MOUNTED; Mode 2 case-prep (PR H 2026-05-23) ' +
+        'DEFINED + config-gated behind AI_MODE2_ENABLED (default false) per Codex PR #210 ' +
+        'R1 NEEDS-WORK closure — POST /v0/ai/case-prep returns 404 until the flag is on. ' +
+        'Real Anthropic provider integration pending secrets management resolution ' +
+        '(NullLLMProvider routes every workload to AI-RESIL-001 fail-soft at v0.1)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -107,6 +116,24 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
   // module until the AI surface can serve every documented capability
   // with the platform-floor invariants (FLOOR-007..FLOOR-013, I-019,
   // AI-ARCH-001/002, AI-GUARD-001..005, AI-RESIL-001/002) enforced.
+  // Codex PR #210 R2 MEDIUM closure (2026-05-24): /ready descriptive
+  // text MUST agree with the mode2_case_prep_mounted introspection
+  // field. The boolean is the source of truth; the human-readable
+  // string echoes that state so an operator parsing prose can't
+  // arrive at a different conclusion than an operator parsing the
+  // boolean.
+  const mode2DescriptiveText = mode2CasePrepMounted
+    ? 'Mode 2 case-prep (POST /v0/ai/case-prep) is MOUNTED and exercises the full ' +
+      'I-019 crisis-detection floor, FLOOR-020 audit emission, and AI-RESIL-001 ' +
+      'fail-soft path (AI_MODE2_ENABLED=true in this environment; production rollout ' +
+      'still blocks on the three Day-3+ prerequisites per Codex PR #210 R1 closure)'
+    : 'Mode 2 case-prep (POST /v0/ai/case-prep) is DEFINED but NOT mounted — ' +
+      'AI_MODE2_ENABLED=false gates the route registration per Codex PR #210 R1 ' +
+      'NEEDS-WORK closure. POST requests return Fastify\'s documented 404. The flag ' +
+      'is held off until clinical-anchor authorization + real protocol-engine ' +
+      'provider execution + verified end-to-end audit-emission discipline land in ' +
+      'lockstep';
+
   app.get('/ready', async (_req, reply) => {
     return reply.code(503).send({
       status: 'not_ready',
@@ -125,11 +152,12 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
         'verified audit emission) — AI_MODE2_ENABLED gates the route mount until all ' +
         'three Day-3+ prerequisites land per Codex PR #210 R1 NEEDS-WORK closure',
       pending_message:
-        'Module is NOT yet production-ready — Mode 1 chat (POST /v0/ai/chat) + Mode 2 ' +
-        'case-prep (POST /v0/ai/case-prep) handlers are MOUNTED and exercise the full ' +
-        'I-019 crisis-detection floor, FLOOR-020 audit emission, and AI-RESIL-001 ' +
-        'fail-soft path, but the LLM provider abstraction (per ADR-020) routes every ' +
-        'workload to NullLLMProvider — so every non-crisis response is the documented ' +
+        'Module is NOT yet production-ready — Mode 1 chat (POST /v0/ai/chat) is MOUNTED ' +
+        'and exercises the full I-019 crisis-detection floor, FLOOR-020 audit emission, ' +
+        'and AI-RESIL-001 fail-soft path. ' +
+        mode2DescriptiveText +
+        '. The LLM provider abstraction (per ADR-020) routes every workload to ' +
+        'NullLLMProvider — so every non-crisis response is the documented ' +
         '"AI temporarily unavailable" envelope. Per AI_LAYERING v5.2 §2 + ADR-029, the ' +
         'v1.0 workload taxonomy admits exactly two active types: conversational_assistant ' +
         'and protocol_execution; reserved types (autonomous_agent, multi_agent_supervisor, ' +

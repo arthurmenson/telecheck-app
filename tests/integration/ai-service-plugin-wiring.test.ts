@@ -86,11 +86,16 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     // Mode 1 chat handler is mounted (PR G); Mode 2 case-prep is
     // CONFIG-GATED (PR #210 R1 NEEDS-WORK closure) — DEFINED but only
     // mounted when AI_MODE2_ENABLED=true. handlers_wired remains
-    // descriptively true (Mode 1 path exists) and tracking text covers
-    // both Mode 1 + Mode 2 mount status.
+    // descriptively true (Mode 1 path exists) and tracking text reflects
+    // the per-mode mount state honestly per R2 MEDIUM closure.
     expect(body.handlers_wired).toBe(true);
     expect(body.handlers_wired_tracking).toContain('Mode 1 chat');
     expect(body.handlers_wired_tracking).toContain('Mode 2 case-prep');
+    // R2 MEDIUM closure: when the flag is off, the tracking string must
+    // agree with mode2_case_prep_mounted=false — it must NOT claim Mode 2
+    // is mounted.
+    expect(body.handlers_wired_tracking).toContain('AI_MODE2_ENABLED');
+    expect(body.handlers_wired_tracking).toContain('404');
     // Honest startup-state introspection: default config keeps Mode 2
     // case-prep route DEFINED but NOT mounted. Day-3+ wiring flips it.
     expect(body.mode2_case_prep_mounted).toBe(false);
@@ -131,6 +136,11 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     expect(body.pending_message).toContain('NOT yet production-ready');
     expect(body.pending_message).toContain('conversational_assistant');
     expect(body.pending_message).toContain('protocol_execution');
+    // R2 MEDIUM closure: pending_message must agree with
+    // mode2_case_prep_mounted=false (no "Mode 2 ... MOUNTED" claim).
+    // It MUST say the route is DEFINED but not mounted.
+    expect(body.pending_message).toContain('DEFINED but NOT mounted');
+    expect(body.pending_message).not.toMatch(/Mode 2 case-prep \(POST \/v0\/ai\/case-prep\) is MOUNTED/);
     // Per CLAUDE.md hard-rule: post-P-011 the schema is ratified;
     // pending_message must not claim otherwise.
     expect(body.pending_message).not.toContain('schema not yet ratified');
