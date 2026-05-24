@@ -37,6 +37,17 @@
  *                error messages; the 404 envelope strips that).
  *            409 on idempotency replay / in-flight / body mismatch
  *
+ * **Canonical lifecycle audit rule for this handler (R1 Finding 2 closure
+ * 2026-05-23):**
+ *   This handler emits EXACTLY ONE audit event per successful request:
+ *     1. `interaction_signal_lifecycle_transition_emitted` (Cat A) with
+ *        `from_state='emitted'`, `to_state='active'`,
+ *        `transition_reason='activation'`.
+ *   The unit test below asserts the exact emitter call sequence
+ *   (`auditCalls` mock log shape) AND the from_state / to_state /
+ *   transition_reason payload values. See `audit.ts` file-level docstring
+ *   `CANONICAL LIFECYCLE AUDIT RULE` for the full cross-handler contract.
+ *
  * **SECDEF wrapper signature (migration 050 §2):**
  *   record_signal_activation(
  *     p_id            VARCHAR(26),   -- ULID for the new transition row

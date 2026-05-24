@@ -283,6 +283,45 @@ describe('emitSignalHandler §4 — INSERT + wrapper + audit same-tx', () => {
     expect(args['severity']).toBe('major');
     expect(args['recommendedAction']).toBe('warn');
   });
+
+  // R1 Finding 2 closure (Codex 2026-05-23): assert the EXACT per-handler
+  // audit-event emission set per the canonical lifecycle audit rule in
+  // `audit.ts` file-level docstring. emit-signal emits EXACTLY ONE event:
+  // interaction_signal_emitted. The initial `none → emitted` lifecycle
+  // transition row INSERTed atomically by `record_signal_emission` is NOT
+  // separately attested by interaction_signal_lifecycle_transition_emitted
+  // — see the formal initial-emission carve-out in audit.ts. Any future
+  // regression that adds a second emission here MUST update this assertion
+  // AND the canonical rule docstring; drift between rule and test is a
+  // defect.
+  it('emits EXACTLY ONE audit event (the canonical lifecycle rule for this handler)', async () => {
+    const req = makeReq();
+    const { reply } = makeReply();
+    await emitSignalHandler(req, reply);
+
+    expect(auditCalls.map((c) => c.fn)).toEqual(['emitSignalEmittedAudit']);
+  });
+
+  // R1 Finding 2 closure (Codex 2026-05-23): assert the EXACT inner-query
+  // sequence per the SI-019 Sub-decision 8 wrapper-arbitration pattern:
+  //   1. INSERT INTO interaction_signal  (paired-row pre-INSERT)
+  //   2. SELECT record_signal_emission(...) (SECDEF wrapper call)
+  // The wrapper internally INSERTs the initial lifecycle transition row;
+  // the handler then emits the single audit event. Subsequent regressions
+  // that reorder these MUST update the order assertion.
+  it('issues queries in canonical order: signal INSERT → record_signal_emission → audit', async () => {
+    const req = makeReq();
+    const { reply } = makeReply();
+    await emitSignalHandler(req, reply);
+
+    expect(recordedQueries.map((q) => q.sql.trim().split(/\s+/).slice(0, 3).join(' '))).toEqual([
+      'INSERT INTO interaction_signal',
+      'SELECT record_signal_emission($1,',
+    ]);
+    // Audit fires AFTER both DB writes; assert auditCalls length is 1 and
+    // followed (not preceded) by any further DB writes.
+    expect(auditCalls).toHaveLength(1);
+  });
 });
 
 describe('emitSignalHandler §5 — error mapping (I-025)', () => {

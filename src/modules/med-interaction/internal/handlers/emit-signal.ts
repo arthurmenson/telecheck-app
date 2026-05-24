@@ -65,6 +65,19 @@
  *   row. Both INSERTs run in the same transaction so a failed wrapper
  *   call rolls back the signal INSERT too — no orphan signal rows.
  *
+ * **Canonical lifecycle audit rule for this handler (R1 Finding 2 closure
+ * 2026-05-23):**
+ *   This handler emits EXACTLY ONE audit event per successful request:
+ *     1. `interaction_signal_emitted` (Cat A)
+ *   The initial `none → emitted` lifecycle transition row INSERTed
+ *   atomically by `record_signal_emission` is NOT separately attested by
+ *   `interaction_signal_lifecycle_transition_emitted` — the
+ *   `interaction_signal_emitted` event carries the same evidence
+ *   (signal_id, evaluation_id, severity, check_class). The unit test
+ *   below asserts the exact emitter call sequence (`auditCalls` mock log
+ *   shape). See `audit.ts` file-level docstring `CANONICAL LIFECYCLE
+ *   AUDIT RULE` for the full cross-handler contract.
+ *
  * **Why not put the signal INSERT inside the wrapper?**
  *   The migration 050 wrapper's contract (per the §1 docstring) is
  *   strictly to record the lifecycle transition; the signal row INSERT

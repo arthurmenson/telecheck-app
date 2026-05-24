@@ -270,6 +270,23 @@ describe('activateSignalHandler §4 — SECDEF wrapper + audit same-tx', () => {
     expect(args['toState']).toBe('active');
     expect(args['transitionReason']).toBe('activation');
   });
+
+  // R1 Finding 2 closure (Codex 2026-05-23): assert the EXACT per-handler
+  // audit-event emission set per the canonical lifecycle audit rule in
+  // `audit.ts` file-level docstring. activate-signal emits EXACTLY ONE
+  // event: interaction_signal_lifecycle_transition_emitted with the
+  // (emitted → active / activation) payload. Any future regression that
+  // adds a second emission here (e.g. an unnecessary
+  // interaction_signal_emitted re-attestation) MUST update this assertion
+  // AND the canonical rule docstring; drift between rule and test is a
+  // defect.
+  it('emits EXACTLY ONE audit event (the canonical lifecycle rule for this handler)', async () => {
+    const req = makeReq();
+    const { reply } = makeReply();
+    await activateSignalHandler(req, reply);
+
+    expect(auditCalls.map((c) => c.fn)).toEqual(['emitSignalLifecycleTransitionAudit']);
+  });
 });
 
 describe('activateSignalHandler §5 — error mapping (I-025)', () => {
