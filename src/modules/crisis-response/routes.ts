@@ -87,11 +87,14 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
 
   // Sprint 2 PR 2 — initiate a crisis event (FIRST write-path handler).
   //
-  // Composition: requireTenantContext → requireClinicianActorContext →
+  // Composition: requireTenantContext → requireCrisisInitiatorActorContext
+  // (SI-022 §7 slice-role gate; returns bound crisisInitiatorIdentity) →
   // body validation → resolveActorTenantIdForAudit → withIdempotentExecution
   // → withTenantContext → (withActorContext when nonce bound) → withDbRole
-  // crisis_initiator → SELECT record_crisis_initiation(...) → emitCrisisDetectedAudit
-  // (same tx; FLOOR-020 fail-closed Cat A).
+  // crisis_initiator → SELECT record_crisis_initiation(...) →
+  // claimResourceLifecycleAuditSlot (replay-aware audit dedupe; same tx) →
+  // emitCrisisDetectedAudit (only when claimed=true; FLOOR-020 fail-closed
+  // Cat A; Codex R1 #201 findings 1+2 closure 2026-05-24).
   //
   // Returns 201 + { crisis_event_id } on success, 400 on body validation,
   // 403 (tenant-blind per I-025; 42501 mapped via R2 MED-1 closure pattern

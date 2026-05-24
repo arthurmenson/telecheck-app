@@ -65,29 +65,38 @@
  * private tenant binding the rls.ts library uses for its own helpers
  * (parity with PR 1's pattern; both bindings coexist by design).
  *
- * **Layer B authorization (DEFERRED — closest-available role-gate gap):**
- *   Per SI-022 §7, `crisis_initiator` is granted to clinician +
- *   on-call clinician + ai_mode1_service. Until the JWT-role →
- *   DB-slice-role membership mapping lands (Phase A successor to
- *   SI-010 / SI-024.1), Sprint 2 PR 2 gates Layer B at the closest-
- *   available role — `clinician` — via `requireClinicianActorContext`.
+ * **Layer B authorization — SI-022 §7 `crisis_initiator` slice-role
+ * gate (Codex R1 #201 finding 2 closure 2026-05-24):**
+ *   Per SI-022 §7, the `crisis_initiator` slice role is granted to
+ *   clinician + on-call clinician + ai_mode1_service. Sprint 2 PR 2
+ *   uses the ratified, slice-scoped `requireCrisisInitiatorActorContext`
+ *   gate which returns a typed `crisisInitiatorIdentity` field
+ *   threaded into the audit emitter (canonical `actor_type`
+ *   derivation lives in the emitter's `CRISIS_INITIATOR_ACTOR_TYPE`
+ *   map: clinician + on_call_clinician → 'clinician';
+ *   ai_mode1_service → 'ai_workload'). The earlier clinician-only
+ *   stopgap (the prior `requireClinicianActorContext` call site +
+ *   the hard-coded `actor_type: 'clinician'` literal in the audit
+ *   emitter) is gone.
  *
- *   **TODO (Layer B gap):** when the membership mapping lands, replace
- *   the `requireClinicianActorContext` gate with a precise check that
- *   asserts the acting JWT role + identity is entitled to act as
- *   `crisis_initiator` (clinician OR on-call clinician OR
- *   ai_mode1_service). The audit emitter's `actor_type` derivation must
- *   ALSO expand at that point — currently hard-coded `'clinician'` at
- *   the emitter call site; the future expansion uses `'ai_workload'`
- *   when the bound actor is the ai_mode1_service identity.
+ *   **Closest-available eligibility:** the gate today accepts
+ *   `role='clinician'` only — the JWT-role → DB-slice-role mapping
+ *   for on_call_clinician + ai_mode1_service has NOT yet landed
+ *   (Phase A successor to SI-010 / SI-024.1). The gate's return
+ *   shape + the emitter's identity-map are already wired for those
+ *   two future branches, so the expansion is a one-line change at
+ *   the gate (add JWT-claim → CrisisInitiatorIdentity mapping)
+ *   without any call-site refactor here.
  *
- *   Defense-in-depth: even if the Layer B gate were absent at the
- *   Fastify layer, the DB layer fails closed — the request's bound
- *   role (`telecheck_app_role`) does NOT inherit `crisis_initiator`
- *   privileges (NOINHERIT per migration 051), so `withDbRole`'s
- *   `SET LOCAL ROLE` is what gates privilege acquisition; bypassing
- *   the role-gate at the Fastify layer would still require an explicit
- *   `withDbRole('crisis_initiator', ...)` call to reach the wrapper.
+ *   **Defense-in-depth at the SQL boundary:** even if the Layer B
+ *   gate were absent at the Fastify layer, the DB layer fails
+ *   closed — the request's bound role (`telecheck_app_role`) does
+ *   NOT inherit `crisis_initiator` privileges (NOINHERIT per
+ *   migration 051), and `record_crisis_initiation()` is EXECUTE-
+ *   granted ONLY to `crisis_initiator` per migration 036 §3. The
+ *   `withDbRole('crisis_initiator', ...)` call below is what gates
+ *   SQL-side privilege acquisition; bypassing the Fastify gate would
+ *   still require explicit role acquisition + tenant-scope match.
  *
  * **Crisis-specific platform-floor discipline (I-019):**
  *   - The initiation path MUST NEVER silently swallow errors. If the
@@ -154,7 +163,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { claimResourceLifecycleAuditSlot } from '../../../../lib/audit-dedupe.js';
 import {
-  requireClinicianActorContext,
+  requireCrisisInitiatorActorContext,
   resolveActorTenantIdForAudit,
 } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
@@ -299,7 +308,9 @@ interface PostCrisisEventResponseView {
  *
  * Flow (8 phases):
  *   1. Resolve tenant context.
- *   2. Layer B closest-available role-gate (`requireClinicianActorContext`).
+ *   2. Layer B SI-022 §7 `crisis_initiator` slice-role gate
+ *      (`requireCrisisInitiatorActorContext`); returns the bound
+ *      slice-role identity threaded into the audit emitter.
  *   3. Parse + validate body (all 6 required fields).
  *   4. Resolve actor home-tenant for audit attribution (F-4 R5 closure).
  *   5. Enter `withIdempotentExecution` (manages the
@@ -332,9 +343,22 @@ export async function postCrisisEventHandler(
   // Phase 1 — tenant context.
   const ctx = requireTenantContext(req);
 
-  // Phase 2 — LAYER B authorization (closest-available role-gate).
-  // See file header "Layer B authorization (DEFERRED)" for the TODO.
-  const actor = requireClinicianActorContext(req);
+  // Phase 2 — LAYER B authorization via the SI-022 §7 `crisis_initiator`
+  // slice-role gate (Codex R1 #201 finding 2 closure 2026-05-24).
+  // Replaces the prior clinician-only stopgap with the ratified
+  // crisis_initiator gate. The returned `crisisInitiatorIdentity`
+  // (today: always 'clinician'; future: + 'on_call_clinician' /
+  // 'ai_mode1_service' when JWT-role → DB-slice-role mapping lands)
+  // is threaded into the audit emitter so `actor_type` derives from
+  // the bound slice-role identity instead of a hard-coded literal.
+  //
+  // Defense-in-depth at the SQL boundary: even if this gate is
+  // bypassed, `record_crisis_initiation()` is EXECUTE-granted ONLY
+  // to the `crisis_initiator` PG role per migration 036 §3, and
+  // `telecheck_app_role` is NOINHERIT-member per migration 051 —
+  // the `withDbRole('crisis_initiator', ...)` call below is what
+  // gates SQL-side privilege acquisition.
+  const actor = requireCrisisInitiatorActorContext(req);
 
   // Phase 3 — body validation.
   const body = (req.body ?? {}) as PostCrisisEventBody;
@@ -545,6 +569,7 @@ export async function postCrisisEventHandler(
         await emitCrisisDetectedAudit(
           {
             tenantId: ctx.tenantId,
+            crisisInitiatorIdentity: actor.crisisInitiatorIdentity,
             actorAccountId: actor.accountId,
             actorTenantId,
             countryOfCare: actor.countryOfCare,

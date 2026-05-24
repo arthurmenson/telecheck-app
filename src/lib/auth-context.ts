@@ -551,6 +551,114 @@ export function requireClinicianActorContext(
   return actor as ActorContext & { role: 'clinician' };
 }
 
+// ---------------------------------------------------------------------------
+// SI-022 `crisis_initiator` slice-role gate (Codex R1 #201 finding 2 closure
+// 2026-05-24)
+// ---------------------------------------------------------------------------
+
+/**
+ * SI-022 §7 ratified `crisis_initiator` slice-role membership. Per the
+ * spec these actors are entitled to initiate a crisis_event via
+ * `record_crisis_initiation()`:
+ *
+ *   - clinician                — clinical staff acting in their own
+ *                                 tenant
+ *   - on_call_clinician        — on-call clinician (cross-shift /
+ *                                 escalation-rotation member)
+ *   - ai_mode1_service         — Mode 1 AI Service handler service
+ *                                 account (autonomous initiation from
+ *                                 platform-floor crisis detection per
+ *                                 I-019 + FLOOR-020)
+ *
+ * Returned by `requireCrisisInitiatorActorContext` so the caller can
+ * thread it into `emitCrisisDetectedAudit`'s `crisisInitiatorIdentity`
+ * arg — that emitter derives the canonical `actor_type` from this
+ * identity (clinician / on_call_clinician → 'clinician',
+ * ai_mode1_service → 'ai_workload') via its `CRISIS_INITIATOR_ACTOR_TYPE`
+ * map. Single-source-of-truth for the slice-role → ActorType
+ * derivation lives at the emitter; this gate's job is asserting the
+ * caller's eligibility + returning the bound identity.
+ */
+export type CrisisInitiatorIdentity =
+  | 'clinician'
+  | 'on_call_clinician'
+  | 'ai_mode1_service';
+
+/**
+ * Narrowed ActorContext extension for callers of
+ * `requireCrisisInitiatorActorContext`. The `crisisInitiatorIdentity`
+ * field carries the bound SI-022 §7 slice-role identity used for
+ * audit attribution + future SQL-side role acquisition (when the
+ * JWT-role → DB-slice-role mapping lands).
+ */
+export interface CrisisInitiatorActorContext extends ActorContext {
+  crisisInitiatorIdentity: CrisisInitiatorIdentity;
+}
+
+/**
+ * Assert that the request carries an authenticated actor that is a
+ * member of the SI-022 §7 `crisis_initiator` slice role, and return
+ * the bound identity for audit attribution.
+ *
+ * **Eligibility (closest-available Layer B gate):** Sprint 2 PR 2
+ * (this PR) accepts JWT role='clinician' only. The on_call_clinician
+ * + ai_mode1_service branches are wired through this function's
+ * return type + the emitter's `CRISIS_INITIATOR_ACTOR_TYPE` map so
+ * the future expansion (when the JWT-role → DB-slice-role mapping
+ * lands — Phase A successor to SI-010 / SI-024.1) is a one-line
+ * change here without any call-site refactor:
+ *
+ *   1. Add an `on_call_clinician` ActorRole variant (or a JWT claim
+ *      distinguishing on-call from regular clinician) + branch here
+ *      to set `crisisInitiatorIdentity: 'on_call_clinician'`.
+ *   2. Add an `ai_mode1_service` ActorRole variant (or a service-
+ *      account principal pattern) + branch here to set
+ *      `crisisInitiatorIdentity: 'ai_mode1_service'`.
+ *
+ * Until then, every legitimate caller is `role='clinician'` + binds
+ * to `crisisInitiatorIdentity: 'clinician'`.
+ *
+ * **Defense-in-depth at the SQL boundary:** even if a non-clinician
+ * actor bypassed this gate, the DB layer fails closed — the request's
+ * bound role (`telecheck_app_role`) is NOINHERIT-member of
+ * `crisis_initiator` per migration 051, and `record_crisis_initiation()`
+ * is EXECUTE-granted ONLY to `crisis_initiator` per migration 036 §3.
+ * The Fastify gate is a usability layer (correct 403 envelope; pre-
+ * `withDbRole` short-circuit); the SQL boundary is the security floor.
+ *
+ * **Distinction from `requireClinicianActorContext`:** the generic
+ * clinician gate returns `ActorContext & { role: 'clinician' }`
+ * (typed-narrowed to the JWT role); this gate ALSO binds the SI-022
+ * slice-role identity used for audit attribution. Callers in the
+ * crisis-response slice MUST use this gate — the slice-role identity
+ * is part of the SI-022 §3 `crisis.detected` audit-row contract.
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role outside crisis_initiator
+ *     membership (currently: any role !== 'clinician'; expanded
+ *     when on_call_clinician / ai_mode1_service JWT identity is
+ *     wired)
+ */
+export function requireCrisisInitiatorActorContext(
+  req: FastifyRequest,
+): CrisisInitiatorActorContext {
+  const actor = requireActorContext(req);
+  // Closest-available Layer B gate: only 'clinician' is currently
+  // wired through the JWT into a SI-022 §7 crisis_initiator slice-role
+  // identity. Expand the accepted roles + the identity-derivation
+  // switch when on_call_clinician / ai_mode1_service JWT identity
+  // lands.
+  if (actor.role !== 'clinician') {
+    throw new UnauthorizedRoleError('clinician', actor.role);
+  }
+  // The slice-role identity is the canonical attribution value the
+  // emitter consumes; today's clinician JWT maps to the 'clinician'
+  // branch of CrisisInitiatorIdentity.
+  const crisisInitiatorIdentity: CrisisInitiatorIdentity = 'clinician';
+  return Object.assign({}, actor, { crisisInitiatorIdentity });
+}
+
 /**
  * Reject CLINICIAN actors from admin routes (Codex PR-118 R7 HIGH closure
  * 2026-05-13). The full admin-role mechanism (tenant_admin / platform_admin

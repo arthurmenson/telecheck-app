@@ -4,13 +4,14 @@
  * (POST /v0/crisis-events).
  *
  * Covers the handler's composition discipline at unit scope (no real DB):
- *   §1 happy path: tenant + clinician role-gate + body validation +
- *      withIdempotentExecution composes withTenantContext → withActorContext
- *      → withDbRole('crisis_initiator', ...) → wrapper SELECT →
- *      claimResourceLifecycleAuditSlot → audit emit; response is 201 +
- *      { crisis_event_id }.
+ *   §1 happy path: tenant + crisis_initiator slice-role gate + body
+ *      validation + withIdempotentExecution composes withTenantContext →
+ *      withActorContext → withDbRole('crisis_initiator', ...) →
+ *      wrapper SELECT → claimResourceLifecycleAuditSlot → audit emit;
+ *      response is 201 + { crisis_event_id }.
  *   §2 tenant guard fires before idempotency wrap / tx open.
- *   §3 clinician role-gate fires before idempotency wrap / tx open.
+ *   §3 crisis_initiator slice-role gate fires before idempotency wrap /
+ *      tx open.
  *   §4 body validation: missing / non-UUID / non-enum / non-boolean fields
  *      all → 400 BEFORE idempotency wrap; per-field coverage.
  *   §5 Cat A `crisis.detected` audit emitted in the same withDbRole-
@@ -60,7 +61,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // vi.mock hoists ABOVE imports — declare BEFORE the handler is imported
 // so the mocks are in place when the handler module evaluates.
 vi.mock('../../../../lib/auth-context.js', () => ({
-  requireClinicianActorContext: vi.fn(),
+  requireCrisisInitiatorActorContext: vi.fn(),
   resolveActorTenantIdForAudit: vi.fn(),
 }));
 vi.mock('../../../../lib/tenant-context.js', () => ({
@@ -89,7 +90,7 @@ vi.mock('../../audit.js', () => ({
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { claimResourceLifecycleAuditSlot } from '../../../../lib/audit-dedupe.js';
 import {
-  requireClinicianActorContext,
+  requireCrisisInitiatorActorContext,
   resolveActorTenantIdForAudit,
 } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
@@ -123,6 +124,13 @@ const FAKE_CLINICIAN_ACTOR = {
   delegateId: null,
   adminTenantBinding: null,
   adminHomeTenantId: null,
+  // Codex R1 #201 finding 2: requireCrisisInitiatorActorContext
+  // returns a CrisisInitiatorActorContext (ActorContext + bound
+  // crisis_initiator slice-role identity per SI-022 §7). For Sprint 2
+  // PR 2 the JWT role='clinician' branch maps to identity='clinician';
+  // future on_call_clinician + ai_mode1_service branches expand here
+  // when the JWT-role → DB-slice-role mapping lands.
+  crisisInitiatorIdentity: 'clinician' as const,
 };
 
 const VALID_PATIENT_ID = '11111111-2222-4333-8444-555555555555';
@@ -207,8 +215,8 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
   vi.mocked(requireTenantContext).mockReturnValue(
     FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
   );
-  vi.mocked(requireClinicianActorContext).mockReturnValue(
-    FAKE_CLINICIAN_ACTOR as unknown as ReturnType<typeof requireClinicianActorContext>,
+  vi.mocked(requireCrisisInitiatorActorContext).mockReturnValue(
+    FAKE_CLINICIAN_ACTOR as unknown as ReturnType<typeof requireCrisisInitiatorActorContext>,
   );
   vi.mocked(resolveActorTenantIdForAudit).mockReturnValue('Telecheck-US');
   vi.mocked(withIdempotentExecution).mockImplementation(
@@ -259,7 +267,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('postCrisisEventHandler §1 — happy path composition', () => {
-  it('§1a invokes requireTenantContext, requireClinicianActorContext, withIdempotentExecution, withTenantContext, withActorContext, withDbRole, then queries the wrapper + emits audit', async () => {
+  it('§1a invokes requireTenantContext, requireCrisisInitiatorActorContext, withIdempotentExecution, withTenantContext, withActorContext, withDbRole, then queries the wrapper + emits audit', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
     const req = makeReq({ actorNonce: 'fake-uuid-v4-nonce' });
@@ -268,7 +276,7 @@ describe('postCrisisEventHandler §1 — happy path composition', () => {
     await postCrisisEventHandler(req, reply);
 
     expect(requireTenantContext).toHaveBeenCalledWith(req);
-    expect(requireClinicianActorContext).toHaveBeenCalledWith(req);
+    expect(requireCrisisInitiatorActorContext).toHaveBeenCalledWith(req);
     expect(withIdempotentExecution).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledWith(
@@ -316,6 +324,9 @@ describe('postCrisisEventHandler §1 — happy path composition', () => {
     const [auditArgs, auditTx] = vi.mocked(emitCrisisDetectedAudit).mock.calls[0]!;
     expect(auditTx).toBe(tx);
     expect(auditArgs.tenantId).toBe('Telecheck-US');
+    // Codex R1 #201 finding 2: the bound SI-022 §7 slice-role identity
+    // is threaded into the emitter so actor_type derives from it.
+    expect(auditArgs.crisisInitiatorIdentity).toBe('clinician');
     expect(auditArgs.crisisEventId).toBe(RETURNED_CRISIS_EVENT_ID);
     expect(auditArgs.targetPatientId).toBe(VALID_PATIENT_ID);
     expect(auditArgs.serverSignalId).toBe(VALID_SERVER_SIGNAL_ID);
@@ -344,22 +355,24 @@ describe('postCrisisEventHandler §2 — tenant guard precedes idempotency wrap'
       /tenantContext absent/,
     );
 
-    expect(requireClinicianActorContext).not.toHaveBeenCalled();
+    expect(requireCrisisInitiatorActorContext).not.toHaveBeenCalled();
     expect(withIdempotentExecution).not.toHaveBeenCalled();
   });
 });
 
 // ---------------------------------------------------------------------------
-// §3 — clinician role-gate fires before idempotency wrap / tx open
+// §3 — crisis_initiator slice-role gate fires before idempotency wrap / tx open
 // ---------------------------------------------------------------------------
 
-describe('postCrisisEventHandler §3 — clinician role-gate precedes idempotency wrap', () => {
-  it('§3a requireClinicianActorContext throw aborts before withIdempotentExecution', async () => {
+describe('postCrisisEventHandler §3 — crisis_initiator slice-role gate precedes idempotency wrap', () => {
+  it('§3a requireCrisisInitiatorActorContext throw aborts before withIdempotentExecution', async () => {
     vi.mocked(requireTenantContext).mockReturnValue(
       FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
     );
-    vi.mocked(requireClinicianActorContext).mockImplementation(() => {
-      throw new Error('forbidden: actor role=patient does not satisfy clinician gate');
+    vi.mocked(requireCrisisInitiatorActorContext).mockImplementation(() => {
+      throw new Error(
+        'forbidden: actor role=patient does not satisfy crisis_initiator gate',
+      );
     });
 
     await expect(postCrisisEventHandler(makeReq(), makeReply())).rejects.toThrow(

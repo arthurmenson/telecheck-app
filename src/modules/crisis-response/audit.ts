@@ -65,6 +65,7 @@
  */
 
 import type {
+  ActorType,
   AuditAction,
   AuditDbClient,
   AuditEnvelope,
@@ -91,6 +92,42 @@ export type CrisisDetectionSourceSurface =
   | 'community'
   | 'forms'
   | 'messaging';
+
+/**
+ * SI-022 §7 ratified `crisis_initiator` slice-role membership maps
+ * directly onto canonical AUDIT_EVENTS `actor_type` values:
+ *
+ *   - clinician + on-call clinician           → 'clinician'
+ *   - ai_mode1_service (Mode 1 service acct)  → 'ai_workload'
+ *
+ * The SI-022 §3 `crisis.detected` row is normatively a Cat A audit
+ * with `actor_type` derived from the bound actor identity, NOT a
+ * gate-fixed literal. This map is the single sanctioned site for
+ * deriving the canonical `ActorType` from the slice-role identity
+ * the caller has authenticated as. Sprint 2 PR 2 (this PR) only
+ * exercises the `'clinician'` branch (the JWT-role-to-DB-slice-role
+ * mapping for ai_mode1_service lands in a successor PR — see file
+ * header §"crisis_initiator role membership"); the `'ai_workload'`
+ * branch is wired here so the future ai_mode1_service caller
+ * automatically gets correct attribution without a 2nd code change.
+ *
+ * Per Codex R1 #201 finding 2 closure 2026-05-24: replaces the
+ * earlier hard-coded `actor_type: 'clinician'` literal in
+ * `emitCrisisDetectedAudit` envelope construction. The slice-role
+ * → ActorType derivation is now centralized at this site.
+ */
+export type CrisisInitiatorActorIdentity =
+  | 'clinician'
+  | 'on_call_clinician'
+  | 'ai_mode1_service';
+
+const CRISIS_INITIATOR_ACTOR_TYPE: Readonly<
+  Record<CrisisInitiatorActorIdentity, ActorType>
+> = {
+  clinician: 'clinician',
+  on_call_clinician: 'clinician',
+  ai_mode1_service: 'ai_workload',
+};
 
 /**
  * Forbidden-alias-typed placeholder set for the SI-022 §3 amendment
@@ -134,18 +171,24 @@ function crisisAuditPlaceholder(actionId: CrisisAuditActionPlaceholder): AuditAc
  * both the wrapper-query and this emitter — see
  * `internal/handlers/post-crisis-event.ts`).
  *
- * **actor_type discipline:**
+ * **actor_type discipline (Codex R1 #201 finding 2 closure 2026-05-24):**
  *   The initiation route is invoked by a clinician / on-call clinician /
  *   ai_mode1_service per SI-022 §7 `crisis_initiator` role membership.
- *   Sprint 2 PR 2 (this PR) is gated by `requireClinicianActorContext`
- *   per Layer B closest-available pattern (see PR 1 file header §"Layer
- *   B authorization DEFERRED"); the audit therefore carries
- *   `actor_type: 'clinician'`. When the JWT-role → DB-slice-role mapping
- *   lands (Phase A successor to SI-010 / SI-024.1) + the
- *   ai_mode1_service identity is wired through to `crisis_initiator`
- *   role membership, the call site's actor_type derivation expands to
- *   distinguish clinician vs ai_mode1_service per the actual bound
- *   identity. The 1-call-site discipline keeps this migration localized.
+ *   The emitter now takes a `crisisInitiatorIdentity` argument that
+ *   drives the canonical `actor_type` via the
+ *   `CRISIS_INITIATOR_ACTOR_TYPE` map (clinician / on_call_clinician →
+ *   'clinician'; ai_mode1_service → 'ai_workload'). No hard-coded
+ *   literal — caller passes the bound identity from
+ *   `requireCrisisInitiatorActorContext`, the emitter derives the
+ *   canonical ActorType.
+ *
+ *   Sprint 2 PR 2 (this PR) only exercises the `'clinician'` branch
+ *   because the JWT-role → DB-slice-role mapping for ai_mode1_service
+ *   has not yet landed (closest-available Layer B gate restricts to
+ *   role='clinician'). When that mapping lands, the handler will
+ *   route ai_mode1_service callers through the same emitter without
+ *   any change to this file — only the handler's identity-derivation
+ *   logic expands.
  *
  * **ai_workload_type / autonomy_level discipline:**
  *   `crisis.detected` is NOT in the I-012 action-class set (I-012
@@ -162,6 +205,17 @@ function crisisAuditPlaceholder(actionId: CrisisAuditActionPlaceholder): AuditAc
 export async function emitCrisisDetectedAudit(
   args: {
     tenantId: TenantId;
+    /**
+     * Per Codex R1 #201 finding 2 closure 2026-05-24: the bound
+     * SI-022 §7 `crisis_initiator` slice-role identity (clinician /
+     * on_call_clinician / ai_mode1_service). Drives the canonical
+     * `actor_type` via the `CRISIS_INITIATOR_ACTOR_TYPE` map (no
+     * hard-coded literal). When the JWT-role → DB-slice-role mapping
+     * for on_call_clinician / ai_mode1_service lands, the handler
+     * passes the actual bound identity here and the audit envelope
+     * carries the correct actor_type automatically.
+     */
+    crisisInitiatorIdentity: CrisisInitiatorActorIdentity;
     actorAccountId: string;
     /** Actor's home tenant per F-4 attribution (R5 HIGH closure
      *  2026-05-15). For clinician role acting in own tenant this
@@ -180,17 +234,20 @@ export async function emitCrisisDetectedAudit(
   },
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
+  const actorType = CRISIS_INITIATOR_ACTOR_TYPE[args.crisisInitiatorIdentity];
+  // When the bound identity is ai_mode1_service the audit MUST carry the
+  // Mode 1 AI workload taxonomy fields per WORKLOAD_TAXONOMY v5.2 §1
+  // (parity with the upstream `crisis_detection_trigger` Mode 1 envelope).
+  // Non-AI identities carry null/null per the same §1 nullability rule.
+  const isAiInitiator = args.crisisInitiatorIdentity === 'ai_mode1_service';
   const input: AuditEnvelopeInput = {
     timestamp: new Date().toISOString(),
     tenant_id: args.tenantId,
-    // Sprint 2 PR 2: handler is gated by requireClinicianActorContext
-    // (Layer B closest-available per PR 1 header). When ai_mode1_service
-    // identity is wired into crisis_initiator role membership, this
-    // emitter's call site will branch on actor identity to emit
-    // 'ai_workload' for those calls — handled at the call site, not
-    // inside this helper (single-responsibility: this helper builds the
-    // envelope from supplied args; the handler decides actor identity).
-    actor_type: 'clinician',
+    // Per Codex R1 #201 finding 2 closure: actor_type now derives from
+    // the bound `crisisInitiatorIdentity` via CRISIS_INITIATOR_ACTOR_TYPE.
+    // The hard-coded 'clinician' literal (and the call-site TODO it
+    // carried) is gone.
+    actor_type: actorType,
     actor_id: args.actorAccountId,
     actor_tenant_id: args.actorTenantId,
     target_patient_id: args.targetPatientId,
@@ -214,11 +271,13 @@ export async function emitCrisisDetectedAudit(
     },
     engine_versions: null,
     // crisis.detected is NOT an I-012 action-class member (I-012
-    // governs prescribing/refill/medication-order). Per WORKLOAD_TAXONOMY
-    // v5.2 §1 nullability rule, non-AI emissions from non-AI actors
-    // carry null/null.
-    ai_workload_type: null,
-    autonomy_level: null,
+    // governs prescribing/refill/medication-order). Per
+    // WORKLOAD_TAXONOMY v5.2 §1 nullability rule, non-AI emissions
+    // from non-AI actors carry null/null; Mode 1 emissions populate
+    // the AI fields per the upstream crisis_detection_trigger
+    // envelope shape.
+    ai_workload_type: isAiInitiator ? 'conversational_assistant' : null,
+    autonomy_level: isAiInitiator ? 'advisory' : null,
     agent_id: null,
     agent_version: null,
     tool_call_id: null,
