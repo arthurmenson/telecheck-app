@@ -76,9 +76,7 @@ type MedInteractionAuditActionPlaceholder =
   | 'interaction_signal_emitted'
   | 'interaction_signal_lifecycle_transition_emitted';
 
-function medInteractionAuditPlaceholder(
-  id: MedInteractionAuditActionPlaceholder,
-): AuditAction {
+function medInteractionAuditPlaceholder(id: MedInteractionAuditActionPlaceholder): AuditAction {
   return id as AuditAction;
 }
 
@@ -175,27 +173,23 @@ export async function emitEvaluationCompletedAudit(
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
   return emitAudit(
-    buildEnvelope(
-      medInteractionAuditPlaceholder('interaction_engine_evaluation_completed'),
-      'A',
-      {
-        tenant_id: args.tenantId,
-        actor_type: 'clinician',
-        actor_id: args.actorId,
-        actor_tenant_id: args.actorTenantId,
-        target_patient_id: args.patientId,
-        country_of_care: args.countryOfCare,
-        resource_type: 'interaction_engine_evaluation',
-        resource_id: args.evaluationId,
-        detail: {
-          triggered_by: args.triggeredBy,
-          triggered_by_resource_id: args.triggeredByResourceId,
-          engine_version: args.engineVersion,
-          knowledge_base_version: args.knowledgeBaseVersion,
-          signals_produced_count: args.signalsProducedCount,
-        },
+    buildEnvelope(medInteractionAuditPlaceholder('interaction_engine_evaluation_completed'), 'A', {
+      tenant_id: args.tenantId,
+      actor_type: 'clinician',
+      actor_id: args.actorId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'interaction_engine_evaluation',
+      resource_id: args.evaluationId,
+      detail: {
+        triggered_by: args.triggeredBy,
+        triggered_by_resource_id: args.triggeredByResourceId,
+        engine_version: args.engineVersion,
+        knowledge_base_version: args.knowledgeBaseVersion,
+        signals_produced_count: args.signalsProducedCount,
       },
-    ),
+    }),
     tx,
   );
 }

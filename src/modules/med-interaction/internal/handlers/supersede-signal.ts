@@ -28,12 +28,12 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
-import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withTenantContext } from '../../../../lib/rls.js';
+import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { emitSignalLifecycleTransitionAudit } from '../../audit.js';
 
@@ -54,20 +54,32 @@ function mapServiceError(err: unknown, reply: FastifyReply, requestId: string): 
   if (typeof err !== 'object' || err === null || !('code' in err)) return false;
   const code = (err as { code?: unknown }).code;
   if (code === '42501') {
-    reply.code(403).send({
-      error: { code: 'med_interaction.forbidden', message: 'Insufficient scope for this request.', request_id: requestId },
+    void reply.code(403).send({
+      error: {
+        code: 'med_interaction.forbidden',
+        message: 'Insufficient scope for this request.',
+        request_id: requestId,
+      },
     });
     return true;
   }
   if (code === '02000' || code === '23514') {
-    reply.code(404).send({
-      error: { code: 'med_interaction.signal_not_found_or_wrong_state', message: 'Signal not found or not in a superseded-eligible state.', request_id: requestId },
+    void reply.code(404).send({
+      error: {
+        code: 'med_interaction.signal_not_found_or_wrong_state',
+        message: 'Signal not found or not in a superseded-eligible state.',
+        request_id: requestId,
+      },
     });
     return true;
   }
   if (code === '23505') {
-    reply.code(409).send({
-      error: { code: 'med_interaction.signal_already_superseded', message: 'Signal already superseded.', request_id: requestId },
+    void reply.code(409).send({
+      error: {
+        code: 'med_interaction.signal_already_superseded',
+        message: 'Signal already superseded.',
+        request_id: requestId,
+      },
     });
     return true;
   }
@@ -96,9 +108,7 @@ export async function supersedeSignalHandler(
   const { replacement_evaluation_id: replacementEvalId, metadata = {} } = bodyParsed.data;
 
   const actorId =
-    req.actorContext?.accountId ??
-    (req.headers['x-actor-id'] as string | undefined) ??
-    'unknown';
+    req.actorContext?.accountId ?? (req.headers['x-actor-id'] as string | undefined) ?? 'unknown';
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   // Deterministic transition row id (ULID-ish) derived from idempotency key
@@ -109,13 +119,20 @@ export async function supersedeSignalHandler(
   return withIdempotentExecution(req, reply, mapServiceError, async (tx, idempotencyCtx) => {
     const transitionId = idempotencyCtx.idempotencyKey; // ULID-shaped per IDEMPOTENCY v5.1
     return withTenantContext(tx, ctx.tenantId, async () => {
-      const run = async (): Promise<{ status: number; view: { signal_id: string; status: 'superseded' } }> => {
+      const run = async (): Promise<{
+        status: number;
+        view: { signal_id: string; status: 'superseded' };
+      }> => {
         try {
           await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
-            await tx.query(
-              'SELECT record_signal_supersession($1, $2, $3, $4, $5, $6::jsonb)',
-              [transitionId, ctx.tenantId, signalId, replacementEvalId, actorId, JSON.stringify(metadata)],
-            );
+            await tx.query('SELECT record_signal_supersession($1, $2, $3, $4, $5, $6::jsonb)', [
+              transitionId,
+              ctx.tenantId,
+              signalId,
+              replacementEvalId,
+              actorId,
+              JSON.stringify(metadata),
+            ]);
           });
         } catch (err) {
           if (

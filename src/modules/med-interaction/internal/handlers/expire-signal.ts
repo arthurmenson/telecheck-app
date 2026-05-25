@@ -19,12 +19,12 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
-import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withTenantContext } from '../../../../lib/rls.js';
+import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { emitSignalLifecycleTransitionAudit } from '../../audit.js';
 
@@ -40,20 +40,32 @@ function mapServiceError(err: unknown, reply: FastifyReply, requestId: string): 
   if (typeof err !== 'object' || err === null || !('code' in err)) return false;
   const code = (err as { code?: unknown }).code;
   if (code === '42501') {
-    reply.code(403).send({
-      error: { code: 'med_interaction.forbidden', message: 'Insufficient scope for this request.', request_id: requestId },
+    void reply.code(403).send({
+      error: {
+        code: 'med_interaction.forbidden',
+        message: 'Insufficient scope for this request.',
+        request_id: requestId,
+      },
     });
     return true;
   }
   if (code === '0A000') {
-    reply.code(503).send({
-      error: { code: 'med_interaction.expiry_capability_not_yet_available', message: 'Signal expiry capability is not yet available in this deployment.', request_id: requestId },
+    void reply.code(503).send({
+      error: {
+        code: 'med_interaction.expiry_capability_not_yet_available',
+        message: 'Signal expiry capability is not yet available in this deployment.',
+        request_id: requestId,
+      },
     });
     return true;
   }
   if (code === '02000' || code === '23514') {
-    reply.code(404).send({
-      error: { code: 'med_interaction.signal_not_found_or_wrong_state', message: 'Signal not found or not in an expire-eligible state.', request_id: requestId },
+    void reply.code(404).send({
+      error: {
+        code: 'med_interaction.signal_not_found_or_wrong_state',
+        message: 'Signal not found or not in an expire-eligible state.',
+        request_id: requestId,
+      },
     });
     return true;
   }
@@ -81,22 +93,26 @@ export async function expireSignalHandler(
   const { metadata = {} } = bodyParsed.data;
 
   const actorId =
-    req.actorContext?.accountId ??
-    (req.headers['x-actor-id'] as string | undefined) ??
-    'unknown';
+    req.actorContext?.accountId ?? (req.headers['x-actor-id'] as string | undefined) ?? 'unknown';
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx, idempotencyCtx) => {
     const transitionId = idempotencyCtx.idempotencyKey;
     return withTenantContext(tx, ctx.tenantId, async () => {
-      const run = async (): Promise<{ status: number; view: { signal_id: string; status: 'expired' } }> => {
+      const run = async (): Promise<{
+        status: number;
+        view: { signal_id: string; status: 'expired' };
+      }> => {
         let rejected = false;
         try {
           await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
-            await tx.query(
-              'SELECT record_signal_expiry($1, $2, $3, $4, $5::jsonb)',
-              [transitionId, ctx.tenantId, signalId, actorId, JSON.stringify(metadata)],
-            );
+            await tx.query('SELECT record_signal_expiry($1, $2, $3, $4, $5::jsonb)', [
+              transitionId,
+              ctx.tenantId,
+              signalId,
+              actorId,
+              JSON.stringify(metadata),
+            ]);
           });
         } catch (err) {
           if (typeof err === 'object' && err !== null && 'code' in err) {

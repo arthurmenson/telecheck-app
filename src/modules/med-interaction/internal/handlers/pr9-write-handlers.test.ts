@@ -41,25 +41,25 @@ vi.mock('../../audit.js', () => ({
   emitSignalLifecycleTransitionAudit: vi.fn(),
 }));
 
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { emitSignalLifecycleTransitionAudit } from '../../audit.js';
 
-import { supersedeSignalHandler } from './supersede-signal.js';
+import { expireSignalHandler } from './expire-signal.js';
 import { overrideSignalHandler } from './override-signal.js';
 import { resolveSignalHandler } from './resolve-signal.js';
-import { expireSignalHandler } from './expire-signal.js';
+import { supersedeSignalHandler } from './supersede-signal.js';
 
 const FAKE_TENANT_CTX = { tenantId: 'Telecheck-US', countryOfCare: 'US' };
-const VALID_SIGNAL_ID = '01HXYZSIGNAL000000000ABCDE';
-const VALID_REPLACEMENT_EVAL_ID = '01HXYZEVALUATION0000000XYZ';
-const VALID_CLINICIAN_ID = '01HXYZCLIN000000000000ABCD';
-const VALID_DISCONT_EVENT_ID = '01HXYZDISCONT00000000ABCDE';
-const FAKE_IDEMPOTENCY_KEY = '01HXYZIDEMPOTENCY0000000ABC';
+const VALID_SIGNAL_ID = '01HXYZSGNA0000000000ABCDEF';
+const VALID_REPLACEMENT_EVAL_ID = '01HXYZEVA0000000000WXYZ234';
+const VALID_CLINICIAN_ID = '01HXYZCN0000000000000ABCDE';
+const VALID_DISCONT_EVENT_ID = '01HXYZDSC0000000000000WXYZ';
+const FAKE_IDEMPOTENCY_KEY = '01HXYZDMP00000000000000ABC';
 
 interface FakeTx {
   query: ReturnType<typeof vi.fn>;
@@ -70,10 +70,8 @@ function makeFakeTx(): FakeTx {
 
 function makeReq(opts?: { body?: unknown; actorNonce?: string | undefined }): FastifyRequest {
   const httpErrors = {
-    forbidden: (msg?: string) =>
-      Object.assign(new Error(msg ?? 'Forbidden'), { statusCode: 403 }),
-    notFound: (msg?: string) =>
-      Object.assign(new Error(msg ?? 'Not Found'), { statusCode: 404 }),
+    forbidden: (msg?: string) => Object.assign(new Error(msg ?? 'Forbidden'), { statusCode: 403 }),
+    notFound: (msg?: string) => Object.assign(new Error(msg ?? 'Not Found'), { statusCode: 404 }),
     badRequest: (msg?: string) =>
       Object.assign(new Error(msg ?? 'Bad Request'), { statusCode: 400 }),
   };
@@ -101,11 +99,13 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
     FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
   );
   vi.mocked(resolveActorTenantIdForAudit).mockReturnValue('Telecheck-US');
-  vi.mocked(withIdempotentExecution).mockImplementation(
-    async (_req, _reply, _mapper, fn) =>
-      fn(tx as unknown as Parameters<typeof fn>[0], {
+  vi.mocked(withIdempotentExecution).mockImplementation(async (_req, _reply, _mapper, fn) =>
+    fn(
+      tx as unknown as Parameters<typeof fn>[0],
+      {
         idempotencyKey: FAKE_IDEMPOTENCY_KEY,
-      } as unknown as Parameters<typeof fn>[1]),
+      } as unknown as Parameters<typeof fn>[1],
+    ),
   );
   vi.mocked(withTenantContext).mockImplementation(async (_client, _tenantId, fn) =>
     fn(tx as unknown as Parameters<typeof fn>[0]),
@@ -250,9 +250,12 @@ describe('resolveSignalHandler — fail-closed (0A000/42501 → 503)', () => {
     installDefaultCompositionMocks(tx);
     vi.mocked(withDbRole).mockImplementation(async (_tx, _role, fn) => {
       tx.query.mockRejectedValueOnce(
-        Object.assign(new Error('feature_not_supported: Async Consult discontinuation log not yet shipped'), {
-          code: '0A000',
-        }),
+        Object.assign(
+          new Error('feature_not_supported: Async Consult discontinuation log not yet shipped'),
+          {
+            code: '0A000',
+          },
+        ),
       );
       return fn();
     });
@@ -312,18 +315,18 @@ describe('expireSignalHandler — fail-closed (0A000 → 503)', () => {
     installDefaultCompositionMocks(tx);
     vi.mocked(withDbRole).mockImplementation(async (_tx, _role, fn) => {
       tx.query.mockRejectedValueOnce(
-        Object.assign(new Error('feature_not_supported: per-basis cadence config not yet shipped'), {
-          code: '0A000',
-        }),
+        Object.assign(
+          new Error('feature_not_supported: per-basis cadence config not yet shipped'),
+          {
+            code: '0A000',
+          },
+        ),
       );
       return fn();
     });
     let thrown: unknown;
     try {
-      await expireSignalHandler(
-        makeReq({ body: {}, actorNonce: 'nonce-x' }),
-        makeReply(),
-      );
+      await expireSignalHandler(makeReq({ body: {}, actorNonce: 'nonce-x' }), makeReply());
     } catch (e) {
       thrown = e;
     }
@@ -343,23 +346,23 @@ describe('PR 9 body validation precedence', () => {
   beforeEach(() => vi.resetAllMocks());
 
   it('§5a supersede missing replacement_evaluation_id → 400 BEFORE tx open', async () => {
-    await expect(
-      supersedeSignalHandler(makeReq({ body: {} }), makeReply()),
-    ).rejects.toThrow(/Invalid request body/);
+    await expect(supersedeSignalHandler(makeReq({ body: {} }), makeReply())).rejects.toThrow(
+      /Invalid request body/,
+    );
     expect(withIdempotentExecution).not.toHaveBeenCalled();
   });
 
   it('§5b override missing clinician_account_id → 400 BEFORE tx open', async () => {
-    await expect(
-      overrideSignalHandler(makeReq({ body: {} }), makeReply()),
-    ).rejects.toThrow(/Invalid request body/);
+    await expect(overrideSignalHandler(makeReq({ body: {} }), makeReply())).rejects.toThrow(
+      /Invalid request body/,
+    );
     expect(withIdempotentExecution).not.toHaveBeenCalled();
   });
 
   it('§5c resolve missing discontinuation_event_id → 400 BEFORE tx open', async () => {
-    await expect(
-      resolveSignalHandler(makeReq({ body: {} }), makeReply()),
-    ).rejects.toThrow(/Invalid request body/);
+    await expect(resolveSignalHandler(makeReq({ body: {} }), makeReply())).rejects.toThrow(
+      /Invalid request body/,
+    );
     expect(withIdempotentExecution).not.toHaveBeenCalled();
   });
 });

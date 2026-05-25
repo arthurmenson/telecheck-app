@@ -22,12 +22,12 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
-import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withTenantContext } from '../../../../lib/rls.js';
+import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { emitSignalLifecycleTransitionAudit } from '../../audit.js';
 
@@ -48,14 +48,22 @@ function mapServiceError(err: unknown, reply: FastifyReply, requestId: string): 
   // wrapper-body 0A000. Both mean "resolution capability not yet
   // available in this deployment." Tenant-blind per I-025.
   if (code === '42501' || code === '0A000') {
-    reply.code(503).send({
-      error: { code: 'med_interaction.resolution_capability_not_yet_available', message: 'Signal resolution capability is not yet available in this deployment.', request_id: requestId },
+    void reply.code(503).send({
+      error: {
+        code: 'med_interaction.resolution_capability_not_yet_available',
+        message: 'Signal resolution capability is not yet available in this deployment.',
+        request_id: requestId,
+      },
     });
     return true;
   }
   if (code === '02000' || code === '23514') {
-    reply.code(404).send({
-      error: { code: 'med_interaction.signal_not_found_or_wrong_state', message: 'Signal not found or not in a resolve-eligible state.', request_id: requestId },
+    void reply.code(404).send({
+      error: {
+        code: 'med_interaction.signal_not_found_or_wrong_state',
+        message: 'Signal not found or not in a resolve-eligible state.',
+        request_id: requestId,
+      },
     });
     return true;
   }
@@ -83,15 +91,16 @@ export async function resolveSignalHandler(
   const { discontinuation_event_id: discontinuationEventId, metadata = {} } = bodyParsed.data;
 
   const actorId =
-    req.actorContext?.accountId ??
-    (req.headers['x-actor-id'] as string | undefined) ??
-    'unknown';
+    req.actorContext?.accountId ?? (req.headers['x-actor-id'] as string | undefined) ?? 'unknown';
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx, idempotencyCtx) => {
     const transitionId = idempotencyCtx.idempotencyKey;
     return withTenantContext(tx, ctx.tenantId, async () => {
-      const run = async (): Promise<{ status: number; view: { signal_id: string; status: 'resolved' } }> => {
+      const run = async (): Promise<{
+        status: number;
+        view: { signal_id: string; status: 'resolved' };
+      }> => {
         let rejected = false;
         let rejectionCode: string | undefined;
         try {
@@ -102,10 +111,14 @@ export async function resolveSignalHandler(
           // the closest-available app role; PG EXECUTE check fails with
           // 42501 → mapped to 503 per mapServiceError.
           await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
-            await tx.query(
-              'SELECT record_signal_resolution($1, $2, $3, $4, $5, $6::jsonb)',
-              [transitionId, ctx.tenantId, signalId, discontinuationEventId, actorId, JSON.stringify(metadata)],
-            );
+            await tx.query('SELECT record_signal_resolution($1, $2, $3, $4, $5, $6::jsonb)', [
+              transitionId,
+              ctx.tenantId,
+              signalId,
+              discontinuationEventId,
+              actorId,
+              JSON.stringify(metadata),
+            ]);
           });
         } catch (err) {
           if (typeof err === 'object' && err !== null && 'code' in err) {
@@ -141,7 +154,9 @@ export async function resolveSignalHandler(
         );
 
         if (rejected) {
-          throw Object.assign(new Error('resolution_capability_not_yet_available'), { code: rejectionCode });
+          throw Object.assign(new Error('resolution_capability_not_yet_available'), {
+            code: rejectionCode,
+          });
         }
 
         return { status: 201, view: { signal_id: signalId, status: 'resolved' } };

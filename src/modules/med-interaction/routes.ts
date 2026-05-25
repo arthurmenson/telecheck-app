@@ -61,11 +61,11 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { expireSignalHandler } from './internal/handlers/expire-signal.js';
 import { getSignalHandler } from './internal/handlers/get-signal.js';
-import { supersedeSignalHandler } from './internal/handlers/supersede-signal.js';
 import { overrideSignalHandler } from './internal/handlers/override-signal.js';
 import { resolveSignalHandler } from './internal/handlers/resolve-signal.js';
-import { expireSignalHandler } from './internal/handlers/expire-signal.js';
+import { supersedeSignalHandler } from './internal/handlers/supersede-signal.js';
 
 export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,

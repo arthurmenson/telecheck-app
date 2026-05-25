@@ -40,12 +40,12 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
-import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withTenantContext } from '../../../../lib/rls.js';
+import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { emitSignalLifecycleTransitionAudit } from '../../audit.js';
 
@@ -63,20 +63,32 @@ function mapServiceError(err: unknown, reply: FastifyReply, requestId: string): 
   if (typeof err !== 'object' || err === null || !('code' in err)) return false;
   const code = (err as { code?: unknown }).code;
   if (code === '42501') {
-    reply.code(403).send({
-      error: { code: 'med_interaction.forbidden', message: 'Insufficient scope for this request.', request_id: requestId },
+    void reply.code(403).send({
+      error: {
+        code: 'med_interaction.forbidden',
+        message: 'Insufficient scope for this request.',
+        request_id: requestId,
+      },
     });
     return true;
   }
   if (code === '0A000') {
-    reply.code(503).send({
-      error: { code: 'med_interaction.override_capability_not_yet_available', message: 'Signal override capability is not yet available in this deployment.', request_id: requestId },
+    void reply.code(503).send({
+      error: {
+        code: 'med_interaction.override_capability_not_yet_available',
+        message: 'Signal override capability is not yet available in this deployment.',
+        request_id: requestId,
+      },
     });
     return true;
   }
   if (code === '02000' || code === '23514') {
-    reply.code(404).send({
-      error: { code: 'med_interaction.signal_not_found_or_wrong_state', message: 'Signal not found or not in an override-eligible state.', request_id: requestId },
+    void reply.code(404).send({
+      error: {
+        code: 'med_interaction.signal_not_found_or_wrong_state',
+        message: 'Signal not found or not in an override-eligible state.',
+        request_id: requestId,
+      },
     });
     return true;
   }
@@ -104,16 +116,17 @@ export async function overrideSignalHandler(
   const { clinician_account_id: clinicianAccountId, metadata = {} } = bodyParsed.data;
 
   const actorId =
-    req.actorContext?.accountId ??
-    (req.headers['x-actor-id'] as string | undefined) ??
-    'unknown';
+    req.actorContext?.accountId ?? (req.headers['x-actor-id'] as string | undefined) ?? 'unknown';
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx, idempotencyCtx) => {
     const overrideId = idempotencyCtx.idempotencyKey;
     const lifecycleTransitionId = `${overrideId.slice(0, 25)}T`; // deterministic-derived; OK for v0.1
     return withTenantContext(tx, ctx.tenantId, async () => {
-      const run = async (): Promise<{ status: number; view: { signal_id: string; status: 'overridden' } }> => {
+      const run = async (): Promise<{
+        status: number;
+        view: { signal_id: string; status: 'overridden' };
+      }> => {
         let wrapperFailedWith0A000 = false;
         try {
           await withDbRole(tx, 'medication_interaction_override_recorder', async () => {
@@ -127,17 +140,20 @@ export async function overrideSignalHandler(
                 ctx.tenantId,
                 signalId,
                 clinicianAccountId,
-                null, null, null, null, null, null, null, null, // 8 KMS envelope cols
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null, // 8 KMS envelope cols
                 JSON.stringify(metadata),
               ],
             );
           });
         } catch (err) {
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err
-          ) {
+          if (typeof err === 'object' && err !== null && 'code' in err) {
             const code = (err as { code?: unknown }).code;
             if (code === '42501') {
               throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
@@ -177,7 +193,9 @@ export async function overrideSignalHandler(
 
         if (wrapperFailedWith0A000) {
           // Re-throw the 0A000 so mapServiceError surfaces it as 503.
-          throw Object.assign(new Error('override_capability_not_yet_available'), { code: '0A000' });
+          throw Object.assign(new Error('override_capability_not_yet_available'), {
+            code: '0A000',
+          });
         }
 
         return { status: 201, view: { signal_id: signalId, status: 'overridden' } };
