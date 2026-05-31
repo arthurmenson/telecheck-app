@@ -2,11 +2,20 @@
 
 Implementation of **SI-022 Crisis Response Slice v1.0** (RATIFIED 2026-05-21 P-039) + the canonical follow-on **CDM v1.9 → v1.10 Amendment** (RATIFIED 2026-05-21 P-040).
 
-## Status: Sprint 2 PR 2 — **FIRST WRITE-PATH HANDLER LANDED**
+## Status: Sprint 2 PR 3 — **ACKNOWLEDGE MID-LIFECYCLE WRITE-PATH LANDED** (on top of merged initiate PR 2)
 
-The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition). The TypeScript application layer is at Sprint 2 — Sprint 1's skeleton + branded IDs + canonical vocabularies, plus the Sprint 2 PR 1 staff-scoped read handler, plus the FIRST write-path handler (`POST /v0/crisis-events` initiate via SECDEF wrapper + Cat A audit) landed this commit. Remaining Sprint 2-3 write-path handlers (acknowledge / respond / resolve / sweep) + KMS envelope + integration tests land in follow-up PRs.
+The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition). The TypeScript application layer is at Sprint 2 — Sprint 1's skeleton + branded IDs + canonical vocabularies, the staff-scoped read (`GET /v0/crisis-events/:id`, Sprint 2 PR 1, merged), the initiate write-path (`POST /v0/crisis-events`, Sprint 2 PR 2, merged), and now the acknowledge mid-lifecycle write-path (`POST /v0/crisis-events/:id/acknowledge`, this commit). The respond/resolve (PR 4), sweep (PR 6), and patient-scoped read (PR 5) handlers are parked on sibling `[CODEX-PENDING]` branches and merge as a union. Remaining Cat A audit-event-catalog landing + KMS envelope + integration tests land in follow-up PRs.
 
-### Sprint 2 PR 2 (this commit) — POST /v0/crisis-events
+### Sprint 2 PR 3 (this commit)
+
+- `POST /v0/crisis-events/:id/acknowledge` — clinician/care-team claims a detected (or escalated) crisis event via the `record_crisis_acknowledgement_claim()` SECDEF wrapper (migration 037 §1) under the `crisis_acknowledger` role.
+- Composition: `requireTenantContext → requireClinicianActorContext → path/body validation → resolveActorTenantIdForAudit → withIdempotentExecution → withTenantContext → (withActorContext when nonce bound) → withDbRole('crisis_event_staff_reader', ...) pre-fetch (patient_id only; 404 branch on 0 rows) → withDbRole('crisis_acknowledger', ...) wrapper SELECT → claimResourceLifecycleAuditSlot (per-transition dedupe) → withDbRole('crisis_event_staff_reader', ...) from_state read-back → emitCrisisAcknowledgedAudit (same tx; FLOOR-020 fail-closed Cat A)`.
+- Two allowed from-states per migration 037 §1 + State Machines v1.1 §3 triples #7 + #8: `detected → acknowledged` OR `escalated → acknowledged` (both `clinician_acknowledgement`). The audit's `detail.from_state` is read back from the committed `crisis_event_lifecycle_transition` row (keyed by the wrapper-returned id) — NOT from the pre-lock pre-fetch, which is not authoritative under a detected→escalated sweep race or same-actor replay (Codex R1 #199 finding 1).
+- Cat A `crisis.acknowledged` audit emitted in the same transaction via the `crisisAuditPlaceholder()` single-sanctioned-cast helper (mirrors `formsAuditPlaceholder`), pending the AUDIT_EVENTS v5.12 catalog landing in `lib/audit.ts`.
+- Tenant-blind envelopes per I-025: 400 (path/body), 403 (42501 via R2 MED-1 closure), 404 (missing/cross-tenant), 409 (wrapper 40001 — concurrent-claim race-loss or invalid from-state).
+- Unit tests (§1-§10): happy path, payload pass-through, from_state echo, 3 guards-precede-tx, path/body validation, 404 tenant-blind, FLOOR-020 audit ordering + I-003 fail-closed propagation, 42501 → 403 in all three sites, actorNonce-undefined path, 40001 → 409.
+
+### Sprint 2 PR 2 (merged on main) — POST /v0/crisis-events
 
 - Initiates a crisis event by calling the SECDEF wrapper `record_crisis_initiation()` from migration 036 (granted EXECUTE to `crisis_initiator` role) and emitting the replay-aware Cat A `crisis.detected` audit in the SAME atomic transaction (FLOOR-020 fail-closed + Codex R1 #201 findings 1+2 closure 2026-05-24; if any of marker INSERT / wrapper INSERT / audit emit fails the whole tx rolls back so no orphan crisis_event row exists without its audit record AND no audit record exists without its companion marker).
 - Composition: `requireTenantContext → requireCrisisInitiatorActorContext (SI-022 §7 slice-role gate; returns bound crisisInitiatorIdentity) → body validation → resolveActorTenantIdForAudit → withIdempotentExecution (which opens tx + binds tenant context for idempotency_keys RLS) → withTenantContext (rls.ts private binding for parity with PR 1) → (withActorContext when req.actorNonce bound) → withDbRole('crisis_initiator', ...) → SELECT record_crisis_initiation(...) → claimResourceLifecycleAuditSlot (resource-keyed dedupe; same tx) → emitCrisisDetectedAudit(tx) (only when claimed=true)`.
@@ -33,33 +42,36 @@ The DB layer is **complete** through migration 038 + foundation 051 (Option B ap
 
 ### DB layer (PRs 1-6 — already merged on `main`)
 
-| Migration | Lines | Codex APPROVE | What |
-|---|---|---|---|
-| 032 | 228 | round 1 | 15 RBAC roles (7 application + 6 procedure-owner + 2 view-owner) |
-| 033 | 882 | round 7 | 6 tables (3 Crisis canonical + 3 P-027 notification baseline) + RLS + per-table append-only triggers + monotonic-ordering trigger |
-| 034 | 399 | round 1 | 2 derived views (R1 HIGH-2 staff/patient reader split; column-level patient minimization) |
-| 035 | 252 | round 1 | Raw lifecycle writer SECDEF + anti-bypass EXECUTE matrix |
-| 036 | 423 | round 3 | `record_crisis_initiation()` SECDEF (with idempotency-mismatch fail-closed) |
-| 037 | 502 | round 2 | 3 mid-lifecycle wrappers (acknowledgement + response + resolution) |
-| 038 | 535 | round 4 | `execute_crisis_no_acknowledgement_sweep()` (lease-takeover + fencing-token + STEP F atomic completion) |
-| **Total** | **3,221 SQL** | **18 rounds** | **6 tables + 2 views + 6 SECDEF + 15 RBAC roles** |
+| Migration | Lines         | Codex APPROVE | What                                                                                                                              |
+| --------- | ------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| 032       | 228           | round 1       | 15 RBAC roles (7 application + 6 procedure-owner + 2 view-owner)                                                                  |
+| 033       | 882           | round 7       | 6 tables (3 Crisis canonical + 3 P-027 notification baseline) + RLS + per-table append-only triggers + monotonic-ordering trigger |
+| 034       | 399           | round 1       | 2 derived views (R1 HIGH-2 staff/patient reader split; column-level patient minimization)                                         |
+| 035       | 252           | round 1       | Raw lifecycle writer SECDEF + anti-bypass EXECUTE matrix                                                                          |
+| 036       | 423           | round 3       | `record_crisis_initiation()` SECDEF (with idempotency-mismatch fail-closed)                                                       |
+| 037       | 502           | round 2       | 3 mid-lifecycle wrappers (acknowledgement + response + resolution)                                                                |
+| 038       | 535           | round 4       | `execute_crisis_no_acknowledgement_sweep()` (lease-takeover + fencing-token + STEP F atomic completion)                           |
+| **Total** | **3,221 SQL** | **18 rounds** | **6 tables + 2 views + 6 SECDEF + 15 RBAC roles**                                                                                 |
 
 ### Sprint 2-4 remaining work (NOT yet implemented)
 
 **Sprint 2 — Initiation + acknowledgement + read**
-- `POST /v0/crisis-events` → wraps `record_crisis_initiation()` + emits Cat A `crisis.detected` audit (KMS-envelope-encrypted intake_payload deferred to Sprint 4 per ADR-024). **DONE — Sprint 2 PR 2 (this commit).**
-- `POST /v0/crisis-events/:id/acknowledge` → wraps `record_crisis_acknowledgement_claim()` + Cat A `crisis.acknowledged` audit  *(remaining)*
+
+- `POST /v0/crisis-events` → wraps `record_crisis_initiation()` + emits Cat A `crisis.detected` audit (KMS-envelope-encrypted intake_payload deferred to Sprint 4 per ADR-024). **DONE — Sprint 2 PR 2 (merged on main).**
+- `POST /v0/crisis-events/:id/acknowledge` → wraps `record_crisis_acknowledgement_claim()` + Cat A `crisis.acknowledged` audit. **DONE — Sprint 2 PR 3 (this commit).**
 - `GET /v0/crisis-events/:id` staff-scoped — reads `crisis_event_current_state_v`. **DONE — Sprint 2 PR 1 (e4cb312).**
-- `GET /v0/crisis-events/:id` patient-scoped — reads `crisis_event_patient_summary_v` via `crisis_event_patient_reader` role; the two views' SELECT grants enforce the staff/patient split  *(follow-up: Sprint 2 PR 1.1)*
-- Integration tests for the initiation + acknowledgement happy paths  *(remaining)*
+- `GET /v0/crisis-events/:id` patient-scoped — reads `crisis_event_patient_summary_v` via `crisis_event_patient_reader` role; the two views' SELECT grants enforce the staff/patient split _(follow-up: Sprint 2 PR 5)_
+- Integration tests for the initiation + acknowledgement happy paths _(remaining)_
 
 **Sprint 3 — Response + resolution + sweep**
+
 - `POST /v0/crisis-events/:id/respond` → wraps `record_crisis_response()` + Cat A `crisis.responded` audit
 - `POST /v0/crisis-events/:id/resolve` → wraps `record_crisis_resolution()` + Cat A `crisis.resolved` audit
 - `POST /v0/crisis-events/:id/sweep` → operator-initiated; wraps `execute_crisis_no_acknowledgement_sweep()` + Cat A `crisis.no_acknowledgement_escalation` audit when outcome=completed_escalated
 - Integration tests for state-machine guards (e.g., responding before acknowledging → 409 tenant-blind)
 
 **Sprint 4 — Hardening**
+
 - Cross-tenant isolation tests
 - Idempotency-replay regression (initiation with same server_signal_id → same crisis_event_id)
 - Race-condition coverage (concurrent acknowledgement claims; concurrent sweep workers)
@@ -72,16 +84,18 @@ The DB layer is **complete** through migration 038 + foundation 051 (Option B ap
 crisis-response/
 ├── index.ts              ← public interface (cross-module-safe exports)
 ├── plugin.ts             ← Fastify plugin entry point (registered in src/app.ts under /v0/crisis-events)
-├── routes.ts             ← Sprint 2 PR 2: health + ready + POST / (initiate) + GET /:id (staff-scoped)
-├── audit.ts              ← Sprint 2 PR 2 — module-local Cat A `crisis.detected` emitter (placeholder pattern; will simplify on AUDIT_EVENTS v5.12 landing)
+├── routes.ts             ← health + ready + POST / (initiate, PR 2) + GET /:id (staff, PR 1) + POST /:id/acknowledge (PR 3)
+├── audit.ts              ← Cat A crisis.* emitters (emitCrisisDetectedAudit PR 2 + emitCrisisAcknowledgedAudit PR 3; placeholder pattern; will simplify on AUDIT_EVENTS v5.12 landing)
 ├── README.md             ← this file
 └── internal/             ← module-private; no cross-module imports allowed
     ├── types.ts          ← branded IDs + state/classification vocabularies (Sprint 1)
     └── handlers/
-        ├── get-crisis-event.ts       ← Sprint 2 PR 1 (e4cb312) — staff-scoped read
-        ├── get-crisis-event.test.ts  ← unit tests (composition, validation, 404)
-        ├── post-crisis-event.ts      ← Sprint 2 PR 2 (this commit) — initiate via SECDEF wrapper + Cat A audit emit
-        └── post-crisis-event.test.ts ← unit tests (composition, validation, audit ordering, 42501, idempotency-mismatch)
+        ├── get-crisis-event.ts             ← Sprint 2 PR 1 (e4cb312) — staff-scoped read
+        ├── get-crisis-event.test.ts        ← unit tests (composition, validation, 404)
+        ├── post-crisis-event.ts            ← Sprint 2 PR 2 (merged) — initiate via SECDEF wrapper + Cat A audit emit
+        ├── post-crisis-event.test.ts       ← unit tests (composition, validation, audit ordering, 42501, idempotency-mismatch)
+        ├── post-crisis-acknowledge.ts      ← Sprint 2 PR 3 (this commit) — acknowledge write-path
+        └── post-crisis-acknowledge.test.ts ← unit tests (§1-§10 composition, audit, error-mapping)
 ```
 
 ## Option 2 ratifier decision (2026-05-22)
@@ -91,7 +105,7 @@ Evans chose **Option 2 — adapt to existing code-repo patterns** rather than la
 - **Trust anchor:** SQL wrappers use SI-010 `current_actor_*()` helpers (migration 031), not SI-024.1 `verify_session_jwt_and_extract_claims()`.
 - **Trigger functions:** per-table inline functions (audit_chain pattern from migration 002), not generic `enforce_append_only()`.
 - **patient + server_signal_id FKs:** column kept as `UUID NOT NULL` but FK constraint to `patient(tenant_id, id)` / Mode 1 conversation envelope SKIPPED (target tables don't exist yet; logical reference only).
-- **notification_crisis_* baseline:** P-027 §4.66-4.68 tables inline-created in migration 033 (SI-022 is the first slice that needs them).
+- **notification*crisis*\* baseline:** P-027 §4.66-4.68 tables inline-created in migration 033 (SI-022 is the first slice that needs them).
 - **`jwt_migration_entity_status` seed:** SKIPPED at v1.0 (the migration-tracker table itself doesn't exist; added in future foundation hygiene cycle alongside SI-024.1 trust anchor).
 - **Audit emission:** Cat A `crisis.*` audit emission deferred from SQL wrappers to the application layer (the Fastify route handler MUST wrap the SECDEF wrapper call + `emitAudit()` in a single DB transaction so a partial commit cannot leave a crisis_event row without its audit record — FLOOR-020 fail-closed at app layer rather than at SQL).
 
