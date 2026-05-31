@@ -320,11 +320,14 @@ export async function emitCrisisDetectedAudit(
  * §1 (State Machines v1.1 §3 triples #7 `detected → acknowledged` + #8
  * `escalated → acknowledged`, both via clinician_acknowledgement). The
  * wrapper does NOT echo the from_state back; the handler carries it
- * explicitly on `detail.from_state` from its pre-fetch of
- * `crisis_event_current_state_v` (which it issues for the `patient_id`
- * resolution + tenant-scope pre-check anyway), so post-incident
- * reconstruction can identify which lifecycle path was taken without
- * re-querying.
+ * explicitly on `detail.from_state`, read back AFTER the wrapper from the
+ * committed `crisis_event_lifecycle_transition` row (keyed by the
+ * wrapper-returned id). The pre-lock pre-fetch of
+ * `crisis_event_current_state_v` (issued for the `patient_id` resolution +
+ * tenant-scope pre-check) is NOT used for from_state — it is not
+ * authoritative under a detected→escalated sweep race or same-actor replay
+ * (Codex R1 #199 finding 1). Post-incident reconstruction can thus
+ * identify which lifecycle path was taken without ambiguity.
  *
  * **actor_type discipline:**
  *   SI-022 §7 binds the `crisis_acknowledger` role to clinician +
