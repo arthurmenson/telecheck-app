@@ -481,16 +481,26 @@ export async function postCrisisAcknowledgeHandler(
         // transaction, gated by claimResourceLifecycleAuditSlot so a
         // wrapper-level idempotent replay (same actor, different
         // Idempotency-Key, latest already `acknowledged`) does NOT append a
-        // duplicate Cat A row (Codex R1 #199 finding 2 — mirrors the
-        // post-crisis-event `crisis.detected` dedupe). Keyed on the
-        // canonical crisis_event_id + 'crisis.acknowledged' (a crisis_event
-        // is acknowledged exactly once). Per FLOOR-020 + I-003 the emit
-        // inside the claimed branch is NOT wrapped in try/catch — a throw
-        // propagates so the tx rolls back (no marker survives a failed emit).
+        // duplicate Cat A row (Codex R1 #199 finding 2).
+        //
+        // The dedupe key is anchored on the wrapper-returned
+        // lifecycle_transition_id — NOT the crisis_event_id. A crisis_event
+        // is NOT acknowledged exactly once: the state machine permits
+        // acknowledged → escalated (acknowledged_no_response_timeout) and
+        // then escalated → acknowledged again (migration 033 transition
+        // triples), so a single crisis_event can carry multiple legitimate
+        // acknowledgement transitions, each of which MUST audit. The wrapper
+        // returns the SAME transition_id only for a same-actor replay of the
+        // current acknowledgement, and a fresh transition_id for a later
+        // re-acknowledgement — so a per-transition key dedupes the replay
+        // while still auditing every distinct acknowledgement transition
+        // (Codex R2 #199 catch). Per FLOOR-020 + I-003 the emit inside the
+        // claimed branch is NOT wrapped in try/catch — a throw propagates so
+        // the tx rolls back (no marker survives a failed emit).
         const auditClaimed = await claimResourceLifecycleAuditSlot(tx, {
           tenantId: ctx.tenantId,
-          resourceType: 'crisis_event',
-          resourceId: crisisEventIdRaw,
+          resourceType: 'crisis_event_lifecycle_transition',
+          resourceId: lifecycleTransitionId,
           auditAction: 'crisis.acknowledged',
         });
         if (auditClaimed) {

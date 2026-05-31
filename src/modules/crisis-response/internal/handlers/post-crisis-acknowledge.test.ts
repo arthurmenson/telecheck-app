@@ -262,12 +262,15 @@ describe('postCrisisAcknowledgeHandler §1 — happy path composition', () => {
     expect(fromStateSql).toContain('from_state');
     expect(fromStateParams).toEqual(['Telecheck-US', RETURNED_TRANSITION_ID]);
 
-    // Audit-dedupe slot claimed once for crisis.acknowledged.
+    // Audit-dedupe slot claimed once for crisis.acknowledged, anchored on
+    // the wrapper-returned transition id (NOT the crisis_event id — a
+    // crisis_event can be acknowledged more than once across the
+    // acknowledged→escalated→acknowledged cycle; Codex R2 #199 catch).
     expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledTimes(1);
     expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledWith(tx, {
       tenantId: 'Telecheck-US',
-      resourceType: 'crisis_event',
-      resourceId: VALID_CRISIS_EVENT_ID,
+      resourceType: 'crisis_event_lifecycle_transition',
+      resourceId: RETURNED_TRANSITION_ID,
       auditAction: 'crisis.acknowledged',
     });
 
