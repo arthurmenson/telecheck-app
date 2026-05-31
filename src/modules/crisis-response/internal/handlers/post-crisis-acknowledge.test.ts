@@ -7,17 +7,23 @@
  *   §1 happy path: tenant + clinician role-gate + path validation +
  *      body validation + withIdempotentExecution composes withTenantContext
  *      → withActorContext → withDbRole('crisis_event_staff_reader', ...)
- *      pre-fetch (patient_id + current_state) →
- *      withDbRole('crisis_acknowledger', ...) wrapper SELECT → audit emit;
+ *      pre-fetch (patient_id only) →
+ *      withDbRole('crisis_acknowledger', ...) wrapper SELECT →
+ *      claimResourceLifecycleAuditSlot → withDbRole('crisis_event_staff_reader')
+ *      from_state read-back → audit emit;
  *      response is 200 + { crisis_event_id, lifecycle_transition_id }.
  *   §2 tenant guard fires before idempotency wrap / tx open.
  *   §3 clinician role-gate fires before idempotency wrap / tx open.
  *   §4 path validation: missing / non-UUID :id → 400 BEFORE idempotency wrap.
- *   §5 body validation: non-object `payload` → 400 BEFORE idempotency wrap.
+ *   §5 body validation: non-object `payload` AND non-object root body → 400
+ *      BEFORE idempotency wrap.
  *   §6 pre-fetch 0-row read → tenant-blind 404; wrapper NOT called, audit NOT emitted.
- *   §7 Cat A `crisis.acknowledged` audit emitted in same tx AFTER wrapper SELECT;
- *      audit emit failure propagates (I-003 bare suppression forbidden);
- *      from_state echo carried from the pre-fetch current_state.
+ *   §7 Cat A `crisis.acknowledged` audit emitted in same tx AFTER wrapper SELECT
+ *      + dedupe-slot claim; audit emit failure propagates (I-003 bare
+ *      suppression forbidden); from_state echo read back from the committed
+ *      transition row (NOT the pre-lock pre-fetch — Codex R1 #199 finding 1).
+ *   §11 wrapper-level idempotent replay (dedupe slot already claimed) → audit
+ *       NOT re-emitted (Codex R1 #199 finding 2); still 200 with same ids.
  *   §8 42501 → tenant-blind 403 via the canonical R2 MED-1 closure pattern
  *      (covers both SET LOCAL ROLE elevation failure AND wrapper LAYER B/C
  *      tenant-scope guard failure). Pre-fetch 42501 also maps to 403.
@@ -54,8 +60,12 @@ vi.mock('../../../../lib/with-db-role.js', () => ({
 vi.mock('../../audit.js', () => ({
   emitCrisisAcknowledgedAudit: vi.fn(),
 }));
+vi.mock('../../../../lib/audit-dedupe.js', () => ({
+  claimResourceLifecycleAuditSlot: vi.fn(),
+}));
 
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { claimResourceLifecycleAuditSlot } from '../../../../lib/audit-dedupe.js';
 import {
   requireClinicianActorContext,
   resolveActorTenantIdForAudit,
@@ -106,18 +116,26 @@ function makeFakeTx(): FakeTx {
 }
 
 /**
- * Default tx.query implementation: first call is the pre-fetch (returns
- * patient_id + current_state='detected'), second call is the wrapper
- * SELECT (returns lifecycle transition id).
+ * Default tx.query implementation, in handler call order:
+ *   1. pre-fetch staff view → returns patient_id (no current_state; the
+ *      audit from_state is NOT sourced from the pre-fetch — Codex R1 #199
+ *      finding 1).
+ *   2. wrapper SELECT → returns lifecycle transition id.
+ *   3. post-wrapper from_state read-back from crisis_event_lifecycle_transition
+ *      → returns the authoritative from_state the wrapper committed under lock.
  */
-function installDefaultQueryResponses(tx: FakeTx, currentState = 'detected'): void {
+function installDefaultQueryResponses(tx: FakeTx, fromState = 'detected'): void {
   tx.query
     .mockImplementationOnce(async () => ({
-      rows: [{ patient_id: VALID_PATIENT_ID, current_state: currentState }],
+      rows: [{ patient_id: VALID_PATIENT_ID }],
       rowCount: 1,
     }))
     .mockImplementationOnce(async () => ({
       rows: [{ lifecycle_transition_id: RETURNED_TRANSITION_ID }],
+      rowCount: 1,
+    }))
+    .mockImplementationOnce(async () => ({
+      rows: [{ from_state: fromState }],
       rowCount: 1,
     }));
 }
@@ -152,7 +170,7 @@ function makeReply(): FastifyReply {
   return reply as unknown as FastifyReply;
 }
 
-function installDefaultCompositionMocks(tx: FakeTx, currentState = 'detected'): void {
+function installDefaultCompositionMocks(tx: FakeTx, fromState = 'detected'): void {
   vi.mocked(requireTenantContext).mockReturnValue(
     FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
   );
@@ -181,7 +199,8 @@ function installDefaultCompositionMocks(tx: FakeTx, currentState = 'detected'): 
   vi.mocked(emitCrisisAcknowledgedAudit).mockResolvedValue({
     audit_id: 'aud_fake',
   } as unknown as Awaited<ReturnType<typeof emitCrisisAcknowledgedAudit>>);
-  installDefaultQueryResponses(tx, currentState);
+  vi.mocked(claimResourceLifecycleAuditSlot).mockResolvedValue(true);
+  installDefaultQueryResponses(tx, fromState);
 }
 
 beforeEach(() => {
@@ -206,8 +225,10 @@ describe('postCrisisAcknowledgeHandler §1 — happy path composition', () => {
     expect(withIdempotentExecution).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledTimes(1);
     expect(withActorContext).toHaveBeenCalledTimes(1);
-    // Two withDbRole calls: pre-fetch then wrapper.
-    expect(withDbRole).toHaveBeenCalledTimes(2);
+    // Three withDbRole calls: pre-fetch (staff_reader), wrapper
+    // (acknowledger), then the post-wrapper from_state read-back
+    // (staff_reader again).
+    expect(withDbRole).toHaveBeenCalledTimes(3);
     expect(withDbRole).toHaveBeenNthCalledWith(
       1,
       tx,
@@ -215,18 +236,40 @@ describe('postCrisisAcknowledgeHandler §1 — happy path composition', () => {
       expect.any(Function),
     );
     expect(withDbRole).toHaveBeenNthCalledWith(2, tx, 'crisis_acknowledger', expect.any(Function));
+    expect(withDbRole).toHaveBeenNthCalledWith(
+      3,
+      tx,
+      'crisis_event_staff_reader',
+      expect.any(Function),
+    );
 
-    // Two tx.query calls: pre-fetch view then wrapper SELECT.
-    expect(tx.query).toHaveBeenCalledTimes(2);
+    // Three tx.query calls: pre-fetch view, wrapper SELECT, from_state
+    // read-back.
+    expect(tx.query).toHaveBeenCalledTimes(3);
     const [preFetchSql, preFetchParams] = tx.query.mock.calls[0]!;
     expect(preFetchSql).toContain('crisis_event_current_state_v');
     expect(preFetchSql).toContain('patient_id');
-    expect(preFetchSql).toContain('current_state');
+    expect(preFetchSql).not.toContain('current_state');
     expect(preFetchParams).toEqual([VALID_CRISIS_EVENT_ID]);
 
     const [wrapperSql, wrapperParams] = tx.query.mock.calls[1]!;
     expect(wrapperSql).toContain('record_crisis_acknowledgement_claim');
     expect(wrapperParams).toEqual(['Telecheck-US', VALID_CRISIS_EVENT_ID, null]);
+
+    // from_state read-back reads the committed transition row by id.
+    const [fromStateSql, fromStateParams] = tx.query.mock.calls[2]!;
+    expect(fromStateSql).toContain('crisis_event_lifecycle_transition');
+    expect(fromStateSql).toContain('from_state');
+    expect(fromStateParams).toEqual(['Telecheck-US', RETURNED_TRANSITION_ID]);
+
+    // Audit-dedupe slot claimed once for crisis.acknowledged.
+    expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledTimes(1);
+    expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledWith(tx, {
+      tenantId: 'Telecheck-US',
+      resourceType: 'crisis_event',
+      resourceId: VALID_CRISIS_EVENT_ID,
+      auditAction: 'crisis.acknowledged',
+    });
 
     // Audit emitted in the same tx with correct envelope.
     expect(emitCrisisAcknowledgedAudit).toHaveBeenCalledTimes(1);
@@ -260,7 +303,7 @@ describe('postCrisisAcknowledgeHandler §1 — happy path composition', () => {
     expect(wrapperParams[2]).toEqual(payload);
   });
 
-  it('§1c from_state echo follows the pre-fetch current_state (escalated → escalated)', async () => {
+  it('§1c from_state echo follows the committed transition read-back (escalated → escalated)', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx, 'escalated');
     await postCrisisAcknowledgeHandler(makeReq({ actorNonce: 'fake-nonce' }), makeReply());
@@ -359,6 +402,26 @@ describe('postCrisisAcknowledgeHandler §5 — body validation precedes idempote
     await postCrisisAcknowledgeHandler(makeReq({ body: undefined }), makeReply());
     expect(withIdempotentExecution).toHaveBeenCalledTimes(1);
   });
+
+  // Codex R1 #199 finding 3 — a non-object root body (array / scalar) must
+  // 400 up front; `'payload' in body` on a scalar throws a TypeError and
+  // bypasses the 400 envelope.
+  it.each<[string, unknown]>([
+    ['root is array', [{ payload: { a: 1 } }]],
+    ['root is string', 'free text'],
+    ['root is number', 42],
+    ['root is boolean', true],
+  ])('§5 returns 400 for non-object root body: %s', async (_label, rawBody) => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+
+    const req = makeReq({ body: rawBody as Record<string, unknown> });
+    const reply = makeReply();
+    await postCrisisAcknowledgeHandler(req, reply);
+
+    expect(reply.code).toHaveBeenCalledWith(400);
+    expect(withIdempotentExecution).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -423,6 +486,8 @@ describe('postCrisisAcknowledgeHandler §7 — Cat A audit emission in same tx',
       'withDbRole-crisis_event_staff_reader-1-exit',
       'withDbRole-crisis_acknowledger-2-enter',
       'withDbRole-crisis_acknowledger-2-exit',
+      'withDbRole-crisis_event_staff_reader-3-enter',
+      'withDbRole-crisis_event_staff_reader-3-exit',
       'audit-emit',
     ]);
   });
@@ -540,8 +605,8 @@ describe('postCrisisAcknowledgeHandler §9 — missing actorNonce skips withActo
     await postCrisisAcknowledgeHandler(makeReq({ actorNonce: undefined }), makeReply());
 
     expect(withActorContext).not.toHaveBeenCalled();
-    expect(withDbRole).toHaveBeenCalledTimes(2);
-    expect(tx.query).toHaveBeenCalledTimes(2);
+    expect(withDbRole).toHaveBeenCalledTimes(3);
+    expect(tx.query).toHaveBeenCalledTimes(3);
     expect(emitCrisisAcknowledgedAudit).toHaveBeenCalledTimes(1);
   });
 });
@@ -582,5 +647,41 @@ describe('postCrisisAcknowledgeHandler §10 — 40001 → tenant-blind 409', () 
     expect(serialized).not.toContain(VALID_CRISIS_EVENT_ID);
     // audit not emitted on rejection path
     expect(emitCrisisAcknowledgedAudit).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §11 — wrapper-level idempotent replay → no duplicate Cat A audit row
+//        (Codex R1 #199 finding 2)
+// ---------------------------------------------------------------------------
+
+describe('postCrisisAcknowledgeHandler §11 — replay dedupe (no duplicate audit)', () => {
+  it('§11a dedupe slot already claimed (replay) → audit NOT emitted; no from_state read-back; still 200 + same ids', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    // A same-actor wrapper replay: the wrapper returns the existing
+    // transition id, and the dedupe marker for crisis.acknowledged was
+    // already committed by the originating tx → claim returns false.
+    vi.mocked(claimResourceLifecycleAuditSlot).mockResolvedValue(false);
+
+    const reply = makeReply();
+    await postCrisisAcknowledgeHandler(makeReq({ actorNonce: 'fake-nonce' }), reply);
+
+    // Dedupe slot was probed exactly once.
+    expect(claimResourceLifecycleAuditSlot).toHaveBeenCalledTimes(1);
+    // Audit NOT re-emitted on replay.
+    expect(emitCrisisAcknowledgedAudit).not.toHaveBeenCalled();
+    // Only two tx.query calls (pre-fetch + wrapper); the from_state
+    // read-back is gated behind the claim and is skipped on replay.
+    expect(tx.query).toHaveBeenCalledTimes(2);
+    // Two withDbRole calls only (pre-fetch + wrapper); no read-back role.
+    expect(withDbRole).toHaveBeenCalledTimes(2);
+    // Response is still the canonical 200 with the same ids the
+    // originating tx returned.
+    expect(reply.code).toHaveBeenCalledWith(200);
+    expect(reply.send).toHaveBeenCalledWith({
+      crisis_event_id: VALID_CRISIS_EVENT_ID,
+      lifecycle_transition_id: RETURNED_TRANSITION_ID,
+    });
   });
 });

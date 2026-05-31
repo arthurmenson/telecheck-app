@@ -24,18 +24,27 @@
  *     `p_tenant_id` is sourced from tenant context; `p_crisis_event_id`
  *     is sourced from path `:id`; only `p_transition_payload` is
  *     body-supplied (optional `{ payload?: object | null }`).
- *   - patient_id + current_state resolution for the audit: the wrapper
+ *   - patient_id + from_state resolution for the audit: the wrapper
  *     RETURNS BIGINT (the transition_id) — it does NOT echo patient_id
  *     or from_state. The audit envelope MUST carry `target_patient_id`
  *     (P1 audit partitioning per SI-022 §3 + I-027) AND `from_state`
- *     (post-incident reconstructability). The handler resolves both by
- *     a side SELECT against `crisis_event_current_state_v` under
- *     `withDbRole('crisis_event_staff_reader', ...)` inside the SAME tx
- *     BEFORE the wrapper SELECT — that read also serves as a
- *     tenant-scope guard (view's RLS + tenant-context binding forces the
- *     row to belong to the request tenant, returning 0 rows on
- *     cross-tenant or missing). 0-row read maps to tenant-blind 404 per
- *     I-025 BEFORE the wrapper is ever called.
+ *     (post-incident reconstructability). The handler resolves these in
+ *     two reads, NOT one:
+ *       (a) `target_patient_id` + the tenant-blind 404 — a pre-fetch
+ *           SELECT of `patient_id` against `crisis_event_current_state_v`
+ *           under `withDbRole('crisis_event_staff_reader', ...)` BEFORE
+ *           the wrapper. The view's RLS + tenant-context binding forces
+ *           the row to belong to the request tenant; 0 rows maps to
+ *           tenant-blind 404 per I-025 BEFORE the wrapper is ever called.
+ *       (b) `from_state` — read back AFTER the wrapper from the committed
+ *           `crisis_event_lifecycle_transition` row (keyed by the
+ *           wrapper-returned id), again under `crisis_event_staff_reader`.
+ *           The pre-fetch's `current_state` is read pre-lock and is NOT
+ *           authoritative: a sweep can transition detected→escalated in
+ *           the pre-fetch→wrapper-lock window, and the same-actor replay
+ *           path pre-fetches `acknowledged`. The committed transition row
+ *           carries the exact from_state the wrapper recorded under its
+ *           SELECT FOR UPDATE lock (Codex R1 #199 finding 1).
  *
  * **Composition stack (Option B per `src/lib/with-db-role.ts`
  * §preconditions; same as PR 4):**
@@ -52,7 +61,7 @@
  *                                                  lines 76-86)
  *                   ├─ withDbRole(tx,
  *                   │     'crisis_event_staff_reader', ...)
- *                   │  └─ SELECT patient_id, current_state
+ *                   │  └─ SELECT patient_id
  *                   │     FROM crisis_event_current_state_v
  *                   │     WHERE crisis_event_id = $1    (404 envelope
  *                   │                                    branch if 0 rows)
@@ -64,7 +73,17 @@
  *                         natural idempotency on same-actor replay per
  *                         wrapper §1 lines 126-140; concurrent-claim
  *                         loser raises 40001 per lines 135-139)
- *             └─ emitCrisisAcknowledgedAudit(tx)  (Cat A FLOOR-020;
+ *             └─ claimResourceLifecycleAuditSlot(tx)   (dedupe: skip the
+ *                                                  emit on wrapper-level
+ *                                                  replay — Codex R1 #199
+ *                                                  finding 2)
+ *                └─ if claimed:
+ *                   ├─ withDbRole(tx,
+ *                   │     'crisis_event_staff_reader', ...)
+ *                   │  └─ SELECT from_state
+ *                   │     FROM crisis_event_lifecycle_transition
+ *                   │     WHERE id = <wrapper-returned id>
+ *                   └─ emitCrisisAcknowledgedAudit(tx)  (Cat A FLOOR-020;
  *                                                  fails-closed atomically
  *                                                  with the wrapper write
  *                                                  via the shared tx)
@@ -140,6 +159,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
+import { claimResourceLifecycleAuditSlot } from '../../../../lib/audit-dedupe.js';
 import {
   requireClinicianActorContext,
   resolveActorTenantIdForAudit,
@@ -335,10 +355,25 @@ export async function postCrisisAcknowledgeHandler(
       );
   }
 
-  // Phase 4 — body validation. Body is optional. When present, the only
-  // accepted shape is `{ payload?: object }`. A non-object `payload`
-  // (array / scalar / null) is rejected.
-  const body = (req.body ?? {}) as PostCrisisAcknowledgeBody;
+  // Phase 4 — body validation. Body is optional. When present, the root
+  // MUST be a JSON object whose only accepted member is `payload?: object`.
+  // A non-object root (array / scalar) is rejected up front (Codex R1 #199
+  // finding 3 — `'payload' in body` on a scalar throws a TypeError and
+  // bypasses the 400 envelope); a non-object `payload` is then rejected.
+  const rawBody: unknown = req.body ?? {};
+  if (!isPlainObject(rawBody)) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          'Invalid acknowledge body: request body must be a JSON object ' +
+            '(not array, string, number, or boolean).',
+        ),
+      );
+  }
+  const body = rawBody as PostCrisisAcknowledgeBody;
   if ('payload' in body && body.payload !== undefined && !isPlainObject(body.payload)) {
     return reply
       .code(400)
@@ -367,23 +402,25 @@ export async function postCrisisAcknowledgeHandler(
         { kind: 'ok'; response: PostCrisisAcknowledgeResponseView } | { kind: 'not_found' }
       > => {
         // Phase 7 — staff-view pre-fetch. Captures patient_id (audit P1
-        // partition key) AND current_state (audit from_state echo).
-        // Tenant-scope via view RLS + bound tenant_context — 0 rows is
-        // tenant-blind 404 per I-025.
-        const preFetch = async (): Promise<{ patientId: string; currentState: string } | null> => {
+        // partition key) + establishes the tenant-blind 404. current_state
+        // is intentionally NOT captured for audit: it is read pre-lock and
+        // is not authoritative for the audit from_state (Codex R1 #199
+        // finding 1 — the from_state is read back post-wrapper from the
+        // committed transition row instead). Tenant-scope via view RLS +
+        // bound tenant_context — 0 rows is tenant-blind 404 per I-025.
+        const preFetch = async (): Promise<{ patientId: string } | null> => {
           try {
             return await withDbRole(tx, 'crisis_event_staff_reader', async () => {
               const result = await tx.query<{
                 patient_id: string;
-                current_state: string;
               }>(
-                'SELECT patient_id, current_state FROM crisis_event_current_state_v ' +
+                'SELECT patient_id FROM crisis_event_current_state_v ' +
                   'WHERE crisis_event_id = $1',
                 [crisisEventIdRaw],
               );
               const row = result.rows[0];
               if (row === undefined) return null;
-              return { patientId: row.patient_id, currentState: row.current_state };
+              return { patientId: row.patient_id };
             });
           } catch (err) {
             if (
@@ -402,7 +439,7 @@ export async function postCrisisAcknowledgeHandler(
         if (preFetched === null) {
           return { kind: 'not_found' };
         }
-        const { patientId, currentState } = preFetched;
+        const { patientId } = preFetched;
 
         // Phase 8 — wrapper SELECT under crisis_acknowledger.
         // R2 MED-1 closure: try/catch wraps the ENTIRE withDbRole call
@@ -441,36 +478,73 @@ export async function postCrisisAcknowledgeHandler(
         const lifecycleTransitionId = await runAcknowledge();
 
         // Phase 9 — Cat A crisis.acknowledged audit emission in the SAME
-        // transaction. Per FLOOR-020 + I-003 any audit-emit failure MUST
-        // propagate (no bare try/catch) — a partial commit that leaves a
-        // lifecycle_transition row without its audit is a platform-floor
-        // violation.
-        //
-        // from_state narrowing: by the time control reaches here the
-        // wrapper has accepted current_state as a valid from-state
-        // (detected OR escalated per migration 037 §1 line 143). Any
-        // other value would have surfaced as 40001 from the wrapper (or
-        // the same-actor idempotent-replay path, which returns the
-        // existing transition_id) BEFORE this emit. Defensive narrowing:
-        // anything that is not literally `escalated` is recorded as
-        // `detected` — the canonical post-incident reconstruction
-        // surfaces any anomaly via the join to lifecycle_transition.
-        const auditFromState: 'detected' | 'escalated' =
-          currentState === 'escalated' ? 'escalated' : 'detected';
+        // transaction, gated by claimResourceLifecycleAuditSlot so a
+        // wrapper-level idempotent replay (same actor, different
+        // Idempotency-Key, latest already `acknowledged`) does NOT append a
+        // duplicate Cat A row (Codex R1 #199 finding 2 — mirrors the
+        // post-crisis-event `crisis.detected` dedupe). Keyed on the
+        // canonical crisis_event_id + 'crisis.acknowledged' (a crisis_event
+        // is acknowledged exactly once). Per FLOOR-020 + I-003 the emit
+        // inside the claimed branch is NOT wrapped in try/catch — a throw
+        // propagates so the tx rolls back (no marker survives a failed emit).
+        const auditClaimed = await claimResourceLifecycleAuditSlot(tx, {
+          tenantId: ctx.tenantId,
+          resourceType: 'crisis_event',
+          resourceId: crisisEventIdRaw,
+          auditAction: 'crisis.acknowledged',
+        });
+        if (auditClaimed) {
+          // from_state is read back from the transition row the wrapper
+          // committed under its SELECT FOR UPDATE lock (Codex R1 #199
+          // finding 1). The staff-view pre-fetch's current_state is read
+          // pre-lock and is NOT authoritative — a sweep can transition
+          // detected→escalated in the pre-fetch→wrapper-lock window, and
+          // the replay path pre-fetches `acknowledged`. The
+          // lifecycle_transition row keyed on the wrapper-returned id
+          // carries the exact from_state the wrapper recorded (detected OR
+          // escalated), in both the insert and same-actor-replay cases.
+          // crisis_event_staff_reader holds SELECT on
+          // crisis_event_lifecycle_transition (migration 034 §line 240).
+          const auditFromState = await withDbRole(
+            tx,
+            'crisis_event_staff_reader',
+            async (): Promise<'detected' | 'escalated'> => {
+              const result = await tx.query<{ from_state: string }>(
+                'SELECT from_state FROM crisis_event_lifecycle_transition ' +
+                  'WHERE tenant_id = $1 AND id = $2',
+                [ctx.tenantId, lifecycleTransitionId],
+              );
+              const row = result.rows[0];
+              if (row === undefined) {
+                throw new Error(
+                  'crisis_event_lifecycle_transition row absent for ' +
+                    'wrapper-returned id; wrapper-contract violation.',
+                );
+              }
+              if (row.from_state !== 'detected' && row.from_state !== 'escalated') {
+                throw new Error(
+                  `crisis.acknowledged transition recorded unexpected ` +
+                    `from_state '${row.from_state}'; expected detected|escalated.`,
+                );
+              }
+              return row.from_state;
+            },
+          );
 
-        await emitCrisisAcknowledgedAudit(
-          {
-            tenantId: ctx.tenantId,
-            actorAccountId: actor.accountId,
-            actorTenantId,
-            countryOfCare: actor.countryOfCare,
-            crisisEventId: asCrisisEventId(crisisEventIdRaw),
-            targetPatientId: patientId,
-            lifecycleTransitionId,
-            fromState: auditFromState,
-          },
-          tx,
-        );
+          await emitCrisisAcknowledgedAudit(
+            {
+              tenantId: ctx.tenantId,
+              actorAccountId: actor.accountId,
+              actorTenantId,
+              countryOfCare: actor.countryOfCare,
+              crisisEventId: asCrisisEventId(crisisEventIdRaw),
+              targetPatientId: patientId,
+              lifecycleTransitionId,
+              fromState: auditFromState,
+            },
+            tx,
+          );
+        }
 
         return {
           kind: 'ok',
