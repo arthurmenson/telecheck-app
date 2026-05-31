@@ -143,10 +143,15 @@ const CRISIS_INITIATOR_ACTOR_TYPE: Readonly<Record<CrisisInitiatorActorIdentity,
  * detected / acknowledge / respond / resolve / sweep / no-acknowledgement-
  * escalation), this union accumulates the additional ratified-but-
  * un-landed action IDs from SI-022 §3 (12 total Cat A + Cat C).
- * Sprint 2 PR 2 landed `crisis.detected`; Sprint 2 PR 3 adds
- * `crisis.acknowledged`.
+ * Sprint 2 PR 2 landed `crisis.detected`; Sprint 2 PR 3 added
+ * `crisis.acknowledged`; Sprint 2 PR 4 adds `crisis.responded` +
+ * `crisis.resolved`.
  */
-type CrisisAuditActionPlaceholder = 'crisis.detected' | 'crisis.acknowledged';
+type CrisisAuditActionPlaceholder =
+  | 'crisis.detected'
+  | 'crisis.acknowledged'
+  | 'crisis.responded'
+  | 'crisis.resolved';
 
 /**
  * crisisAuditPlaceholder — single sanctioned `as AuditAction` cast site
@@ -359,10 +364,10 @@ export async function emitCrisisAcknowledgedAudit(
      *  driver. Carried as `detail.lifecycle_transition_id` for
      *  post-incident join. */
     lifecycleTransitionId: string;
-    /** The from-state per the handler's pre-fetch — one of `'detected'`
-     *  or `'escalated'` per migration 037 §1 allowed triples. Carried
-     *  explicitly so post-incident reconstruction can identify which
-     *  lifecycle path was taken without re-querying. */
+    /** The from-state read back from the committed transition row — one
+     *  of `'detected'` or `'escalated'` per migration 037 §1 allowed
+     *  triples. Carried explicitly so post-incident reconstruction can
+     *  identify which lifecycle path was taken without re-querying. */
     fromState: 'detected' | 'escalated';
   },
   tx: AuditDbClient,
@@ -386,6 +391,186 @@ export async function emitCrisisAcknowledgedAudit(
       from_state: args.fromState,
       to_state: 'acknowledged',
       transition_reason: 'clinician_acknowledgement',
+    },
+    engine_versions: null,
+    ai_workload_type: null,
+    autonomy_level: null,
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(input, tx);
+}
+
+/**
+ * emitCrisisRespondedAudit — Cat A fail-closed audit emission for the
+ * lifecycle-bound `crisis.responded` event. MUST be called in the SAME
+ * transaction as the `record_crisis_response()` SECDEF wrapper SELECT
+ * per FLOOR-020 (handler ensures this by passing the same `tx` into
+ * both the wrapper-query and this emitter — see
+ * `internal/handlers/post-crisis-respond.ts`).
+ *
+ * **Resource binding:** identical to acknowledged — the wrapper
+ * RETURNS BIGINT lifecycle_transition_id; the audit's narrative
+ * subject is the crisis_event entity, with the transition_id carried
+ * in `detail.lifecycle_transition_id` for post-incident join. The
+ * from_state for `crisis.responded` is always `acknowledged` per
+ * migration 037 §2 (single allowed from-state per State Machines v1.1
+ * §3 triple #9 `acknowledged → responded clinician_response`).
+ *
+ * **actor_type discipline:**
+ *   SI-022 §7 binds the `crisis_responder` role to clinician + on-call
+ *   clinician. Sprint 2 PR 4 (this PR) is gated by
+ *   `requireClinicianActorContext` per Layer B closest-available
+ *   pattern; the audit carries `actor_type: 'clinician'`. When the
+ *   JWT-role → DB-slice-role membership mapping lands (Phase A
+ *   successor to SI-010 / SI-024.1), the call site's actor_type
+ *   derivation expands to distinguish the bound identity-class
+ *   (clinician vs on-call-clinician).
+ *
+ * **ai_workload_type / autonomy_level discipline:**
+ *   `crisis.responded` is NOT in the I-012 action-class set; the
+ *   response is by definition a clinician intervention (no AI workload
+ *   responds to a crisis on the patient's behalf at v1.0). Per
+ *   WORKLOAD_TAXONOMY v5.2 §1 nullability rule, the envelope carries
+ *   `ai_workload_type: null` + `autonomy_level: null`.
+ */
+export async function emitCrisisRespondedAudit(
+  args: {
+    tenantId: TenantId;
+    actorAccountId: string;
+    /** Actor's home tenant per F-4 attribution. For clinician acting
+     *  in own tenant this equals `tenantId`. */
+    actorTenantId: string;
+    countryOfCare: string;
+    crisisEventId: CrisisEventId;
+    targetPatientId: string;
+    /** The wrapper's RETURNS BIGINT, serialized as a string by the pg
+     *  driver. */
+    lifecycleTransitionId: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const input: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: args.tenantId,
+    actor_type: 'clinician',
+    actor_id: args.actorAccountId,
+    actor_tenant_id: args.actorTenantId,
+    target_patient_id: args.targetPatientId,
+    delegate_context: null,
+    action: crisisAuditPlaceholder('crisis.responded'),
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: 'crisis_event',
+    resource_id: args.crisisEventId,
+    detail: {
+      patient_id: args.targetPatientId,
+      lifecycle_transition_id: args.lifecycleTransitionId,
+      // Single allowed from-state per migration 037 §2 + State Machines
+      // v1.1 §3 triple #9 (acknowledged → responded clinician_response).
+      from_state: 'acknowledged',
+      to_state: 'responded',
+      transition_reason: 'clinician_response',
+    },
+    engine_versions: null,
+    ai_workload_type: null,
+    autonomy_level: null,
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(input, tx);
+}
+
+/**
+ * emitCrisisResolvedAudit — Cat A fail-closed audit emission for the
+ * lifecycle-bound `crisis.resolved` event. MUST be called in the SAME
+ * transaction as the `record_crisis_resolution()` SECDEF wrapper SELECT
+ * per FLOOR-020 (handler ensures this by passing the same `tx` into
+ * both the wrapper-query and this emitter — see
+ * `internal/handlers/post-crisis-resolve.ts`).
+ *
+ * **Two allowed from-states per migration 037 §3:**
+ *   - `responded → resolved` (State Machines v1.1 §3 triple #10)
+ *   - `escalated → resolved` (State Machines v1.1 §3 triple #11)
+ *
+ * The wrapper does NOT echo the from_state back; the handler carries it
+ * explicitly on `detail.from_state`, read back AFTER the wrapper from the
+ * committed `crisis_event_lifecycle_transition` row (keyed by the
+ * wrapper-returned id). The pre-lock pre-fetch of
+ * `crisis_event_current_state_v` (issued for the `patient_id` resolution +
+ * tenant-scope pre-check) is NOT used for from_state — it is not
+ * authoritative under a responded_no_resolution_timeout sweep that
+ * transitions responded→escalated in the pre-fetch→wrapper-lock window
+ * (Codex R1 #202 — same closure as PR3 acknowledge finding 1). The
+ * committed transition row carries the exact from_state (`responded` or
+ * `escalated`) the wrapper recorded under its SELECT FOR UPDATE lock.
+ *
+ * **Resource binding:** identical to acknowledged + responded — the
+ * audit's narrative subject is the crisis_event entity; the
+ * transition_id is in `detail.lifecycle_transition_id`.
+ *
+ * **actor_type / ai_workload_type discipline:** identical to responded
+ * (clinician action; null/null for AI fields).
+ */
+export async function emitCrisisResolvedAudit(
+  args: {
+    tenantId: TenantId;
+    actorAccountId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    crisisEventId: CrisisEventId;
+    targetPatientId: string;
+    /** The wrapper's RETURNS BIGINT, serialized as a string. */
+    lifecycleTransitionId: string;
+    /** The from-state read back from the committed transition row — one
+     *  of `'responded'` or `'escalated'` per migration 037 §3 allowed
+     *  triples. Carried explicitly so post-incident reconstruction can
+     *  identify which lifecycle path was taken without re-querying. */
+    fromState: 'responded' | 'escalated';
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const input: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: args.tenantId,
+    actor_type: 'clinician',
+    actor_id: args.actorAccountId,
+    actor_tenant_id: args.actorTenantId,
+    target_patient_id: args.targetPatientId,
+    delegate_context: null,
+    action: crisisAuditPlaceholder('crisis.resolved'),
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: 'crisis_event',
+    resource_id: args.crisisEventId,
+    detail: {
+      patient_id: args.targetPatientId,
+      lifecycle_transition_id: args.lifecycleTransitionId,
+      from_state: args.fromState,
+      to_state: 'resolved',
+      transition_reason: 'clinician_resolution',
     },
     engine_versions: null,
     ai_workload_type: null,
