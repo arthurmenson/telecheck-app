@@ -1,4 +1,4 @@
-# SI-023 — Crisis slice actor/patient identity-model gap (UUID vs canonical VARCHAR(26) `account_id`)
+# SI-025 — Crisis slice actor/patient identity-model gap (UUID vs canonical VARCHAR(26) `account_id`)
 
 **Raised by:** Engineering (autonomous queue-drain run 2026-05-31; surfaced by Codex R1 adversarial review of crisis Sprint 2 PR 5 `GET /v0/crisis-events/:id/patient-summary` — the first handler to actually consume the patient self-scoping view `crisis_event_patient_summary_v`)
 **Date:** 2026-05-31
