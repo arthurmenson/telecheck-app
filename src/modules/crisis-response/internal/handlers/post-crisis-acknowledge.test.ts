@@ -248,8 +248,11 @@ describe('postCrisisAcknowledgeHandler §1 — happy path composition', () => {
     expect(tx.query).toHaveBeenCalledTimes(3);
     const [preFetchSql, preFetchParams] = tx.query.mock.calls[0]!;
     expect(preFetchSql).toContain('crisis_event_current_state_v');
-    expect(preFetchSql).toContain('patient_id');
-    expect(preFetchSql).not.toContain('current_state');
+    // Pre-fetch selects ONLY patient_id (no current_state column — the audit
+    // from_state is read back post-wrapper). Asserted via the exact SELECT
+    // clause rather than a `current_state` substring check, since the view
+    // name `crisis_event_current_state_v` itself contains that substring.
+    expect(preFetchSql).toContain('SELECT patient_id FROM');
     expect(preFetchParams).toEqual([VALID_CRISIS_EVENT_ID]);
 
     const [wrapperSql, wrapperParams] = tx.query.mock.calls[1]!;
