@@ -85,11 +85,16 @@ END;
 $$;
 
 -- Retype from UUID to VARCHAR(26).
--- USING clause: UUID::TEXT produces a 36-char dash-separated hex string;
--- for test rows already in the table this is lossless. Production rows will
--- have real VARCHAR(26) ULIDs once test fixtures are corrected (step covered
--- in the crisis handler test-fixture update). The constraint below enforces
--- the canonical 26-char Crockford base32 shape going forward.
+-- Greenfield safety note (Codex R2 finding 4): this migration applies in the
+-- CI test environment which starts with an empty DB (all migrations run fresh,
+-- no existing crisis_event rows). The USING clause casts any existing UUID text
+-- values to TEXT (36-char strings), which do NOT satisfy the canonical 26-char
+-- Crockford ULID pattern and would fail the subsequent FK constraint if any rows
+-- existed. For any non-empty dev/staging DB, rows MUST be deleted or migrated
+-- to real account_id ULID values before applying this migration. In production
+-- this system is pre-launch (greenfield per Master PRD v1.10 §17); no live
+-- crisis_event rows exist. CI passes because the test DB is always empty at
+-- migration time.
 ALTER TABLE public.crisis_event
     ALTER COLUMN patient_account_id TYPE VARCHAR(26)
     USING patient_account_id::TEXT;
@@ -230,7 +235,10 @@ COMMENT ON VIEW crisis_event_patient_summary_v IS
 
 
 -- =============================================================================
--- §5 — Drop OLD record_crisis_initiation(TEXT,UUID,...) before replacing.
+
+-- =============================================================================
+-- §5 — Drop OLD record_crisis_initiation(TEXT,UUID,UUID,...) + replace raw
+--      lifecycle writer (migration 035) with TEXT actor param (SI-025 P-045).
 -- =============================================================================
 
 DROP FUNCTION IF EXISTS record_crisis_initiation(
@@ -238,7 +246,15 @@ DROP FUNCTION IF EXISTS record_crisis_initiation(
     BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
 );
 
+-- Drop the old raw lifecycle writer overload before creating the new TEXT-actor one.
+-- CREATE OR REPLACE with a different signature creates a new overload rather than
+-- replacing the original, leaving a stale UUID-actor INSERT path (Codex R2 finding 2).
+DROP FUNCTION IF EXISTS record_crisis_event_lifecycle_transition(
+    TEXT, UUID, TEXT, TEXT, TEXT, UUID, JSONB
+);
+
 -- Replace raw lifecycle writer: p_actor_principal_id UUID -> TEXT (SI-025 P-045).
+-- Must be replaced before the wrappers that call it (they now pass TEXT).
 CREATE OR REPLACE FUNCTION record_crisis_event_lifecycle_transition(
     p_tenant_id           TEXT,
     p_crisis_event_id     UUID,
@@ -323,113 +339,10 @@ COMMENT ON FUNCTION record_crisis_event_lifecycle_transition(
     '(11 valid triples + monotonic-ordering + append-only) enforced at the '
     'table layer via migration 033 triggers + CHECK constraint.';
 
--- =============================================================================
--- §4 — Verification
--- =============================================================================
-
-DO $$
-DECLARE
-    -- R1 MED-2 closure 2026-05-22: resolve the EXACT target signature OID so
-    -- all verification queries scope to record_crisis_event_lifecycle_transition
-    -- (TEXT, UUID, TEXT, TEXT, TEXT, UUID, JSONB) only — no overload drift hazard.
-    v_target_oid                OID := to_regprocedure(
-        'public.record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb)'
-    );
-    v_function_owner            TEXT;
-    v_function_security_definer BOOLEAN;
-    v_function_specific_name    TEXT;
-    v_function_proconfig        TEXT[];
-    v_execute_grantee_count     INTEGER;
-    v_unauthorized_grantee      TEXT;
-BEGIN
-    IF v_target_oid IS NULL THEN
-        RAISE EXCEPTION
-            'migration-035-function-missing: record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb) not found by signature';
-    END IF;
-
-    -- Resolve owner + SECDEF flag + proconfig (search_path lock) for the EXACT OID
-    SELECT r.rolname, p.prosecdef, p.proconfig
-      INTO v_function_owner, v_function_security_definer, v_function_proconfig
-      FROM pg_proc p
-      JOIN pg_roles r ON r.oid = p.proowner
-     WHERE p.oid = v_target_oid;
-
-    IF v_function_owner <> 'crisis_event_lifecycle_transition_writer_owner' THEN
-        RAISE EXCEPTION
-            'migration-035-ownership-mismatch: record_crisis_event_lifecycle_transition() ownership is % but MUST be crisis_event_lifecycle_transition_writer_owner',
-            v_function_owner;
-    END IF;
-
-    IF NOT v_function_security_definer THEN
-        RAISE EXCEPTION
-            'migration-035-security-definer-missing: record_crisis_event_lifecycle_transition() MUST be SECURITY DEFINER';
-    END IF;
-
-    -- R1 MED-1 closure 2026-05-22: assert proconfig contains the canonical
-    -- locked search_path. A SECDEF function without a locked search_path is
-    -- vulnerable to search-path injection by a caller controlling SET (or by
-    -- role-default search_path drift). The migration creates the function
-    -- with SET search_path = pg_catalog, public; this assertion catches any
-    -- future replacement or drift that removes the SET.
-    IF v_function_proconfig IS NULL
-       OR NOT (v_function_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
-        RAISE EXCEPTION
-            'migration-035-search-path-not-locked: record_crisis_event_lifecycle_transition() MUST have proconfig containing "search_path=pg_catalog, public"; found %',
-            v_function_proconfig;
-    END IF;
-
-    -- Resolve the function's specific_name to scope information_schema grant queries
-    -- by OID-equivalent identifier (information_schema doesn't expose OID directly,
-    -- but specific_name uniquely identifies the function row in routines/role_routine_grants).
-    SELECT p.proname || '_' || p.oid::TEXT INTO v_function_specific_name
-      FROM pg_proc p WHERE p.oid = v_target_oid;
-
-    -- R1 MED-2 closure: signature-scoped EXECUTE grant assertions via specific_name
-    -- (information_schema's canonical OID-equivalent identifier; no overload drift).
-    SELECT COUNT(*) INTO v_execute_grantee_count
-      FROM information_schema.role_routine_grants g
-     WHERE g.specific_name = v_function_specific_name
-       AND g.privilege_type = 'EXECUTE'
-       AND g.grantee <> 'crisis_event_lifecycle_transition_writer_owner';
-
-    IF v_execute_grantee_count <> 5 THEN
-        RAISE EXCEPTION
-            'migration-035-execute-grant-count: expected exactly 5 wrapper-owner EXECUTE grants (excluding owner-self), found %',
-            v_execute_grantee_count;
-    END IF;
-
-    FOR v_unauthorized_grantee IN
-        SELECT g.grantee
-          FROM information_schema.role_routine_grants g
-         WHERE g.specific_name = v_function_specific_name
-           AND g.privilege_type = 'EXECUTE'
-           AND g.grantee NOT IN ('crisis_event_lifecycle_transition_writer_owner',
-                                 'crisis_initiation_wrapper_owner',
-                                 'crisis_acknowledgement_wrapper_owner',
-                                 'crisis_response_wrapper_owner',
-                                 'crisis_resolution_wrapper_owner',
-                                 'crisis_sweep_wrapper_owner')
-    LOOP
-        RAISE EXCEPTION
-            'migration-035-execute-grant-violation: record_crisis_event_lifecycle_transition() EXECUTE granted to non-canonical role %; canonical grantees = {5 wrapper-owners}',
-            v_unauthorized_grantee;
-    END LOOP;
-
-    -- Negative anti-bypass: PUBLIC must NOT have EXECUTE (signature-scoped)
-    PERFORM 1
-      FROM information_schema.role_routine_grants
-     WHERE specific_name = v_function_specific_name
-       AND privilege_type = 'EXECUTE'
-       AND grantee = 'PUBLIC';
-    IF FOUND THEN
-        RAISE EXCEPTION
-            'migration-035-anti-bypass-violation: PUBLIC has EXECUTE on record_crisis_event_lifecycle_transition() — anti-bypass discipline broken';
-    END IF;
-END $$;
-
 
 -- =============================================================================
--- §6 — Replace record_crisis_initiation with TEXT p_patient_account_id param.
+-- §6 — Replace record_crisis_initiation (migration 036) with new TEXT
+--      p_patient_account_id param and TEXT actor. Grants + ownership preserved.
 -- =============================================================================
 CREATE OR REPLACE FUNCTION record_crisis_initiation(
     p_tenant_id                    TEXT,
@@ -669,106 +582,6 @@ COMMENT ON FUNCTION record_crisis_initiation(
     'return existing crisis_event_id. Audit emission for Cat A crisis.detected event '
     'deferred to application layer (PR 7+ Fastify route + emitAudit() wrap in single tx).';
 
--- =============================================================================
--- §4 — Verification (signature-exact via to_regprocedure per PR 3 pattern)
--- =============================================================================
-
-DO $$
-DECLARE
-    v_target_oid OID := to_regprocedure(
-        'public.record_crisis_initiation(text, uuid, uuid, text, text, boolean, bytea, uuid, integer, bytea, bytea, uuid, integer, text)'
-    );
-    v_function_owner            TEXT;
-    v_function_security_definer BOOLEAN;
-    v_function_specific_name    TEXT;
-    v_function_proconfig        TEXT[];
-    v_execute_grantee_count     INTEGER;
-    v_unauthorized_grantee      TEXT;
-BEGIN
-    IF v_target_oid IS NULL THEN
-        RAISE EXCEPTION
-            'migration-036-function-missing: record_crisis_initiation() not found by signature';
-    END IF;
-
-    SELECT r.rolname, p.prosecdef, p.proconfig
-      INTO v_function_owner, v_function_security_definer, v_function_proconfig
-      FROM pg_proc p
-      JOIN pg_roles r ON r.oid = p.proowner
-     WHERE p.oid = v_target_oid;
-
-    IF v_function_owner <> 'crisis_initiation_wrapper_owner' THEN
-        RAISE EXCEPTION
-            'migration-036-ownership-mismatch: record_crisis_initiation() ownership is % but MUST be crisis_initiation_wrapper_owner',
-            v_function_owner;
-    END IF;
-
-    IF NOT v_function_security_definer THEN
-        RAISE EXCEPTION
-            'migration-036-security-definer-missing: record_crisis_initiation() MUST be SECURITY DEFINER';
-    END IF;
-
-    IF v_function_proconfig IS NULL
-       OR NOT (v_function_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
-        RAISE EXCEPTION
-            'migration-036-search-path-not-locked: record_crisis_initiation() MUST have proconfig containing "search_path=pg_catalog, public"; found %',
-            v_function_proconfig;
-    END IF;
-
-    SELECT p.proname || '_' || p.oid::TEXT INTO v_function_specific_name
-      FROM pg_proc p WHERE p.oid = v_target_oid;
-
-    -- EXECUTE grant matrix: exactly 1 (crisis_initiator), excluding owner-self.
-    SELECT COUNT(*) INTO v_execute_grantee_count
-      FROM information_schema.role_routine_grants g
-     WHERE g.specific_name = v_function_specific_name
-       AND g.privilege_type = 'EXECUTE'
-       AND g.grantee <> 'crisis_initiation_wrapper_owner';
-
-    IF v_execute_grantee_count <> 1 THEN
-        RAISE EXCEPTION
-            'migration-036-execute-grant-count: expected exactly 1 application-role EXECUTE grant (crisis_initiator), found %',
-            v_execute_grantee_count;
-    END IF;
-
-    FOR v_unauthorized_grantee IN
-        SELECT g.grantee
-          FROM information_schema.role_routine_grants g
-         WHERE g.specific_name = v_function_specific_name
-           AND g.privilege_type = 'EXECUTE'
-           AND g.grantee NOT IN ('crisis_initiation_wrapper_owner', 'crisis_initiator')
-    LOOP
-        RAISE EXCEPTION
-            'migration-036-execute-grant-violation: record_crisis_initiation() EXECUTE granted to non-canonical role %; canonical grantee = crisis_initiator',
-            v_unauthorized_grantee;
-    END LOOP;
-
-    PERFORM 1
-      FROM information_schema.role_routine_grants
-     WHERE specific_name = v_function_specific_name
-       AND privilege_type = 'EXECUTE'
-       AND grantee = 'PUBLIC';
-    IF FOUND THEN
-        RAISE EXCEPTION
-            'migration-036-anti-bypass-violation: PUBLIC has EXECUTE on record_crisis_initiation()';
-    END IF;
-
-    -- R2 HIGH-1 closure 2026-05-22: assert wrapper-owner has EXECUTE on the
-    -- 2 SI-010 helpers the wrapper body calls. Without these, the SECDEF
-    -- function fails at runtime for every legitimate caller.
-    IF NOT has_function_privilege(
-        'crisis_initiation_wrapper_owner', 'public.current_actor_account_id()', 'EXECUTE'
-    ) THEN
-        RAISE EXCEPTION
-            'migration-036-helper-grant-missing: crisis_initiation_wrapper_owner lacks EXECUTE on current_actor_account_id() — R2 HIGH-1 closure broken';
-    END IF;
-    IF NOT has_function_privilege(
-        'crisis_initiation_wrapper_owner', 'public.current_actor_account_tenant_id()', 'EXECUTE'
-    ) THEN
-        RAISE EXCEPTION
-            'migration-036-helper-grant-missing: crisis_initiation_wrapper_owner lacks EXECUTE on current_actor_account_tenant_id() — wrapper LAYER C check broken';
-    END IF;
-END $$;
-
 
 -- =============================================================================
 -- §7 — Replace 3 mid-lifecycle wrappers (migration 037): drop ::UUID actor cast.
@@ -796,7 +609,7 @@ BEGIN
         RAISE EXCEPTION 'record_crisis_acknowledgement_claim: no actor account bound'
             USING ERRCODE = '42501';
     END IF;
-    -- SI-025 P-045: assign TEXT directly; no ::UUID cast.
+    -- SI-025 P-045: TEXT; no ::UUID cast.
     v_actor_principal_id := v_actor_account_id_text;;
 
     -- LAYER C — tenant scope match.
@@ -1108,113 +921,6 @@ COMMENT ON FUNCTION record_crisis_resolution(TEXT, UUID, JSONB) IS
     'responded OR escalated. SECDEF + same closure-of-defects pattern. '
     'Audit emission for Cat A crisis.resolved deferred to application layer.';
 
--- =============================================================================
--- §4 — Verification (signature-exact via to_regprocedure per PR 3 pattern)
--- =============================================================================
-
-DO $$
-DECLARE
-    v_target_oid OID;
-    v_owner TEXT;
-    v_secdef BOOLEAN;
-    v_proconfig TEXT[];
-    v_specific TEXT;
-    v_grant_count INTEGER;
-    -- Per-function expectations
-    v_target RECORD;
-BEGIN
-    FOR v_target IN
-        VALUES
-            ('public.record_crisis_acknowledgement_claim(text, uuid, jsonb)'::TEXT,
-             'crisis_acknowledgement_wrapper_owner'::TEXT,
-             'crisis_acknowledger'::TEXT),
-            ('public.record_crisis_response(text, uuid, jsonb)',
-             'crisis_response_wrapper_owner',
-             'crisis_responder'),
-            ('public.record_crisis_resolution(text, uuid, jsonb)',
-             'crisis_resolution_wrapper_owner',
-             'crisis_resolver')
-    LOOP
-        v_target_oid := to_regprocedure(v_target.column1);
-        IF v_target_oid IS NULL THEN
-            RAISE EXCEPTION 'migration-037-function-missing: % not found by signature', v_target.column1;
-        END IF;
-
-        SELECT r.rolname, p.prosecdef, p.proconfig, p.proname || '_' || p.oid::TEXT
-          INTO v_owner, v_secdef, v_proconfig, v_specific
-          FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner
-         WHERE p.oid = v_target_oid;
-
-        IF v_owner <> v_target.column2 THEN
-            RAISE EXCEPTION 'migration-037-ownership-mismatch: % ownership is % but MUST be %',
-                v_target.column1, v_owner, v_target.column2;
-        END IF;
-        IF NOT v_secdef THEN
-            RAISE EXCEPTION 'migration-037-security-definer-missing: % MUST be SECURITY DEFINER', v_target.column1;
-        END IF;
-        IF v_proconfig IS NULL OR NOT (v_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
-            RAISE EXCEPTION 'migration-037-search-path-not-locked: % proconfig=%', v_target.column1, v_proconfig;
-        END IF;
-
-        -- EXECUTE grant matrix: exactly 1 application-role grantee (excluding owner-self)
-        SELECT COUNT(*) INTO v_grant_count
-          FROM information_schema.role_routine_grants
-         WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee <> v_target.column2;
-        IF v_grant_count <> 1 THEN
-            RAISE EXCEPTION 'migration-037-execute-grant-count: % expected 1 application-role grant, found %', v_target.column1, v_grant_count;
-        END IF;
-
-        -- The single grantee must match expected application role
-        PERFORM 1 FROM information_schema.role_routine_grants
-         WHERE specific_name = v_specific AND privilege_type = 'EXECUTE'
-           AND grantee = v_target.column3;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'migration-037-grant-missing: % missing EXECUTE for %', v_target.column1, v_target.column3;
-        END IF;
-
-        -- No PUBLIC
-        PERFORM 1 FROM information_schema.role_routine_grants
-         WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee = 'PUBLIC';
-        IF FOUND THEN
-            RAISE EXCEPTION 'migration-037-anti-bypass: PUBLIC has EXECUTE on %', v_target.column1;
-        END IF;
-
-        -- SI-010 helper grants on wrapper-owner
-        IF NOT has_function_privilege(v_target.column2, 'public.current_actor_account_id()', 'EXECUTE') THEN
-            RAISE EXCEPTION 'migration-037-helper-grant-missing: % lacks EXECUTE on current_actor_account_id()', v_target.column2;
-        END IF;
-        IF NOT has_function_privilege(v_target.column2, 'public.current_actor_account_tenant_id()', 'EXECUTE') THEN
-            RAISE EXCEPTION 'migration-037-helper-grant-missing: % lacks EXECUTE on current_actor_account_tenant_id()', v_target.column2;
-        END IF;
-
-        -- R1 HIGH-1 closure 2026-05-22: SELECT + UPDATE on crisis_event for SELECT FOR UPDATE row-lock
-        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event', 'SELECT') THEN
-            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks SELECT on crisis_event', v_target.column2;
-        END IF;
-        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event', 'UPDATE') THEN
-            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks UPDATE on crisis_event (required for SELECT FOR UPDATE row-lock)', v_target.column2;
-        END IF;
-        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event_lifecycle_transition', 'SELECT') THEN
-            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks SELECT on crisis_event_lifecycle_transition', v_target.column2;
-        END IF;
-
-        -- R2 HIGH-1 closure 2026-05-22: defensive cross-migration assertion.
-        -- Migration 035 §3 grants EXECUTE on the raw writer to all 5 wrapper-owner
-        -- roles (including the 3 used by this migration). Verify the grant is
-        -- still present — catches schema drift if 035's grant matrix was
-        -- accidentally narrowed by a downstream migration.
-        IF NOT has_function_privilege(
-            v_target.column2,
-            'public.record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb)',
-            'EXECUTE'
-        ) THEN
-            RAISE EXCEPTION
-                'migration-037-raw-writer-grant-missing: % lacks EXECUTE on record_crisis_event_lifecycle_transition() — migration 035 §3 grant matrix may have drifted',
-                v_target.column2;
-        END IF;
-    END LOOP;
-END $$;
-
 
 -- =============================================================================
 -- §8 — Replace sweep wrapper (migration 038): drop ::UUID actor cast.
@@ -1254,7 +960,7 @@ BEGIN
         RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: no actor account bound'
             USING ERRCODE = '42501';
     END IF;
-    -- SI-025 P-045: assign TEXT directly; no ::UUID cast.
+    -- SI-025 P-045: TEXT; no ::UUID cast.
     v_actor_principal_id := v_actor_account_id_text;;
 
     -- LAYER C — tenant scope.
@@ -1567,89 +1273,7 @@ COMMENT ON FUNCTION execute_crisis_no_acknowledgement_sweep(TEXT, UUID, INTEGER,
     'and commits completion guarded by fencing_token race detection. Audit emission for '
     'Cat A crisis.no_acknowledgement_escalation deferred to application layer.';
 
--- =============================================================================
--- §4 — Verification
--- =============================================================================
 
-DO $$
-DECLARE
-    v_target_oid OID := to_regprocedure(
-        'public.execute_crisis_no_acknowledgement_sweep(text, uuid, integer, text, integer)'
-    );
-    v_owner TEXT;
-    v_secdef BOOLEAN;
-    v_proconfig TEXT[];
-    v_specific TEXT;
-    v_grant_count INTEGER;
-BEGIN
-    IF v_target_oid IS NULL THEN
-        RAISE EXCEPTION 'migration-038-function-missing: execute_crisis_no_acknowledgement_sweep() not found by signature';
-    END IF;
-
-    SELECT r.rolname, p.prosecdef, p.proconfig, p.proname || '_' || p.oid::TEXT
-      INTO v_owner, v_secdef, v_proconfig, v_specific
-      FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner
-     WHERE p.oid = v_target_oid;
-
-    IF v_owner <> 'crisis_sweep_wrapper_owner' THEN
-        RAISE EXCEPTION 'migration-038-ownership-mismatch: owner is % but MUST be crisis_sweep_wrapper_owner', v_owner;
-    END IF;
-    IF NOT v_secdef THEN
-        RAISE EXCEPTION 'migration-038-security-definer-missing';
-    END IF;
-    IF v_proconfig IS NULL OR NOT (v_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
-        RAISE EXCEPTION 'migration-038-search-path-not-locked: proconfig=%', v_proconfig;
-    END IF;
-
-    -- EXECUTE: exactly 1 application-role grantee (crisis_sweep_scheduler), excluding owner-self
-    SELECT COUNT(*) INTO v_grant_count
-      FROM information_schema.role_routine_grants
-     WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee <> 'crisis_sweep_wrapper_owner';
-    IF v_grant_count <> 1 THEN
-        RAISE EXCEPTION 'migration-038-execute-grant-count: expected 1, found %', v_grant_count;
-    END IF;
-    PERFORM 1 FROM information_schema.role_routine_grants
-     WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee = 'crisis_sweep_scheduler';
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'migration-038-grant-missing: crisis_sweep_scheduler EXECUTE';
-    END IF;
-    PERFORM 1 FROM information_schema.role_routine_grants
-     WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee = 'PUBLIC';
-    IF FOUND THEN
-        RAISE EXCEPTION 'migration-038-anti-bypass: PUBLIC has EXECUTE';
-    END IF;
-
-    -- Wrapper-owner privilege assertions
-    IF NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_event', 'SELECT') THEN
-        RAISE EXCEPTION 'migration-038-table-grant-missing: SELECT on crisis_event';
-    END IF;
-    IF NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_event', 'UPDATE') THEN
-        RAISE EXCEPTION 'migration-038-table-grant-missing: UPDATE on crisis_event (for FOR UPDATE lock)';
-    END IF;
-    IF NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_sweep_execution', 'INSERT')
-       OR NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_sweep_execution', 'SELECT')
-       OR NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_sweep_execution', 'UPDATE') THEN
-        RAISE EXCEPTION 'migration-038-table-grant-missing: INSERT/SELECT/UPDATE on crisis_sweep_execution';
-    END IF;
-    IF NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_event_lifecycle_transition', 'SELECT') THEN
-        RAISE EXCEPTION 'migration-038-table-grant-missing: SELECT on crisis_event_lifecycle_transition';
-    END IF;
-    IF NOT has_function_privilege('crisis_sweep_wrapper_owner', 'public.current_actor_account_id()', 'EXECUTE')
-       OR NOT has_function_privilege('crisis_sweep_wrapper_owner', 'public.current_actor_account_tenant_id()', 'EXECUTE') THEN
-        RAISE EXCEPTION 'migration-038-helper-grant-missing';
-    END IF;
-    -- Defensive cross-migration: raw writer EXECUTE
-    IF NOT has_function_privilege(
-        'crisis_sweep_wrapper_owner',
-        'public.record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb)',
-        'EXECUTE'
-    ) THEN
-        RAISE EXCEPTION 'migration-038-raw-writer-grant-missing: migration 035 §3 grant matrix may have drifted';
-    END IF;
-END $$;
-
-
--- =============================================================================
 -- §7 — Verification assertions (run at migration time; abort if any fail).
 -- =============================================================================
 
