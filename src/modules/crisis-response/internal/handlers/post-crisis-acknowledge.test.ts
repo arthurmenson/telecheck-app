@@ -252,7 +252,7 @@ describe('postCrisisAcknowledgeHandler §1 — happy path composition', () => {
     // from_state is read back post-wrapper). Asserted via the exact SELECT
     // clause rather than a `current_state` substring check, since the view
     // name `crisis_event_current_state_v` itself contains that substring.
-    expect(preFetchSql).toContain('SELECT patient_id FROM');
+    expect(preFetchSql).toContain('SELECT patient_account_id FROM');
     expect(preFetchParams).toEqual([VALID_CRISIS_EVENT_ID]);
 
     const [wrapperSql, wrapperParams] = tx.query.mock.calls[1]!;

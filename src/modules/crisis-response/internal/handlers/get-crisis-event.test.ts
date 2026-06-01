@@ -91,12 +91,12 @@ const FAKE_CLINICIAN_ACTOR = {
   adminHomeTenantId: null,
 };
 
-const VALID_UUID = '01TESTPATIENT00000ACCOUNTID0';
+const VALID_UUID = '11111111-2222-4333-8444-555555555555'; // crisis_event.id is still UUID
 
 const SAMPLE_ROW = {
   crisis_event_id: VALID_UUID,
   tenant_id: 'Telecheck-US',
-  patient_id: '01TESTPATIENT01111ACCOUNTID0',
+  patient_account_id: '01TESTPATIENT01111ACCOUNTID0',
   server_signal_id: '88888888-aaaa-4bbb-8ccc-dddddddddddd',
   crisis_type: 'suicidal_ideation',
   severity: 'imminent',

@@ -48,6 +48,20 @@
 -- ---------------------------------------------------------------------------
 
 -- =============================================================================
+-- §0 — Drop views that depend on the columns being altered.
+--
+-- PostgreSQL blocks ALTER COLUMN TYPE when a view references the column
+-- ("cannot alter type of a column used by a view or rule"). Both derived
+-- views from migration 034 SELECT patient_id from crisis_event; they must
+-- be dropped before the ALTER COLUMN, then re-created after in §3 and §4.
+-- Ownership, grants, and comments are re-established with the CREATE OR
+-- REPLACE VIEW statements in §3 and §4.
+-- =============================================================================
+
+DROP VIEW IF EXISTS public.crisis_event_patient_summary_v CASCADE;
+DROP VIEW IF EXISTS public.crisis_event_current_state_v CASCADE;
+
+-- =============================================================================
 -- §1 — crisis_event: rename patient_id → patient_account_id, retype UUID → VARCHAR(26),
 --      add FK to accounts, drop+recreate affected index.
 -- =============================================================================
@@ -213,145 +227,552 @@ COMMENT ON VIEW crisis_event_patient_summary_v IS
     'SI-025 P-045: patient_id → patient_account_id; ::UUID cast removed from '
     'self-scoping predicate — compare VARCHAR(26) TEXT to TEXT directly.';
 
+
+
 -- =============================================================================
--- §5 — Replace record_crisis_initiation() wrapper (migration 036) to:
---      a) change v_actor_principal_id from UUID to TEXT,
---      b) drop the ::UUID cast.
---      All other logic, grants, and comments preserved verbatim.
+-- §5 — Drop OLD record_crisis_initiation(TEXT,UUID,...) before replacing.
 -- =============================================================================
 
--- NOTE: This replaces the function body only (CREATE OR REPLACE). The SECURITY
--- DEFINER, search_path, GRANT EXECUTE, and ownership lines from migration 036
--- remain in effect (PostgreSQL preserves them across CREATE OR REPLACE).
+DROP FUNCTION IF EXISTS record_crisis_initiation(
+    TEXT, UUID, UUID, TEXT, TEXT, BOOLEAN,
+    BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
+);
 
+-- Replace raw lifecycle writer: p_actor_principal_id UUID -> TEXT (SI-025 P-045).
+CREATE OR REPLACE FUNCTION record_crisis_event_lifecycle_transition(
+    p_tenant_id           TEXT,
+    p_crisis_event_id     UUID,
+    p_from_state          TEXT,
+    p_to_state            TEXT,
+    p_transition_reason   TEXT,
+    p_actor_principal_id  TEXT,    -- SI-025 P-045
+    p_transition_payload  JSONB
+) RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_transition_id BIGINT;
+BEGIN
+    -- All business invariants enforced at the table layer:
+    -- - CHECK constraint at §6 of migration 033 enforces the 11 valid
+    --   (from_state, to_state, transition_reason) triples
+    -- - monotonic-ordering trigger at §6 of migration 033 takes an advisory
+    --   lock keyed by (tenant_id, crisis_event_id) hash + asserts
+    --   NEW.transition_at >= MAX(prior.transition_at) under the lock
+    --   (future-dating bounded by 5s clock-skew; backdating rejected)
+    -- - append-only trigger at §6 of migration 033 blocks UPDATE/DELETE
+    --
+    -- This raw writer is the SOLE INSERT path into the table; EXECUTE on
+    -- this function is granted ONLY to the 5 wrapper-owner roles (§3 below)
+    -- so application roles cannot bypass the wrapper-level LAYER A+B+C
+    -- authorization that each state-changing wrapper enforces.
+    INSERT INTO public.crisis_event_lifecycle_transition (
+        tenant_id, crisis_event_id, from_state, to_state, transition_reason,
+        transition_at, actor_principal_id, transition_payload
+    ) VALUES (
+        p_tenant_id, p_crisis_event_id, p_from_state, p_to_state, p_transition_reason,
+        now(), p_actor_principal_id, p_transition_payload
+    )
+    RETURNING id INTO v_transition_id;
+
+    RETURN v_transition_id;
+END;
+$$;
+
+-- =============================================================================
+-- §2 — Function ownership + writer_owner role grants on lifecycle_transition
+-- =============================================================================
+
+ALTER FUNCTION record_crisis_event_lifecycle_transition(
+    TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+) OWNER TO crisis_event_lifecycle_transition_writer_owner;
+
+-- writer_owner needs INSERT (the function body inserts) + SELECT (the
+-- SECURITY INVOKER monotonic-ordering trigger reads MAX(transition_at)
+-- under the caller's identity = writer_owner when this SECDEF runs).
+GRANT INSERT ON crisis_event_lifecycle_transition TO crisis_event_lifecycle_transition_writer_owner;
+GRANT SELECT ON crisis_event_lifecycle_transition TO crisis_event_lifecycle_transition_writer_owner;
+
+-- =============================================================================
+-- §3 — Anti-bypass EXECUTE grant matrix (P-040 §3.1 + P-038 §3.1 canonical
+-- pattern): the raw writer is callable ONLY by the 5 wrapper-owner roles.
+-- =============================================================================
+
+REVOKE EXECUTE ON FUNCTION record_crisis_event_lifecycle_transition(
+    TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+) FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION record_crisis_event_lifecycle_transition(
+    TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+) TO crisis_initiation_wrapper_owner,
+     crisis_acknowledgement_wrapper_owner,
+     crisis_response_wrapper_owner,
+     crisis_resolution_wrapper_owner,
+     crisis_sweep_wrapper_owner;
+
+COMMENT ON FUNCTION record_crisis_event_lifecycle_transition(
+    TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+) IS
+    'P-040 §3.1 + SI-022 Sub-decision 4.5 raw canonical lifecycle writer. '
+    'SECURITY DEFINER + locked search_path. SOLE INSERT path into '
+    'crisis_event_lifecycle_transition. EXECUTE granted ONLY to the 5 wrapper-'
+    'owner roles (anti-bypass per P-034 §3 + P-038 §3 + P-040 §3 pattern); '
+    'application roles never call this directly. All business invariants '
+    '(11 valid triples + monotonic-ordering + append-only) enforced at the '
+    'table layer via migration 033 triggers + CHECK constraint.';
+
+-- =============================================================================
+-- §4 — Verification
+-- =============================================================================
+
+DO $$
+DECLARE
+    -- R1 MED-2 closure 2026-05-22: resolve the EXACT target signature OID so
+    -- all verification queries scope to record_crisis_event_lifecycle_transition
+    -- (TEXT, UUID, TEXT, TEXT, TEXT, UUID, JSONB) only — no overload drift hazard.
+    v_target_oid                OID := to_regprocedure(
+        'public.record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb)'
+    );
+    v_function_owner            TEXT;
+    v_function_security_definer BOOLEAN;
+    v_function_specific_name    TEXT;
+    v_function_proconfig        TEXT[];
+    v_execute_grantee_count     INTEGER;
+    v_unauthorized_grantee      TEXT;
+BEGIN
+    IF v_target_oid IS NULL THEN
+        RAISE EXCEPTION
+            'migration-035-function-missing: record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb) not found by signature';
+    END IF;
+
+    -- Resolve owner + SECDEF flag + proconfig (search_path lock) for the EXACT OID
+    SELECT r.rolname, p.prosecdef, p.proconfig
+      INTO v_function_owner, v_function_security_definer, v_function_proconfig
+      FROM pg_proc p
+      JOIN pg_roles r ON r.oid = p.proowner
+     WHERE p.oid = v_target_oid;
+
+    IF v_function_owner <> 'crisis_event_lifecycle_transition_writer_owner' THEN
+        RAISE EXCEPTION
+            'migration-035-ownership-mismatch: record_crisis_event_lifecycle_transition() ownership is % but MUST be crisis_event_lifecycle_transition_writer_owner',
+            v_function_owner;
+    END IF;
+
+    IF NOT v_function_security_definer THEN
+        RAISE EXCEPTION
+            'migration-035-security-definer-missing: record_crisis_event_lifecycle_transition() MUST be SECURITY DEFINER';
+    END IF;
+
+    -- R1 MED-1 closure 2026-05-22: assert proconfig contains the canonical
+    -- locked search_path. A SECDEF function without a locked search_path is
+    -- vulnerable to search-path injection by a caller controlling SET (or by
+    -- role-default search_path drift). The migration creates the function
+    -- with SET search_path = pg_catalog, public; this assertion catches any
+    -- future replacement or drift that removes the SET.
+    IF v_function_proconfig IS NULL
+       OR NOT (v_function_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
+        RAISE EXCEPTION
+            'migration-035-search-path-not-locked: record_crisis_event_lifecycle_transition() MUST have proconfig containing "search_path=pg_catalog, public"; found %',
+            v_function_proconfig;
+    END IF;
+
+    -- Resolve the function's specific_name to scope information_schema grant queries
+    -- by OID-equivalent identifier (information_schema doesn't expose OID directly,
+    -- but specific_name uniquely identifies the function row in routines/role_routine_grants).
+    SELECT p.proname || '_' || p.oid::TEXT INTO v_function_specific_name
+      FROM pg_proc p WHERE p.oid = v_target_oid;
+
+    -- R1 MED-2 closure: signature-scoped EXECUTE grant assertions via specific_name
+    -- (information_schema's canonical OID-equivalent identifier; no overload drift).
+    SELECT COUNT(*) INTO v_execute_grantee_count
+      FROM information_schema.role_routine_grants g
+     WHERE g.specific_name = v_function_specific_name
+       AND g.privilege_type = 'EXECUTE'
+       AND g.grantee <> 'crisis_event_lifecycle_transition_writer_owner';
+
+    IF v_execute_grantee_count <> 5 THEN
+        RAISE EXCEPTION
+            'migration-035-execute-grant-count: expected exactly 5 wrapper-owner EXECUTE grants (excluding owner-self), found %',
+            v_execute_grantee_count;
+    END IF;
+
+    FOR v_unauthorized_grantee IN
+        SELECT g.grantee
+          FROM information_schema.role_routine_grants g
+         WHERE g.specific_name = v_function_specific_name
+           AND g.privilege_type = 'EXECUTE'
+           AND g.grantee NOT IN ('crisis_event_lifecycle_transition_writer_owner',
+                                 'crisis_initiation_wrapper_owner',
+                                 'crisis_acknowledgement_wrapper_owner',
+                                 'crisis_response_wrapper_owner',
+                                 'crisis_resolution_wrapper_owner',
+                                 'crisis_sweep_wrapper_owner')
+    LOOP
+        RAISE EXCEPTION
+            'migration-035-execute-grant-violation: record_crisis_event_lifecycle_transition() EXECUTE granted to non-canonical role %; canonical grantees = {5 wrapper-owners}',
+            v_unauthorized_grantee;
+    END LOOP;
+
+    -- Negative anti-bypass: PUBLIC must NOT have EXECUTE (signature-scoped)
+    PERFORM 1
+      FROM information_schema.role_routine_grants
+     WHERE specific_name = v_function_specific_name
+       AND privilege_type = 'EXECUTE'
+       AND grantee = 'PUBLIC';
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'migration-035-anti-bypass-violation: PUBLIC has EXECUTE on record_crisis_event_lifecycle_transition() — anti-bypass discipline broken';
+    END IF;
+END $$;
+
+
+-- =============================================================================
+-- §6 — Replace record_crisis_initiation with TEXT p_patient_account_id param.
+-- =============================================================================
 CREATE OR REPLACE FUNCTION record_crisis_initiation(
-    p_tenant_id                     TEXT,
-    p_patient_account_id            TEXT,   -- SI-025: renamed from p_patient_id; VARCHAR(26) ULID
-    p_server_signal_id              UUID,
-    p_crisis_type                   TEXT,
-    p_severity                      TEXT,
-    p_regulatory_reporting_enabled  BOOLEAN,
-    p_transition_payload            JSONB DEFAULT NULL,
-    -- KMS envelope params (all NULL at v0 wire surface; Sprint 4 lands KMS encryption)
-    p_intake_payload_encrypted      BYTEA DEFAULT NULL,
-    p_intake_payload_kms_key_alias  TEXT  DEFAULT NULL,
-    p_intake_payload_kms_region     TEXT  DEFAULT NULL,
-    p_intake_payload_iv             BYTEA DEFAULT NULL,
-    p_intake_payload_auth_tag       BYTEA DEFAULT NULL,
-    p_intake_payload_schema_version TEXT  DEFAULT NULL,
-    p_intake_payload_encrypted_at   TIMESTAMPTZ DEFAULT NULL,
-    p_idempotency_key               TEXT  DEFAULT NULL
+    p_tenant_id                    TEXT,
+    p_patient_account_id           TEXT,    -- SI-025 P-045
+    p_server_signal_id             UUID,
+    p_crisis_type                  TEXT,
+    p_severity                     TEXT,
+    p_regulatory_reporting_enabled BOOLEAN,
+    -- KMS envelope for intake_payload PHI (all 8 columns or all NULL per
+    -- the table's CHECK constraint at migration 033 §4)
+    p_intake_payload_ciphertext    BYTEA   DEFAULT NULL,
+    p_intake_payload_dek_id        UUID    DEFAULT NULL,
+    p_intake_payload_dek_version   INTEGER DEFAULT NULL,
+    p_intake_payload_iv            BYTEA   DEFAULT NULL,
+    p_intake_payload_auth_tag      BYTEA   DEFAULT NULL,
+    p_intake_payload_kek_id        UUID    DEFAULT NULL,
+    p_intake_payload_kek_version   INTEGER DEFAULT NULL,
+    p_intake_payload_algorithm     TEXT    DEFAULT NULL
 ) RETURNS UUID
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    v_actor_account_id_text  TEXT;
-    v_actor_principal_id     TEXT;    -- SI-025 P-045: was UUID; now TEXT (VARCHAR(26) ULID)
-    v_actor_tenant_id        TEXT;
     v_crisis_event_id        UUID;
     v_existing_event_id      UUID;
+    v_actor_tenant_id        TEXT;
+    v_actor_account_id_text  TEXT;
+    v_actor_principal_id     TEXT;    -- SI-025 P-045: was UUID
 BEGIN
-    -- LAYER B — bind actor identity from SI-010.
+    -- ---------------------------------------------------------------------
+    -- LAYER B — bind actor identity from SI-010 trust anchor; caller cannot
+    -- supply or forge the principal_id. current_actor_account_id() returns
+    -- the verified-bound account identity for the current PG backend, or
+    -- NULL if no actor context bound (fail-closed per SI-010 pattern).
+    -- ---------------------------------------------------------------------
     v_actor_account_id_text := current_actor_account_id();
     IF v_actor_account_id_text IS NULL THEN
-        RAISE EXCEPTION 'record_crisis_initiation: no actor account bound'
+        RAISE EXCEPTION
+            'record_crisis_initiation: no actor account bound for current backend; authContextPlugin must bind before SECDEF wrapper invocation'
             USING ERRCODE = '42501';
     END IF;
-    -- SI-025 P-045: assign TEXT directly; no ::UUID cast.
-    -- current_actor_account_id() returns the VARCHAR(26) ULID from
-    -- accounts.account_id; casting to UUID raised invalid_text_representation
-    -- for any real token and was the root-cause failure of SI-025.
-    v_actor_principal_id := v_actor_account_id_text;
+    -- account_id is stored as TEXT in SI-010 _session_actor_context (variable-shape
+    -- identifier per code-repo convention); the lifecycle_transition.actor_principal_id
+    -- column is UUID. Cast with explicit error message on malformed input.
+    BEGIN
+        v_actor_principal_id := v_actor_account_id_text;  -- SI-025 P-045: TEXT
+    EXCEPTION
+        WHEN invalid_text_representation THEN
+            RAISE EXCEPTION
+                'record_crisis_initiation: bound actor account_id % is not a valid UUID; cannot record as lifecycle actor_principal_id',
+                v_actor_account_id_text
+                USING ERRCODE = '42501';
+    END;
 
-    -- LAYER C — tenant scope match.
+    -- ---------------------------------------------------------------------
+    -- LAYER C — tenant scope match (defense-in-depth alongside LAYER A
+    -- EXECUTE grant which restricts to crisis_initiator role members).
+    -- current_actor_account_tenant_id() returns NULL if no actor context
+    -- is bound for the current PG backend (fails closed per SI-010
+    -- trust-anchor pattern).
+    -- ---------------------------------------------------------------------
     v_actor_tenant_id := current_actor_account_tenant_id();
     IF v_actor_tenant_id IS NULL THEN
-        RAISE EXCEPTION 'record_crisis_initiation: no actor tenant bound'
+        RAISE EXCEPTION
+            'record_crisis_initiation: no actor tenant bound for current backend'
             USING ERRCODE = '42501';
     END IF;
     IF v_actor_tenant_id IS DISTINCT FROM p_tenant_id THEN
-        RAISE EXCEPTION 'record_crisis_initiation: tenant scope mismatch — actor tenant % vs p_tenant_id %',
+        RAISE EXCEPTION
+            'record_crisis_initiation: tenant scope mismatch — actor tenant % does not match wrapper p_tenant_id %; cross-tenant initiation rejected',
             v_actor_tenant_id, p_tenant_id
             USING ERRCODE = '42501';
     END IF;
 
-    -- Idempotency: check for existing crisis_event with same (tenant_id, server_signal_id).
+    -- ---------------------------------------------------------------------
+    -- Idempotency check: FLOOR-020 retries land on the existing crisis_event
+    -- via UNIQUE(tenant_id, server_signal_id). R3 HIGH-1 closure 2026-05-22:
+    -- a canonical idempotent replay must verify that the immutable initiation
+    -- payload (patient_id + crisis_type + severity + regulatory_reporting_enabled
+    -- + KMS envelope) matches the existing row exactly. A duplicate server
+    -- signal with different patient or classification is NOT a valid replay
+    -- — it's a caller bug or attempted misattribution and must fail closed.
+    -- IS NOT DISTINCT FROM handles the all-NULL KMS envelope case (table CHECK
+    -- at migration 033 §4 allows all-NULL or all-set).
+    -- ---------------------------------------------------------------------
     SELECT id INTO v_existing_event_id
       FROM public.crisis_event
-     WHERE tenant_id      = p_tenant_id
+     WHERE tenant_id = p_tenant_id
        AND server_signal_id = p_server_signal_id
-     LIMIT 1;
+       AND patient_account_id = p_patient_account_id
+       AND crisis_type = p_crisis_type
+       AND severity = p_severity
+       AND regulatory_reporting_enabled = p_regulatory_reporting_enabled
+       AND intake_payload_ciphertext  IS NOT DISTINCT FROM p_intake_payload_ciphertext
+       AND intake_payload_dek_id      IS NOT DISTINCT FROM p_intake_payload_dek_id
+       AND intake_payload_dek_version IS NOT DISTINCT FROM p_intake_payload_dek_version
+       AND intake_payload_iv          IS NOT DISTINCT FROM p_intake_payload_iv
+       AND intake_payload_auth_tag    IS NOT DISTINCT FROM p_intake_payload_auth_tag
+       AND intake_payload_kek_id      IS NOT DISTINCT FROM p_intake_payload_kek_id
+       AND intake_payload_kek_version IS NOT DISTINCT FROM p_intake_payload_kek_version
+       AND intake_payload_algorithm   IS NOT DISTINCT FROM p_intake_payload_algorithm;
     IF v_existing_event_id IS NOT NULL THEN
+        -- All immutable fields match — canonical idempotent replay.
         RETURN v_existing_event_id;
     END IF;
+    -- If a row with the same (tenant_id, server_signal_id) exists but DOES NOT
+    -- match all immutable fields, the next INSERT will hit unique_violation +
+    -- the EXCEPTION handler below performs the same field-match check + raises
+    -- idempotency-mismatch if the existing row doesn't match. This catches both
+    -- the pre-INSERT-lookup race (server_signal exists but fields differ) and
+    -- the concurrent-INSERT race (two callers race; loser's handler runs).
 
-    -- INSERT new crisis_event (patient_account_id per SI-025 P-045).
-    INSERT INTO public.crisis_event (
-        id,
-        tenant_id,
-        patient_account_id,              -- SI-025: renamed column
-        server_signal_id,
-        crisis_type,
-        severity,
-        regulatory_reporting_enabled,
-        detected_at,
-        intake_payload_encrypted,
-        intake_payload_kms_key_alias,
-        intake_payload_kms_region,
-        intake_payload_iv,
-        intake_payload_auth_tag,
-        intake_payload_schema_version,
-        intake_payload_encrypted_at
-    ) VALUES (
-        gen_random_uuid(),
-        p_tenant_id,
-        p_patient_account_id,
-        p_server_signal_id,
-        p_crisis_type,
-        p_severity,
-        p_regulatory_reporting_enabled,
-        NOW(),
-        p_intake_payload_encrypted,
-        p_intake_payload_kms_key_alias,
-        p_intake_payload_kms_region,
-        p_intake_payload_iv,
-        p_intake_payload_auth_tag,
-        p_intake_payload_schema_version,
-        p_intake_payload_encrypted_at
-    )
-    RETURNING id INTO v_crisis_event_id;
+    -- ---------------------------------------------------------------------
+    -- Insert new crisis_event row. CHECK constraints at table layer
+    -- (migration 033 §4) enforce crisis_type enum, severity enum, KMS
+    -- envelope coherence (all 8 columns or all NULL).
+    -- ---------------------------------------------------------------------
+    BEGIN
+        INSERT INTO public.crisis_event (
+            tenant_id, patient_account_id, server_signal_id,
+            crisis_type, severity, regulatory_reporting_enabled,
+            intake_payload_ciphertext, intake_payload_dek_id,
+            intake_payload_dek_version, intake_payload_iv,
+            intake_payload_auth_tag, intake_payload_kek_id,
+            intake_payload_kek_version, intake_payload_algorithm
+        ) VALUES (
+            p_tenant_id, p_patient_account_id, p_server_signal_id,
+            p_crisis_type, p_severity, p_regulatory_reporting_enabled,
+            p_intake_payload_ciphertext, p_intake_payload_dek_id,
+            p_intake_payload_dek_version, p_intake_payload_iv,
+            p_intake_payload_auth_tag, p_intake_payload_kek_id,
+            p_intake_payload_kek_version, p_intake_payload_algorithm
+        )
+        RETURNING id INTO v_crisis_event_id;
+    EXCEPTION
+        WHEN unique_violation THEN
+            -- Concurrent FLOOR-020 retry won the race OR caller submitted a
+            -- duplicate server_signal_id with different immutable fields.
+            -- R3 HIGH-1 closure 2026-05-22: re-read with FULL immutable-field
+            -- match (same predicate as pre-INSERT check); if no match found
+            -- the existing row diverges from this caller's payload — raise
+            -- idempotency-mismatch + roll back the transaction.
+            SELECT id INTO v_crisis_event_id
+              FROM public.crisis_event
+             WHERE tenant_id = p_tenant_id
+               AND server_signal_id = p_server_signal_id
+               AND patient_account_id = p_patient_account_id
+               AND crisis_type = p_crisis_type
+               AND severity = p_severity
+               AND regulatory_reporting_enabled = p_regulatory_reporting_enabled
+               AND intake_payload_ciphertext  IS NOT DISTINCT FROM p_intake_payload_ciphertext
+               AND intake_payload_dek_id      IS NOT DISTINCT FROM p_intake_payload_dek_id
+               AND intake_payload_dek_version IS NOT DISTINCT FROM p_intake_payload_dek_version
+               AND intake_payload_iv          IS NOT DISTINCT FROM p_intake_payload_iv
+               AND intake_payload_auth_tag    IS NOT DISTINCT FROM p_intake_payload_auth_tag
+               AND intake_payload_kek_id      IS NOT DISTINCT FROM p_intake_payload_kek_id
+               AND intake_payload_kek_version IS NOT DISTINCT FROM p_intake_payload_kek_version
+               AND intake_payload_algorithm   IS NOT DISTINCT FROM p_intake_payload_algorithm;
 
-    -- INSERT initial lifecycle_transition (detected).
+            IF v_crisis_event_id IS NULL THEN
+                RAISE EXCEPTION
+                    'record_crisis_initiation: idempotency-mismatch — existing crisis_event for (tenant_id=%, server_signal_id=%) has different immutable fields than the supplied payload; caller MUST resolve the conflict before retrying',
+                    p_tenant_id, p_server_signal_id
+                    USING ERRCODE = '23505';  -- unique_violation (canonical for idempotency conflict)
+            END IF;
+
+            -- Field-match confirmed; canonical idempotent replay.
+            RETURN v_crisis_event_id;
+    END;
+
+    -- ---------------------------------------------------------------------
+    -- Emit `none → detected / initial_detection` lifecycle transition via
+    -- the raw writer (migration 035). The raw writer's monotonic-ordering
+    -- trigger takes an advisory lock keyed by (tenant_id, crisis_event_id)
+    -- and asserts ordering invariants under it.
+    -- ---------------------------------------------------------------------
     PERFORM public.record_crisis_event_lifecycle_transition(
         p_tenant_id,
         v_crisis_event_id,
         'none',
         'detected',
         'initial_detection',
-        v_actor_principal_id,   -- TEXT (VARCHAR(26) ULID) per SI-025 P-045
-        p_transition_payload
+        v_actor_principal_id,  -- bound from SI-010 (R1 HIGH-1 closure); caller cannot forge
+        NULL  -- transition_payload — caller's audit emission carries the descriptive payload
     );
 
     RETURN v_crisis_event_id;
 END;
 $$;
 
-COMMENT ON FUNCTION record_crisis_initiation IS
-    'SECURITY DEFINER crisis-initiation wrapper (migration 036). '
-    'SI-025 P-045: p_patient_id renamed to p_patient_account_id (VARCHAR(26) ULID); '
-    'v_actor_principal_id changed from UUID to TEXT; ::UUID cast removed.';
-
 -- =============================================================================
--- §6 — Replace the 3 mid-lifecycle wrappers (migration 037) to:
---      a) change v_actor_principal_id from UUID to TEXT,
---      b) drop ::UUID cast.
--- record_crisis_acknowledgement_claim / record_crisis_response /
--- record_crisis_resolution — each independently replicated.
+-- §2 — Function ownership + initiation_wrapper_owner role grants
 -- =============================================================================
 
--- §6a — record_crisis_acknowledgement_claim()
+ALTER FUNCTION record_crisis_initiation(
+    TEXT, TEXT, UUID, TEXT, TEXT, BOOLEAN,
+    BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
+) OWNER TO crisis_initiation_wrapper_owner;
+
+-- initiation_wrapper_owner needs:
+-- - INSERT + SELECT on crisis_event (for the new-row INSERT + idempotency check)
+-- - EXECUTE on record_crisis_event_lifecycle_transition (granted at migration 035 §3)
+-- - EXECUTE on current_actor_account_id() + current_actor_account_tenant_id() SI-010
+--   helpers (migration 031 only grants these to telecheck_app_role; wrapper-owner
+--   needs explicit grants for SECURITY DEFINER execution under its own identity).
+--   R2 HIGH-1 closure 2026-05-22 (PR 4 Codex review): without these grants the
+--   internal-actor-binding from R1 HIGH-1 closure would fail at runtime with
+--   permission_denied for function ... on every legitimate caller.
+GRANT INSERT, SELECT ON crisis_event TO crisis_initiation_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_id() TO crisis_initiation_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id() TO crisis_initiation_wrapper_owner;
+
+-- =============================================================================
+-- §3 — Anti-bypass EXECUTE grant matrix: ONLY crisis_initiator application role
+-- =============================================================================
+
+REVOKE EXECUTE ON FUNCTION record_crisis_initiation(
+    TEXT, TEXT, UUID, TEXT, TEXT, BOOLEAN,
+    BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
+) FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION record_crisis_initiation(
+    TEXT, TEXT, UUID, TEXT, TEXT, BOOLEAN,
+    BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
+) TO crisis_initiator;
+
+COMMENT ON FUNCTION record_crisis_initiation(
+    TEXT, TEXT, UUID, TEXT, TEXT, BOOLEAN,
+    BYTEA, UUID, INTEGER, BYTEA, BYTEA, UUID, INTEGER, TEXT
+) IS
+    'P-040 §3.2 + SI-022 Sub-decision 4 record_crisis_initiation wrapper. '
+    'SECURITY DEFINER + locked search_path. SOLE entry point for new crisis_event rows. '
+    'EXECUTE granted ONLY to crisis_initiator role (application-layer authContextPlugin '
+    'manages membership: clinician + on-call clinician + ai_mode1_service). '
+    'Idempotent via crisis_event UNIQUE(tenant_id, server_signal_id) — FLOOR-020 retries '
+    'return existing crisis_event_id. Audit emission for Cat A crisis.detected event '
+    'deferred to application layer (PR 7+ Fastify route + emitAudit() wrap in single tx).';
+
+-- =============================================================================
+-- §4 — Verification (signature-exact via to_regprocedure per PR 3 pattern)
+-- =============================================================================
+
+DO $$
+DECLARE
+    v_target_oid OID := to_regprocedure(
+        'public.record_crisis_initiation(text, uuid, uuid, text, text, boolean, bytea, uuid, integer, bytea, bytea, uuid, integer, text)'
+    );
+    v_function_owner            TEXT;
+    v_function_security_definer BOOLEAN;
+    v_function_specific_name    TEXT;
+    v_function_proconfig        TEXT[];
+    v_execute_grantee_count     INTEGER;
+    v_unauthorized_grantee      TEXT;
+BEGIN
+    IF v_target_oid IS NULL THEN
+        RAISE EXCEPTION
+            'migration-036-function-missing: record_crisis_initiation() not found by signature';
+    END IF;
+
+    SELECT r.rolname, p.prosecdef, p.proconfig
+      INTO v_function_owner, v_function_security_definer, v_function_proconfig
+      FROM pg_proc p
+      JOIN pg_roles r ON r.oid = p.proowner
+     WHERE p.oid = v_target_oid;
+
+    IF v_function_owner <> 'crisis_initiation_wrapper_owner' THEN
+        RAISE EXCEPTION
+            'migration-036-ownership-mismatch: record_crisis_initiation() ownership is % but MUST be crisis_initiation_wrapper_owner',
+            v_function_owner;
+    END IF;
+
+    IF NOT v_function_security_definer THEN
+        RAISE EXCEPTION
+            'migration-036-security-definer-missing: record_crisis_initiation() MUST be SECURITY DEFINER';
+    END IF;
+
+    IF v_function_proconfig IS NULL
+       OR NOT (v_function_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
+        RAISE EXCEPTION
+            'migration-036-search-path-not-locked: record_crisis_initiation() MUST have proconfig containing "search_path=pg_catalog, public"; found %',
+            v_function_proconfig;
+    END IF;
+
+    SELECT p.proname || '_' || p.oid::TEXT INTO v_function_specific_name
+      FROM pg_proc p WHERE p.oid = v_target_oid;
+
+    -- EXECUTE grant matrix: exactly 1 (crisis_initiator), excluding owner-self.
+    SELECT COUNT(*) INTO v_execute_grantee_count
+      FROM information_schema.role_routine_grants g
+     WHERE g.specific_name = v_function_specific_name
+       AND g.privilege_type = 'EXECUTE'
+       AND g.grantee <> 'crisis_initiation_wrapper_owner';
+
+    IF v_execute_grantee_count <> 1 THEN
+        RAISE EXCEPTION
+            'migration-036-execute-grant-count: expected exactly 1 application-role EXECUTE grant (crisis_initiator), found %',
+            v_execute_grantee_count;
+    END IF;
+
+    FOR v_unauthorized_grantee IN
+        SELECT g.grantee
+          FROM information_schema.role_routine_grants g
+         WHERE g.specific_name = v_function_specific_name
+           AND g.privilege_type = 'EXECUTE'
+           AND g.grantee NOT IN ('crisis_initiation_wrapper_owner', 'crisis_initiator')
+    LOOP
+        RAISE EXCEPTION
+            'migration-036-execute-grant-violation: record_crisis_initiation() EXECUTE granted to non-canonical role %; canonical grantee = crisis_initiator',
+            v_unauthorized_grantee;
+    END LOOP;
+
+    PERFORM 1
+      FROM information_schema.role_routine_grants
+     WHERE specific_name = v_function_specific_name
+       AND privilege_type = 'EXECUTE'
+       AND grantee = 'PUBLIC';
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'migration-036-anti-bypass-violation: PUBLIC has EXECUTE on record_crisis_initiation()';
+    END IF;
+
+    -- R2 HIGH-1 closure 2026-05-22: assert wrapper-owner has EXECUTE on the
+    -- 2 SI-010 helpers the wrapper body calls. Without these, the SECDEF
+    -- function fails at runtime for every legitimate caller.
+    IF NOT has_function_privilege(
+        'crisis_initiation_wrapper_owner', 'public.current_actor_account_id()', 'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'migration-036-helper-grant-missing: crisis_initiation_wrapper_owner lacks EXECUTE on current_actor_account_id() — R2 HIGH-1 closure broken';
+    END IF;
+    IF NOT has_function_privilege(
+        'crisis_initiation_wrapper_owner', 'public.current_actor_account_tenant_id()', 'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'migration-036-helper-grant-missing: crisis_initiation_wrapper_owner lacks EXECUTE on current_actor_account_tenant_id() — wrapper LAYER C check broken';
+    END IF;
+END $$;
+
+
+-- =============================================================================
+-- §7 — Replace 3 mid-lifecycle wrappers (migration 037): drop ::UUID actor cast.
+-- =============================================================================
 CREATE OR REPLACE FUNCTION record_crisis_acknowledgement_claim(
     p_tenant_id           TEXT,
     p_crisis_event_id     UUID,
@@ -366,17 +787,17 @@ DECLARE
     v_actor_principal_id     TEXT;    -- SI-025 P-045: was UUID
     v_actor_tenant_id        TEXT;
     v_latest_to_state        TEXT;
-    v_latest_actor           TEXT;    -- SI-025 P-045: was UUID (matches actor_principal_id column)
+    v_latest_actor           TEXT;    -- SI-025 P-045: was UUID
     v_transition_id          BIGINT;
 BEGIN
-    -- LAYER B — bind actor identity from SI-010.
+    -- LAYER B — bind actor identity from SI-010 (caller cannot forge).
     v_actor_account_id_text := current_actor_account_id();
     IF v_actor_account_id_text IS NULL THEN
         RAISE EXCEPTION 'record_crisis_acknowledgement_claim: no actor account bound'
             USING ERRCODE = '42501';
     END IF;
-    -- SI-025 P-045: TEXT assignment; no ::UUID cast.
-    v_actor_principal_id := v_actor_account_id_text;
+    -- SI-025 P-045: assign TEXT directly; no ::UUID cast.
+    v_actor_principal_id := v_actor_account_id_text;;
 
     -- LAYER C — tenant scope match.
     v_actor_tenant_id := current_actor_account_tenant_id();
@@ -390,13 +811,17 @@ BEGIN
             USING ERRCODE = '42501';
     END IF;
 
-    -- SELECT FOR UPDATE on parent crisis_event row.
+    -- SELECT FOR UPDATE on parent crisis_event row — serializes concurrent
+    -- mid-lifecycle wrapper calls for the same crisis_event. The advisory
+    -- lock at the lifecycle_transition monotonic-ordering trigger is a
+    -- second layer (per-event hash-key); the row lock here is the primary
+    -- serialization point + matches the canonical P-040 pattern.
     PERFORM 1 FROM public.crisis_event
      WHERE tenant_id = p_tenant_id AND id = p_crisis_event_id
        FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'record_crisis_acknowledgement_claim: crisis_event % not found for tenant %', p_crisis_event_id, p_tenant_id
-            USING ERRCODE = '02000';
+            USING ERRCODE = '02000';  -- no_data
     END IF;
 
     -- Read latest lifecycle state under lock.
@@ -407,7 +832,11 @@ BEGIN
      ORDER BY transition_at DESC, id DESC
      LIMIT 1;
 
-    -- Idempotent replay: same-actor already acknowledged.
+    -- Idempotent replay: if latest is already acknowledged BY THIS ACTOR,
+    -- treat as canonical replay + return the latest transition id without
+    -- inserting a duplicate. Latest acknowledged by ANOTHER actor is a
+    -- race condition where another claimer won — surface as serialization
+    -- conflict for the loser.
     IF v_latest_to_state = 'acknowledged' THEN
         IF v_latest_actor = v_actor_principal_id THEN
             SELECT id INTO v_transition_id
@@ -420,11 +849,11 @@ BEGIN
         ELSE
             RAISE EXCEPTION 'record_crisis_acknowledgement_claim: crisis_event % already acknowledged by another actor %; concurrent-claim race lost',
                 p_crisis_event_id, v_latest_actor
-                USING ERRCODE = '40001';
+                USING ERRCODE = '40001';  -- serialization_failure (retry-safe semantic; another caller won)
         END IF;
     END IF;
 
-    -- Validate from-state.
+    -- Validate latest is in the allowed from-state set for acknowledgement.
     IF v_latest_to_state IS NULL OR v_latest_to_state NOT IN ('detected', 'escalated') THEN
         RAISE EXCEPTION 'record_crisis_acknowledgement_claim: cannot acknowledge crisis_event % from state %; allowed from-states are detected, escalated',
             p_crisis_event_id, COALESCE(v_latest_to_state, '<NULL/none>')
@@ -435,10 +864,10 @@ BEGIN
     v_transition_id := public.record_crisis_event_lifecycle_transition(
         p_tenant_id,
         p_crisis_event_id,
-        v_latest_to_state,
-        'acknowledged',
-        'clinician_acknowledgement',
-        v_actor_principal_id,   -- TEXT per SI-025 P-045
+        v_latest_to_state,                    -- from_state (detected OR escalated)
+        'acknowledged',                       -- to_state
+        'clinician_acknowledgement',          -- transition_reason
+        v_actor_principal_id,                 -- bound from SI-010
         p_transition_payload
     );
 
@@ -446,7 +875,34 @@ BEGIN
 END;
 $$;
 
--- §6b — record_crisis_response()
+ALTER FUNCTION record_crisis_acknowledgement_claim(TEXT, UUID, JSONB)
+    OWNER TO crisis_acknowledgement_wrapper_owner;
+-- R1 HIGH-1 closure 2026-05-22 (PR 5 Codex review): SELECT + UPDATE on crisis_event.
+-- PostgreSQL SELECT ... FOR UPDATE requires UPDATE privilege on the locked table
+-- (even if the append-only trigger from migration 033 blocks any actual UPDATE at
+-- runtime — the GRANT prerequisite is checked separately). Without UPDATE, every
+-- wrapper call fails at runtime with permission_denied on the row-lock acquisition.
+-- Matches the canonical P-042 R8 HIGH-1 closure pattern from the spec corpus.
+GRANT SELECT, UPDATE ON crisis_event               TO crisis_acknowledgement_wrapper_owner;
+GRANT SELECT ON crisis_event_lifecycle_transition  TO crisis_acknowledgement_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_id()         TO crisis_acknowledgement_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id()  TO crisis_acknowledgement_wrapper_owner;
+REVOKE EXECUTE ON FUNCTION record_crisis_acknowledgement_claim(TEXT, UUID, JSONB) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION record_crisis_acknowledgement_claim(TEXT, UUID, JSONB) TO crisis_acknowledger;
+
+COMMENT ON FUNCTION record_crisis_acknowledgement_claim(TEXT, UUID, JSONB) IS
+    'P-040 §3.3 record_crisis_acknowledgement_claim — clinician/care-team claims '
+    'detected/escalated crisis. SECDEF + actor bound from SI-010 + SELECT FOR UPDATE '
+    'on parent row + latest-state validation + natural idempotency on same-actor replay. '
+    'Audit emission for Cat A crisis.acknowledged deferred to application layer.';
+
+-- =============================================================================
+-- §2 — record_crisis_response()
+--
+-- Clinician records first-response after acknowledgement. Single allowed
+-- from-state: acknowledged → responded (clinician_response).
+-- =============================================================================
+
 CREATE OR REPLACE FUNCTION record_crisis_response(
     p_tenant_id           TEXT,
     p_crisis_event_id     UUID,
@@ -466,19 +922,20 @@ DECLARE
 BEGIN
     v_actor_account_id_text := current_actor_account_id();
     IF v_actor_account_id_text IS NULL THEN
-        RAISE EXCEPTION 'record_crisis_response: no actor account bound'
-            USING ERRCODE = '42501';
+        RAISE EXCEPTION 'record_crisis_response: no actor account bound' USING ERRCODE = '42501';
     END IF;
-    v_actor_principal_id := v_actor_account_id_text;  -- TEXT; no ::UUID
+    BEGIN v_actor_principal_id := v_actor_account_id_text;  -- SI-025 P-045: TEXT
+    EXCEPTION WHEN invalid_text_representation THEN
+        RAISE EXCEPTION 'record_crisis_response: bound actor account_id % is not a valid UUID', v_actor_account_id_text
+            USING ERRCODE = '42501';
+    END;
 
     v_actor_tenant_id := current_actor_account_tenant_id();
     IF v_actor_tenant_id IS NULL THEN
-        RAISE EXCEPTION 'record_crisis_response: no actor tenant bound'
-            USING ERRCODE = '42501';
+        RAISE EXCEPTION 'record_crisis_response: no actor tenant bound' USING ERRCODE = '42501';
     END IF;
     IF v_actor_tenant_id IS DISTINCT FROM p_tenant_id THEN
-        RAISE EXCEPTION 'record_crisis_response: tenant scope mismatch — actor tenant % vs p_tenant_id %',
-            v_actor_tenant_id, p_tenant_id
+        RAISE EXCEPTION 'record_crisis_response: tenant scope mismatch'
             USING ERRCODE = '42501';
     END IF;
 
@@ -486,7 +943,7 @@ BEGIN
      WHERE tenant_id = p_tenant_id AND id = p_crisis_event_id
        FOR UPDATE;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'record_crisis_response: crisis_event % not found for tenant %', p_crisis_event_id, p_tenant_id
+        RAISE EXCEPTION 'record_crisis_response: crisis_event % not found', p_crisis_event_id
             USING ERRCODE = '02000';
     END IF;
 
@@ -497,6 +954,7 @@ BEGIN
      ORDER BY transition_at DESC, id DESC
      LIMIT 1;
 
+    -- Idempotent replay for same actor.
     IF v_latest_to_state = 'responded' THEN
         IF v_latest_actor = v_actor_principal_id THEN
             SELECT id INTO v_transition_id
@@ -507,33 +965,50 @@ BEGIN
              LIMIT 1;
             RETURN v_transition_id;
         ELSE
-            RAISE EXCEPTION 'record_crisis_response: crisis_event % already responded by another actor %; concurrent race lost',
-                p_crisis_event_id, v_latest_actor
+            RAISE EXCEPTION 'record_crisis_response: crisis_event % already responded by another actor; race lost', p_crisis_event_id
                 USING ERRCODE = '40001';
         END IF;
     END IF;
 
-    IF v_latest_to_state IS NULL OR v_latest_to_state NOT IN ('acknowledged') THEN
-        RAISE EXCEPTION 'record_crisis_response: cannot respond to crisis_event % from state %; allowed from-state is acknowledged',
-            p_crisis_event_id, COALESCE(v_latest_to_state, '<NULL/none>')
+    -- Only acknowledged → responded allowed per spec §6 triple #9.
+    IF v_latest_to_state IS DISTINCT FROM 'acknowledged' THEN
+        RAISE EXCEPTION 'record_crisis_response: cannot respond from state %; must be acknowledged',
+            COALESCE(v_latest_to_state, '<NULL/none>')
             USING ERRCODE = '40001';
     END IF;
 
     v_transition_id := public.record_crisis_event_lifecycle_transition(
-        p_tenant_id,
-        p_crisis_event_id,
-        v_latest_to_state,
-        'responded',
-        'clinician_response',
-        v_actor_principal_id,   -- TEXT per SI-025 P-045
-        p_transition_payload
+        p_tenant_id, p_crisis_event_id,
+        'acknowledged', 'responded', 'clinician_response',
+        v_actor_principal_id, p_transition_payload
     );
 
     RETURN v_transition_id;
 END;
 $$;
 
--- §6c — record_crisis_resolution()
+ALTER FUNCTION record_crisis_response(TEXT, UUID, JSONB)
+    OWNER TO crisis_response_wrapper_owner;
+GRANT SELECT, UPDATE ON crisis_event               TO crisis_response_wrapper_owner;  -- UPDATE required for SELECT FOR UPDATE (R1 HIGH-1)
+GRANT SELECT ON crisis_event_lifecycle_transition  TO crisis_response_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_id()         TO crisis_response_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id()  TO crisis_response_wrapper_owner;
+REVOKE EXECUTE ON FUNCTION record_crisis_response(TEXT, UUID, JSONB) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION record_crisis_response(TEXT, UUID, JSONB) TO crisis_responder;
+
+COMMENT ON FUNCTION record_crisis_response(TEXT, UUID, JSONB) IS
+    'P-040 §3.4 record_crisis_response — clinician records first-response. '
+    'SECDEF + same closure-of-defects pattern as acknowledgement wrapper. '
+    'Audit emission for Cat A crisis.responded deferred to application layer.';
+
+-- =============================================================================
+-- §3 — record_crisis_resolution()
+--
+-- Clinician resolves the crisis. Two allowed from-states:
+-- responded → resolved (clinician_resolution; triple #10)
+-- escalated → resolved (clinician_resolution; triple #11)
+-- =============================================================================
+
 CREATE OR REPLACE FUNCTION record_crisis_resolution(
     p_tenant_id           TEXT,
     p_crisis_event_id     UUID,
@@ -553,27 +1028,27 @@ DECLARE
 BEGIN
     v_actor_account_id_text := current_actor_account_id();
     IF v_actor_account_id_text IS NULL THEN
-        RAISE EXCEPTION 'record_crisis_resolution: no actor account bound'
-            USING ERRCODE = '42501';
+        RAISE EXCEPTION 'record_crisis_resolution: no actor account bound' USING ERRCODE = '42501';
     END IF;
-    v_actor_principal_id := v_actor_account_id_text;  -- TEXT; no ::UUID
+    BEGIN v_actor_principal_id := v_actor_account_id_text;  -- SI-025 P-045: TEXT
+    EXCEPTION WHEN invalid_text_representation THEN
+        RAISE EXCEPTION 'record_crisis_resolution: bound actor account_id % is not a valid UUID', v_actor_account_id_text
+            USING ERRCODE = '42501';
+    END;
 
     v_actor_tenant_id := current_actor_account_tenant_id();
     IF v_actor_tenant_id IS NULL THEN
-        RAISE EXCEPTION 'record_crisis_resolution: no actor tenant bound'
-            USING ERRCODE = '42501';
+        RAISE EXCEPTION 'record_crisis_resolution: no actor tenant bound' USING ERRCODE = '42501';
     END IF;
     IF v_actor_tenant_id IS DISTINCT FROM p_tenant_id THEN
-        RAISE EXCEPTION 'record_crisis_resolution: tenant scope mismatch — actor tenant % vs p_tenant_id %',
-            v_actor_tenant_id, p_tenant_id
-            USING ERRCODE = '42501';
+        RAISE EXCEPTION 'record_crisis_resolution: tenant scope mismatch' USING ERRCODE = '42501';
     END IF;
 
     PERFORM 1 FROM public.crisis_event
      WHERE tenant_id = p_tenant_id AND id = p_crisis_event_id
        FOR UPDATE;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'record_crisis_resolution: crisis_event % not found for tenant %', p_crisis_event_id, p_tenant_id
+        RAISE EXCEPTION 'record_crisis_resolution: crisis_event % not found', p_crisis_event_id
             USING ERRCODE = '02000';
     END IF;
 
@@ -584,6 +1059,9 @@ BEGIN
      ORDER BY transition_at DESC, id DESC
      LIMIT 1;
 
+    -- Idempotent replay for same actor (resolved is terminal — any further
+    -- mutation is rejected by state-machine CHECK; same-actor retry returns
+    -- the existing row).
     IF v_latest_to_state = 'resolved' THEN
         IF v_latest_actor = v_actor_principal_id THEN
             SELECT id INTO v_transition_id
@@ -594,31 +1072,582 @@ BEGIN
              LIMIT 1;
             RETURN v_transition_id;
         ELSE
-            RAISE EXCEPTION 'record_crisis_resolution: crisis_event % already resolved by another actor %; concurrent race lost',
-                p_crisis_event_id, v_latest_actor
+            RAISE EXCEPTION 'record_crisis_resolution: crisis_event % already resolved by another actor; race lost', p_crisis_event_id
                 USING ERRCODE = '40001';
         END IF;
     END IF;
 
+    -- Two allowed from-states: responded OR escalated.
     IF v_latest_to_state IS NULL OR v_latest_to_state NOT IN ('responded', 'escalated') THEN
-        RAISE EXCEPTION 'record_crisis_resolution: cannot resolve crisis_event % from state %; allowed from-states are responded, escalated',
-            p_crisis_event_id, COALESCE(v_latest_to_state, '<NULL/none>')
+        RAISE EXCEPTION 'record_crisis_resolution: cannot resolve from state %; allowed from-states are responded, escalated',
+            COALESCE(v_latest_to_state, '<NULL/none>')
             USING ERRCODE = '40001';
     END IF;
 
     v_transition_id := public.record_crisis_event_lifecycle_transition(
-        p_tenant_id,
-        p_crisis_event_id,
-        v_latest_to_state,
-        'resolved',
-        'clinician_resolution',
-        v_actor_principal_id,   -- TEXT per SI-025 P-045
-        p_transition_payload
+        p_tenant_id, p_crisis_event_id,
+        v_latest_to_state, 'resolved', 'clinician_resolution',
+        v_actor_principal_id, p_transition_payload
     );
 
     RETURN v_transition_id;
 END;
 $$;
+
+ALTER FUNCTION record_crisis_resolution(TEXT, UUID, JSONB)
+    OWNER TO crisis_resolution_wrapper_owner;
+GRANT SELECT, UPDATE ON crisis_event               TO crisis_resolution_wrapper_owner;  -- UPDATE required for SELECT FOR UPDATE (R1 HIGH-1)
+GRANT SELECT ON crisis_event_lifecycle_transition  TO crisis_resolution_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_id()         TO crisis_resolution_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id()  TO crisis_resolution_wrapper_owner;
+REVOKE EXECUTE ON FUNCTION record_crisis_resolution(TEXT, UUID, JSONB) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION record_crisis_resolution(TEXT, UUID, JSONB) TO crisis_resolver;
+
+COMMENT ON FUNCTION record_crisis_resolution(TEXT, UUID, JSONB) IS
+    'P-040 §3.5 record_crisis_resolution — clinician resolves crisis from '
+    'responded OR escalated. SECDEF + same closure-of-defects pattern. '
+    'Audit emission for Cat A crisis.resolved deferred to application layer.';
+
+-- =============================================================================
+-- §4 — Verification (signature-exact via to_regprocedure per PR 3 pattern)
+-- =============================================================================
+
+DO $$
+DECLARE
+    v_target_oid OID;
+    v_owner TEXT;
+    v_secdef BOOLEAN;
+    v_proconfig TEXT[];
+    v_specific TEXT;
+    v_grant_count INTEGER;
+    -- Per-function expectations
+    v_target RECORD;
+BEGIN
+    FOR v_target IN
+        VALUES
+            ('public.record_crisis_acknowledgement_claim(text, uuid, jsonb)'::TEXT,
+             'crisis_acknowledgement_wrapper_owner'::TEXT,
+             'crisis_acknowledger'::TEXT),
+            ('public.record_crisis_response(text, uuid, jsonb)',
+             'crisis_response_wrapper_owner',
+             'crisis_responder'),
+            ('public.record_crisis_resolution(text, uuid, jsonb)',
+             'crisis_resolution_wrapper_owner',
+             'crisis_resolver')
+    LOOP
+        v_target_oid := to_regprocedure(v_target.column1);
+        IF v_target_oid IS NULL THEN
+            RAISE EXCEPTION 'migration-037-function-missing: % not found by signature', v_target.column1;
+        END IF;
+
+        SELECT r.rolname, p.prosecdef, p.proconfig, p.proname || '_' || p.oid::TEXT
+          INTO v_owner, v_secdef, v_proconfig, v_specific
+          FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner
+         WHERE p.oid = v_target_oid;
+
+        IF v_owner <> v_target.column2 THEN
+            RAISE EXCEPTION 'migration-037-ownership-mismatch: % ownership is % but MUST be %',
+                v_target.column1, v_owner, v_target.column2;
+        END IF;
+        IF NOT v_secdef THEN
+            RAISE EXCEPTION 'migration-037-security-definer-missing: % MUST be SECURITY DEFINER', v_target.column1;
+        END IF;
+        IF v_proconfig IS NULL OR NOT (v_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
+            RAISE EXCEPTION 'migration-037-search-path-not-locked: % proconfig=%', v_target.column1, v_proconfig;
+        END IF;
+
+        -- EXECUTE grant matrix: exactly 1 application-role grantee (excluding owner-self)
+        SELECT COUNT(*) INTO v_grant_count
+          FROM information_schema.role_routine_grants
+         WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee <> v_target.column2;
+        IF v_grant_count <> 1 THEN
+            RAISE EXCEPTION 'migration-037-execute-grant-count: % expected 1 application-role grant, found %', v_target.column1, v_grant_count;
+        END IF;
+
+        -- The single grantee must match expected application role
+        PERFORM 1 FROM information_schema.role_routine_grants
+         WHERE specific_name = v_specific AND privilege_type = 'EXECUTE'
+           AND grantee = v_target.column3;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'migration-037-grant-missing: % missing EXECUTE for %', v_target.column1, v_target.column3;
+        END IF;
+
+        -- No PUBLIC
+        PERFORM 1 FROM information_schema.role_routine_grants
+         WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee = 'PUBLIC';
+        IF FOUND THEN
+            RAISE EXCEPTION 'migration-037-anti-bypass: PUBLIC has EXECUTE on %', v_target.column1;
+        END IF;
+
+        -- SI-010 helper grants on wrapper-owner
+        IF NOT has_function_privilege(v_target.column2, 'public.current_actor_account_id()', 'EXECUTE') THEN
+            RAISE EXCEPTION 'migration-037-helper-grant-missing: % lacks EXECUTE on current_actor_account_id()', v_target.column2;
+        END IF;
+        IF NOT has_function_privilege(v_target.column2, 'public.current_actor_account_tenant_id()', 'EXECUTE') THEN
+            RAISE EXCEPTION 'migration-037-helper-grant-missing: % lacks EXECUTE on current_actor_account_tenant_id()', v_target.column2;
+        END IF;
+
+        -- R1 HIGH-1 closure 2026-05-22: SELECT + UPDATE on crisis_event for SELECT FOR UPDATE row-lock
+        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event', 'SELECT') THEN
+            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks SELECT on crisis_event', v_target.column2;
+        END IF;
+        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event', 'UPDATE') THEN
+            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks UPDATE on crisis_event (required for SELECT FOR UPDATE row-lock)', v_target.column2;
+        END IF;
+        IF NOT has_table_privilege(v_target.column2, 'public.crisis_event_lifecycle_transition', 'SELECT') THEN
+            RAISE EXCEPTION 'migration-037-table-grant-missing: % lacks SELECT on crisis_event_lifecycle_transition', v_target.column2;
+        END IF;
+
+        -- R2 HIGH-1 closure 2026-05-22: defensive cross-migration assertion.
+        -- Migration 035 §3 grants EXECUTE on the raw writer to all 5 wrapper-owner
+        -- roles (including the 3 used by this migration). Verify the grant is
+        -- still present — catches schema drift if 035's grant matrix was
+        -- accidentally narrowed by a downstream migration.
+        IF NOT has_function_privilege(
+            v_target.column2,
+            'public.record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb)',
+            'EXECUTE'
+        ) THEN
+            RAISE EXCEPTION
+                'migration-037-raw-writer-grant-missing: % lacks EXECUTE on record_crisis_event_lifecycle_transition() — migration 035 §3 grant matrix may have drifted',
+                v_target.column2;
+        END IF;
+    END LOOP;
+END $$;
+
+
+-- =============================================================================
+-- §8 — Replace sweep wrapper (migration 038): drop ::UUID actor cast.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION execute_crisis_no_acknowledgement_sweep(
+    p_tenant_id                     TEXT,
+    p_crisis_event_id               UUID,
+    p_target_obligation_generation  INTEGER,
+    p_worker_id                     TEXT,
+    p_claim_ttl_seconds             INTEGER DEFAULT 60
+)
+RETURNS TABLE (
+    sweep_execution_id   UUID,
+    fencing_token        BIGINT,
+    outcome              TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_actor_account_id_text  TEXT;
+    v_actor_principal_id     TEXT;    -- SI-025 P-045: was UUID
+    v_actor_tenant_id        TEXT;
+    v_latest_to_state        TEXT;
+    v_to_state               TEXT;
+    v_transition_reason      TEXT;
+    v_sweep_row              RECORD;
+    v_existing_sweep_id      UUID;
+    v_returning_sweep_id     UUID;
+    v_returning_fencing      BIGINT;
+    v_returning_outcome      TEXT;
+BEGIN
+    -- LAYER B — bind actor (sweep scheduler worker).
+    v_actor_account_id_text := current_actor_account_id();
+    IF v_actor_account_id_text IS NULL THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: no actor account bound'
+            USING ERRCODE = '42501';
+    END IF;
+    -- SI-025 P-045: assign TEXT directly; no ::UUID cast.
+    v_actor_principal_id := v_actor_account_id_text;;
+
+    -- LAYER C — tenant scope.
+    v_actor_tenant_id := current_actor_account_tenant_id();
+    IF v_actor_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: no actor tenant bound'
+            USING ERRCODE = '42501';
+    END IF;
+    IF v_actor_tenant_id IS DISTINCT FROM p_tenant_id THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: tenant scope mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+
+    IF p_claim_ttl_seconds <= 0 OR p_claim_ttl_seconds > 600 THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: p_claim_ttl_seconds % out of range [1, 600]', p_claim_ttl_seconds
+            USING ERRCODE = '22023';  -- invalid_parameter_value
+    END IF;
+
+    -- Parent-row lock — serializes concurrent sweep workers + acknowledgement/
+    -- response/resolution wrappers for the same crisis_event.
+    PERFORM 1 FROM public.crisis_event
+     WHERE tenant_id = p_tenant_id AND id = p_crisis_event_id
+       FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: crisis_event % not found for tenant %', p_crisis_event_id, p_tenant_id
+            USING ERRCODE = '02000';
+    END IF;
+
+    -- =====================================================================
+    -- §1.1 — Claim or take-over phase
+    --
+    -- Try to find an open sweep_execution row for this (tenant, event, generation).
+    -- - If exists with claim_expires_at >= now() AND claimed_by_worker_id <> p_worker_id:
+    --     another worker holds a valid lease; reject this attempt (40001 retry-safe).
+    -- - If exists with claim_expires_at < now() OR claim_expires_at IS NULL:
+    --     take over by UPDATEing claimed_by_worker_id + claim_expires_at +
+    --     incrementing fencing_token.
+    -- - If no row exists: INSERT a new claim with fencing_token = 1.
+    -- =====================================================================
+
+    -- R1 HIGH-1 closure 2026-05-22: idempotent replay guard for already-
+    -- completed sweep. A retry after successful completion (or a scheduler
+    -- redelivery of the same generation) must NOT mint a new open row that
+    -- would emit a duplicate escalation. Return the existing completed
+    -- sweep's info with outcome='already_completed' instead.
+    SELECT cse.sweep_execution_id, cse.fencing_token
+      INTO v_existing_sweep_id, v_returning_fencing
+      FROM public.crisis_sweep_execution cse
+     WHERE cse.tenant_id = p_tenant_id
+       AND cse.crisis_event_id = p_crisis_event_id
+       AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+       AND cse.completed_at IS NOT NULL
+     ORDER BY cse.completed_at DESC, cse.sweep_execution_id DESC
+     LIMIT 1;
+    IF v_existing_sweep_id IS NOT NULL THEN
+        sweep_execution_id := v_existing_sweep_id;
+        fencing_token      := v_returning_fencing;
+        outcome            := 'already_completed';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    SELECT sweep_execution_id, claimed_by_worker_id, claim_expires_at, fencing_token, completed_at
+      INTO v_sweep_row
+      FROM public.crisis_sweep_execution
+     WHERE tenant_id = p_tenant_id
+       AND crisis_event_id = p_crisis_event_id
+       AND scheduled_for_obligation_generation = p_target_obligation_generation
+       AND completed_at IS NULL    -- only open rows; partial UNIQUE index allows at most one
+     FOR UPDATE;
+
+    IF FOUND THEN
+        -- Another worker may hold a valid lease.
+        IF v_sweep_row.claim_expires_at IS NOT NULL
+           AND v_sweep_row.claim_expires_at >= now()
+           AND v_sweep_row.claimed_by_worker_id IS DISTINCT FROM p_worker_id THEN
+            RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: sweep_execution_id % for crisis_event % gen % currently leased by worker % until %; retry after expiry',
+                v_sweep_row.sweep_execution_id, p_crisis_event_id, p_target_obligation_generation,
+                v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                USING ERRCODE = '40001';
+        END IF;
+
+        -- Take over the lease (claim expired, or same worker reclaiming).
+        UPDATE public.crisis_sweep_execution
+           SET claimed_by_worker_id = p_worker_id,
+               claim_expires_at     = now() + (p_claim_ttl_seconds || ' seconds')::INTERVAL,
+               fencing_token        = v_sweep_row.fencing_token + 1,
+               heartbeat_at         = now()
+         WHERE sweep_execution_id = v_sweep_row.sweep_execution_id
+         RETURNING sweep_execution_id, fencing_token
+              INTO v_returning_sweep_id, v_returning_fencing;
+        v_returning_outcome := 'claimed_takeover';
+    ELSE
+        -- New claim: insert a fresh row. R2 HIGH-1 closure 2026-05-22:
+        -- two scheduler workers can race for the FIRST claim — both pass the
+        -- completed-row guard + open-row SELECT (no rows exist yet), both
+        -- reach this INSERT. The partial UNIQUE on (tenant, event, generation)
+        -- WHERE completed_at IS NULL allows only one to succeed; the loser
+        -- raises unique_violation. Without a handler, the loser leaks raw
+        -- SQLSTATE 23505. Wrap in EXCEPTION block + re-read winning row to
+        -- determine controlled outcome.
+        BEGIN
+            INSERT INTO public.crisis_sweep_execution (
+                tenant_id, crisis_event_id, scheduled_at,
+                scheduled_for_obligation_generation,
+                claimed_by_worker_id, claim_expires_at,
+                fencing_token, heartbeat_at
+            ) VALUES (
+                p_tenant_id, p_crisis_event_id, now(),
+                p_target_obligation_generation,
+                p_worker_id, now() + (p_claim_ttl_seconds || ' seconds')::INTERVAL,
+                1,    -- initial fencing_token
+                now()
+            )
+            RETURNING crisis_sweep_execution.sweep_execution_id, crisis_sweep_execution.fencing_token
+                 INTO v_returning_sweep_id, v_returning_fencing;
+            v_returning_outcome := 'claimed_new';
+        EXCEPTION
+            WHEN unique_violation THEN
+                -- R4 HIGH-1 closure 2026-05-22: discriminate the violated
+                -- constraint. Only the partial UNIQUE index from migration 033
+                -- §7 (`crisis_sweep_execution_open_uk`) represents a first-claim
+                -- race; any other unique_violation indicates schema drift,
+                -- corruption, or an unrelated integrity failure that MUST be
+                -- re-raised to preserve the real diagnostic — silently
+                -- swallowing it could mask a real bug + drop a required sweep.
+                DECLARE
+                    v_constraint_name TEXT;
+                BEGIN
+                    GET STACKED DIAGNOSTICS v_constraint_name = CONSTRAINT_NAME;
+                    IF v_constraint_name IS DISTINCT FROM 'crisis_sweep_execution_open_uk' THEN
+                        -- Unrelated unique violation; re-raise with diagnostic.
+                        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: unexpected unique_violation on constraint %; not the canonical first-claim race; preserving original failure',
+                            v_constraint_name
+                            USING ERRCODE = '23505';  -- canonical unique_violation
+                    END IF;
+                END;
+
+                -- R3 HIGH-1 closure 2026-05-22: race-loser re-read. The partial
+                -- UNIQUE constraint only enforces uniqueness on OPEN rows, so the
+                -- winning row that just caused our unique_violation MUST be open.
+                -- Re-read OPEN row FIRST + return 40001 lease-conflict if found.
+                -- ONLY if no open row exists (winner finished in the gap before
+                -- we caught the violation) do we fall back to the most-recent
+                -- completed row + return already_completed.
+                SELECT cse.sweep_execution_id, cse.fencing_token, cse.claimed_by_worker_id, cse.claim_expires_at
+                  INTO v_returning_sweep_id, v_returning_fencing,
+                       v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                  FROM public.crisis_sweep_execution cse
+                 WHERE cse.tenant_id = p_tenant_id
+                   AND cse.crisis_event_id = p_crisis_event_id
+                   AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+                   AND cse.completed_at IS NULL;
+                IF FOUND THEN
+                    -- Winner still holds the open lease — return controlled 40001.
+                    RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: concurrent first-claim race lost; sweep_execution_id % currently leased by worker % until %; retry after expiry',
+                        v_returning_sweep_id, v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                        USING ERRCODE = '40001';
+                END IF;
+
+                -- No open row — winner finished completion in the gap. Find
+                -- the most-recent COMPLETED row (ordered by completed_at DESC,
+                -- not by sweep_execution_id which is UUID and not a recency
+                -- signal) and return already_completed.
+                SELECT cse.sweep_execution_id, cse.fencing_token
+                  INTO v_returning_sweep_id, v_returning_fencing
+                  FROM public.crisis_sweep_execution cse
+                 WHERE cse.tenant_id = p_tenant_id
+                   AND cse.crisis_event_id = p_crisis_event_id
+                   AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+                   AND cse.completed_at IS NOT NULL
+                 ORDER BY cse.completed_at DESC, cse.sweep_execution_id DESC
+                 LIMIT 1;
+                IF v_returning_sweep_id IS NOT NULL THEN
+                    sweep_execution_id := v_returning_sweep_id;
+                    fencing_token      := v_returning_fencing;
+                    outcome            := 'already_completed';
+                    RETURN NEXT;
+                    RETURN;
+                END IF;
+
+                -- Should be unreachable — unique_violation implies a colliding
+                -- row exists, and we just searched all states.
+                RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: unique_violation re-read found no colliding row — invariant violation; investigate sweep_execution data integrity'
+                    USING ERRCODE = 'XX000';  -- internal_error
+        END;
+    END IF;
+
+    -- =====================================================================
+    -- §1.2 — Lifecycle emission phase
+    --
+    -- Read latest lifecycle state under the parent FOR UPDATE lock. The
+    -- sweep escalates ONLY if current state is detected or escalated.
+    -- Other states (acknowledged/responded/resolved) are no-ops — the
+    -- sweep simply commits with outcome 'completed_no_op'.
+    -- =====================================================================
+
+    SELECT to_state
+      INTO v_latest_to_state
+      FROM public.crisis_event_lifecycle_transition
+     WHERE tenant_id = p_tenant_id AND crisis_event_id = p_crisis_event_id
+     ORDER BY transition_at DESC, id DESC
+     LIMIT 1;
+
+    IF v_latest_to_state = 'detected' THEN
+        -- Triple #2 — detected → escalated (no_acknowledgement_timeout)
+        v_to_state := 'escalated';
+        v_transition_reason := 'no_acknowledgement_timeout';
+    ELSIF v_latest_to_state = 'escalated' THEN
+        -- Triple #3 — escalated → escalated (tier_progression_no_acknowledgement)
+        v_to_state := 'escalated';
+        v_transition_reason := 'tier_progression_no_acknowledgement';
+    ELSE
+        -- Latest is acknowledged/responded/resolved (or NULL — shouldn't happen
+        -- post-initiation but treat defensively). No escalation; mark sweep
+        -- completed with no-op outcome.
+        UPDATE public.crisis_sweep_execution
+           SET completed_at             = now(),
+               sweep_cycle_id_committed = v_returning_fencing,    -- using fencing_token as cycle id
+               heartbeat_at             = now()
+         WHERE sweep_execution_id = v_returning_sweep_id
+           AND fencing_token       = v_returning_fencing;          -- guard against takeover during processing
+
+        IF NOT FOUND THEN
+            -- Another worker took over since our claim; abort.
+            RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: lease lost during processing; another worker may have taken over sweep_execution_id %',
+                v_returning_sweep_id
+                USING ERRCODE = '40001';
+        END IF;
+
+        sweep_execution_id := v_returning_sweep_id;
+        fencing_token      := v_returning_fencing;
+        outcome            := 'completed_no_op';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Emit escalation transition via raw writer.
+    PERFORM public.record_crisis_event_lifecycle_transition(
+        p_tenant_id,
+        p_crisis_event_id,
+        v_latest_to_state,
+        v_to_state,
+        v_transition_reason,
+        v_actor_principal_id,
+        NULL  -- transition_payload
+    );
+
+    -- =====================================================================
+    -- §1.3 — STEP F atomic completion
+    --
+    -- Set completed_at + sweep_cycle_id_committed in a single UPDATE,
+    -- guarded by fencing_token to detect lease-takeover races. If the
+    -- UPDATE affects zero rows, another worker took over our claim
+    -- during processing and we must abort without committing.
+    -- =====================================================================
+
+    UPDATE public.crisis_sweep_execution
+       SET completed_at             = now(),
+           sweep_cycle_id_committed = v_returning_fencing,
+           heartbeat_at             = now()
+     WHERE sweep_execution_id = v_returning_sweep_id
+       AND fencing_token       = v_returning_fencing;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: lease lost during processing; another worker may have taken over sweep_execution_id %',
+            v_returning_sweep_id
+            USING ERRCODE = '40001';
+    END IF;
+
+    sweep_execution_id := v_returning_sweep_id;
+    fencing_token      := v_returning_fencing;
+    outcome            := 'completed_escalated';
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+-- =============================================================================
+-- §2 — Function ownership + sweep_wrapper_owner role grants
+-- =============================================================================
+
+ALTER FUNCTION execute_crisis_no_acknowledgement_sweep(TEXT, UUID, INTEGER, TEXT, INTEGER)
+    OWNER TO crisis_sweep_wrapper_owner;
+
+-- sweep_wrapper_owner needs:
+-- - SELECT + UPDATE on crisis_event (SELECT FOR UPDATE parent row)
+-- - INSERT + SELECT + UPDATE on crisis_sweep_execution (claim + take-over + STEP F)
+-- - SELECT on crisis_event_lifecycle_transition (latest-state read)
+-- - EXECUTE on SI-010 helpers
+-- - EXECUTE on raw writer (granted at migration 035 §3 — verified below)
+GRANT SELECT, UPDATE ON crisis_event                       TO crisis_sweep_wrapper_owner;
+GRANT INSERT, SELECT, UPDATE ON crisis_sweep_execution     TO crisis_sweep_wrapper_owner;
+GRANT SELECT ON crisis_event_lifecycle_transition          TO crisis_sweep_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_id()        TO crisis_sweep_wrapper_owner;
+GRANT EXECUTE ON FUNCTION current_actor_account_tenant_id() TO crisis_sweep_wrapper_owner;
+
+-- =============================================================================
+-- §3 — Anti-bypass: EXECUTE granted ONLY to crisis_sweep_scheduler app role
+-- =============================================================================
+
+REVOKE EXECUTE ON FUNCTION execute_crisis_no_acknowledgement_sweep(TEXT, UUID, INTEGER, TEXT, INTEGER) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION execute_crisis_no_acknowledgement_sweep(TEXT, UUID, INTEGER, TEXT, INTEGER) TO crisis_sweep_scheduler;
+
+COMMENT ON FUNCTION execute_crisis_no_acknowledgement_sweep(TEXT, UUID, INTEGER, TEXT, INTEGER) IS
+    'P-040 §3.6 + SI-022 Sub-decision 4 + Sub-decision 6 no-acknowledgement sweep wrapper. '
+    'SECDEF + lease-takeover semantics + fencing-token + STEP F atomic completion. '
+    'Application-layer sweep scheduler invokes this with target obligation generation; '
+    'wrapper claims/takes-over the sweep row, emits escalation if current state warrants, '
+    'and commits completion guarded by fencing_token race detection. Audit emission for '
+    'Cat A crisis.no_acknowledgement_escalation deferred to application layer.';
+
+-- =============================================================================
+-- §4 — Verification
+-- =============================================================================
+
+DO $$
+DECLARE
+    v_target_oid OID := to_regprocedure(
+        'public.execute_crisis_no_acknowledgement_sweep(text, uuid, integer, text, integer)'
+    );
+    v_owner TEXT;
+    v_secdef BOOLEAN;
+    v_proconfig TEXT[];
+    v_specific TEXT;
+    v_grant_count INTEGER;
+BEGIN
+    IF v_target_oid IS NULL THEN
+        RAISE EXCEPTION 'migration-038-function-missing: execute_crisis_no_acknowledgement_sweep() not found by signature';
+    END IF;
+
+    SELECT r.rolname, p.prosecdef, p.proconfig, p.proname || '_' || p.oid::TEXT
+      INTO v_owner, v_secdef, v_proconfig, v_specific
+      FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner
+     WHERE p.oid = v_target_oid;
+
+    IF v_owner <> 'crisis_sweep_wrapper_owner' THEN
+        RAISE EXCEPTION 'migration-038-ownership-mismatch: owner is % but MUST be crisis_sweep_wrapper_owner', v_owner;
+    END IF;
+    IF NOT v_secdef THEN
+        RAISE EXCEPTION 'migration-038-security-definer-missing';
+    END IF;
+    IF v_proconfig IS NULL OR NOT (v_proconfig @> ARRAY['search_path=pg_catalog, public']) THEN
+        RAISE EXCEPTION 'migration-038-search-path-not-locked: proconfig=%', v_proconfig;
+    END IF;
+
+    -- EXECUTE: exactly 1 application-role grantee (crisis_sweep_scheduler), excluding owner-self
+    SELECT COUNT(*) INTO v_grant_count
+      FROM information_schema.role_routine_grants
+     WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee <> 'crisis_sweep_wrapper_owner';
+    IF v_grant_count <> 1 THEN
+        RAISE EXCEPTION 'migration-038-execute-grant-count: expected 1, found %', v_grant_count;
+    END IF;
+    PERFORM 1 FROM information_schema.role_routine_grants
+     WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee = 'crisis_sweep_scheduler';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'migration-038-grant-missing: crisis_sweep_scheduler EXECUTE';
+    END IF;
+    PERFORM 1 FROM information_schema.role_routine_grants
+     WHERE specific_name = v_specific AND privilege_type = 'EXECUTE' AND grantee = 'PUBLIC';
+    IF FOUND THEN
+        RAISE EXCEPTION 'migration-038-anti-bypass: PUBLIC has EXECUTE';
+    END IF;
+
+    -- Wrapper-owner privilege assertions
+    IF NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_event', 'SELECT') THEN
+        RAISE EXCEPTION 'migration-038-table-grant-missing: SELECT on crisis_event';
+    END IF;
+    IF NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_event', 'UPDATE') THEN
+        RAISE EXCEPTION 'migration-038-table-grant-missing: UPDATE on crisis_event (for FOR UPDATE lock)';
+    END IF;
+    IF NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_sweep_execution', 'INSERT')
+       OR NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_sweep_execution', 'SELECT')
+       OR NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_sweep_execution', 'UPDATE') THEN
+        RAISE EXCEPTION 'migration-038-table-grant-missing: INSERT/SELECT/UPDATE on crisis_sweep_execution';
+    END IF;
+    IF NOT has_table_privilege('crisis_sweep_wrapper_owner', 'public.crisis_event_lifecycle_transition', 'SELECT') THEN
+        RAISE EXCEPTION 'migration-038-table-grant-missing: SELECT on crisis_event_lifecycle_transition';
+    END IF;
+    IF NOT has_function_privilege('crisis_sweep_wrapper_owner', 'public.current_actor_account_id()', 'EXECUTE')
+       OR NOT has_function_privilege('crisis_sweep_wrapper_owner', 'public.current_actor_account_tenant_id()', 'EXECUTE') THEN
+        RAISE EXCEPTION 'migration-038-helper-grant-missing';
+    END IF;
+    -- Defensive cross-migration: raw writer EXECUTE
+    IF NOT has_function_privilege(
+        'crisis_sweep_wrapper_owner',
+        'public.record_crisis_event_lifecycle_transition(text, uuid, text, text, text, uuid, jsonb)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'migration-038-raw-writer-grant-missing: migration 035 §3 grant matrix may have drifted';
+    END IF;
+END $$;
+
 
 -- =============================================================================
 -- §7 — Verification assertions (run at migration time; abort if any fail).
@@ -673,3 +1702,326 @@ BEGIN
         v_patient_col_type, v_actor_col_type;
 END;
 $$;
+
+
+-- =============================================================================
+-- §7 -- Replace execute_crisis_no_acknowledgement_sweep (migration 038):
+--      v_actor_principal_id UUID -> TEXT; drop ::UUID cast block (SI-025 P-045).
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION execute_crisis_no_acknowledgement_sweep(
+    p_tenant_id                     TEXT,
+    p_crisis_event_id               UUID,
+    p_target_obligation_generation  INTEGER,
+    p_worker_id                     TEXT,
+    p_claim_ttl_seconds             INTEGER DEFAULT 60
+)
+RETURNS TABLE (
+    sweep_execution_id   UUID,
+    fencing_token        BIGINT,
+    outcome              TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_actor_account_id_text  TEXT;
+    v_actor_principal_id     TEXT;    -- SI-025 P-045: was UUID; no ::UUID cast
+    v_actor_tenant_id        TEXT;
+    v_latest_to_state        TEXT;
+    v_to_state               TEXT;
+    v_transition_reason      TEXT;
+    v_sweep_row              RECORD;
+    v_existing_sweep_id      UUID;
+    v_returning_sweep_id     UUID;
+    v_returning_fencing      BIGINT;
+    v_returning_outcome      TEXT;
+BEGIN
+    -- LAYER B — bind actor (sweep scheduler worker).
+    v_actor_account_id_text := current_actor_account_id();
+    IF v_actor_account_id_text IS NULL THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: no actor account bound'
+            USING ERRCODE = '42501';
+    END IF;
+    -- SI-025 P-045: assign TEXT directly; no ::UUID cast.
+    v_actor_principal_id := v_actor_account_id_text;
+
+    -- LAYER C — tenant scope.
+    v_actor_tenant_id := current_actor_account_tenant_id();
+    IF v_actor_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: no actor tenant bound'
+            USING ERRCODE = '42501';
+    END IF;
+    IF v_actor_tenant_id IS DISTINCT FROM p_tenant_id THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: tenant scope mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+
+    IF p_claim_ttl_seconds <= 0 OR p_claim_ttl_seconds > 600 THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: p_claim_ttl_seconds % out of range [1, 600]', p_claim_ttl_seconds
+            USING ERRCODE = '22023';  -- invalid_parameter_value
+    END IF;
+
+    -- Parent-row lock — serializes concurrent sweep workers + acknowledgement/
+    -- response/resolution wrappers for the same crisis_event.
+    PERFORM 1 FROM public.crisis_event
+     WHERE tenant_id = p_tenant_id AND id = p_crisis_event_id
+       FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: crisis_event % not found for tenant %', p_crisis_event_id, p_tenant_id
+            USING ERRCODE = '02000';
+    END IF;
+
+    -- =====================================================================
+    -- §1.1 — Claim or take-over phase
+    --
+    -- Try to find an open sweep_execution row for this (tenant, event, generation).
+    -- - If exists with claim_expires_at >= now() AND claimed_by_worker_id <> p_worker_id:
+    --     another worker holds a valid lease; reject this attempt (40001 retry-safe).
+    -- - If exists with claim_expires_at < now() OR claim_expires_at IS NULL:
+    --     take over by UPDATEing claimed_by_worker_id + claim_expires_at +
+    --     incrementing fencing_token.
+    -- - If no row exists: INSERT a new claim with fencing_token = 1.
+    -- =====================================================================
+
+    -- R1 HIGH-1 closure 2026-05-22: idempotent replay guard for already-
+    -- completed sweep. A retry after successful completion (or a scheduler
+    -- redelivery of the same generation) must NOT mint a new open row that
+    -- would emit a duplicate escalation. Return the existing completed
+    -- sweep's info with outcome='already_completed' instead.
+    SELECT cse.sweep_execution_id, cse.fencing_token
+      INTO v_existing_sweep_id, v_returning_fencing
+      FROM public.crisis_sweep_execution cse
+     WHERE cse.tenant_id = p_tenant_id
+       AND cse.crisis_event_id = p_crisis_event_id
+       AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+       AND cse.completed_at IS NOT NULL
+     ORDER BY cse.completed_at DESC, cse.sweep_execution_id DESC
+     LIMIT 1;
+    IF v_existing_sweep_id IS NOT NULL THEN
+        sweep_execution_id := v_existing_sweep_id;
+        fencing_token      := v_returning_fencing;
+        outcome            := 'already_completed';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    SELECT sweep_execution_id, claimed_by_worker_id, claim_expires_at, fencing_token, completed_at
+      INTO v_sweep_row
+      FROM public.crisis_sweep_execution
+     WHERE tenant_id = p_tenant_id
+       AND crisis_event_id = p_crisis_event_id
+       AND scheduled_for_obligation_generation = p_target_obligation_generation
+       AND completed_at IS NULL    -- only open rows; partial UNIQUE index allows at most one
+     FOR UPDATE;
+
+    IF FOUND THEN
+        -- Another worker may hold a valid lease.
+        IF v_sweep_row.claim_expires_at IS NOT NULL
+           AND v_sweep_row.claim_expires_at >= now()
+           AND v_sweep_row.claimed_by_worker_id IS DISTINCT FROM p_worker_id THEN
+            RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: sweep_execution_id % for crisis_event % gen % currently leased by worker % until %; retry after expiry',
+                v_sweep_row.sweep_execution_id, p_crisis_event_id, p_target_obligation_generation,
+                v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                USING ERRCODE = '40001';
+        END IF;
+
+        -- Take over the lease (claim expired, or same worker reclaiming).
+        UPDATE public.crisis_sweep_execution
+           SET claimed_by_worker_id = p_worker_id,
+               claim_expires_at     = now() + (p_claim_ttl_seconds || ' seconds')::INTERVAL,
+               fencing_token        = v_sweep_row.fencing_token + 1,
+               heartbeat_at         = now()
+         WHERE sweep_execution_id = v_sweep_row.sweep_execution_id
+         RETURNING sweep_execution_id, fencing_token
+              INTO v_returning_sweep_id, v_returning_fencing;
+        v_returning_outcome := 'claimed_takeover';
+    ELSE
+        -- New claim: insert a fresh row. R2 HIGH-1 closure 2026-05-22:
+        -- two scheduler workers can race for the FIRST claim — both pass the
+        -- completed-row guard + open-row SELECT (no rows exist yet), both
+        -- reach this INSERT. The partial UNIQUE on (tenant, event, generation)
+        -- WHERE completed_at IS NULL allows only one to succeed; the loser
+        -- raises unique_violation. Without a handler, the loser leaks raw
+        -- SQLSTATE 23505. Wrap in EXCEPTION block + re-read winning row to
+        -- determine controlled outcome.
+        BEGIN
+            INSERT INTO public.crisis_sweep_execution (
+                tenant_id, crisis_event_id, scheduled_at,
+                scheduled_for_obligation_generation,
+                claimed_by_worker_id, claim_expires_at,
+                fencing_token, heartbeat_at
+            ) VALUES (
+                p_tenant_id, p_crisis_event_id, now(),
+                p_target_obligation_generation,
+                p_worker_id, now() + (p_claim_ttl_seconds || ' seconds')::INTERVAL,
+                1,    -- initial fencing_token
+                now()
+            )
+            RETURNING crisis_sweep_execution.sweep_execution_id, crisis_sweep_execution.fencing_token
+                 INTO v_returning_sweep_id, v_returning_fencing;
+            v_returning_outcome := 'claimed_new';
+        EXCEPTION
+            WHEN unique_violation THEN
+                -- R4 HIGH-1 closure 2026-05-22: discriminate the violated
+                -- constraint. Only the partial UNIQUE index from migration 033
+                -- §7 (`crisis_sweep_execution_open_uk`) represents a first-claim
+                -- race; any other unique_violation indicates schema drift,
+                -- corruption, or an unrelated integrity failure that MUST be
+                -- re-raised to preserve the real diagnostic — silently
+                -- swallowing it could mask a real bug + drop a required sweep.
+                DECLARE
+                    v_constraint_name TEXT;
+                BEGIN
+                    GET STACKED DIAGNOSTICS v_constraint_name = CONSTRAINT_NAME;
+                    IF v_constraint_name IS DISTINCT FROM 'crisis_sweep_execution_open_uk' THEN
+                        -- Unrelated unique violation; re-raise with diagnostic.
+                        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: unexpected unique_violation on constraint %; not the canonical first-claim race; preserving original failure',
+                            v_constraint_name
+                            USING ERRCODE = '23505';  -- canonical unique_violation
+                    END IF;
+                END;
+
+                -- R3 HIGH-1 closure 2026-05-22: race-loser re-read. The partial
+                -- UNIQUE constraint only enforces uniqueness on OPEN rows, so the
+                -- winning row that just caused our unique_violation MUST be open.
+                -- Re-read OPEN row FIRST + return 40001 lease-conflict if found.
+                -- ONLY if no open row exists (winner finished in the gap before
+                -- we caught the violation) do we fall back to the most-recent
+                -- completed row + return already_completed.
+                SELECT cse.sweep_execution_id, cse.fencing_token, cse.claimed_by_worker_id, cse.claim_expires_at
+                  INTO v_returning_sweep_id, v_returning_fencing,
+                       v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                  FROM public.crisis_sweep_execution cse
+                 WHERE cse.tenant_id = p_tenant_id
+                   AND cse.crisis_event_id = p_crisis_event_id
+                   AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+                   AND cse.completed_at IS NULL;
+                IF FOUND THEN
+                    -- Winner still holds the open lease — return controlled 40001.
+                    RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: concurrent first-claim race lost; sweep_execution_id % currently leased by worker % until %; retry after expiry',
+                        v_returning_sweep_id, v_sweep_row.claimed_by_worker_id, v_sweep_row.claim_expires_at
+                        USING ERRCODE = '40001';
+                END IF;
+
+                -- No open row — winner finished completion in the gap. Find
+                -- the most-recent COMPLETED row (ordered by completed_at DESC,
+                -- not by sweep_execution_id which is UUID and not a recency
+                -- signal) and return already_completed.
+                SELECT cse.sweep_execution_id, cse.fencing_token
+                  INTO v_returning_sweep_id, v_returning_fencing
+                  FROM public.crisis_sweep_execution cse
+                 WHERE cse.tenant_id = p_tenant_id
+                   AND cse.crisis_event_id = p_crisis_event_id
+                   AND cse.scheduled_for_obligation_generation = p_target_obligation_generation
+                   AND cse.completed_at IS NOT NULL
+                 ORDER BY cse.completed_at DESC, cse.sweep_execution_id DESC
+                 LIMIT 1;
+                IF v_returning_sweep_id IS NOT NULL THEN
+                    sweep_execution_id := v_returning_sweep_id;
+                    fencing_token      := v_returning_fencing;
+                    outcome            := 'already_completed';
+                    RETURN NEXT;
+                    RETURN;
+                END IF;
+
+                -- Should be unreachable — unique_violation implies a colliding
+                -- row exists, and we just searched all states.
+                RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: unique_violation re-read found no colliding row — invariant violation; investigate sweep_execution data integrity'
+                    USING ERRCODE = 'XX000';  -- internal_error
+        END;
+    END IF;
+
+    -- =====================================================================
+    -- §1.2 — Lifecycle emission phase
+    --
+    -- Read latest lifecycle state under the parent FOR UPDATE lock. The
+    -- sweep escalates ONLY if current state is detected or escalated.
+    -- Other states (acknowledged/responded/resolved) are no-ops — the
+    -- sweep simply commits with outcome 'completed_no_op'.
+    -- =====================================================================
+
+    SELECT to_state
+      INTO v_latest_to_state
+      FROM public.crisis_event_lifecycle_transition
+     WHERE tenant_id = p_tenant_id AND crisis_event_id = p_crisis_event_id
+     ORDER BY transition_at DESC, id DESC
+     LIMIT 1;
+
+    IF v_latest_to_state = 'detected' THEN
+        -- Triple #2 — detected → escalated (no_acknowledgement_timeout)
+        v_to_state := 'escalated';
+        v_transition_reason := 'no_acknowledgement_timeout';
+    ELSIF v_latest_to_state = 'escalated' THEN
+        -- Triple #3 — escalated → escalated (tier_progression_no_acknowledgement)
+        v_to_state := 'escalated';
+        v_transition_reason := 'tier_progression_no_acknowledgement';
+    ELSE
+        -- Latest is acknowledged/responded/resolved (or NULL — shouldn't happen
+        -- post-initiation but treat defensively). No escalation; mark sweep
+        -- completed with no-op outcome.
+        UPDATE public.crisis_sweep_execution
+           SET completed_at             = now(),
+               sweep_cycle_id_committed = v_returning_fencing,    -- using fencing_token as cycle id
+               heartbeat_at             = now()
+         WHERE sweep_execution_id = v_returning_sweep_id
+           AND fencing_token       = v_returning_fencing;          -- guard against takeover during processing
+
+        IF NOT FOUND THEN
+            -- Another worker took over since our claim; abort.
+            RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: lease lost during processing; another worker may have taken over sweep_execution_id %',
+                v_returning_sweep_id
+                USING ERRCODE = '40001';
+        END IF;
+
+        sweep_execution_id := v_returning_sweep_id;
+        fencing_token      := v_returning_fencing;
+        outcome            := 'completed_no_op';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Emit escalation transition via raw writer.
+    PERFORM public.record_crisis_event_lifecycle_transition(
+        p_tenant_id,
+        p_crisis_event_id,
+        v_latest_to_state,
+        v_to_state,
+        v_transition_reason,
+        v_actor_principal_id,   -- TEXT per SI-025 P-045
+        NULL  -- transition_payload
+    );
+
+    -- =====================================================================
+    -- §1.3 — STEP F atomic completion
+    --
+    -- Set completed_at + sweep_cycle_id_committed in a single UPDATE,
+    -- guarded by fencing_token to detect lease-takeover races. If the
+    -- UPDATE affects zero rows, another worker took over our claim
+    -- during processing and we must abort without committing.
+    -- =====================================================================
+
+    UPDATE public.crisis_sweep_execution
+       SET completed_at             = now(),
+           sweep_cycle_id_committed = v_returning_fencing,
+           heartbeat_at             = now()
+     WHERE sweep_execution_id = v_returning_sweep_id
+       AND fencing_token       = v_returning_fencing;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'execute_crisis_no_acknowledgement_sweep: lease lost during processing; another worker may have taken over sweep_execution_id %',
+            v_returning_sweep_id
+            USING ERRCODE = '40001';
+    END IF;
+
+    sweep_execution_id := v_returning_sweep_id;
+    fencing_token      := v_returning_fencing;
+    outcome            := 'completed_escalated';
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+COMMENT ON FUNCTION execute_crisis_no_acknowledgement_sweep IS
+    'SECURITY DEFINER crisis sweep wrapper (migration 038). SI-025 P-045: v_actor_principal_id changed from UUID to TEXT; ::UUID cast removed.';

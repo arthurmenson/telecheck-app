@@ -196,7 +196,7 @@ import {
  * (allowed by the migration 033 §4 all-or-none CHECK constraint).
  */
 interface PostCrisisEventBody {
-  patient_id?: string;
+  patient_account_id?: string; // SI-025 P-045: was patient_id (UUID); now VARCHAR(26) ULID account_id
   server_signal_id?: string;
   crisis_type?: string;
   severity?: string;
@@ -215,16 +215,23 @@ const VALID_CRISIS_TYPES: ReadonlySet<string> = new Set(CRISIS_TYPES);
 const VALID_SEVERITIES: ReadonlySet<string> = new Set(CRISIS_SEVERITIES);
 
 /**
- * RFC 4122 UUID shape (case-insensitive hex; any variant). Mirrors PR 1
- * `UUID_PATTERN` — both `patient_id` and `server_signal_id` columns on
- * `crisis_event` are UUID per migration 033 §4 (NOT ULID despite some
- * brief drift). Boundary validation catches malformed input before the
- * DB type-cast error path (which would otherwise surface as 500).
+ * RFC 4122 UUID shape for server_signal_id (still UUID per migration 033 §4).
+ * Boundary validation catches malformed input before the DB type-cast error path.
  */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Crockford base32 ULID shape for patient_account_id (SI-025 P-045: was UUID;
+ * now VARCHAR(26) canonical account_id — accounts.account_id VARCHAR(26)).
+ */
+const ULID_PATTERN = /^[0-9A-HJKMNP-TV-Z]{26}$/i;
+
 function isUuidShape(raw: string): boolean {
   return UUID_PATTERN.test(raw);
+}
+
+function isUlidShape(raw: string): boolean {
+  return ULID_PATTERN.test(raw);
 }
 
 function isString(v: unknown): v is string {
@@ -360,8 +367,8 @@ export async function postCrisisEventHandler(
   const body = (req.body ?? {}) as PostCrisisEventBody;
 
   if (
-    !isString(body.patient_id) ||
-    !isUuidShape(body.patient_id) ||
+    !isString(body.patient_account_id) ||
+    !isUlidShape(body.patient_account_id) || // SI-025 P-045: ULID not UUID
     !isString(body.server_signal_id) ||
     !isUuidShape(body.server_signal_id) ||
     !isString(body.crisis_type) ||
@@ -378,7 +385,7 @@ export async function postCrisisEventHandler(
         makeErrorEnvelope(
           req.id,
           'internal.request.invalid',
-          'Invalid initiate body: patient_id (UUID), server_signal_id (UUID), ' +
+          'Invalid initiate body: patient_account_id (26-char ULID account_id), server_signal_id (UUID), ' +
             'crisis_type (6-value enum), severity (3-value enum), ' +
             'regulatory_reporting_enabled (boolean), source_surface ' +
             '(mode_1_chat|community|forms|messaging) are required.',
@@ -393,7 +400,7 @@ export async function postCrisisEventHandler(
   // POST handlers in the codebase.
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
-  const patientId = body.patient_id;
+  const patientId = body.patient_account_id; // SI-025 P-045: ULID account_id
   const serverSignalId = body.server_signal_id;
   const crisisType = body.crisis_type as CrisisType;
   const severity = body.severity as CrisisSeverity;
