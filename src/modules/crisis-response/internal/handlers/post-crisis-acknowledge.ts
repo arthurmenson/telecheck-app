@@ -412,15 +412,15 @@ export async function postCrisisAcknowledgeHandler(
           try {
             return await withDbRole(tx, 'crisis_event_staff_reader', async () => {
               const result = await tx.query<{
-                patient_id: string;
+                patient_account_id: string;
               }>(
-                'SELECT patient_id FROM crisis_event_current_state_v ' +
+                'SELECT patient_account_id FROM crisis_event_current_state_v ' +
                   'WHERE crisis_event_id = $1',
                 [crisisEventIdRaw],
               );
               const row = result.rows[0];
               if (row === undefined) return null;
-              return { patientId: row.patient_id };
+              return { patientId: row.patient_account_id };
             });
           } catch (err) {
             if (

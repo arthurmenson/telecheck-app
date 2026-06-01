@@ -81,7 +81,7 @@ const FAKE_TENANT_CTX = {
 };
 
 const FAKE_CLINICIAN_ACTOR = {
-  accountId: '00000000-0000-4000-8000-000000000001',
+  accountId: '01HTEST0ACT0R000000000000A',
   sessionId: 'sess-fake',
   tenantId: 'Telecheck-US',
   role: 'clinician' as const,
@@ -91,12 +91,12 @@ const FAKE_CLINICIAN_ACTOR = {
   adminHomeTenantId: null,
 };
 
-const VALID_UUID = '11111111-2222-4333-8444-555555555555';
+const VALID_UUID = '11111111-2222-4333-8444-555555555555'; // crisis_event.id is still UUID
 
 const SAMPLE_ROW = {
   crisis_event_id: VALID_UUID,
   tenant_id: 'Telecheck-US',
-  patient_id: '99999999-aaaa-4bbb-8ccc-dddddddddddd',
+  patient_account_id: '01HTEST1PATNT00000000000P0',
   server_signal_id: '88888888-aaaa-4bbb-8ccc-dddddddddddd',
   crisis_type: 'suicidal_ideation',
   severity: 'imminent',
