@@ -610,7 +610,7 @@ BEGIN
             USING ERRCODE = '42501';
     END IF;
     -- SI-025 P-045: TEXT; no ::UUID cast.
-    v_actor_principal_id := v_actor_account_id_text;;
+    v_actor_principal_id := v_actor_account_id_text;
 
     -- LAYER C — tenant scope match.
     v_actor_tenant_id := current_actor_account_tenant_id();
@@ -961,7 +961,7 @@ BEGIN
             USING ERRCODE = '42501';
     END IF;
     -- SI-025 P-045: TEXT; no ::UUID cast.
-    v_actor_principal_id := v_actor_account_id_text;;
+    v_actor_principal_id := v_actor_account_id_text;
 
     -- LAYER C — tenant scope.
     v_actor_tenant_id := current_actor_account_tenant_id();

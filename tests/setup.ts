@@ -188,19 +188,8 @@ async function applyMigrations(client: Client): Promise<void> {
           // Best-effort rollback; original error throws below.
         }
         const message = err instanceof Error ? err.message : String(err);
-        // SI-025 debug: include PostgreSQL position/detail in error message
-        const pgDetail = err as Record<string, unknown>;
-        const extraDetail = [
-          pgDetail['position'] ? `PG_POSITION=${String(pgDetail['position'])}` : null,
-          pgDetail['line'] ? `PG_LINE=${String(pgDetail['line'])}` : null,
-          pgDetail['detail'] ? `PG_DETAIL=${String(pgDetail['detail'])}` : null,
-          pgDetail['hint'] ? `PG_HINT=${String(pgDetail['hint'])}` : null,
-          pgDetail['where'] ? `PG_WHERE=${String(pgDetail['where'])}` : null,
-        ]
-          .filter(Boolean)
-          .join(' | ');
         throw new Error(
-          `Migration ${file} failed (transactional apply+track): ${message}${extraDetail ? ` [${extraDetail}]` : ''}. ` +
+          `Migration ${file} failed (transactional apply+track): ${message}. ` +
             `ROLLBACK issued; tracking row NOT inserted; next session will re-attempt.`,
         );
       }
