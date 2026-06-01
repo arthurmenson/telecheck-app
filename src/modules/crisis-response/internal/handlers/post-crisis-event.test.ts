@@ -116,7 +116,7 @@ const FAKE_TENANT_CTX = {
 };
 
 const FAKE_CLINICIAN_ACTOR = {
-  accountId: '01TESTACTOR0000000ACCOUNTID0',
+  accountId: '01HTEST0ACT0R000000000000A',
   sessionId: 'sess-fake',
   tenantId: 'Telecheck-US',
   role: 'clinician' as const,
@@ -133,7 +133,7 @@ const FAKE_CLINICIAN_ACTOR = {
   crisisInitiatorIdentity: 'clinician' as const,
 };
 
-const VALID_PATIENT_ID = '01TESTPATIENT00000ACCOUNTID0';
+const VALID_PATIENT_ID = '01HTEST0PATNT00000000000P0';
 const VALID_SERVER_SIGNAL_ID = '22222222-3333-4444-8555-666666666666';
 const RETURNED_CRISIS_EVENT_ID = '33333333-4444-4555-8666-777777777777';
 

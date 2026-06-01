@@ -84,7 +84,7 @@ const FAKE_TENANT_CTX = {
 };
 
 const FAKE_CLINICIAN_ACTOR = {
-  accountId: '01TESTACTOR0000000ACCOUNTID0',
+  accountId: '01HTEST0ACT0R000000000000A',
   sessionId: 'sess-fake',
   tenantId: 'Telecheck-US',
   role: 'clinician' as const,
@@ -95,7 +95,7 @@ const FAKE_CLINICIAN_ACTOR = {
 };
 
 const VALID_CRISIS_EVENT_ID = '33333333-4444-4555-8666-777777777777';
-const VALID_PATIENT_ID = '01TESTPATIENT00000ACCOUNTID0';
+const VALID_PATIENT_ID = '01HTEST0PATNT00000000000P0';
 const RETURNED_TRANSITION_ID = '99000000000000123';
 
 interface FakeTx {
@@ -222,7 +222,7 @@ describe('postCrisisRespondHandler §1 — happy path composition', () => {
     expect(tx.query).toHaveBeenCalledTimes(2);
     const [preFetchSql, preFetchParams] = tx.query.mock.calls[0]!;
     expect(preFetchSql).toContain('crisis_event_current_state_v');
-    expect(preFetchSql).toContain('patient_id');
+    expect(preFetchSql).toContain('patient_account_id');
     expect(preFetchParams).toEqual([VALID_CRISIS_EVENT_ID]);
 
     const [wrapperSql, wrapperParams] = tx.query.mock.calls[1]!;
