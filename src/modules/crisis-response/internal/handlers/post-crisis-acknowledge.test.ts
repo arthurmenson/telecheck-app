@@ -93,7 +93,7 @@ const FAKE_TENANT_CTX = {
 };
 
 const FAKE_CLINICIAN_ACTOR = {
-  accountId: '00000000-0000-4000-8000-000000000001',
+  accountId: '01TESTACTOR0000000ACCOUNTID0',
   sessionId: 'sess-fake',
   tenantId: 'Telecheck-US',
   role: 'clinician' as const,
@@ -104,7 +104,7 @@ const FAKE_CLINICIAN_ACTOR = {
 };
 
 const VALID_CRISIS_EVENT_ID = '33333333-4444-4555-8666-777777777777';
-const VALID_PATIENT_ID = '11111111-2222-4333-8444-555555555555';
+const VALID_PATIENT_ID = '01TESTPATIENT00000ACCOUNTID0';
 const RETURNED_TRANSITION_ID = '99000000000000123';
 
 interface FakeTx {
@@ -127,7 +127,7 @@ function makeFakeTx(): FakeTx {
 function installDefaultQueryResponses(tx: FakeTx, fromState = 'detected'): void {
   tx.query
     .mockImplementationOnce(async () => ({
-      rows: [{ patient_id: VALID_PATIENT_ID }],
+      rows: [{ patient_account_id: VALID_PATIENT_ID }],
       rowCount: 1,
     }))
     .mockImplementationOnce(async () => ({
@@ -541,7 +541,7 @@ describe('postCrisisAcknowledgeHandler §8 — 42501 → tenant-blind 403', () =
     tx.query.mockReset();
     tx.query
       .mockImplementationOnce(async () => ({
-        rows: [{ patient_id: VALID_PATIENT_ID, current_state: 'detected' }],
+        rows: [{ patient_account_id: VALID_PATIENT_ID, current_state: 'detected' }],
         rowCount: 1,
       }))
       .mockImplementationOnce(async () => {
@@ -582,7 +582,7 @@ describe('postCrisisAcknowledgeHandler §8 — 42501 → tenant-blind 403', () =
     tx.query.mockReset();
     tx.query
       .mockImplementationOnce(async () => ({
-        rows: [{ patient_id: VALID_PATIENT_ID, current_state: 'detected' }],
+        rows: [{ patient_account_id: VALID_PATIENT_ID, current_state: 'detected' }],
         rowCount: 1,
       }))
       .mockImplementationOnce(async () => {
@@ -628,7 +628,7 @@ describe('postCrisisAcknowledgeHandler §10 — 40001 → tenant-blind 409', () 
     tx.query.mockReset();
     tx.query
       .mockImplementationOnce(async () => ({
-        rows: [{ patient_id: VALID_PATIENT_ID, current_state: 'responded' }],
+        rows: [{ patient_account_id: VALID_PATIENT_ID, current_state: 'responded' }],
         rowCount: 1,
       }))
       .mockImplementationOnce(async () => {

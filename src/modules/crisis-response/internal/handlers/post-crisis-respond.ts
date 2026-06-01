@@ -392,13 +392,13 @@ export async function postCrisisRespondHandler(
         const preFetch = async (): Promise<string | null> => {
           try {
             return await withDbRole(tx, 'crisis_event_staff_reader', async () => {
-              const result = await tx.query<{ patient_id: string }>(
-                'SELECT patient_id FROM crisis_event_current_state_v ' +
+              const result = await tx.query<{ patient_account_id: string }>(
+                'SELECT patient_account_id FROM crisis_event_current_state_v ' +
                   'WHERE crisis_event_id = $1',
                 [crisisEventIdRaw],
               );
               const row = result.rows[0];
-              return row?.patient_id ?? null;
+              return row?.patient_account_id ?? null;
             });
           } catch (err) {
             if (
