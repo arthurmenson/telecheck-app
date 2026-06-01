@@ -122,6 +122,45 @@ export type CrisisLifecycleTransitionReason =
   | 'clinician_resolution';
 
 // ---------------------------------------------------------------------------
+// View row shape — patient-scoped (data-minimized vs staff view)
+// (consumed by `internal/handlers/get-crisis-event-patient-summary.ts`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Row shape returned by `crisis_event_patient_summary_v` (migration 034 §2).
+ * This is the **data-minimized** projection the patient view exposes — fewer
+ * columns than `crisis_event_current_state_v` (the staff projection consumed
+ * by `get-crisis-event.ts`).
+ *
+ * Columns intentionally OMITTED vs the staff view (per migration 034 §2
+ * inline rationale + R1 HIGH-1 column-grant minimization closure 2026-05-22):
+ *   - `server_signal_id` — Mode 1 envelope reference; staff-diagnostic
+ *     concern, not patient-facing.
+ *   - `regulatory_reporting_enabled` — tenant config; patient need-to-know
+ *     is the disposition, not the config flag.
+ *   - `current_state_transition_reason` — operator-internal; patient sees
+ *     state, not who/why operator-side.
+ *   - `current_state_actor_principal_id` — operator-internal.
+ *   - `intake_payload_*` KMS envelope columns — PHI encrypted-at-rest;
+ *     would need decryption + audit emission to expose to patient;
+ *     deferred.
+ *
+ * Nullable `current_state*` reflects the LEFT JOIN LATERAL — see the staff
+ * view's `CrisisEventCurrentStateRow` (in
+ * `internal/handlers/get-crisis-event.ts`) for the same rationale.
+ */
+export interface CrisisEventPatientSummaryRow {
+  crisis_event_id: string;
+  tenant_id: string;
+  patient_account_id: string;
+  crisis_type: CrisisType;
+  severity: CrisisSeverity;
+  detected_at: Date;
+  current_state: CrisisLifecycleState | null;
+  current_state_transition_at: Date | null;
+}
+
+// ---------------------------------------------------------------------------
 // Sweep wrapper outcome — migration 038 §1 RETURNS TABLE
 // ---------------------------------------------------------------------------
 
