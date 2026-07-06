@@ -6,12 +6,13 @@
  * SI-023 §3 normative audit-event enumeration:
  *
  *   1. `admin.dashboard_query_executed`             Cat A (SECDEF read-wrappers)
- *   2. `admin.template_submitted_for_review`        Cat A (THIS PR — Sprint 2 PR 2)
- *   3. `admin.template_review_decision`             Cat A (decision wrapper PR)
+ *   2. `admin.template_submitted_for_review`        Cat A (Sprint 2 PR 2, on `main`)
+ *   3. `admin.template_review_decision`             Cat A (THIS PR — Sprint 2 PR 3)
  *   4. `admin.template_published_via_review_workflow` Cat A (decision approve-path)
  *
- * **PR scope (Sprint 2 PR 2):** only emitter (2) — the submit-for-review
- * Cat A event — is shipped here. Emitters (1), (3), (4) land in the
+ * **PR scope (Sprint 2 PR 3):** emitter (2) landed on `main` with the
+ * submit-for-review handler; THIS PR adds emitter (3) — the
+ * template-review-decision Cat A event. Emitters (1) and (4) land in the
  * companion PRs that mount their respective wrappers. Adding emitters
  * incrementally keeps each PR's blast radius narrow + preserves Codex's
  * ability to review the canonical action-id resolution discipline (no
@@ -76,15 +77,19 @@ import type { TenantId } from '../../lib/glossary.js';
 /**
  * Closed union of unratified `admin.*` action IDs used by this module.
  *
- * **Current population (Sprint 2 PR 2 — submit wrapper):** only
- * `admin.template_submitted_for_review` is enumerated here. The other 3
- * SI-023 §3 cat A action IDs (`admin.dashboard_query_executed`,
- * `admin.template_review_decision`, `admin.template_published_via_review_workflow`)
- * will be added incrementally as their handler PRs land. The union itself
- * is the authoritative inventory of what the canonical AUDIT_EVENTS catalog
- * still owes us.
+ * **Current population (Sprint 2 PR 3 — decision wrapper):**
+ * `admin.template_submitted_for_review` (PR 2, on `main`),
+ * `admin.template_review_decision` (THIS PR), and the approve-path
+ * `admin.template_published_via_review_workflow` (enumerated ahead of its
+ * emitter so the decision handler's publication branch can reference it).
+ * The remaining SI-023 §3 cat A action ID (`admin.dashboard_query_executed`)
+ * is added when its emitter lands. The union itself is the authoritative
+ * inventory of what the canonical AUDIT_EVENTS catalog still owes us.
  */
-type AdminBackendAuditActionPlaceholder = 'admin.template_submitted_for_review';
+type AdminBackendAuditActionPlaceholder =
+  | 'admin.template_submitted_for_review'
+  | 'admin.template_review_decision'
+  | 'admin.template_published_via_review_workflow';
 
 /**
  * adminBackendAuditPlaceholder — single sanctioned `as AuditAction` cast
@@ -174,6 +179,91 @@ export async function emitTemplateSubmittedForReviewAudit(
       forms_template_id: args.formsTemplateId,
       submitter_principal_id: args.submitterPrincipalId,
       path: args.path,
+    },
+    engine_versions: null,
+    ai_workload_type: null,
+    autonomy_level: null,
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(envelope, tx);
+}
+
+// ---------------------------------------------------------------------------
+// admin.template_review_decision (Cat A)
+//
+// Emitted by the Sprint 2 PR 3 handler immediately after the
+// `record_forms_template_admin_decision` SECDEF wrapper returns. Runs in
+// the SAME transaction as the wrapper INSERT so a partial commit cannot
+// leave a `forms_template_admin_review` state-transition (or
+// approve-path publication) without the corresponding audit record
+// (I-003 same-transaction durability).
+//
+// **Payload schema per SI-023 §3 row 3 (`{review_id UUID, forms_template_id UUID,
+// decider_principal_id UUID, decision <approve|reject|request_revision>}`)** plus
+// the `decision_payload` echo (review_notes / required_revisions array
+// per migration 043 §3 wrapper body).
+//
+// **Actor attribution:** the actor identity in this handler is the
+// `admin_template_reviewer` (per SI-023 §5 endpoint #5; distinct slice
+// role from the submit endpoint's `admin_basic_operator`). For v0.1 the
+// `actor_type='operator'` and `actor_id` is the actor-context account id
+// (or 'unknown' fallback per the resolveActorIdForAudit pattern).
+//
+// `target_patient_id` is `null` — template review-decision is a platform-
+// scope governance action (no patient touched); foundation maps null to
+// the 'PLATFORM' hash-chain partition sentinel.
+//
+// `ai_workload_type` / `autonomy_level` remain `null` — review-decision
+// is a deterministic admin-workflow action, not in the I-012 action-
+// class set, per WORKLOAD_TAXONOMY v5.2 nullability rule.
+// ---------------------------------------------------------------------------
+
+export type TemplateReviewDecision = 'approve' | 'reject' | 'request_revision';
+
+export async function emitTemplateReviewDecisionAudit(
+  args: {
+    tenantId: TenantId;
+    reviewId: string;
+    formsTemplateId: string;
+    deciderPrincipalId: string;
+    deciderActorTenantId: string;
+    countryOfCare: string;
+    decision: TemplateReviewDecision;
+    decisionPayload: Record<string, unknown>;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const envelope: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: args.tenantId,
+    actor_type: 'operator',
+    actor_id: args.deciderPrincipalId,
+    actor_tenant_id: args.deciderActorTenantId,
+    target_patient_id: null,
+    delegate_context: null,
+    action: adminBackendAuditPlaceholder('admin.template_review_decision'),
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: 'forms_template_admin_review',
+    resource_id: args.reviewId,
+    detail: {
+      review_id: args.reviewId,
+      forms_template_id: args.formsTemplateId,
+      decider_principal_id: args.deciderPrincipalId,
+      decision: args.decision,
+      decision_payload: args.decisionPayload,
     },
     engine_versions: null,
     ai_workload_type: null,
