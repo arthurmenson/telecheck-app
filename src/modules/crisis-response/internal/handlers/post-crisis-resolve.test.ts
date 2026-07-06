@@ -87,7 +87,7 @@ const FAKE_TENANT_CTX = {
 };
 
 const FAKE_CLINICIAN_ACTOR = {
-  accountId: '00000000-0000-4000-8000-000000000001',
+  accountId: '01HTEST0ACT0R000000000000A',
   sessionId: 'sess-fake',
   tenantId: 'Telecheck-US',
   role: 'clinician' as const,
@@ -98,7 +98,7 @@ const FAKE_CLINICIAN_ACTOR = {
 };
 
 const VALID_CRISIS_EVENT_ID = '33333333-4444-4555-8666-777777777777';
-const VALID_PATIENT_ID = '11111111-2222-4333-8444-555555555555';
+const VALID_PATIENT_ID = '01HTEST0PATNT00000000000P0';
 const RETURNED_TRANSITION_ID = '99000000000000456';
 
 interface FakeTx {
@@ -121,7 +121,7 @@ function makeFakeTx(): FakeTx {
 function installDefaultQueryResponses(tx: FakeTx, fromState: string = 'responded'): void {
   tx.query
     .mockImplementationOnce(async () => ({
-      rows: [{ patient_id: VALID_PATIENT_ID }],
+      rows: [{ patient_account_id: VALID_PATIENT_ID }],
       rowCount: 1,
     }))
     .mockImplementationOnce(async () => ({
@@ -238,7 +238,7 @@ describe('postCrisisResolveHandler §1 — happy path (from_state=responded)', (
     // Pre-fetch selects ONLY patient_id (asserted via the exact SELECT clause
     // rather than a `current_state` substring check — the view name
     // `crisis_event_current_state_v` itself contains that substring).
-    expect(preFetchSql).toContain('SELECT patient_id FROM');
+    expect(preFetchSql).toContain('SELECT patient_account_id FROM');
     const [wrapperSql, wrapperParams] = tx.query.mock.calls[1]!;
     expect(wrapperSql).toContain('record_crisis_resolution');
     expect(wrapperParams).toEqual(['Telecheck-US', VALID_CRISIS_EVENT_ID, null]);
@@ -503,7 +503,7 @@ describe('postCrisisResolveHandler §8 — 42501 → tenant-blind 403', () => {
     tx.query.mockReset();
     tx.query
       .mockImplementationOnce(async () => ({
-        rows: [{ patient_id: VALID_PATIENT_ID, current_state: 'responded' }],
+        rows: [{ patient_account_id: VALID_PATIENT_ID, current_state: 'responded' }],
         rowCount: 1,
       }))
       .mockImplementationOnce(async () => {
@@ -543,7 +543,7 @@ describe('postCrisisResolveHandler §8 — 42501 → tenant-blind 403', () => {
     tx.query.mockReset();
     tx.query
       .mockImplementationOnce(async () => ({
-        rows: [{ patient_id: VALID_PATIENT_ID, current_state: 'responded' }],
+        rows: [{ patient_account_id: VALID_PATIENT_ID, current_state: 'responded' }],
         rowCount: 1,
       }))
       .mockImplementationOnce(async () => {
@@ -589,7 +589,7 @@ describe('postCrisisResolveHandler §10 — 40001 → tenant-blind 409', () => {
     tx.query.mockReset();
     tx.query
       .mockImplementationOnce(async () => ({
-        rows: [{ patient_id: VALID_PATIENT_ID, current_state: 'detected' }],
+        rows: [{ patient_account_id: VALID_PATIENT_ID, current_state: 'detected' }],
         rowCount: 1,
       }))
       .mockImplementationOnce(async () => {

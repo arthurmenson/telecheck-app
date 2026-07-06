@@ -1,19 +1,16 @@
 /**
  * crisis-response/routes.ts — Fastify route registration.
  *
- * Status at v0.4 (Sprint 2): the initiate write-path (PR 2), the
- * acknowledge mid-lifecycle write-path (PR 3), and the respond + resolve
- * mid-lifecycle write-paths (PR 4, this commit's merge) are all mounted
- * alongside the PR 1 staff-scoped read. The remaining Sprint 2 handlers
- * (sweep PR 6; patient-scoped read PR 5) stay parked on sibling
- * [CODEX-PENDING] branches based on `main`; their route mounts + audit
- * emitters union into this file as each lands.
+ * Status at v0.6 (Sprint 2 COMPLETE): all 7 Sprint 2 handlers mounted —
+ * initiate (PR 2), acknowledge (PR 3), respond + resolve (PR 4),
+ * patient-summary (PR 5), sweep (PR 6, this commit), alongside the
+ * PR 1 staff-scoped read.
  *
  * Mounted under plugin prefix `/v0/crisis-events`:
  *   GET    /health                                 — liveness (200)
- *   GET    /ready                                  — readiness (503; remaining
- *                                                    Sprint 2 endpoints not
- *                                                    yet fully mounted)
+ *   GET    /ready                                  — readiness (503; KMS
+ *                                                    envelope + integration
+ *                                                    tests still pending)
  *   POST   /                                       — initiate via SECDEF wrapper
  *                                                    record_crisis_initiation()
  *                                                    + Cat A crisis.detected
@@ -42,13 +39,12 @@
  *                                                    FLOOR-020 fail-closed)
  *                                                    (NEW — Sprint 2 PR 4)
  *
- * Sprint 2 routes still parked on sibling [CODEX-PENDING] branches based on
- * `main` (full surface per SI-022):
- *   POST   /:id/sweep                              — operator-initiated sweep (PR 6)
- *   GET    /:id (patient-scoped variant)           — uses
- *                                                    crisis_event_patient_summary_v
- *                                                    + crisis_event_patient_reader
- *                                                    role (Sprint 2 PR 5)
+ *   POST   /:id/_sweep                            — operator-invoked no-acknowledgement sweep
+ *                                                    via execute_crisis_no_acknowledgement_sweep
+ *                                                    + Cat A crisis.no_acknowledgement_escalation
+ *                                                    (NEW — Sprint 2 PR 6)
+ *
+ * Sprint 2 routes: All 7 handlers now mounted.
  *
  * Spec references:
  *   - SI-022 Crisis Response Slice v1.0
@@ -66,6 +62,7 @@ import { postCrisisAcknowledgeHandler } from './internal/handlers/post-crisis-ac
 import { postCrisisEventHandler } from './internal/handlers/post-crisis-event.js';
 import { postCrisisResolveHandler } from './internal/handlers/post-crisis-resolve.js';
 import { postCrisisRespondHandler } from './internal/handlers/post-crisis-respond.js';
+import { postCrisisSweepHandler } from './internal/handlers/post-crisis-sweep.js';
 
 export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
@@ -76,7 +73,7 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'crisis-response',
-    blocked: 'Crisis Response slice handler implementation (Sprint 2 of 4 at v0.4)',
+    blocked: 'Crisis Response slice handler implementation (Sprint 2 of 4 at v0.6)',
     blocked_message:
       'DB layer COMPLETE through migration 038 (6 tables + 2 views + 6 SECDEF + ' +
       '15 RBAC roles + 18 Codex APPROVE rounds). Sprint 2 PR 1 landed GET ' +
@@ -87,13 +84,13 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
       'PR 4 (this commit) lands POST /v0/crisis-events/:id/respond + /:id/resolve via ' +
       'record_crisis_response() + record_crisis_resolution() + Cat A crisis.responded / ' +
       'crisis.resolved audit emission (all same tx; FLOOR-020 fail-closed). Remaining ' +
-      'Sprint 2 handlers (sweep; GET patient-scoped) + KMS envelope encryption + ' +
+      'Sprint 2 handler (GET patient-scoped) + KMS envelope encryption + ' +
       'integration tests land across follow-up PRs. See ' +
       'src/modules/crisis-response/README.md + docs/crisis-response-implementation-plan.md.',
   }));
 
   // Readiness probe — module is NOT yet fully ready to serve traffic at
-  // v0.4 because the remaining write-path handler (sweep) + patient-scoped
+  // v0.6 — all Sprint 2 handlers mounted; KMS envelope + integration tests
   // read + KMS envelope haven't all landed. Returns 503 (Service
   // Unavailable) to advertise BLOCKED state to load-balancers + deploy
   // gates per the canonical pharmacy / med-interaction / subscription /
@@ -104,12 +101,10 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
       module: 'crisis-response',
       reason: 'write_path_handlers_not_yet_implemented',
       reason_message:
-        'Crisis Response remaining write-path handler (POST /v0/crisis-events/:id/sweep, ' +
-        'parked at PR 6) + patient-scoped read (GET /v0/crisis-events/:id patient variant, ' +
-        'parked at PR 5) + KMS envelope are not yet mounted. Sprint 2 PR 1 landed the ' +
-        'staff-scoped read; PR 2 landed initiate; PR 3 landed acknowledge; PR 4 (this ' +
-        'commit) lands respond + resolve; the /ready probe will return 200 once Sprint 4 ' +
-        '(full audit emission + KMS envelope + cross-tenant tests) closes. See ' +
+        'Crisis Response Sprint 2 is fully mounted (all 7 handlers: ' +
+        'initiate/acknowledge/respond/resolve/staff-read/patient-summary/sweep). ' +
+        'The /ready probe will return 200 once Sprint 4 (KMS envelope + ' +
+        'cross-tenant integration tests) closes. See ' +
         'src/modules/crisis-response/README.md for the resume path.',
     });
   });
@@ -198,4 +193,7 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
   // Returns 200 + { crisis_event_id, lifecycle_transition_id } on
   // success, 400 / 403 / 404 / 409 on mapped failures.
   app.post('/:id/resolve', postCrisisResolveHandler);
+
+  // Sprint 2 PR 6 — operator-invoked no-acknowledgement sweep.
+  app.post('/:id/_sweep', postCrisisSweepHandler);
 };
