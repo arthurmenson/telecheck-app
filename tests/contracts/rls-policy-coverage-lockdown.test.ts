@@ -114,7 +114,14 @@ const TENANT_SCOPED_TABLES = [
   'ccr_configs',
   'consent',
   'consent_versions',
+  'consult', // migration 056 — Async Consult slice (SI-020 / P-038)
+  'consult_clinical_summary', // migration 056 — Async Consult slice
+  'consult_clinician_decision', // migration 056 — Async Consult slice
   'consult_events',
+  'consult_follow_up_message', // migration 056 — Async Consult slice
+  'consult_intake_submission', // migration 056 — Async Consult slice
+  'consult_lifecycle_transition', // migration 056 — Async Consult slice
+  'consult_review_claim', // migration 056 — Async Consult slice
   'consults',
   'crisis_event', // migration 033 — Crisis Response slice
   'crisis_event_lifecycle_transition', // migration 033 — Crisis Response slice
