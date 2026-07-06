@@ -1,7 +1,9 @@
 # Caddy reverse proxy — automatic HTTPS via Let's Encrypt.
-# STAGING_DOMAIN + ACME_EMAIL come from infra/staging/.env via compose.
+# STAGING_DOMAINS + ACME_EMAIL come from infra/staging/.env via compose.
+# STAGING_DOMAINS may be multiple comma-separated hosts (placeholder is
+# expanded before address parsing) — one cert per host, same site config.
 
-{$STAGING_DOMAIN} {
+{$STAGING_DOMAINS} {
 	tls {$ACME_EMAIL}
 
 	# Basic hardening; staging serves synthetic data only, but the posture

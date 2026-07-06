@@ -173,10 +173,65 @@ const SUBDOMAIN_TENANT_MAP: Record<string, SubdomainTenantEntry> = {
   },
 };
 
+/**
+ * Environment-driven hostname overrides for non-production deployments
+ * (staging / preview hosts whose hostnames are not the canonical consumer
+ * subdomains — e.g. `87.99.159.214.sslip.io` on the staging VPS).
+ *
+ * Format: comma-separated `hostname=TenantId` pairs, e.g.
+ *   TENANT_HOST_OVERRIDES=87.99.159.214.sslip.io=Telecheck-US,ghana.87.99.159.214.sslip.io=Telecheck-Ghana
+ *
+ * Overrides can only alias EXISTING canonical tenants (the entry is cloned
+ * from SUBDOMAIN_TENANT_MAP by tenant id) — they cannot mint new tenants,
+ * change country_of_care, or bypass the DB verification step, which still
+ * runs against the aliased tenant id (fail-closed on inactive/unknown).
+ * Invalid pairs throw at module load (boot-time fail-fast: a typo'd
+ * override must never silently fall through to another tenant).
+ */
+export function parseTenantHostOverrides(
+  raw: string | undefined,
+): Record<string, SubdomainTenantEntry> {
+  const overrides: Record<string, SubdomainTenantEntry> = {};
+  if (!raw || raw.trim() === '') return overrides;
+
+  const canonicalById = new Map<string, SubdomainTenantEntry>();
+  for (const entry of Object.values(SUBDOMAIN_TENANT_MAP)) {
+    canonicalById.set(entry.tenantId, entry);
+  }
+
+  for (const pair of raw.split(',')) {
+    const trimmed = pair.trim();
+    if (trimmed === '') continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0 || eq === trimmed.length - 1) {
+      throw new Error(
+        `TENANT_HOST_OVERRIDES: malformed pair "${trimmed}" — expected hostname=TenantId`,
+      );
+    }
+    const hostname = trimmed.slice(0, eq).trim().toLowerCase();
+    const tenantId = trimmed.slice(eq + 1).trim();
+    const canonical = canonicalById.get(tenantId);
+    if (!canonical) {
+      throw new Error(
+        `TENANT_HOST_OVERRIDES: unknown tenant id "${tenantId}" for host "${hostname}" — ` +
+          `must be one of: ${[...canonicalById.keys()].join(', ')}`,
+      );
+    }
+    overrides[hostname] = { ...canonical };
+  }
+  return overrides;
+}
+
+const TENANT_HOST_OVERRIDES: Record<string, SubdomainTenantEntry> = parseTenantHostOverrides(
+  process.env['TENANT_HOST_OVERRIDES'],
+);
+
 function resolveHostFromMap(host: string): SubdomainTenantEntry | null {
   // Strip port if present (e.g., localhost:3000 → localhost)
   const hostname = host.split(':')[0]?.toLowerCase() ?? '';
-  return SUBDOMAIN_TENANT_MAP[hostname] ?? null;
+  // Canonical subdomains win; env overrides only add hostnames, never
+  // shadow the production consumer domains.
+  return SUBDOMAIN_TENANT_MAP[hostname] ?? TENANT_HOST_OVERRIDES[hostname] ?? null;
 }
 
 /**
