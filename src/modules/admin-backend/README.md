@@ -2,45 +2,53 @@
 
 Implementation of **SI-023 Admin Backend Basics Slice v1.0** (RATIFIED 2026-05-22 P-041) + the canonical follow-on **CDM v1.10 → v1.11 Amendment** (RATIFIED 2026-05-22 P-042).
 
-## Status: Sprint 2 PR 2 (this commit) — **SECOND HANDLER MOUNTED; FIRST WRITE HANDLER**
+## Status: Sprint 2 PR 4 (this commit) — **3 of 3 dashboard reads MOUNTED (2 fail-closed pending data sources); all 5 SI-023 §5 endpoints mounted**
 
-The DB layer is **complete** through migration 044. Foundation 051 (Option B app-role acquisition via `src/lib/with-db-role.ts`) merged. **Sprint 2 PR 2 mounts the first WRITE handler + establishes the canonical write composition for the slice**:
+The DB layer is **complete** through migration 044. Foundation 051 (Option B app-role acquisition via `src/lib/with-db-role.ts`) merged. On `main`: Sprint 2 PR 1 shipped the live crisis dashboard + PR 2 shipped the first WRITE handler (submit-for-review) + PR 3 shipped the second WRITE handler (template-review decision). **Sprint 2 PR 4 (this commit) mounts the 2 deferred-wrapper dashboard scaffolds**, completing the 3-dashboard read surface:
 
-- **`GET /v1/admin/dashboards/crisis-operational-health`** (Sprint 2 PR 1) — wraps the SECDEF read function `read_admin_crisis_operational_health` (migration 044 §1). Composes `withTransaction → withTenantContext → withActorContext → withDbRole('admin_basic_operator')` → wrapper call. LAYER B uses the legacy `requireAdminRole` shim pending Sprint 4 RBAC v1.1 wiring. I-027 read-trail satisfied by the wrapper's co-transactional `admin_dashboard_query_execution` INSERT. **No Cat A audit emission** (READ endpoint scope per task brief; `admin.dashboard_query_executed` lands in Sprint 4 hardening).
-- **`POST /v1/admin/templates/:template_id/submit-for-review`** (NEW Sprint 2 PR 2) — wraps the SECDEF write function `submit_forms_template_for_admin_review` (migration 043 §1). Composes `withIdempotentExecution → withTenantContext → withActorContext → withDbRole('admin_basic_operator')` → wrapper call → **same-tx Cat A audit emission under the restored `telecheck_app_role`** (the admin_basic_operator slice role does NOT hold INSERT on audit_records; restoration via withDbRole's finally-block at foundation-051 §R1 HIGH-1 closure is the bridge). Cat A action `admin.template_submitted_for_review` per SI-023 §3 row 2 is emitted via the module-local `adminBackendAuditPlaceholder()` cast helper (action ID is not yet ratified in the canonical AUDIT_EVENTS catalog — see SPEC ISSUE in `admin-backend/audit.ts`). Idempotency-protected via `withIdempotentExecution` per IDEMPOTENCY v5.1 + SI-006 reserve-then-execute. 42501 → tenant-blind 403 mapping wraps the entire `withDbRole` call (R2 MED-1 closure parity with the GET handler).
+- **`GET /v1/admin/dashboards/crisis-operational-health`** (PR 1, on `main`; **LIVE**) — wraps the SECDEF read function `read_admin_crisis_operational_health` (migration 044 §1). Composes `withTransaction → withTenantContext → withActorContext → withDbRole('admin_basic_operator')` → wrapper call. LAYER B uses the legacy `requireAdminRole` shim. I-027 read-trail satisfied by the wrapper's co-transactional `admin_dashboard_query_execution` INSERT.
+- **`POST /v1/admin/templates/:template_id/submit-for-review`** (PR 2, on `main`) — wraps the SECDEF write function `submit_forms_template_for_admin_review` (migration 043 §1). Composes `withIdempotentExecution → withTenantContext → withActorContext → withDbRole('admin_basic_operator')` → wrapper call → **same-tx Cat A audit emission under the restored `telecheck_app_role`**. Cat A action `admin.template_submitted_for_review` per SI-023 §3 row 2 emitted via the module-local `adminBackendAuditPlaceholder()` cast helper. Idempotency-protected via `withIdempotentExecution`. 42501 → tenant-blind 403 mapping wraps the entire `withDbRole` call.
+- **`GET /v1/admin/dashboards/consult-queue-health`** (NEW PR 4; **FAIL-CLOSED 503**) — handler scaffold mirroring the PR 1 composition pipeline. The SECDEF wrapper `read_admin_consult_queue_health` is **deferred** at migration 044 §3 (Async Consult slice not in code repo yet); the wrapper does NOT exist in the DB. The handler runs auth + role gates + the canonical composition; the wrapper SELECT surfaces PG SQLSTATE `42883` (undefined_function) today, mapped to a canonical 503 tenant-blind envelope via `req.server.httpErrors.serviceUnavailable()`. The handler additionally maps `0A000` (feature_not_supported — forward-compat with a possible future intermediate hygiene state where the wrapper exists as a stub) → 503, and `42501` → 403 (mirrors PR 1 R2 MED-1 closure). **Zero handler change required** when the Async Consult slice + matching Option-2 hygiene migration land the view + wrapper.
+- **`GET /v1/admin/dashboards/mode1-volume-health`** (NEW PR 4; **FAIL-CLOSED 503**) — sibling pattern to consult-queue-health; wrapper deferred at migration 044 §4 pending Mode 1 slice. Same fail-closed 503 mapping; same auto-unblock posture.
+- **`POST /v1/admin/templates/:template_id/reviews/:review_id/decision`** (Sprint 2 PR 3, on `main`) — wraps the SECDEF write function `record_forms_template_admin_decision` (migration 043 §3) under the **`admin_template_reviewer`** slice role (distinct from PR 2's `admin_basic_operator`). Composes the same canonical write stack → wrapper call → **same-tx Cat A audit emission** of `admin.template_review_decision` per SI-023 §3 row 3 (via `adminBackendAuditPlaceholder()` — ID not yet AUDIT_EVENTS-ratified). The `decision` enum is `approve | reject | request_revision`. Idempotency via the `Idempotency-Key` header threaded into the wrapper's `p_idempotency_key` (same canonical key per IDEMPOTENCY v5.1). 42501 → tenant-blind 403 mapping wraps the entire `withDbRole` call (R2 MED-1 closure parity).
 
-The remaining 3 of 5 SI-023 §5 endpoints + Cat A audit emission for the other 3 admin.* action IDs + proper LAYER B role-membership check + cross-tenant isolation tests + AUDIT_EVENTS catalog ratification of `admin.*` IDs are tracked in the Sprint 2+ list below.
+**No Cat A audit emission at any of the 3 dashboard reads at this PR** (READ endpoint scope per task brief; `admin.dashboard_query_executed` lands in Sprint 4 hardening). With this PR all 5 SI-023 §5 endpoints are mounted; Cat A audit emission for the remaining admin.* IDs + proper LAYER B role-membership check + cross-tenant isolation tests are tracked in the Sprint 2+ list below.
 
 ### DB layer (PRs 1-5 — already merged on `main`)
 
-| Migration | Lines | Codex APPROVE | What |
-|---|---|---|---|
-| 039 | 167 | round 1 | 12 RBAC roles (2 application + 3 dashboard-wrapper-owner + 2 template-wrapper-owner + 1 raw-writer-owner + 4 view-owner) |
-| 040 | 648 | round 2 | 4 entities + RLS + per-table append-only triggers + unified lifecycle-invariants trigger + one-active-review LAYER 2 (R1 HIGH-1 closure: lock + orphan check) |
-| 041 | 343 | round 4 | 2 derived views (admin_crisis_operational_health_v + forms_template_admin_review_pending_v); 2 deferred (consult + Mode 1 dashboards). R1+R2+R3 closures: base-table grants + runner-independent rollback |
-| 042 | 317 | round 4 | Raw lifecycle writer SECDEF + anti-bypass EXECUTE matrix + BIGSERIAL USAGE (R3 HIGH-1 closure) |
-| 043 | 741 | round 1 | 2 template wrappers (submit + decision); decision-wrapper body verbatim per ratifier P-042 R2 hard-floor item 6 closure on idempotency-ordering |
-| 044 | 366 | round 2 | 1 dashboard read-wrapper (crisis); 2 deferred. R1 MED-1+MED-2 closures: temp-table reentrancy + rollback existence-gates |
-| **Total** | **2,582 SQL** | **14 rounds** | **4 tables + 2 views + 4 SECDEF + 12 RBAC roles** |
+| Migration | Lines         | Codex APPROVE | What                                                                                                                                                                                                      |
+| --------- | ------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 039       | 167           | round 1       | 12 RBAC roles (2 application + 3 dashboard-wrapper-owner + 2 template-wrapper-owner + 1 raw-writer-owner + 4 view-owner)                                                                                  |
+| 040       | 648           | round 2       | 4 entities + RLS + per-table append-only triggers + unified lifecycle-invariants trigger + one-active-review LAYER 2 (R1 HIGH-1 closure: lock + orphan check)                                             |
+| 041       | 343           | round 4       | 2 derived views (admin_crisis_operational_health_v + forms_template_admin_review_pending_v); 2 deferred (consult + Mode 1 dashboards). R1+R2+R3 closures: base-table grants + runner-independent rollback |
+| 042       | 317           | round 4       | Raw lifecycle writer SECDEF + anti-bypass EXECUTE matrix + BIGSERIAL USAGE (R3 HIGH-1 closure)                                                                                                            |
+| 043       | 741           | round 1       | 2 template wrappers (submit + decision); decision-wrapper body verbatim per ratifier P-042 R2 hard-floor item 6 closure on idempotency-ordering                                                           |
+| 044       | 366           | round 2       | 1 dashboard read-wrapper (crisis); 2 deferred. R1 MED-1+MED-2 closures: temp-table reentrancy + rollback existence-gates                                                                                  |
+| **Total** | **2,582 SQL** | **14 rounds** | **4 tables + 2 views + 4 SECDEF + 12 RBAC roles**                                                                                                                                                         |
 
 ### Sprint 2+ remaining work (NOT yet implemented)
 
 **Sprint 2 — Template submit + decision endpoints**
+
 - ✅ `POST /v1/admin/templates/:template_id/submit-for-review` → handler MOUNTED (Sprint 2 PR 2). Wraps `submit_forms_template_for_admin_review()` + emits Cat A `admin.template_submitted_for_review` audit same-tx under the restored app role + idempotency-protected via `withIdempotentExecution`. Unit tests cover composition order + guard precedence + 42501 → tenant-blind 403 mapping + audit payload shape (initial_submission + revision_resubmission paths) + idempotency-wrapper integration.
-- ⏳ `POST /v1/admin/template-reviews/{review_id}/decision` → wraps `record_forms_template_admin_decision()` + Cat A `admin.template_review_decision` + conditional Cat A `admin.template_published_via_review_workflow` (IFF approve)
+- ✅ `POST /v1/admin/templates/:template_id/reviews/:review_id/decision` → handler MOUNTED (Sprint 2 PR 3). Wraps `record_forms_template_admin_decision()` under `admin_template_reviewer` + emits Cat A `admin.template_review_decision` same-tx under the restored app role + idempotency via the `Idempotency-Key` header. Conditional Cat A `admin.template_published_via_review_workflow` (IFF approve) lands when the publication wrapper is exercised. Unit tests cover composition order + guard precedence + decision-enum validation + 42501 → tenant-blind 403 mapping + audit payload shape.
 - ⏳ Integration tests for both happy paths + idempotency-replay regression on decision wrapper
 
-**Sprint 3 — Crisis dashboard endpoint** ✅ partially shipped (Sprint 2 PR 1)
-- ✅ `GET /v1/admin/dashboards/crisis-operational-health` → handler MOUNTED (wraps `read_admin_crisis_operational_health()` via the canonical context-helper composition + Option B `withDbRole('admin_basic_operator')` elevation; unit tests cover the composition order + guard precedence + wrapper-error propagation).
-- ⏳ Cat A `admin.dashboard_query_executed` audit emission — deferred to Sprint 4 hardening (READ endpoint scope at Sprint 2 PR 1 per task brief).
-- ⏳ Integration tests for tenant-isolation cases (cross-tenant read → tenant-blind 02000 / 42501) — pending the foundation-role-acquisition integration test suite landing alongside the per-slice handler PRs (per migration 051 header §"DEFERRED TO FOLLOW-UP PRS").
+**Sprint 3 — Dashboard endpoints** ✅ all 3 reads shipped (PR 1 + PR 4)
+- ✅ `GET /v1/admin/dashboards/crisis-operational-health` (PR 1) → handler MOUNTED (live; wraps `read_admin_crisis_operational_health()` via the canonical context-helper composition + Option B `withDbRole('admin_basic_operator')` elevation; unit tests cover the composition order + guard precedence + 42501 → 403 mapping).
+- ✅ `GET /v1/admin/dashboards/consult-queue-health` (PR 4) → handler MOUNTED (fail-closed 503 scaffold; auth + composition wired; PG `42883` undefined_function + `0A000` feature_not_supported both → 503 tenant-blind; `42501` → 403; unit tests cover all 4 paths + composition order). Auto-unblocks when the Async Consult slice + hygiene migration land the view + wrapper.
+- ✅ `GET /v1/admin/dashboards/mode1-volume-health` (PR 4) → handler MOUNTED (fail-closed 503 scaffold; same pattern as consult-queue-health). Auto-unblocks when the Mode 1 slice lands.
+- ⏳ Cat A `admin.dashboard_query_executed` audit emission — deferred to Sprint 4 hardening (READ endpoint scope per task brief).
+- ⏳ Integration tests for tenant-isolation cases (cross-tenant read → tenant-blind 42501 → 403) — pending the foundation-role-acquisition integration test suite landing alongside the per-slice handler PRs (per migration 051 header §"DEFERRED TO FOLLOW-UP PRS").
 
 **Sprint 4 — Hardening**
+
 - LAYER B role-membership check at Fastify route layer (admin_basic_operator for submit + dashboard; admin_template_reviewer for decision; deferred from SQL wrappers per Option 2)
 - Cross-tenant isolation tests (the wrapper-level LAYER C is one defense; the route-level LAYER B is the other)
 - Fail-closed verification (Cat A audit emission MUST commit co-transactionally with the SECDEF call — single DB transaction wraps both)
 
 **Future Option-2 hygiene cycle (post-pilot v1.1)**
+
 - Land consult + Mode 1 entities → recreate the 2 deferred dashboard views (per migration 041 §2/§3 deferral notes) → recreate the 2 deferred dashboard read-wrappers (per migration 044 §3/§4 deferral notes) → wire the 2 deferred endpoints
 
 ## Module structure (per `src/modules/README.md` template)
