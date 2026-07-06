@@ -42,7 +42,7 @@ hapi() { # method path [json-body]
   fi
 }
 
-jget() { python3 -c "import sys, json; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
+jget() { python -c "import sys, json; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
 
 rand() { openssl rand -base64 48 | tr -d '/+=\n' | cut -c1-"${1:-40}"; }
 
@@ -146,11 +146,11 @@ runcmd:
 EOF
 )"
 
-BODY="$(python3 - "$USER_DATA" <<'PY'
+BODY="$(python - "$USER_DATA" <<'PY'
 import json, sys
 print(json.dumps({
     "name": "telecheck-staging",
-    "server_type": "cx22",
+    "server_type": "cpx21",
     "image": "ubuntu-24.04",
     "location": "ash",
     "ssh_keys": ["telecheck-staging"],
