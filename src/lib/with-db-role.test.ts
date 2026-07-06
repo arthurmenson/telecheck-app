@@ -229,7 +229,7 @@ describe('with-db-role §5 — allowlist composition', () => {
     expect(SLICE_ROLES).toContain('crisis_initiator');
     expect(SLICE_ROLES).toContain('admin_basic_operator');
     expect(SLICE_ROLES).toContain('medication_interaction_engine_evaluator');
-    // Async Consult Sprint 10 PR 6 (migration 055 roles + migration 060 bridge)
+    // Async Consult Sprint 10 PR 6 (migration 055 roles + migration 061 bridge)
     expect(SLICE_ROLES).toContain('async_consult_patient_initiator');
     expect(SLICE_ROLES).toContain('async_consult_delegate_initiator');
     expect(SLICE_ROLES).toContain('async_consult_clinician_reviewer');

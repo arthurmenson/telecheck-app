@@ -1,11 +1,11 @@
 -- =============================================================================
--- File:    migrations/rollback/060_rollback.sql
--- Purpose: Rollback migration 060_async_consult_app_role_bridge.sql.
+-- File:    migrations/rollback/061_rollback.sql
+-- Purpose: Rollback migration 061_async_consult_app_role_bridge.sql.
 --
 --          REVOKEs the 5 async consult application/reader role memberships
 --          from telecheck_app_role. Does NOT touch the 051 foundation
 --          posture (NOINHERIT stays; the 13 original slice-role memberships
---          stay) — 060 was purely additive to the membership set.
+--          stay) — 061 was purely additive to the membership set.
 --
 --          PRE-ROLLBACK CHECK (manual / operator): the /v1/async-consults
 --          Fastify handlers lose their privilege-acquisition mechanism after
@@ -31,7 +31,7 @@ DECLARE
     v_skipped INTEGER := 0;
 BEGIN
     IF to_regrole('telecheck_app_role') IS NULL THEN
-        RAISE NOTICE 'rollback-060-skip: telecheck_app_role does not exist; '
+        RAISE NOTICE 'rollback-061-skip: telecheck_app_role does not exist; '
             'nothing to revoke.';
         RETURN;
     END IF;
@@ -49,7 +49,7 @@ BEGIN
         v_revoked := v_revoked + 1;
     END LOOP;
 
-    RAISE NOTICE 'rollback-060-summary: % revokes applied, % skipped '
+    RAISE NOTICE 'rollback-061-summary: % revokes applied, % skipped '
         '(role-absent or membership-absent)', v_revoked, v_skipped;
 END $$;
 
@@ -75,12 +75,12 @@ BEGIN
         END IF;
         IF pg_has_role('telecheck_app_role', v_role::regrole, 'MEMBER') THEN
             v_residual := v_residual + 1;
-            RAISE WARNING 'rollback-060-incomplete: telecheck_app_role is '
+            RAISE WARNING 'rollback-061-incomplete: telecheck_app_role is '
                 'still a member of %; REVOKE may have failed.', v_role;
         END IF;
     END LOOP;
     IF v_residual = 0 THEN
-        RAISE NOTICE 'rollback-060-verify: clean — no residual async consult '
+        RAISE NOTICE 'rollback-061-verify: clean — no residual async consult '
             'role memberships on telecheck_app_role';
     END IF;
 END $$;

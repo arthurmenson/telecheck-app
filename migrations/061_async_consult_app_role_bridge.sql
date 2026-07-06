@@ -1,5 +1,5 @@
 -- =============================================================================
--- File:    migrations/060_async_consult_app_role_bridge.sql
+-- File:    migrations/061_async_consult_app_role_bridge.sql
 -- Purpose: Bridge the 5 Async Consult application/reader roles (created at
 --          migration 055) into the Option B app-role acquisition foundation
 --          (migration 051) by granting telecheck_app_role NOINHERIT
@@ -52,14 +52,14 @@ DECLARE
 BEGIN
     -- Recipient must exist (foundation-level invariant per 051 §2).
     IF to_regrole('telecheck_app_role') IS NULL THEN
-        RAISE EXCEPTION 'migration-060-precondition-failed: '
+        RAISE EXCEPTION 'migration-061-precondition-failed: '
             'telecheck_app_role does not exist; apply the migration that '
-            'creates the application login role (and 051) before 060.';
+            'creates the application login role (and 051) before 061.';
     END IF;
 
     -- All 5 async-consult roles MUST exist (fail-closed per the 051 R1
     -- MED-1 closure posture — silently skipping missing roles would mark
-    -- 060 applied while leaving the bridge incomplete).
+    -- 061 applied while leaving the bridge incomplete).
     FOREACH v_role IN ARRAY v_slice_roles LOOP
         IF to_regrole(v_role) IS NULL THEN
             v_missing_roles := array_append(v_missing_roles, v_role);
@@ -67,9 +67,9 @@ BEGIN
     END LOOP;
 
     IF array_length(v_missing_roles, 1) > 0 THEN
-        RAISE EXCEPTION 'migration-060-precondition-failed: % of 5 async '
+        RAISE EXCEPTION 'migration-061-precondition-failed: % of 5 async '
             'consult application/reader roles do not exist: %. Apply '
-            'migration 055_async_consult_rbac_roles.sql BEFORE 060, then '
+            'migration 055_async_consult_rbac_roles.sql BEFORE 061, then '
             're-run.',
             array_length(v_missing_roles, 1),
             array_to_string(v_missing_roles, ', ');
@@ -100,7 +100,7 @@ BEGIN
         END LOOP;
     END;
 
-    RAISE NOTICE 'migration-060-summary: % grants applied (PG version %), '
+    RAISE NOTICE 'migration-061-summary: % grants applied (PG version %), '
         '% already-existed skipped (PG15 only); all 5 async consult roles '
         'confirmed present',
         v_granted,
@@ -129,7 +129,7 @@ BEGIN
       FROM pg_roles
      WHERE rolname = 'telecheck_app_role';
     IF v_inherits THEN
-        RAISE EXCEPTION 'migration-060-verification: telecheck_app_role is '
+        RAISE EXCEPTION 'migration-061-verification: telecheck_app_role is '
             'INHERIT; the Option B foundation requires NOINHERIT (051 §1). '
             'Something reverted the foundation posture — do not proceed.';
     END IF;
@@ -137,11 +137,11 @@ BEGIN
     -- (b) telecheck_app_role is a member of all 5 async consult roles.
     FOREACH v_role IN ARRAY v_slice_roles LOOP
         IF NOT pg_has_role('telecheck_app_role', v_role::regrole, 'MEMBER') THEN
-            RAISE EXCEPTION 'migration-060-verification: telecheck_app_role '
+            RAISE EXCEPTION 'migration-061-verification: telecheck_app_role '
                 'is not a member of % after the bridge; GRANT failed.', v_role;
         END IF;
     END LOOP;
 
-    RAISE NOTICE 'migration-060-verify: clean — telecheck_app_role NOINHERIT '
+    RAISE NOTICE 'migration-061-verify: clean — telecheck_app_role NOINHERIT '
         '+ member of all 5 async consult application/reader roles';
 END $$;
