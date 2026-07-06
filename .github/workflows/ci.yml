@@ -84,7 +84,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Clone the spec corpus into a sibling directory so
       # tests/contracts/openapi-conformance.test.ts can resolve
