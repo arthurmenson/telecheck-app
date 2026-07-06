@@ -199,6 +199,22 @@ const ConfigSchema = z.object({
   // Research data partnership (per ADR-028) — Stage 2 gate
   RESEARCH_DATA_PARTNERSHIP_ACTIVE: z.enum(['active', 'inactive']).default('inactive'),
 
+  // Mode 2 case-prep route mount gate. Default OFF in every environment
+  // until (a) clinical-anchor authorization is implemented (clinician
+  // must be on the consult's care team for the named protocol — not
+  // just JWT-role gating); (b) real protocol-engine provider execution
+  // wires the I-012 reject-unless three-clause rule at the downstream
+  // prescribing boundary per State Machines v1.2 §19 §19.X; (c) the
+  // audit-emission discipline per I-019 / I-027 is verified end-to-end
+  // against a live Postgres + real LLM provider. Flipping this to
+  // `'true'` in production WITHOUT all three Day-3+ prerequisites is a
+  // platform-floor violation per Codex PR #210 R1 NEEDS-WORK closure.
+  //
+  // Honest-failure-until-wiring-lands pattern matching the C1 cockpit
+  // precedent: ship the route DEFINED but BEHIND A FLAG so prod can't
+  // reach it; Day-3+ wiring flips the flag.
+  AI_MODE2_ENABLED: z.enum(['false', 'true']).default('false'),
+
   // Resume-token signing secret (Forms/Intake save-and-resume per Slice PRD §8).
   // The forms-intake module's resume-token.ts derives an HMAC-SHA-256 signature
   // over (resume_state_id, tenant_id, expires_at_ms) so a leaked token is
@@ -335,6 +351,37 @@ function loadConfig() {
     );
   }
 
+  // Codex PR #210 R2 HIGH closure (2026-05-24): production fail-fast on
+  // AI_MODE2_ENABLED=true. The handler only has clinician-role JWT
+  // gating + an explicit TODO for clinician-on-care-team / protocol-
+  // eligibility verification (see case-prep.ts §Layer B authorization
+  // TODO(SI-024)). A mistaken or premature production env flip would
+  // expose a known-unauthorized clinical surface. The config layer
+  // enforces the documented production-invariant rather than relying
+  // on operator discipline alone.
+  //
+  // When the three Day-3+ prerequisites land (clinical-anchor auth +
+  // real protocol-engine provider execution + verified audit-emission
+  // discipline end-to-end), this gate is removed in lockstep with the
+  // SI that delivers them — not before. Dev / test / staging remain
+  // permissive so the route's mount semantics can be exercised under
+  // the same config singleton.
+  if (parsed.NODE_ENV === 'production' && parsed.AI_MODE2_ENABLED === 'true') {
+    throw new Error(
+      'AI_MODE2_ENABLED must remain "false" in production. The Mode 2 case-prep ' +
+        'handler at v0.1 has clinician-role JWT gating but lacks (a) clinical-anchor ' +
+        'authorization (clinician-on-care-team-for-named-protocol — see ' +
+        'src/modules/ai-service/internal/handlers/case-prep.ts TODO(SI-024)), ' +
+        '(b) real protocol-engine provider execution wiring the I-012 reject-unless ' +
+        'three-clause rule at the downstream prescribing boundary per State Machines ' +
+        'v1.2 §19 §19.X, and (c) verified end-to-end audit-emission discipline per ' +
+        'I-019 / I-027 against a live Postgres + real LLM provider. The flag may be ' +
+        'flipped in dev / test / staging to exercise the mount path, but production ' +
+        'rollout blocks until the SI that delivers all three prerequisites removes ' +
+        'this gate in lockstep (Codex PR #210 R2 HIGH closure).',
+    );
+  }
+
   return {
     nodeEnv: parsed.NODE_ENV,
     port: parsed.PORT,
@@ -370,6 +417,7 @@ function loadConfig() {
       ENABLE_FULLY_AUTONOMOUS: false as const,
     },
     researchDataPartnershipActive: parsed.RESEARCH_DATA_PARTNERSHIP_ACTIVE === 'active',
+    aiMode2Enabled: parsed.AI_MODE2_ENABLED === 'true',
     resumeTokenSecret,
   } as const;
 }

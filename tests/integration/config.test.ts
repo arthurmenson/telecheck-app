@@ -71,6 +71,7 @@ interface FreshConfigModule {
     aws: { region: string; drRegion: string; bedrockRegion: string };
     featureFlags: Readonly<Record<string, false>>;
     researchDataPartnershipActive: boolean;
+    aiMode2Enabled: boolean;
     resumeTokenSecret: string;
   };
 }
@@ -645,5 +646,81 @@ describe('config — AWS region defaults (ADR-026 us-east-1 primary)', () => {
     vi.stubEnv('AWS_REGION', 'eu-west-1');
     const fresh = await loadFreshConfig();
     expect(fresh.config.aws.region).toBe('eu-west-1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §14 — AI_MODE2_ENABLED (Mode 2 case-prep route mount gate)
+//
+// Codex PR #210 R1 + R2 closure (2026-05-24): the Mode 2 case-prep route
+// is DEFINED but config-gated. Default OFF in every environment. R2 HIGH
+// adds a production fail-fast: setting AI_MODE2_ENABLED=true in
+// NODE_ENV=production throws at startup because the handler at v0.1 lacks
+// clinical-anchor authorization, real protocol-engine provider execution,
+// and verified end-to-end audit-emission discipline. Dev / test / staging
+// remain permissive so the mount path is exercisable.
+// ---------------------------------------------------------------------------
+
+describe('config — AI_MODE2_ENABLED (Mode 2 case-prep mount gate)', () => {
+  it('§14a default (unset) → false (route stays unmounted)', async () => {
+    applyBaseline();
+    const fresh = await loadFreshConfig();
+    expect(fresh.config.aiMode2Enabled).toBe(false);
+  });
+
+  it('§14b "false" → false (explicit-default parity)', async () => {
+    applyBaseline();
+    vi.stubEnv('AI_MODE2_ENABLED', 'false');
+    const fresh = await loadFreshConfig();
+    expect(fresh.config.aiMode2Enabled).toBe(false);
+  });
+
+  it('§14c "true" in NODE_ENV=test → true (dev/test/staging permissive)', async () => {
+    applyBaseline();
+    vi.stubEnv('NODE_ENV', 'test');
+    vi.stubEnv('AI_MODE2_ENABLED', 'true');
+    const fresh = await loadFreshConfig();
+    expect(fresh.config.aiMode2Enabled).toBe(true);
+  });
+
+  it('§14d "true" in NODE_ENV=development → true (permissive)', async () => {
+    applyBaseline();
+    vi.stubEnv('NODE_ENV', 'development');
+    vi.stubEnv('AI_MODE2_ENABLED', 'true');
+    const fresh = await loadFreshConfig();
+    expect(fresh.config.aiMode2Enabled).toBe(true);
+  });
+
+  it('§14e "true" in NODE_ENV=production → THROWS (production fail-fast per R2 HIGH closure)', async () => {
+    applyBaseline();
+    vi.stubEnv('NODE_ENV', 'production');
+    // Production additionally requires DATABASE_SSL_MODE=require + a
+    // non-trivial RESUME_TOKEN_SECRET + JWT_SIGNING_KEY + bind-pool URL
+    // — set them all so the AI_MODE2_ENABLED gate is what surfaces, not
+    // a different production-only fail-fast.
+    vi.stubEnv('DATABASE_SSL_MODE', 'require');
+    vi.stubEnv('BIND_ACTOR_CONTEXT_DATABASE_URL', 'postgres://bind:bind@localhost:5432/z');
+    vi.stubEnv('RESUME_TOKEN_SECRET', 'x'.repeat(48));
+    vi.stubEnv('JWT_SIGNING_KEY', 'y'.repeat(48));
+    vi.stubEnv('AI_MODE2_ENABLED', 'true');
+    await expectLoadConfigToThrow(/AI_MODE2_ENABLED must remain "false" in production/);
+  });
+
+  it('§14f "false" in NODE_ENV=production → does NOT throw (production stays gated off)', async () => {
+    applyBaseline();
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('DATABASE_SSL_MODE', 'require');
+    vi.stubEnv('BIND_ACTOR_CONTEXT_DATABASE_URL', 'postgres://bind:bind@localhost:5432/z');
+    vi.stubEnv('RESUME_TOKEN_SECRET', 'x'.repeat(48));
+    vi.stubEnv('JWT_SIGNING_KEY', 'y'.repeat(48));
+    vi.stubEnv('AI_MODE2_ENABLED', 'false');
+    const fresh = await loadFreshConfig();
+    expect(fresh.config.aiMode2Enabled).toBe(false);
+  });
+
+  it('§14g invalid value (e.g., "yes") → throws (Zod enum rejects)', async () => {
+    applyBaseline();
+    vi.stubEnv('AI_MODE2_ENABLED', 'yes');
+    await expectLoadConfigToThrow(/AI_MODE2_ENABLED/);
   });
 });
