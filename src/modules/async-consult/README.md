@@ -4,11 +4,22 @@ Implementation of **Async Consult Slice PRD v1.0** (Canonical for development).
 
 This module owns the platform's asynchronous consult primitive — patient-initiated intake, clinician review, prescription / advice / referral / decline branches, and the patient-responds follow-up cycle. Per the slice PRD, async consult is the first non-blocked clinical workflow on the platform: it does not depend on real-time scheduling (which Sync Video Consult handles) and is the entry point for the Mode 2 protocol-execution agent (per ADR-002, preserved at v1.0 active levels per ADR-029).
 
-## Status: implementation-complete at v1.0 (Sprint 33-34 close, 2026-05-08)
+## Status: DUAL SURFACE — legacy /v0 complete + Sprint 10 /v1 core handlers landed (PR 6)
 
-All 6 functional routes mounted under `/v0/async-consult` (plus `/health` and `/ready`) are implemented end-to-end with HTTP-level integration tests, service-layer direct integration tests, cross-tenant isolation tests, and (post-Sprint 33-34) idempotency-replay regression on state-changing handlers.
+**Two route surfaces are mounted by `plugin.ts`:**
 
-Sprint 33 PR-F-prep migrated 5 handlers to the reserve-then-execute idempotency pattern. Sprint 34 PR #51 added comprehensive HTTP integration tests + closed a handler bug where `InvalidTransitionError` and `UnsupportedTransitionError` leaked as 500 responses (now mapped to tenant-blind 409 per I-025) — 4 Codex rounds (r1→r4) including a CI-revealed handler bug closure.
+1. **`/v0/async-consult` (legacy; implementation-complete at v1.0, Sprint 33-34 close 2026-05-08).** All 6 functional routes against the migration 020 `consults` + `consult_events` tables, with HTTP-level integration tests, service-layer direct integration tests, cross-tenant isolation tests, and idempotency-replay regression on state-changing handlers. Sprint 33 PR-F-prep migrated 5 handlers to the reserve-then-execute idempotency pattern. Sprint 34 PR #51 added comprehensive HTTP integration tests + closed a handler bug where `InvalidTransitionError` and `UnsupportedTransitionError` leaked as 500 responses (now mapped to tenant-blind 409 per I-025) — 4 Codex rounds (r1→r4) including a CI-revealed handler bug closure.
+
+2. **`/v1/async-consults` (Sprint 10 canonical surface; PR 6).** The P-038 canonical entity chain (migrations 055 roles → 056 entities → 057 caller-class views → 058 raw lifecycle writer → 059 SECDEF wrappers → 060 app-role bridge). Six core endpoints per OpenAPI v0.4: initiate / intake / queue / get / claim / decision — all under the canonical composition (withIdempotentExecution or withTransaction → withTenantContext → withActorContext → withDbRole(`async_consult_*` slice role) → SQL → same-tx `async_consult.*` audit emission per AUDIT_EVENTS v5.11 under the restored app role), 42501 → tenant-blind 403 (I-025), Idempotency-Key on all POSTs (IDEMPOTENCY v5.1).
+
+**v1-surface hardening still open (why `/ready` stays 503):**
+- Delegate-initiated flows fail closed (403 + documented TODO in `initiate-consult-v1.ts`) pending a delegate-principal binding primitive from the Consent slice. The read path DOES honor delegates (the migration 057 patient-view predicate authorizes active `book_consults` delegations).
+- `record_consult_ai_preparation_completed` (migration 059 §3) is not exposed — wrapper EXECUTE is owner-only until the AI-service slice role is wired.
+- `reassign_consult_claim` (migration 059 §5) is not exposed — admin surface; lands with the admin-backend follow-on PR.
+- KMS envelopes for intake payload + decision rationale are accepted PRE-ENCRYPTED from an internal service boundary (crisis precedent; see `internal/handlers/v1-shared.ts`); app-side envelope encryption is a hardening follow-on.
+- Live-PostgreSQL integration tests for the v1 endpoints are pending (unit tests per handler shipped with PR 6).
+- SPEC ISSUE: the 17 `async_consult.*` audit action IDs are ratified in AUDIT_EVENTS v5.11 but not yet enumerated in `src/lib/audit.ts` — module-local placeholder casts per the med-interaction precedent (see `audit.ts` §Sprint 10).
+- Claim TTL defaults to 30 minutes pending a CCR-resolved key (TODO in `claim-consult-v1.ts`).
 
 ## Module structure (per `src/modules/README.md` template)
 
@@ -43,6 +54,17 @@ async-consult/
 | POST | `/:id/resume` | `resumeConsultHandler` | patient resumes an abandoned consult before expiry (idempotency-protected) |
 | POST | `/:id/patient-responds` | `patientRespondsConsultHandler` | patient responds to clinician request for additional data (idempotency-protected) |
 | GET | `/:id/events` | `listConsultEventsHandler` | list lifecycle events for a consult |
+
+## Routes (under `/v1/async-consults` — Sprint 10 canonical surface, PR 6)
+
+| Method | Path | Handler | Description |
+|---|---|---|---|
+| POST | `/` | `initiateConsultV1Handler` | patient initiates a consult (`record_consult_initiation`; Cat C `async_consult.initiated`) |
+| POST | `/:consult_id/intake` | `submitIntakeV1Handler` | intake submission with pre-encrypted KMS envelope (`record_consult_intake_submission`; Cat C `async_consult.intake_submitted`) |
+| GET | `/queue` | `getQueueV1Handler` | staff review queue from `async_consult_staff_summary_v` (paginated; staff callers only) |
+| GET | `/:consult_id` | `getConsultV1Handler` | caller-class-routed read (patient/delegate → patient view; staff → staff view; tenant-blind 404) |
+| POST | `/:consult_id/claim` | `claimConsultV1Handler` | clinician claim (`claim_consult_for_review`; 55006 → 409 `claim_already_held`; Cat B auto-release + Cat C `async_consult.case_claimed`) |
+| POST | `/:consult_id/decision` | `recordDecisionV1Handler` | clinician decision (`record_consult_clinician_decision`; Cat A `async_consult.clinician_decision_recorded` [+ `prescribing_recorded` / `rationale_disagreement` per decision shape]) |
 
 ## State vocabulary (17 canonical states from State Machines v1.1 §3)
 
@@ -104,3 +126,5 @@ The handler `mapServiceError` extension to map `InvalidTransitionError` + `Unsup
 - Sprints 9-10 (TLC-021 / TLC-022) — repos + service + state-machine + initial HTTP handlers; full HTTP integration + audit/domain emitters + cross-tenant isolation tests
 - Sprint 33 PR-F-prep — reserve-then-execute idempotency migration (5 handlers)
 - Sprint 34 PR #51 — comprehensive HTTP integration tests + handler `InvalidTransitionError` 500-leak fix (4 Codex rounds)
+- Sprint 10 (P-038 cadence) PRs 1-5 — canonical DB layer (migrations 055-059: roles, entities, caller-class views, raw lifecycle writer, 6 SECDEF wrappers)
+- Sprint 10 PR 6 — /v1/async-consults core handler surface (initiate / intake / queue / get / claim / decision) + migration 060 app-role bridge + per-handler unit tests

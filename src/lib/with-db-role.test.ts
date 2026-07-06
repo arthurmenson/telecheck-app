@@ -11,7 +11,7 @@
  * against a live PostgreSQL with migration 051 applied land in a
  * separate `tests/integration/foundation-role-acquisition.test.ts`
  * (separate PR or future commit; requires TEST_DATABASE_URL + the
- * 13 slice roles + telecheck_app_role present).
+ * 18 slice roles + telecheck_app_role present).
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -223,12 +223,18 @@ describe('with-db-role §4 — callback throw propagation + restore-on-throw', (
 });
 
 describe('with-db-role §5 — allowlist composition', () => {
-  it('SLICE_ROLES contains all 7 Crisis + 2 Admin + 4 Med-Interaction = 13 roles', () => {
-    expect(SLICE_ROLES).toHaveLength(13);
+  it('SLICE_ROLES contains all 7 Crisis + 2 Admin + 4 Med-Interaction + 5 Async-Consult = 18 roles', () => {
+    expect(SLICE_ROLES).toHaveLength(18);
     // Spot-check one from each slice
     expect(SLICE_ROLES).toContain('crisis_initiator');
     expect(SLICE_ROLES).toContain('admin_basic_operator');
     expect(SLICE_ROLES).toContain('medication_interaction_engine_evaluator');
+    // Async Consult Sprint 10 PR 6 (migration 055 roles + migration 060 bridge)
+    expect(SLICE_ROLES).toContain('async_consult_patient_initiator');
+    expect(SLICE_ROLES).toContain('async_consult_delegate_initiator');
+    expect(SLICE_ROLES).toContain('async_consult_clinician_reviewer');
+    expect(SLICE_ROLES).toContain('async_consult_patient_reader');
+    expect(SLICE_ROLES).toContain('async_consult_staff_reader');
   });
 
   it('SLICE_ROLES does NOT contain wrapper-owner / view-owner / writer-owner roles', () => {
@@ -242,6 +248,15 @@ describe('with-db-role §5 — allowlist composition', () => {
       'emission_wrapper_owner',
       'lifecycle_transition_writer_owner',
       'mv_refresh_owner',
+      // Async Consult (migration 055 §2 wrapper-owner / view-owner identities)
+      'consult_lifecycle_transition_writer_owner',
+      'consult_initiation_wrapper_owner',
+      'consult_intake_wrapper_owner',
+      'consult_ai_preparation_wrapper_owner',
+      'consult_claim_wrapper_owner',
+      'record_consult_decision_wrapper_owner',
+      'async_consult_view_owner',
+      'async_consult_mv_refresh_owner',
     ];
     for (const role of forbidden) {
       expect(SLICE_ROLES as readonly string[]).not.toContain(role);
