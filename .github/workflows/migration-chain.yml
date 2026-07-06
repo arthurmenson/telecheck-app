@@ -68,7 +68,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # ubuntu-latest ships the postgresql-client (psql); install only if absent
       # so the gate is robust to future runner-image changes.
