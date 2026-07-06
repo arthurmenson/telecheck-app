@@ -62,7 +62,7 @@ afterAll(async () => {
 });
 
 describe('med-interaction slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/med-interaction/health returns 200 (liveness — module alive) with Sprint 1 skeleton metadata', async () => {
+  it('§1a GET /v0/med-interaction/health returns 200 (liveness — module alive) with PR 8 partial-wiring metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/med-interaction/health',
@@ -78,32 +78,25 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     expect(body.status).toBe('ok');
     expect(body.module).toBe('med-interaction');
     expect(body.blocked).toContain('Sprint 1 of N');
-    // PR 7: first real handler shipped post-foundation-051.
-    expect(body.blocked).toContain('PR 7 of N');
+    // PR 8: first write handlers + Cat A audit emission pattern shipped.
+    expect(body.blocked).toContain('PR 8 of N');
     // Post-P-033/P-034 ratification — blocker is implementation, NOT
     // unratified spec.
     expect(body.blocked_message).toContain('Spec layer COMPLETE');
     expect(body.blocked_message).toContain('P-033');
     expect(body.blocked_message).toContain('P-034');
-    // Post-PR-5: DB layer COMPLETE through migration 050. Anti-drift guard
-    // for the merged-PR count (Codex R1 finding 2026-05-23): only PRs 1-5
-    // of the DB-layer series are merged; PR 6 is the scaffold-update
-    // commit; PR 7 (this commit) is the first real handler post-foundation-
-    // 051. The forbidden-substring check below catches drift on the
-    // DB-layer count.
+    // DB layer COMPLETE through migration 050.
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 050');
-    expect(body.blocked_message).toContain('PRs 1-5 merged');
-    expect(body.blocked_message).not.toContain('6 PRs merged');
-    // PR 7 anti-drift: the blocker payload MUST advertise the first real
-    // handler shipped + the Option B composition reference + the
-    // remaining-7-endpoints count. If a future PR ships more handlers
+    // PR 8 anti-drift: the blocker payload MUST advertise the 3 write
+    // handlers shipped + the Option 2 carryforward composition reference +
+    // the remaining-4-endpoints count. If a future PR ships more handlers
     // without updating this payload, this assertion fails fast.
-    expect(body.blocked_message).toContain('GET /v0/med-interaction/signals/:id');
-    expect(body.blocked_message).toContain('withDbRole(medication_interaction_signal_viewer)');
-    expect(body.blocked_message).toContain('7 endpoints remain');
+    expect(body.blocked_message).toContain('GET /signals/:id');
+    expect(body.blocked_message).toContain('withDbRole(medication_interaction_engine_evaluator)');
+    expect(body.blocked_message).toContain('4 endpoints remain');
   });
 
-  it('§1b GET /v0/med-interaction/ready returns 503 (handlers not yet mounted) with implementation-pending reason', async () => {
+  it('§1b GET /v0/med-interaction/ready returns 503 (partial_handlers_wired — 4 of 8 mounted) with implementation-pending reason', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/med-interaction/ready',
@@ -118,15 +111,14 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     }>();
     expect(body.status).toBe('unavailable');
     expect(body.module).toBe('med-interaction');
-    // PR 7 (this commit) bumps the reason from `handlers_not_yet_implemented`
-    // to `partial_handlers_wired` — 1 of 8 handlers is now live but the
-    // slice as a whole is still not production-ready (audit emission
-    // helper + Layer B tightening + remaining 7 endpoints all pending).
-    // /ready stays 503 until the full PR series closes per the
+    // PR 8 keeps the reason `partial_handlers_wired` — 4 of 8 handlers are
+    // now live (PR 7 read + PR 8's 3 writes) but the slice as a whole is
+    // still not production-ready (Layer B tightening + remaining 4 endpoints
+    // pending). /ready stays 503 until the full PR series closes per the
     // Crisis-Response / Admin-Backend scaffold convention.
     expect(body.reason).toBe('partial_handlers_wired');
-    expect(body.reason_message).toContain('1 of 8');
+    expect(body.reason_message).toContain('4 of 8');
     expect(body.reason_message).toContain('GET /v0/med-interaction/signals/:id');
-    expect(body.reason_message).toContain('migration 048');
+    expect(body.reason_message).toContain('migration 050');
   });
 });

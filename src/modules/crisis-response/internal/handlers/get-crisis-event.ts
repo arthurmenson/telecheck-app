@@ -171,7 +171,7 @@ function isUuidShape(raw: string): boolean {
 export interface CrisisEventCurrentStateRow {
   crisis_event_id: string;
   tenant_id: string;
-  patient_id: string;
+  patient_account_id: string;
   server_signal_id: string;
   crisis_type: CrisisType;
   severity: CrisisSeverity;
@@ -281,7 +281,7 @@ export async function getCrisisEventHandler(
         try {
           return await withDbRole(tx, 'crisis_event_staff_reader', async () => {
             const result = await tx.query<CrisisEventCurrentStateRow>(
-              'SELECT crisis_event_id, tenant_id, patient_id, server_signal_id, ' +
+              'SELECT crisis_event_id, tenant_id, patient_account_id, server_signal_id, ' +
                 'crisis_type, severity, regulatory_reporting_enabled, detected_at, ' +
                 'current_state, current_state_transition_at, ' +
                 'current_state_transition_reason, current_state_actor_principal_id ' +

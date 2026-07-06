@@ -1,19 +1,24 @@
 /**
  * admin-backend/routes.ts — Fastify route registration.
  *
- * Status at v0.3 (Sprint 2 PR 2 — this commit): SECOND HANDLER MOUNTED;
- * first WRITE handler post-foundation-051.
+ * Status at v0.3 (Sprint 2 PR 3 — this commit): THIRD HANDLER MOUNTED;
+ * second WRITE handler post-foundation-051.
  *
  *   - GET  /dashboards/crisis-operational-health    (Sprint 2 PR 1)
  *     wraps the SECDEF read wrapper read_admin_crisis_operational_health
  *     from migration 044 §1.
- *   - POST /templates/:template_id/submit-for-review (NEW Sprint 2 PR 2)
- *     wraps the SECDEF write wrapper submit_forms_template_for_admin_review
- *     from migration 043 §1. First WRITE handler for the slice;
- *     establishes the canonical write composition (withIdempotentExecution
- *     → withTenantContext → withActorContext → withDbRole(admin_basic_operator)
- *     → wrapper call → same-tx Cat A audit emission under restored
- *     app role).
+ *   - POST /templates/:template_id/submit-for-review (Sprint 2 PR 2,
+ *     already merged on `main`) wraps the SECDEF write wrapper
+ *     submit_forms_template_for_admin_review from migration 043 §1.
+ *     First WRITE handler for the slice; establishes the canonical write
+ *     composition (withIdempotentExecution → withTenantContext →
+ *     withActorContext → withDbRole(admin_basic_operator) → wrapper call
+ *     → same-tx Cat A audit emission under restored app role).
+ *   - POST /templates/:template_id/reviews/:review_id/decision
+ *     (NEW Sprint 2 PR 3) wraps the SECDEF write wrapper
+ *     record_forms_template_admin_decision from migration 043 §3 under the
+ *     admin_template_reviewer slice role; same-tx Cat A audit emission
+ *     (admin.template_review_decision).
  *
  *   - /health (200) + /ready (still 503 until full Sprint 2-4 work
  *     closes — see /ready body for the remaining-blockers list).
@@ -23,13 +28,13 @@
  *   /v1/admin/health
  *   /v1/admin/ready
  *   /v1/admin/dashboards/crisis-operational-health
- *   /v1/admin/templates/:template_id/submit-for-review   ← NEW
+ *   /v1/admin/templates/:template_id/submit-for-review
+ *   /v1/admin/templates/:template_id/reviews/:review_id/decision   ← NEW
  *
  * Sprint 2+ routes still pending (NOT mounted yet; per SI-023 §5 + CDM
- * v1.10 → v1.11 Amendment §4 endpoint list, 3 of 5 endpoints remain):
+ * v1.10 → v1.11 Amendment §4 endpoint list, 2 of 5 endpoints remain):
  *   GET    /dashboards/consult-queue-health        (deferred per Option 2)
  *   GET    /dashboards/mode1-volume-health         (deferred per Option 2)
- *   POST   /template-reviews/{review_id}/decision
  *
  * Spec references:
  *   - SI-023 Admin Backend Basics Slice v1.0 (RATIFIED 2026-05-22 P-041)
@@ -44,6 +49,7 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import { getCrisisOperationalHealthHandler } from './internal/handlers/get-crisis-operational-health.js';
+import { postFormsTemplateDecisionHandler } from './internal/handlers/post-forms-template-decision.js';
 import { postFormsTemplateSubmitHandler } from './internal/handlers/post-forms-template-submit.js';
 
 export const registerAdminBackendRoutes: FastifyPluginAsync = async (
@@ -140,4 +146,19 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   //     SI-006 reserve-then-execute).
   // -------------------------------------------------------------------------
   app.post('/templates/:template_id/submit-for-review', postFormsTemplateSubmitHandler);
+
+  // -------------------------------------------------------------------------
+  // POST /v1/admin/templates/:template_id/reviews/:review_id/decision
+  //   (Sprint 2 PR 3 — second WRITE handler)
+  //
+  // Reviewer-decision endpoint per SI-023 §5 row 5. Calls SECDEF wrapper
+  // record_forms_template_admin_decision from migration 043 §3 under the
+  // admin_template_reviewer slice role (distinct from PR 2's
+  // admin_basic_operator). Emits Cat A audit
+  // admin.template_review_decision per SI-023 §3 row 3, same-tx with the
+  // wrapper INSERT (I-003 durability). Idempotency via Idempotency-Key
+  // header + the wrapper's internal p_idempotency_key parameter (both
+  // resolved from the same canonical key per IDEMPOTENCY v5.1).
+  // -------------------------------------------------------------------------
+  app.post('/templates/:template_id/reviews/:review_id/decision', postFormsTemplateDecisionHandler);
 };
