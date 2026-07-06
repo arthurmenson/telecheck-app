@@ -3,7 +3,7 @@
 **Raised by:** Engineering (autonomous turn 2026-05-14)
 **Date raised:** 2026-05-14
 **Severity:** high
-**Status:** **OPEN — v0.19 DRAFT** (Codex R18 HIGH ×1 closed: tenant-scoped composite FK invariant made explicit for every cross-table relationship per ADR-023 + PROJECT_CONVENTIONS r5 §1.1; pre-ratification gate continues. Trajectory at R18.)
+**Status:** **RATIFIED 2026-07-06 (P-046)** — Evans chat-message ratification; implementation landed migrations 060+
 **Target spec doc (proposed):** `Telecheck_Canonical_Data_Model_v1_2.md` (headers will govern v1.4; on-disk filename retains the `v1_2.md` legacy pattern per v1.10 cycle convention)
 **Target slice PRD:** `Telecheck_Pharmacy_Refill_Slice_PRD_v2_1.md` (canonical references §4.17 + §4.18 + §4.19 post-promotion)
 **Companion SIs:** SI-001 (MedicationRequest schema gap — CLOSED 2026-05-11 via P-011) — same pattern, expanded scope
@@ -489,3 +489,12 @@ The autonomous-turn discipline preserved from SI-001: **never author canonical s
   - Codex finding-class shift: R16/R17 were canonical-name dup; R18 is a new class (cross-tenant attack vector via plain FKs). The asymptote pattern hasn't yet hit: each round is finding a real, distinct issue. SI-007's wider surface (3 entities + 2 cross-entity handoffs + tenant-scoped FK fan-out) compared to SI-001 (1 entity) explains the longer trajectory.
 - **Convergence call posture:** R19+ rounds will be continued if findings remain substantive (architectural / contract / invariant class). Convergence is called when Codex either (a) returns a non-`needs-attention` verdict, OR (b) produces 3 consecutive rounds of doc-polish-only findings.
 - **Next:** v0.20 after Codex R19 review.
+
+---
+
+## Ratifier decision (2026-07-06)
+
+- **Approved as v0.19.** Evans chat-message ratification 2026-07-06; the v0.19 content above (three entity schemas §4.17/§4.18/§4.19, state machines + allowed-transition tables, cross-entity handoff + cancellation + coordination rules, audit/domain event enumerations, tenant-scoped composite FK invariant per R18) is the RATIFIED canonical content.
+- **Promotion Ledger entry: P-046.** The historical P-013 target proposed in this SI resolves to P-046 (intermediate P-NUMs were consumed by other cycles between the 2026-05-14 raise and ratification).
+- **Registry bump: v2.29 → v2.30.**
+- **Implementation:** DB layer landed as `migrations/060_pharmacy_refill_entities.sql` (+ rollback companion) — `refills` + `dispensings` + `shipments` with RLS ENABLE+FORCE, tenant-scoped composite FKs, SI CHECK constraints, and business-final append-only guard triggers. SI-to-repo Option-2 adaptations (id VARCHAR(26), TEXT tenant_id, deferred FKs for subscriptions / pharmacy_locations / attachments, adapter_configs composite-UNIQUE fix-forward, handler-layer I-012 evidence enforcement) are recorded in the migration 060 header. Repo/service/handler PRs follow per Step 2.

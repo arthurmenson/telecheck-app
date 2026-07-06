@@ -1,0 +1,92 @@
+# Telecheck staging stack — single-VPS pre-go-live test environment.
+#
+# Topology mirrors the production shape at toy scale: the app container is
+# the SAME image the AWS deploy will run; PostgreSQL 16 with full role/RLS
+# freedom (the migration chain creates ~40 NOLOGIN roles + SECURITY DEFINER
+# functions — managed-PG free tiers restrict this; owning the instance
+# avoids the whole class of permission surprises); Redis for cache/queues;
+# Caddy terminates TLS with automatic Let's Encrypt.
+#
+# Usage (on the VPS, from the repo root):
+#   cp infra/staging/.env.example infra/staging/.env   # then edit
+#   docker compose -f infra/staging/docker-compose.yml --env-file infra/staging/.env up -d --build
+#   docker compose -f infra/staging/docker-compose.yml exec app bash scripts/apply-migrations.sh
+#
+# See infra/staging/STAGING_RUNBOOK.md for full provisioning steps.
+
+name: telecheck-staging
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-telecheck}
+      POSTGRES_USER: ${POSTGRES_USER:-telecheck}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in infra/staging/.env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telecheck} -d ${POSTGRES_DB:-telecheck}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # NOT exposed to the host network; app + migrations reach it on the
+    # compose network. For operator psql access use:
+    #   docker compose exec db psql -U telecheck telecheck
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATABASE_URL: postgres://${POSTGRES_USER:-telecheck}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-telecheck}
+      REDIS_URL: redis://redis:6379
+      # App-specific secrets/flags come from the env file (see .env.example);
+      # NEVER commit real values — infra/staging/.env is gitignored.
+    env_file:
+      - .env
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      STAGING_DOMAIN: ${STAGING_DOMAIN:?set in infra/staging/.env}
+      ACME_EMAIL: ${ACME_EMAIL:?set in infra/staging/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+
+volumes:
+  pgdata:
+  redisdata:
+  caddydata:
+  caddyconfig:
