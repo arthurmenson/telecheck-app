@@ -20,12 +20,20 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    # TLS on: the app boots NODE_ENV=production, whose config gate requires
+    # DATABASE_SSL_MODE=require (src/lib/config.ts); pg-init-ssl.sh generates
+    # a self-signed cert on first boot (rejectUnauthorized:false app-side).
+    command: >
+      postgres -c ssl=on
+               -c ssl_cert_file=/var/lib/postgresql/server.crt
+               -c ssl_key_file=/var/lib/postgresql/server.key
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-telecheck}
       POSTGRES_USER: ${POSTGRES_USER:-telecheck}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in infra/staging/.env}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./pg-init-ssl.sh:/docker-entrypoint-initdb.d/00-ssl.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telecheck} -d ${POSTGRES_DB:-telecheck}"]
       interval: 5s
@@ -61,8 +69,13 @@ services:
       NODE_ENV: production
       PORT: "3000"
       DATABASE_URL: postgres://${POSTGRES_USER:-telecheck}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-telecheck}
+      DATABASE_SSL_MODE: require
+      # SI-010 dedicated bind pool — authenticates as bind_actor_context_role
+      # (LOGIN role from migration 031; password provisioned by deploy.sh
+      # post-migration ALTER ROLE step).
+      BIND_ACTOR_CONTEXT_DATABASE_URL: postgres://bind_actor_context_role:${BIND_ROLE_PASSWORD}@db:5432/${POSTGRES_DB:-telecheck}
       REDIS_URL: redis://redis:6379
-      # App-specific secrets/flags come from the env file (see .env.example);
+      # Remaining secrets/flags come from the env file (see .env.example);
       # NEVER commit real values — infra/staging/.env is gitignored.
     env_file:
       - .env

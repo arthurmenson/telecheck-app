@@ -29,6 +29,13 @@ done
 echo ">> apply migrations"
 "${COMPOSE[@]}" exec -T app bash scripts/apply-migrations.sh
 
+echo ">> provision SI-010 bind-pool credentials (idempotent)"
+# migration 031 creates bind_actor_context_role LOGIN without a password;
+# the operator provisions credentials post-migration (031 header §Role).
+source infra/staging/.env
+"${COMPOSE[@]}" exec -T db psql -U "${POSTGRES_USER:-telecheck}" -d "${POSTGRES_DB:-telecheck}" -q -c \
+  "ALTER ROLE bind_actor_context_role WITH LOGIN PASSWORD '${BIND_ROLE_PASSWORD}';"
+
 echo ">> restart app (pick up schema)"
 "${COMPOSE[@]}" restart app
 

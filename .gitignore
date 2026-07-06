@@ -65,3 +65,5 @@ secrets/
 src/generated/
 *.tmp
 infra/staging/.env
+infra/staging/.keys/
+infra/staging/.env.provisioned
