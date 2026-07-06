@@ -2,9 +2,10 @@
  * admin-backend/routes.ts — Fastify route registration.
  *
  * Status at v0.3 (Sprint 2 cascade): the crisis-operational-health read
- * (PR 1) + the submit-for-review write (PR 2) are mounted on `main`; this
- * commit (Sprint 2 PR 4) additionally mounts the two remaining dashboard
- * reads as FAIL-CLOSED 503 scaffolds pending their data-source landings.
+ * (PR 1) + the submit-for-review write (PR 2) + the review-decision write
+ * (PR 3) are mounted on `main`; this commit (Sprint 2 PR 4) additionally
+ * mounts the two remaining dashboard reads as FAIL-CLOSED 503 scaffolds
+ * pending their data-source landings.
  *
  *   - GET  /dashboards/crisis-operational-health    (Sprint 2 PR 1; LIVE)
  *     wraps the SECDEF read wrapper read_admin_crisis_operational_health
@@ -16,6 +17,11 @@
  *     → withTenantContext → withActorContext → withDbRole(admin_basic_operator)
  *     → wrapper call → same-tx Cat A audit emission under restored
  *     app role).
+ *   - POST /templates/:template_id/reviews/:review_id/decision
+ *     (Sprint 2 PR 3) wraps the SECDEF write wrapper
+ *     record_forms_template_admin_decision from migration 043 §3 under the
+ *     admin_template_reviewer slice role; same-tx Cat A audit emission
+ *     (admin.template_review_decision).
  *   - GET /dashboards/consult-queue-health (NEW Sprint 2 PR 4;
  *     FAIL-CLOSED 503 pending Async Consult slice). Handler scaffold
  *     mirrors the crisis-dashboard composition pipeline; auth + role
@@ -35,12 +41,12 @@
  *   /v1/admin/ready
  *   /v1/admin/dashboards/crisis-operational-health
  *   /v1/admin/templates/:template_id/submit-for-review
+ *   /v1/admin/templates/:template_id/reviews/:review_id/decision
  *   /v1/admin/dashboards/consult-queue-health           ← NEW (fail-closed)
  *   /v1/admin/dashboards/mode1-volume-health            ← NEW (fail-closed)
  *
- * Sprint 2+ routes still pending (NOT mounted yet; per SI-023 §5 + CDM
- * v1.10 → v1.11 Amendment §4 endpoint list, 1 of 5 endpoints remains):
- *   POST   /template-reviews/{review_id}/decision
+ * With this PR all 5 SI-023 §5 endpoints are mounted (the 2 dashboard
+ * reads fail-closed pending their data-source landings per Option 2).
  *
  * Spec references:
  *   - SI-023 Admin Backend Basics Slice v1.0 (RATIFIED 2026-05-22 P-041)
@@ -56,6 +62,7 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import { getConsultQueueHealthHandler } from './internal/handlers/get-consult-queue-health.js';
 import { getCrisisOperationalHealthHandler } from './internal/handlers/get-crisis-operational-health.js';
 import { getMode1VolumeHealthHandler } from './internal/handlers/get-mode1-volume-health.js';
+import { postFormsTemplateDecisionHandler } from './internal/handlers/post-forms-template-decision.js';
 import { postFormsTemplateSubmitHandler } from './internal/handlers/post-forms-template-submit.js';
 
 export const registerAdminBackendRoutes: FastifyPluginAsync = async (
@@ -145,6 +152,21 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   //     SI-006 reserve-then-execute).
   // -------------------------------------------------------------------------
   app.post('/templates/:template_id/submit-for-review', postFormsTemplateSubmitHandler);
+
+  // -------------------------------------------------------------------------
+  // POST /v1/admin/templates/:template_id/reviews/:review_id/decision
+  //   (Sprint 2 PR 3 — second WRITE handler)
+  //
+  // Reviewer-decision endpoint per SI-023 §5 row 5. Calls SECDEF wrapper
+  // record_forms_template_admin_decision from migration 043 §3 under the
+  // admin_template_reviewer slice role (distinct from PR 2's
+  // admin_basic_operator). Emits Cat A audit
+  // admin.template_review_decision per SI-023 §3 row 3, same-tx with the
+  // wrapper INSERT (I-003 durability). Idempotency via Idempotency-Key
+  // header + the wrapper's internal p_idempotency_key parameter (both
+  // resolved from the same canonical key per IDEMPOTENCY v5.1).
+  // -------------------------------------------------------------------------
+  app.post('/templates/:template_id/reviews/:review_id/decision', postFormsTemplateDecisionHandler);
 
   // -------------------------------------------------------------------------
   // Sprint 2 PR 4 — DEFERRED-WRAPPER dashboard handler scaffolds.

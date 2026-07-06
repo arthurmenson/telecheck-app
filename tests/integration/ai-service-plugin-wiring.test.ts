@@ -61,12 +61,13 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
       autonomy_levels_reserved: string[];
       handlers_wired: boolean;
       handlers_wired_tracking: string;
-      mode_1_chat_handler_mounted: boolean;
-      mode_2_case_prep_handler_mounted: boolean;
+      mode2_case_prep_mounted: boolean;
+      mode2_case_prep_mount_gate: string;
+      mode2_case_prep_day3_prerequisites: string[];
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('mode_1_chat_mounted');
+    expect(body.phase).toBe('crisis_gate_wired_pr_f');
     // Per AI_LAYERING v5.2 §10.2 + WORKLOAD_TAXONOMY v5.2 §2, the v1.0
     // active workload types are exactly `conversational_assistant` +
     // `protocol_execution`. Reserved types must be enumerated so a
@@ -82,20 +83,28 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     ]);
     expect(body.autonomy_levels_at_v1).toEqual(['advisory', 'suggestion', 'action_with_confirm']);
     expect(body.autonomy_levels_reserved).toEqual(['action_with_audit_only', 'fully_autonomous']);
-    // Mode 1 chat is mounted; Mode 2 case-prep is the sole un-mounted
-    // documented handler, so the full-surface rollup stays false.
-    expect(body.mode_1_chat_handler_mounted).toBe(true);
-    expect(body.mode_2_case_prep_handler_mounted).toBe(false);
-    expect(body.handlers_wired).toBe(false);
-    // Tracking must point at the genuinely-remaining work (PR C / Mode 2
-    // case-prep) only — provider (PR D), guardrails (PR E), and the
-    // crisis gate (PR F) are all wired, so they must NOT be listed as
-    // pending. This is the anti-drift assertion.
-    expect(body.handlers_wired_tracking).toContain('PR C');
+    // Mode 1 chat handler is mounted (PR G); Mode 2 case-prep is
+    // CONFIG-GATED (PR #210 R1 NEEDS-WORK closure) — DEFINED but only
+    // mounted when AI_MODE2_ENABLED=true. handlers_wired remains
+    // descriptively true (Mode 1 path exists) and tracking text reflects
+    // the per-mode mount state honestly per R2 MEDIUM closure.
+    expect(body.handlers_wired).toBe(true);
+    expect(body.handlers_wired_tracking).toContain('Mode 1 chat');
     expect(body.handlers_wired_tracking).toContain('Mode 2 case-prep');
-    expect(body.handlers_wired_tracking).not.toContain('PR D');
-    expect(body.handlers_wired_tracking).not.toContain('PR E');
-    expect(body.handlers_wired_tracking).not.toContain('PR F');
+    // R2 MEDIUM closure: when the flag is off, the tracking string must
+    // agree with mode2_case_prep_mounted=false — it must NOT claim Mode 2
+    // is mounted.
+    expect(body.handlers_wired_tracking).toContain('AI_MODE2_ENABLED');
+    expect(body.handlers_wired_tracking).toContain('404');
+    // Honest startup-state introspection: default config keeps Mode 2
+    // case-prep route DEFINED but NOT mounted. Day-3+ wiring flips it.
+    expect(body.mode2_case_prep_mounted).toBe(false);
+    expect(body.mode2_case_prep_mount_gate).toBe('AI_MODE2_ENABLED');
+    expect(body.mode2_case_prep_day3_prerequisites).toEqual([
+      'clinical_anchor_authorization (clinician-on-care-team-for-named-protocol)',
+      'real_protocol_provider_execution (I-012 reject-unless three-clause at prescribing boundary)',
+      'verified_audit_emission_discipline (I-019 + I-027 end-to-end against live Postgres + real LLM provider)',
+    ]);
   });
 
   it('§1b GET /v0/ai/ready returns 503 (not ready for traffic) while scaffold PR A is the latest', async () => {
@@ -111,19 +120,29 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
       phase: string;
       pending: string;
       pending_message: string;
+      mode2_case_prep_mounted: boolean;
+      mode2_case_prep_mount_gate: string;
     }>();
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('ai-service');
-    expect(body.phase).toBe('mode_1_chat_mounted');
-    expect(body.pending).toContain('PR C');
-    // Anti-drift: Mode 2 case-prep (PR C) is the only pending handler;
-    // provider/guardrails/crisis (PR D/E/F) are wired and must not be
-    // listed as pending.
-    expect(body.pending).not.toContain('PR D');
-    expect(body.pending).not.toContain('PR F');
-    expect(body.pending_message).toContain('not yet ready');
+    expect(body.phase).toBe('crisis_gate_wired_pr_f');
+    // Codex PR #210 R1 NEEDS-WORK closure: /ready honestly reports
+    // Mode 2 case-prep mount state. Default-OFF flag means the route
+    // is DEFINED but not registered; production rollout flips the
+    // flag only after the three Day-3+ prerequisites land.
+    expect(body.mode2_case_prep_mounted).toBe(false);
+    expect(body.mode2_case_prep_mount_gate).toBe('AI_MODE2_ENABLED');
+    expect(body.pending).toContain('AI_MODE2_ENABLED');
+    expect(body.pending_message).toContain('NOT yet production-ready');
     expect(body.pending_message).toContain('conversational_assistant');
     expect(body.pending_message).toContain('protocol_execution');
+    // R2 MEDIUM closure: pending_message must agree with
+    // mode2_case_prep_mounted=false (no "Mode 2 ... MOUNTED" claim).
+    // It MUST say the route is DEFINED but not mounted.
+    expect(body.pending_message).toContain('DEFINED but NOT mounted');
+    expect(body.pending_message).not.toMatch(
+      /Mode 2 case-prep \(POST \/v0\/ai\/case-prep\) is MOUNTED/,
+    );
     // Per CLAUDE.md hard-rule: post-P-011 the schema is ratified;
     // pending_message must not claim otherwise.
     expect(body.pending_message).not.toContain('schema not yet ratified');
@@ -187,16 +206,18 @@ describe('ai-service slice — §1 plugin wiring (PR A scaffold)', () => {
     expect(r.statusCode).toBe(401);
   });
 
-  it('§1e POST /v0/ai/case-prep is NOT mounted at PR C — Fastify returns 404', async () => {
-    // Per Codex PR B R2 CRITICAL closure 2026-05-14 (applied to Mode 2
-    // by analogy at PR C), the Mode 2 case-prep route is deliberately
-    // NOT registered. Mode 2 inputs (clinician-supplied symptoms,
-    // patient notes) may contain crisis text that must trip the
-    // I-019 platform-floor detector + audit + escalation. The route
-    // is gated until PR F lands crisis detection AND the protocol-
-    // engine integration ships (the I-012 reject-unless three-clause
-    // rule at the downstream prescribing boundary per State Machines
-    // v1.2 §19 §19.X depends on it).
+  it('§1e POST /v0/ai/case-prep is NOT mounted by default — AI_MODE2_ENABLED=false gates the route', async () => {
+    // Per Codex PR #210 R1 NEEDS-WORK closure (2026-05-24): the Mode 2
+    // case-prep route is DEFINED in source but config-gated behind
+    // `AI_MODE2_ENABLED`. The default ('false') keeps the route
+    // unregistered with Fastify, so a POST yields the documented 404.
+    //
+    // Day-3+ wiring flips the flag to 'true' AFTER all three
+    // prerequisites land: (a) clinical-anchor authorization, (b) real
+    // protocol-engine provider execution wiring I-012, (c) verified
+    // audit-emission discipline end-to-end per I-019 + I-027. Until
+    // then, production MUST keep AI_MODE2_ENABLED=false — honest-
+    // failure-until-wiring-lands pattern matching cockpit C1 precedent.
     //
     // Same Idempotency-Key trick as §1d so the route-not-found 404
     // surfaces instead of being shadowed by the idempotency-plugin's
