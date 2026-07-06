@@ -52,7 +52,7 @@ afterAll(async () => {
 });
 
 describe('async-consult slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/async-consult/health returns 200 (liveness — module alive) with Sprint 8 skeleton metadata', async () => {
+  it('§1a GET /v0/async-consult/health returns 200 (liveness — module alive) with Sprint 10 dual-surface metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/async-consult/health',
@@ -67,12 +67,13 @@ describe('async-consult slice — §1 plugin wiring', () => {
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('async-consult');
-    expect(body.blocked).toContain('Async Consult slice authoring');
-    expect(body.blocked).toContain('Sprint 1 of 3');
-    expect(body.blocked_message).toContain('skeleton state');
+    expect(body.blocked).toContain('Async Consult slice hardening');
+    expect(body.blocked).toContain('Sprint 10 PR 6');
+    expect(body.blocked_message).toContain('/v1/async-consults');
+    expect(body.blocked_message).toContain('migrations 055-060');
   });
 
-  it('§1b GET /v0/async-consult/ready returns 503 (not ready for traffic) while slice in skeleton state', async () => {
+  it('§1b GET /v0/async-consult/ready returns 503 (not ready for traffic) while v1-surface hardening is open', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/async-consult/ready',
@@ -87,7 +88,24 @@ describe('async-consult slice — §1 plugin wiring', () => {
     }>();
     expect(body.status).toBe('not_ready');
     expect(body.module).toBe('async-consult');
-    expect(body.blocked).toContain('Async Consult slice authoring');
-    expect(body.blocked_message).toContain('not ready to serve traffic');
+    expect(body.blocked).toContain('Async Consult slice hardening');
+    expect(body.blocked_message).toContain('not ready to serve production traffic');
+  });
+
+  it('§1c the Sprint 10 /v1/async-consults surface is mounted (all 6 core routes registered)', () => {
+    // Route-presence assertions only — behavior is covered by the
+    // per-handler unit tests + the (CI-gated) integration suite.
+    expect(app!.hasRoute({ method: 'POST', url: '/v1/async-consults/' })).toBe(true);
+    expect(app!.hasRoute({ method: 'GET', url: '/v1/async-consults/queue' })).toBe(true);
+    expect(app!.hasRoute({ method: 'GET', url: '/v1/async-consults/:consult_id' })).toBe(true);
+    expect(app!.hasRoute({ method: 'POST', url: '/v1/async-consults/:consult_id/intake' })).toBe(
+      true,
+    );
+    expect(app!.hasRoute({ method: 'POST', url: '/v1/async-consults/:consult_id/claim' })).toBe(
+      true,
+    );
+    expect(app!.hasRoute({ method: 'POST', url: '/v1/async-consults/:consult_id/decision' })).toBe(
+      true,
+    );
   });
 });
