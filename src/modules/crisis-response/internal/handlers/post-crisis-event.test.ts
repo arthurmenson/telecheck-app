@@ -116,7 +116,7 @@ const FAKE_TENANT_CTX = {
 };
 
 const FAKE_CLINICIAN_ACTOR = {
-  accountId: '00000000-0000-4000-8000-000000000001',
+  accountId: '01HTEST0ACT0R000000000000A',
   sessionId: 'sess-fake',
   tenantId: 'Telecheck-US',
   role: 'clinician' as const,
@@ -133,13 +133,13 @@ const FAKE_CLINICIAN_ACTOR = {
   crisisInitiatorIdentity: 'clinician' as const,
 };
 
-const VALID_PATIENT_ID = '11111111-2222-4333-8444-555555555555';
+const VALID_PATIENT_ID = '01HTEST0PATNT00000000000P0';
 const VALID_SERVER_SIGNAL_ID = '22222222-3333-4444-8555-666666666666';
 const RETURNED_CRISIS_EVENT_ID = '33333333-4444-4555-8666-777777777777';
 
 function validBody(overrides?: Record<string, unknown>): Record<string, unknown> {
   return {
-    patient_id: VALID_PATIENT_ID,
+    patient_account_id: VALID_PATIENT_ID, // SI-025 P-045
     server_signal_id: VALID_SERVER_SIGNAL_ID,
     crisis_type: 'suicidal_ideation',
     severity: 'imminent',
@@ -370,8 +370,8 @@ describe('postCrisisEventHandler §3 — crisis_initiator slice-role gate preced
 describe('postCrisisEventHandler §4 — body validation precedes idempotency wrap', () => {
   it.each<[string, Record<string, unknown> | undefined]>([
     ['missing body entirely (undefined)', undefined],
-    ['missing patient_id', validBody({ patient_id: undefined })],
-    ['non-UUID patient_id', validBody({ patient_id: 'not-a-uuid' })],
+    ['missing patient_account_id', validBody({ patient_account_id: undefined })],
+    ['non-ULID patient_account_id', validBody({ patient_account_id: 'not-a-ulid' })],
     ['missing server_signal_id', validBody({ server_signal_id: undefined })],
     ['non-UUID server_signal_id', validBody({ server_signal_id: 'NOT_A_UUID_AT_ALL' })],
     ['missing crisis_type', validBody({ crisis_type: undefined })],
