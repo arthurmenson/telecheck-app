@@ -21,12 +21,11 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     # TLS on: the app boots NODE_ENV=production, whose config gate requires
-    # DATABASE_SSL_MODE=require (src/lib/config.ts); pg-init-ssl.sh generates
-    # a self-signed cert on first boot (rejectUnauthorized:false app-side).
-    command: >
-      postgres -c ssl=on
-               -c ssl_cert_file=/var/lib/postgresql/data/server.crt
-               -c ssl_key_file=/var/lib/postgresql/data/server.key
+    # DATABASE_SSL_MODE=require (src/lib/config.ts). pg-init-ssl.sh generates
+    # a self-signed cert on first boot AND enables ssl via postgresql.conf —
+    # deliberately NOT via command flags here (the entrypoint's temporary
+    # init server inherits command flags and would fail before the cert
+    # exists; see pg-init-ssl.sh header).
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-telecheck}
       POSTGRES_USER: ${POSTGRES_USER:-telecheck}
