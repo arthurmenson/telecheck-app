@@ -61,6 +61,9 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { activateSignalHandler } from './internal/handlers/activate-signal.js';
+import { createEvaluationHandler } from './internal/handlers/create-evaluation.js';
+import { emitSignalHandler } from './internal/handlers/emit-signal.js';
 import { getSignalHandler } from './internal/handlers/get-signal.js';
 
 export const registerMedInteractionRoutes: FastifyPluginAsync = async (
@@ -73,22 +76,28 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
     status: 'ok',
     module: 'med-interaction',
     blocked:
-      'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1; PR 7 of N — first real handler shipped)',
+      'Med Interaction Engine handler implementation (Sprint 1 of N at v0.1; PR 8 of N — first write handlers + Cat A audit emission pattern shipped)',
     blocked_message:
       'Spec layer COMPLETE: SI-019 v2.0 RATIFIED 2026-05-21 P-033 + CDM v1.6 → v1.7 ' +
       '+ AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 ' +
-      '+ RBAC v1.1 → v1.2 RATIFIED P-034. DB layer COMPLETE through migration 050 ' +
-      '(PRs 1-5 merged; 21 Codex rounds total): 12 RBAC roles (046) + 4 entities + RLS + ' +
-      'triggers (047) + view + MV + SECDEF access function (048) + raw lifecycle writer ' +
-      'SECDEF + anti-bypass matrix (049) + 6 reason-specific wrappers (050; 3 ' +
-      'operational + 3 fail-closed pending evidence-source migrations). ' +
-      'PR 7 (this commit) ships the FIRST real Fastify handler post-foundation-051: ' +
-      'GET /v0/med-interaction/signals/:id reading via the SECDEF access function from ' +
-      'migration 048 under the canonical withTransaction → withTenantContext → ' +
-      'withActorContext → withDbRole(medication_interaction_signal_viewer) composition. ' +
-      '7 endpoints remain (POST evaluations + 6 signal lifecycle actions); they land in ' +
-      'PRs 8-11 with Cat A audit emission + LAYER B role-membership tightening. See ' +
-      'src/modules/med-interaction/README.md + docs/med-interaction-implementation-plan.md.',
+      '+ RBAC v1.1 → v1.2 RATIFIED P-034. DB layer COMPLETE through migration 050. ' +
+      'PR 7 shipped the first read handler (GET /signals/:id via SECDEF access ' +
+      'function from migration 048). PR 8 (this commit) ships 3 write handlers that ' +
+      'establish the Cat A audit-emission pattern for the slice: POST /evaluations ' +
+      '(direct interaction_engine_evaluation INSERT + Cat A audit ' +
+      'interaction_engine_evaluation_completed), POST /signals (interaction_signal ' +
+      'INSERT + SECDEF wrapper record_signal_emission from migration 050 §1 + Cat A ' +
+      'audit interaction_signal_emitted), POST /signals/:id/activate (SECDEF wrapper ' +
+      'record_signal_activation from migration 050 §2 + Cat A audit ' +
+      'interaction_signal_lifecycle_transition_emitted per Option A SI-019 ' +
+      'Sub-decision 3 item 5). All under the canonical withTransaction (via ' +
+      'withIdempotentExecution) → withTenantContext → withActorContext → ' +
+      'withDbRole(medication_interaction_engine_evaluator) composition with same-tx ' +
+      'audit per Option 2 carryforward; 42501 → tenant-blind 403 (I-025); 23514/02000 ' +
+      '→ tenant-blind 404. 4 endpoints remain (POST signals/:id/{override, resolve, ' +
+      'expire, supersede}); they land in PRs 9-11 with KMS-envelope wiring (override) ' +
+      'and evidence-source migrations (resolve/expire/supersede fail-closed wrappers). ' +
+      'See src/modules/med-interaction/README.md + docs/med-interaction-implementation-plan.md.',
   }));
 
   // Readiness probe — module is partially serving traffic at PR 7 (the
@@ -107,15 +116,15 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
       module: 'med-interaction',
       reason: 'partial_handlers_wired',
       reason_message:
-        '1 of 8 Med Interaction Engine Fastify handlers wired (PR 7: ' +
-        'GET /v0/med-interaction/signals/:id via SECDEF access function from ' +
-        'migration 048 under the canonical withDbRole composition). 7 endpoints ' +
-        'remain: POST /evaluations + POST /signals + POST /signals/:id/{activate, ' +
-        'override, resolve, expire, supersede}. Spec + DB layers COMPLETE through ' +
-        'migration 050 + PR 7 first real handler. The /ready probe returns 200 once ' +
-        'the full PR series (remaining handlers + Cat A audit emission + LAYER B ' +
-        'role-membership check + integration tests) closes. See ' +
-        'src/modules/med-interaction/README.md for the resume path.',
+        '4 of 8 Med Interaction Engine Fastify handlers wired (PR 7: GET ' +
+        '/v0/med-interaction/signals/:id; PR 8: POST /evaluations + POST /signals + ' +
+        'POST /signals/:id/activate — all under the canonical withDbRole composition ' +
+        'with same-tx Cat A audit emission per Option 2 carryforward). 4 endpoints ' +
+        'remain: POST /signals/:id/{override, resolve, expire, supersede}. Spec + DB ' +
+        'layers COMPLETE through migration 050 + PR 8 write handlers + Cat A audit ' +
+        'pattern. The /ready probe returns 200 once the full PR series (remaining ' +
+        '4 handlers + LAYER B role-membership tightening + integration tests) closes. ' +
+        'See src/modules/med-interaction/README.md for the resume path.',
     });
   });
 
@@ -128,13 +137,35 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
   // composition order + Layer B deferral rationale.
   app.get('/signals/:id', getSignalHandler);
 
-  // Remaining 7 endpoints (POST /evaluations, POST /signals, POST
-  // /signals/:id/{activate, override, resolve, expire, supersede})
-  // land in PR 8+ when write-handler implementation begins. They will
-  // share the same withTransaction → withTenantContext → withActorContext
-  // → withDbRole composition pattern as the PR 7 read handler; the
-  // write variants additionally wire Cat A audit emission inside the
-  // same DB transaction as the SECDEF wrapper call (so a partial commit
-  // cannot leave a wrapper effect without its audit record, per the
-  // module README's Option 2 carryforward).
+  // PR 8 of N: 3 write handlers establishing the Cat A audit emission
+  // pattern for the slice. Each handler follows the canonical Option B
+  // composition (withTransaction → withTenantContext → withActorContext →
+  // withDbRole('medication_interaction_engine_evaluator')) + the same-tx
+  // Cat A audit emission (Option 2 carryforward — audit deferred from
+  // SQL wrappers to the application layer for atomicity with the wrapper
+  // INSERT) + the 42501 → tenant-blind 403 mapping (I-025) inherited
+  // from the PR 7 reference handler.
+  //
+  //   POST /evaluations          — create an interaction_engine_evaluation row;
+  //                                emits `interaction_engine_evaluation_completed`.
+  //                                Per SI-019 §5, NOT via a SECDEF wrapper —
+  //                                the wrappers in migration 050 are scoped to
+  //                                the signal-lifecycle state machine only.
+  //   POST /signals              — INSERT interaction_signal row + call SECDEF
+  //                                `record_signal_emission(...)` (migration 050 §1)
+  //                                in same tx; emits `interaction_signal_emitted`.
+  //   POST /signals/:id/activate — call SECDEF `record_signal_activation(...)`
+  //                                (migration 050 §2); emits
+  //                                `interaction_signal_lifecycle_transition_emitted`
+  //                                (Option A add per SI-019 Sub-decision 3 item 5).
+  //
+  // Remaining 4 endpoints (POST /signals/:id/{override, resolve, expire,
+  // supersede}) land in PRs 9-11. Of those: override is operational once
+  // KMS envelope wiring lands; resolve/expire/supersede partially gated
+  // by the fail-closed wrappers in migration 050 §§4-6 pending evidence
+  // sources (Async Consult discontinuation log + per-basis cadence config
+  // + active-medication-list view).
+  app.post('/evaluations', createEvaluationHandler);
+  app.post('/signals', emitSignalHandler);
+  app.post('/signals/:id/activate', activateSignalHandler);
 };
