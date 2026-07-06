@@ -31,6 +31,30 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     filename    TEXT PRIMARY KEY,
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Cluster-global role bootstrap (mirrors the CI chain gate's pre-chain
+-- provisioning in .github/workflows/migration-chain.yml):
+--
+--   telecheck_app_role — consumed by 047-050 GRANT TO clauses before
+--   foundation 051 formalizes it; NOINHERIT NOLOGIN here, 051 ALTERs it.
+--
+--   postgres — migration 047+ pins SECURITY DEFINER function ownership to
+--   the bootstrap superuser name 'postgres' (R2 MED-1 closure: owner must
+--   carry BYPASSRLS semantics). Environments whose bootstrap superuser has
+--   a different name (this staging stack uses POSTGRES_USER=telecheck)
+--   need the role to exist. NOLOGIN: ownership anchor only, no auth
+--   surface. NOTE for pre-go-live review: AWS RDS forbids SUPERUSER —
+--   the OWNER TO postgres pattern needs an RDS-compatible redesign
+--   (tracked in the staging runbook's AWS migration map).
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'telecheck_app_role') THEN
+    CREATE ROLE telecheck_app_role NOINHERIT NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres') THEN
+    CREATE ROLE postgres SUPERUSER NOLOGIN;
+  END IF;
+END $$;
 SQL
 
 applied=0
