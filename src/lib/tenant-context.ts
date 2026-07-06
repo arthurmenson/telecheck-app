@@ -338,6 +338,17 @@ async function resolveHostFromDb(host: string): Promise<DbResolution> {
   const hostname = host.split(':')[0]?.toLowerCase() ?? '';
   if (hostname === '') return { kind: 'inactive_or_unknown' };
 
+  // TENANT_HOST_OVERRIDES aliasing (staging/preview hosts): an override
+  // maps this hostname to a canonical tenant ID, so the authoritative DB
+  // row is looked up BY ID instead of by consumer_subdomain (the staging
+  // hostname is deliberately not seeded as a consumer_subdomain). All
+  // downstream checks are identical — status='active' gate, country
+  // union check, tri-state semantics — so the production fail-closed
+  // posture (DB authoritative; deactivated tenant stops resolving) is
+  // preserved. The override cannot mint a tenant: it only redirects the
+  // lookup key to an id that must exist AND be active in the DB.
+  const overrideEntry = TENANT_HOST_OVERRIDES[hostname];
+
   let result: Awaited<ReturnType<typeof withConnection<{ rows: unknown[] }>>>;
   try {
     result = await withConnection(async (client) => {
@@ -356,12 +367,18 @@ async function resolveHostFromDb(host: string): Promise<DbResolution> {
         // suspended/archived tenant returns 'inactive_or_unknown' (fail
         // closed) rather than 'no row' which the legacy implementation
         // conflated with 'tenant doesn't exist at all'.
-        `SELECT id, display_name, consumer_dba, legal_entity, consumer_subdomain,
+        overrideEntry === undefined
+          ? `SELECT id, display_name, consumer_dba, legal_entity, consumer_subdomain,
                 country_of_care, kms_key_alias, status
            FROM tenants
           WHERE LOWER(consumer_subdomain) = $1
+          LIMIT 1`
+          : `SELECT id, display_name, consumer_dba, legal_entity, consumer_subdomain,
+                country_of_care, kms_key_alias, status
+           FROM tenants
+          WHERE id = $1
           LIMIT 1`,
-        [hostname],
+        [overrideEntry === undefined ? hostname : overrideEntry.tenantId],
       );
     });
   } catch (err) {
