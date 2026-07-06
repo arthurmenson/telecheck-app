@@ -62,7 +62,7 @@ afterAll(async () => {
 });
 
 describe('med-interaction slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/med-interaction/health returns 200 (liveness — module alive) with PR 8 partial-wiring metadata', async () => {
+  it('§1a GET /v0/med-interaction/health returns 200 (liveness — module alive) with PR 9 full-surface metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/med-interaction/health',
@@ -78,8 +78,9 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     expect(body.status).toBe('ok');
     expect(body.module).toBe('med-interaction');
     expect(body.blocked).toContain('Sprint 1 of N');
-    // PR 8: first write handlers + Cat A audit emission pattern shipped.
-    expect(body.blocked).toContain('PR 8 of N');
+    // PR 8/PR 9 merge: all 8 endpoint handlers mounted (PR 7 read +
+    // PR 8's 3 writes + PR 9's 4 remaining writes).
+    expect(body.blocked).toContain('PR 9 of N');
     // Post-P-033/P-034 ratification — blocker is implementation, NOT
     // unratified spec.
     expect(body.blocked_message).toContain('Spec layer COMPLETE');
@@ -87,16 +88,19 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     expect(body.blocked_message).toContain('P-034');
     // DB layer COMPLETE through migration 050.
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 050');
-    // PR 8 anti-drift: the blocker payload MUST advertise the 3 write
-    // handlers shipped + the Option 2 carryforward composition reference +
-    // the remaining-4-endpoints count. If a future PR ships more handlers
-    // without updating this payload, this assertion fails fast.
+    // PR 9 anti-drift: the blocker payload MUST advertise the full mounted
+    // surface (PR 7 read + PR 8's 3 writes + PR 9's 4 remaining writes) +
+    // the Option 2 carryforward composition reference + the
+    // zero-endpoints-remain count + the still-open hardening items. If a
+    // future PR changes the surface without updating this payload, this
+    // assertion fails fast.
     expect(body.blocked_message).toContain('GET /signals/:id');
     expect(body.blocked_message).toContain('withDbRole(medication_interaction_engine_evaluator)');
-    expect(body.blocked_message).toContain('4 endpoints remain');
+    expect(body.blocked_message).toContain('0 endpoints remain');
+    expect(body.blocked_message).toContain('FAIL-CLOSED');
   });
 
-  it('§1b GET /v0/med-interaction/ready returns 503 (partial_handlers_wired — 4 of 8 mounted) with implementation-pending reason', async () => {
+  it('§1b GET /v0/med-interaction/ready returns 503 (slice_hardening_pending — 8 of 8 mounted, hardening open) with implementation-pending reason', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/med-interaction/ready',
@@ -111,13 +115,15 @@ describe('med-interaction slice — §1 plugin wiring', () => {
     }>();
     expect(body.status).toBe('unavailable');
     expect(body.module).toBe('med-interaction');
-    // PR 8 keeps the reason `partial_handlers_wired` — 4 of 8 handlers are
-    // now live (PR 7 read + PR 8's 3 writes) but the slice as a whole is
-    // still not production-ready (Layer B tightening + remaining 4 endpoints
-    // pending). /ready stays 503 until the full PR series closes per the
-    // Crisis-Response / Admin-Backend scaffold convention.
-    expect(body.reason).toBe('partial_handlers_wired');
-    expect(body.reason_message).toContain('4 of 8');
+    // PR 8/PR 9 merge bumps the reason from `partial_handlers_wired` to
+    // `slice_hardening_pending` — all 8 handlers are now live (PR 7 read +
+    // PR 8's 3 writes + PR 9's 4 remaining writes) but the slice as a
+    // whole is still not production-ready (3 fail-closed wrappers pending
+    // evidence sources + Layer B tightening + integration tests). /ready
+    // stays 503 until hardening closes per the Crisis-Response /
+    // Admin-Backend scaffold convention.
+    expect(body.reason).toBe('slice_hardening_pending');
+    expect(body.reason_message).toContain('8 of 8');
     expect(body.reason_message).toContain('GET /v0/med-interaction/signals/:id');
     expect(body.reason_message).toContain('migration 050');
   });

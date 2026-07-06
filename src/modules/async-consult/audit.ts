@@ -252,3 +252,407 @@ export async function emitConsultExpiredAudit(
     tx,
   );
 }
+
+// ===========================================================================
+// Sprint 10 PR 6 — /v1/async-consults handler-surface emitters (P-038 slice)
+//
+// The Sprint-10 canonical entities (migrations 056-059) carry their own
+// ratified audit catalog: 17 `async_consult.*` action IDs in AUDIT_EVENTS
+// v5.11. SPEC ISSUE (SI follow-on, same posture as the Sprint-9 SI-004
+// placeholders above): `src/lib/audit.ts`'s AuditAction union has NOT yet
+// been synced with the AUDIT_EVENTS v5.11 `async_consult.*` rows, so these
+// IDs are realized via the same sanctioned `as AuditAction` cast pattern
+// (med-interaction/audit.ts + admin-backend precedent). When the catalog
+// sync lands in `src/lib/audit.ts`, delete the placeholder union entries
+// below and let the canonical enum flow through (verbatim string match).
+//
+// Per-handler audit-emission contract (PR 6 endpoints; the emit runs in
+// the SAME tx as the SECDEF wrapper call, AFTER withDbRole returns — i.e.
+// under the restored telecheck_app_role, matching the crisis-response
+// post-crisis-event.ts precedent):
+//
+//   POST /v1/async-consults                     → async_consult.initiated (Cat C)
+//   POST /v1/async-consults/:id/intake          → async_consult.intake_submitted (Cat C)
+//   POST /v1/async-consults/:id/claim           → async_consult.claim_expired_auto_released
+//                                                 (Cat B; ONLY when the wrapper returned a
+//                                                 released prior-claim id) THEN
+//                                                 async_consult.case_claimed (Cat C; always)
+//   POST /v1/async-consults/:id/decision        → async_consult.clinician_decision_recorded
+//                                                 (Cat A; always) + async_consult.prescribing_recorded
+//                                                 (Cat A; decision_type='prescribe' only)
+//                                                 + async_consult.clinician_decision_rationale_disagreement
+//                                                 (Cat A; agreement='disagreed' only)
+//   GET  /v1/async-consults/queue + /:id        → no audit (read-only; med-interaction
+//                                                 GET /signals/:id precedent)
+//
+// I-003: none of these emissions may be suppressed — a throw from emitAudit
+// rolls back the wrapper effect in the same tx.
+// ===========================================================================
+
+type AsyncConsultV1AuditActionPlaceholder =
+  | 'async_consult.initiated'
+  | 'async_consult.intake_submitted'
+  | 'async_consult.case_claimed'
+  | 'async_consult.claim_expired_auto_released'
+  | 'async_consult.clinician_decision_recorded'
+  | 'async_consult.prescribing_recorded'
+  | 'async_consult.clinician_decision_rationale_disagreement';
+
+function asyncConsultV1AuditPlaceholder(id: AsyncConsultV1AuditActionPlaceholder): AuditAction {
+  return id as AuditAction;
+}
+
+/**
+ * Common envelope builder for the Sprint-10 v1 surface. Differs from the
+ * Sprint-9 `buildEnvelope` above in two ways: (a) actor_type admits
+ * 'clinician' (claim + decision handlers) and (b) resource_type is
+ * caller-supplied (the v1 events attest to four distinct entities:
+ * consult, consult_intake_submission, consult_review_claim,
+ * consult_clinician_decision).
+ */
+interface AsyncConsultV1AuditCommon {
+  tenant_id: TenantId;
+  actor_type: 'patient' | 'delegate' | 'clinician' | 'system';
+  actor_id: string;
+  actor_tenant_id: string | null;
+  target_patient_id: string | null;
+  country_of_care: string;
+  resource_type: string;
+  resource_id: string;
+  detail: Record<string, unknown>;
+}
+
+function buildV1Envelope(
+  action: AuditAction,
+  category: 'A' | 'B' | 'C',
+  common: AsyncConsultV1AuditCommon,
+): AuditEnvelopeInput {
+  return {
+    timestamp: new Date().toISOString(),
+    tenant_id: common.tenant_id,
+    actor_type: common.actor_type,
+    actor_id: common.actor_id,
+    actor_tenant_id: common.actor_tenant_id,
+    target_patient_id: common.target_patient_id,
+    delegate_context: null,
+    action,
+    category,
+    audit_sensitivity_level: 'standard',
+    resource_type: common.resource_type,
+    resource_id: common.resource_id,
+    detail: common.detail,
+    engine_versions: null,
+    // These are lifecycle attestations, not I-012 action-class records —
+    // ai_workload_type + autonomy_level stay null (med-interaction
+    // buildEnvelope precedent). The prescribe outcome's I-012 gate lives
+    // with the Pharmacy medication_request flow (prescription_details_id
+    // is an opaque handle at this slice per P-038 §12 OQ2).
+    ai_workload_type: null,
+    autonomy_level: null,
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: common.country_of_care,
+    break_glass: null,
+  };
+}
+
+/** Cat C — async_consult.initiated (POST /v1/async-consults success path). */
+export async function emitAsyncConsultInitiatedAudit(
+  args: {
+    tenantId: TenantId;
+    consultId: string;
+    patientId: string;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    consultType: string;
+    programId: string | null;
+    initiationSource: string;
+    consultFeeCents: number;
+    currency: string;
+    paymentProvider: string;
+    expectedTurnaroundAt: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(asyncConsultV1AuditPlaceholder('async_consult.initiated'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'patient',
+      actor_id: args.actorId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consult',
+      resource_id: args.consultId,
+      detail: {
+        consult_type: args.consultType,
+        program_id: args.programId,
+        initiation_source: args.initiationSource,
+        consult_fee_cents: args.consultFeeCents,
+        currency: args.currency,
+        payment_provider: args.paymentProvider,
+        expected_turnaround_at: args.expectedTurnaroundAt,
+      },
+    }),
+    tx,
+  );
+}
+
+/** Cat C — async_consult.intake_submitted (POST /v1/async-consults/:id/intake). */
+export async function emitAsyncConsultIntakeSubmittedAudit(
+  args: {
+    tenantId: TenantId;
+    submissionId: string;
+    consultId: string;
+    patientId: string;
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    templateId: string;
+    templateVersion: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(asyncConsultV1AuditPlaceholder('async_consult.intake_submitted'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'patient',
+      actor_id: args.actorId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consult_intake_submission',
+      resource_id: args.submissionId,
+      detail: {
+        consult_id: args.consultId,
+        template_id: args.templateId,
+        template_version: args.templateVersion,
+        // The intake payload itself is a KMS envelope (I-026) — never
+        // echoed into audit detail.
+      },
+    }),
+    tx,
+  );
+}
+
+/** Cat C — async_consult.case_claimed (POST /v1/async-consults/:id/claim; always). */
+export async function emitAsyncConsultCaseClaimedAudit(
+  args: {
+    tenantId: TenantId;
+    claimId: string;
+    consultId: string;
+    clinicianAccountId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    claimExpiresAt: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(asyncConsultV1AuditPlaceholder('async_consult.case_claimed'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'clinician',
+      actor_id: args.clinicianAccountId,
+      actor_tenant_id: args.actorTenantId,
+      // The claim wrapper resolves patient_id internally; the handler does
+      // not read it back (the claim row carries it). target_patient_id is
+      // therefore null here — the consult resource linkage in detail is
+      // the forensic anchor.
+      target_patient_id: null,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consult_review_claim',
+      resource_id: args.claimId,
+      detail: {
+        consult_id: args.consultId,
+        clinician_account_id: args.clinicianAccountId,
+        claim_expires_at: args.claimExpiresAt,
+      },
+    }),
+    tx,
+  );
+}
+
+/**
+ * Cat B — async_consult.claim_expired_auto_released (AUDIT_EVENTS v5.11
+ * row 17). Emitted by POST /v1/async-consults/:id/claim ONLY when
+ * `claim_consult_for_review` returned a non-NULL auto-released prior
+ * claim id (migration 059 §4 STEP 2). Fires BEFORE the paired
+ * async_consult.case_claimed Cat C (cause before effect), same tx.
+ */
+export async function emitAsyncConsultClaimExpiredAutoReleasedAudit(
+  args: {
+    tenantId: TenantId;
+    releasedClaimId: string;
+    consultId: string;
+    /** The clinician whose claim attempt triggered the auto-release. */
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(
+      asyncConsultV1AuditPlaceholder('async_consult.claim_expired_auto_released'),
+      'B',
+      {
+        tenant_id: args.tenantId,
+        actor_type: 'clinician',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: null,
+        country_of_care: args.countryOfCare,
+        resource_type: 'consult_review_claim',
+        resource_id: args.releasedClaimId,
+        detail: {
+          consult_id: args.consultId,
+          release_reason: 'claim_expired',
+          released_during: 'claim_consult_for_review',
+        },
+      },
+    ),
+    tx,
+  );
+}
+
+/** Cat A — async_consult.clinician_decision_recorded (POST .../decision; always). */
+export async function emitAsyncConsultClinicianDecisionRecordedAudit(
+  args: {
+    tenantId: TenantId;
+    decisionId: string;
+    consultId: string;
+    patientId: string;
+    claimId: string;
+    clinicianAccountId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    decisionType: string;
+    agreementWithAiRecommendation: string;
+    interactionSignalsReviewedIds: readonly string[];
+    prescriptionDetailsId: string | null;
+    referralTargetId: string | null;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(
+      asyncConsultV1AuditPlaceholder('async_consult.clinician_decision_recorded'),
+      'A',
+      {
+        tenant_id: args.tenantId,
+        actor_type: 'clinician',
+        actor_id: args.clinicianAccountId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: args.patientId,
+        country_of_care: args.countryOfCare,
+        resource_type: 'consult_clinician_decision',
+        resource_id: args.decisionId,
+        detail: {
+          consult_id: args.consultId,
+          claim_id: args.claimId,
+          decision_type: args.decisionType,
+          agreement_with_ai_recommendation: args.agreementWithAiRecommendation,
+          interaction_signals_reviewed_ids: [...args.interactionSignalsReviewedIds],
+          prescription_details_id: args.prescriptionDetailsId,
+          referral_target_id: args.referralTargetId,
+          // Decision rationale is a KMS envelope (I-026) — never echoed.
+        },
+      },
+    ),
+    tx,
+  );
+}
+
+/**
+ * Cat A — async_consult.prescribing_recorded. Emitted by POST .../decision
+ * ONLY when decision_type='prescribe', AFTER the decision_recorded event
+ * (same tx). prescription_details_id is an opaque handle at this slice
+ * (P-038 §12 OQ2); the I-012 prescribing gate executes in the Pharmacy
+ * medication_request flow that this handle will bind to.
+ */
+export async function emitAsyncConsultPrescribingRecordedAudit(
+  args: {
+    tenantId: TenantId;
+    decisionId: string;
+    consultId: string;
+    patientId: string;
+    clinicianAccountId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    prescriptionDetailsId: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(asyncConsultV1AuditPlaceholder('async_consult.prescribing_recorded'), 'A', {
+      tenant_id: args.tenantId,
+      actor_type: 'clinician',
+      actor_id: args.clinicianAccountId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consult_clinician_decision',
+      resource_id: args.decisionId,
+      detail: {
+        consult_id: args.consultId,
+        prescription_details_id: args.prescriptionDetailsId,
+      },
+    }),
+    tx,
+  );
+}
+
+/**
+ * Cat A — async_consult.clinician_decision_rationale_disagreement.
+ * Emitted by POST .../decision ONLY when
+ * agreement_with_ai_recommendation='disagreed' — flags the human-AI
+ * disagreement for downstream clinical-governance review. Fires AFTER the
+ * decision_recorded event (and after prescribing_recorded when both
+ * apply), same tx.
+ */
+export async function emitAsyncConsultDecisionRationaleDisagreementAudit(
+  args: {
+    tenantId: TenantId;
+    decisionId: string;
+    consultId: string;
+    patientId: string;
+    clinicianAccountId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    decisionType: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(
+      asyncConsultV1AuditPlaceholder('async_consult.clinician_decision_rationale_disagreement'),
+      'A',
+      {
+        tenant_id: args.tenantId,
+        actor_type: 'clinician',
+        actor_id: args.clinicianAccountId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: args.patientId,
+        country_of_care: args.countryOfCare,
+        resource_type: 'consult_clinician_decision',
+        resource_id: args.decisionId,
+        detail: {
+          consult_id: args.consultId,
+          decision_type: args.decisionType,
+          agreement_with_ai_recommendation: 'disagreed',
+        },
+      },
+    ),
+    tx,
+  );
+}

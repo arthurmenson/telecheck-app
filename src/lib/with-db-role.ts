@@ -89,8 +89,11 @@ import type { DbClient } from './db.js';
 // ---------------------------------------------------------------------------
 // §1. Allowlisted slice roles.
 //
-// MUST match exactly the 13 GRANT membership clauses in
-// migrations/051_app_role_acquisition_foundation.sql §2.
+// MUST match exactly the GRANT membership clauses in
+// migrations/051_app_role_acquisition_foundation.sql §2 (13 roles:
+// crisis + admin + med-interaction) PLUS
+// migrations/061_async_consult_app_role_bridge.sql §1 (5 async-consult
+// roles) — 18 roles total.
 //
 // Adding a new role to this list WITHOUT a corresponding GRANT
 // in 051 (or a follow-up foundation migration) will cause SET LOCAL ROLE
@@ -117,6 +120,14 @@ export const SLICE_ROLES = [
   'medication_interaction_signal_viewer',
   'medication_interaction_override_recorder',
   'medication_interaction_knowledge_base_updater',
+  // Async Consult (SI-020 / P-038; 5 roles — migration 055 creates them,
+  // migration 061 bridges telecheck_app_role membership per the 051 §2
+  // Option B pattern)
+  'async_consult_patient_initiator',
+  'async_consult_delegate_initiator',
+  'async_consult_clinician_reviewer',
+  'async_consult_patient_reader',
+  'async_consult_staff_reader',
 ] as const;
 
 export type SliceRole = (typeof SLICE_ROLES)[number];
