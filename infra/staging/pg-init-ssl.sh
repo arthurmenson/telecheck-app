@@ -5,7 +5,7 @@
 # see src/lib/db.ts — so a self-signed cert satisfies the production
 # encrypted-transport gate on the compose-internal network).
 set -e
-CERT_DIR=/var/lib/postgresql
+CERT_DIR="${PGDATA:-/var/lib/postgresql/data}"
 if [ ! -f "$CERT_DIR/server.crt" ]; then
   openssl req -new -x509 -days 3650 -nodes \
     -subj "/CN=telecheck-staging-db" \
