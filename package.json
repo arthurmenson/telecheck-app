@@ -2,7 +2,7 @@
   "name": "telecheck-app",
   "version": "0.0.1",
   "private": true,
-  "description": "Telecheck multi-tenant AI-powered telehealth platform \u00e2\u20ac\u201d implementation of the spec corpus in arthurmenson/telecheckONE",
+  "description": "Telecheck multi-tenant AI-powered telehealth platform â€” implementation of the spec corpus in arthurmenson/telecheckONE",
   "type": "module",
   "engines": {
     "node": ">=20.0.0",
