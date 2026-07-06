@@ -43,9 +43,13 @@ for f in "$MIGRATIONS_DIR"/[0-9][0-9][0-9]_*.sql; do
     continue
   fi
   echo ">> applying $base"
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
-    "INSERT INTO schema_migrations (filename) VALUES ('$base')"
+  # --single-transaction matches the CI chain gate (check-migration-chain.sh):
+  # migrations use SET LOCAL / LOCK TABLE and assume a surrounding tx. Folding
+  # the tracking INSERT into the same tx makes apply+record atomic (a crash
+  # between them can't leave a migration applied-but-unrecorded).
+  psql "$DATABASE_URL" --no-psqlrc --single-transaction -v ON_ERROR_STOP=1 -q \
+    -f "$f" \
+    -c "INSERT INTO schema_migrations (filename) VALUES ('$base')"
   applied=$((applied + 1))
 done
 
