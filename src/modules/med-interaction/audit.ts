@@ -48,37 +48,63 @@
  *       — fires AFTER the SECDEF wrapper `record_signal_activation` returns,
  *         in the same transaction.
  *
- *   **Future handlers (PRs 9-11) follow the same one-event-per-handler rule:**
+ *   **PR 9 handlers (supersede / override / resolve / expire — shipped in
+ *   the PR 8/PR 9 merge) follow the same one-event-per-handler rule, with
+ *   an audit-on-rejection variant for the fail-closed wrappers (I-003
+ *   bare-suppression-forbidden — the rejected attempt belongs in the
+ *   audit chain):**
  *
- *     POST /v0/med-interaction/signals/:id/supersede:
+ *     POST /v0/med-interaction/signals/:id/supersede (OPERATIONAL):
+ *       emits EXACTLY ONE audit event:
  *         1. interaction_signal_lifecycle_transition_emitted
- *            (from_state='active', to_state='superseded', reason='superseded_by_evaluation')
+ *            (from_state='active', to_state='superseded', reason='supersession')
+ *       — fires AFTER the SECDEF wrapper `record_signal_supersession`
+ *         (migration 050 §3) returns, in the same transaction.
  *
- *     POST /v0/med-interaction/signals/:id/resolve:
+ *     POST /v0/med-interaction/signals/:id/resolve (FAIL-CLOSED at v0.1):
+ *       emits EXACTLY ONE audit event:
  *         1. interaction_signal_lifecycle_transition_emitted
- *            (from_state='active', to_state='resolved', reason='resolution_event')
+ *            — operational path (when the wrapper unblocks):
+ *              (from_state='active', to_state='resolved', reason='resolution')
+ *            — rejection path (current fail-closed wrapper, 0A000/42501):
+ *              (from_state='active', to_state='rejected',
+ *               reason='resolve_rejected_{feature_not_supported|execute_not_granted}')
+ *              emitted in the same tx as the failed wrapper call, then the
+ *              error is re-thrown to the tenant-blind 503 mapper (I-025).
  *
- *     POST /v0/med-interaction/signals/:id/expire:
+ *     POST /v0/med-interaction/signals/:id/expire (FAIL-CLOSED at v0.1):
+ *       emits EXACTLY ONE audit event:
  *         1. interaction_signal_lifecycle_transition_emitted
- *            (from_state='active', to_state='expired', reason='time_expiry')
+ *            — operational path:
+ *              (from_state='active', to_state='expired', reason='expiry')
+ *            — rejection path (current fail-closed wrapper, 0A000):
+ *              (from_state='active', to_state='rejected',
+ *               reason='expire_rejected_feature_not_supported_cadence_config_missing')
  *
- *     POST /v0/med-interaction/signals/:id/override:
- *         1. interaction_signal_override
- *            (canonical AUDIT_EVENTS v5.3 line 151 event — NOT a placeholder)
- *         2. interaction_signal_lifecycle_transition_emitted
- *            (from_state='active', to_state='overridden', reason='override')
- *       — the override handler is the ONLY handler that emits TWO audit
- *         events: the override-rationale attestation (existing canonical
- *         event) + the lifecycle transition. Both fire in the same tx;
- *         emission order: override first (it documents the cause), then
- *         lifecycle transition (it documents the effect on the state
- *         machine).
+ *     POST /v0/med-interaction/signals/:id/override (FAIL-CLOSED at v0.1):
+ *       at v0.1 emits EXACTLY ONE audit event:
+ *         1. interaction_signal_lifecycle_transition_emitted
+ *            — operational path (once the wrapper unblocks):
+ *              (from_state='active', to_state='overridden', reason='override')
+ *            — rejection path (current fail-closed wrapper, 0A000):
+ *              (from_state='active', to_state='rejected',
+ *               reason='override_rejected_feature_not_supported_evidence_source_missing')
+ *       — **forward contract:** when the override wrapper turns operational
+ *         (KMS envelope wiring + SI-024.1 JWT-binding evidence source), the
+ *         override handler becomes the ONLY handler that emits TWO audit
+ *         events: the canonical `interaction_signal_override` attestation
+ *         (AUDIT_EVENTS v5.3 line 151 event — NOT a placeholder) FIRST (it
+ *         documents the cause), then the lifecycle transition (it documents
+ *         the effect on the state machine). Both in the same tx. Until
+ *         then, no interaction_signal_override row is inserted (the
+ *         wrapper RAISEs 0A000 before any write), so only the rejection
+ *         lifecycle attestation fires.
  *
- *   Tests in this PR assert the exact emitter-function call sequence per
- *   handler (`auditCalls` mock log shape). Subsequent PRs that touch
- *   these handlers MUST update both the rule above + the assertion test
- *   if the per-handler audit-event set changes; drift between the rule
- *   and the tests is a defect.
+ *   Tests in the PR 8 + PR 9 series assert the exact emitter-function call
+ *   sequence per handler (`auditCalls` mock log shape). Subsequent PRs
+ *   that touch these handlers MUST update both the rule above + the
+ *   assertion tests if the per-handler audit-event set changes; drift
+ *   between the rule and the tests is a defect.
  *
  * The `interaction_signal_override` action ID is already enumerated in the
  * canonical Category A audit catalog (`src/lib/audit.ts`) and is consumed by
@@ -324,9 +350,13 @@ export async function emitSignalEmittedAudit(
 // inserts a new `interaction_signal_lifecycle_transition` row:
 //   - POST /v0/med-interaction/signals/:id/activate (emitted → active)
 //   - POST /v0/med-interaction/signals/:id/supersede (active → superseded)
-//   - POST /v0/med-interaction/signals/:id/resolve (active → resolved) (gated)
-//   - POST /v0/med-interaction/signals/:id/expire (active → expired) (gated)
-//   - POST /v0/med-interaction/signals/:id/override (active → overridden)
+//   - POST /v0/med-interaction/signals/:id/resolve (active → resolved;
+//     wrapper FAIL-CLOSED at v0.1 — rejection path attested with
+//     to_state='rejected' per I-003 bare-suppression-forbidden)
+//   - POST /v0/med-interaction/signals/:id/expire (active → expired;
+//     wrapper FAIL-CLOSED at v0.1 — rejection path attested)
+//   - POST /v0/med-interaction/signals/:id/override (active → overridden;
+//     wrapper FAIL-CLOSED at v0.1 — rejection path attested)
 //
 // **Formal initial-emission carve-out (R1 Finding 2 closure 2026-05-23):**
 //   The initial `none → emitted` transition row INSERTed atomically by
@@ -346,7 +376,10 @@ export async function emitSignalEmittedAudit(
 //   this event. The override-driven `active → overridden` transition
 //   is ALSO attested by the canonical `interaction_signal_override`
 //   event (AUDIT_EVENTS v5.3 line 151) per the override-handler two-event
-//   rule documented in the file-level CANONICAL LIFECYCLE AUDIT RULE.
+//   forward contract documented in the file-level CANONICAL LIFECYCLE
+//   AUDIT RULE (binding once the override wrapper turns operational; at
+//   v0.1 the fail-closed wrapper RAISEs 0A000 before any write, so only
+//   the rejection lifecycle attestation fires).
 // ---------------------------------------------------------------------------
 
 export async function emitSignalLifecycleTransitionAudit(
