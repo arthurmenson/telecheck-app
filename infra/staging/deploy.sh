@@ -16,6 +16,24 @@ echo ">> git pull (main)"
 git fetch origin main
 git reset --hard origin/main
 
+echo ">> PG TLS certs (host-side, idempotent)"
+# Generated here — NOT in a docker-entrypoint-initdb.d script. See the db
+# service comment in docker-compose.yml for the two failed prior designs
+# (command-flag chicken-and-egg; alpine init scripts run non-root so
+# apk/openssl are unavailable).
+TLS_DIR="infra/staging/tls"
+if [ ! -f "$TLS_DIR/server.crt" ]; then
+  mkdir -p "$TLS_DIR"
+  openssl req -new -x509 -days 3650 -nodes \
+    -subj "/CN=telecheck-staging-db" \
+    -out "$TLS_DIR/server.crt" -keyout "$TLS_DIR/server.key"
+  # alpine postgres runs as uid/gid 70; the key must be 0600 and owned by
+  # the server user or postgres refuses to load it. One-time sudo.
+  sudo chown 70:70 "$TLS_DIR/server.crt" "$TLS_DIR/server.key"
+  sudo chmod 600 "$TLS_DIR/server.key"
+  sudo chmod 644 "$TLS_DIR/server.crt"
+fi
+
 echo ">> build + start stack"
 "${COMPOSE[@]}" up -d --build
 
@@ -27,7 +45,11 @@ for i in $(seq 1 30); do
 done
 
 echo ">> apply migrations"
-"${COMPOSE[@]}" exec -T app bash scripts/apply-migrations.sh
+# run --rm (one-shot container), NOT exec into the app service: on a first
+# deploy the app crash-loops by design until migrations + bind-role
+# credentials exist (SI-010 fail-fast boot probe), and exec into a
+# restarting container fails.
+"${COMPOSE[@]}" run --rm --no-deps -T app bash scripts/apply-migrations.sh
 
 echo ">> provision SI-010 bind-pool credentials (idempotent)"
 # migration 031 creates bind_actor_context_role LOGIN without a password;
