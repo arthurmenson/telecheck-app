@@ -51,7 +51,7 @@ import {
 } from '../../lib/audit.js';
 import type { TenantId } from '../../lib/glossary.js';
 
-import type { AIChatSessionId } from './internal/types.js';
+import type { AIChatSessionId, AIWorkflowExecutionId } from './internal/types.js';
 
 // ---------------------------------------------------------------------------
 // Placeholder-helper for unratified AI-surface audit action IDs
@@ -157,6 +157,143 @@ export async function emitMode1ChatResponseAudit(
     // conversational_assistant + advisory, canonically.
     ai_workload_type: 'conversational_assistant',
     autonomy_level: 'advisory',
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(envelope, tx);
+}
+
+// ---------------------------------------------------------------------------
+// Mode 2 case-prep response audit emitter
+// ---------------------------------------------------------------------------
+
+/**
+ * Detail payload on the Mode 2 `ai_mode_2_evaluation` envelope. Mirrors
+ * the canonical AI_LAYERING v5.2 §2 Mode 2 audit fields PLUS audit-only
+ * context (input/output length lengths, provider state, crisis-gate
+ * outcome). The envelope's category-A action ID lands directly from
+ * AUDIT_EVENTS v5.3 — no `aiServiceAuditPlaceholder` cast is required
+ * because `ai_mode_2_evaluation` is already on the canonical
+ * `CategoryAAction` union in `lib/audit.ts`.
+ *
+ * Per I-025 + I-027 + audit-policy: NEVER include the raw patient
+ * context (the structured intake data the case-prep agent operated
+ * over) in the audit detail. The audit is the durable append-only
+ * record of WHAT envelope was emitted and WHY; full case-prep
+ * transcripts persist in a separate transcript store with its own
+ * retention + access controls.
+ */
+export interface Mode2CasePrepResponseAuditDetail {
+  ai_workflow_execution_id: AIWorkflowExecutionId;
+  /** Anchor consult — Mode 2 audit records carry consult_id, not
+   *  session_id. */
+  consult_id: string;
+  /** Always 'mode_2' for this emitter. */
+  ai_mode: 'mode_2';
+  /** Protocol the case-prep agent operated under. NEVER null at v1.0 —
+   *  Mode 2 always runs within a named protocol context per AI Clinical
+   *  Assistant Slice PRD v1.0 §4.2. */
+  protocol_id: string;
+  protocol_version: string;
+  /** Self-reported confidence band per AI_LAYERING v5.2 §2 Mode 2
+   *  audit fields. */
+  confidence: 'low' | 'medium' | 'high';
+  /** Count of concern flags the AI surfaced (the flag IDENTIFIERS
+   *  themselves are NOT logged in audit detail at v1.0 — they may
+   *  encode PHI via lab-value thresholds or symptom names. The full
+   *  flag list lives in the response transcript store. The COUNT is
+   *  safe + useful for compliance dashboards). */
+  concern_flag_count: number;
+  /** Crisis detection outcome (I-019). When true, the
+   *  `crisis_detection_trigger` Category A audit has ALREADY been
+   *  emitted separately by `runCrisisGate`. */
+  crisis_detected: boolean;
+  /** True if the response surfaced a crisis escalation envelope
+   *  (suppressing the case-prep recommendation). */
+  escalation_triggered: boolean;
+  /** AI-RESIL-001 fail-soft state: true when the LLM provider was
+   *  unavailable (NullProvider always; real adapters when degraded). */
+  provider_unavailable: boolean;
+  /** Length of the patient context payload as serialized JSON
+   *  characters (audit-safe — no field VALUES). */
+  context_length: number;
+  /** Length of the AI recommendation text in characters. */
+  recommendation_length: number;
+}
+
+/**
+ * Emit `ai_mode_2_evaluation` for every Mode 2 case-prep HTTP response.
+ * Category A (safety-critical clinical action) per AUDIT_EVENTS v5.3 —
+ * Mode 2 outputs influence the clinician's downstream prescribing
+ * decision, so the audit class matches the prescribing-pathway floor
+ * rather than the Mode 1 conversational (Category C) floor.
+ *
+ * The downstream `prescribing.protocol_authorization_granted` audit
+ * (emitted by the protocol-engine slice when the clinician confirms)
+ * carries forward the AI envelope (model_version, ai_workflow_execution_id)
+ * so the I-012 reject-unless three-clause rule can be audited
+ * end-to-end against the case-prep emission that informed it.
+ *
+ * For crisis-detected case-prep responses, this emitter records the
+ * case-prep envelope (recording that case-prep ran AND was suppressed
+ * by crisis flow); the canonical I-019 `crisis_detection_trigger`
+ * Category A audit is emitted separately by `runCrisisGate`. Both
+ * audits coexist in the chain for the same request.
+ */
+export async function emitMode2CasePrepResponseAudit(
+  args: {
+    tenantId: TenantId;
+    /** Clinician actor invoking case-prep (tenant-scoped). */
+    actorId: string;
+    /** F-4 audit attribution — equals tenantId for tenant-scoped clinician. */
+    actorTenantId: string;
+    countryOfCare: string;
+    /** Target patient — the consult subject. Distinct from the actor
+     *  (clinician), unlike Mode 1 where actor === target. */
+    targetPatientId: string;
+    detail: Mode2CasePrepResponseAuditDetail;
+    /** AI_LAYERING §6 envelope: workload type for canonical column. */
+    aiModelVersion: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const envelope: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: args.tenantId,
+    actor_type: 'clinician',
+    actor_id: args.actorId,
+    actor_tenant_id: args.actorTenantId,
+    target_patient_id: args.targetPatientId,
+    delegate_context: null,
+    // Canonical Category A action ID per AUDIT_EVENTS v5.3 — no
+    // placeholder cast required (action is on the closed union in
+    // lib/audit.ts).
+    action: 'ai_mode_2_evaluation',
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: 'ai_workflow_execution',
+    resource_id: args.detail.ai_workflow_execution_id,
+    detail: args.detail as unknown as Record<string, unknown>,
+    engine_versions: { ai_model_version: args.aiModelVersion },
+    // WORKLOAD_TAXONOMY v5.2 + AUTONOMY_LEVELS v5.2 — Mode 2 case-prep
+    // is protocol_execution + action_with_confirm, canonically. Per
+    // ADR-029 + I-012 the autonomy ceiling at v1.0 is
+    // action_with_confirm; the reserved `action_with_audit_only` /
+    // `fully_autonomous` levels require successor ADR + activation
+    // audit event.
+    ai_workload_type: 'protocol_execution',
+    autonomy_level: 'action_with_confirm',
     agent_id: null,
     agent_version: null,
     tool_call_id: null,
