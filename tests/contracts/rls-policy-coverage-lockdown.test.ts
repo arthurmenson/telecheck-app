@@ -99,6 +99,11 @@ import { getTestClient } from '../setup.ts';
 //       interaction_engine_evaluation, interaction_signal,
 //       interaction_signal_lifecycle_transition, interaction_signal_override
 //
+// Pharmacy Refill sub-slice addition (+3 tables): `refills`, `dispensings`,
+// `shipments` from migration 060_pharmacy_refill_entities.sql per SI-007
+// v0.19 (RATIFIED 2026-07-06 / P-046) — CDM §4.17/§4.18/§4.19, entities
+// #19/#20/#21. All three: RLS ENABLE + FORCE + `tenant_isolation` policy.
+//
 // If a future migration adds a tenant-scoped table, it MUST be added here
 // AND the migration MUST attach a tenant-isolation policy. The §2 count
 // assertion catches the latter; this list catches the former at the
@@ -128,6 +133,7 @@ const TENANT_SCOPED_TABLES = [
   'crisis_sweep_execution', // migration 033 — Crisis Response slice
   'delegation_scopes',
   'delegations',
+  'dispensings', // migration 060 — Pharmacy Refill sub-slice (SI-007 / P-046)
   'domain_events_outbox',
   'forms_deployment',
   'forms_resume_state',
@@ -148,7 +154,9 @@ const TENANT_SCOPED_TABLES = [
   'notification_crisis_provider_attempt', // migration 033 — Crisis Response slice
   'otp_challenges',
   'product_catalog', // migration 024 — per CDM v1.2 §4.9 ProductCatalog
+  'refills', // migration 060 — Pharmacy Refill sub-slice (SI-007 / P-046)
   'sessions',
+  'shipments', // migration 060 — Pharmacy Refill sub-slice (SI-007 / P-046)
   'tenant_brands',
   'tenant_users',
 ] as const;
