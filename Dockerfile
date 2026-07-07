@@ -21,7 +21,7 @@ COPY --from=build /app/dist ./dist
 # Migrations ship in the image so the deploy step can apply them from the
 # app container (psql client included below).
 COPY migrations ./migrations
-COPY scripts/apply-migrations.sh ./scripts/apply-migrations.sh
+COPY scripts ./scripts
 RUN apk add --no-cache postgresql16-client bash
 USER node
 EXPOSE 3000
