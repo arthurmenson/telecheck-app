@@ -70,7 +70,8 @@ CONSULT_ID=$(echo "$RESP" | JQ consult_id)
 echo "consult_id=$CONSULT_ID"
 
 say "4. submit intake (patient)"
-INTAKE_BODY=$(printf '{"template_id":"%s","template_version":"1.0","intake_payload_envelope":%s}' "$(ulid_now)" "$(envelope)")
+# Fixed template ULID from seed-staging-accounts.sql (composite FK target).
+INTAKE_BODY=$(printf '{"template_id":"01JZZZ00000000000000TMPL01","template_version":"1","intake_payload_envelope":%s}' "$(envelope)")
 RESP=$(curl -s -m 20 -X POST "$BASE/v1/async-consults/$CONSULT_ID/intake" \
   -H "Authorization: Bearer $PT" -H "Content-Type: application/json" \
   -H "Idempotency-Key: $(ulid_now)" -d "$INTAKE_BODY")
