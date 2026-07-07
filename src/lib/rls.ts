@@ -157,6 +157,25 @@ export async function withTenantContext<T>(
   }
 
   if (cleanupError !== undefined) {
+    // Aborted-transaction carve-out (staging E2E closure 2026-07-07): when
+    // the callback error aborted the surrounding transaction, EVERY
+    // subsequent statement — including our restore/clear — fails with
+    // SQLSTATE 25P02 until ROLLBACK. That restore failure is expected and
+    // harmless: set_tenant_context writes are transactional, so the
+    // caller's ROLLBACK (withTransaction always rolls back on throw)
+    // undoes the inner binding along with everything else — no stale
+    // binding can survive. Wrapping the typed callback error in an
+    // AggregateError here masked handler 4xx envelopes into 500s.
+    // Re-throw the ORIGINAL error instead. (Outside a transaction, 25P02
+    // cannot occur, so the fail-closed discard path below is untouched.)
+    const isAbortedTx =
+      typeof cleanupError === 'object' &&
+      cleanupError !== null &&
+      (cleanupError as { code?: string }).code === '25P02';
+    if (isAbortedTx && cbError !== undefined) {
+      throw cbError;
+    }
+
     // I-023 safety: queries cannot be allowed to run under a stale
     // tenant binding on this connection. Fail closed. If the callback
     // ALSO errored, wrap both errors via AggregateError so the original
