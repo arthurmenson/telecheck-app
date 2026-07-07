@@ -1,5 +1,7 @@
 # Telecheck — Project Context for Claude Code
 
+> **New here / zero context?** Read `telecheckONE/TELECHECK_TEAM_HANDOFF.md` first — it maps all 6 repos, the staging environment, credentials to provision, and how to resume. Then come back to this file for build rules.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
