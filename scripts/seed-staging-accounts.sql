@@ -39,7 +39,7 @@ INSERT INTO forms_template (
     template_id, tenant_id, program_id, country_of_care,
     template_version, name, description
 ) VALUES (
-    '01JZZZ00000000000000TMPL01', 'Telecheck-US', '01JZZZ00000000000000PROG01',
+    '01JZZZ0000000000000000TP01', 'Telecheck-US', '01JZZZ0000000000000000PR01',
     'US', 1, 'Staging E2E synthetic intake template',
     'Staging-only synthetic template for the authenticated consult-flow smoke.'
 )
