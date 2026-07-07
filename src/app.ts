@@ -204,6 +204,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     allowlistedPaths: [
       // Extend here when new tenant-blind routes are added.
       // /health is automatically allowlisted by the plugin.
+      '/',
+      '/ready',
       '/v0/identity/health',
       '/v0/consent/health',
       '/v0/tenant-config/health',
@@ -370,6 +372,74 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       version: process.env['npm_package_version'] ?? '0.0.1',
       // Tenant-blind health endpoint — deliberately no tenant context exposed.
       // Per-tenant readiness checks are scoped to authenticated admin endpoints.
+      timestamp: new Date().toISOString(),
+    };
+  });
+
+  // Root API index — tenant-blind (allowlisted). This is an API-only
+  // service: a browser hitting `/` previously got the tenant-blind 404
+  // envelope, which reads as breakage. Serve an honest index instead.
+  app.get('/', async () => {
+    return {
+      service: 'telecheck-app',
+      status: 'ok',
+      description:
+        'Telecheck platform API — no browser UI is served from this host. ' +
+        'Liveness: /health. Aggregate readiness: /ready. ' +
+        'Module surfaces are versioned under /v0/* and /v1/* and require ' +
+        'tenant resolution + authentication.',
+      health: '/health',
+      ready: '/ready',
+      timestamp: new Date().toISOString(),
+    };
+  });
+
+  // Aggregate readiness — tenant-blind (allowlisted). Fans out to the
+  // per-module readiness endpoints via in-process injection (no network
+  // hop) and summarizes. Modules report honest gated states
+  // (e.g. slice_hardening_pending) — an 'unavailable' module is expected
+  // pre-pilot and does NOT flip the aggregate to an error status; the
+  // aggregate is 'degraded' unless every module reports ok. LB health
+  // checks at AWS pre-go-live should target /health (liveness) or a
+  // specific module's readiness, not this endpoint.
+  const MODULE_READY_PATHS: Record<string, string> = {
+    pharmacy: '/v0/pharmacy/ready',
+    'med-interaction': '/v0/med-interaction/ready',
+    subscription: '/v0/subscription/ready',
+    'async-consult': '/v0/async-consult/ready',
+    'crisis-response': '/v0/crisis-events/ready',
+    admin: '/v0/admin/ready',
+    'ai-service': '/v0/ai/ready',
+  };
+
+  app.get('/ready', async (req) => {
+    const modules: Record<string, { status: string; http: number }> = {};
+    await Promise.all(
+      Object.entries(MODULE_READY_PATHS).map(async ([name, path]) => {
+        try {
+          const res = await app.inject({
+            method: 'GET',
+            url: path,
+            headers: { host: req.headers.host ?? 'localhost' },
+          });
+          let status = 'unknown';
+          try {
+            const body = JSON.parse(res.body) as { status?: string };
+            status = body.status ?? 'unknown';
+          } catch {
+            // non-JSON body — report the HTTP status code only
+          }
+          modules[name] = { status, http: res.statusCode };
+        } catch {
+          modules[name] = { status: 'error', http: 0 };
+        }
+      }),
+    );
+    const allOk = Object.values(modules).every((m) => m.status === 'ok');
+    return {
+      status: allOk ? 'ok' : 'degraded',
+      service: 'telecheck-app',
+      modules,
       timestamp: new Date().toISOString(),
     };
   });
