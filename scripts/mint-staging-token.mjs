@@ -8,7 +8,7 @@
  *     exec -T app node scripts/mint-staging-token.mjs --role patient
  *
  * Options:
- *   --role     patient | clinician | tenant_admin | platform_admin  (required)
+ *   --role     patient | clinician | tenant_admin | platform_admin | ai_service  (required)
  *   --account  ULID (defaults to the scripts/seed-staging-accounts.sql identity
  *              for patient/clinician roles)
  *   --tenant   operating tenant id (default Telecheck-US)
@@ -30,13 +30,17 @@ function opt(name, fallback) {
 
 const role = opt('role');
 if (!role) {
-  console.error('usage: mint-staging-token.mjs --role patient|clinician|tenant_admin [--account ULID] [--tenant id] [--country US|GH]');
+  console.error('usage: mint-staging-token.mjs --role patient|clinician|tenant_admin|ai_service [--account ULID] [--tenant id] [--country US|GH]');
   process.exit(1);
 }
 
 const DEFAULT_ACCOUNTS = {
   patient: '01JZZZ00000000000000000P01',
   clinician: '01JZZZ00000000000000000C01',
+  // AI-service principal (migration 064 caller class). Not an accounts
+  // row — the SI-010 bind path carries the id as an opaque service
+  // principal identity for audit attribution.
+  ai_service: '01JZZZ00000000000000000A01',
 };
 
 const tenant = opt('tenant', 'Telecheck-US');

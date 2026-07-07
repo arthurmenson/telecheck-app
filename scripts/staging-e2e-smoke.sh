@@ -8,9 +8,10 @@
 # Exercises the full Sprint 10 surface against Telecheck-US:
 #   1. seed synthetic accounts (idempotent)
 #   2. mint patient + clinician tokens (in-container, JWT_SIGNING_KEY)
-#   3. POST /v1/async-consults                      (patient)   → consult_id
-#   4. POST /v1/async-consults/:id/intake           (patient)   → submission_id
-#   5. GET  /v1/async-consults/queue                (clinician) → sees consult
+#   3. POST /v1/async-consults                      (patient)    → consult_id
+#   4. POST /v1/async-consults/:id/intake           (patient)    → submission_id
+#  4.5. POST /v1/async-consults/:id/ai-preparation  (ai_service) → summary_id
+#   5. GET  /v1/async-consults/queue                (clinician)  → sees consult
 #   6. POST /v1/async-consults/:id/claim            (clinician) → claim_id
 #   7. POST /v1/async-consults/:id/decision         (clinician) → decision_id
 #   8. GET  /v1/async-consults/:id                  (patient)   → final state
@@ -79,26 +80,26 @@ echo "$RESP"
 SUBMISSION_ID=$(echo "$RESP" | JQ submission_id)
 [ -n "$SUBMISSION_ID" ] || fail "intake — no submission_id"
 
-say "4.5 simulate AI-preparation transitions (submitted → processing → queued)"
-# STAND-IN for the Mode-1 AI-preparation step: the platform's AI service
-# will call record_consult_ai_preparation_completed once the AI-prep
-# endpoint is wired (PR #230 recorded TODO). Until then the smoke advances
-# the lifecycle with the same canonical transition triples the wrapper
-# uses (056 CHECK: ai_processing_started / ai_processing_completed), as
-# actor_role='ai_service', via the raw writer under superuser.
-T1="$(ulid_now)"; T2="$(ulid_now)"
-SIM_NONCE=$("${COMPOSE[@]}" exec -T app node -e "process.stdout.write(require('crypto').randomUUID())")
-"${COMPOSE[@]}" exec -T db psql -U bind_actor_context_role -d telecheck -v ON_ERROR_STOP=1 -q -c \
-  "SELECT bind_actor_context('01JZZZ00000000000000000C01','Telecheck-US','clinician',NULL,'$(ulid_now)','$SIM_NONCE'::uuid,300)" >/dev/null \
-  || fail "AI-prep simulation bind"
-"${COMPOSE[@]}" exec -T db psql -U telecheck -d telecheck -v ON_ERROR_STOP=1 -q -c \
-  "BEGIN;
-   SET LOCAL app.request_nonce = '$SIM_NONCE';
-   SELECT set_tenant_context('Telecheck-US');
-   SELECT record_consult_lifecycle_transition('$T1','Telecheck-US','$CONSULT_ID','processing','ai_processing_started',NULL,'ai_service','{}'::jsonb);
-   SELECT record_consult_lifecycle_transition('$T2','Telecheck-US','$CONSULT_ID','queued','ai_processing_completed',NULL,'ai_service','{}'::jsonb);
-   COMMIT;" \
-  && echo "consult advanced to queued" || fail "AI-prep simulation transitions"
+say "4.5 AI preparation (ai_service) — REAL endpoint (migration 064 + P-038 endpoint #4)"
+# The former raw-SQL stand-in is retired: the consult now advances
+# submitted → processing → queued through the ratified path —
+# POST /v1/async-consults/:id/ai-preparation under an ai_service-role
+# token → withDbRole(ai_service_account) → SECDEF wrapper
+# record_consult_ai_preparation_completed → raw lifecycle writer, with
+# Cat C ai_preparation_started/_completed audits in the same tx.
+# The clinical summary envelope is synthetic (same pre-encrypted-KMS
+# posture as intake; app-side encryption is the recorded hardening TODO).
+AIT="$("${COMPOSE[@]}" exec -T app node scripts/mint-staging-token.mjs --role ai_service)"
+[ -n "$AIT" ] || fail "ai_service token minting"
+PREP_BODY=$(printf '{"patient_id":"%s","prepared_by_mode":"mode_1","ai_provider":"null_local_dev","model_id":"null-provider:staging-smoke","summary_envelope":%s,"interaction_signals_snapshot":{},"recommendation":"recommend"}' \
+  "$PATIENT_ID" "$(envelope)")
+RESP=$(curl -s -m 20 -X POST "$BASE/v1/async-consults/$CONSULT_ID/ai-preparation" \
+  -H "Authorization: Bearer $AIT" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(ulid_now)" -d "$PREP_BODY")
+echo "$RESP"
+SUMMARY_ID=$(echo "$RESP" | JQ summary_id)
+[ -n "$SUMMARY_ID" ] || fail "ai-preparation — no summary_id"
+echo "consult advanced to queued (summary_id=$SUMMARY_ID)"
 
 say "5. clinician queue"
 RESP=$(curl -s -m 20 "$BASE/v1/async-consults/queue?limit=50" -H "Authorization: Bearer $CT")
