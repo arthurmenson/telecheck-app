@@ -14,7 +14,7 @@ This module owns the platform's asynchronous consult primitive — patient-initi
 
 **v1-surface hardening still open (why `/ready` stays 503):**
 - Delegate-initiated flows fail closed (403 + documented TODO in `initiate-consult-v1.ts`) pending a delegate-principal binding primitive from the Consent slice. The read path DOES honor delegates (the migration 057 patient-view predicate authorizes active `book_consults` delegations).
-- `record_consult_ai_preparation_completed` (migration 059 §3) is not exposed — wrapper EXECUTE is owner-only until the AI-service slice role is wired.
+- ~~`record_consult_ai_preparation_completed` (migration 059 §3) is not exposed — wrapper EXECUTE is owner-only until the AI-service slice role is wired.~~ **CLOSED (migration 064):** POST `/v1/async-consults/:consult_id/ai-preparation` (OpenAPI v0.4 endpoint #4) is live under the `ai_service` caller class — `ai_service_account` slice role + wrapper EXECUTE + app-role bridge + SI-010 actor-enum widening shipped with the handler (`internal/handlers/ai-preparation-v1.ts`) and Cat C `ai_preparation_started`/`_completed` audits. The in-process Mode 1 preparation pipeline (LLM → summary → app-side envelope encryption → this recording surface) remains a hardening follow-on until a real LLM provider replaces NullLLMProvider.
 - `reassign_consult_claim` (migration 059 §5) is not exposed — admin surface; lands with the admin-backend follow-on PR.
 - KMS envelopes for intake payload + decision rationale are accepted PRE-ENCRYPTED from an internal service boundary (crisis precedent; see `internal/handlers/v1-shared.ts`); app-side envelope encryption is a hardening follow-on.
 - Live-PostgreSQL integration tests for the v1 endpoints are pending (unit tests per handler shipped with PR 6).

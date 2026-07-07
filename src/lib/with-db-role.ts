@@ -128,6 +128,11 @@ export const SLICE_ROLES = [
   'async_consult_clinician_reviewer',
   'async_consult_patient_reader',
   'async_consult_staff_reader',
+  // AI-service caller class (P-038 §3 wrapper table verbatim name —
+  // migration 064 creates the role, grants wrapper EXECUTE on
+  // record_consult_ai_preparation_completed, and bridges
+  // telecheck_app_role membership per the 051 §2 Option B pattern)
+  'ai_service_account',
 ] as const;
 
 export type SliceRole = (typeof SLICE_ROLES)[number];

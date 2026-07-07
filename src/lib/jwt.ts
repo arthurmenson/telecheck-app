@@ -47,13 +47,24 @@ import type { TenantId } from './glossary.js';
  * rejects with reason='invalid_payload' on any unknown value — defense
  * against a future bug in the issuer that mints out-of-enum roles.
  */
-export type AccessTokenRole = 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
+export type AccessTokenRole =
+  | 'patient'
+  | 'clinician'
+  | 'tenant_admin'
+  | 'platform_admin'
+  | 'ai_service';
 
 const VALID_ACCESS_TOKEN_ROLES: ReadonlySet<AccessTokenRole> = new Set<AccessTokenRole>([
   'patient',
   'clinician',
   'tenant_admin',
   'platform_admin',
+  // AI-service internal caller class (migration 064): the service
+  // principal behind POST /v1/async-consults/:id/ai-preparation
+  // (P-038 OpenAPI v0.4 endpoint #4, "AI Service (internal)").
+  // Ratified actor class per State Machines v1.3 transition actor_role
+  // + RBAC Matrix v1.2 §3 Group B AI Service workload identities.
+  'ai_service',
 ]);
 
 /**
@@ -172,7 +183,7 @@ export function issueAccessToken(input: IssueAccessTokenInput, signingKey: strin
   if (!VALID_ACCESS_TOKEN_ROLES.has(input.role)) {
     throw new Error(
       `issueAccessToken: role ${String(input.role)} is not a valid AccessTokenRole. ` +
-        'Valid values: patient | clinician | tenant_admin | platform_admin. ' +
+        'Valid values: patient | clinician | tenant_admin | platform_admin | ai_service. ' +
         'Update VALID_ACCESS_TOKEN_ROLES + the AccessTokenRole union when ' +
         'widening (RBAC v1.1 §1.2).',
     );

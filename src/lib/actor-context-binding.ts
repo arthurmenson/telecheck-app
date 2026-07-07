@@ -45,7 +45,10 @@ export type BindActorRole =
   | 'delegate'
   | 'clinician'
   | 'tenant_admin'
-  | 'platform_admin';
+  | 'platform_admin'
+  // AI-service internal caller class (migration 064 widens the
+  // _session_actor_context CHECK + bind_actor_context() validation).
+  | 'ai_service';
 
 /**
  * Inputs to `bindActorContextForRequest`. All values are derived from

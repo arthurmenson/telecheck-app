@@ -292,6 +292,8 @@ export async function emitConsultExpiredAudit(
 type AsyncConsultV1AuditActionPlaceholder =
   | 'async_consult.initiated'
   | 'async_consult.intake_submitted'
+  | 'async_consult.ai_preparation_started'
+  | 'async_consult.ai_preparation_completed'
   | 'async_consult.case_claimed'
   | 'async_consult.claim_expired_auto_released'
   | 'async_consult.clinician_decision_recorded'
@@ -312,7 +314,7 @@ function asyncConsultV1AuditPlaceholder(id: AsyncConsultV1AuditActionPlaceholder
  */
 interface AsyncConsultV1AuditCommon {
   tenant_id: TenantId;
-  actor_type: 'patient' | 'delegate' | 'clinician' | 'system';
+  actor_type: 'patient' | 'delegate' | 'clinician' | 'system' | 'ai_workload';
   actor_id: string;
   actor_tenant_id: string | null;
   target_patient_id: string | null;
@@ -320,6 +322,14 @@ interface AsyncConsultV1AuditCommon {
   resource_type: string;
   resource_id: string;
   detail: Record<string, unknown>;
+  /**
+   * Required when actor_type='ai_workload' (WORKLOAD_TAXONOMY v5.2 §1
+   * nullability rule enforced in src/lib/audit.ts). The AI-preparation
+   * emitters pass the prepared_by_mode-derived workload class
+   * ('conversational_assistant' for mode_1, 'protocol_execution' for
+   * mode_2); all other emitters omit it (null).
+   */
+  ai_workload_type?: 'conversational_assistant' | 'protocol_execution';
 }
 
 function buildV1Envelope(
@@ -344,10 +354,13 @@ function buildV1Envelope(
     engine_versions: null,
     // These are lifecycle attestations, not I-012 action-class records —
     // ai_workload_type + autonomy_level stay null (med-interaction
-    // buildEnvelope precedent). The prescribe outcome's I-012 gate lives
-    // with the Pharmacy medication_request flow (prescription_details_id
-    // is an opaque handle at this slice per P-038 §12 OQ2).
-    ai_workload_type: null,
+    // buildEnvelope precedent), EXCEPT the ai_preparation_* emitters
+    // whose actor_type='ai_workload' requires ai_workload_type populated
+    // per the WORKLOAD_TAXONOMY v5.2 §1 nullability rule. The prescribe
+    // outcome's I-012 gate lives with the Pharmacy medication_request
+    // flow (prescription_details_id is an opaque handle at this slice
+    // per P-038 §12 OQ2).
+    ai_workload_type: common.ai_workload_type ?? null,
     autonomy_level: null,
     agent_id: null,
     agent_version: null,
@@ -441,6 +454,86 @@ export async function emitAsyncConsultIntakeSubmittedAudit(
         // echoed into audit detail.
       },
     }),
+    tx,
+  );
+}
+
+/**
+ * Cat C — async_consult.ai_preparation_started + ai_preparation_completed
+ * (POST /v1/async-consults/:id/ai-preparation; AUDIT_EVENTS v5.11 rows 4-5).
+ *
+ * The migration 059 §3 wrapper is ATOMIC (ai_processing_started when
+ * entering from submitted + clinical_summary INSERT + ai_processing_completed
+ * in one call), so the handler emits both attestations in the same tx after
+ * the wrapper returns — preparation started and completed within this
+ * request. actor_type='ai_workload' per the migration 002 actor-type rule
+ * for new v1.10+ AI emitters; ai_workload_type derives from
+ * prepared_by_mode (mode_1 → conversational_assistant, mode_2 →
+ * protocol_execution per ADR-029 / WORKLOAD_TAXONOMY v5.2).
+ */
+export async function emitAsyncConsultAiPreparationAudits(
+  args: {
+    tenantId: TenantId;
+    summaryId: string;
+    consultId: string;
+    patientId: string;
+    /** The AI-service principal's account id (JWT sub). */
+    actorId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+    preparedByMode: 'mode_1' | 'mode_2';
+    aiProvider: string;
+    modelId: string;
+    recommendation: string | null;
+  },
+  tx: AuditDbClient,
+): Promise<void> {
+  const aiWorkloadType =
+    args.preparedByMode === 'mode_1' ? 'conversational_assistant' : 'protocol_execution';
+  await emitAudit(
+    buildV1Envelope(asyncConsultV1AuditPlaceholder('async_consult.ai_preparation_started'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'ai_workload',
+      actor_id: args.actorId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consult',
+      resource_id: args.consultId,
+      ai_workload_type: aiWorkloadType,
+      detail: {
+        prepared_by_mode: args.preparedByMode,
+        ai_provider: args.aiProvider,
+        model_id: args.modelId,
+      },
+    }),
+    tx,
+  );
+  await emitAudit(
+    buildV1Envelope(
+      asyncConsultV1AuditPlaceholder('async_consult.ai_preparation_completed'),
+      'C',
+      {
+        tenant_id: args.tenantId,
+        actor_type: 'ai_workload',
+        actor_id: args.actorId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: args.patientId,
+        country_of_care: args.countryOfCare,
+        resource_type: 'consult_clinical_summary',
+        resource_id: args.summaryId,
+        ai_workload_type: aiWorkloadType,
+        detail: {
+          consult_id: args.consultId,
+          prepared_by_mode: args.preparedByMode,
+          ai_provider: args.aiProvider,
+          model_id: args.modelId,
+          recommendation: args.recommendation,
+          // The clinical summary itself is a KMS envelope (I-026) —
+          // never echoed into audit detail.
+        },
+      },
+    ),
     tx,
   );
 }

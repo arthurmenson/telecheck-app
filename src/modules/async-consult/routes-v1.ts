@@ -33,9 +33,14 @@
  *                                                  [+ prescribing_recorded / rationale
  *                                                  disagreement per decision shape])
  *
- * NOT exposed at PR 6 (deferred per migration 059 documented TODOs):
- *   - AI preparation (record_consult_ai_preparation_completed) — wrapper
- *     EXECUTE is owner-only until the AI-service slice role is wired.
+ * Added post-PR 6:
+ *   POST /v1/async-consults/:consult_id/ai-preparation — AI-service
+ *     caller class records a completed case preparation
+ *     (record_consult_ai_preparation_completed; migration 064 wires the
+ *     ai_service_account slice role + closes the 059 §3 deferred grant;
+ *     Cat C async_consult.ai_preparation_started + _completed).
+ *
+ * NOT exposed yet (deferred per migration 059 documented TODOs):
  *   - Claim reassignment (reassign_consult_claim) — admin surface;
  *     lands with the admin-backend follow-on PR.
  *   - Delegate-initiated flows — patient-principal-only at PR 6 (see
@@ -53,6 +58,7 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { aiPreparationV1Handler } from './internal/handlers/ai-preparation-v1.js';
 import { claimConsultV1Handler } from './internal/handlers/claim-consult-v1.js';
 import { getConsultV1Handler } from './internal/handlers/get-consult-v1.js';
 import { getQueueV1Handler } from './internal/handlers/get-queue-v1.js';
@@ -71,6 +77,7 @@ export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
   app.post('/', initiateConsultV1Handler);
   app.get('/:consult_id', getConsultV1Handler);
   app.post('/:consult_id/intake', submitIntakeV1Handler);
+  app.post('/:consult_id/ai-preparation', aiPreparationV1Handler);
   app.post('/:consult_id/claim', claimConsultV1Handler);
   app.post('/:consult_id/decision', recordDecisionV1Handler);
 };

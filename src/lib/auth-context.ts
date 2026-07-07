@@ -86,8 +86,13 @@ export interface ActorContext {
    * matches the request's resolved tenant context. A binding mismatch
    * leaves actorContext undefined (handler will 401, response stays
    * tenant-blind per I-025). platform_admin is global (no binding).
+   *
+   * ai_service (migration 064): the internal AI-service caller class
+   * behind POST /v1/async-consults/:id/ai-preparation (P-038 OpenAPI
+   * v0.4 endpoint #4). Tenant-scoped like patient/clinician (the
+   * service principal's token is minted per operating tenant).
    */
-  role: 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
+  role: 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin' | 'ai_service';
   /** Country of care from token. */
   countryOfCare: 'US' | 'GH';
   /** Delegate context when the patient is acting as a delegate. */
@@ -497,7 +502,7 @@ export function requireActorContext(req: FastifyRequest): ActorContext {
 // and bring their own per-route role logic.
 // ---------------------------------------------------------------------------
 
-export type ActorRole = 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin';
+export type ActorRole = 'patient' | 'clinician' | 'tenant_admin' | 'platform_admin' | 'ai_service';
 
 export class UnauthorizedRoleError extends Error {
   readonly statusCode = 403;
@@ -549,6 +554,26 @@ export function requireClinicianActorContext(
     throw new UnauthorizedRoleError('clinician', actor.role);
   }
   return actor as ActorContext & { role: 'clinician' };
+}
+
+/**
+ * Assert that the request carries an authenticated AI-SERVICE actor
+ * (the internal caller class behind POST /v1/async-consults/:id/
+ * ai-preparation per P-038 OpenAPI v0.4 endpoint #4; migration 064).
+ * Mirror of requirePatientActorContext / requireClinicianActorContext.
+ *
+ * Throws:
+ *   - UnauthenticatedError (401) on missing/invalid JWT
+ *   - UnauthorizedRoleError (403) on role !== 'ai_service'
+ */
+export function requireAiServiceActorContext(
+  req: FastifyRequest,
+): ActorContext & { role: 'ai_service' } {
+  const actor = requireActorContext(req);
+  if (actor.role !== 'ai_service') {
+    throw new UnauthorizedRoleError('ai_service', actor.role);
+  }
+  return actor as ActorContext & { role: 'ai_service' };
 }
 
 // ---------------------------------------------------------------------------
