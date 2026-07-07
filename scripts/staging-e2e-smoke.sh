@@ -79,6 +79,27 @@ echo "$RESP"
 SUBMISSION_ID=$(echo "$RESP" | JQ submission_id)
 [ -n "$SUBMISSION_ID" ] || fail "intake — no submission_id"
 
+say "4.5 simulate AI-preparation transitions (submitted → processing → queued)"
+# STAND-IN for the Mode-1 AI-preparation step: the platform's AI service
+# will call record_consult_ai_preparation_completed once the AI-prep
+# endpoint is wired (PR #230 recorded TODO). Until then the smoke advances
+# the lifecycle with the same canonical transition triples the wrapper
+# uses (056 CHECK: ai_processing_started / ai_processing_completed), as
+# actor_role='ai_service', via the raw writer under superuser.
+T1="$(ulid_now)"; T2="$(ulid_now)"
+SIM_NONCE=$("${COMPOSE[@]}" exec -T app node -e "process.stdout.write(require('crypto').randomUUID())")
+"${COMPOSE[@]}" exec -T db psql -U bind_actor_context_role -d telecheck -v ON_ERROR_STOP=1 -q -c \
+  "SELECT bind_actor_context('01JZZZ00000000000000000C01','Telecheck-US','clinician',NULL,'$(ulid_now)','$SIM_NONCE'::uuid,300)" >/dev/null \
+  || fail "AI-prep simulation bind"
+"${COMPOSE[@]}" exec -T db psql -U telecheck -d telecheck -v ON_ERROR_STOP=1 -q -c \
+  "BEGIN;
+   SET LOCAL app.request_nonce = '$SIM_NONCE';
+   SELECT set_tenant_context('Telecheck-US');
+   SELECT record_consult_lifecycle_transition('$T1','Telecheck-US','$CONSULT_ID','processing','ai_processing_started',NULL,'ai_service','{}'::jsonb);
+   SELECT record_consult_lifecycle_transition('$T2','Telecheck-US','$CONSULT_ID','queued','ai_processing_completed',NULL,'ai_service','{}'::jsonb);
+   COMMIT;" \
+  && echo "consult advanced to queued" || fail "AI-prep simulation transitions"
+
 say "5. clinician queue"
 RESP=$(curl -s -m 20 "$BASE/v1/async-consults/queue?limit=50" -H "Authorization: Bearer $CT")
 echo "$RESP" | head -c 500; echo
