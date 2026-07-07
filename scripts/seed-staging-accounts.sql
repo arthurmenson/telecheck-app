@@ -32,6 +32,19 @@ INSERT INTO accounts (
     )
 ON CONFLICT (account_id) DO NOTHING;
 
+-- Synthetic forms template — consult_intake_submission carries a composite
+-- FK (tenant_id, template_id) → forms_template; the E2E smoke's intake step
+-- needs a real target row.
+INSERT INTO forms_template (
+    template_id, tenant_id, program_id, country_of_care,
+    template_version, name, description
+) VALUES (
+    '01JZZZ00000000000000TMPL01', 'Telecheck-US', '01JZZZ00000000000000PROG01',
+    'US', 1, 'Staging E2E synthetic intake template',
+    'Staging-only synthetic template for the authenticated consult-flow smoke.'
+)
+ON CONFLICT (template_id) DO NOTHING;
+
 -- Verification: both rows present and active.
 DO $$
 DECLARE
