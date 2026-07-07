@@ -510,30 +510,26 @@ export async function emitAsyncConsultAiPreparationAudits(
     tx,
   );
   await emitAudit(
-    buildV1Envelope(
-      asyncConsultV1AuditPlaceholder('async_consult.ai_preparation_completed'),
-      'C',
-      {
-        tenant_id: args.tenantId,
-        actor_type: 'ai_workload',
-        actor_id: args.actorId,
-        actor_tenant_id: args.actorTenantId,
-        target_patient_id: args.patientId,
-        country_of_care: args.countryOfCare,
-        resource_type: 'consult_clinical_summary',
-        resource_id: args.summaryId,
-        ai_workload_type: aiWorkloadType,
-        detail: {
-          consult_id: args.consultId,
-          prepared_by_mode: args.preparedByMode,
-          ai_provider: args.aiProvider,
-          model_id: args.modelId,
-          recommendation: args.recommendation,
-          // The clinical summary itself is a KMS envelope (I-026) —
-          // never echoed into audit detail.
-        },
+    buildV1Envelope(asyncConsultV1AuditPlaceholder('async_consult.ai_preparation_completed'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'ai_workload',
+      actor_id: args.actorId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consult_clinical_summary',
+      resource_id: args.summaryId,
+      ai_workload_type: aiWorkloadType,
+      detail: {
+        consult_id: args.consultId,
+        prepared_by_mode: args.preparedByMode,
+        ai_provider: args.aiProvider,
+        model_id: args.modelId,
+        recommendation: args.recommendation,
+        // The clinical summary itself is a KMS envelope (I-026) —
+        // never echoed into audit detail.
       },
-    ),
+    }),
     tx,
   );
 }
