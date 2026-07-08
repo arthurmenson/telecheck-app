@@ -220,11 +220,20 @@ const ConfigSchema = z.object({
   // the plaintext, which makes the real login flow unreachable outside
   // tests. When 'true', login/start includes the OTP plaintext in its
   // response as `dev_otp` so staging testers can complete the flow.
-  // HARD-REFUSED in production by the fail-fast below (AI_MODE2_ENABLED
-  // precedent): echoing an auth credential in a response is a
-  // staging-only affordance, removed in lockstep with the SMS-provider
-  // SI, never a production toggle.
+  // HARD-REFUSED when DEPLOY_ENV resolves to 'production' (fail-fast
+  // below): echoing an auth credential in a response is a staging-only
+  // affordance, removed in lockstep with the SMS-provider SI, never a
+  // production toggle.
   AUTH_DEV_OTP_ECHO: z.enum(['false', 'true']).default('false'),
+
+  // Deployment-environment label, DISTINCT from NODE_ENV: the staging
+  // stack runs NODE_ENV=production for runtime parity (prod code paths,
+  // no dev middleware), so NODE_ENV cannot express "is this the
+  // production deployment". DEPLOY_ENV defaults to NODE_ENV's value —
+  // fail-closed: an environment that does not explicitly label itself
+  // 'staging' is treated as production for gate purposes. The staging
+  // compose sets DEPLOY_ENV=staging.
+  DEPLOY_ENV: z.enum(['development', 'test', 'staging', 'production']).optional(),
 
   // Resume-token signing secret (Forms/Intake save-and-resume per Slice PRD §8).
   // The forms-intake module's resume-token.ts derives an HMAC-SHA-256 signature
@@ -396,15 +405,19 @@ function loadConfig() {
   // Production fail-fast on AUTH_DEV_OTP_ECHO=true (same posture as the
   // AI_MODE2_ENABLED gate): echoing OTP plaintext in an HTTP response is
   // a staging-only affordance for the Track-4 patient-app login flow
-  // while no SMS provider is wired. It must never reach production —
-  // the config layer enforces that invariant rather than relying on
-  // operator discipline alone.
-  if (parsed.NODE_ENV === 'production' && parsed.AUTH_DEV_OTP_ECHO === 'true') {
+  // while no SMS provider is wired. Keyed on DEPLOY_ENV (not NODE_ENV):
+  // the staging stack runs NODE_ENV=production for runtime parity, and
+  // DEPLOY_ENV defaults to NODE_ENV when unset — so any deployment that
+  // has not explicitly labeled itself 'staging'/'development'/'test'
+  // still fails closed as production.
+  const deployEnv = parsed.DEPLOY_ENV ?? parsed.NODE_ENV;
+  if (deployEnv === 'production' && parsed.AUTH_DEV_OTP_ECHO === 'true') {
     throw new Error(
-      'AUTH_DEV_OTP_ECHO must remain "false" in production. The flag exists only ' +
-        'so staging testers can complete the OTP login flow while no SMS provider ' +
-        'is wired (login/start otherwise discards the OTP plaintext). It is removed ' +
-        'in lockstep with the SMS-provider SI.',
+      'AUTH_DEV_OTP_ECHO must remain "false" in production deployments ' +
+        '(DEPLOY_ENV=production, or unset with NODE_ENV=production). The flag ' +
+        'exists only so staging testers can complete the OTP login flow while no ' +
+        'SMS provider is wired (login/start otherwise discards the OTP plaintext). ' +
+        'It is removed in lockstep with the SMS-provider SI.',
     );
   }
 
@@ -445,6 +458,7 @@ function loadConfig() {
     researchDataPartnershipActive: parsed.RESEARCH_DATA_PARTNERSHIP_ACTIVE === 'active',
     aiMode2Enabled: parsed.AI_MODE2_ENABLED === 'true',
     authDevOtpEcho: parsed.AUTH_DEV_OTP_ECHO === 'true',
+    deployEnv,
     resumeTokenSecret,
   } as const;
 }
