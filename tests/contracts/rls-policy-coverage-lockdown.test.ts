@@ -114,6 +114,11 @@ const TENANT_SCOPED_TABLES = [
   'adapter_configs',
   'admin_dashboard_query_execution', // migration 040 — Admin Backend slice
   'admin_template_decision_idempotency_key', // migration 040 — Admin Backend slice
+  'ai_mode1_conversation', // migration 067 — Mode 1 persistence (P-035/P-036)
+  'ai_mode1_conversation_archival_event', // migration 067 — Mode 1 persistence
+  'ai_mode1_conversation_turn_admission', // migration 067 — Mode 1 persistence
+  'ai_mode1_conversation_turn_detector_result', // migration 067 — Mode 1 persistence
+  'ai_mode1_conversation_turn_result', // migration 067 — Mode 1 persistence
   'audit_records',
   'auth_devices',
   'ccr_configs',
