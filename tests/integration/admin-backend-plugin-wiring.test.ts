@@ -97,10 +97,11 @@ describe('admin-backend slice — §1 plugin wiring', () => {
     expect(body.status).toBe('unavailable');
     expect(body.module).toBe('admin-backend');
     expect(body.reason).toBe('partial_handlers_mounted_full_surface_incomplete');
-    // Post-migration-065 truth: 4 of 5 SI-023 §5 endpoints live; the
-    // mode1-volume dashboard remains the named blocker.
-    expect(body.reason_message).toContain('4 of 5 SI-023 §5 endpoints are live');
-    expect(body.reason_message).toContain('mode1-volume-health');
+    // Post-migration-069 truth: all 5 SI-023 §5 endpoints live (mode1-volume
+    // unlocked by migration 069); the Sprint 4 hardening set remains the
+    // named blocker.
+    expect(body.reason_message).toContain('5 of 5 SI-023 §5 endpoints are live');
+    expect(body.reason_message).toContain('mode1-volume-health (unlocked by migration 069');
   });
 
   // §1c — paired-probe coverage proving the template submit-for-review write
