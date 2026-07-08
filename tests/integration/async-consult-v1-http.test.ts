@@ -88,11 +88,6 @@ let aiServiceToken = '';
 const AI_SERVICE_PRINCIPAL = ulid(); // service principal — no accounts row needed
 let templateId = '';
 
-// Cross-test state (Group A/B chains).
-let consultA = '';
-let consultB = '';
-let claimB = '';
-
 function mintToken(accountId: string, role: AccessTokenRole): string {
   return issueAccessToken(
     {
@@ -330,53 +325,54 @@ afterAll(async () => {
 });
 
 // ===========================================================================
-// Group A — full pilot loop
+// Tests. IMPORTANT: tests/setup.ts wraps EVERY test in a savepoint that is
+// rolled back at test end — DB state does NOT survive across `it` blocks
+// (CI run 28911517079 pinned this: cross-test chaining 409'd on rolled-back
+// consults while the self-contained B1 chain passed). Every test below is
+// therefore fully self-contained: it creates whatever consult chain it
+// needs and asserts within the same block.
 // ===========================================================================
 
-describe('async-consult v1 — Group A full pilot loop (live SI-010 + SECDEF + RLS)', () => {
-  it('A1 initiate (patient) returns 201 + consult_id; no tenant leak', async () => {
-    consultA = await initiateConsult(patient.token);
-    expect(consultA).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-  });
+describe('async-consult v1 — full pilot loop (live SI-010 + SECDEF + RLS)', () => {
+  it('A. initiate → intake → ai-preparation → queue → claim → decision → patient read-back', async () => {
+    // Initiate (patient).
+    const consultId = await initiateConsult(patient.token);
+    expect(consultId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
 
-  it('A2 intake (patient) returns 201 + submission_id', async () => {
-    const submissionId = await submitIntake(patient.token, consultA);
+    // Intake (patient).
+    const submissionId = await submitIntake(patient.token, consultId);
     expect(submissionId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-  });
 
-  it('A3 ai-preparation (ai_service) advances submitted → queued through the real wrapper', async () => {
-    const summaryId = await runAiPreparation(consultA, patient.accountId);
+    // AI preparation (ai_service) — submitted → processing → queued
+    // through the migration 059 §3 wrapper under ai_service_account.
+    const summaryId = await runAiPreparation(consultId, patient.accountId);
     expect(summaryId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-
-    const read = await inject({
+    const queuedRead = await inject({
       method: 'GET',
-      url: `/v1/async-consults/${consultA}`,
+      url: `/v1/async-consults/${consultId}`,
       token: patient.token,
     });
-    expect(read.statusCode).toBe(200);
-    expect(json<{ current_state: string }>(read).current_state).toBe('queued');
-  });
+    expect(queuedRead.statusCode).toBe(200);
+    expect(json<{ current_state: string }>(queuedRead).current_state).toBe('queued');
 
-  it('A4 clinician queue lists the consult in state queued', async () => {
-    const res = await inject({
+    // Clinician queue lists it.
+    const queue = await inject({
       method: 'GET',
       url: '/v1/async-consults/queue?limit=50',
       token: clinician.token,
     });
-    expect(res.statusCode).toBe(200);
-    const rows = json<{ rows: { consult_id: string; current_state: string | null }[] }>(res).rows;
-    const row = rows.find((r) => r.consult_id === consultA);
+    expect(queue.statusCode).toBe(200);
+    const row = json<{ rows: { consult_id: string; current_state: string | null }[] }>(
+      queue,
+    ).rows.find((r) => r.consult_id === consultId);
     expect(row).toBeDefined();
     expect(row!.current_state).toBe('queued');
-  });
 
-  it('A5 claim (clinician) returns 201 + claim_id', async () => {
-    const claimId = await claimConsult(consultA);
-    expect(claimId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-
-    const res = await inject({
+    // Claim + decision (clinician, recommend).
+    const claimId = await claimConsult(consultId);
+    const decision = await inject({
       method: 'POST',
-      url: `/v1/async-consults/${consultA}/decision`,
+      url: `/v1/async-consults/${consultId}/decision`,
       token: clinician.token,
       payload: {
         claim_id: claimId,
@@ -387,125 +383,110 @@ describe('async-consult v1 — Group A full pilot loop (live SI-010 + SECDEF + R
         interaction_signals_reviewed_ids: [],
       },
     });
-    expect(res.statusCode).toBe(201);
-    expect(json<{ decision_id: string }>(res).decision_id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-  });
+    expect(decision.statusCode).toBe(201);
 
-  it('A7 patient reads back the decided consult (advised / recommend); tenant-blind body', async () => {
-    const res = await inject({
+    // Patient read-back — tenant-blind body (I-025 / §17 brand rule).
+    const finalRead = await inject({
       method: 'GET',
-      url: `/v1/async-consults/${consultA}`,
+      url: `/v1/async-consults/${consultId}`,
       token: patient.token,
     });
-    expect(res.statusCode).toBe(200);
-    const view = json<{ current_state: string; decision_type: string | null }>(res);
+    expect(finalRead.statusCode).toBe(200);
+    const view = json<{ current_state: string; decision_type: string | null }>(finalRead);
     expect(view.current_state).toBe('advised');
     expect(view.decision_type).toBe('recommend');
-    expect(res.body).not.toContain('"tenant_id"');
-    expect(res.body).not.toContain('Telecheck-US');
+    expect(finalRead.body).not.toContain('"tenant_id"');
+    expect(finalRead.body).not.toContain('Telecheck-US');
   });
 });
 
-// ===========================================================================
-// Group B — endpoint #9 + follow-up messages on a second consult
-// ===========================================================================
+describe('async-consult v1 — endpoint #9 + follow-up messages (#10/#11)', () => {
+  it('B. request-additional-data → awaiting_data; both parties message; both list; envelope round-trips', async () => {
+    // Chain to under_review.
+    const consultId = await initiateConsult(patient.token);
+    await submitIntake(patient.token, consultId);
+    await runAiPreparation(consultId, patient.accountId);
+    const claimId = await claimConsult(consultId);
 
-describe('async-consult v1 — Group B request-additional-data + follow-up messages', () => {
-  it('B1 request-additional-data (endpoint #9) → awaiting_data', async () => {
-    consultB = await initiateConsult(patient.token);
-    await submitIntake(patient.token, consultB);
-    await runAiPreparation(consultB, patient.accountId);
-    claimB = await claimConsult(consultB);
-
-    const res = await inject({
+    // Endpoint #9 — decision_type pinned server-side.
+    const rad = await inject({
       method: 'POST',
-      url: `/v1/async-consults/${consultB}/request-additional-data`,
+      url: `/v1/async-consults/${consultId}/request-additional-data`,
       token: clinician.token,
       payload: {
-        claim_id: claimB,
+        claim_id: claimId,
         patient_id: patient.accountId,
         agreement_with_ai_recommendation: 'no_ai_recommendation',
         decision_rationale_envelope: makeEnvelope('need-more-data'),
         interaction_signals_reviewed_ids: [],
       },
     });
-    expect(res.statusCode).toBe(201);
-
-    const read = await inject({
+    expect(rad.statusCode).toBe(201);
+    const awaiting = await inject({
       method: 'GET',
-      url: `/v1/async-consults/${consultB}`,
+      url: `/v1/async-consults/${consultId}`,
       token: patient.token,
     });
-    expect(json<{ current_state: string }>(read).current_state).toBe('awaiting_data');
-  });
+    expect(json<{ current_state: string }>(awaiting).current_state).toBe('awaiting_data');
 
-  it('B2 patient sends a follow-up message (endpoint #10)', async () => {
-    const res = await inject({
+    // Endpoint #10 — patient + clinician sends.
+    const patientSend = await inject({
       method: 'POST',
-      url: `/v1/async-consults/${consultB}/follow-up-messages`,
+      url: `/v1/async-consults/${consultId}/follow-up-messages`,
       token: patient.token,
       payload: { message_envelope: makeEnvelope('patient-msg') },
     });
-    expect(res.statusCode).toBe(201);
-    expect(json<{ message_id: string }>(res).message_id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-  });
-
-  it('B3 clinician sends a follow-up message (endpoint #10)', async () => {
-    const res = await inject({
+    expect(patientSend.statusCode).toBe(201);
+    const clinicianSend = await inject({
       method: 'POST',
-      url: `/v1/async-consults/${consultB}/follow-up-messages`,
+      url: `/v1/async-consults/${consultId}/follow-up-messages`,
       token: clinician.token,
       payload: {
         patient_id: patient.accountId,
         message_envelope: makeEnvelope('clinician-msg'),
       },
     });
-    expect(res.statusCode).toBe(201);
-  });
+    expect(clinicianSend.statusCode).toBe(201);
 
-  it('B4 patient lists both messages; envelope round-trips; no tenant leak (endpoint #11)', async () => {
-    const res = await inject({
+    // Endpoint #11 — patient list (self-scoped) round-trips the sealed
+    // envelope; clinician list sees the same rows.
+    const patientList = await inject({
       method: 'GET',
-      url: `/v1/async-consults/${consultB}/follow-up-messages`,
+      url: `/v1/async-consults/${consultId}/follow-up-messages`,
       token: patient.token,
     });
-    expect(res.statusCode).toBe(200);
+    expect(patientList.statusCode).toBe(200);
     const rows = json<{
-      rows: {
-        sender_role: string;
-        message_envelope: { ciphertext_b64: string };
-      }[];
-    }>(res).rows;
+      rows: { sender_role: string; message_envelope: { ciphertext_b64: string } }[];
+    }>(patientList).rows;
     expect(rows).toHaveLength(2);
     expect(rows.map((r) => r.sender_role).sort()).toEqual(['clinician', 'patient']);
     const patientMsg = rows.find((r) => r.sender_role === 'patient')!;
     expect(Buffer.from(patientMsg.message_envelope.ciphertext_b64, 'base64').toString()).toBe(
       'sealed:patient-msg',
     );
-    expect(res.body).not.toContain('"tenant_id"');
-    expect(res.body).not.toContain('Telecheck-US');
-  });
+    expect(patientList.body).not.toContain('"tenant_id"');
+    expect(patientList.body).not.toContain('Telecheck-US');
 
-  it('B5 clinician lists both messages (endpoint #11)', async () => {
-    const res = await inject({
+    const clinicianList = await inject({
       method: 'GET',
-      url: `/v1/async-consults/${consultB}/follow-up-messages`,
+      url: `/v1/async-consults/${consultId}/follow-up-messages`,
       token: clinician.token,
     });
-    expect(res.statusCode).toBe(200);
-    expect(json<{ rows: unknown[] }>(res).rows).toHaveLength(2);
+    expect(clinicianList.statusCode).toBe(200);
+    expect(json<{ rows: unknown[] }>(clinicianList).rows).toHaveLength(2);
   });
 });
 
-// ===========================================================================
-// Group C — caller-class gates
-// ===========================================================================
+describe('async-consult v1 — caller-class gates', () => {
+  // Layer B fires before any consult lookup, so a syntactically-valid
+  // random consult_id suffices — no seeded state needed.
+  const someConsultId = '01HFG6Z3Q8B7H9P2W4V5K6N7T0';
 
-describe('async-consult v1 — Group C caller-class gates', () => {
   it('C1 ai-preparation rejects a patient token with 403', async () => {
     const res = await inject({
       method: 'POST',
-      url: `/v1/async-consults/${consultA}/ai-preparation`,
+      url: `/v1/async-consults/${someConsultId}/ai-preparation`,
       token: patient.token,
       payload: {},
     });
@@ -515,7 +496,7 @@ describe('async-consult v1 — Group C caller-class gates', () => {
   it('C2 ai-preparation rejects a clinician token with 403', async () => {
     const res = await inject({
       method: 'POST',
-      url: `/v1/async-consults/${consultA}/ai-preparation`,
+      url: `/v1/async-consults/${someConsultId}/ai-preparation`,
       token: clinician.token,
       payload: {},
     });
@@ -532,25 +513,31 @@ describe('async-consult v1 — Group C caller-class gates', () => {
   });
 });
 
-// ===========================================================================
-// Group D — tenant-blind self-scoping (I-025)
-// ===========================================================================
-
-describe('async-consult v1 — Group D self-scoping', () => {
-  it('D1 a second patient reading the first patient consult gets a tenant-blind 404', async () => {
+describe('async-consult v1 — tenant-blind self-scoping (I-025)', () => {
+  it('D1 a second patient reading another patient consult gets a tenant-blind 404', async () => {
+    const consultId = await initiateConsult(patient.token);
     const res = await inject({
       method: 'GET',
-      url: `/v1/async-consults/${consultA}`,
+      url: `/v1/async-consults/${consultId}`,
       token: patientB.token,
     });
     expect(res.statusCode).toBe(404);
     expect(res.body).not.toContain('Telecheck-US');
   });
 
-  it('D2 the second patient sees ZERO follow-up messages on the foreign consult (indistinguishable from message-less)', async () => {
+  it('D2 a second patient sees ZERO follow-up messages on a foreign consult (indistinguishable from message-less)', async () => {
+    const consultId = await initiateConsult(patient.token);
+    const send = await inject({
+      method: 'POST',
+      url: `/v1/async-consults/${consultId}/follow-up-messages`,
+      token: patient.token,
+      payload: { message_envelope: makeEnvelope('private-msg') },
+    });
+    expect(send.statusCode).toBe(201);
+
     const res = await inject({
       method: 'GET',
-      url: `/v1/async-consults/${consultB}/follow-up-messages`,
+      url: `/v1/async-consults/${consultId}/follow-up-messages`,
       token: patientB.token,
     });
     expect(res.statusCode).toBe(200);
