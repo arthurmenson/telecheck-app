@@ -72,7 +72,6 @@ import { createAccount } from '../../src/modules/identity/internal/repositories/
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
-import { getTestClient } from '../setup.ts';
 
 const T_US = asTenantId(TENANT_US);
 const BIND_ROLE_TEST_PASSWORD = 'telecheck_test_bind_pw';
@@ -239,15 +238,24 @@ beforeAll(async () => {
   // ------------------------------------------------------------------
   // SI-010 bind-pool provisioning (slice-level opt-in per tests/setup.ts
   // R2/R4 closure). Migration 031 creates bind_actor_context_role as
-  // LOGIN without credentials; the TEST_DATABASE_URL user (superuser in
-  // CI) provisions a suite-local password, and we open a DEDICATED pool
-  // whose session_user is the bind role — the exact production trust
-  // boundary the boot probe verifies.
+  // LOGIN without credentials; a DEDICATED superuser connection from
+  // TEST_DATABASE_URL provisions a suite-local password (the SHARED test
+  // client authenticates as non-superuser telecheck_test_app and cannot
+  // AlterRole — CI run 28910988544 pinned that 42501). Then we open a
+  // pool whose session_user is the bind role — the exact production
+  // trust boundary the boot probe verifies.
   // ------------------------------------------------------------------
-  const admin = getTestClient();
-  await admin.query(
-    `ALTER ROLE bind_actor_context_role WITH LOGIN PASSWORD '${BIND_ROLE_TEST_PASSWORD}'`,
-  );
+  const superuser = new pg.Client({
+    connectionString: process.env['TEST_DATABASE_URL'] as string,
+  });
+  await superuser.connect();
+  try {
+    await superuser.query(
+      `ALTER ROLE bind_actor_context_role WITH LOGIN PASSWORD '${BIND_ROLE_TEST_PASSWORD}'`,
+    );
+  } finally {
+    await superuser.end();
+  }
 
   const testUrl = new URL(process.env['TEST_DATABASE_URL'] as string);
   testUrl.username = 'bind_actor_context_role';
@@ -270,9 +278,17 @@ beforeAll(async () => {
   clinician = { accountId: clinicianId, token: mintToken(clinicianId, 'clinician') };
   aiServiceToken = mintToken(AI_SERVICE_PRINCIPAL, 'ai_service');
 
+  // Forms-template FK target for the intake step (mirrors
+  // scripts/seed-staging-accounts.sql). Inserted via a dedicated
+  // superuser connection — superusers bypass RLS, so no tenant GUC is
+  // needed on this one-off seed row.
   templateId = ulid();
-  await withTenantContext(T_US, async () => {
-    await admin.query(
+  const seeder = new pg.Client({
+    connectionString: process.env['TEST_DATABASE_URL'] as string,
+  });
+  await seeder.connect();
+  try {
+    await seeder.query(
       `INSERT INTO forms_template (
          template_id, tenant_id, program_id, country_of_care,
          template_version, name, description, created_by
@@ -280,7 +296,9 @@ beforeAll(async () => {
                  'Synthetic template for async-consult v1 HTTP integration tests.', $3)`,
       [templateId, T_US, clinicianId],
     );
-  });
+  } finally {
+    await seeder.end();
+  }
 }, 60_000);
 
 afterAll(async () => {
