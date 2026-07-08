@@ -281,6 +281,10 @@ describe('postCrisisEventHandler §1 — happy path composition', () => {
     expect(tx.query).toHaveBeenCalledTimes(1);
     const [sql, params] = tx.query.mock.calls[0]!;
     expect(sql).toContain('record_crisis_initiation');
+    // Sprint 4: the wrapper is ALWAYS called with the full 14-param
+    // signature; the 8 KMS envelope params ($7..$14) bind NULL when the
+    // optional intake_payload_envelope is absent (migration 033 §4
+    // all-NULL CHECK branch — Sprint 2 behavior preserved).
     expect(params).toEqual([
       'Telecheck-US',
       VALID_PATIENT_ID,
@@ -288,6 +292,14 @@ describe('postCrisisEventHandler §1 — happy path composition', () => {
       'suicidal_ideation',
       'imminent',
       true,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
     ]);
 
     // Replay-aware audit dedupe (Codex R1 #201 finding 1 closure): the
@@ -662,5 +674,174 @@ describe('postCrisisEventHandler §9 — replay-aware audit emission', () => {
     // Wrapper SELECT MUST run first (the marker's resource_id is the
     // wrapper-returned crisis_event_id, not a caller-supplied UUID).
     expect(callOrder).toEqual(['wrapper-select', 'dedupe-claim']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §10 — Sprint 4: optional pre-encrypted intake_payload KMS envelope
+// ---------------------------------------------------------------------------
+
+const VALID_DEK_ID = '44444444-5555-4666-8777-888888888888';
+const VALID_KEK_ID = '55555555-6666-4777-8888-999999999999';
+
+function validEnvelope(overrides?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ciphertext_b64: Buffer.from('sealed:intake-payload').toString('base64'),
+    dek_id: VALID_DEK_ID,
+    dek_version: 1,
+    iv_b64: Buffer.from('0123456789ab').toString('base64'),
+    auth_tag_b64: Buffer.from('0123456789abcdef').toString('base64'),
+    kek_id: VALID_KEK_ID,
+    kek_version: 2,
+    algorithm: 'AES-256-GCM',
+    ...overrides,
+  };
+}
+
+describe('postCrisisEventHandler §10 — intake_payload KMS envelope (Sprint 4)', () => {
+  it('§10a valid envelope: decoded fields bind as wrapper params $7..$14 (BYTEA as Buffers; UUIDs/ints/text passthrough) → 201', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    const reply = makeReply();
+
+    await postCrisisEventHandler(
+      makeReq({
+        actorNonce: 'fake-nonce',
+        body: validBody({ intake_payload_envelope: validEnvelope() }),
+      }),
+      reply,
+    );
+
+    expect(tx.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = tx.query.mock.calls[0]! as [string, unknown[]];
+    expect(sql).toContain('record_crisis_initiation');
+    expect(sql).toContain('$14');
+    expect(params).toHaveLength(14);
+    expect(Buffer.isBuffer(params[6])).toBe(true);
+    expect((params[6] as Buffer).toString()).toBe('sealed:intake-payload');
+    expect(params[7]).toBe(VALID_DEK_ID);
+    expect(params[8]).toBe(1);
+    expect(Buffer.isBuffer(params[9])).toBe(true);
+    expect((params[9] as Buffer).toString()).toBe('0123456789ab');
+    expect(Buffer.isBuffer(params[10])).toBe(true);
+    expect((params[10] as Buffer).toString()).toBe('0123456789abcdef');
+    expect(params[11]).toBe(VALID_KEK_ID);
+    expect(params[12]).toBe(2);
+    expect(params[13]).toBe('AES-256-GCM');
+    expect(reply.code).toHaveBeenCalledWith(201);
+  });
+
+  it('§10b envelope absent: params $7..$14 are all NULL (Sprint 2 wire behavior preserved) → 201', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    const reply = makeReply();
+
+    await postCrisisEventHandler(makeReq({ actorNonce: 'fake-nonce' }), reply);
+
+    const [, params] = tx.query.mock.calls[0]! as [string, unknown[]];
+    expect(params.slice(6)).toEqual([null, null, null, null, null, null, null, null]);
+    expect(reply.code).toHaveBeenCalledWith(201);
+  });
+
+  it('§10c partial/malformed envelopes → 400 BEFORE any tx work (all-or-none per migration 033 §4 CHECK)', async () => {
+    const badEnvelopes: unknown[] = [
+      // Missing one of the 8 fields, each.
+      (() => {
+        const e = validEnvelope();
+        delete e['ciphertext_b64'];
+        return e;
+      })(),
+      (() => {
+        const e = validEnvelope();
+        delete e['dek_id'];
+        return e;
+      })(),
+      (() => {
+        const e = validEnvelope();
+        delete e['dek_version'];
+        return e;
+      })(),
+      (() => {
+        const e = validEnvelope();
+        delete e['iv_b64'];
+        return e;
+      })(),
+      (() => {
+        const e = validEnvelope();
+        delete e['auth_tag_b64'];
+        return e;
+      })(),
+      (() => {
+        const e = validEnvelope();
+        delete e['kek_id'];
+        return e;
+      })(),
+      (() => {
+        const e = validEnvelope();
+        delete e['kek_version'];
+        return e;
+      })(),
+      (() => {
+        const e = validEnvelope();
+        delete e['algorithm'];
+        return e;
+      })(),
+      // Malformed field shapes.
+      validEnvelope({ ciphertext_b64: 'not-base64-!!!' }),
+      validEnvelope({ dek_id: 'not-a-uuid' }),
+      validEnvelope({ dek_version: 0 }),
+      validEnvelope({ dek_version: 1.5 }),
+      validEnvelope({ kek_version: -1 }),
+      validEnvelope({ algorithm: '' }),
+      // Non-object envelope roots.
+      'a-string',
+      42,
+      ['an', 'array'],
+    ];
+
+    for (const intake_payload_envelope of badEnvelopes) {
+      const tx = makeFakeTx();
+      installDefaultCompositionMocks(tx);
+      const reply = makeReply();
+
+      await postCrisisEventHandler(
+        makeReq({
+          actorNonce: 'fake-nonce',
+          body: validBody({ intake_payload_envelope }),
+        }),
+        reply,
+      );
+
+      expect(reply.code).toHaveBeenCalledWith(400);
+      const sentBody = vi.mocked(reply.send).mock.calls[0]?.[0] as
+        | { error?: { code?: string; message?: string } }
+        | undefined;
+      expect(sentBody?.error?.code).toBe('internal.request.invalid');
+      expect(sentBody?.error?.message).toContain('intake_payload_envelope');
+      // 400 fires at the HTTP boundary — no idempotency slot, no tx, no
+      // wrapper call, no audit.
+      expect(withIdempotentExecution).not.toHaveBeenCalled();
+      expect(tx.query).not.toHaveBeenCalled();
+      expect(emitCrisisDetectedAudit).not.toHaveBeenCalled();
+      vi.clearAllMocks();
+    }
+  });
+
+  it('§10d envelope explicitly null is treated as absent (NULL params; no 400)', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    const reply = makeReply();
+
+    await postCrisisEventHandler(
+      makeReq({
+        actorNonce: 'fake-nonce',
+        body: validBody({ intake_payload_envelope: null }),
+      }),
+      reply,
+    );
+
+    const [, params] = tx.query.mock.calls[0]! as [string, unknown[]];
+    expect(params.slice(6)).toEqual([null, null, null, null, null, null, null, null]);
+    expect(reply.code).toHaveBeenCalledWith(201);
   });
 });

@@ -1,16 +1,25 @@
 /**
  * crisis-response/routes.ts — Fastify route registration.
  *
- * Status at v0.6 (Sprint 2 COMPLETE): all 7 Sprint 2 handlers mounted —
- * initiate (PR 2), acknowledge (PR 3), respond + resolve (PR 4),
- * patient-summary (PR 5), sweep (PR 6, this commit), alongside the
- * PR 1 staff-scoped read.
+ * Status at v1.0 (Sprint 4 COMPLETE — this commit): all 7 handlers
+ * mounted — initiate (PR 2; Sprint 4 adds the optional pre-encrypted
+ * intake_payload KMS envelope), acknowledge (PR 3), respond + resolve
+ * (PR 4), patient-summary (PR 5 handler; Sprint 4 route-mount fix),
+ * sweep (PR 6), alongside the PR 1 staff-scoped read. Sprint 4 also
+ * lands the live-PG integration suite
+ * (tests/integration/crisis-response-http.test.ts) and flips /ready to
+ * 200 with machine-readable spec_gated_gaps.
  *
  * Mounted under plugin prefix `/v0/crisis-events`:
  *   GET    /health                                 — liveness (200)
- *   GET    /ready                                  — readiness (503; KMS
- *                                                    envelope + integration
- *                                                    tests still pending)
+ *   GET    /ready                                  — readiness (200 +
+ *                                                    spec_gated_gaps; Sprint 4
+ *                                                    hardening closed)
+ *   GET    /:id/patient-summary                    — patient-scoped
+ *                                                    data-minimized read via
+ *                                                    crisis_event_patient_summary_v
+ *                                                    (Sprint 2 PR 5; mount
+ *                                                    fixed Sprint 4)
  *   POST   /                                       — initiate via SECDEF wrapper
  *                                                    record_crisis_initiation()
  *                                                    + Cat A crisis.detected
@@ -42,9 +51,9 @@
  *   POST   /:id/_sweep                            — operator-invoked no-acknowledgement sweep
  *                                                    via execute_crisis_no_acknowledgement_sweep
  *                                                    + Cat A crisis.no_acknowledgement_escalation
- *                                                    (NEW — Sprint 2 PR 6)
+ *                                                    (Sprint 2 PR 6)
  *
- * Sprint 2 routes: All 7 handlers now mounted.
+ * All 7 handlers mounted (Sprint 4 verified via the live-PG suite).
  *
  * Spec references:
  *   - SI-022 Crisis Response Slice v1.0
@@ -57,6 +66,7 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { getCrisisEventPatientSummaryHandler } from './internal/handlers/get-crisis-event-patient-summary.js';
 import { getCrisisEventHandler } from './internal/handlers/get-crisis-event.js';
 import { postCrisisAcknowledgeHandler } from './internal/handlers/post-crisis-acknowledge.js';
 import { postCrisisEventHandler } from './internal/handlers/post-crisis-event.js';
@@ -73,39 +83,59 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'crisis-response',
-    blocked: 'Crisis Response slice handler implementation (Sprint 2 of 4 at v0.6)',
+    blocked: null,
     blocked_message:
-      'DB layer COMPLETE through migration 038 (6 tables + 2 views + 6 SECDEF + ' +
-      '15 RBAC roles + 18 Codex APPROVE rounds). Sprint 2 PR 1 landed GET ' +
-      '/v0/crisis-events/:id staff-scoped read; PR 2 landed POST /v0/crisis-events ' +
-      'initiate via record_crisis_initiation() SECDEF wrapper + Cat A crisis.detected ' +
-      'audit emission; PR 3 landed POST /v0/crisis-events/:id/acknowledge via ' +
-      'record_crisis_acknowledgement_claim() + Cat A crisis.acknowledged audit emission; ' +
-      'PR 4 (this commit) lands POST /v0/crisis-events/:id/respond + /:id/resolve via ' +
-      'record_crisis_response() + record_crisis_resolution() + Cat A crisis.responded / ' +
-      'crisis.resolved audit emission (all same tx; FLOOR-020 fail-closed). Remaining ' +
-      'Sprint 2 handler (GET patient-scoped) + KMS envelope encryption + ' +
-      'integration tests land across follow-up PRs. See ' +
+      'DB layer COMPLETE through migration 038 + 053 identity re-shape (6 tables ' +
+      '+ 2 views + 6 SECDEF + 15 RBAC roles + 18 Codex APPROVE rounds). ALL 7 ' +
+      'endpoint handlers mounted: initiate (PR 2, Sprint 4 adds the optional ' +
+      'pre-encrypted intake_payload KMS envelope pass-through per ADR-021/ADR-024), ' +
+      'staff read (PR 1), acknowledge (PR 3), respond + resolve (PR 4), ' +
+      'patient-summary (PR 5; route mount landed Sprint 4), sweep (PR 6). ' +
+      'Sprint 4 (this commit) closes the hardening list: KMS envelope wire ' +
+      'surface + live-PG cross-tenant integration suite ' +
+      '(tests/integration/crisis-response-http.test.ts). See ' +
       'src/modules/crisis-response/README.md + docs/crisis-response-implementation-plan.md.',
   }));
 
-  // Readiness probe — module is NOT yet fully ready to serve traffic at
-  // v0.6 — all Sprint 2 handlers mounted; KMS envelope + integration tests
-  // read + KMS envelope haven't all landed. Returns 503 (Service
-  // Unavailable) to advertise BLOCKED state to load-balancers + deploy
-  // gates per the canonical pharmacy / med-interaction / subscription /
-  // async-consult pattern.
+  // Readiness probe — READY (200). The Sprint 4 hardening list that held
+  // this at 503 has closed: the intake_payload KMS envelope is accepted
+  // on the initiate wire surface (pre-encrypted 8-field posture per
+  // ADR-021/ADR-024 — platform-standard; async-consult precedent), and
+  // the live-PG integration suite covers all 7 handlers over the real
+  // SI-010 bind path (happy paths + I-025 tenant-blind cross-tenant
+  // denials + idempotency-replay audit dedupe + FLOOR-020 atomicity +
+  // state-machine guards). The remaining gaps are SPEC-GATED, not
+  // build-gated, and fail closed (or fail-conservative) at their
+  // boundaries per the KNOWN_FOLLOWUPS.md waiver record:
+  //   - lifecycle-audit dedupe 30-day TTL long tail → a >30-day replay
+  //     through a NEW Idempotency-Key re-emits the (append-only) Cat A
+  //     audit row — over-emission, never suppression; the canonical
+  //     exactly-once-forever marker class is a schema artifact needing
+  //     its own SI (KNOWN_FOLLOWUPS.md Followup 1)
+  //   - on_call_clinician / ai_mode1_service initiator identities → 403
+  //     at Layer B until the JWT-role → DB-slice-role mapping lands
+  //     (Phase A successor to SI-010 / SI-024.1; KNOWN_FOLLOWUPS.md
+  //     Followup 2)
+  //   - crisis_sweep_scheduler JWT identity → sweep gate is the
+  //     closest-available admin gate + deploy-time network ACL until
+  //     the same Phase A successor lands (fails closed to
+  //     patient/clinician)
+  //   - app-side KMS envelope encryption → standing platform-wide
+  //     hardening TODO (pre-encrypted wire posture; async-consult
+  //     v1-shared.ts precedent — did not hold that module's gate)
+  // Per the readiness contract, "ready" means traffic-acceptable for
+  // the implemented surface — spec-gated gaps that fail closed do not
+  // hold the gate (pharmacy + async-consult precedent, PR #254).
   app.get('/ready', async (_request, reply) => {
-    return reply.code(503).send({
-      status: 'unavailable',
+    return reply.code(200).send({
+      status: 'ready',
       module: 'crisis-response',
-      reason: 'write_path_handlers_not_yet_implemented',
-      reason_message:
-        'Crisis Response Sprint 2 is fully mounted (all 7 handlers: ' +
-        'initiate/acknowledge/respond/resolve/staff-read/patient-summary/sweep). ' +
-        'The /ready probe will return 200 once Sprint 4 (KMS envelope + ' +
-        'cross-tenant integration tests) closes. See ' +
-        'src/modules/crisis-response/README.md for the resume path.',
+      spec_gated_gaps: [
+        'lifecycle_audit_dedupe_ttl_long_tail_needs_schema_si',
+        'crisis_initiator_identity_expansion_needs_phase_a_si',
+        'sweep_scheduler_jwt_identity_needs_phase_a_si',
+        'app_side_kms_envelope_encryption_todo',
+      ],
     });
   });
 
@@ -193,6 +223,24 @@ export const registerCrisisResponseRoutes: FastifyPluginAsync = async (
   // Returns 200 + { crisis_event_id, lifecycle_transition_id } on
   // success, 400 / 403 / 404 / 409 on mapped failures.
   app.post('/:id/resolve', postCrisisResolveHandler);
+
+  // Sprint 2 PR 5 — patient-scoped (data-minimized) single-row read.
+  //
+  // Sprint 4 latent-defect fix: the PR 5 handler + its unit tests landed
+  // on main WITHOUT this route mount (the import + app.get were dropped
+  // in the PR 6 rebase union), while /ready + the routes docstring
+  // claimed 7 mounted handlers. The live-PG integration suite now pins
+  // the mount.
+  //
+  // Composition: requireTenantContext → requirePatientActorContext →
+  // fail-closed on missing actorNonce (the patient view's self-scoping
+  // predicate needs the bound actor) → path validation → withTransaction
+  // → withTenantContext → withActorContext → withDbRole
+  // crisis_event_patient_reader → SELECT FROM crisis_event_patient_summary_v.
+  //
+  // Returns 200 + the view's 8-column data-minimized row shape on hit,
+  // 404 (tenant-blind per I-025) on miss / cross-tenant / other-patient.
+  app.get('/:id/patient-summary', getCrisisEventPatientSummaryHandler);
 
   // Sprint 2 PR 6 — operator-invoked no-acknowledgement sweep.
   app.post('/:id/_sweep', postCrisisSweepHandler);

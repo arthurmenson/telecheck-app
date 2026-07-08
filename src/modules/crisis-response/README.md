@@ -2,9 +2,19 @@
 
 Implementation of **SI-022 Crisis Response Slice v1.0** (RATIFIED 2026-05-21 P-039) + the canonical follow-on **CDM v1.9 → v1.10 Amendment** (RATIFIED 2026-05-21 P-040).
 
-## Status: Sprint 2 PR 6 — **SWEEP HANDLER LANDED — Sprint 2 COMPLETE** (6 of 6 endpoints wired)
+## Status: Sprint 4 — **HARDENING COMPLETE — /ready flipped to 200** (7 of 7 endpoints wired + live-PG integration suite)
 
-The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition). The TypeScript application layer has all Sprint 2 endpoints mounted — BOTH read handlers (staff-scoped PR 1, patient-scoped PR 5), all four write-paths (initiate PR 2, acknowledge PR 3, respond + resolve PR 4), and now the sweep handler (PR 6, this commit). **6 of 6 endpoint targets wired — Sprint 2 COMPLETE.** Remaining: Cat A audit-event-catalog landing + KMS envelope + integration tests in follow-up PRs.
+The DB layer is **complete** through migration 038 + foundation 051 (Option B app-role acquisition) + migration 053 (SI-025 P-045 identity re-shape: patient_id → patient_account_id VARCHAR(26)). The TypeScript application layer has ALL endpoints mounted and the Sprint 4 hardening list closed. Remaining gaps are spec-gated only (see `KNOWN_FOLLOWUPS.md` + the /ready probe's machine-readable `spec_gated_gaps`).
+
+### Sprint 4 (this commit) — hardening closure
+
+- **KMS envelope wire surface** — `POST /v0/crisis-events` accepts an OPTIONAL `intake_payload_envelope` (pre-encrypted 8-field posture per ADR-021 / ADR-024): `ciphertext_b64`, `dek_id` (UUID), `dek_version` (int ≥ 1), `iv_b64`, `auth_tag_b64`, `kek_id` (UUID), `kek_version` (int ≥ 1), `algorithm`. All-or-none per the migration 033 §4 CHECK; absent → all 8 wrapper params bind NULL (Sprint 2 behavior preserved). The caller (Mode 1 orchestration / clinician console BFF) performs the per-tenant KMS envelope encryption at an internal boundary and forwards the sealed fields — NO app-side crypto (`src/lib/kms.ts` is not an envelope builder; app-side encryption is the standing platform-wide Track-5 TODO, same posture as async-consult `v1-shared.ts`). Note the crisis envelope field set differs from async-consult's (crisis carries dek_version/kek_id/kek_version; async-consult carries alg_version/aad/encrypted_at) because the ratified migration 033 column sets differ.
+- **Live-PG integration suite** — `tests/integration/crisis-response-http.test.ts` (bind-pool + grant-slice-roles harness; med-interaction PR #262 precedent): initiate happy paths ± envelope, idempotency-replay regression (same server_signal_id → same crisis_event_id + exactly ONE `crisis.detected` audit), mismatched-replay 409 with FLOOR-020 atomic-rollback assertions, staff + patient reads with data-minimization pins, full lifecycle chain, respond-before-acknowledge 409 state-machine guard, acknowledge replay per-transition audit dedupe, sweep escalation/no-op/already_completed outcomes, cross-tenant I-023/I-025 tenant-blind denials (GET/acknowledge/patient-summary/sweep), and the I-019 always-mounted floor assertions. True multi-connection race interleaving cannot run under the shared-client savepoint harness — the suite pins the deterministic SQLSTATE→envelope equivalents (40001→409; fencing replay → `already_completed`).
+- **Latent-defect fix 1 (route mount)** — `GET /:id/patient-summary` existed as a handler + unit tests on `main` but was NEVER mounted in `routes.ts` (dropped in the PR 6 rebase union) while /ready + the routes docstring claimed 7 mounted handlers. Now mounted; integration test B3 pins it.
+- **Latent-defect fix 2 (42703 on sweep)** — the sweep handler's staff-view pre-fetch still selected the pre-migration-053 view column `patient_id`; migration 053 §3 renamed it `patient_account_id`, so every live sweep call raised 42703 (undefined_column) → 500. Unit-test mocks masked it; integration test D1 pins the fix.
+- **Latent-defect fix 3 (42702 in the sweep WRAPPER — migration 071)** — `execute_crisis_no_acknowledgement_sweep()` (migration 038, carried through 053 §7) referenced its own `RETURNS TABLE` OUT params (`sweep_execution_id`, `fencing_token`) UNQUALIFIED at 4 sites (§1.1 open-row SELECT; §1.1 takeover UPDATE WHERE+RETURNING; §1.2 + §1.3 completion UPDATE WHEREs). Under PL/pgSQL's default `#variable_conflict error` this raises SQLSTATE 42702 (ambiguous_column) on EVERY live execution reaching the site — the wrapper had never run against live PostgreSQL until the Sprint 4 integration suite (Group D) exercised it; it survived 18 Codex APPROVE rounds because the defect is runtime-only (CREATE succeeds). Fixed by `migrations/071_crisis_sweep_wrapper_out_param_ambiguity_fix.sql` (+ `rollback/071_rollback.sql`): `#variable_conflict use_column` pragma + explicit alias qualification at all 4 sites; semantics otherwise identical to 053 §7; ownership + EXECUTE matrix preserved and re-asserted by the migration's verification block.
+- **/ready flipped 503 → 200** with machine-readable `spec_gated_gaps` per the PR #254 readiness contract (every remaining gap is spec-gated AND fails closed / fail-conservative — see `KNOWN_FOLLOWUPS.md`).
+- **PR-#262 latent-defect-class sweep** — checked all 7 handlers for the med-interaction defect classes: Cat A audit emitted inside `withDbRole` (NOT present — all crisis emitters fire after the role reverts, at the tx level), missing wrapper-owner SELECT grants (NOT present — migrations 036-038 + 053 grant matrices verified), rejection-audit-into-aborted-tx (N/A — crisis rejection paths deliberately do not emit per SI-022 §3; the surface-side `crisis_detection_trigger` is the canonical pre-initiation record).
 
 ### Sprint 2 PR 6 (this commit) — operator-invoked sweep
 
@@ -95,13 +105,13 @@ The DB layer is **complete** through migration 038 + foundation 051 (Option B ap
 - `POST /v0/crisis-events/:id/_sweep` → operator-initiated; wraps `execute_crisis_no_acknowledgement_sweep()` + Cat A `crisis.no_acknowledgement_escalation` audit when outcome=completed_escalated. **DONE — Sprint 2 PR 6 (this commit).**
 - Integration tests for state-machine guards (e.g., responding before acknowledging → 409 tenant-blind)
 
-**Sprint 4 — Hardening**
+**Sprint 4 — Hardening (COMPLETE — this commit)**
 
-- Cross-tenant isolation tests
-- Idempotency-replay regression (initiation with same server_signal_id → same crisis_event_id)
-- Race-condition coverage (concurrent acknowledgement claims; concurrent sweep workers)
-- FLOOR-020 fail-closed verification (audit emission MUST commit co-transactionally with the lifecycle write — single DB transaction wraps both `emitAudit()` and the SECDEF wrapper call)
-- KMS envelope encryption of `intake_payload` per ADR-024
+- Cross-tenant isolation tests. **DONE — `tests/integration/crisis-response-http.test.ts` Groups D5 + E (I-023/I-025 tenant-blind envelope-equality pins).**
+- Idempotency-replay regression (initiation with same server_signal_id → same crisis_event_id). **DONE — test A4 (+ exactly-one-audit assertion).**
+- Race-condition coverage (concurrent acknowledgement claims; concurrent sweep workers). **DONE at the deterministic envelope level — tests C2/C4 (40001 → tenant-blind 409; same-actor replay per-transition dedupe) + D2 (fencing/generation replay → `already_completed`). True multi-connection interleaving cannot run under the shared-client savepoint harness; the SQLSTATE→envelope mappings a racing caller observes are pinned instead.**
+- FLOOR-020 fail-closed verification (audit emission MUST commit co-transactionally with the lifecycle write — single DB transaction wraps both `emitAudit()` and the SECDEF wrapper call). **DONE — tests A1/A5/C2/C3 (co-persistence on success; zero partial state on rejection).**
+- KMS envelope encryption of `intake_payload` per ADR-024. **DONE at the ratified wire surface — pre-encrypted 8-field envelope pass-through (tests A2/A3 + unit §10). App-side envelope building remains the standing platform-wide Track-5 TODO (async-consult precedent; does not hold the /ready gate).**
 
 ## Module structure (per `src/modules/README.md` template)
 

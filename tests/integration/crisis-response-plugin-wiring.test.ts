@@ -1,15 +1,14 @@
 /**
  * crisis-response slice — plugin wiring smoke test.
  *
- * Sprint 2 of 4 for this slice — first real handler merged (Sprint 2 PR 1:
- * GET /v0/crisis-events/:id staff-scoped read, commit e4cb312). The skeleton
- * /health + /ready introspection text advanced when that handler landed, so
- * the §1a/§1b assertions below track the v0.2 wording, and §1c now asserts the
- * global idempotency guard's 400 (it precedes routing) rather than the v0.1
- * route-not-mounted 404. Standalone stale-assertion reconciliation in the
- * spirit of PR #193 (ai-service /health + /ready introspection accuracy);
- * remaining write-path handlers (acknowledge/respond/resolve/sweep) ride the
- * May-26 cascade and will advance this introspection again.
+ * Sprint 4 (hardening) closed for this slice: all 7 handlers mounted
+ * (including the patient-summary route-mount fix), the initiate wire
+ * surface accepts the optional pre-encrypted intake_payload KMS envelope,
+ * and the live-PG integration suite
+ * (tests/integration/crisis-response-http.test.ts) covers the full
+ * surface. §1a/§1b track the Sprint 4 introspection wording: /health is
+ * unblocked (blocked: null) and /ready returns 200 + machine-readable
+ * spec_gated_gaps per the PR #254 readiness contract.
  *
  * The DB layer is COMPLETE through migration 038 (PRs 1-6 on `main`; 18
  * rounds of Codex APPROVE; 6 tables + 2 views + 6 SECDEF procedures +
@@ -61,7 +60,7 @@ afterAll(async () => {
 });
 
 describe('crisis-response slice — §1 plugin wiring', () => {
-  it('§1a GET /v0/crisis-events/health returns 200 (liveness — module alive) with Sprint 2 v0.6 metadata', async () => {
+  it('§1a GET /v0/crisis-events/health returns 200 (liveness — module alive) with Sprint 4 metadata (blocked: null)', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/crisis-events/health',
@@ -71,32 +70,41 @@ describe('crisis-response slice — §1 plugin wiring', () => {
     const body = r.json() as {
       status: string;
       module: string;
-      blocked: string;
+      blocked: string | null;
       blocked_message: string;
     };
     expect(body.status).toBe('ok');
     expect(body.module).toBe('crisis-response');
-    expect(body.blocked).toContain('Sprint 2 of 4 at v0.6');
+    // Sprint 4 closed the hardening list — the module is no longer
+    // blocked (async-consult `blocked: null` precedent).
+    expect(body.blocked).toBeNull();
     expect(body.blocked_message).toContain('DB layer COMPLETE through migration 038');
+    expect(body.blocked_message).toContain('ALL 7 endpoint handlers mounted');
   });
 
-  it('§1b GET /v0/crisis-events/ready returns 503 (readiness — write-path handlers not yet mounted) with BLOCKED reason', async () => {
+  it('§1b GET /v0/crisis-events/ready returns 200 (readiness — Sprint 4 hardening closed) with machine-readable spec_gated_gaps', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/crisis-events/ready',
       headers: { host: 'localhost' },
     });
-    expect(r.statusCode).toBe(503);
+    expect(r.statusCode).toBe(200);
     const body = r.json() as {
       status: string;
       module: string;
-      reason: string;
-      reason_message: string;
+      spec_gated_gaps: string[];
     };
-    expect(body.status).toBe('unavailable');
+    expect(body.status).toBe('ready');
     expect(body.module).toBe('crisis-response');
-    expect(body.reason).toBe('write_path_handlers_not_yet_implemented');
-    expect(body.reason_message).toContain('Sprint 4');
+    // PR #254 readiness-contract criterion: every remaining gap is
+    // spec-gated AND fails closed (or fail-conservative for the
+    // append-only audit long tail); enumerated machine-readably.
+    expect(body.spec_gated_gaps).toEqual([
+      'lifecycle_audit_dedupe_ttl_long_tail_needs_schema_si',
+      'crisis_initiator_identity_expansion_needs_phase_a_si',
+      'sweep_scheduler_jwt_identity_needs_phase_a_si',
+      'app_side_kms_envelope_encryption_todo',
+    ]);
   });
 
   // §1c — paired-probe coverage proving the write collection-root POST is
@@ -168,6 +176,6 @@ describe('crisis-response slice — §1 plugin wiring', () => {
       url: '/v0/crisis-events/ready',
       headers: { host: 'unresolved.load-balancer.invalid' },
     });
-    expect(r.statusCode).toBe(503);
+    expect(r.statusCode).toBe(200);
   });
 });

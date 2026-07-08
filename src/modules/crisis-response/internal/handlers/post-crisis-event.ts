@@ -186,14 +186,17 @@ import {
 
 /**
  * Wire body for POST /v0/crisis-events. Matches the
- * `record_crisis_initiation()` wrapper signature in migration 036 §1
- * (the 6 required identification / classification params + the
- * `source_surface` audit-payload field from SI-022 §4 line 916). The
- * 8-column KMS envelope params are NOT exposed on this v0 wire surface
- * — Sprint 4 lands the KMS envelope encryption path per the README
- * "Sprint 4 — Hardening" section + ADR-024. For Sprint 2 PR 2 (this PR),
+ * `record_crisis_initiation()` wrapper signature (migration 036 §1 as
+ * amended by migration 053 §6 — patient_account_id VARCHAR(26)): the 6
+ * required identification / classification params + the
+ * `source_surface` audit-payload field from SI-022 §4 line 916 + the
+ * OPTIONAL Sprint 4 `intake_payload_envelope` (pre-encrypted 8-field
+ * KMS envelope per ADR-021 / ADR-024 — see
+ * `IntakePayloadEnvelopeWire` below). When the envelope is absent,
  * crisis events are initiated with all 8 KMS envelope columns NULL
- * (allowed by the migration 033 §4 all-or-none CHECK constraint).
+ * (allowed by the migration 033 §4 all-or-none CHECK constraint) —
+ * the Sprint 2 wire behavior, preserved for callers without sealed
+ * intake payloads.
  */
 interface PostCrisisEventBody {
   patient_account_id?: string; // SI-025 P-045: was patient_id (UUID); now VARCHAR(26) ULID account_id
@@ -202,6 +205,124 @@ interface PostCrisisEventBody {
   severity?: string;
   regulatory_reporting_enabled?: boolean;
   source_surface?: string;
+  intake_payload_envelope?: unknown; // Sprint 4 — optional pre-encrypted KMS envelope (see below)
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 4 — intake_payload KMS envelope (pre-encrypted wire posture)
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire shape for the OPTIONAL pre-encrypted intake_payload KMS envelope
+ * (Sprint 4 hardening per README "Sprint 4 — Hardening" + ADR-021 /
+ * ADR-024). Mirrors the platform-standard pre-encrypted posture from
+ * async-consult v1-shared.ts: the caller (Mode 1 orchestration /
+ * clinician console BFF) performs the ADR-024 per-tenant KMS envelope
+ * encryption at an internal service boundary and forwards the sealed
+ * fields — NO app-side crypto here (`src/lib/kms.ts` exposes only the
+ * dev-mode kmsEncrypt/kmsDecrypt pair, not the envelope builder; moving
+ * encryption server-side is the standing platform-wide Track-5 TODO).
+ *
+ * Field shapes track the crisis_event KMS columns from migration 033 §4
+ * (which differ from the async-consult migration 056 shape — crisis
+ * carries dek_version/kek_id/kek_version INTEGER/UUID columns instead of
+ * alg_version/aad/encrypted_at):
+ *
+ *   ciphertext_b64 → intake_payload_ciphertext  BYTEA   (base64 wire)
+ *   dek_id         → intake_payload_dek_id      UUID
+ *   dek_version    → intake_payload_dek_version INTEGER (>= 1)
+ *   iv_b64         → intake_payload_iv          BYTEA   (base64 wire)
+ *   auth_tag_b64   → intake_payload_auth_tag    BYTEA   (base64 wire)
+ *   kek_id         → intake_payload_kek_id      UUID
+ *   kek_version    → intake_payload_kek_version INTEGER (>= 1)
+ *   algorithm      → intake_payload_algorithm   TEXT
+ *
+ * All-or-none: the envelope object is either ABSENT (all 8 wrapper
+ * params bind NULL — the migration 033 §4 CHECK's all-NULL branch,
+ * preserving the Sprint 2 wire behavior) or PRESENT with all 8 fields
+ * valid. A present-but-partial/malformed envelope is a 400 at the HTTP
+ * boundary (the table CHECK would reject it anyway; failing at the
+ * boundary keeps the error tenant-blind + non-500 per I-025).
+ */
+interface IntakePayloadEnvelopeWire {
+  ciphertext_b64?: string;
+  dek_id?: string;
+  dek_version?: number;
+  iv_b64?: string;
+  auth_tag_b64?: string;
+  kek_id?: string;
+  kek_version?: number;
+  algorithm?: string;
+}
+
+/** Decoded envelope ready to bind as wrapper params $7..$14. */
+interface IntakePayloadEnvelopeDecoded {
+  ciphertext: Buffer;
+  dekId: string;
+  dekVersion: number;
+  iv: Buffer;
+  authTag: Buffer;
+  kekId: string;
+  kekVersion: number;
+  algorithm: string;
+}
+
+/**
+ * Decode a base64 string into a Buffer. Returns null when the input is
+ * not a string, is empty, or is not canonical base64 (round-trip check
+ * defeats silently-truncated decodes — async-consult v1-shared.ts
+ * precedent).
+ */
+function decodeBase64(v: unknown): Buffer | null {
+  if (typeof v !== 'string' || v.length === 0) return null;
+  const buf = Buffer.from(v, 'base64');
+  if (buf.length === 0) return null;
+  if (buf.toString('base64').replace(/=+$/, '') !== v.replace(/=+$/, '')) {
+    return null;
+  }
+  return buf;
+}
+
+function isPositiveInteger(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1;
+}
+
+/**
+ * Validate + decode the wire intake_payload envelope. Returns null when
+ * any of the 8 fields is missing or malformed (all-or-none per the
+ * migration 033 §4 CHECK — partial envelopes are rejected at the HTTP
+ * boundary).
+ */
+function decodeIntakePayloadEnvelope(v: unknown): IntakePayloadEnvelopeDecoded | null {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
+  const e = v as IntakePayloadEnvelopeWire;
+  const ciphertext = decodeBase64(e.ciphertext_b64);
+  const iv = decodeBase64(e.iv_b64);
+  const authTag = decodeBase64(e.auth_tag_b64);
+  if (
+    ciphertext === null ||
+    iv === null ||
+    authTag === null ||
+    !isString(e.dek_id) ||
+    !isUuidShape(e.dek_id) ||
+    !isPositiveInteger(e.dek_version) ||
+    !isString(e.kek_id) ||
+    !isUuidShape(e.kek_id) ||
+    !isPositiveInteger(e.kek_version) ||
+    !isString(e.algorithm)
+  ) {
+    return null;
+  }
+  return {
+    ciphertext,
+    dekId: e.dek_id,
+    dekVersion: e.dek_version,
+    iv,
+    authTag,
+    kekId: e.kek_id,
+    kekVersion: e.kek_version,
+    algorithm: e.algorithm,
+  };
 }
 
 const VALID_SOURCE_SURFACES: ReadonlySet<CrisisDetectionSourceSurface> = new Set([
@@ -406,6 +527,31 @@ export async function postCrisisEventHandler(
       );
   }
 
+  // Phase 3b — OPTIONAL intake_payload envelope validation (Sprint 4).
+  // Absent → all 8 wrapper params bind NULL (migration 033 §4 all-NULL
+  // CHECK branch; Sprint 2 behavior preserved). Present → all 8 fields
+  // must validate + decode (all-or-none) or the request 400s at the
+  // boundary.
+  let envelope: IntakePayloadEnvelopeDecoded | null = null;
+  if (body.intake_payload_envelope !== undefined && body.intake_payload_envelope !== null) {
+    envelope = decodeIntakePayloadEnvelope(body.intake_payload_envelope);
+    if (envelope === null) {
+      return reply
+        .code(400)
+        .send(
+          makeErrorEnvelope(
+            req.id,
+            'internal.request.invalid',
+            'Invalid intake_payload_envelope: when present it must carry all 8 ' +
+              'fields — ciphertext_b64 (base64), dek_id (UUID), dek_version ' +
+              '(integer >= 1), iv_b64 (base64), auth_tag_b64 (base64), kek_id ' +
+              '(UUID), kek_version (integer >= 1), algorithm (string). ' +
+              'Envelope columns are all-or-none per the crisis_event CHECK.',
+          ),
+        );
+    }
+  }
+
   // Phase 4 — resolve actor home-tenant for audit attribution.
   // For clinician role acting in own tenant, equals ctx.tenantId; the
   // helper exists for the platform_admin path (cross-tenant action),
@@ -459,13 +605,17 @@ export async function postCrisisEventHandler(
         const runInitiate = async (): Promise<string> => {
           try {
             return await withDbRole(tx, 'crisis_initiator', async () => {
-              // Call the SECDEF wrapper. All 8 KMS envelope params
-              // are NULL at v0 wire surface; Sprint 4 lands KMS
-              // envelope encryption per README + ADR-024. The
-              // wrapper accepts NULLs for those columns under the
-              // table CHECK's "all-or-none" constraint.
+              // Call the SECDEF wrapper. Sprint 4: the 8 KMS envelope
+              // params ($7..$14) bind the caller's pre-encrypted
+              // envelope when present, or NULL when absent (the
+              // migration 033 §4 CHECK's all-or-none constraint
+              // accepts either branch). Encryption happens at the
+              // internal caller boundary per the platform-standard
+              // pre-encrypted wire posture (async-consult v1-shared.ts
+              // precedent); app-side envelope building remains the
+              // standing Track-5 TODO.
               const result = await tx.query<{ crisis_event_id: string }>(
-                'SELECT record_crisis_initiation($1, $2, $3, $4, $5, $6) AS crisis_event_id',
+                'SELECT record_crisis_initiation($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) AS crisis_event_id',
                 [
                   ctx.tenantId,
                   patientId,
@@ -473,6 +623,14 @@ export async function postCrisisEventHandler(
                   crisisType,
                   severity,
                   regulatoryReportingEnabled,
+                  envelope?.ciphertext ?? null,
+                  envelope?.dekId ?? null,
+                  envelope?.dekVersion ?? null,
+                  envelope?.iv ?? null,
+                  envelope?.authTag ?? null,
+                  envelope?.kekId ?? null,
+                  envelope?.kekVersion ?? null,
+                  envelope?.algorithm ?? null,
                 ],
               );
               const row = result.rows[0];

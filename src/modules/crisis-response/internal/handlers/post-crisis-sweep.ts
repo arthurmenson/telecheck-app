@@ -63,7 +63,7 @@
  *                               raises 42501 on missing actor binding
  *                               per migration 038 §1 lines 112-122)
  *             ├─ withDbRole(tx, 'crisis_event_staff_reader', ...)
- *             │  └─ SELECT patient_id
+ *             │  └─ SELECT patient_account_id
  *             │     FROM crisis_event_current_state_v
  *             │     WHERE crisis_event_id = $1
  *             │     (404 envelope branch if 0 rows — same shape for
@@ -375,7 +375,7 @@ interface PostCrisisSweepResponseView {
  *   5. Resolve actor home-tenant for audit attribution.
  *   6. Open tx; compose withTenantContext → withActorContext (REQUIRED;
  *      wrapper raises 42501 on missing actor) → withDbRole
- *      crisis_event_staff_reader → SELECT patient_id (404 on 0 rows).
+ *      crisis_event_staff_reader → SELECT patient_account_id (404 on 0 rows).
  *   7. Same tx, second withDbRole crisis_sweep_scheduler → SELECT FROM
  *      execute_crisis_no_acknowledgement_sweep(...). Map 42501 → 403
  *      via canonical R2 MED-1 closure. Map other SQLSTATEs at outer
@@ -479,11 +479,18 @@ export async function postCrisisSweepHandler(
       const preFetch = async (): Promise<string | null> => {
         try {
           return await withDbRole(tx, 'crisis_event_staff_reader', async () => {
-            const result = await tx.query<{ patient_id: string }>(
-              'SELECT patient_id FROM crisis_event_current_state_v ' + 'WHERE crisis_event_id = $1',
+            // Sprint 4 latent-defect fix: migration 053 §3 renamed the
+            // view column patient_id → patient_account_id (SI-025
+            // P-045); this pre-fetch still selected the old name and
+            // raised 42703 (undefined_column) on every live sweep call.
+            // Unit-test mocks masked it; the Sprint 4 live-PG
+            // integration suite now pins the corrected column.
+            const result = await tx.query<{ patient_account_id: string }>(
+              'SELECT patient_account_id FROM crisis_event_current_state_v ' +
+                'WHERE crisis_event_id = $1',
               [crisisEventIdRaw],
             );
-            return result.rows[0]?.patient_id ?? null;
+            return result.rows[0]?.patient_account_id ?? null;
           });
         } catch (err) {
           if (
