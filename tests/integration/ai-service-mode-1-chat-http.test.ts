@@ -99,6 +99,7 @@ import { ulid } from '../../src/lib/ulid.ts';
 import { deriveDeterministicMode1Uuid } from '../../src/modules/ai-service/internal/handlers/chat.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId } from '../../src/modules/identity/internal/types.ts';
+import { grantSliceRolesToTestApp } from '../helpers/grant-slice-roles.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
@@ -113,6 +114,15 @@ let app: FastifyInstance | null = null;
 
 beforeAll(async () => {
   process.env['NODE_ENV'] = 'test';
+  // The Mode 1 chat handler elevates to ai_service_mode1 (migration 068)
+  // for the persistence writes; the shared test client's session role
+  // (telecheck_test_app) has no slice-role memberships by default, so
+  // SET LOCAL ROLE would 42501 → 500 (CI run 28944926412 pinned this;
+  // same class as the async-consult-v1 CI run 28911340820). Grant via a
+  // dedicated superuser connection per the async-consult-v1-http
+  // precedent — do NOT rely on another suite's SLICE_ROLES-wide grant
+  // loop having run first (fork order is nondeterministic).
+  await grantSliceRolesToTestApp(['ai_service_mode1']);
   app = await buildApp({ logger: false });
   await app.ready();
 });

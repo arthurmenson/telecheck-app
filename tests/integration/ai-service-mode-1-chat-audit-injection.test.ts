@@ -45,6 +45,7 @@ import { ulid } from '../../src/lib/ulid.ts';
 import { deriveDeterministicMode1Uuid } from '../../src/modules/ai-service/internal/handlers/chat.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId } from '../../src/modules/identity/internal/types.ts';
+import { grantSliceRolesToTestApp } from '../helpers/grant-slice-roles.ts';
 import {
   consumeMode1AuditFailureOrThrow,
   resetMode1AuditFailure,
@@ -120,6 +121,11 @@ let app: FastifyInstance | null = null;
 
 beforeAll(async () => {
   process.env['NODE_ENV'] = 'test';
+  // Mode 1 persistence (migration 068) — the handler elevates to
+  // ai_service_mode1; grant the test principal membership so
+  // SET LOCAL ROLE doesn't 42501 (async-consult-v1-http precedent;
+  // fork order is nondeterministic so every suite grants its own).
+  await grantSliceRolesToTestApp(['ai_service_mode1']);
   // Dynamic import after the vi.mock factory is registered.
   const { buildApp } = await import('../../src/app.ts');
   app = await buildApp({ logger: false });

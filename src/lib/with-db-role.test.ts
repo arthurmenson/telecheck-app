@@ -223,8 +223,8 @@ describe('with-db-role §4 — callback throw propagation + restore-on-throw', (
 });
 
 describe('with-db-role §5 — allowlist composition', () => {
-  it('SLICE_ROLES contains 7 Crisis + 2 Admin + 4 Med-Interaction + 5 Async-Consult + 1 AI-Service = 19 roles', () => {
-    expect(SLICE_ROLES).toHaveLength(19);
+  it('SLICE_ROLES contains 7 Crisis + 2 Admin + 4 Med-Interaction + 5 Async-Consult + 2 AI-Service = 20 roles', () => {
+    expect(SLICE_ROLES).toHaveLength(20);
     // Spot-check one from each slice
     expect(SLICE_ROLES).toContain('crisis_initiator');
     expect(SLICE_ROLES).toContain('admin_basic_operator');
@@ -237,6 +237,9 @@ describe('with-db-role §5 — allowlist composition', () => {
     expect(SLICE_ROLES).toContain('async_consult_staff_reader');
     // AI-service caller class (P-038 §3; migration 064 role + bridge)
     expect(SLICE_ROLES).toContain('ai_service_account');
+    // Mode 1 service writer (Mode 1 spec §5.1 Layer 1 RBAC R-3; migration
+    // 068 role + INSERT/SELECT grants + bridge)
+    expect(SLICE_ROLES).toContain('ai_service_mode1');
   });
 
   it('SLICE_ROLES does NOT contain wrapper-owner / view-owner / writer-owner roles', () => {

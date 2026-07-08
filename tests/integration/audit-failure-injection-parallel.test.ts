@@ -93,6 +93,7 @@ import { createAccount } from '../../src/modules/identity/internal/repositories/
 import { asAccountId } from '../../src/modules/identity/internal/types.ts';
 import { AuditInjectedFailure } from '../helpers/audit-failure-injection.ts';
 import { auditPlaceholderInjector } from '../helpers/audit-placeholder-injection.ts';
+import { grantSliceRolesToTestApp } from '../helpers/grant-slice-roles.ts';
 import {
   Mode1AuditInjectedFailure,
   mode1ChatResponseAuditInjector,
@@ -175,6 +176,11 @@ let mockedAuditPlaceholder:
 
 beforeAll(async () => {
   process.env['NODE_ENV'] = 'test';
+  // Mode 1 persistence (migration 068) — the chat handler elevates to
+  // ai_service_mode1; grant the test principal membership so
+  // SET LOCAL ROLE doesn't 42501 (async-consult-v1-http precedent;
+  // fork order is nondeterministic so every suite grants its own).
+  await grantSliceRolesToTestApp(['ai_service_mode1']);
   const { buildApp } = await import('../../src/app.ts');
   app = await buildApp({ logger: false });
   await app.ready();
