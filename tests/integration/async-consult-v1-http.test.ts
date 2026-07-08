@@ -73,6 +73,7 @@ import { createAccount } from '../../src/modules/identity/internal/repositories/
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
+import { getTestClient } from '../setup.ts';
 
 const T_US = asTenantId(TENANT_US);
 const BIND_ROLE_TEST_PASSWORD = 'telecheck_test_bind_pw';
@@ -289,16 +290,15 @@ beforeAll(async () => {
   aiServiceToken = mintToken(AI_SERVICE_PRINCIPAL, 'ai_service');
 
   // Forms-template FK target for the intake step (mirrors
-  // scripts/seed-staging-accounts.sql). Inserted via a dedicated
-  // superuser connection — superusers bypass RLS, so no tenant GUC is
-  // needed on this one-off seed row.
+  // scripts/seed-staging-accounts.sql). Seeded through the SHARED test
+  // client — its writes live inside the file's outer transaction, so the
+  // row is visible to every request in this file (the app queries run on
+  // the same connection via setTestPool) but NEVER commits — a
+  // superuser-committed row leaked into the parallel forms-intake fork's
+  // keyset-pagination expectations (CI run 28911758035 pinned that).
   templateId = ulid();
-  const seeder = new pg.Client({
-    connectionString: process.env['TEST_DATABASE_URL'] as string,
-  });
-  await seeder.connect();
-  try {
-    await seeder.query(
+  await withTenantContext(T_US, async () => {
+    await getTestClient().query(
       `INSERT INTO forms_template (
          template_id, tenant_id, program_id, country_of_care,
          template_version, name, description, created_by
@@ -309,9 +309,7 @@ beforeAll(async () => {
       // satisfies it (CI run 28911163674 pinned the 23502).
       [templateId, T_US, ulid(), clinicianId],
     );
-  } finally {
-    await seeder.end();
-  }
+  });
 }, 60_000);
 
 afterAll(async () => {
