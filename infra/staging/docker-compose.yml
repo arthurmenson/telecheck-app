@@ -84,6 +84,10 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
+      # Deployment-environment label (config.ts DEPLOY_ENV): staging runs
+      # NODE_ENV=production for runtime parity, so staging-only gates
+      # (AUTH_DEV_OTP_ECHO) key on this instead.
+      DEPLOY_ENV: staging
       PORT: '3000'
       DATABASE_URL: postgres://${POSTGRES_USER:-telecheck}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-telecheck}
       DATABASE_SSL_MODE: require
