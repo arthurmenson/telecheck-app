@@ -292,9 +292,12 @@ beforeAll(async () => {
       `INSERT INTO forms_template (
          template_id, tenant_id, program_id, country_of_care,
          template_version, name, description, created_by
-       ) VALUES ($1, $2, NULL, 'US', 1, 'v1 integration intake template',
-                 'Synthetic template for async-consult v1 HTTP integration tests.', $3)`,
-      [templateId, T_US, clinicianId],
+       ) VALUES ($1, $2, $3, 'US', 1, 'v1 integration intake template',
+                 'Synthetic template for async-consult v1 HTTP integration tests.', $4)`,
+      // program_id is NOT NULL on forms_template (migration 006) — an
+      // opaque identifier per the migration 010 TEXT widening; any ULID
+      // satisfies it (CI run 28911163674 pinned the 23502).
+      [templateId, T_US, ulid(), clinicianId],
     );
   } finally {
     await seeder.end();
