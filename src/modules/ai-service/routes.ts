@@ -154,33 +154,48 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
       pending_message:
         'Module is NOT yet production-ready — Mode 1 chat (POST /v0/ai/chat) is MOUNTED ' +
         'and exercises the full I-019 crisis-detection floor, FLOOR-020 audit emission, ' +
-        'and AI-RESIL-001 fail-soft path. ' +
+        'the AI-RESIL-001 fail-soft path, AND same-transaction Mode 1 conversation/turn ' +
+        'persistence into the migration-067 ai_mode1_* entities under the ' +
+        'ai_service_mode1 writer role (migration 068 per Mode 1 Handler Spec v0.4 ' +
+        'P-035 §5.1 Layer 1; CDM v1.8 P-036). Readiness intentionally stays 503 on the ' +
+        'remaining gates in `pending`. ' +
         mode2DescriptiveText +
         '. The LLM provider abstraction (per ADR-020) routes every workload to ' +
         'NullLLMProvider — so every non-crisis response is the documented ' +
-        '"AI temporarily unavailable" envelope. Per AI_LAYERING v5.2 §2 + ADR-029, the ' +
+        '"AI temporarily unavailable" envelope (persisted as a ' +
+        "turn_outcome='failed' / failure_class='llm_provider_unavailable' turn-result " +
+        'row). Per AI_LAYERING v5.2 §2 + ADR-029, the ' +
         'v1.0 workload taxonomy admits exactly two active types: conversational_assistant ' +
         'and protocol_execution; reserved types (autonomous_agent, multi_agent_supervisor, ' +
         'tool_using_agent) require a successor ADR + activation audit event before code ' +
         'paths exist. Per AI_LAYERING v5.2 §9, conversations are tenant-scoped — ' +
-        '(tenant_id, ai_chat_session_id) is the authorization pair. Per ADR-020, the ' +
+        '(tenant_id, ai_chat_session_id) is the authorization pair, now DB-enforced by ' +
+        'the ai_mode1_conversation composite tenant-scoped FKs + RLS. Per ADR-020, the ' +
         'multi-provider abstraction (Anthropic primary + Bedrock + Azure OpenAI ' +
         'resilience) is platform-scoped; tenants do not select providers.',
     });
   });
 
-  // Mode 1 conversational assistant — MOUNTED 2026-05-15.
+  // Mode 1 conversational assistant — MOUNTED 2026-05-15; conversation
+  // persistence wired per migrations 066/067/068 (P-035/P-036).
   //
-  // Lifecycle (per AI_LAYERING v5.2 + Slice PRD v1.0 §3):
+  // Lifecycle (per AI_LAYERING v5.2 + Slice PRD v1.0 §3 + Mode 1
+  // Handler Spec v0.4 §4/§6):
   //   1. tenantContext (foundation plugin) + actorContext (JWT)
   //   2. Patient-only role gate (Mode 1 is patient-facing)
   //   3. Body validation (Zod; tenant-blind 400 on failure)
   //   4. runCrisisGate on INPUT text (I-019; emits Cat A audit on positive)
-  //   5. On crisis: return crisis-resource sentinel (no LLM call)
-  //   6. On no crisis: call resolveProvider → sendCompletion
+  //   5. Persist conversation (create-or-validate-ownership) +
+  //      turn-admission + detector-result rows into the ai_mode1_*
+  //      entities under the ai_service_mode1 role, same tx as the
+  //      idempotency reservation
+  //   6. On crisis: return crisis-resource sentinel (no LLM call)
+  //   7. On no crisis: verify the detector-result row exists (spec §4.2
+  //      runtime ordering precondition), then call the provider
   //      (v1.0 NullProvider always throws → AI-RESIL-001 fail-soft)
-  //   7. Emit FLOOR-020 audit (`ai_chat_response_emitted` Cat C)
-  //   8. Return Mode1ChatResponseView
+  //   8. Persist the turn-result terminal row (completed / failed)
+  //   9. Emit FLOOR-020 audit (`ai_chat_response_emitted` Cat C)
+  //  10. Return Mode1ChatResponseView
   //
   // The (future) crisis gate on OUTPUT text is planned alongside real
   // provider integration; at v1.0 the only AI-generated text paths are

@@ -89,13 +89,17 @@ import { config } from '../../src/lib/config.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import { issueAccessToken } from '../../src/lib/jwt.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
+import { asAccountId } from '../../src/modules/identity/internal/types.ts';
 import { AuditInjectedFailure } from '../helpers/audit-failure-injection.ts';
 import { auditPlaceholderInjector } from '../helpers/audit-placeholder-injection.ts';
+import { grantSliceRolesToTestApp } from '../helpers/grant-slice-roles.ts';
 import {
   Mode1AuditInjectedFailure,
   mode1ChatResponseAuditInjector,
 } from '../helpers/mode-1-chat-audit-injection.ts';
-import { TENANT_US } from '../helpers/tenant-fixtures.ts';
+import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 
 // ---------------------------------------------------------------------------
 // Second injector — for aiServiceAuditPlaceholder
@@ -172,6 +176,11 @@ let mockedAuditPlaceholder:
 
 beforeAll(async () => {
   process.env['NODE_ENV'] = 'test';
+  // Mode 1 persistence (migration 068) — the chat handler elevates to
+  // ai_service_mode1; grant the test principal membership so
+  // SET LOCAL ROLE doesn't 42501 (async-consult-v1-http precedent;
+  // fork order is nondeterministic so every suite grants its own).
+  await grantSliceRolesToTestApp(['ai_service_mode1']);
   const { buildApp } = await import('../../src/app.ts');
   app = await buildApp({ logger: false });
   await app.ready();
@@ -223,10 +232,39 @@ function patientHeaders(token: string, idempotencyKey: string): Record<string, s
   };
 }
 
+/**
+ * Seed a REAL patient account. The Mode 1 persistence path (migrations
+ * 067/068) composite-FKs patient identity to
+ * accounts(tenant_id, account_id), so chat POSTs that reach the
+ * persistence phase must run under an existing account. Mirrors
+ * ai-service-mode-1-chat-http.test.ts seedPatientAccount().
+ */
+async function seedPatientAccount(): Promise<string> {
+  const accountId = asAccountId(ulid());
+  const phone = uniquePhone('+1');
+  await withTenantContext(T_US, () =>
+    createAccount(
+      {
+        account_id: accountId,
+        tenant_id: T_US,
+        phone_e164: phone,
+        first_name: 'A',
+        last_name: 'B',
+        date_of_birth: '1990-01-01',
+        gender: 'prefer_not_to_say',
+        country_of_residence: 'US',
+        country_of_care: 'US',
+      },
+      async () => {},
+    ),
+  );
+  return accountId;
+}
+
 async function postChat(idempotencyKey?: string): Promise<{
   statusCode: number;
 }> {
-  const accountId = `acct_${ulid()}`;
+  const accountId = await seedPatientAccount();
   const token = mintPatientToken(accountId);
   const response = await app!.inject({
     method: 'POST',

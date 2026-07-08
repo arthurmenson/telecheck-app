@@ -1,8 +1,31 @@
-# AI Service module — mode_2_case_prep_mounted
+# AI Service module — mode_1_persistence_wired
 
-## Status (post-Mode-2-case-prep mount: 2026-05-23; gated 2026-05-24)
+## Status (post-Mode-1-persistence wiring: 2026-07-08)
 
 This module hosts the Telecheck platform's two-mode AI surface per **AI Clinical Assistant Slice PRD v1.0** + **AI_LAYERING v5.2**. As of the Mode 2 case-prep handler mount (PR H 2026-05-23), **Mode 1 chat (POST /v0/ai/chat) is LIVE; Mode 2 case-prep (POST /v0/ai/case-prep) is DEFINED but CONFIG-GATED behind `AI_MODE2_ENABLED` (default `false`)** per Codex PR #210 R1 NEEDS-WORK closure (2026-05-24). Mode 1 exercises the full I-019 crisis-detection floor, FLOOR-020 audit emission, and AI-RESIL-001 fail-soft path; every non-crisis response is currently the documented "AI temporarily unavailable" envelope because the LLM provider abstraction routes every workload to NullLLMProvider until real adapters (Anthropic primary + Bedrock + Azure OpenAI per ADR-020) ship with secrets-management resolution.
+
+As of 2026-07-08 the Mode 1 chat handler **persists every turn into the migration-067 conversation entities** (P-035 Mode 1 Handler Spec v0.4 + P-036 CDM v1.8) — see the "Mode 1 conversation persistence" section below. `/v0/ai/ready` still returns **503**: persistence narrows the pending list but the real-provider + clinical-grade-crisis-classifier + protocol-engine gates remain.
+
+## Mode 1 conversation persistence (migrations 066/067/068)
+
+Every `POST /v0/ai/chat` turn is persisted **in the same transaction** as the idempotency reservation and the FLOOR-020 response audit, under the dedicated `ai_service_mode1` DB role (created + granted INSERT/SELECT on exactly the 4 lifecycle tables by migration 068, per the P-035-ratified Mode 1 spec §5.1 Layer 1 "dedicated DB role" sentence; acquired via `SET LOCAL ROLE` through `withDbRole` per the migration-051 Option B pattern):
+
+| Entity (CDM v1.8) | What lands | When |
+| --- | --- | --- |
+| `ai_mode1_conversation` | Conversation envelope; id is deterministic per Idempotency-Key when the client sends no `ai_chat_session_id`; when the client supplies one, the row is loaded + patient-ownership-validated (tenant-blind 404 per I-025 on any miss) | every persisted turn |
+| `ai_mode1_conversation_turn_admission` | `turn_id` (deterministic UUID), raw `user_message`, `request_body_hash` (idempotency hasher output), `history_snapshot_high_water_mark` (spec §6.3; `-infinity` floor for first turns), window 20 | every persisted turn |
+| `ai_mode1_conversation_turn_detector_result` | `severity NULL + crisis_server_signal_id NULL` no-crisis shape + detector version/latency; its existence is the §4.2 `detector_completed` precondition SELECT-verified before any provider call | **non-crisis turns only** (see spec-gated deferral) |
+| `ai_mode1_conversation_turn_result` | Terminal state: `completed` (crisis sentinel or — future — real assistant text + provider/model/tokens) or `failed` (`llm_provider_unavailable` / `during_llm` for the NullProvider fail-soft path; `assistant_message NULL`) | every persisted turn |
+
+**Wire-shape note:** `ai_chat_session_id` / `message_id` in `Mode1ChatResponseView` are now the conversation / turn UUID primary keys. The request body accepts an optional `ai_chat_session_id` (UUID) to thread an existing conversation — ownership is validated server-side, which closes the R3 H2 client-trust hazard that previously forced one-shot sessions.
+
+**Spec-gated deferrals (do not "fix" these inline — they are ratification-blocked):**
+
+1. **Crisis-positive detector-result rows are NOT persisted.** The ratified `signal_iff_severity` CHECK requires a `crisis_server_signal_id` referencing the I-019 enqueue-ack log, whose canonical code-repo target is DEFERRED in migration 067 pending ratifier confirmation (`i019_enqueue_ack_log` does not exist), and the keyword-stub detector's `CrisisType` taxonomy does not map bijectively onto the ratified severity enum. The Category A `crisis_detection_trigger` audit (own-tx, rollback-immune) remains the durable I-019 record for crisis turns.
+2. **`ai.mode1.*` audit action IDs (AUDIT_EVENTS v5.10, 11 IDs)** are not yet registered at the app layer; the existing `ai_chat_response_emitted` placeholder + crisis Cat A emission discipline is unchanged. Registration + per-phase emission is a follow-up PR.
+3. **No conversation-history/state READ endpoint.** The P-035 spec ratifies only `POST` (§2.1); no GET surface is ratified, so none is implemented. The `ai_mode1_conversation_state` view + `ai_mode1_reader` role (migration 067) stay unconsumed by this module until a read endpoint is ratified.
+4. **I-026 at-rest encryption for `user_message` / `assistant_message`** rides the platform KMS integration (src/lib/kms.ts is a throwing stub outside tests; Track 5) — same posture as every other PHI-bearing TEXT column in the repo.
+5. **`internal_error`-class turn-result rows** cannot survive their own transaction's rollback (unknown errors rethrow → tx rollback); a durable own-tx failure writer is deferred alongside item 2.
 
 ## Mode 2 case-prep route mount gate (`AI_MODE2_ENABLED`)
 
@@ -189,6 +212,9 @@ src/modules/ai-service/
     │   ├── types.ts                            # GuardrailTemplate + PLATFORM_FLOOR_RULES (PR E)
     │   ├── conservative-default.ts             # immutable Conservative Default (PR E)
     │   └── registry.ts                         # getActiveGuardrailTemplate + validator (PR E)
+    ├── handlers/
+    │   ├── chat.ts                             # Mode 1 chat handler (PR G; persistence wired 2026-07-08)
+    │   └── case-prep.ts                        # Mode 2 case-prep handler (PR H; AI_MODE2_ENABLED-gated)
     └── crisis/
         ├── audit.ts                            # emitAICrisisDetectionTrigger (PR F)
         └── gate.ts                             # runCrisisGate (PR F)
@@ -198,4 +224,6 @@ src/modules/ai-service/
 
 - `tests/integration/ai-service-plugin-wiring.test.ts` — `/health`, `/ready`, `/chat`/`/case-prep` 404, tenant-blind probes
 - `tests/integration/ai-service-guardrails.test.ts` — Conservative Default immutability + platform-floor validator
+- `tests/integration/ai-service-mode-1-chat-http.test.ts` — Mode 1 chat HTTP lifecycle (crisis bypass, fail-soft, idempotency, deterministic IDs) + Group P persistence assertions against the migration-067 entities
+- `tests/integration/ai-service-mode-1-chat-audit-injection.test.ts` — FLOOR-020 audit-failure round-trip (503 + rollback + deterministic-ID retry; exactly-one Cat A crisis audit)
 - `tests/integration/ai-service-crisis-gate.test.ts` — 30+ test cases covering all 16 R-closures: no-crisis path, positive Mode 1/Mode 2 emissions, workload-envelope correctness, idempotency dedupe (single + multi-resource + multi-segment), wiring-error fallback, PHI-leak protection across audit + log, tenant equality, discriminator shape validation, required-field substitution, operational signaling

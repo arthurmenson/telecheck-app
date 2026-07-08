@@ -93,7 +93,8 @@ import type { DbClient } from './db.js';
 // migrations/051_app_role_acquisition_foundation.sql §2 (13 roles:
 // crisis + admin + med-interaction) PLUS
 // migrations/061_async_consult_app_role_bridge.sql §1 (5 async-consult
-// roles) — 18 roles total.
+// roles) PLUS migrations/064 §4 (ai_service_account) PLUS
+// migrations/068 §3 (ai_service_mode1) — 20 roles total.
 //
 // Adding a new role to this list WITHOUT a corresponding GRANT
 // in 051 (or a follow-up foundation migration) will cause SET LOCAL ROLE
@@ -133,6 +134,12 @@ export const SLICE_ROLES = [
   // record_consult_ai_preparation_completed, and bridges
   // telecheck_app_role membership per the 051 §2 Option B pattern)
   'ai_service_account',
+  // Mode 1 service writer role (Mode 1 Handler Spec v0.4 RATIFIED P-035
+  // §5.1 Layer 1 dedicated DB role; spec RBAC name R-3 — migration 068
+  // creates the role, grants INSERT+SELECT on the 4 ai_mode1_*
+  // conversation lifecycle tables, and bridges telecheck_app_role
+  // membership per the 051 §2 Option B pattern)
+  'ai_service_mode1',
 ] as const;
 
 export type SliceRole = (typeof SLICE_ROLES)[number];
