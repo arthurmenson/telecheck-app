@@ -305,9 +305,14 @@ beforeAll(async () => {
        ) VALUES ($1, $2, $3, 'US', 1, 'v1 integration intake template',
                  'Synthetic template for async-consult v1 HTTP integration tests.', $4)`,
       // program_id is NOT NULL on forms_template (migration 006) — an
-      // opaque identifier per the migration 010 TEXT widening; any ULID
-      // satisfies it (CI run 28911163674 pinned the 23502).
-      [templateId, T_US, ulid(), clinicianId],
+      // opaque TEXT per the migration 010 widening. The 'zzz_' prefix is
+      // load-bearing: forms-intake-admin's keyset-pagination test lists
+      // tenant-wide (limit 2, ordered by program_id first) then filters
+      // to its own 'prog_*' program — a digit-prefixed ULID here sorts
+      // BEFORE 'prog_*' and steals a page-1 slot when both files share a
+      // worker's outer transaction (CI runs 28911758035 + 28911931016
+      // pinned this). 'zzz_*' sorts after every fixture family.
+      [templateId, T_US, `zzz_v1_http_${ulid()}`, clinicianId],
     );
   });
 }, 60_000);
