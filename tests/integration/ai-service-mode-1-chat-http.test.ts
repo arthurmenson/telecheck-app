@@ -914,7 +914,9 @@ describe('Mode 1 chat — Group P: conversation/turn persistence', () => {
       payload: { message_text: SAFE_TEXT_SHORT },
     });
     expect(r1.statusCode).toBe(200);
-    const conversationId = r1.json<Record<string, unknown>>()['ai_chat_session_id'] as string;
+    const b1 = r1.json<Record<string, unknown>>();
+    const conversationId = b1['ai_chat_session_id'] as string;
+    const turn1Id = b1['message_id'] as string;
 
     const r2 = await app!.inject({
       method: 'POST',
@@ -929,6 +931,7 @@ describe('Mode 1 chat — Group P: conversation/turn persistence', () => {
     const b2 = r2.json<Record<string, unknown>>();
     // The response echoes the threaded conversation id.
     expect(b2['ai_chat_session_id']).toBe(conversationId);
+    const turn2Id = b2['message_id'] as string;
 
     expect(await countConversationsForPatient(accountId)).toBe(1);
     const rows = await loadMode1Rows(conversationId);
@@ -936,8 +939,22 @@ describe('Mode 1 chat — Group P: conversation/turn persistence', () => {
     // Turn 1 had no prior completed turns (-infinity floor); turn 2's
     // history_snapshot_high_water_mark captured turn 1's completed_at
     // (spec §6.3 replay-safety anchor).
-    expect(rows.admissions[0]!.past_floor).toBe(false);
-    expect(rows.admissions[1]!.past_floor).toBe(true);
+    //
+    // Look the two admission rows up BY TURN ID, not by array order:
+    // under the savepoint test harness the whole file runs inside one
+    // long-lived outer transaction, so now() (= transaction_timestamp())
+    // is IDENTICAL for both turns' admitted_at and the loadMode1Rows
+    // ORDER BY admitted_at tie-breaks nondeterministically (CI run
+    // 28945612525 pinned the flipped order). In production each request
+    // runs its own transaction, so admitted_at ordering holds there —
+    // the identity-keyed lookup asserts the same semantics without the
+    // harness-only ordering assumption.
+    const admission1 = rows.admissions.find((a) => a.id === turn1Id);
+    const admission2 = rows.admissions.find((a) => a.id === turn2Id);
+    expect(admission1).toBeDefined();
+    expect(admission2).toBeDefined();
+    expect(admission1!.past_floor).toBe(false);
+    expect(admission2!.past_floor).toBe(true);
     expect(rows.turnResults).toHaveLength(2);
   });
 
