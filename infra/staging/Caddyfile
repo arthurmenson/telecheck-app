@@ -17,3 +17,23 @@
 
 	reverse_proxy app:3000
 }
+
+# Patient app (Track 4) — static Expo web export served from the host
+# directory mounted at /srv/patient-app (see docker-compose.yml caddy
+# volumes). Mock-backed at this stage: the app's TelecheckApi interface
+# is satisfied by src/api/mock; the real HTTP client swap-in is the
+# recorded Track-4 follow-on. SPA fallback via try_files (client-side
+# routing). No X-Frame-Options DENY here — the app is a UI, not an API.
+{$PATIENT_APP_DOMAIN} {
+	tls {$ACME_EMAIL}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	root * /srv/patient-app
+	try_files {path} /index.html
+	file_server
+}
