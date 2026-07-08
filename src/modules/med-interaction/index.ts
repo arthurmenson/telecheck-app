@@ -12,7 +12,9 @@
  *
  * **Status:** spec layer COMPLETE + RATIFIED (SI-019 v2.0 P-033 +
  * CDM v1.6 → v1.7 P-034 RATIFIED 2026-05-21). **DB layer COMPLETE
- * through migration 050** (PRs 1-5 merged; 21 Codex rounds total):
+ * through migration 070** (override-wrapper evidence unlock; see
+ * migrations/070 header). Original DB-layer series (PRs 1-5 merged;
+ * 21 Codex rounds total):
  *
  *   - PR 1 (migration 046, 5 rounds): 12 net-new RBAC roles —
  *     4 application + 6 wrapper-owner + 2 service-level-owner. NOLOGIN

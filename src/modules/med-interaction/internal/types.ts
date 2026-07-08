@@ -10,7 +10,8 @@
  * entities + RLS + per-table append-only + monotonic-ordering triggers
  * (047) + SECURITY BARRIER view + optional MV + SECDEF access function
  * (048) + raw lifecycle writer SECDEF (049) + 6 reason-specific
- * wrappers (050; 3 operational + 3 fail-closed) are in place.
+ * wrappers (050; 3 operational + 3 fail-closed at ship time; the
+ * override wrapper turned OPERATIONAL at migration 070) are in place.
  *
  * Branded IDs continue to ship at PR 6 (this commit, the Fastify
  * scaffold-update PR) for cross-module type safety so downstream slices

@@ -12,10 +12,12 @@
  * server-assigned monotonic-ordering triggers (047) + SECURITY BARRIER
  * view + optional MV + SECDEF access function (048) + raw lifecycle
  * writer SECDEF + anti-bypass EXECUTE matrix (049) + 6 reason-specific
- * wrappers (050; 3 operational + 3 fail-closed). This commit (PR 6 of 6)
- * is the Fastify scaffold update closing the DB-layer series. Full
- * handler implementation (8 endpoints per SI-019 §5 + CDM §6 OpenAPI
- * v0.3: signal-check + override-record + lifecycle actions) lands at PR 7+.
+ * wrappers (050; 3 operational + 3 fail-closed at ship time — the
+ * override wrapper turned OPERATIONAL at migration 070's evidence
+ * unlock; resolve + expiry remain fail-closed with narrowed deferrals).
+ * PR 6 was the Fastify scaffold update closing the DB-layer series;
+ * PRs 7-9 + the evidence-unlock PR mounted all 8 endpoints per SI-019
+ * §5 + CDM §6 OpenAPI v0.3 (6 of 8 operational).
  *
  * Spec references:
  *   - ADR-001 (modular monolith)

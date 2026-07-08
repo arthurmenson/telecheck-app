@@ -5,15 +5,29 @@
  * `record_signal_expiry` from migration 050 §5 under
  * `medication_interaction_engine_evaluator` (scheduler) slice role.
  *
- * **Fail-closed posture (v0.1):** the wrapper RAISES SQLSTATE `0A000`
- * per Codex R1 closure 2026-05-23 — wrapper body fails-closed pending
- * the per-basis cadence config table (needed for window-end-time check
- * "now() > emission_time + time_window"). Mapped here to 503
- * Service Unavailable tenant-blind per I-025.
+ * **Fail-closed posture (STANDS after the migration 070 evidence-unlock
+ * pass):** the wrapper RAISES SQLSTATE `0A000` per Codex R1 closure
+ * 2026-05-23. The precisely-narrowed remaining deferral (migration 070
+ * header): SI-019 §6.NEW6's elapsed-time predicate
+ * `now() > emission_time + per_basis_duration` needs the CCR-driven
+ * per-basis cadence config table (duration formula per
+ * `time_window_basis`), which is still absent from the code repo. The
+ * structural preflights (time_window_basis non-null → 23514; emission row
+ * exists → 02000) run first; only a structurally-valid expiry attempt
+ * reaches the 0A000. Mapped here to 503 tenant-blind per I-025.
  *
- * **Cat A audit emission on REJECTION:** same I-003 pattern as
- * override-signal.ts + resolve-signal.ts — even rejection paths emit
- * Cat A `interaction_signal_lifecycle_transition_emitted`.
+ * **Cat A audit emission on REJECTION (savepoint-recovered):** I-003
+ * bare-suppression-forbidden — the rejected attempt belongs in the audit
+ * chain. On live PostgreSQL the failed wrapper call ABORTS the
+ * transaction, so the attempt is wrapped in a SAVEPOINT: on 0A000 the
+ * handler ROLLBACKs TO the savepoint, emits the rejection attestation in
+ * the recovered tx, and RETURNS the 503 envelope (not a throw — a throw
+ * would roll back the whole business tx and destroy the attestation).
+ * The idempotency record then replays the same 503 for the same key,
+ * which is the honest deterministic outcome while the capability is
+ * spec-gated. (The v0.1 scaffold emitted the audit directly into the
+ * aborted tx and re-threw — which on live PG would have surfaced 25P02 →
+ * 500 and persisted nothing; corrected in the evidence-unlock PR.)
  */
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
@@ -101,9 +115,17 @@ export async function expireSignalHandler(
     return withTenantContext(tx, ctx.tenantId, async () => {
       const run = async (): Promise<{
         status: number;
-        view: { signal_id: string; status: 'expired' };
+        view:
+          | { signal_id: string; status: 'expired' }
+          | { error: { code: string; message: string; request_id: string } };
       }> => {
+        // SAVEPOINT around the wrapper attempt: a failed SQL statement
+        // aborts the tx on live PostgreSQL; the savepoint lets the handler
+        // recover the tx to emit the I-003 rejection attestation. The
+        // ROLLBACK TO also unwinds withDbRole's SET LOCAL ROLE, so the
+        // audit INSERT runs under the session app role.
         let rejected = false;
+        await tx.query('SAVEPOINT med_interaction_wrapper_attempt');
         try {
           await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
             await tx.query('SELECT record_signal_expiry($1, $2, $3, $4, $5::jsonb)', [
@@ -114,18 +136,20 @@ export async function expireSignalHandler(
               JSON.stringify(metadata),
             ]);
           });
+          await tx.query('RELEASE SAVEPOINT med_interaction_wrapper_attempt');
         } catch (err) {
-          if (typeof err === 'object' && err !== null && 'code' in err) {
-            const code = (err as { code?: unknown }).code;
-            if (code === '42501') {
-              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-            }
-            if (code === '0A000') {
-              rejected = true;
-            } else {
-              throw err;
-            }
+          await tx.query('ROLLBACK TO SAVEPOINT med_interaction_wrapper_attempt');
+          if (
+            typeof err === 'object' &&
+            err !== null &&
+            'code' in err &&
+            (err as { code?: unknown }).code === '0A000'
+          ) {
+            rejected = true;
           } else {
+            // 42501 → mapper 403; 02000/23514 → mapper 404; others → 500.
+            // Structured rejections are absorbed AFTER the business tx
+            // rolls back (withIdempotentExecution → mapServiceError).
             throw err;
           }
         }
@@ -150,7 +174,19 @@ export async function expireSignalHandler(
         );
 
         if (rejected) {
-          throw Object.assign(new Error('expiry_capability_not_yet_available'), { code: '0A000' });
+          // RETURN (don't throw) so the recovered tx COMMITS the rejection
+          // attestation — I-003 bare-suppression-forbidden. Envelope shape
+          // matches the mapServiceError 0A000 branch verbatim.
+          return {
+            status: 503,
+            view: {
+              error: {
+                code: 'med_interaction.expiry_capability_not_yet_available',
+                message: 'Signal expiry capability is not yet available in this deployment.',
+                request_id: req.id,
+              },
+            },
+          };
         }
 
         return { status: 201, view: { signal_id: signalId, status: 'expired' } };

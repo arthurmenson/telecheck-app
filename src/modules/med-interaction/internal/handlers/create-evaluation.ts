@@ -268,6 +268,7 @@ export async function createEvaluationHandler(
     const evaluatedAt = new Date();
 
     const callWrappers = async (): Promise<void> => {
+      let evaluationWindowMsForAudit = 0;
       try {
         await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
           // §3a — Direct INSERT into interaction_engine_evaluation
@@ -307,41 +308,49 @@ export async function createEvaluationHandler(
               JSON.stringify(labSetSnapshot),
             ],
           );
-
-          // §3b — Cat A audit emission in the SAME tx (I-003 +
-          // Option 2 carryforward atomicity). Signals_produced_count
-          // is 0 at evaluation create time — signals are INSERTed
-          // by the separate POST /signals endpoint and attested via
-          // interaction_signal_emitted (the engine evaluator may
-          // call /signals 1..N times after this evaluation row).
-          //
-          // Canonical lifecycle audit rule (R1 Finding 2 closure
-          // 2026-05-23): this handler emits EXACTLY ONE audit event:
-          //   1. interaction_engine_evaluation_completed (Cat A)
-          // No other audit events fire from this handler. The
-          // signal-lifecycle events (interaction_signal_emitted,
-          // interaction_signal_lifecycle_transition_emitted) belong
-          // to the /signals and /signals/:id/activate handlers
-          // respectively. See `audit.ts` file-level docstring for
-          // the cross-handler audit-emission contract.
-          await emitEvaluationCompletedAudit(
-            {
-              tenantId: ctx.tenantId,
-              evaluationId,
-              patientId,
-              actorId,
-              actorTenantId,
-              countryOfCare: ctx.countryOfCare,
-              triggeredBy,
-              triggeredByResourceId,
-              engineVersion,
-              knowledgeBaseVersion,
-              evaluationWindowMs,
-              signalsProducedCount: 0,
-            },
-            tx,
-          );
+          evaluationWindowMsForAudit = evaluationWindowMs;
         });
+
+        // §3b — Cat A audit emission in the SAME tx (I-003 + Option 2
+        // carryforward atomicity), AFTER the withDbRole block returns.
+        // Evidence-unlock PR live-PG fix: the audit INSERT must NOT run
+        // under the elevated slice role — medication_interaction_engine_
+        // evaluator has no audit_records privileges (least-privilege:
+        // slice roles get their slice's tables only), so emitting inside
+        // the elevated callback raised 42501 → 403 on live PostgreSQL.
+        // withDbRole restores the prior session role on return (its R1
+        // closure exists precisely for handlers that perform audit work
+        // after the elevated call), so this emission runs as the app
+        // role, in the SAME transaction — atomicity is unchanged.
+        // Mirrors the async-consult record-decision precedent.
+        //
+        // Signals_produced_count is 0 at evaluation create time —
+        // signals are INSERTed by the separate POST /signals endpoint
+        // and attested via interaction_signal_emitted (the engine
+        // evaluator may call /signals 1..N times after this row).
+        //
+        // Canonical lifecycle audit rule (R1 Finding 2 closure
+        // 2026-05-23): this handler emits EXACTLY ONE audit event:
+        //   1. interaction_engine_evaluation_completed (Cat A)
+        // No other audit events fire from this handler. See `audit.ts`
+        // file-level docstring for the cross-handler contract.
+        await emitEvaluationCompletedAudit(
+          {
+            tenantId: ctx.tenantId,
+            evaluationId,
+            patientId,
+            actorId,
+            actorTenantId,
+            countryOfCare: ctx.countryOfCare,
+            triggeredBy,
+            triggeredByResourceId,
+            engineVersion,
+            knowledgeBaseVersion,
+            evaluationWindowMs: evaluationWindowMsForAudit,
+            signalsProducedCount: 0,
+          },
+          tx,
+        );
       } catch (err) {
         // 42501 → 403 per I-025 (mirrors get-signal.ts §5 pattern).
         // Both the SET LOCAL ROLE pre-callback step AND the inner

@@ -229,6 +229,7 @@ export async function emitSignalHandler(
     const emittedAt = new Date();
 
     const callWrappers = async (): Promise<void> => {
+      let derivedPatientIdForAudit = '';
       try {
         await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
           // §1 — Derive the canonical patient_id from the persisted
@@ -305,33 +306,43 @@ export async function emitSignalHandler(
             JSON.stringify({ evaluation_id: evaluationId }),
           ]);
 
-          // §4 — Cat A audit `interaction_signal_emitted` in the
-          // SAME tx as the wrapper call. Per I-003 the audit write
-          // is non-suppressible; an audit-INSERT failure rolls back
-          // the entire transaction (including the signal INSERT +
-          // lifecycle transition INSERT). This is the Option 2
-          // carryforward atomicity guarantee.
-          //
-          // The patient_id passed to the audit emitter is the
-          // DB-derived value, NOT the body-supplied value (R2
-          // HIGH-1 closure). They are validated equal above, so
-          // this is a defense-in-depth use of the derived value.
-          await emitSignalEmittedAudit(
-            {
-              tenantId: ctx.tenantId,
-              signalId,
-              evaluationId,
-              patientId: derivedPatientId,
-              actorId,
-              actorTenantId,
-              countryOfCare: ctx.countryOfCare,
-              checkClass,
-              severity,
-              recommendedAction,
-            },
-            tx,
-          );
+          derivedPatientIdForAudit = derivedPatientId;
         });
+
+        // §4 — Cat A audit `interaction_signal_emitted` in the SAME tx
+        // as the wrapper call, AFTER the withDbRole block returns.
+        // Evidence-unlock PR live-PG fix: the audit INSERT must NOT run
+        // under the elevated slice role — medication_interaction_engine_
+        // evaluator has no audit_records privileges (least-privilege:
+        // slice roles get their slice's tables only), so emitting inside
+        // the elevated callback raised 42501 → 403 on live PostgreSQL.
+        // withDbRole restores the prior session role on return (its R1
+        // closure exists precisely for handlers that perform audit work
+        // after the elevated call), so this runs as the app role in the
+        // SAME transaction — the I-003 / Option 2 atomicity guarantee is
+        // unchanged (an audit-INSERT failure still rolls back the signal
+        // INSERT + lifecycle transition INSERT). Mirrors the
+        // async-consult record-decision precedent.
+        //
+        // The patient_id passed to the audit emitter is the DB-derived
+        // value, NOT the body-supplied value (R2 HIGH-1 closure). They
+        // are validated equal above, so this is a defense-in-depth use
+        // of the derived value.
+        await emitSignalEmittedAudit(
+          {
+            tenantId: ctx.tenantId,
+            signalId,
+            evaluationId,
+            patientId: derivedPatientIdForAudit,
+            actorId,
+            actorTenantId,
+            countryOfCare: ctx.countryOfCare,
+            checkClass,
+            severity,
+            recommendedAction,
+          },
+          tx,
+        );
       } catch (err) {
         // 42501 → tenant-blind 403 (I-025). Covers SET LOCAL ROLE +
         // INSERT RLS denial + SECDEF wrapper's tenant-scope guard

@@ -175,7 +175,19 @@ export function setTestPool(client: DbClient): void {
         // a defensive COMMIT outside withTransaction doesn't error.
         return { rows: [], rowCount: null };
       }
-      if (trimmed === 'ROLLBACK' || trimmed.startsWith('ROLLBACK ')) {
+      // 'ROLLBACK TO SAVEPOINT <name>' is NOT an app-transaction rollback —
+      // it is nested-savepoint recovery issued by handlers that need to
+      // emit an audit attestation after a failed SQL statement (the
+      // med-interaction resolve/expire fail-closed rejection paths per
+      // I-003; evidence-unlock PR). It must pass through unchanged, or the
+      // interceptor would discard the ENTIRE app-level savepoint (including
+      // the idempotency reservation row) and the handler's post-recovery
+      // queries would 500. Only a bare/statement-level ROLLBACK is the app
+      // transaction boundary.
+      if (
+        trimmed === 'ROLLBACK' ||
+        (trimmed.startsWith('ROLLBACK ') && !trimmed.startsWith('ROLLBACK TO '))
+      ) {
         if (activeAppTxSavepoint !== null) {
           const sp = activeAppTxSavepoint;
           activeAppTxSavepoint = null;
