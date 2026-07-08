@@ -96,12 +96,12 @@ vi.mock('../../../../lib/tenant-context.js', () => ({
   })),
 }));
 
-class MockUnauthorizedRoleError extends Error {
-  statusCode = 403;
-}
-
 vi.mock('../../../../lib/auth-context.js', () => ({
-  UnauthorizedRoleError: class extends MockUnauthorizedRoleError {
+  // Defined inline — vi.mock factories are hoisted above top-level
+  // declarations, so referencing an outer class here would throw
+  // "Cannot access before initialization".
+  UnauthorizedRoleError: class extends Error {
+    statusCode = 403;
     constructor(_required: unknown, observed: string) {
       super(`role mismatch: ${observed}`);
     }
