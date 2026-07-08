@@ -94,11 +94,12 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   }));
 
   // Readiness probe — module is still NOT ready to serve full traffic:
-  // 4 of 5 SI-023 §5 endpoints are LIVE (crisis dashboard + template
+  // all 5 SI-023 §5 endpoints are LIVE (crisis dashboard + template
   // submit + template decision + consult-queue dashboard post-migration
-  // 065); the mode1-volume dashboard remains fail-closed pending the
-  // P-036 ai_mode1_conversation entity. Cat A audit emission + LAYER B
-  // role-membership check remain deferred. Continues returning 503 per
+  // 065 + mode1-volume dashboard post-migration 069), but the Sprint 4
+  // hardening set (Cat A dashboard audit emission + LAYER B
+  // role-membership check + cross-tenant isolation tests + admin.*
+  // catalog ratification) remains open. Continues returning 503 per
   // the canonical BLOCKED-aware pattern.
   app.get('/ready', async (_request, reply) => {
     return reply.code(503).send({
@@ -106,14 +107,14 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
       module: 'admin-backend',
       reason: 'partial_handlers_mounted_full_surface_incomplete',
       reason_message:
-        '4 of 5 SI-023 §5 endpoints are live: GET /v1/admin/dashboards/' +
+        '5 of 5 SI-023 §5 endpoints are live: GET /v1/admin/dashboards/' +
         'crisis-operational-health, POST /v1/admin/templates/:template_id/submit-for-review, ' +
-        'POST /v1/admin/templates/:template_id/reviews/:review_id/decision, and ' +
+        'POST /v1/admin/templates/:template_id/reviews/:review_id/decision, ' +
         'GET /v1/admin/dashboards/consult-queue-health (unlocked by migration 065 — ' +
-        'CDM §4.NEW6/§4.NEW8c after the P-038 consult entities landed at 055-061). ' +
-        'Still pending: GET /v1/admin/dashboards/mode1-volume-health (fail-closed 503 — ' +
-        'blocked on the P-036 ai_mode1_conversation entity + Mode 1 audit emitters, ' +
-        'migration 041 §3 deferral); Cat A audit emission for the 3 remaining admin.* IDs ' +
+        'CDM §4.NEW6/§4.NEW8c after the P-038 consult entities landed at 055-061), and ' +
+        'GET /v1/admin/dashboards/mode1-volume-health (unlocked by migration 069 — ' +
+        'CDM §4.NEW7/§4.NEW8d after the P-036 Mode 1 entities landed at 066-068). ' +
+        'Still pending: Cat A audit emission for the 3 remaining admin.* IDs ' +
         '(dashboard_query_executed + template_review_decision + ' +
         'template_published_via_review_workflow); proper LAYER B role-membership check ' +
         '(replacing the legacy admin-role shim); cross-tenant isolation tests; ' +
