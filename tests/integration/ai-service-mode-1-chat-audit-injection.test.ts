@@ -42,13 +42,16 @@ import { asTenantId } from '../../src/lib/glossary.ts';
 import type { IdempotencyCtx } from '../../src/lib/idempotency.ts';
 import { issueAccessToken } from '../../src/lib/jwt.ts';
 import { ulid } from '../../src/lib/ulid.ts';
-import { deriveDeterministicId } from '../../src/modules/ai-service/internal/handlers/chat.ts';
+import { deriveDeterministicMode1Uuid } from '../../src/modules/ai-service/internal/handlers/chat.ts';
+import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
+import { asAccountId } from '../../src/modules/identity/internal/types.ts';
 import {
   consumeMode1AuditFailureOrThrow,
   resetMode1AuditFailure,
   setMode1AuditFailure,
 } from '../helpers/mode-1-chat-audit-injection.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
+import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
@@ -140,6 +143,35 @@ afterEach(() => {
   resetMode1AuditFailure();
 });
 
+/**
+ * Seed a REAL patient account. The Mode 1 persistence path (migrations
+ * 067/068) composite-FKs patient identity to
+ * accounts(tenant_id, account_id), so requests that reach the
+ * persistence phase must run under an existing account. Mirrors
+ * ai-service-mode-1-chat-http.test.ts seedPatientAccount().
+ */
+async function seedPatientAccount(): Promise<string> {
+  const accountId = asAccountId(ulid());
+  const phone = uniquePhone('+1');
+  await withTenantContext(T_US, () =>
+    createAccount(
+      {
+        account_id: accountId,
+        tenant_id: T_US,
+        phone_e164: phone,
+        first_name: 'A',
+        last_name: 'B',
+        date_of_birth: '1990-01-01',
+        gender: 'prefer_not_to_say',
+        country_of_residence: 'US',
+        country_of_care: 'US',
+      },
+      async () => {},
+    ),
+  );
+  return accountId;
+}
+
 function mintPatientToken(accountId: string): string {
   return issueAccessToken(
     {
@@ -170,7 +202,7 @@ describe('Mode 1 chat — Group H: audit-failure injection round-trip (R7 round-
   it('H1 fail-always → POST /v0/ai/chat → 503 with canonical error envelope', async () => {
     setMode1AuditFailure('fail-always');
 
-    const accountId = `acct_${ulid()}`;
+    const accountId = await seedPatientAccount();
     const token = mintPatientToken(accountId);
     const response = await app!.inject({
       method: 'POST',
@@ -195,7 +227,7 @@ describe('Mode 1 chat — Group H: audit-failure injection round-trip (R7 round-
     // Category A audit across the failed-attempt + retry pair" —
     // a non-crisis payload would emit zero Category A audits, so
     // the assertion would pass vacuously.
-    const accountId = `acct_${ulid()}`;
+    const accountId = await seedPatientAccount();
     const token = mintPatientToken(accountId);
     const idempotencyKey = ulid();
     const payload = { message_text: CRISIS_TEXT_SHORT };
@@ -253,7 +285,7 @@ describe('Mode 1 chat — Group H: audit-failure injection round-trip (R7 round-
     // + bodyHash that's the input; here we reconstruct the salient fields
     // (the actorId / bodyHash details are abstracted by the handler).
     // What we CAN assert is the cross-attempt stability: if a future
-    // refactor reverts deriveDeterministicId to random, r2's IDs would
+    // refactor reverts deriveDeterministicMode1Uuid to random, r2's IDs would
     // STILL be different from a hypothetical attempt-1-success (no
     // observation of attempt 1's IDs because attempt 1 errored before
     // returning a body). The actual round-trip invariant — that the
@@ -265,9 +297,10 @@ describe('Mode 1 chat — Group H: audit-failure injection round-trip (R7 round-
 
     // R4 H1 deterministic ID invariant — explicit cross-check: the
     // session_id + message_id the SUCCESSFUL attempt returned MUST
-    // match what deriveDeterministicId would produce for the same
-    // idempotency context. Reconstruct the IdempotencyCtx the handler
-    // built and assert equality.
+    // match what deriveDeterministicMode1Uuid would produce for the
+    // same idempotency context (persistence-era: the ids are the
+    // migration-067 conversation/turn UUID primary keys). Reconstruct
+    // the IdempotencyCtx the handler built and assert equality.
     //
     // The handler's buildIdempotencyCtx threads: tenantId from
     // tenantContext, idempotencyKey from header, endpoint from url,
@@ -284,8 +317,8 @@ describe('Mode 1 chat — Group H: audit-failure injection round-trip (R7 round-
       actorId: accountId,
       bodyHash: hashBody(JSON.stringify(payload)),
     };
-    const expectedSessionId = deriveDeterministicId('aics_', reconstructedCtx);
-    const expectedMessageId = deriveDeterministicId('aimsg_', reconstructedCtx, 'message');
+    const expectedSessionId = deriveDeterministicMode1Uuid(reconstructedCtx, 'conversation');
+    const expectedMessageId = deriveDeterministicMode1Uuid(reconstructedCtx, 'turn');
 
     expect(body2['ai_chat_session_id']).toBe(expectedSessionId);
     expect(body2['message_id']).toBe(expectedMessageId);
