@@ -9,16 +9,15 @@
  *   Plugin prefix is `/v1/admin` (admin-backend/plugin.ts §R1 MED-1
  *   closure 2026-05-22 — spec-canonical SI-023 §5 endpoint contract).
  *
- * What it does (v0.1 — DEFERRED DATA SOURCE):
- *   This handler is the Sprint 2 PR 4 carryforward from Admin Backend
- *   PR 5: the SECDEF wrapper `read_admin_consult_queue_health()` was
- *   DEFERRED at migration 044 §3 because the underlying view
- *   `admin_consult_queue_health_v` is itself deferred (migration 041 §2:
- *   the consult entities — Async Consult slice — are not in the code repo
- *   yet). The wrapper is NOT a stub that RAISEs `0A000`; it does NOT
- *   exist at all in the database. Calling
- *   `SELECT * FROM read_admin_consult_queue_health($1, $2)` therefore
- *   returns PostgreSQL SQLSTATE `42883` (undefined_function).
+ * What it does (post-migration-065 — LIVE DATA SOURCE):
+ *   Originally the Sprint 2 PR 4 deferred-wrapper scaffold: the SECDEF
+ *   wrapper `read_admin_consult_queue_health()` was DEFERRED at
+ *   migration 044 §3 pending the P-038 consult entities. Those landed at
+ *   migrations 055-061, and **migration 065 unlocked the surface** —
+ *   the view (`admin_consult_queue_health_v`, CDM §4.NEW6) + wrapper
+ *   (§4.NEW8c) now exist, so the wrapper call succeeds and the 42883 →
+ *   503 mapping below is dead code on the happy path (kept as the
+ *   fail-closed posture for environments that lag the migration).
  *
  *   The handler nonetheless implements the FULL composition pipeline
  *   (auth + tx + tenant + actor + db role + wrapper call) mirroring
@@ -90,27 +89,23 @@ import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 
 /**
- * Row shape returned by `read_admin_consult_queue_health(text, jsonb)`
- * once the deferred wrapper + underlying view land. Mirrors the
- * RETURNS TABLE definition that will be authored per CDM §4.NEW8c when
- * the Async Consult slice ships.
- *
- * Field-shape rationale (forward-compatible, may be refined when the
- * hygiene migration lands): per-tenant per-queue-status rollup of
- * consult-queue metrics (active_consults_count, sla_breach_count,
- * avg_wait_seconds, oldest_unclaimed_age_seconds). NUMERIC / BIGINT
- * are surfaced as JS `string` by the `pg` driver — same convention
- * as the crisis-operational-health row.
- *
- * Until the wrapper lands the handler never returns a row at v0.1.
+ * Row shape returned by `read_admin_consult_queue_health(text, jsonb)` —
+ * the RETURNS TABLE definition landed at migration 065 verbatim from CDM
+ * §4.NEW6/§4.NEW8c (P-042 RATIFIED): per-(program_id, current_state)
+ * rollup with independently-aggregated metrics (P-042 R3 HIGH-1
+ * anti-join-multiplication design). NUMERIC / BIGINT are surfaced as JS
+ * `string` by the `pg` driver — same convention as the
+ * crisis-operational-health row. program_id / current_state are NULL for
+ * general consults / transition-less consults respectively.
  */
 interface ConsultQueueHealthRow {
   tenant_id: string;
-  queue_status: string;
-  active_consults_count: string;
-  sla_breach_count: string;
-  avg_wait_seconds: string | null;
-  oldest_unclaimed_age_seconds: string | null;
+  program_id: string | null;
+  current_state: string | null;
+  consult_count: string;
+  avg_time_to_first_claim_seconds: string | null;
+  orphan_claim_backlog_count: string;
+  async_consult_audit_24h_count: string;
 }
 
 /**

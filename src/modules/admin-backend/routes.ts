@@ -93,28 +93,32 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
       'via adminBackendAuditPlaceholder). See src/modules/admin-backend/README.md.',
   }));
 
-  // Readiness probe — module is still NOT ready to serve full traffic at
-  // v0.3: 3 of 5 spec endpoints remain unmounted (1 template wrapper +
-  // the 2 dashboards mounted by this PR are fail-closed pending data
-  // sources) AND Cat A audit emission + LAYER B role-membership check are
-  // deferred. Continues returning 503 per the canonical BLOCKED-aware
-  // pattern.
+  // Readiness probe — module is still NOT ready to serve full traffic:
+  // 4 of 5 SI-023 §5 endpoints are LIVE (crisis dashboard + template
+  // submit + template decision + consult-queue dashboard post-migration
+  // 065); the mode1-volume dashboard remains fail-closed pending the
+  // P-036 ai_mode1_conversation entity. Cat A audit emission + LAYER B
+  // role-membership check remain deferred. Continues returning 503 per
+  // the canonical BLOCKED-aware pattern.
   app.get('/ready', async (_request, reply) => {
     return reply.code(503).send({
       status: 'unavailable',
       module: 'admin-backend',
       reason: 'partial_handlers_mounted_full_surface_incomplete',
       reason_message:
-        'Sprint 2 PRs 1+2 mounted GET /v1/admin/dashboards/crisis-operational-health ' +
-        '+ POST /v1/admin/templates/:template_id/submit-for-review. 3 of 5 SI-023 §5 ' +
-        'endpoints still pending: 1 template wrapper (decision) + 2 deferred dashboard ' +
-        'reads (consult-queue-health + mode1-volume-health; deferred per Option 2 ' +
-        'until consult + Mode 1 entities land). Additionally: Cat A audit emission ' +
-        'for the other 3 admin.* IDs (dashboard_query_executed + template_review_decision ' +
-        '+ template_published_via_review_workflow) + proper LAYER B role-membership ' +
-        'check (replacing the legacy admin-role shim) + cross-tenant isolation tests ' +
-        '+ AUDIT_EVENTS catalog ratification of admin.* IDs (currently placeholder-cast) ' +
-        'pending Sprint 4 hardening. /ready will return 200 once Sprint 4 closes. ' +
+        '4 of 5 SI-023 §5 endpoints are live: GET /v1/admin/dashboards/' +
+        'crisis-operational-health, POST /v1/admin/templates/:template_id/submit-for-review, ' +
+        'POST /v1/admin/templates/:template_id/reviews/:review_id/decision, and ' +
+        'GET /v1/admin/dashboards/consult-queue-health (unlocked by migration 065 — ' +
+        'CDM §4.NEW6/§4.NEW8c after the P-038 consult entities landed at 055-061). ' +
+        'Still pending: GET /v1/admin/dashboards/mode1-volume-health (fail-closed 503 — ' +
+        'blocked on the P-036 ai_mode1_conversation entity + Mode 1 audit emitters, ' +
+        'migration 041 §3 deferral); Cat A audit emission for the 3 remaining admin.* IDs ' +
+        '(dashboard_query_executed + template_review_decision + ' +
+        'template_published_via_review_workflow); proper LAYER B role-membership check ' +
+        '(replacing the legacy admin-role shim); cross-tenant isolation tests; ' +
+        'AUDIT_EVENTS catalog ratification of admin.* IDs (currently placeholder-cast). ' +
+        '/ready returns 200 once the hardening set closes. ' +
         'See src/modules/admin-backend/README.md.',
     });
   });
