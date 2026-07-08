@@ -68,6 +68,7 @@ import {
 import { asTenantId } from '../../src/lib/glossary.ts';
 import { issueAccessToken, type AccessTokenRole } from '../../src/lib/jwt.ts';
 import { ulid } from '../../src/lib/ulid.ts';
+import { SLICE_ROLES } from '../../src/lib/with-db-role.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
@@ -253,6 +254,20 @@ beforeAll(async () => {
     await superuser.query(
       `ALTER ROLE bind_actor_context_role WITH LOGIN PASSWORD '${BIND_ROLE_TEST_PASSWORD}'`,
     );
+    // Mirror the production app-role acquisition topology onto the test
+    // principal: migrations 051/061/064 grant slice-role memberships to
+    // telecheck_app_role, but the suite's shared client runs as
+    // telecheck_test_app (tests/setup.ts installTestAppRole), which gets
+    // broad table grants and NO memberships — so every handler's
+    // SET LOCAL ROLE would 42501 (CI run 28911340820 pinned this as a
+    // blanket 403 on all v1 writes). Plain GRANT (CI is PG 15 — the
+    // 051 §2 per-membership `WITH INHERIT FALSE, SET TRUE` clause is
+    // PG 16 grammar; the PG 15 posture relies on the member role's
+    // NOINHERIT attribute, exactly as migration 061's version branch
+    // documents).
+    for (const sliceRole of SLICE_ROLES) {
+      await superuser.query(`GRANT ${sliceRole} TO telecheck_test_app`);
+    }
   } finally {
     await superuser.end();
   }
