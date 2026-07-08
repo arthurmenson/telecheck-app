@@ -298,7 +298,9 @@ type AsyncConsultV1AuditActionPlaceholder =
   | 'async_consult.claim_expired_auto_released'
   | 'async_consult.clinician_decision_recorded'
   | 'async_consult.prescribing_recorded'
-  | 'async_consult.clinician_decision_rationale_disagreement';
+  | 'async_consult.clinician_decision_rationale_disagreement'
+  | 'async_consult.additional_data_requested'
+  | 'async_consult.follow_up_message_sent';
 
 function asyncConsultV1AuditPlaceholder(id: AsyncConsultV1AuditActionPlaceholder): AuditAction {
   return id as AuditAction;
@@ -528,6 +530,90 @@ export async function emitAsyncConsultAiPreparationAudits(
         recommendation: args.recommendation,
         // The clinical summary itself is a KMS envelope (I-026) —
         // never echoed into audit detail.
+      },
+    }),
+    tx,
+  );
+}
+
+/**
+ * Cat C — async_consult.additional_data_requested (AUDIT_EVENTS v5.11
+ * row 12). Emitted whenever a clinician decision with
+ * decision_type='request_more_data' is recorded — via EITHER
+ * POST /v1/async-consults/:id/decision or the dedicated
+ * POST /v1/async-consults/:id/request-additional-data route (OpenAPI
+ * v0.4 endpoint #9). Both paths run the same wrapper
+ * (record_consult_clinician_decision → under_review → awaiting_data),
+ * so both carry the same audit shape — route-level divergence in the
+ * audit trail would be a defect.
+ */
+export async function emitAsyncConsultAdditionalDataRequestedAudit(
+  args: {
+    tenantId: TenantId;
+    decisionId: string;
+    consultId: string;
+    patientId: string;
+    clinicianAccountId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(
+      asyncConsultV1AuditPlaceholder('async_consult.additional_data_requested'),
+      'C',
+      {
+        tenant_id: args.tenantId,
+        actor_type: 'clinician',
+        actor_id: args.clinicianAccountId,
+        actor_tenant_id: args.actorTenantId,
+        target_patient_id: args.patientId,
+        country_of_care: args.countryOfCare,
+        resource_type: 'consult',
+        resource_id: args.consultId,
+        detail: {
+          decision_id: args.decisionId,
+        },
+      },
+    ),
+    tx,
+  );
+}
+
+/**
+ * Cat C — async_consult.follow_up_message_sent (AUDIT_EVENTS v5.11
+ * row 15; not sampled — PHI-relevant). Emitted same-tx with the
+ * consult_follow_up_message INSERT (POST /v1/async-consults/:id/
+ * follow-up-messages; OpenAPI v0.4 endpoint #10). The message body is
+ * a KMS envelope (I-026) — never echoed into audit detail.
+ */
+export async function emitAsyncConsultFollowUpMessageSentAudit(
+  args: {
+    tenantId: TenantId;
+    messageId: string;
+    consultId: string;
+    patientId: string;
+    senderRole: 'patient' | 'clinician';
+    senderAccountId: string;
+    actorTenantId: string;
+    countryOfCare: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(asyncConsultV1AuditPlaceholder('async_consult.follow_up_message_sent'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: args.senderRole,
+      actor_id: args.senderAccountId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consult_follow_up_message',
+      resource_id: args.messageId,
+      detail: {
+        consult_id: args.consultId,
+        sender_role: args.senderRole,
       },
     }),
     tx,
