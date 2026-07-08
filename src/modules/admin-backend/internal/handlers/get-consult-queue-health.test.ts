@@ -73,15 +73,17 @@ const FAKE_TENANT_CTX = {
   consumerSubdomain: 'heroshealth.com',
 };
 
-// Post-hygiene sample row (shape matches the row interface in the handler).
+// Post-hygiene sample row (shape matches the migration 065 wrapper's
+// RETURNS TABLE — CDM §4.NEW6/§4.NEW8c ratified columns).
 const SAMPLE_ROWS = [
   {
     tenant_id: 'Telecheck-US',
-    queue_status: 'waiting',
-    active_consults_count: '7',
-    sla_breach_count: '0',
-    avg_wait_seconds: '120.5',
-    oldest_unclaimed_age_seconds: '480',
+    program_id: null,
+    current_state: 'queued',
+    consult_count: '7',
+    avg_time_to_first_claim_seconds: '120.50',
+    orphan_claim_backlog_count: '0',
+    async_consult_audit_24h_count: '42',
   },
 ];
 
