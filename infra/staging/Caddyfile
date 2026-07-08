@@ -33,7 +33,24 @@
 		-Server
 	}
 
-	root * /srv/patient-app
-	try_files {path} /index.html
-	file_server
+	# Same-origin API proxy: the app's fetches go to THIS host (the API
+	# has no CORS surface — deliberate; same-origin avoids opening one).
+	# Tenant resolution works because TENANT_HOST_OVERRIDES maps this
+	# host to Telecheck-US in infra/staging/.env.
+	handle /v0/* {
+		reverse_proxy app:3000
+	}
+	handle /v1/* {
+		reverse_proxy app:3000
+	}
+	handle /health {
+		reverse_proxy app:3000
+	}
+
+	# Everything else: the static Expo web export (SPA fallback).
+	handle {
+		root * /srv/patient-app
+		try_files {path} /index.html
+		file_server
+	}
 }
