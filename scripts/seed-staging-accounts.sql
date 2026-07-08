@@ -7,6 +7,11 @@
 --   01JZZZ00000000000000000P01  patient    (Staging Patient)
 --   01JZZZ00000000000000000C01  clinician  (Staging Clinician)
 --
+-- Identities (Telecheck-Ghana — second operating tenant, GH country of care,
+-- host ghana.87.99.159.214.sslip.io via TENANT_HOST_OVERRIDES on staging):
+--   01JZZZ00000000000000000P02  patient    (Staging Patient GH)
+--   01JZZZ00000000000000000C02  clinician  (Staging Clinician GH)
+--
 -- ULIDs use only Crockford base32 characters (no I, L, O, U) and are 26
 -- chars, matching the platform VARCHAR(26) identity shape.
 
@@ -29,34 +34,63 @@ INSERT INTO accounts (
         'Staging', 'Clinician', DATE '1985-01-01', 'prefer_not_to_say',
         'US', 'US', 'en-US',
         'clinician', 'active', NOW()
+    ),
+    (
+        '01JZZZ00000000000000000P02', 'Telecheck-Ghana', '+233550100001',
+        'staging-patient-gh@example.invalid',
+        'Staging', 'Patient GH', DATE '1990-01-01', 'prefer_not_to_say',
+        'GH', 'GH', 'en-GH',
+        'patient', 'active', NOW()
+    ),
+    (
+        '01JZZZ00000000000000000C02', 'Telecheck-Ghana', '+233550100002',
+        'staging-clinician-gh@example.invalid',
+        'Staging', 'Clinician GH', DATE '1985-01-01', 'prefer_not_to_say',
+        'GH', 'GH', 'en-GH',
+        'clinician', 'active', NOW()
     )
 ON CONFLICT (account_id) DO NOTHING;
 
--- Synthetic forms template — consult_intake_submission carries a composite
+-- Synthetic forms templates — consult_intake_submission carries a composite
 -- FK (tenant_id, template_id) → forms_template; the E2E smoke's intake step
--- needs a real target row.
+-- needs a real per-tenant target row (one per operating tenant; distinct
+-- template_id because forms_template PK is template_id alone). program_id
+-- is the same platform-level ProgramCatalogEntry in both rows — Pattern A:
+-- a platform program ported across tenants (per the GLP-1 Program Porting
+-- Checklist worked example), tenant-instanced via the template row.
 INSERT INTO forms_template (
     template_id, tenant_id, program_id, country_of_care,
     template_version, name, description, created_by
-) VALUES (
-    '01JZZZ0000000000000000TP01', 'Telecheck-US', '01JZZZ0000000000000000PR01',
-    'US', 1, 'Staging E2E synthetic intake template',
-    'Staging-only synthetic template for the authenticated consult-flow smoke.',
-    '01JZZZ00000000000000000C01'
-)
+) VALUES
+    (
+        '01JZZZ0000000000000000TP01', 'Telecheck-US', '01JZZZ0000000000000000PR01',
+        'US', 1, 'Staging E2E synthetic intake template',
+        'Staging-only synthetic template for the authenticated consult-flow smoke.',
+        '01JZZZ00000000000000000C01'
+    ),
+    (
+        '01JZZZ0000000000000000TP02', 'Telecheck-Ghana', '01JZZZ0000000000000000PR01',
+        'GH', 1, 'Staging E2E synthetic intake template (Ghana)',
+        'Staging-only synthetic template for the Telecheck-Ghana consult-flow smoke.',
+        '01JZZZ00000000000000000C02'
+    )
 ON CONFLICT (template_id) DO NOTHING;
 
--- Verification: both rows present and active.
+-- Verification: all four synthetic accounts present and active (two per
+-- operating tenant).
 DO $$
 DECLARE
     v_count INTEGER;
 BEGIN
     SELECT COUNT(*) INTO v_count
       FROM accounts
-     WHERE account_id IN ('01JZZZ00000000000000000P01', '01JZZZ00000000000000000C01')
+     WHERE account_id IN (
+               '01JZZZ00000000000000000P01', '01JZZZ00000000000000000C01',
+               '01JZZZ00000000000000000P02', '01JZZZ00000000000000000C02'
+           )
        AND status = 'active';
-    IF v_count <> 2 THEN
-        RAISE EXCEPTION 'seed-staging-accounts: expected 2 active seed accounts, found %', v_count;
+    IF v_count <> 4 THEN
+        RAISE EXCEPTION 'seed-staging-accounts: expected 4 active seed accounts, found %', v_count;
     END IF;
-    RAISE NOTICE 'seed-staging-accounts: 2 active synthetic accounts present';
+    RAISE NOTICE 'seed-staging-accounts: 4 active synthetic accounts present (US + Ghana)';
 END $$;
