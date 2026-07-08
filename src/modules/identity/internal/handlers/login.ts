@@ -59,6 +59,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { config } from '../../../../lib/config.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -187,7 +188,7 @@ export async function loginStartHandler(
 
       // issueOtp throws OTP_LOCKOUT_ACTIVE on cooldown — mapServiceError
       // (passed to withIdempotentExecution) maps that to the 400 envelope.
-      const { otp } = await otpService.issueOtp(
+      const { otp, codePlaintext } = await otpService.issueOtp(
         ctx,
         { actorId: 'system' },
         {
@@ -198,6 +199,14 @@ export async function loginStartHandler(
         },
         tx,
       );
+      // Staging-only OTP echo (AUTH_DEV_OTP_ECHO; production fail-fast in
+      // config.ts): no SMS provider is wired at v1.0, so the plaintext is
+      // otherwise discarded and the real login flow is unreachable. The
+      // Track-4 patient app's staging login consumes `dev_otp`. Removed
+      // in lockstep with the SMS-provider SI.
+      if (config.authDevOtpEcho) {
+        return { status: 200, view: { otp_id: otp.otp_id, dev_otp: codePlaintext } };
+      }
       return { status: 200, view: { otp_id: otp.otp_id } };
     },
   );

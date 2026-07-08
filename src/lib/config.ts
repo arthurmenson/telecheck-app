@@ -215,6 +215,17 @@ const ConfigSchema = z.object({
   // reach it; Day-3+ wiring flips the flag.
   AI_MODE2_ENABLED: z.enum(['false', 'true']).default('false'),
 
+  // Staging-only OTP echo (Track 4 patient-app real-login wiring). No SMS
+  // provider is wired at v1.0 — login/start issues the OTP and discards
+  // the plaintext, which makes the real login flow unreachable outside
+  // tests. When 'true', login/start includes the OTP plaintext in its
+  // response as `dev_otp` so staging testers can complete the flow.
+  // HARD-REFUSED in production by the fail-fast below (AI_MODE2_ENABLED
+  // precedent): echoing an auth credential in a response is a
+  // staging-only affordance, removed in lockstep with the SMS-provider
+  // SI, never a production toggle.
+  AUTH_DEV_OTP_ECHO: z.enum(['false', 'true']).default('false'),
+
   // Resume-token signing secret (Forms/Intake save-and-resume per Slice PRD §8).
   // The forms-intake module's resume-token.ts derives an HMAC-SHA-256 signature
   // over (resume_state_id, tenant_id, expires_at_ms) so a leaked token is
@@ -382,6 +393,21 @@ function loadConfig() {
     );
   }
 
+  // Production fail-fast on AUTH_DEV_OTP_ECHO=true (same posture as the
+  // AI_MODE2_ENABLED gate): echoing OTP plaintext in an HTTP response is
+  // a staging-only affordance for the Track-4 patient-app login flow
+  // while no SMS provider is wired. It must never reach production —
+  // the config layer enforces that invariant rather than relying on
+  // operator discipline alone.
+  if (parsed.NODE_ENV === 'production' && parsed.AUTH_DEV_OTP_ECHO === 'true') {
+    throw new Error(
+      'AUTH_DEV_OTP_ECHO must remain "false" in production. The flag exists only ' +
+        'so staging testers can complete the OTP login flow while no SMS provider ' +
+        'is wired (login/start otherwise discards the OTP plaintext). It is removed ' +
+        'in lockstep with the SMS-provider SI.',
+    );
+  }
+
   return {
     nodeEnv: parsed.NODE_ENV,
     port: parsed.PORT,
@@ -418,6 +444,7 @@ function loadConfig() {
     },
     researchDataPartnershipActive: parsed.RESEARCH_DATA_PARTNERSHIP_ACTIVE === 'active',
     aiMode2Enabled: parsed.AI_MODE2_ENABLED === 'true',
+    authDevOtpEcho: parsed.AUTH_DEV_OTP_ECHO === 'true',
     resumeTokenSecret,
   } as const;
 }
