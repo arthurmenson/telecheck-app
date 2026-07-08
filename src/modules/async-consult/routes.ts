@@ -40,39 +40,51 @@ export const registerAsyncConsultRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'async-consult',
-    blocked: 'Async Consult slice hardening (Sprint 10 PR 6 — dual surface mounted)',
+    blocked: null,
     blocked_message:
       'Two route surfaces are mounted: the Sprint-9 legacy surface under ' +
       '/v0/async-consult (migration 020 consults tables; 6 functional routes, ' +
       'implementation-complete with HTTP integration tests) AND the Sprint-10 ' +
       'canonical surface under /v1/async-consults (P-038 entity chain; migrations ' +
-      '055-060; 6 core endpoints: initiate / intake / queue / get / claim / ' +
-      'decision through the migration 059 SECDEF wrappers + migration 057 ' +
-      'caller-class views, with async_consult.* audit emission per AUDIT_EVENTS ' +
-      'v5.11). Slice hardening still open on the v1 surface: delegate-initiated ' +
-      'flows fail closed (403), the AI-preparation + claim-reassignment wrappers ' +
-      'are not yet exposed, and the live-PostgreSQL integration-test pass for the ' +
-      'v1 endpoints has not run. See src/modules/async-consult/README.md.',
+      '055-065; 9 endpoints: initiate / intake / ai-preparation / queue / get / ' +
+      'claim / decision / request-additional-data / follow-up-messages through ' +
+      'the migration 059 SECDEF wrappers + 057 caller-class views + 064 ' +
+      'ai_service_account wiring, with async_consult.* audit emission per ' +
+      'AUDIT_EVENTS v5.11 and live-PostgreSQL HTTP integration coverage incl. ' +
+      'the real SI-010 bind path). See src/modules/async-consult/README.md.',
   }));
 
-  // Readiness probe — module is READY to serve traffic. Returns 503
-  // while v1-surface hardening is open (med-interaction /ready
-  // convention: keep deploy gates from advancing the slice through
-  // production rollout until the PR series closes). Distinguishes
-  // liveness ("process up") from readiness ("traffic-acceptable").
+  // Readiness probe — READY (200). The v1-surface hardening list that
+  // held this at 503 has closed: every buildable ratified endpoint is
+  // live (AI-preparation at migration 064; request-additional-data +
+  // follow-up messages post-PR 250), and the live-PG integration suite
+  // covers the full pilot loop over the real SI-010 bind path. The
+  // remaining gaps are SPEC-GATED, not build-gated, and fail closed at
+  // their boundaries:
+  //   - delegate-initiated writes → 403 (Consent-slice delegate-principal
+  //     binding primitive; read path DOES honor delegates per 057 §2)
+  //   - intake abandon (endpoint #3) → no wrapper spec'd in P-038 §3
+  //     (needs SI before the route can exist)
+  //   - claim reassignment → wrapper ratified but NO HTTP endpoint
+  //     ratified anywhere (needs SI)
+  //   - admin caller on GET follow-up-messages → 403 (no ratified
+  //     SELECT grant in 056 §7)
+  //   - app-side KMS envelope encryption → standing platform-wide
+  //     hardening TODO (v1-shared.ts posture; crisis precedent)
+  // Per the readiness contract, "ready" means traffic-acceptable for the
+  // implemented surface — spec-gated gaps that fail closed do not hold
+  // the gate (pharmacy precedent).
   app.get('/ready', async (_req, reply) => {
-    return reply.code(503).send({
-      status: 'not_ready',
+    return reply.code(200).send({
+      status: 'ready',
       module: 'async-consult',
-      blocked: 'Async Consult slice hardening (Sprint 10 PR 6 — dual surface mounted)',
-      blocked_message:
-        'Module is not ready to serve production traffic — the Sprint-10 ' +
-        '/v1/async-consults surface (6 core endpoints on the P-038 canonical ' +
-        'entity chain) landed at PR 6 but slice hardening is open: delegate ' +
-        'flows fail closed, AI-preparation + claim-reassignment endpoints are ' +
-        'deferred, and integration tests for the v1 surface are pending. The ' +
-        'legacy /v0/async-consult surface remains implementation-complete. See ' +
-        'src/modules/async-consult/README.md.',
+      spec_gated_gaps: [
+        'delegate_initiated_writes_403_pending_consent_primitive',
+        'intake_abandon_needs_wrapper_si',
+        'claim_reassignment_needs_endpoint_si',
+        'follow_up_admin_read_needs_grant_si',
+        'app_side_kms_envelope_encryption_todo',
+      ],
     });
   });
 
