@@ -39,10 +39,28 @@
  *     (record_consult_ai_preparation_completed; migration 064 wires the
  *     ai_service_account slice role + closes the 059 §3 deferred grant;
  *     Cat C async_consult.ai_preparation_started + _completed).
+ *   POST /v1/async-consults/:consult_id/request-additional-data —
+ *     endpoint #9 (clinician); shared decision core with
+ *     decision_type pinned to 'request_more_data' (+ Cat C
+ *     async_consult.additional_data_requested on BOTH routes).
+ *   POST + GET /v1/async-consults/:consult_id/follow-up-messages —
+ *     endpoints #10/#11 (patient/clinician); direct-INSERT composition
+ *     per migration 056 §7 (no wrapper spec'd); Cat C
+ *     async_consult.follow_up_message_sent on send.
  *
- * NOT exposed yet (deferred per migration 059 documented TODOs):
- *   - Claim reassignment (reassign_consult_claim) — admin surface;
- *     lands with the admin-backend follow-on PR.
+ * NOT exposed (no ratified HTTP surface / deferred):
+ *   - Claim reassignment (reassign_consult_claim) — the wrapper is
+ *     ratified (P-038 §3 row 7) but NO HTTP endpoint is ratified for it
+ *     (not in the P-038 §7 11-endpoint list, not in SI-023 §5). Exposing
+ *     one requires an SI — do not build ad hoc.
+ *   - Intake abandon (endpoint #3) — ratified in §7 but NO wrapper is
+ *     spec'd (P-038 §3 has no abandon procedure) and the raw lifecycle
+ *     writer is owner-only; needs an SI for the wrapper before the
+ *     route can exist.
+ *   - Admin caller class on GET follow-up-messages — ratified caller
+ *     list includes admin but migration 056 §7 grants SELECT only to
+ *     the patient/clinician slice roles; fails closed 403 until a
+ *     grant migration is ratified.
  *   - Delegate-initiated flows — patient-principal-only at PR 6 (see
  *     initiate-consult-v1.ts docstring for the fail-closed 403 + TODO).
  *
@@ -60,10 +78,17 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import { aiPreparationV1Handler } from './internal/handlers/ai-preparation-v1.js';
 import { claimConsultV1Handler } from './internal/handlers/claim-consult-v1.js';
+import {
+  listFollowUpMessagesV1Handler,
+  sendFollowUpMessageV1Handler,
+} from './internal/handlers/follow-up-messages-v1.js';
 import { getConsultV1Handler } from './internal/handlers/get-consult-v1.js';
 import { getQueueV1Handler } from './internal/handlers/get-queue-v1.js';
 import { initiateConsultV1Handler } from './internal/handlers/initiate-consult-v1.js';
-import { recordDecisionV1Handler } from './internal/handlers/record-decision-v1.js';
+import {
+  recordDecisionV1Handler,
+  requestAdditionalDataV1Handler,
+} from './internal/handlers/record-decision-v1.js';
 import { submitIntakeV1Handler } from './internal/handlers/submit-intake-v1.js';
 
 export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
@@ -80,4 +105,7 @@ export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
   app.post('/:consult_id/ai-preparation', aiPreparationV1Handler);
   app.post('/:consult_id/claim', claimConsultV1Handler);
   app.post('/:consult_id/decision', recordDecisionV1Handler);
+  app.post('/:consult_id/request-additional-data', requestAdditionalDataV1Handler);
+  app.post('/:consult_id/follow-up-messages', sendFollowUpMessageV1Handler);
+  app.get('/:consult_id/follow-up-messages', listFollowUpMessagesV1Handler);
 };

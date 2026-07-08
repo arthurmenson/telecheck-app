@@ -14,7 +14,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
-import { recordDecisionV1Handler } from './record-decision-v1.js';
+import { recordDecisionV1Handler, requestAdditionalDataV1Handler } from './record-decision-v1.js';
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -124,6 +124,10 @@ vi.mock('../../audit.js', () => ({
   emitAsyncConsultDecisionRationaleDisagreementAudit: vi.fn(async (args: unknown, _tx: unknown) => {
     auditCalls.push({ fn: 'emitAsyncConsultDecisionRationaleDisagreementAudit', args });
     return { audit_id: 'aud_3' };
+  }),
+  emitAsyncConsultAdditionalDataRequestedAudit: vi.fn(async (args: unknown, _tx: unknown) => {
+    auditCalls.push({ fn: 'emitAsyncConsultAdditionalDataRequestedAudit', args });
+    return { audit_id: 'aud_4' };
   }),
 }));
 
@@ -461,5 +465,62 @@ describe('recordDecisionV1Handler §4 — error mapping + view', () => {
     await recordDecisionV1Handler(req, reply);
     expect(sent.code).toBe(201);
     expect(typeof (sent.body as Record<string, unknown>)['decision_id']).toBe('string');
+  });
+});
+
+// ===========================================================================
+// §5 — request_more_data Cat C + the dedicated endpoint #9 route
+// ===========================================================================
+
+describe('request-additional-data (endpoint #9) + request_more_data audit', () => {
+  it('/decision with decision_type=request_more_data ALSO emits Cat C additional_data_requested', async () => {
+    const req = makeReq({ body: makeValidBody({ decision_type: 'request_more_data' }) });
+    const { reply, sent } = makeReply();
+    await recordDecisionV1Handler(req, reply);
+    expect(sent.code).toBe(201);
+    expect(auditCalls.map((c) => c.fn)).toEqual([
+      'emitAsyncConsultClinicianDecisionRecordedAudit',
+      'emitAsyncConsultAdditionalDataRequestedAudit',
+    ]);
+  });
+
+  it('the dedicated route pins decision_type=request_more_data when omitted from the body', async () => {
+    const body = makeValidBody();
+    delete body['decision_type'];
+    const req = makeReq({ body });
+    const { reply, sent } = makeReply();
+    await requestAdditionalDataV1Handler(req, reply);
+    expect(sent.code).toBe(201);
+    const { params } = recordedQueries[0]!;
+    expect(params?.[6]).toBe('request_more_data'); // p_decision_type
+    expect(auditCalls.map((c) => c.fn)).toEqual([
+      'emitAsyncConsultClinicianDecisionRecordedAudit',
+      'emitAsyncConsultAdditionalDataRequestedAudit',
+    ]);
+  });
+
+  it('the dedicated route accepts a matching explicit decision_type', async () => {
+    const req = makeReq({ body: makeValidBody({ decision_type: 'request_more_data' }) });
+    const { reply, sent } = makeReply();
+    await requestAdditionalDataV1Handler(req, reply);
+    expect(sent.code).toBe(201);
+  });
+
+  it('the dedicated route 400s on a disagreeing decision_type (not caller-overridable)', async () => {
+    const req = makeReq({ body: makeValidBody({ decision_type: 'prescribe' }) });
+    const { reply, sent } = makeReply();
+    await requestAdditionalDataV1Handler(req, reply);
+    expect(sent.code).toBe(400);
+    expect(recordedQueries).toHaveLength(0);
+  });
+
+  it('the dedicated route keeps the clinician-only Layer B gate', async () => {
+    const body = makeValidBody();
+    delete body['decision_type'];
+    const req = makeReq({ role: 'patient', body });
+    const { reply } = makeReply();
+    await expect(requestAdditionalDataV1Handler(req, reply)).rejects.toMatchObject({
+      statusCode: 403,
+    });
   });
 });

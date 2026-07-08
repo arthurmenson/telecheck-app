@@ -74,6 +74,7 @@ import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import {
+  emitAsyncConsultAdditionalDataRequestedAudit,
   emitAsyncConsultClinicianDecisionRecordedAudit,
   emitAsyncConsultDecisionRationaleDisagreementAudit,
   emitAsyncConsultPrescribingRecordedAudit,
@@ -150,9 +151,24 @@ interface RecordDecisionV1View {
   decision_id: string;
 }
 
-export async function recordDecisionV1Handler(
+/**
+ * Shared decision core for the two ratified routes that record a
+ * clinician decision on the P-038 chain:
+ *
+ *   - POST /:consult_id/decision (endpoint #8) — caller supplies
+ *     decision_type (6-value enum); `forcedDecisionType` is null.
+ *   - POST /:consult_id/request-additional-data (endpoint #9) — the
+ *     route pins decision_type='request_more_data'; a body-supplied
+ *     decision_type that disagrees is a 400 (the dedicated route's
+ *     semantics are not caller-overridable).
+ *
+ * Both run the SAME wrapper + audit contract; the only ratified
+ * difference is who chooses the decision type.
+ */
+async function handleDecision(
   req: FastifyRequest,
   reply: FastifyReply,
+  forcedDecisionType: 'request_more_data' | null,
 ): Promise<unknown> {
   const ctx = requireTenantContext(req);
 
@@ -177,10 +193,26 @@ export async function recordDecisionV1Handler(
   // Body validation (mirrors migration 056 §5 CHECK constraints,
   // including the prescription-iff-prescribe + referral-iff-refer pairs).
   const body = (req.body ?? {}) as RecordDecisionV1Body;
+  if (
+    forcedDecisionType !== null &&
+    body.decision_type !== undefined &&
+    body.decision_type !== forcedDecisionType
+  ) {
+    return reply
+      .code(400)
+      .send(
+        makeErrorEnvelope(
+          req.id,
+          'internal.request.invalid',
+          `This route records decision_type='${forcedDecisionType}'; omit decision_type ` +
+            'or supply that exact value.',
+        ),
+      );
+  }
   const envelope = decodeKmsEnvelope(body.decision_rationale_envelope);
   const signalsRaw = body.interaction_signals_reviewed_ids;
   const signalsValid = Array.isArray(signalsRaw) && signalsRaw.every((s) => isUlid(s));
-  const decisionType = body.decision_type;
+  const decisionType = forcedDecisionType ?? body.decision_type;
   const prescriptionValid =
     decisionType === 'prescribe'
       ? isUlid(body.prescription_details_id)
@@ -340,6 +372,24 @@ export async function recordDecisionV1Handler(
           tx,
         );
       }
+      // 4. additional_data_requested (Cat C; AUDIT_EVENTS v5.11 row 12) —
+      //    request_more_data only, regardless of which route recorded it
+      //    (route-level audit divergence for the same DB effect would be
+      //    a defect; see audit.ts emitter docstring).
+      if (decisionType === 'request_more_data') {
+        await emitAsyncConsultAdditionalDataRequestedAudit(
+          {
+            tenantId: ctx.tenantId,
+            decisionId,
+            consultId,
+            patientId,
+            clinicianAccountId: actor.accountId,
+            actorTenantId,
+            countryOfCare: ctx.countryOfCare,
+          },
+          tx,
+        );
+      }
 
       return {
         status: 201,
@@ -347,4 +397,27 @@ export async function recordDecisionV1Handler(
       };
     },
   );
+}
+
+export async function recordDecisionV1Handler(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<unknown> {
+  return handleDecision(req, reply, null);
+}
+
+/**
+ * POST /v1/async-consults/:consult_id/request-additional-data —
+ * OpenAPI v0.4 endpoint #9 (clinician). Records a
+ * decision_type='request_more_data' clinician decision through the
+ * shared core: same wrapper (under_review → awaiting_data via the
+ * additional_data_requested transition), same Cat A
+ * clinician_decision_recorded + Cat C additional_data_requested audit
+ * pair the /decision route emits for this decision type.
+ */
+export async function requestAdditionalDataV1Handler(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<unknown> {
+  return handleDecision(req, reply, 'request_more_data');
 }

@@ -13,6 +13,7 @@ This module owns the platform's asynchronous consult primitive — patient-initi
 2. **`/v1/async-consults` (Sprint 10 canonical surface; PR 6).** The P-038 canonical entity chain (migrations 055 roles → 056 entities → 057 caller-class views → 058 raw lifecycle writer → 059 SECDEF wrappers → 061 app-role bridge (060 = pharmacy refill entities, merged first)). Six core endpoints per OpenAPI v0.4: initiate / intake / queue / get / claim / decision — all under the canonical composition (withIdempotentExecution or withTransaction → withTenantContext → withActorContext → withDbRole(`async_consult_*` slice role) → SQL → same-tx `async_consult.*` audit emission per AUDIT_EVENTS v5.11 under the restored app role), 42501 → tenant-blind 403 (I-025), Idempotency-Key on all POSTs (IDEMPOTENCY v5.1).
 
 **v1-surface hardening still open (why `/ready` stays 503):**
+
 - Delegate-initiated flows fail closed (403 + documented TODO in `initiate-consult-v1.ts`) pending a delegate-principal binding primitive from the Consent slice. The read path DOES honor delegates (the migration 057 patient-view predicate authorizes active `book_consults` delegations).
 - ~~`record_consult_ai_preparation_completed` (migration 059 §3) is not exposed — wrapper EXECUTE is owner-only until the AI-service slice role is wired.~~ **CLOSED (migration 064):** POST `/v1/async-consults/:consult_id/ai-preparation` (OpenAPI v0.4 endpoint #4) is live under the `ai_service` caller class — `ai_service_account` slice role + wrapper EXECUTE + app-role bridge + SI-010 actor-enum widening shipped with the handler (`internal/handlers/ai-preparation-v1.ts`) and Cat C `ai_preparation_started`/`_completed` audits. The in-process Mode 1 preparation pipeline (LLM → summary → app-side envelope encryption → this recording surface) remains a hardening follow-on until a real LLM provider replaces NullLLMProvider.
 - `reassign_consult_claim` (migration 059 §5) is not exposed — admin surface; lands with the admin-backend follow-on PR.
@@ -44,27 +45,27 @@ async-consult/
 
 ## Routes (under `/v0/async-consult`)
 
-| Method | Path | Handler | Description |
-|---|---|---|---|
-| GET | `/health` | inline | liveness probe |
-| GET | `/ready` | inline | readiness probe |
-| POST | `/` | `initiateConsultHandler` | patient initiates a new consult (idempotency-protected) |
-| POST | `/:id/submit` | `submitConsultHandler` | patient submits the intake (idempotency-protected) |
-| POST | `/:id/abandon` | `abandonConsultHandler` | patient abandons an in-progress consult (idempotency-protected) |
-| POST | `/:id/resume` | `resumeConsultHandler` | patient resumes an abandoned consult before expiry (idempotency-protected) |
-| POST | `/:id/patient-responds` | `patientRespondsConsultHandler` | patient responds to clinician request for additional data (idempotency-protected) |
-| GET | `/:id/events` | `listConsultEventsHandler` | list lifecycle events for a consult |
+| Method | Path                    | Handler                         | Description                                                                       |
+| ------ | ----------------------- | ------------------------------- | --------------------------------------------------------------------------------- |
+| GET    | `/health`               | inline                          | liveness probe                                                                    |
+| GET    | `/ready`                | inline                          | readiness probe                                                                   |
+| POST   | `/`                     | `initiateConsultHandler`        | patient initiates a new consult (idempotency-protected)                           |
+| POST   | `/:id/submit`           | `submitConsultHandler`          | patient submits the intake (idempotency-protected)                                |
+| POST   | `/:id/abandon`          | `abandonConsultHandler`         | patient abandons an in-progress consult (idempotency-protected)                   |
+| POST   | `/:id/resume`           | `resumeConsultHandler`          | patient resumes an abandoned consult before expiry (idempotency-protected)        |
+| POST   | `/:id/patient-responds` | `patientRespondsConsultHandler` | patient responds to clinician request for additional data (idempotency-protected) |
+| GET    | `/:id/events`           | `listConsultEventsHandler`      | list lifecycle events for a consult                                               |
 
 ## Routes (under `/v1/async-consults` — Sprint 10 canonical surface, PR 6)
 
-| Method | Path | Handler | Description |
-|---|---|---|---|
-| POST | `/` | `initiateConsultV1Handler` | patient initiates a consult (`record_consult_initiation`; Cat C `async_consult.initiated`) |
-| POST | `/:consult_id/intake` | `submitIntakeV1Handler` | intake submission with pre-encrypted KMS envelope (`record_consult_intake_submission`; Cat C `async_consult.intake_submitted`) |
-| GET | `/queue` | `getQueueV1Handler` | staff review queue from `async_consult_staff_summary_v` (paginated; staff callers only) |
-| GET | `/:consult_id` | `getConsultV1Handler` | caller-class-routed read (patient/delegate → patient view; staff → staff view; tenant-blind 404) |
-| POST | `/:consult_id/claim` | `claimConsultV1Handler` | clinician claim (`claim_consult_for_review`; 55006 → 409 `claim_already_held`; Cat B auto-release + Cat C `async_consult.case_claimed`) |
-| POST | `/:consult_id/decision` | `recordDecisionV1Handler` | clinician decision (`record_consult_clinician_decision`; Cat A `async_consult.clinician_decision_recorded` [+ `prescribing_recorded` / `rationale_disagreement` per decision shape]) |
+| Method | Path                    | Handler                    | Description                                                                                                                                                                          |
+| ------ | ----------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| POST   | `/`                     | `initiateConsultV1Handler` | patient initiates a consult (`record_consult_initiation`; Cat C `async_consult.initiated`)                                                                                           |
+| POST   | `/:consult_id/intake`   | `submitIntakeV1Handler`    | intake submission with pre-encrypted KMS envelope (`record_consult_intake_submission`; Cat C `async_consult.intake_submitted`)                                                       |
+| GET    | `/queue`                | `getQueueV1Handler`        | staff review queue from `async_consult_staff_summary_v` (paginated; staff callers only)                                                                                              |
+| GET    | `/:consult_id`          | `getConsultV1Handler`      | caller-class-routed read (patient/delegate → patient view; staff → staff view; tenant-blind 404)                                                                                     |
+| POST   | `/:consult_id/claim`    | `claimConsultV1Handler`    | clinician claim (`claim_consult_for_review`; 55006 → 409 `claim_already_held`; Cat B auto-release + Cat C `async_consult.case_claimed`)                                              |
+| POST   | `/:consult_id/decision` | `recordDecisionV1Handler`  | clinician decision (`record_consult_clinician_decision`; Cat A `async_consult.clinician_decision_recorded` [+ `prescribing_recorded` / `rationale_disagreement` per decision shape]) |
 
 ## State vocabulary (17 canonical states from State Machines v1.1 §3)
 
@@ -75,6 +76,7 @@ DECLINED, REFERRED, FOLLOW_UP, COMPLETED, EXPIRED, CLOSED
 ```
 
 Per CLAUDE.md hard rule "Slice PRD vs State Machines v1.1 → State Machines wins", the canonical inventory is 17 states (not the 16 listed in PRD v1.0 §12). Differences:
+
 - PRD §12 had `DECISION_MADE`; State Machines §3 absorbs into UNDER_REVIEW branch points
 - State Machines §3 adds `EXPIRED` (`ABANDONED → expire → 14d → EXPIRED`)
 - State Machines §3 adds `CLOSED` (`AWAITING_DATA → timeout → 14d → CLOSED`)
@@ -82,6 +84,7 @@ Per CLAUDE.md hard rule "Slice PRD vs State Machines v1.1 → State Machines win
 ## Schema
 
 Owned migrations:
+
 - `migrations/020_async_consult.sql` — `consults` + `consult_events` (composite UNIQUE on self for `consult_events` FK; composite FK to `accounts` + `forms_submission`)
 - `migrations/021_async_consult_tenant_boundary_constraints.sql` — Codex-driven fix-forward for cross-tenant boundary constraints (idempotent ALTERs covering the upgraded-DB path)
 
@@ -89,15 +92,15 @@ Composite UNIQUE + composite FK pattern per PROJECT_CONVENTIONS r5 §1.1.
 
 ## Cross-slice dependency posture
 
-| Dependency | Status | Notes |
-|---|---|---|
-| Identity & Auth | ✅ wired | actor context for clinician + patient |
-| Forms/Intake Engine | ✅ wired | intake form rendering + submission |
-| Consent & Delegation | ✅ wired | delegate context + scope-grant matrix |
-| AI Clinical Assistant Mode 2 | ⏳ deferred | awaits AI Service slice authoring |
-| Med Interaction Engine | ⏳ DB-layer in progress | spec RATIFIED (SI-019 v2.0 P-033 + CDM v1.6→v1.7 P-034 2026-05-21); awaits Med-Interaction handler implementation (PR 1 of ~6 — RBAC roles shipped; entities + views + raw writer + wrappers + Fastify handlers pending) |
-| Pharmacy + Refill | ⛔ BLOCKED | SI-001 (MedicationRequest schema gap) |
-| Subscription | ⛔ BLOCKED | SI-001 |
+| Dependency                   | Status                  | Notes                                                                                                                                                                                                                    |
+| ---------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Identity & Auth              | ✅ wired                | actor context for clinician + patient                                                                                                                                                                                    |
+| Forms/Intake Engine          | ✅ wired                | intake form rendering + submission                                                                                                                                                                                       |
+| Consent & Delegation         | ✅ wired                | delegate context + scope-grant matrix                                                                                                                                                                                    |
+| AI Clinical Assistant Mode 2 | ⏳ deferred             | awaits AI Service slice authoring                                                                                                                                                                                        |
+| Med Interaction Engine       | ⏳ DB-layer in progress | spec RATIFIED (SI-019 v2.0 P-033 + CDM v1.6→v1.7 P-034 2026-05-21); awaits Med-Interaction handler implementation (PR 1 of ~6 — RBAC roles shipped; entities + views + raw writer + wrappers + Fastify handlers pending) |
+| Pharmacy + Refill            | ⛔ BLOCKED              | SI-001 (MedicationRequest schema gap)                                                                                                                                                                                    |
+| Subscription                 | ⛔ BLOCKED              | SI-001                                                                                                                                                                                                                   |
 
 ## Integration test coverage
 
