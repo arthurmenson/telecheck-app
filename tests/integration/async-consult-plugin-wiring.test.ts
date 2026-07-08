@@ -67,29 +67,32 @@ describe('async-consult slice — §1 plugin wiring', () => {
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('async-consult');
-    expect(body.blocked).toContain('Async Consult slice hardening');
-    expect(body.blocked).toContain('Sprint 10 PR 6');
+    // Post-/ready-flip: blocked is null (no build-gated blocker); the
+    // message documents the dual surface incl. the v1 endpoint set.
+    expect(body.blocked).toBeNull();
     expect(body.blocked_message).toContain('/v1/async-consults');
-    expect(body.blocked_message).toContain('migrations 055-060');
+    expect(body.blocked_message).toContain('migrations 055-065');
   });
 
-  it('§1b GET /v0/async-consult/ready returns 503 (not ready for traffic) while v1-surface hardening is open', async () => {
+  it('§1b GET /v0/async-consult/ready returns 200 READY with the spec-gated gap inventory', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v0/async-consult/ready',
       headers: { host: 'localhost' },
     });
-    expect(r.statusCode).toBe(503);
+    expect(r.statusCode).toBe(200);
     const body = r.json<{
       status: string;
       module: string;
-      blocked: string;
-      blocked_message: string;
+      spec_gated_gaps: string[];
     }>();
-    expect(body.status).toBe('not_ready');
+    expect(body.status).toBe('ready');
     expect(body.module).toBe('async-consult');
-    expect(body.blocked).toContain('Async Consult slice hardening');
-    expect(body.blocked_message).toContain('not ready to serve production traffic');
+    // The gate flipped because the remaining gaps are SPEC-gated (need
+    // SIs / the Consent primitive), not build-gated — and each fails
+    // closed at its boundary. The inventory is the honest-status surface.
+    expect(body.spec_gated_gaps).toContain('intake_abandon_needs_wrapper_si');
+    expect(body.spec_gated_gaps).toContain('claim_reassignment_needs_endpoint_si');
   });
 
   it('§1c the Sprint 10 /v1/async-consults surface is mounted (all 6 core routes registered)', () => {
