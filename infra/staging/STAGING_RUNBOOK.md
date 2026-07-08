@@ -95,3 +95,25 @@ pre-go-live task), SIEM shipping (pino stdout + `docker logs` suffice).
 Same image → ECR; `db` service → RDS PostgreSQL 16 (apply-migrations.sh
 against the RDS URL); `redis` → ElastiCache; `caddy` → ALB + ACM; env file
 → Secrets Manager. The compose file is the checklist.
+
+## Patient app (Track 4) static hosting
+
+The Expo web export of `telecheck-patient-app` is served by the same Caddy
+at `https://patient.87.99.159.214.sslip.io` (override via
+`PATIENT_APP_DOMAIN` in `.env`). **Mock-backed at this stage** — the app's
+`TelecheckApi` interface is satisfied by its bundled mock layer; wiring the
+real HTTP client against `/v1/*` is the recorded Track-4 follow-on.
+
+Deploy/update the bundle (from the workspace root on a dev machine):
+
+```bash
+cd telecheck-patient-app
+npx expo export --platform web            # → dist/
+ssh root@87.99.159.214 "mkdir -p /home/deploy/patient-app-web"
+scp -r dist/* root@87.99.159.214:/home/deploy/patient-app-web/
+ssh root@87.99.159.214 "cd /home/deploy/telecheck-app && \
+  docker compose -f infra/staging/docker-compose.yml --env-file infra/staging/.env up -d caddy"
+```
+
+Caddy picks up the new files immediately (static file_server); the
+`up -d caddy` is only needed when the compose/Caddyfile config changed.
