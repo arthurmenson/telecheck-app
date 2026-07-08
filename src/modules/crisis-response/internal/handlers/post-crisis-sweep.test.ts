@@ -172,7 +172,7 @@ function makeReply(): FastifyReply {
 /**
  * Pre-fetch result + wrapper result helpers — the handler issues two
  * `tx.query` calls in order: (1) staff-view pre-fetch returns
- * `{ patient_id }`, (2) wrapper SELECT returns
+ * `{ patient_account_id }`, (2) wrapper SELECT returns
  * `{ sweep_execution_id, fencing_token, outcome }`.
  */
 function queueQueryResults(
@@ -217,7 +217,7 @@ describe('postCrisisSweepHandler §1 — happy path completed_escalated', () => 
   it('§1a composes tx → tenant → actor → role + pre-fetch + wrapper + audit; returns 200', async () => {
     const tx = makeFakeTx();
     queueQueryResults(tx, [
-      { rows: [{ patient_id: VALID_PATIENT_UUID }], rowCount: 1 },
+      { rows: [{ patient_account_id: VALID_PATIENT_UUID }], rowCount: 1 },
       {
         rows: [
           {
@@ -429,7 +429,7 @@ describe('postCrisisSweepHandler §5 — body validation precedes tx', () => {
   it('§5x accepts body without claim_ttl_seconds (optional → defaults to 60)', async () => {
     const tx = makeFakeTx();
     queueQueryResults(tx, [
-      { rows: [{ patient_id: VALID_PATIENT_UUID }], rowCount: 1 },
+      { rows: [{ patient_account_id: VALID_PATIENT_UUID }], rowCount: 1 },
       {
         rows: [
           {
@@ -500,7 +500,7 @@ describe('postCrisisSweepHandler §7 — 42501 → tenant-blind 403', () => {
   it('§7b wrapper-SELECT 42501 → 403 via httpErrors.forbidden; audit NOT emitted', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
-    queueQueryResults(tx, [{ rows: [{ patient_id: VALID_PATIENT_UUID }], rowCount: 1 }]);
+    queueQueryResults(tx, [{ rows: [{ patient_account_id: VALID_PATIENT_UUID }], rowCount: 1 }]);
     const pgErr = Object.assign(new Error('insufficient_privilege'), { code: '42501' });
     tx.query.mockImplementationOnce(async () => {
       throw pgErr;
@@ -520,7 +520,7 @@ describe('postCrisisSweepHandler §7 — 42501 → tenant-blind 403', () => {
 describe('postCrisisSweepHandler §8 — outer SQLSTATE → tenant-blind envelopes', () => {
   function setupAndThrow(code: string): { tx: FakeTx; reply: FastifyReply } {
     const tx = makeFakeTx();
-    queueQueryResults(tx, [{ rows: [{ patient_id: VALID_PATIENT_UUID }], rowCount: 1 }]);
+    queueQueryResults(tx, [{ rows: [{ patient_account_id: VALID_PATIENT_UUID }], rowCount: 1 }]);
     installDefaultCompositionMocks(tx);
     const pgErr = Object.assign(new Error(`pg ${code}`), { code });
     tx.query.mockImplementationOnce(async () => {
@@ -608,7 +608,7 @@ describe('postCrisisSweepHandler §9 — non-escalation outcomes skip audit', ()
     it(`§9 outcome=${outcome} → 200 but audit NOT emitted (I-003 hash-chain)`, async () => {
       const tx = makeFakeTx();
       queueQueryResults(tx, [
-        { rows: [{ patient_id: VALID_PATIENT_UUID }], rowCount: 1 },
+        { rows: [{ patient_account_id: VALID_PATIENT_UUID }], rowCount: 1 },
         {
           rows: [
             {
@@ -640,7 +640,7 @@ describe('postCrisisSweepHandler §10 — audit-emit failure propagates per I-00
   it('§10a audit emitter throws → handler re-throws; surrounding tx rolls back atomically', async () => {
     const tx = makeFakeTx();
     queueQueryResults(tx, [
-      { rows: [{ patient_id: VALID_PATIENT_UUID }], rowCount: 1 },
+      { rows: [{ patient_account_id: VALID_PATIENT_UUID }], rowCount: 1 },
       {
         rows: [
           {
@@ -672,7 +672,7 @@ describe('postCrisisSweepHandler §11 — actorNonce undefined path', () => {
   it('§11a actorNonce undefined → withActorContext NOT invoked; pre-fetch + wrapper still run', async () => {
     const tx = makeFakeTx();
     queueQueryResults(tx, [
-      { rows: [{ patient_id: VALID_PATIENT_UUID }], rowCount: 1 },
+      { rows: [{ patient_account_id: VALID_PATIENT_UUID }], rowCount: 1 },
       {
         rows: [
           {
@@ -702,7 +702,7 @@ describe('postCrisisSweepHandler §12 — fencing_token echo (not wrapper input)
   it('§12a body fencing_token NOT included in wrapper SQL params; wrapper-returned fencing IS in audit + view', async () => {
     const tx = makeFakeTx();
     queueQueryResults(tx, [
-      { rows: [{ patient_id: VALID_PATIENT_UUID }], rowCount: 1 },
+      { rows: [{ patient_account_id: VALID_PATIENT_UUID }], rowCount: 1 },
       {
         rows: [
           {

@@ -72,15 +72,31 @@ type means downstream consumers see the canonical shape from day one
 identified in the spec corpus; owner + ratification date to be assigned
 by Evans).
 
-## /ready stays 503 — explicit non-ready signal
+## /ready — flipped 503 → 200 at Sprint 4 close (2026-07-08)
 
-Per Codex Pass-2 synthesis safeguard: the crisis-response slice's
-`GET /v0/crisis-events/ready` returns **503 Service Unavailable** while
-this PR is the latest landed work. Operators reading the readiness probe
-will see the honest "BLOCKED — Sprint 2 partial; full audit emission +
-KMS envelope + crisis-detection-protocol wiring lands Sprint 4" signal
-until both followups above land + the rest of the Sprint 2 cascade
-completes.
+Historical: per Codex Pass-2 synthesis safeguard at PR #201 time, the
+crisis-response slice's `GET /v0/crisis-events/ready` returned **503
+Service Unavailable** while the Sprint 2 cascade + Sprint 4 hardening
+were open.
+
+**Sprint 4 (feat/crisis-response-sprint4) closed the build-gated list**
+— KMS envelope wire surface (pre-encrypted 8-field posture per
+ADR-021/ADR-024), live-PG cross-tenant integration suite, patient-summary
+route-mount fix, sweep pre-fetch 42703 fix — and flipped /ready to
+**200 + machine-readable `spec_gated_gaps`** per the PR #254 readiness
+contract ("ready" = traffic-acceptable for the implemented surface;
+spec-gated gaps that fail closed do not hold the gate; pharmacy +
+async-consult precedent).
+
+Gap-by-gap flip rationale (every remaining gap is spec-gated AND fails
+closed or fail-conservative):
+
+| spec_gated_gaps entry | Followup | Failure direction |
+|---|---|---|
+| `lifecycle_audit_dedupe_ttl_long_tail_needs_schema_si` | Followup 1 above | Fail-CONSERVATIVE: a >30-day replay through a NEW Idempotency-Key re-emits the append-only Cat A audit row — over-emission, never suppression, never access. Not a deferred-PERMISSIVE item (the PR #262 counter-example class does not apply). |
+| `crisis_initiator_identity_expansion_needs_phase_a_si` | Followup 2 above | Fails CLOSED: on_call_clinician / ai_mode1_service initiations 403 at Layer B until the Phase A successor SI lands. |
+| `sweep_scheduler_jwt_identity_needs_phase_a_si` | Same Phase A successor | Fails CLOSED: sweep gate is the closest-available admin gate (tenant_admin/platform_admin) + deploy-time network ACL; patient/clinician tokens 403. |
+| `app_side_kms_envelope_encryption_todo` | Standing platform-wide Track-5 TODO | Fails CLOSED: partial/malformed envelopes 400 at the boundary; absent envelope stores NULL columns (all-or-none CHECK). Same posture async-consult shipped /ready 200 with. |
 
 ## Ratifier decision provenance
 
