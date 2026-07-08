@@ -2,7 +2,7 @@
  * override-signal.ts — POST /v0/med-interaction/signals/:id/override
  *
  * **OPERATIONAL since migration 070** (the evidence-unlock migration that
- * executed migration 050 §6's own fail-closed closure prescription). The
+ * executed migration 050 §6's own fail-closed closure directive). The
  * v0.1 fail-closed scaffold (wrapper RAISE 0A000 → 503) is retired; this
  * handler now records real clinician overrides through the SECDEF wrapper
  * `record_interaction_signal_override` (migration 070 §1).

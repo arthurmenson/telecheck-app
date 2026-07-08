@@ -6,7 +6,7 @@
  * (GET /signals/:id), PR 8's 3 write handlers (POST /evaluations +
  * POST /signals + POST /signals/:id/activate), PR 9's supersede, and —
  * since migration 070 executed migration 050 §6's own fail-closed
- * closure prescription — POST /signals/:id/override is OPERATIONAL
+ * closure directive — POST /signals/:id/override is OPERATIONAL
  * (SI-019 §6.NEW7 STEP 3 + STEP 4 evidence checks live). POST
  * /signals/:id/{resolve, expire} remain FAIL-CLOSED at the wrapper
  * layer with precisely-narrowed deferrals (see migration 070 header +
@@ -37,7 +37,7 @@
  *     + activation + supersession; 3 fail-closed: resolution + expiry +
  *     override pending evidence-source migrations) (3 Codex rounds)
  *   - migration 070: override wrapper OPERATIONAL — executes 050 §6's
- *     closure prescription (STEP 3 medication-still-on-active-list +
+ *     closure directive (STEP 3 medication-still-on-active-list +
  *     STEP 4 SI-010-realized LAYER B; INSERT + raw-writer call re-enabled)
  *
  * Mounted endpoint surface (PRs 7-9 + evidence-unlock; /v0/med-interaction):
@@ -101,7 +101,7 @@ export const registerMedInteractionRoutes: FastifyPluginAsync = async (
       '+ AUDIT_EVENTS v5.8 → v5.9 + OpenAPI v0.2 → v0.3 + State Machines v1.1 → v1.2 ' +
       '+ RBAC v1.1 → v1.2 RATIFIED P-034. DB layer COMPLETE through migration 070 ' +
       "(the evidence-unlock migration executing migration 050 §6's own fail-closed " +
-      'closure prescription). Endpoint surface (PRs 7-9): GET /signals/:id (SECDEF ' +
+      'closure directive). Endpoint surface (PRs 7-9): GET /signals/:id (SECDEF ' +
       'access function, migration 048) + POST /evaluations + POST /signals + POST ' +
       '/signals/:id/activate + POST /signals/:id/supersede (OPERATIONAL, migration ' +
       '050 §3) + POST /signals/:id/override (OPERATIONAL since migration 070 — ' +

@@ -362,6 +362,16 @@ GRANT SELECT ON interaction_engine_evaluation   TO override_wrapper_owner;
 GRANT SELECT ON medication_requests             TO override_wrapper_owner;
 GRANT SELECT ON accounts                        TO override_wrapper_owner;
 
+-- Latent live-PG grant fix (surfaced by this PR's live-PostgreSQL
+-- integration pass — the first to exercise the operational wrappers):
+-- migration 050 §1's record_signal_emission evidence check
+-- (`SELECT 1 FROM interaction_signal WHERE tenant_id=... AND id=...`)
+-- executes as emission_wrapper_owner, but neither 047 §2 nor 050 §1
+-- granted that owner SELECT on interaction_signal — every live emission
+-- would fail 42501 inside the SECDEF body. Same grant class 050 §2/§3/§5
+-- gave the other wrapper owners for their evidence reads.
+GRANT SELECT ON interaction_signal              TO emission_wrapper_owner;
+
 -- =============================================================================
 -- §3 — Verification: operational body + ownership + SECDEF + grant matrix
 -- =============================================================================
@@ -429,6 +439,9 @@ BEGIN
         AND has_table_privilege('override_wrapper_owner', 'public.interaction_signal_override', 'INSERT')
     ) THEN
         RAISE EXCEPTION 'migration-070-evidence-grant-missing: override_wrapper_owner lacks a required table privilege';
+    END IF;
+    IF NOT has_table_privilege('emission_wrapper_owner', 'public.interaction_signal', 'SELECT') THEN
+        RAISE EXCEPTION 'migration-070-emission-grant-missing: emission_wrapper_owner lacks SELECT on interaction_signal (050 §1 evidence-check read)';
     END IF;
 
     -- Negative space: the unlock grants read surfaces to the WRAPPER OWNER

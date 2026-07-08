@@ -124,3 +124,4 @@ REVOKE SELECT ON interaction_signal            FROM override_wrapper_owner;
 REVOKE SELECT ON interaction_engine_evaluation FROM override_wrapper_owner;
 REVOKE SELECT ON medication_requests           FROM override_wrapper_owner;
 REVOKE SELECT ON accounts                      FROM override_wrapper_owner;
+REVOKE SELECT ON interaction_signal            FROM emission_wrapper_owner;

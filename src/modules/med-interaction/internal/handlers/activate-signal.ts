@@ -192,6 +192,7 @@ export async function activateSignalHandler(
     const activatedAt = new Date();
 
     const callWrappers = async (): Promise<void> => {
+      let derivedPatientIdForAudit = '';
       try {
         await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
           // §1 — Call the SECDEF wrapper to perform the activation.
@@ -238,29 +239,38 @@ export async function activateSignalHandler(
           if (typeof derivedPatientId !== 'string' || derivedPatientId.length === 0) {
             throw req.server.httpErrors.notFound('Interaction signal not found.');
           }
-
-          // §3 — Cat A audit `interaction_signal_lifecycle_transition_emitted`
-          // in the SAME tx. Per Option A (SI-019 Sub-decision 3 item 5
-          // 2026-05-20), every INSERT into
-          // interaction_signal_lifecycle_transition emits this audit
-          // event (subscribed by the projection refresher + patient-
-          // facing lifecycle-change push surfaces).
-          await emitSignalLifecycleTransitionAudit(
-            {
-              tenantId: ctx.tenantId,
-              signalId,
-              transitionId,
-              patientId: derivedPatientId,
-              actorId,
-              actorTenantId,
-              countryOfCare: ctx.countryOfCare,
-              fromState: 'emitted',
-              toState: 'active',
-              transitionReason: 'activation',
-            },
-            tx,
-          );
+          derivedPatientIdForAudit = derivedPatientId;
         });
+
+        // §3 — Cat A audit `interaction_signal_lifecycle_transition_emitted`
+        // in the SAME tx, AFTER the withDbRole block returns. Per Option A
+        // (SI-019 Sub-decision 3 item 5 2026-05-20), every INSERT into
+        // interaction_signal_lifecycle_transition emits this audit event
+        // (subscribed by the projection refresher + patient-facing
+        // lifecycle-change push surfaces).
+        //
+        // Evidence-unlock PR live-PG fix: the audit INSERT must NOT run
+        // under the elevated slice role — medication_interaction_engine_
+        // evaluator has no audit_records privileges, so emitting inside
+        // the elevated callback raised 42501 → 403 on live PostgreSQL.
+        // withDbRole restores the prior session role on return, so this
+        // runs as the app role in the SAME transaction — atomicity is
+        // unchanged. Mirrors the async-consult precedent.
+        await emitSignalLifecycleTransitionAudit(
+          {
+            tenantId: ctx.tenantId,
+            signalId,
+            transitionId,
+            patientId: derivedPatientIdForAudit,
+            actorId,
+            actorTenantId,
+            countryOfCare: ctx.countryOfCare,
+            fromState: 'emitted',
+            toState: 'active',
+            transitionReason: 'activation',
+          },
+          tx,
+        );
       } catch (err) {
         if (typeof err === 'object' && err !== null && 'code' in err) {
           const code = (err as { code?: unknown }).code;

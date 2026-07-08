@@ -359,6 +359,23 @@ beforeAll(async () => {
   const patientId = await seedAccount('patient', T_US);
   const clinicianId = await seedAccount('clinician', T_US);
   const ghClinicianId = await seedAccount('clinician', T_GH);
+  // The migration 070 §1 STEP 4 DB-layer clinician check requires a LIVE
+  // clinician account (status='active'); createAccount seeds
+  // 'pending_verification' (OTP flow flips it in production). Activate the
+  // seeded clinicians directly (test-fixture shortcut; accounts.status is
+  // mutable by design — identity activateAccount precedent).
+  for (const [tid, accountId] of [
+    [T_US, clinicianId],
+    [T_GH, ghClinicianId],
+  ] as const) {
+    await withTenantContext(tid, async () => {
+      await getTestClient().query(
+        `UPDATE accounts SET status = 'active', activated_at = now()
+          WHERE tenant_id = $1 AND account_id = $2`,
+        [tid, accountId],
+      );
+    });
+  }
   patient = { accountId: patientId, token: mintToken(patientId, 'patient', T_US) };
   clinician = { accountId: clinicianId, token: mintToken(clinicianId, 'clinician', T_US) };
   ghClinician = {

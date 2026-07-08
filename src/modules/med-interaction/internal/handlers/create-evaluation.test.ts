@@ -12,7 +12,9 @@
  *   §3 Canonical composition order — withIdempotentExecution opens the
  *      tx; inner chain is withTenantContext → withActorContext (when
  *      nonce bound) → withDbRole('medication_interaction_engine_evaluator').
- *   §4 INSERT SQL + audit emission BOTH issued inside the withDbRole
+ *   §4 INSERT SQL under the role elevation + audit emission in the SAME
+ *      tx AFTER the withDbRole block (slice roles have no audit_records
+ *      privileges — evidence-unlock PR live-PG fix)
  *      callback (atomicity per Option 2 carryforward).
  *   §5 42501 → tenant-blind 403 mapping (I-025) — both the SET LOCAL ROLE
  *      path AND the inner INSERT's RLS denial path.
@@ -334,7 +336,8 @@ describe('createEvaluationHandler §3 — canonical composition', () => {
 });
 
 // ===========================================================================
-// §4 — INSERT + audit BOTH inside withDbRole (atomicity)
+// §4 — INSERT under role elevation + audit in the same tx (atomicity;
+// audit emission runs AFTER the withDbRole block per the live-PG fix)
 // ===========================================================================
 
 describe('createEvaluationHandler §4 — INSERT + audit same-tx', () => {
