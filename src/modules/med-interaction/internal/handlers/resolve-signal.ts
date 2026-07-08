@@ -4,19 +4,32 @@
  * **PR scope:** Sprint 1 PR 9. Calls SECDEF wrapper
  * `record_signal_resolution` from migration 050 §4.
  *
- * **Fail-closed posture (v0.1):** the wrapper RAISES SQLSTATE `0A000`
- * pending the Async Consult discontinuation-event log migration. Per
- * the GRANT matrix in migration 050 §4 the wrapper has NO app-role
- * EXECUTE grant (only the owner can EXECUTE — "DEFERRED: role exists
- * only after Async Consult subscriber registry lands"). The handler
- * call therefore fails at the PG EXECUTE check with 42501 BEFORE the
- * wrapper body's 0A000 — both paths converge to a 503 tenant-blind
- * response per the mapper below.
+ * **Fail-closed posture (STANDS after the migration 070 evidence-unlock
+ * pass).** The precisely-narrowed remaining deferral (migration 070
+ * header): of SI-019 §6.NEW5's 3 evidence checks, check (1)'s source NOW
+ * EXISTS (`medication_request.discontinued.v1` rows in
+ * domain_events_outbox, emitted by Pharmacy since TLC-055) — but the
+ * wrapper stays fail-closed because (i) check (3)'s protocol-specific
+ * washout-period configuration has no code-repo source, (ii) the app-role
+ * caller `medication_interaction_resolution_subscriber` is still not
+ * created (migration 055 §0 declined; Async Consult domain-event
+ * subscriber registry absent) so the wrapper has NO app-role EXECUTE
+ * grant, and (iii) the wrapper's p_discontinuation_event_id VARCHAR(26)
+ * must be reconciled with the outbox's UUID event_id (migration 004
+ * recorded SPEC ISSUE). The handler call therefore fails at the PG
+ * EXECUTE check with 42501 BEFORE the wrapper body's 0A000 — both paths
+ * converge to a 503 tenant-blind response per the mapper below.
  *
- * **Cat A audit emission on REJECTION:** same I-003 pattern as
- * override-signal.ts — even rejection paths emit Cat A
- * `interaction_signal_lifecycle_transition_emitted` with rejection
- * reason captured in detail.
+ * **Cat A audit emission on REJECTION (savepoint-recovered):** I-003
+ * bare-suppression-forbidden — the rejected attempt belongs in the audit
+ * chain. On live PostgreSQL the failed wrapper call ABORTS the
+ * transaction, so the attempt is wrapped in a SAVEPOINT: on 42501/0A000
+ * the handler ROLLBACKs TO the savepoint, emits the rejection attestation
+ * in the recovered tx, and RETURNS the 503 envelope (not a throw — a
+ * throw would roll back the whole business tx and destroy the
+ * attestation). (The v0.1 scaffold emitted the audit directly into the
+ * aborted tx and re-threw — which on live PG would have surfaced 25P02 →
+ * 500 and persisted nothing; corrected in the evidence-unlock PR.)
  */
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
@@ -99,17 +112,26 @@ export async function resolveSignalHandler(
     return withTenantContext(tx, ctx.tenantId, async () => {
       const run = async (): Promise<{
         status: number;
-        view: { signal_id: string; status: 'resolved' };
+        view:
+          | { signal_id: string; status: 'resolved' }
+          | { error: { code: string; message: string; request_id: string } };
       }> => {
+        // SAVEPOINT around the wrapper attempt: a failed SQL statement
+        // aborts the tx on live PostgreSQL; the savepoint lets the handler
+        // recover the tx to emit the I-003 rejection attestation. The
+        // ROLLBACK TO also unwinds withDbRole's SET LOCAL ROLE, so the
+        // audit INSERT runs under the session app role.
         let rejected = false;
         let rejectionCode: string | undefined;
+        await tx.query('SAVEPOINT med_interaction_wrapper_attempt');
         try {
           // NOTE: app role for resolve has NO GRANT per migration 050 §4
           // (DEFERRED to medication_interaction_resolution_subscriber when
-          // Async Consult subscriber registry lands). v0.1 uses
-          // medication_interaction_engine_evaluator anyway since that's
-          // the closest-available app role; PG EXECUTE check fails with
-          // 42501 → mapped to 503 per mapServiceError.
+          // Async Consult subscriber registry lands — deferral restated in
+          // migration 070's header). Uses
+          // medication_interaction_engine_evaluator as the closest-available
+          // app role; the PG EXECUTE check fails with 42501 → converges to
+          // the same fail-closed 503 as the wrapper-body 0A000.
           await withDbRole(tx, 'medication_interaction_engine_evaluator', async () => {
             await tx.query('SELECT record_signal_resolution($1, $2, $3, $4, $5, $6::jsonb)', [
               transitionId,
@@ -120,7 +142,9 @@ export async function resolveSignalHandler(
               JSON.stringify(metadata),
             ]);
           });
+          await tx.query('RELEASE SAVEPOINT med_interaction_wrapper_attempt');
         } catch (err) {
+          await tx.query('ROLLBACK TO SAVEPOINT med_interaction_wrapper_attempt');
           if (typeof err === 'object' && err !== null && 'code' in err) {
             const code = (err as { code?: unknown }).code;
             if (code === '42501' || code === '0A000') {
@@ -154,9 +178,19 @@ export async function resolveSignalHandler(
         );
 
         if (rejected) {
-          throw Object.assign(new Error('resolution_capability_not_yet_available'), {
-            code: rejectionCode,
-          });
+          // RETURN (don't throw) so the recovered tx COMMITS the rejection
+          // attestation — I-003 bare-suppression-forbidden. Envelope shape
+          // matches the mapServiceError 42501/0A000 branch verbatim.
+          return {
+            status: 503,
+            view: {
+              error: {
+                code: 'med_interaction.resolution_capability_not_yet_available',
+                message: 'Signal resolution capability is not yet available in this deployment.',
+                request_id: req.id,
+              },
+            },
+          };
         }
 
         return { status: 201, view: { signal_id: signalId, status: 'resolved' } };

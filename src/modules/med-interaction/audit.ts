@@ -61,7 +61,8 @@
  *       — fires AFTER the SECDEF wrapper `record_signal_supersession`
  *         (migration 050 §3) returns, in the same transaction.
  *
- *     POST /v0/med-interaction/signals/:id/resolve (FAIL-CLOSED at v0.1):
+ *     POST /v0/med-interaction/signals/:id/resolve (FAIL-CLOSED — see
+ *     migration 070 header for the precisely-narrowed deferral):
  *       emits EXACTLY ONE audit event:
  *         1. interaction_signal_lifecycle_transition_emitted
  *            — operational path (when the wrapper unblocks):
@@ -69,10 +70,19 @@
  *            — rejection path (current fail-closed wrapper, 0A000/42501):
  *              (from_state='active', to_state='rejected',
  *               reason='resolve_rejected_{feature_not_supported|execute_not_granted}')
- *              emitted in the same tx as the failed wrapper call, then the
- *              error is re-thrown to the tenant-blind 503 mapper (I-025).
+ *              **Savepoint-recovered emission (evidence-unlock PR
+ *              hardening):** the failed wrapper call aborts the
+ *              transaction on live PostgreSQL, so the handler wraps the
+ *              wrapper attempt in a SAVEPOINT, ROLLBACKs TO it on the
+ *              fail-closed rejection, emits this attestation in the
+ *              recovered (healthy) tx, and RETURNS the 503 envelope
+ *              (rather than re-throwing — a re-throw would roll back the
+ *              whole tx and destroy the attestation; I-003
+ *              bare-suppression-forbidden requires the rejected attempt
+ *              to COMMIT into the audit chain).
  *
- *     POST /v0/med-interaction/signals/:id/expire (FAIL-CLOSED at v0.1):
+ *     POST /v0/med-interaction/signals/:id/expire (FAIL-CLOSED — see
+ *     migration 070 header for the precisely-narrowed deferral):
  *       emits EXACTLY ONE audit event:
  *         1. interaction_signal_lifecycle_transition_emitted
  *            — operational path:
@@ -80,25 +90,31 @@
  *            — rejection path (current fail-closed wrapper, 0A000):
  *              (from_state='active', to_state='rejected',
  *               reason='expire_rejected_feature_not_supported_cadence_config_missing')
+ *              Same savepoint-recovered emission pattern as resolve.
  *
- *     POST /v0/med-interaction/signals/:id/override (FAIL-CLOSED at v0.1):
- *       at v0.1 emits EXACTLY ONE audit event:
- *         1. interaction_signal_lifecycle_transition_emitted
- *            — operational path (once the wrapper unblocks):
- *              (from_state='active', to_state='overridden', reason='override')
- *            — rejection path (current fail-closed wrapper, 0A000):
- *              (from_state='active', to_state='rejected',
- *               reason='override_rejected_feature_not_supported_evidence_source_missing')
- *       — **forward contract:** when the override wrapper turns operational
- *         (KMS envelope wiring + SI-024.1 JWT-binding evidence source), the
- *         override handler becomes the ONLY handler that emits TWO audit
- *         events: the canonical `interaction_signal_override` attestation
- *         (AUDIT_EVENTS v5.3 line 151 event — NOT a placeholder) FIRST (it
- *         documents the cause), then the lifecycle transition (it documents
- *         the effect on the state machine). Both in the same tx. Until
- *         then, no interaction_signal_override row is inserted (the
- *         wrapper RAISEs 0A000 before any write), so only the rejection
- *         lifecycle attestation fires.
+ *     POST /v0/med-interaction/signals/:id/override (OPERATIONAL since
+ *     migration 070 — the 050 §6 evidence deferral is closed):
+ *       the ONLY handler that emits TWO audit events, per the forward
+ *       contract pinned at PR 9 (now ACTIVE):
+ *         1. interaction_signal_override — the canonical AUDIT_EVENTS
+ *            attestation (enumerated in src/lib/audit.ts; NOT a
+ *            placeholder cast) — FIRST (it documents the cause). Its
+ *            `override.rationale` field carries a KMS-envelope REFERENCE
+ *            (never plaintext — the rationale arrives pre-encrypted and
+ *            plaintext must not enter the append-only audit chain, per
+ *            the same posture as SI-019 R4 HIGH-2 plaintext-column
+ *            removal).
+ *         2. interaction_signal_lifecycle_transition_emitted
+ *            (from_state='active', to_state='overridden',
+ *            reason='override') — SECOND (it documents the effect on the
+ *            state machine). Both in the same tx as the wrapper call.
+ *       Wrapper REJECTIONS (42501 unauthorized_role / 55000
+ *       medication_not_on_list / 23514 signal_not_active / 02000 not
+ *       found) are absorbed AFTER the caller tx has rolled back, per the
+ *       ratified SI-019 Sub-decision 8 caller-transaction discipline —
+ *       no wrapper effect exists to attest, and the structured rejection
+ *       surfaces as the tenant-blind HTTP envelope (I-025). This is NOT
+ *       bare suppression: the rejection is surfaced, not swallowed.
  *
  *   Tests in the PR 8 + PR 9 series assert the exact emitter-function call
  *   sequence per handler (`auditCalls` mock log shape). Subsequent PRs
@@ -107,8 +123,9 @@
  *   between the rule and the tests is a defect.
  *
  * The `interaction_signal_override` action ID is already enumerated in the
- * canonical Category A audit catalog (`src/lib/audit.ts`) and is consumed by
- * the override handler when PR 10 lands. The 3 IDs above are NOT yet
+ * canonical Category A audit catalog (`src/lib/audit.ts`) and IS consumed by
+ * the operational override handler (evidence-unlock PR; migration 070) via
+ * `emitSignalOverrideRecordedAudit` below. The 3 IDs above are NOT yet
  * enumerated in the canonical catalog and are realized as placeholders via
  * the same sanctioned `as AuditAction` cast pattern used by consent/audit.ts
  * + identity/audit.ts + forms-intake/audit.ts. Spec ratification of these
@@ -193,6 +210,12 @@ interface MedInteractionAuditCommon {
   resource_type: string;
   resource_id: string;
   detail: Record<string, unknown>;
+  /**
+   * Canonical `override` envelope field — populated ONLY by the
+   * interaction_signal_override attestation (rationale is a KMS-envelope
+   * reference, never plaintext). All other emitters leave it absent → null.
+   */
+  override?: { signal_id: string; rationale: string; clinician_id: string };
 }
 
 function buildEnvelope(
@@ -230,7 +253,7 @@ function buildEnvelope(
     supervising_policy_id: null,
     knowledge_source_versions: null,
     signals: null,
-    override: null,
+    override: common.override ?? null,
     linked_events: [],
     compliance_flags: [],
     country_of_care: common.country_of_care,
@@ -381,6 +404,71 @@ export async function emitSignalEmittedAudit(
 //   v0.1 the fail-closed wrapper RAISEs 0A000 before any write, so only
 //   the rejection lifecycle attestation fires).
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Cat A — interaction_signal_override (canonical AUDIT_EVENTS action; NOT a
+// placeholder cast — enumerated in src/lib/audit.ts)
+//
+// Emitted by POST /v0/med-interaction/signals/:id/override on successful
+// return of the OPERATIONAL SECDEF wrapper `record_interaction_signal_override`
+// (migration 070 §1). FIRST event of the handler's two-event rule (see the
+// file-level CANONICAL LIFECYCLE AUDIT RULE): this event attests the
+// clinician's documented proceed-despite-signal decision (the CAUSE); the
+// paired `interaction_signal_lifecycle_transition_emitted`
+// (active → overridden / override) attests the state-machine EFFECT.
+//
+// **Rationale is NEVER plaintext here.** The override rationale arrives
+// pre-encrypted as the 8-field KMS envelope and is persisted envelope-only
+// (migration 047 §3 NOT NULL columns). The canonical envelope's
+// `override.rationale` string therefore carries a REFERENCE to the
+// evidence row holding the ciphertext, not the rationale text — putting
+// plaintext rationale in the append-only audit chain would defeat the
+// SI-019 R4 HIGH-2 plaintext-column removal.
+//
+// I-012 adjacency: the override is a clinician-confirmed action
+// (`action_with_confirm` posture) but is NOT one of the three I-012
+// action classes (prescribing / refill / medication_order) — it gates
+// them upstream via I-002. It carries the canonical `override` envelope
+// field instead of the I-012 ai_workload/autonomy pair (which stay null
+// per the buildEnvelope note above).
+// ---------------------------------------------------------------------------
+
+export async function emitSignalOverrideRecordedAudit(
+  args: {
+    tenantId: TenantId;
+    signalId: string;
+    overrideId: string;
+    clinicianAccountId: string;
+    actorTenantId: string;
+    patientId: string | null;
+    countryOfCare: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildEnvelope('interaction_signal_override', 'A', {
+      tenant_id: args.tenantId,
+      actor_type: 'clinician',
+      actor_id: args.clinicianAccountId,
+      actor_tenant_id: args.actorTenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'interaction_signal_override',
+      resource_id: args.overrideId,
+      detail: {
+        signal_id: args.signalId,
+        override_id: args.overrideId,
+        rationale_storage: 'kms_envelope',
+      },
+      override: {
+        signal_id: args.signalId,
+        rationale: `kms_envelope:interaction_signal_override/${args.overrideId}`,
+        clinician_id: args.clinicianAccountId,
+      },
+    }),
+    tx,
+  );
+}
 
 export async function emitSignalLifecycleTransitionAudit(
   args: {
