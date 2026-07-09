@@ -223,8 +223,8 @@ describe('with-db-role §4 — callback throw propagation + restore-on-throw', (
 });
 
 describe('with-db-role §5 — allowlist composition', () => {
-  it('SLICE_ROLES contains 7 Crisis + 2 Admin + 4 Med-Interaction + 5 Async-Consult + 2 AI-Service = 20 roles', () => {
-    expect(SLICE_ROLES).toHaveLength(20);
+  it('SLICE_ROLES contains 7 Crisis + 2 Admin + 4 Med-Interaction + 5 Async-Consult + 2 AI-Service + 4 Subscription = 24 roles', () => {
+    expect(SLICE_ROLES).toHaveLength(24);
     // Spot-check one from each slice
     expect(SLICE_ROLES).toContain('crisis_initiator');
     expect(SLICE_ROLES).toContain('admin_basic_operator');
@@ -240,6 +240,12 @@ describe('with-db-role §5 — allowlist composition', () => {
     // Mode 1 service writer (Mode 1 spec §5.1 Layer 1 RBAC R-3; migration
     // 068 role + INSERT/SELECT grants + bridge)
     expect(SLICE_ROLES).toContain('ai_service_mode1');
+    // Subscription slice (CDM v1.2 §4.7/§4.8; State Machines v1.1 §15;
+    // migration 075 roles + migration 077 bridge)
+    expect(SLICE_ROLES).toContain('subscription_patient_manager');
+    expect(SLICE_ROLES).toContain('subscription_clinician_reviewer');
+    expect(SLICE_ROLES).toContain('subscription_system_scheduler');
+    expect(SLICE_ROLES).toContain('subscription_staff_reader');
   });
 
   it('SLICE_ROLES does NOT contain wrapper-owner / view-owner / writer-owner roles', () => {
