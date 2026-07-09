@@ -171,7 +171,7 @@ export async function createPasscode(
     return passcode;
   };
   if (externalTx !== undefined) return runFn(externalTx);
-  return withTenantBoundConnection(input.tenant_id, (c) => runFn(c as DbTransaction));
+  return withTenantBoundConnection(input.tenant_id, runFn);
 }
 
 export async function consumePasscode(

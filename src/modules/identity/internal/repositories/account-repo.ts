@@ -190,6 +190,35 @@ export async function findAccountByPhoneE164(
 }
 
 // ---------------------------------------------------------------------------
+// findAccountByEmail — case-insensitive tenant-scoped email lookup
+// (email+PIN auth path, migration 078). Uniqueness index uq_account_tenant_email
+// is on (tenant_id, lower(email)); match lower() so lookups are case-blind.
+// ---------------------------------------------------------------------------
+
+export async function findAccountByEmail(
+  tenantId: TenantId,
+  email: string,
+  externalTx?: DbClient,
+): Promise<Account | null> {
+  const runner = externalTx
+    ? (fn: (client: DbClient) => Promise<Account | null>) => fn(externalTx)
+    : (fn: (client: DbClient) => Promise<Account | null>) =>
+        withTenantBoundConnection(tenantId, fn);
+  return runner(async (client) => {
+    const result = await client.query<AccountRow>(
+      `SELECT ${ACCOUNT_COLUMNS}
+         FROM accounts
+        WHERE tenant_id = $1
+          AND lower(email) = lower($2)
+          AND deleted_at IS NULL`,
+      [tenantId, email],
+    );
+    const row = result.rows[0];
+    return row === undefined ? null : rowToAccount(row);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // createAccount — INSERT a fresh account row (lifecycle = pending_verification)
 // ---------------------------------------------------------------------------
 

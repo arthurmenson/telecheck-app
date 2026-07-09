@@ -228,3 +228,11 @@ export async function findAccountByPhoneE164(
 ): Promise<Account | null> {
   return accountRepo.findAccountByPhoneE164(ctx.tenantId, phoneE164, externalTx);
 }
+
+export async function findAccountByEmail(
+  ctx: TenantContext,
+  email: string,
+  externalTx?: DbClient,
+): Promise<Account | null> {
+  return accountRepo.findAccountByEmail(ctx.tenantId, email, externalTx);
+}

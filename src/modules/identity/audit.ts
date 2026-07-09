@@ -440,7 +440,7 @@ export async function emitEmailPasscodeIssuedAudit(
   args: {
     tenantId: TenantId;
     passcodeId: string;
-    accountId: AccountId | null;
+    accountId: string | null;
     actorId: string;
     countryOfCare: string;
     purpose: string;
@@ -468,7 +468,7 @@ export async function emitEmailPasscodeConsumedAudit(
   args: {
     tenantId: TenantId;
     passcodeId: string;
-    accountId: AccountId | null;
+    accountId: string | null;
     actorId: string;
     countryOfCare: string;
     purpose: string;
