@@ -123,38 +123,34 @@ export async function emailRegistrationStartHandler(
     reply,
     mapServiceError,
     async (tx: DbTransaction) => {
-      // Codex HIGH fix: registration/start must NOT reveal whether the email
-      // is already registered. Previously it returned EMAIL_TAKEN (400) for
-      // existing emails vs 200 for new ones — a direct enumeration oracle.
-      // Now it ALWAYS returns the identical 200: a passcode is issued only for
-      // a genuinely-new email (an existing account gets none — they should
-      // sign in, told out-of-band by email). An attacker therefore cannot
-      // distinguish; and a verify attempt on an existing email finds no active
-      // registration passcode → the same PASSCODE_FAILED as a wrong code.
-      const existing = await accountService.findAccountByEmail(ctx, email, tx);
+      // registration/start reveals NOTHING about whether the email is already
+      // registered — not via the response (always 200), not via a passcode
+      // cooldown (swallowed), and not via TIMING (Codex round-6). It therefore
+      // does the SAME work for every email: it ALWAYS issues a registration
+      // passcode, WITHOUT first looking up the account. A passcode for an
+      // already-registered email is harmless — a verify attempt creates a NEW
+      // account which fails the unique index → the same PASSCODE_FAILED as a
+      // wrong code. (When real email delivery lands, an already-registered
+      // address should instead receive a "you already have an account, sign
+      // in" variant; the API response stays identical.)
       let devPasscode: string | undefined;
-      if (existing === null) {
-        try {
-          const { codePlaintext } = await passcodeService.issuePasscode(
-            ctx,
-            { actorId: 'system' },
-            { passcode_id: ulid(), account_id: null, email, purpose: 'email_registration' },
-            tx,
-          );
-          // Staging echoes the code as dev_passcode (AUTH_DEV_OTP_ECHO gate +
-          // production fail-fast, same as the OTP dev_otp echo) so the Track-4
-          // app can complete the flow without a real email provider.
-          if (config.authDevOtpEcho) devPasscode = codePlaintext;
-        } catch (err) {
-          // Codex HIGH (round 5): a passcode cooldown must NOT surface here.
-          // Only NEW emails reach issuePasscode, so a propagated
-          // PASSCODE_LOCKOUT_ACTIVE (→ 400) would let an attacker induce a
-          // cooldown and read 400=new vs 200=registered — an induced-lockout
-          // enumeration oracle. Swallow the cooldown and still return 200
-          // (mirrors recovery/start). Truly-unexpected errors still propagate.
-          if (!(err instanceof Error && err.message === passcodeService.PASSCODE_LOCKOUT_ACTIVE)) {
-            throw err;
-          }
+      try {
+        const { codePlaintext } = await passcodeService.issuePasscode(
+          ctx,
+          { actorId: 'system' },
+          { passcode_id: ulid(), account_id: null, email, purpose: 'email_registration' },
+          tx,
+        );
+        // Staging echoes the code as dev_passcode (AUTH_DEV_OTP_ECHO gate +
+        // production fail-fast, same as the OTP dev_otp echo) so the Track-4
+        // app can complete the flow without a real email provider.
+        if (config.authDevOtpEcho) devPasscode = codePlaintext;
+      } catch (err) {
+        // A passcode cooldown must NOT surface (it would be a 400 that
+        // distinguishes an email that recently requested a code). Swallow it
+        // and still return 200. Truly-unexpected errors still propagate.
+        if (!(err instanceof Error && err.message === passcodeService.PASSCODE_LOCKOUT_ACTIVE)) {
+          throw err;
         }
       }
       return {
@@ -340,64 +336,61 @@ export async function pinLoginHandler(req: FastifyRequest, reply: FastifyReply):
     reply,
     mapServiceError,
     async (tx: DbTransaction) => {
+      const invalid = {
+        status: 401,
+        view: makeErrorEnvelope(req.id, INVALID_CREDENTIALS, 'Invalid email or PIN.'),
+      };
+
       const account = await accountService.findAccountByEmail(ctx, email, tx);
-      if (account === null || account.status !== 'active') {
-        return {
-          status: 401,
-          view: makeErrorEnvelope(req.id, INVALID_CREDENTIALS, 'Invalid email or PIN.'),
-        };
-      }
-      const cred = await pinRepo.findByAccountId(ctx.tenantId, account.account_id, tx);
-      if (cred === null) {
-        return {
-          status: 401,
-          view: makeErrorEnvelope(req.id, INVALID_CREDENTIALS, 'Invalid email or PIN.'),
-        };
+      const cred =
+        account !== null && account.status === 'active'
+          ? await pinRepo.findByAccountId(ctx.tenantId, account.account_id, tx)
+          : null;
+
+      // Codex HIGH (round-6) work-factor timing oracle fix: EVERY /login/pin
+      // request performs exactly ONE scrypt derivation. When there is no
+      // active account / credential, burn an equivalent dummy derivation so
+      // response latency never reveals whether the email is registered. The
+      // real verify below is the other single-scrypt path.
+      if (account === null || cred === null) {
+        pinService.dummyVerify(pin);
+        return invalid;
       }
 
       const lockedUntil = cred.locked_until === null ? null : new Date(cred.locked_until);
-      if (pinService.isLockedOut({ failedAttempts: cred.failed_attempts, lockedUntil })) {
-        // Codex HIGH fix: lockout is enforced (we stop here, no verify/session),
-        // but the RESPONSE must be indistinguishable from wrong-PIN / unknown-
-        // email — a distinct `pin_locked` code let an attacker drive any email
-        // into lockout and then read the code to tell registered-active
-        // accounts from unknown ones (enumeration + lockout-DoS oracle). Return
-        // the identical INVALID_CREDENTIALS envelope; the lockout audit already
-        // captured the event internally.
-        return {
-          status: 401,
-          view: makeErrorEnvelope(req.id, INVALID_CREDENTIALS, 'Invalid email or PIN.'),
-        };
-      }
+      const locked = pinService.isLockedOut({ failedAttempts: cred.failed_attempts, lockedUntil });
+      // Always run the real scrypt (uniform timing, incl. the locked path).
+      const pinOk = pinService.verifyPin(pin, cred.pin_hash, cred.pin_salt);
 
-      if (!pinService.verifyPin(pin, cred.pin_hash, cred.pin_salt)) {
-        // Codex HIGH fix: account the failure with a single row-atomic SQL
-        // increment so N concurrent wrong-PIN attempts each count (Postgres
-        // row-locking serializes them) — the prior read-in-app / write-
-        // absolute path let parallel failures collapse into one.
-        const state = await pinRepo.recordFailureAtomic(
-          ctx.tenantId,
-          account.account_id,
-          pinService.MAX_PIN_ATTEMPTS,
-          pinService.PIN_LOCKOUT_MINUTES,
-          tx,
-        );
-        const lockedNow =
-          state.lockedUntil !== null && new Date(state.lockedUntil).getTime() > Date.now();
-        await emitPinLoginFailedAudit(
-          {
-            tenantId: ctx.tenantId,
-            accountId: account.account_id,
-            actorId: 'system',
-            countryOfCare: ctx.countryOfCare,
-            lockedOut: lockedNow,
-          },
-          tx,
-        );
-        return {
-          status: 401,
-          view: makeErrorEnvelope(req.id, INVALID_CREDENTIALS, 'Invalid email or PIN.'),
-        };
+      if (locked || !pinOk) {
+        // Locked OR wrong PIN → the identical tenant-blind INVALID_CREDENTIALS
+        // (a distinct pin_locked code was an enumeration + lockout-DoS oracle).
+        // Account the failure ONLY when NOT already locked — re-incrementing a
+        // live cooldown on every probe would let an attacker extend the lock
+        // indefinitely (attacker-controlled DoS). The row-atomic increment
+        // makes concurrent wrong-PIN attempts each count.
+        if (!locked) {
+          const state = await pinRepo.recordFailureAtomic(
+            ctx.tenantId,
+            account.account_id,
+            pinService.MAX_PIN_ATTEMPTS,
+            pinService.PIN_LOCKOUT_MINUTES,
+            tx,
+          );
+          const lockedNow =
+            state.lockedUntil !== null && new Date(state.lockedUntil).getTime() > Date.now();
+          await emitPinLoginFailedAudit(
+            {
+              tenantId: ctx.tenantId,
+              accountId: account.account_id,
+              actorId: 'system',
+              countryOfCare: ctx.countryOfCare,
+              lockedOut: lockedNow,
+            },
+            tx,
+          );
+        }
+        return invalid;
       }
 
       // Success — clear the lockout counter + issue a session.
@@ -442,40 +435,31 @@ export async function pinRecoveryStartHandler(
     reply,
     mapServiceError,
     async (tx: DbTransaction) => {
+      // recovery/start reveals NOTHING about existence — not via the response
+      // (always 200), not via cooldown (swallowed), and not via TIMING (Codex
+      // round-6): it does the SAME work for every email. We look the account up
+      // (uniform read, used only to attribute the passcode to an account_id
+      // when one exists) and then ALWAYS issue a pin_recovery passcode. For an
+      // unknown email the passcode carries account_id=null and a later verify
+      // fails at the account lookup → the same PASSCODE_FAILED as a wrong code.
       const account = await accountService.findAccountByEmail(ctx, email, tx);
-      // Issue a passcode ONLY if the account exists — but ALWAYS return the
-      // SAME 200 body so a caller cannot learn whether the email is registered
-      // (I-025 enumeration defense; diverges intentionally from
-      // registration/start).
-      //
-      // Codex HIGH fix: issuePasscode throws PASSCODE_LOCKOUT_ACTIVE when a
-      // recovery cooldown is active for this email. If that propagated, the
-      // shared mapper would turn it into a 400 — which, since unknown emails
-      // return 200, becomes an existence oracle (an attacker locks a real
-      // email then reads 400=registered vs 200=unknown). Swallow the cooldown
-      // and still return the identical 200. Truly-unexpected errors still
-      // propagate (they 500 regardless of existence, so they leak nothing).
-      // Staging dev echo: only populated when AUTH_DEV_OTP_ECHO is on (which
-      // production fail-fasts). It lets the Track-4 app complete recovery
-      // without a real email provider. NOTE: in dev-echo mode the presence of
-      // dev_passcode does reveal existence — an accepted staging-only tradeoff
-      // gated behind the dev flag; production (echo off) stays a strict
-      // always-200 non-oracle.
+      const accountId = account !== null && account.status === 'active' ? account.account_id : null;
       let devPasscode: string | undefined;
-      if (account !== null && account.status === 'active') {
-        try {
-          const { codePlaintext } = await passcodeService.issuePasscode(
-            ctx,
-            { actorId: 'system' },
-            { passcode_id: ulid(), account_id: account.account_id, email, purpose: 'pin_recovery' },
-            tx,
-          );
-          if (config.authDevOtpEcho) devPasscode = codePlaintext;
-        } catch (err) {
-          if (!(err instanceof Error && err.message === passcodeService.PASSCODE_LOCKOUT_ACTIVE)) {
-            throw err;
-          }
-          // Cooldown active — do not reveal it on this endpoint.
+      try {
+        const { codePlaintext } = await passcodeService.issuePasscode(
+          ctx,
+          { actorId: 'system' },
+          { passcode_id: ulid(), account_id: accountId, email, purpose: 'pin_recovery' },
+          tx,
+        );
+        // Staging echoes the code as dev_passcode (AUTH_DEV_OTP_ECHO gate +
+        // production fail-fast). Because a passcode is now ALWAYS issued, the
+        // echo is present for every email → not even a staging-mode oracle.
+        if (config.authDevOtpEcho) devPasscode = codePlaintext;
+      } catch (err) {
+        // Swallow a passcode cooldown (would otherwise 400) — still 200.
+        if (!(err instanceof Error && err.message === passcodeService.PASSCODE_LOCKOUT_ACTIVE)) {
+          throw err;
         }
       }
       return {

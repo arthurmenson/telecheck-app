@@ -111,6 +111,22 @@ export function verifyPin(pin: string, storedHashHex: string, storedSaltHex: str
   return crypto.timingSafeEqual(derived, expected);
 }
 
+// A fixed dummy salt (never a real credential's salt) used to burn an
+// equivalent scrypt derivation on the no-account / no-credential / locked
+// paths, so login latency does not reveal whether an email is registered
+// (Codex round-6 HIGH: work-factor timing oracle).
+const DUMMY_SALT = Buffer.alloc(SALT_BYTES, 0x5a);
+
+/**
+ * Run a scrypt derivation and discard it. Called on the login paths that
+ * would otherwise skip the (slow) real verify, so every /login/pin request
+ * performs exactly one scrypt regardless of account existence.
+ */
+export function dummyVerify(pin: string): void {
+  // Same cost as a real verifyPin derivation; result intentionally unused.
+  crypto.scryptSync(pin, DUMMY_SALT, SCRYPT_KEYLEN);
+}
+
 // ---------------------------------------------------------------------------
 // Lockout helpers (pure — the repo persists failed_attempts + locked_until)
 // ---------------------------------------------------------------------------
