@@ -1,73 +1,62 @@
-# Subscription module — BLOCKED ON SI-001
+# Subscription module
 
-## Status (v0.1 skeleton)
+## Status — LIVE (SI-001 closed)
 
-This module is a **directory skeleton** authored at Sprint 4 (TLC-010) — the 3rd application of the blocked-aware skeleton recipe (after pharmacy TLC-001 in Sprint 1 and med-interaction TLC-007 in Sprint 3). The full Subscription surface (state machine, repos, services, HTTP handlers, Pharmacy + Payment adapter wiring) is **BLOCKED** on SI-001 (`docs/SI-001-MedicationRequest-Schema-Gap.md`) — Subscription binds to MedicationRequest via `medication_request_id` for refill cadence and product-catalog binding.
+SI-001 (the MedicationRequest schema gap) is **closed** — Promotion Ledger P-011 landed `medication_requests` at migration 025 (2026-05-11); operator (Evans) confirmed 2026-07-08 that P-011 closure authorizes this build. The Subscription slice is now implemented end-to-end:
 
-## What ships at v0.1
+- **DB layer** — migrations `075` (RBAC roles) → `076` (entities + grants + the migration 060 deferred-FK closure) → `077` (app-role bridge). Two tables: `subscriptions` (CDM §4.7) and append-only `subscription_events` (CDM §4.8).
+- **State machine** — `internal/state-machine.ts`: the State Machines v1.1 §15 table (16 transitions across 10 states) as a pure transition table + guards.
+- **Service** — `internal/service.ts`: `createSubscriptionDraft` + the generic `executeSubscriptionTransition` executor (locked read → pure guard → transition-specific guard → durable UPDATE with from-state + optimistic-`version` re-check → §4.8 event → same-tx §15 audit) + the three read paths.
+- **HTTP surface** — the 7 OpenAPI v0.2 §20 endpoints under `/v0/subscriptions`.
+- **Audit** — `audit.ts`: §15 emission-per-transition (Category A for switch approval + the SAFETY_HOLD family; Category C otherwise).
 
-- Module directory boundary (per ADR-001 modular monolith)
-- Fastify plugin shell registering `/v0/subscription`
-- Liveness probe (`GET /health` → 200) with informational `blocked` metadata
-- Readiness probe (`GET /ready` → 503) — Kubernetes/LB will keep traffic off the module
-- Branded ID types (`SubscriptionId`, `SubscriptionScheduleId`, `SubscriptionPauseId`) — identifier hygiene only, not schema
-- Plugin smoke test (`tests/integration/subscription-plugin-wiring.test.ts`)
+`GET /v0/subscriptions/ready` returns **200**.
 
-## What does NOT ship at v0.1
+## HTTP surface (OpenAPI v0.2 §20)
 
-- Row-shape interfaces for Subscription / SubscriptionSchedule / SubscriptionPause
-- Repository files
-- State machine (pause / resume / cancel / switch transitions)
-- Real HTTP handlers (POST /subscriptions, PATCH /subscriptions/:id/pause, etc.)
-- Payment adapter wiring
-- Pharmacy module integration (refill cadence → MedicationRequest)
-- Database migrations
-- Audit / domain event emitters
+| Method | Path | Transition / read | Actors |
+|---|---|---|---|
+| GET | `/v0/subscriptions` | list (§20.1) | patient (own) / tenant_admin (tenant-wide) |
+| GET | `/v0/subscriptions/:id` | get (§20.2) | patient (own) / tenant_admin |
+| POST | `/v0/subscriptions/:id/pause` | `pause_request` (§20.3) | patient / tenant_operator |
+| POST | `/v0/subscriptions/:id/resume` | `resume` (§20.4) | patient / tenant_operator |
+| POST | `/v0/subscriptions/:id/switch` | `switch_request` (§20.5) → 202 | patient / tenant_operator |
+| POST | `/v0/subscriptions/:id/cancel` | `cancel_request` (§20.6) | patient / tenant_operator |
+| GET | `/v0/subscriptions/:id/events` | event history (§20.7) | patient (own) / tenant_admin |
 
-## Why this is intentionally a skeleton
+All POSTs require the `Idempotency-Key` header (IDEMPOTENCY v5.1, tenant-scoped). Error envelopes are tenant-blind (I-025). JWT role → subscription actor: `patient` → `patient`; `tenant_admin` → `tenant_operator`. Reads self-scope for patients and go tenant-wide for `tenant_admin`.
 
-Per EHBG §7, engineering does not author canonical schema; the slice PRD owns it. Subscription's row shape depends on MedicationRequest schema (CDM v1.2 §4) — authoring schemas now would silently fork the spec corpus (per the "do NOT silently fork" hard rule in CLAUDE.md). When SI-001 closes (Promotion Ledger P-011), Subscription schema lands as part of Slice 4 schema authoring.
+## NOT exposed over HTTP at v0.2 (by design — do not build ad hoc)
 
-The skeleton lands now so that:
+- **`POST /subscriptions` (DRAFT create)** is ratified under the OpenAPI v0.2 **Payments** module (checkout orchestration), not this slice. The stable in-process target is the exported `createSubscriptionDraft` service function (called by the Payments module per the ADR-001 boundary).
+- **Clinician transitions** (`clinician_approval`, `clinician_decline`, `switch_approve`, `switch_decline`, `clinician_release`, `clinician_terminate`) and **system transitions** (`period_end`, `complete`, auto-`resume`, `pause_expires`, `end_period`, `payment_failed_terminal`, `safety_signal_critical`) — reached via the exported `executeSubscriptionTransition` service function (scheduler / domain-event subscriber wiring). OpenAPI v0.2 §20 ratifies no clinician/system endpoint.
 
-1. **Module boundary is established** under ADR-001 — the public-interface surface is fixed
-2. **App-level wiring is stable** — `src/app.ts` registers `subscriptionPlugin` once; plugin internals can evolve without re-touching `app.ts`
-3. **Downstream slices can typed-import branded IDs** — Async Consult (TLC-017+), Admin Backend Tenant Admin subscription management (TLC-018+) can hold typed references to `SubscriptionId` ahead of full schema ratification
-4. **Liveness/readiness pattern is consistent** — applies the Sprint 1 Codex MEDIUM finding (`pharmacy-blocked-handler`) a-priori; this is now the standing rule across all blocked-aware skeletons
+## Recorded spec issues (§12 SI candidates)
 
-## On-resume notes (when SI-001 closes)
+1. **GLOSSARY TENSION — `prescription_id` column.** CDM §4.7 ratifies the column name `prescription_id`; GLOSSARY v5.2 forbids the `prescription` alias (canonical: `medication_request`). Per source-of-truth hierarchy, CDM's inlined DDL is authoritative for schema, so the **column** is kept verbatim (`prescription_id`, FK → `medication_requests`). **App-layer + wire naming use the canonical `medication_request_id`** (see `toSubscriptionView`). Renaming the column would silently fork ratified DDL — flagged, not done.
+2. **CDM §4.8 event_type enum gap.** State Machines v1.1 §15 mandates emissions `subscription.fulfilled` (FULFILLING→ACTIVE), `subscription.switch_declined` (SWITCHING→ACTIVE decline), `subscription.terminated_clinical` (SAFETY_HOLD→CANCELLED), and a `period_end` marker — but CDM §4.8's ratified 13-value enum has no corresponding values. Those transitions carry `eventType: null` and record their trail via **AUDIT records only** (fail-closed: no unratified enum value is invented). When the enum is amended, set the `eventType` on those four transition-table rows.
+3. **AUDIT_EVENTS `subscription.*` action IDs.** AUDIT_EVENTS v5.x enumerates no canonical `subscription.*` action IDs. `audit.ts` uses the sanctioned single-cast placeholder pattern (identity/forms-intake/consent/async-consult precedent). Replace the placeholder strings with canonical names when ratified.
 
-When SI-001 closes (Promotion Ledger P-011 lands):
+## Named follow-ups (deferred, not blockers)
 
-1. Author CDM §4 row-shape expansion for Subscription / SubscriptionSchedule / SubscriptionPause (spec-side change; not in this repo)
-2. Add row-shape interfaces to `src/modules/subscription/internal/types.ts`
-3. Author `internal/repositories/` with tenant-scoped repos
-4. Author `internal/services/subscription-service.ts` (state-machine + cadence calc)
-5. Author migrations (sequentially numbered) for subscriptions, subscription_schedules, subscription_pauses tables
-6. Replace `routes.ts` skeleton with real handler surface
-7. Flip `/ready` to 200 unconditionally; remove `blocked` field
-8. Wire Pharmacy module integration (subscription → next_ship_at → pharmacy_refill_creation)
-9. Wire Payment adapter (subscription_pause + subscription_resume billing-side hooks)
-10. Add audit + domain event emitters per Contracts Pack v5.2 AUDIT_EVENTS / DOMAIN_EVENTS
+- **Real payment adapter.** `payment_method_id` is an opaque handle; the posture is `mock_local_dev` (Track-5 gap).
+- **Switch review case.** `POST /switch` returns 202 SWITCHING and records the requested `new_product_id` in the `switching_initiated` event; no `review_case_id` is minted (the clinical review case is a cross-module concern with no ratified entity in this slice). The clinician `switch_approve` performs the product rebind.
+- **Renewal-time interaction re-check** on `period_end` (cross-module event wiring).
+- **Refill subscription-consistency trigger** (migration 060 deferred; lands with the refill write path — SI-007).
+- **Event-history filtering/pagination** (`from`/`to`/`event_type`/cursor on §20.7). v1.0 returns the full ordered log with a forward-stable `pagination` envelope (`has_more=false`).
 
-## Branded ID type names (PROVISIONAL)
+## Tests
 
-The branded type names anticipate the slice PRD's entity naming. If the ratified slice PRD picks different names, treat as a Sprint 5+ rename task (find-and-replace + import-path update).
-
-| Branded type               | Anticipated CDM entity     |
-| -------------------------- | -------------------------- |
-| `SubscriptionId`           | `Subscription`             |
-| `SubscriptionScheduleId`   | `SubscriptionSchedule`     |
-| `SubscriptionPauseId`      | `SubscriptionPause`        |
+- `internal/state-machine.test.ts` — pure unit coverage of the §15 table + guards (exhaustive actor-permission matrix, pause-window boundary, cadence intervals).
+- `tests/integration/subscription-http.test.ts` — live-PG HTTP suite: pause/resume/cancel/switch happy paths, pause-window 400, invalid-state 409, tenant isolation + self-scope 404 (I-023/I-025), clinician-write 403, reads, and idempotency-replay.
+- `tests/integration/subscription-plugin-wiring.test.ts` — DB-free wiring smoke (probes READY).
 
 ## Spec references
 
-- ADR-001 modular monolith
-- docs/SI-001-MedicationRequest-Schema-Gap.md
-- CDM v1.2 §3.5 (Pharmacy & Fulfillment entity inventory)
-- Pharmacy + Refill Slice PRD v2.1 §5 (target spec for subscription model)
-- EHBG §7 (engineering implements per CDM, does not author)
-
-## Sprint reference
-
-Authored Sprint 4 (TLC-010) on the autonomous Scrum cycle while SI-001 / SI-002 / SI-003 remain open upstream. 3rd application of the BLOCKED-aware skeleton recipe (after pharmacy TLC-001 and med-interaction TLC-007); the recipe is now fixed and reproducible. Liveness/readiness split applied a-priori per Sprint 1 Codex MEDIUM finding `pharmacy-blocked-handler`.
+- CDM v1.2 §4.7 (Subscription) / §4.8 (SubscriptionEvent) / §3.12 (inventory)
+- State Machines v1.1 §15 (Subscription State Machine)
+- OpenAPI v0.2 §20 (endpoint contracts)
+- RBAC v1.1 (no subscription-specific roles ratified — minimal role set per migration 075 header)
+- Pharmacy + Refill Slice PRD v2.1 §8 (subscription semantics; direct-INSERT write path, no SECDEF wrappers)
+- Promotion Ledger P-011 (SI-001 closure)
+- I-003 / I-023 / I-025 / I-027; IDEMPOTENCY v5.1
