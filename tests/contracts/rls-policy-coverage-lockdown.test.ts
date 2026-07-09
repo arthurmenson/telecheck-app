@@ -162,6 +162,8 @@ const TENANT_SCOPED_TABLES = [
   'refills', // migration 060 — Pharmacy Refill sub-slice (SI-007 / P-046)
   'sessions',
   'shipments', // migration 060 — Pharmacy Refill sub-slice (SI-007 / P-046)
+  'subscription_events', // migration 076 — Subscription slice (CDM v1.2 §4.8; State Machines v1.1 §15)
+  'subscriptions', // migration 076 — Subscription slice (CDM v1.2 §4.7; State Machines v1.1 §15)
   'tenant_brands',
   'tenant_users',
 ] as const;
