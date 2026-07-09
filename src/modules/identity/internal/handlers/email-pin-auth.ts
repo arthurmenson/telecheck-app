@@ -389,6 +389,24 @@ export async function pinLoginHandler(req: FastifyRequest, reply: FastifyReply):
             },
             tx,
           );
+        } else {
+          // Already locked (Codex round-11 MEDIUM): a probe during the cooldown
+          // is still a real failed authentication attempt against a known
+          // account, so it MUST leave an append-only audit trail for detection
+          // + incident reconstruction (I-003). Emit with lockedOut=true, but do
+          // NOT call recordFailureAtomic — re-incrementing would let an attacker
+          // extend the lock indefinitely (attacker-controlled DoS). No lockout-
+          // state mutation on this path; audit only.
+          await emitPinLoginFailedAudit(
+            {
+              tenantId: ctx.tenantId,
+              accountId: account.account_id,
+              actorId: 'system',
+              countryOfCare: ctx.countryOfCare,
+              lockedOut: true,
+            },
+            tx,
+          );
         }
         return invalid;
       }

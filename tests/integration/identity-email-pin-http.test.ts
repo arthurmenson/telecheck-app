@@ -121,6 +121,40 @@ async function queryAccountByEmail(
   });
 }
 
+async function queryPinCredential(
+  email: string,
+): Promise<{ failed_attempts: number; locked_until: string | null } | null> {
+  return withTenantContext(T_US, async () => {
+    const r = await getTestClient().query(
+      `SELECT c.failed_attempts, c.locked_until
+         FROM account_pin_credentials c
+         JOIN accounts a
+           ON a.account_id = c.account_id AND a.tenant_id = c.tenant_id
+        WHERE c.tenant_id = $1 AND lower(a.email) = lower($2)`,
+      [T_US, email],
+    );
+    return (
+      (r.rows[0] as { failed_attempts: number; locked_until: string | null } | undefined) ?? null
+    );
+  });
+}
+
+async function countLockoutAudits(email: string): Promise<number> {
+  return withTenantContext(T_US, async () => {
+    const r = await getTestClient().query(
+      `SELECT COUNT(*)::int AS n
+         FROM audit_records ar
+         JOIN accounts a
+           ON a.account_id = ar.resource_id AND a.tenant_id = ar.tenant_id
+        WHERE ar.tenant_id = $1
+          AND lower(a.email) = lower($2)
+          AND ar.action = 'identity_pin_lockout_triggered'`,
+      [T_US, email],
+    );
+    return (r.rows[0] as { n: number } | undefined)?.n ?? 0;
+  });
+}
+
 describe('email+PIN — registration', () => {
   it('A1. register (passcode → verify + PIN) → 201 + tokens; email-only account (phone NULL), active', async () => {
     const email = uniqueEmail();
@@ -316,6 +350,39 @@ describe('email+PIN — tenant isolation (I-023/I-025)', () => {
     // account does not exist → tenant-blind 401.
     const res = await post('/v0/identity/login/pin', { email, pin }, 'ghana.heroshealth.com');
     expect(res.statusCode).toBe(401);
+  });
+});
+
+describe('email+PIN — locked-probe audit trail (Codex round-11 MEDIUM)', () => {
+  it('C4. a login probe while already locked appends a lockout audit row WITHOUT mutating lockout state', async () => {
+    const email = uniqueEmail();
+    const pin = '481975';
+    expect((await registerEmailPin(email, pin)).statusCode).toBe(201);
+
+    // 5 wrong attempts → the credential locks on the 5th (MAX_PIN_ATTEMPTS).
+    for (let i = 0; i < 5; i++) {
+      expect((await post('/v0/identity/login/pin', { email, pin: '000001' })).statusCode).toBe(401);
+    }
+
+    const afterLock = await queryPinCredential(email);
+    expect(afterLock).not.toBeNull();
+    expect(afterLock?.locked_until).not.toBeNull();
+    const lockoutAuditsBefore = await countLockoutAudits(email);
+    expect(lockoutAuditsBefore).toBeGreaterThanOrEqual(1); // the 5th tripped the lock
+
+    // 6th attempt WHILE locked: still a tenant-blind 401, but it must leave an
+    // append-only audit trail (detection) and must NOT re-increment attempts or
+    // extend the cooldown (no attacker-controlled DoS).
+    expect((await post('/v0/identity/login/pin', { email, pin: '000001' })).statusCode).toBe(401);
+
+    const afterProbe = await queryPinCredential(email);
+    const lockoutAuditsAfter = await countLockoutAudits(email);
+
+    // Audit row appended for the locked probe.
+    expect(lockoutAuditsAfter).toBe(lockoutAuditsBefore + 1);
+    // Lockout state unchanged — no re-increment, no cooldown extension.
+    expect(afterProbe?.failed_attempts).toBe(afterLock?.failed_attempts);
+    expect(afterProbe?.locked_until).toBe(afterLock?.locked_until);
   });
 });
 

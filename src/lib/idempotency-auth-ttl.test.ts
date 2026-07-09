@@ -10,6 +10,7 @@
  * closed on that mistake.
  */
 import { describe, expect, it } from 'vitest';
+
 import { ttlSecondsForEndpoint } from './idempotency.js';
 
 // 900s = JWT ACCESS_TOKEN_TTL_SECONDS (jwt.ts). The exact cap for any body
