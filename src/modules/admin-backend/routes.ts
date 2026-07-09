@@ -59,6 +59,12 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import {
+  deleteAiProviderHandler,
+  getAiProvidersHandler,
+  putAiProviderHandler,
+  testAiProviderHandler,
+} from './internal/handlers/ai-providers.js';
 import { getConsultQueueHealthHandler } from './internal/handlers/get-consult-queue-health.js';
 import { getCrisisOperationalHealthHandler } from './internal/handlers/get-crisis-operational-health.js';
 import { getMode1VolumeHealthHandler } from './internal/handlers/get-mode1-volume-health.js';
@@ -207,4 +213,17 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   app.get('/dashboards/consult-queue-health', getConsultQueueHealthHandler);
 
   app.get('/dashboards/mode1-volume-health', getMode1VolumeHealthHandler);
+
+  // SI-025 Admin-Managed AI Provider Credentials (Phase 1 backend).
+  // Masked GET (platform_admin + tenant_admin); PUT/DELETE/POST-test
+  // platform_admin ONLY (platform-scoped credential asset). Never
+  // returns the plaintext key on any surface (SI-025 §7).
+  //   GET    /v1/admin/ai-providers
+  //   PUT    /v1/admin/ai-providers/:provider
+  //   DELETE /v1/admin/ai-providers/:provider
+  //   POST   /v1/admin/ai-providers/:provider/test
+  app.get('/ai-providers', getAiProvidersHandler);
+  app.put('/ai-providers/:provider', putAiProviderHandler);
+  app.delete('/ai-providers/:provider', deleteAiProviderHandler);
+  app.post('/ai-providers/:provider/test', testAiProviderHandler);
 };

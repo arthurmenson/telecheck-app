@@ -129,7 +129,7 @@ import { withDbRole } from '../../../../lib/with-db-role.js';
 import { emitMode1ChatResponseAudit } from '../../audit.js';
 import { runCrisisGate } from '../crisis/gate.js';
 import { CONSERVATIVE_DEFAULT_TEMPLATE } from '../guardrails/conservative-default.js';
-import { NullLLMProvider } from '../providers/null-provider.js';
+import { resolveClinicalProvider } from '../providers/resolve-clinical-provider.js';
 import { LLMProviderUnavailableError } from '../providers/types.js';
 import { asAIChatSessionId, type Mode1ChatResponseView } from '../types.js';
 
@@ -192,20 +192,12 @@ const MODE1_CONVERSATION_HISTORY_WINDOW = 20;
 // ---------------------------------------------------------------------------
 
 /**
- * v1.0 provider routing: per ADR-020, every active workload routes to
- * NullLLMProvider until real adapters (Anthropic primary + Bedrock +
- * Azure OpenAI resilience) land. The Null provider always throws
- * `LLMProviderUnavailableError`, exercising the AI-RESIL-001 fail-soft
- * path on every request.
- *
- * Why a freshly-constructed instance per request: the Null provider
- * is stateless and cheap; constructing on demand avoids importing the
- * registry (which has a wider surface than this handler needs). When
- * real adapters land, swap this for `resolveProvider('conversational_assistant')`.
+ * SI-025: provider resolution moved to resolveClinicalProvider (imported
+ * above) — it reads the admin-managed DB credential via the SECDEF path or
+ * the ANTHROPIC_API_KEY env fallback, returning NullLLMProvider when neither
+ * resolves so the AI-RESIL-001 fail-soft path is preserved. Called with the
+ * request tx at the LLM-invocation site below.
  */
-function getMode1Provider(): NullLLMProvider {
-  return new NullLLMProvider();
-}
 
 /**
  * Derive a deterministic RFC-4122-shaped UUID from the idempotency
@@ -679,7 +671,15 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
       // throws LLMProviderUnavailableError unconditionally; the
       // AI-RESIL-001 fail-soft path renders the documented "temporarily
       // unavailable" UI state.
-      const provider = getMode1Provider();
+      // SI-025: resolve the real clinical provider from the admin-managed
+      // DB credential (via the SECDEF read under ai_service_credential_reader)
+      // or the ANTHROPIC_API_KEY env fallback; when neither resolves this
+      // returns NullLLMProvider, preserving the AI-RESIL-001 fail-soft path.
+      // The resolved key is NEVER logged. The preceding ai_service_mode1
+      // withDbRole block (above) has already restored the app role, so this
+      // resolver's own withDbRole(ai_service_credential_reader) elevation
+      // composes cleanly.
+      const provider = await resolveClinicalProvider({ tx });
       try {
         // Build a minimal completion request matching the canonical
         // LLMCompletionRequest shape (snake_case per spec).

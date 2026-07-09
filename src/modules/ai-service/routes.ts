@@ -36,6 +36,7 @@ import { config } from '../../lib/config.js';
 
 import { mode2CasePrepHandler } from './internal/handlers/case-prep.js';
 import { mode1ChatHandler } from './internal/handlers/chat.js';
+import { isEnvAnthropicKeyPresent } from './internal/providers/resolve-clinical-provider.js';
 
 export const registerAIServiceRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
@@ -84,7 +85,7 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     ],
     provider_abstraction_published: true,
     provider_abstraction_published_by:
-      'TLC-AI PR D (LLMProvider interface + NullLLMProvider + resolveProvider registry exported; per ADR-020 the v1.0 registry routes every active workload to NullLLMProvider — real Anthropic/Bedrock/Azure adapters land when secrets management is resolved)',
+      'TLC-AI PR D (LLMProvider interface + NullLLMProvider + resolveProvider registry) + SI-025 (real AnthropicLLMProvider + resolveClinicalProvider: resolves the admin-managed DB credential via the read_active_ai_provider_key SECDEF path or the ANTHROPIC_API_KEY env fallback; NullLLMProvider only when NEITHER is configured, preserving AI-RESIL-001). Bedrock/Azure adapters remain deferred per ADR-020.',
     guardrail_templates_wired: true,
     guardrail_templates_wired_by:
       'TLC-AI PR E (Conservative Default hardcoded + immutable per AI-GUARD-003; platform-floor compliance validator per AI-GUARD-002; emergency rollback entry point per AI-GUARD-005; Ghana launch program-specific templates wire in alongside their slices)',
@@ -96,13 +97,13 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
     // mode2_case_prep_mounted. The boolean is source-of-truth.
     handlers_wired_tracking: mode2CasePrepMounted
       ? 'Mode 1 chat (PR G 2026-05-15) + Mode 2 case-prep (PR H 2026-05-23) MOUNTED; ' +
-        'real Anthropic provider integration still pending secrets management resolution ' +
-        '(NullLLMProvider routes every workload to AI-RESIL-001 fail-soft at v0.1)'
+        'real Anthropic provider integration wired per SI-025 (admin-managed DB credential ' +
+        'or ANTHROPIC_API_KEY env fallback; NullLLMProvider fail-soft only when neither is configured)'
       : 'Mode 1 chat (PR G 2026-05-15) MOUNTED; Mode 2 case-prep (PR H 2026-05-23) ' +
         'DEFINED + config-gated behind AI_MODE2_ENABLED (default false) per Codex PR #210 ' +
         'R1 NEEDS-WORK closure — POST /v0/ai/case-prep returns 404 until the flag is on. ' +
-        'Real Anthropic provider integration pending secrets management resolution ' +
-        '(NullLLMProvider routes every workload to AI-RESIL-001 fail-soft at v0.1)',
+        'Real Anthropic provider integration wired per SI-025 (admin-managed DB credential ' +
+        'or ANTHROPIC_API_KEY env fallback; NullLLMProvider fail-soft only when neither is configured)',
   }));
 
   // Readiness probe — module is READY to serve traffic. Returns 503
@@ -141,10 +142,22 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
       phase: 'crisis_gate_wired_pr_f',
       mode2_case_prep_mounted: mode2CasePrepMounted,
       mode2_case_prep_mount_gate: 'AI_MODE2_ENABLED',
+      // SI-025 provider-credential readiness (honest split from the
+      // separate crisis-classifier gate). The provider-credential gate is
+      // SATISFIABLE: resolveClinicalProvider constructs the real Anthropic
+      // adapter from an admin-managed DB credential (PUT /v1/admin/ai-providers)
+      // OR the ANTHROPIC_API_KEY env fallback. `provider_credential_env_present`
+      // reflects the sync env-fallback check; an admin-managed DB credential is
+      // resolved at request time (requires a tx, not visible to this sync probe).
+      provider_credential_satisfiable: true,
+      provider_credential_env_present: isEnvAnthropicKeyPresent(),
+      provider_credential_gate:
+        'admin-managed DB credential (SI-025) OR ANTHROPIC_API_KEY env fallback',
+      remaining_readiness_gate:
+        'crisis-classifier NLP upgrade (AI Safety Lead sign-off) + Mode 2 route wiring — ' +
+        'NOT the provider credential, which SI-025 made runtime-configurable',
       pending:
-        'Real Anthropic / Bedrock / Azure OpenAI provider adapters (NullLLMProvider routes ' +
-        'every workload to AI-RESIL-001 fail-soft at v0.1; real adapters block on secrets ' +
-        'management) + clinical-grade NLP crisis classifier (src/lib/crisis-detection.ts ' +
+        'Clinical-grade NLP crisis classifier (src/lib/crisis-detection.ts ' +
         'is a v1.0 keyword stub; AI Safety Lead sign-off required) + protocol-engine ' +
         'integration (downstream I-012 reject-unless three-clause rule binds at the ' +
         'prescribing boundary, not at case-prep itself) + Mode 2 case-prep route ' +
@@ -160,9 +173,11 @@ export const registerAIServiceRoutes: FastifyPluginAsync = async (
         'P-035 §5.1 Layer 1; CDM v1.8 P-036). Readiness intentionally stays 503 on the ' +
         'remaining gates in `pending`. ' +
         mode2DescriptiveText +
-        '. The LLM provider abstraction (per ADR-020) routes every workload to ' +
-        'NullLLMProvider — so every non-crisis response is the documented ' +
-        '"AI temporarily unavailable" envelope (persisted as a ' +
+        '. Per SI-025 the LLM provider abstraction (ADR-020) now resolves the ' +
+        'real Anthropic adapter from an admin-managed DB credential (SECDEF read) ' +
+        'or the ANTHROPIC_API_KEY env fallback; when NEITHER is configured it ' +
+        'falls back to NullLLMProvider — in which case the non-crisis response is ' +
+        'the documented "AI temporarily unavailable" envelope (persisted as a ' +
         "turn_outcome='failed' / failure_class='llm_provider_unavailable' turn-result " +
         'row). Per AI_LAYERING v5.2 §2 + ADR-029, the ' +
         'v1.0 workload taxonomy admits exactly two active types: conversational_assistant ' +

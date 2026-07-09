@@ -223,8 +223,8 @@ describe('with-db-role §4 — callback throw propagation + restore-on-throw', (
 });
 
 describe('with-db-role §5 — allowlist composition', () => {
-  it('SLICE_ROLES contains 7 Crisis + 2 Admin + 4 Med-Interaction + 5 Async-Consult + 2 AI-Service + 4 Subscription = 24 roles', () => {
-    expect(SLICE_ROLES).toHaveLength(24);
+  it('SLICE_ROLES contains 7 Crisis + 2 Admin + 4 Med-Interaction + 5 Async-Consult + 2 AI-Service + 4 Subscription + 2 AI-Provider-Credentials = 26 roles', () => {
+    expect(SLICE_ROLES).toHaveLength(26);
     // Spot-check one from each slice
     expect(SLICE_ROLES).toContain('crisis_initiator');
     expect(SLICE_ROLES).toContain('admin_basic_operator');
@@ -246,6 +246,9 @@ describe('with-db-role §5 — allowlist composition', () => {
     expect(SLICE_ROLES).toContain('subscription_clinician_reviewer');
     expect(SLICE_ROLES).toContain('subscription_system_scheduler');
     expect(SLICE_ROLES).toContain('subscription_staff_reader');
+    // SI-025 AI Provider Credentials (migration 079 roles + bridge)
+    expect(SLICE_ROLES).toContain('ai_provider_credential_writer');
+    expect(SLICE_ROLES).toContain('ai_service_credential_reader');
   });
 
   it('SLICE_ROLES does NOT contain wrapper-owner / view-owner / writer-owner roles', () => {
@@ -260,6 +263,8 @@ describe('with-db-role §5 — allowlist composition', () => {
       'lifecycle_transition_writer_owner',
       'mv_refresh_owner',
       // Async Consult (migration 055 §2 wrapper-owner / view-owner identities)
+      // SI-025 table/SECDEF owner identity (migration 079)
+      'ai_provider_credential_owner',
       'consult_lifecycle_transition_writer_owner',
       'consult_initiation_wrapper_owner',
       'consult_intake_wrapper_owner',

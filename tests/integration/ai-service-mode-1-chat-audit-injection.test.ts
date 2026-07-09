@@ -125,7 +125,16 @@ beforeAll(async () => {
   // ai_service_mode1; grant the test principal membership so
   // SET LOCAL ROLE doesn't 42501 (async-consult-v1-http precedent;
   // fork order is nondeterministic so every suite grants its own).
-  await grantSliceRolesToTestApp(['ai_service_mode1']);
+  await grantSliceRolesToTestApp([
+    'ai_service_mode1',
+    // SI-025: the Mode 1 chat path now resolves the LLM provider via
+    // resolveClinicalProvider, which elevates to ai_service_credential_reader
+    // to read the admin-managed DB credential (read_active_ai_provider_key).
+    // Grant it so the SET LOCAL ROLE elevation does not 42501. With no
+    // credential + no env key configured the resolver returns NullLLMProvider,
+    // preserving the fail-soft assertions in this suite.
+    'ai_service_credential_reader',
+  ]);
   // Dynamic import after the vi.mock factory is registered.
   const { buildApp } = await import('../../src/app.ts');
   app = await buildApp({ logger: false });

@@ -184,6 +184,15 @@ const TENANT_SCOPED_TABLE_COUNT = TENANT_SCOPED_TABLES.length;
 const PLATFORM_LEVEL_TABLES_EXCLUDED_FROM_RLS = [
   'tenants', // tenant lookup table; carries `id` as the tenant identifier
   'country_profiles', // CCR country registry; shared across tenants
+  // SI-025 (migration 079): ai_provider_credential is a PLATFORM-SECURITY
+  // asset (admin-managed AI provider API keys), NOT PHI and NOT tenant-
+  // scoped. It carries NO tenant_id and is DELIBERATELY not under the
+  // tenant-RLS regime — it is locked down entirely by role grants (REVOKE
+  // ALL FROM PUBLIC + owner/writer/reader grants) per the ratified
+  // platform-level scope decision (SI-025 §3). Allow-listed here so §2b's
+  // 'no rogue non-RLS table' assertion treats it as an EXPLICITLY-EXPECTED
+  // platform-scoped table and §3 asserts relrowsecurity=false on it.
+  'ai_provider_credential',
 ] as const;
 
 // ---------------------------------------------------------------------------
