@@ -29,6 +29,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { config } from '../../../../lib/config.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -123,15 +124,22 @@ export async function emailRegistrationStartHandler(
           view: makeErrorEnvelope(req.id, EMAIL_TAKEN, 'Email is already registered.'),
         };
       }
-      const { passcode } = await passcodeService.issuePasscode(
+      const { passcode, codePlaintext } = await passcodeService.issuePasscode(
         ctx,
         { actorId: 'system' },
         { passcode_id: ulid(), account_id: null, email, purpose: 'email_registration' },
         tx,
       );
-      // The plaintext code goes to the email provider (stub); wire response
-      // carries only the correlation id.
-      return { status: 200, view: { passcode_id: passcode.passcode_id } };
+      // The plaintext code goes to the email provider (stub). Staging echoes
+      // it as dev_passcode (same AUTH_DEV_OTP_ECHO gate + production fail-fast
+      // as the OTP dev_otp echo) so the Track-4 app can complete the flow
+      // without a real email provider. Production carries only the id.
+      return {
+        status: 200,
+        view: config.authDevOtpEcho
+          ? { passcode_id: passcode.passcode_id, dev_passcode: codePlaintext }
+          : { passcode_id: passcode.passcode_id },
+      };
     },
   );
 }
@@ -420,14 +428,22 @@ export async function pinRecoveryStartHandler(
       // email then reads 400=registered vs 200=unknown). Swallow the cooldown
       // and still return the identical 200. Truly-unexpected errors still
       // propagate (they 500 regardless of existence, so they leak nothing).
+      // Staging dev echo: only populated when AUTH_DEV_OTP_ECHO is on (which
+      // production fail-fasts). It lets the Track-4 app complete recovery
+      // without a real email provider. NOTE: in dev-echo mode the presence of
+      // dev_passcode does reveal existence — an accepted staging-only tradeoff
+      // gated behind the dev flag; production (echo off) stays a strict
+      // always-200 non-oracle.
+      let devPasscode: string | undefined;
       if (account !== null && account.status === 'active') {
         try {
-          await passcodeService.issuePasscode(
+          const { codePlaintext } = await passcodeService.issuePasscode(
             ctx,
             { actorId: 'system' },
             { passcode_id: ulid(), account_id: account.account_id, email, purpose: 'pin_recovery' },
             tx,
           );
+          if (config.authDevOtpEcho) devPasscode = codePlaintext;
         } catch (err) {
           if (!(err instanceof Error && err.message === passcodeService.PASSCODE_LOCKOUT_ACTIVE)) {
             throw err;
@@ -435,7 +451,13 @@ export async function pinRecoveryStartHandler(
           // Cooldown active — do not reveal it on this endpoint.
         }
       }
-      return { status: 200, view: { status: 'ok' } };
+      return {
+        status: 200,
+        view:
+          devPasscode !== undefined
+            ? { status: 'ok', dev_passcode: devPasscode }
+            : { status: 'ok' },
+      };
     },
   );
 }

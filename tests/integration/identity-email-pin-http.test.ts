@@ -98,7 +98,7 @@ async function issuePasscode(email: string, purpose: EmailPasscodePurpose): Prom
 /** Full register: issue passcode → verify with PIN. Returns the response. */
 async function registerEmailPin(email: string, pin: string): Promise<InjectResult> {
   const code = await issuePasscode(email, 'email_registration');
-  const res = await post('/v0/identity/registration/email/verify', {
+  return post('/v0/identity/registration/email/verify', {
     email,
     passcode: code,
     pin,
@@ -107,13 +107,6 @@ async function registerEmailPin(email: string, pin: string): Promise<InjectResul
     date_of_birth: '1990-01-01',
     gender: 'prefer_not_to_say',
   });
-  // TEMP DIAGNOSTIC (remove after root-cause): non-prod 5xx carries the real
-  // error message in the envelope; surface it so CI reveals the 500 cause.
-  if (res.statusCode !== 201) {
-    // eslint-disable-next-line no-console
-    console.error('REGISTER_EMAIL_PIN_FAIL', res.statusCode, res.body);
-  }
-  return res;
 }
 
 async function queryAccountByEmail(

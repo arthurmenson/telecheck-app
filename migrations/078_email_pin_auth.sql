@@ -117,8 +117,12 @@ CREATE TABLE account_pin_credentials (
         FOREIGN KEY (tenant_id, account_id)
         REFERENCES accounts (tenant_id, account_id),
 
-    -- scrypt hex shapes (defense-in-depth on the durable boundary).
-    CONSTRAINT pin_hash_hex_format  CHECK (pin_hash ~ '^[0-9a-f]{32,256}$'),
+    -- scrypt hex shapes (defense-in-depth on the durable boundary). The
+    -- upper bound is 255, not 256: Postgres POSIX-regex repetition counts
+    -- max out at RE_DUP_MAX (255); {32,256} raises SQLSTATE 2201B "invalid
+    -- repetition count(s)" at first insert. The scrypt hash is 128 hex chars,
+    -- comfortably inside [32,255].
+    CONSTRAINT pin_hash_hex_format  CHECK (pin_hash ~ '^[0-9a-f]{32,255}$'),
     CONSTRAINT pin_salt_hex_format  CHECK (pin_salt ~ '^[0-9a-f]{16,64}$')
 );
 
