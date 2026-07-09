@@ -156,13 +156,30 @@ describe('email+PIN — registration', () => {
     expect(json<{ error: { code: string } }>(res).error.code).toBe('identity.pin.weak');
   });
 
-  it('A3. register with an already-registered email → 400 EMAIL_TAKEN', async () => {
+  it('A3. registration/start is not an enumeration oracle: an already-registered email and a brand-new email return an identical 200 (Codex HIGH)', async () => {
+    const registered = uniqueEmail();
+    expect((await registerEmailPin(registered, '481975')).statusCode).toBe(201);
+
+    const startRegistered = await post('/v0/identity/registration/email/start', {
+      email: registered,
+    });
+    const startNew = await post('/v0/identity/registration/email/start', { email: uniqueEmail() });
+    expect(startRegistered.statusCode).toBe(200);
+    expect(startNew.statusCode).toBe(200);
+    // Bodies are byte-identical ({ status: 'ok' }; no dev echo in test config).
+    expect(startRegistered.body).toBe(startNew.body);
+  });
+
+  it('A4. a verify attempt on an already-registered email fails tenant-blind (PASSCODE_FAILED, not an email-taken oracle)', async () => {
     const email = uniqueEmail();
     expect((await registerEmailPin(email, '481975')).statusCode).toBe(201);
+    // registerEmailPin issues a registration passcode via the service then
+    // verifies — on an existing email the account INSERT hits the unique index
+    // and must surface as the same PASSCODE_FAILED as a wrong code.
     const res = await registerEmailPin(email, '739218');
     expect(res.statusCode).toBe(400);
     expect(json<{ error: { code: string } }>(res).error.code).toBe(
-      'identity.registration.email_taken',
+      'identity.email_passcode.verification_failed',
     );
   });
 });

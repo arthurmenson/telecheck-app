@@ -12,10 +12,12 @@
  *
  * Disciplines:
  *   - Idempotency: every POST uses withIdempotentExecution (IDEMPOTENCY v5.1).
- *   - Tenant-blind (I-025): PIN login returns a single INVALID_CREDENTIALS for
- *     both no-account and wrong-PIN; recovery/start always returns 200 (no
- *     email-existence enumeration). (Registration/start returns EMAIL_TAKEN,
- *     matching the existing phone flow's PHONE_TAKEN convention.)
+ *   - Tenant-blind (I-025): NO endpoint reveals whether an email is registered.
+ *     PIN login returns a single INVALID_CREDENTIALS for no-account / wrong-PIN
+ *     / locked; registration/start + recovery/start both always return 200
+ *     (a passcode is issued only for the relevant account state); a verify
+ *     attempt on a non-issuing email fails with the same PASSCODE_FAILED as a
+ *     wrong code.
  *   - Audit (I-003): account.created (createAccount), pin.set, session.issued,
  *     pin.login_failed/lockout, passcode.issued/consumed — all same-tx.
  *   - PIN never logged; passcode plaintext emailed once, never persisted.
@@ -46,7 +48,6 @@ import { asAccountId, asSessionId } from '../types.js';
 // Sentinels + helpers
 // ---------------------------------------------------------------------------
 
-const EMAIL_TAKEN = 'identity.registration.email_taken';
 const INVALID_CREDENTIALS = 'identity.login.invalid_credentials';
 const PASSCODE_FAILED = 'identity.email_passcode.verification_failed';
 const WEAK_PIN = 'identity.pin.weak';
@@ -67,7 +68,9 @@ function normalizeEmail(v: unknown): string | null {
   return EMAIL_PATTERN.test(e) ? e : null;
 }
 
-/** Shared service-error mapper: passcode cooldown → 400; email unique → EMAIL_TAKEN. */
+/** Shared service-error mapper: passcode cooldown → 400; email-unique race →
+ *  the tenant-blind PASSCODE_FAILED (NOT a distinct "email taken" — that would
+ *  be an enumeration oracle at verify, mirroring the start-side fix). */
 function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): boolean {
   if (err instanceof Error && err.message === passcodeService.PASSCODE_LOCKOUT_ACTIVE) {
     void reply
@@ -87,9 +90,13 @@ function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): bool
     'code' in err &&
     (err as { code?: unknown }).code === '23505'
   ) {
+    // A unique-violation (email already registered) can only surface here as a
+    // narrow verify-time race (start never issues a registration passcode for
+    // an existing email). Return the same PASSCODE_FAILED envelope as a wrong
+    // code so it leaks nothing about existence.
     void reply
       .code(400)
-      .send(makeErrorEnvelope(reqId, EMAIL_TAKEN, 'Email is already registered.'));
+      .send(makeErrorEnvelope(reqId, PASSCODE_FAILED, 'Passcode verification failed.'));
     return true;
   }
   return false;
@@ -116,28 +123,34 @@ export async function emailRegistrationStartHandler(
     reply,
     mapServiceError,
     async (tx: DbTransaction) => {
+      // Codex HIGH fix: registration/start must NOT reveal whether the email
+      // is already registered. Previously it returned EMAIL_TAKEN (400) for
+      // existing emails vs 200 for new ones — a direct enumeration oracle.
+      // Now it ALWAYS returns the identical 200: a passcode is issued only for
+      // a genuinely-new email (an existing account gets none — they should
+      // sign in, told out-of-band by email). An attacker therefore cannot
+      // distinguish; and a verify attempt on an existing email finds no active
+      // registration passcode → the same PASSCODE_FAILED as a wrong code.
       const existing = await accountService.findAccountByEmail(ctx, email, tx);
-      if (existing !== null) {
-        return {
-          status: 400,
-          view: makeErrorEnvelope(req.id, EMAIL_TAKEN, 'Email is already registered.'),
-        };
+      let devPasscode: string | undefined;
+      if (existing === null) {
+        const { codePlaintext } = await passcodeService.issuePasscode(
+          ctx,
+          { actorId: 'system' },
+          { passcode_id: ulid(), account_id: null, email, purpose: 'email_registration' },
+          tx,
+        );
+        // Staging echoes the code as dev_passcode (AUTH_DEV_OTP_ECHO gate +
+        // production fail-fast, same as the OTP dev_otp echo) so the Track-4
+        // app can complete the flow without a real email provider.
+        if (config.authDevOtpEcho) devPasscode = codePlaintext;
       }
-      const { passcode, codePlaintext } = await passcodeService.issuePasscode(
-        ctx,
-        { actorId: 'system' },
-        { passcode_id: ulid(), account_id: null, email, purpose: 'email_registration' },
-        tx,
-      );
-      // The plaintext code goes to the email provider (stub). Staging echoes
-      // it as dev_passcode (same AUTH_DEV_OTP_ECHO gate + production fail-fast
-      // as the OTP dev_otp echo) so the Track-4 app can complete the flow
-      // without a real email provider. Production carries only the id.
       return {
         status: 200,
-        view: config.authDevOtpEcho
-          ? { passcode_id: passcode.passcode_id, dev_passcode: codePlaintext }
-          : { passcode_id: passcode.passcode_id },
+        view:
+          devPasscode !== undefined
+            ? { status: 'ok', dev_passcode: devPasscode }
+            : { status: 'ok' },
       };
     },
   );
