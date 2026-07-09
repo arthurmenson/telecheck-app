@@ -182,6 +182,37 @@ describe('email+PIN — registration', () => {
       'identity.email_passcode.verification_failed',
     );
   });
+
+  it('A5. registration/start has no induced-lockout oracle: driving a NEW email into passcode cooldown still returns 200 (like a registered email) (Codex HIGH round 5)', async () => {
+    const fresh = uniqueEmail();
+    // Issue a registration passcode, then exhaust its 3 verify attempts to lock
+    // the (tenant, email, email_registration) tuple into cooldown.
+    expect((await post('/v0/identity/registration/email/start', { email: fresh })).statusCode).toBe(
+      200,
+    );
+    for (let i = 0; i < 3; i++) {
+      await post('/v0/identity/registration/email/verify', {
+        email: fresh,
+        passcode: '000001',
+        pin: '481975',
+        first_name: 'A',
+        last_name: 'B',
+        date_of_birth: '1990-01-01',
+        gender: 'prefer_not_to_say',
+      });
+    }
+    // The cooldown must NOT surface — start still returns 200, matching a
+    // registered email (which never issues a passcode → never cools down).
+    const afterCooldown = await post('/v0/identity/registration/email/start', { email: fresh });
+    const registeredEmail = uniqueEmail();
+    expect((await registerEmailPin(registeredEmail, '620914')).statusCode).toBe(201);
+    const registeredStart = await post('/v0/identity/registration/email/start', {
+      email: registeredEmail,
+    });
+    expect(afterCooldown.statusCode).toBe(200);
+    expect(registeredStart.statusCode).toBe(200);
+    expect(afterCooldown.body).toBe(registeredStart.body);
+  });
 });
 
 describe('email+PIN — login', () => {

@@ -134,16 +134,28 @@ export async function emailRegistrationStartHandler(
       const existing = await accountService.findAccountByEmail(ctx, email, tx);
       let devPasscode: string | undefined;
       if (existing === null) {
-        const { codePlaintext } = await passcodeService.issuePasscode(
-          ctx,
-          { actorId: 'system' },
-          { passcode_id: ulid(), account_id: null, email, purpose: 'email_registration' },
-          tx,
-        );
-        // Staging echoes the code as dev_passcode (AUTH_DEV_OTP_ECHO gate +
-        // production fail-fast, same as the OTP dev_otp echo) so the Track-4
-        // app can complete the flow without a real email provider.
-        if (config.authDevOtpEcho) devPasscode = codePlaintext;
+        try {
+          const { codePlaintext } = await passcodeService.issuePasscode(
+            ctx,
+            { actorId: 'system' },
+            { passcode_id: ulid(), account_id: null, email, purpose: 'email_registration' },
+            tx,
+          );
+          // Staging echoes the code as dev_passcode (AUTH_DEV_OTP_ECHO gate +
+          // production fail-fast, same as the OTP dev_otp echo) so the Track-4
+          // app can complete the flow without a real email provider.
+          if (config.authDevOtpEcho) devPasscode = codePlaintext;
+        } catch (err) {
+          // Codex HIGH (round 5): a passcode cooldown must NOT surface here.
+          // Only NEW emails reach issuePasscode, so a propagated
+          // PASSCODE_LOCKOUT_ACTIVE (→ 400) would let an attacker induce a
+          // cooldown and read 400=new vs 200=registered — an induced-lockout
+          // enumeration oracle. Swallow the cooldown and still return 200
+          // (mirrors recovery/start). Truly-unexpected errors still propagate.
+          if (!(err instanceof Error && err.message === passcodeService.PASSCODE_LOCKOUT_ACTIVE)) {
+            throw err;
+          }
+        }
       }
       return {
         status: 200,
