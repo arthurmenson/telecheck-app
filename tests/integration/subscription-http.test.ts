@@ -643,7 +643,9 @@ describe('subscription — createSubscriptionDraft service (DRAFT create + clini
       });
       if (created.outcome !== 'created') throw new Error('create failed');
 
-      // A patient actor cannot drive clinician_approval (actor gate).
+      // A patient actor cannot drive clinician_approval (actor gate). Codex
+      // MED fix: an actor-forbidden attempt against a VISIBLE row now leaves
+      // the I-003 rejection trail.
       const patientAttempt = await executeSubscriptionTransition(getTestClient(), {
         ctx: ctx(),
         actor: patientActor,
@@ -651,6 +653,7 @@ describe('subscription — createSubscriptionDraft service (DRAFT create + clini
         transition: 'clinician_approval',
       });
       expect(patientAttempt.outcome).toBe('guard_failed');
+      expect(await queryAuditActions(created.row.id)).toContain('subscription_transition_rejected');
 
       const approved = await executeSubscriptionTransition(getTestClient(), {
         ctx: ctx(),
@@ -665,5 +668,94 @@ describe('subscription — createSubscriptionDraft service (DRAFT create + clini
     expect(await queryStatus(subId)).toBe('ACTIVE');
     expect(await queryEventTypes(subId)).toContain('activated');
     expect(await queryAuditActions(subId)).toContain('subscription_activated');
+  });
+});
+
+describe('subscription — system PAUSED-exit pause-deadline guard (Codex HIGH fix)', () => {
+  const ctx = (): TransitionContext => ({
+    tenantId: T_US,
+    countryOfCare: 'US',
+    actorTenantIdForAudit: T_US,
+  });
+
+  it('H1. system resume BEFORE pause_until elapses → guard_failed(pause_window_not_elapsed) + rejection audit; row stays PAUSED', async () => {
+    const subId = await seedActiveSubscription();
+    // Pause it with a FUTURE deadline via the patient HTTP path.
+    const paused = await inject({
+      method: 'POST',
+      url: `/v0/subscriptions/${subId}/pause`,
+      auth: usAuth(usPatient, 'patient'),
+      payload: { reason: 'travel', pause_until: futureIso(30) },
+    });
+    expect(paused.statusCode).toBe(200);
+
+    // A system auto-resume must NOT fire before pause_until (scheduler-bug /
+    // replay defense). Exercised via the exported service function (no HTTP
+    // system-resume endpoint at v0.2).
+    const systemActor: SubscriptionActor = { type: 'system', id: null };
+    const outcome = await withTenantContext(T_US, async () =>
+      executeSubscriptionTransition(getTestClient(), {
+        ctx: ctx(),
+        actor: systemActor,
+        subscriptionId: subId,
+        transition: 'resume',
+      }),
+    );
+    expect(outcome.outcome).toBe('guard_failed');
+    if (outcome.outcome === 'guard_failed') {
+      expect(outcome.reason).toBe('pause_window_not_elapsed');
+    }
+    expect(await queryStatus(subId)).toBe('PAUSED');
+    expect(await queryAuditActions(subId)).toContain('subscription_transition_rejected');
+  });
+
+  it('H2. patient EARLY resume (before pause_until) IS allowed → transitioned to ACTIVE (§15 patient sovereignty)', async () => {
+    const subId = await seedActiveSubscription();
+    await inject({
+      method: 'POST',
+      url: `/v0/subscriptions/${subId}/pause`,
+      auth: usAuth(usPatient, 'patient'),
+      payload: { reason: 'travel', pause_until: futureIso(30) },
+    });
+    // Patient (not system) may resume early — the deadline guard is system-only.
+    const res = await inject({
+      method: 'POST',
+      url: `/v0/subscriptions/${subId}/resume`,
+      auth: usAuth(usPatient, 'patient'),
+      payload: {},
+    });
+    expect(res.statusCode).toBe(200);
+    expect(await queryStatus(subId)).toBe('ACTIVE');
+  });
+
+  it('H3. system resume AFTER pause_until has elapsed → transitioned to ACTIVE', async () => {
+    // Seed a PAUSED row whose pause window has already elapsed (direct SQL —
+    // the HTTP pause path forbids a past pause_until).
+    const subId = `sub_${ulid()}`;
+    await withTenantContext(T_US, async () => {
+      await getTestClient().query(
+        `INSERT INTO subscriptions (
+            id, tenant_id, patient_id, product_id, prescription_id, cadence,
+            unit_price, currency, status, started_at, paused_at, pause_until,
+            preauth_window_months, preauth_renewals_remaining, payment_method_id
+         ) VALUES (
+            $1, $2, $3, $4, $5, 'monthly', 199.00, 'USD', 'PAUSED', NOW(),
+            NOW() - INTERVAL '40 days', NOW() - INTERVAL '1 day', 12, 6,
+            'pm_mock_local_dev_1'
+         )`,
+        [subId, T_US, usPatient, usProductId, usMedicationRequestId],
+      );
+    });
+    const systemActor: SubscriptionActor = { type: 'system', id: null };
+    const outcome = await withTenantContext(T_US, async () =>
+      executeSubscriptionTransition(getTestClient(), {
+        ctx: ctx(),
+        actor: systemActor,
+        subscriptionId: subId,
+        transition: 'resume',
+      }),
+    );
+    expect(outcome.outcome).toBe('transitioned');
+    expect(await queryStatus(subId)).toBe('ACTIVE');
   });
 });
