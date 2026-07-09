@@ -59,6 +59,21 @@ export async function issuePasscode(
     throw err;
   }
 
+  // Tuple-wide attempt-budget carry-forward (Codex round-12 HIGH). Issuing a
+  // fresh passcode must NOT reset the guessing window: without this, an
+  // attacker calls start (3 fresh attempts), spends 1-2 wrong verifies, calls
+  // start again, and repeats indefinitely — no row ever reaches
+  // attempts_remaining=0, so the 3-attempt cooldown never triggers. By seeding
+  // the new challenge with the remaining budget of the latest still-active
+  // challenge, the budget decreases monotonically across re-issues until it
+  // locks the tuple (or all challenges expire and it legitimately resets).
+  const priorActive = await passcodeRepo.findLatestActivePasscode(
+    ctx.tenantId,
+    input.email,
+    input.purpose,
+    externalTx,
+  );
+
   const codePlaintext = generateOtpCode();
   const codeHash = hashOtpCode(codePlaintext);
   const expiresAt = new Date(Date.now() + PASSCODE_TTL_MINUTES * MS_PER_MINUTE).toISOString();
@@ -71,6 +86,7 @@ export async function issuePasscode(
     code_hash: codeHash,
     expires_at: expiresAt,
   };
+  if (priorActive !== null) repoInput.attempts_remaining = priorActive.attempts_remaining;
   if (input.account_id !== undefined) repoInput.account_id = input.account_id;
 
   const passcode = await passcodeRepo.createPasscode(

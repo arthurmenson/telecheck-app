@@ -341,6 +341,57 @@ describe('email+PIN — recovery', () => {
   });
 });
 
+describe('email+PIN — re-issuing a passcode does not refresh the attempt budget (Codex round-12 HIGH)', () => {
+  it('D6. start → 2 wrong → start → 1 wrong locks the tuple; the correct latest code is then rejected', async () => {
+    const email = uniqueEmail();
+    const oldPin = '481975';
+    expect((await registerEmailPin(email, oldPin)).statusCode).toBe(201);
+
+    // start #1 (3 attempts). Two wrong verifies leave 1 attempt on the tuple.
+    await issuePasscode(email, 'pin_recovery');
+    for (let i = 0; i < 2; i++) {
+      expect(
+        (
+          await post('/v0/identity/recovery/pin/verify', {
+            email,
+            passcode: '000001',
+            new_pin: '620914',
+          })
+        ).statusCode,
+      ).toBe(400);
+    }
+
+    // start #2 — MUST carry forward the 1 remaining attempt, NOT reset to 3.
+    const codeB = await issuePasscode(email, 'pin_recovery');
+
+    // A single wrong verify now exhausts the tuple-wide budget → lockout.
+    // (If issuance had refreshed the budget to 3, this would leave 2 and the
+    // tuple would NOT be locked.)
+    expect(
+      (
+        await post('/v0/identity/recovery/pin/verify', {
+          email,
+          passcode: '000001',
+          new_pin: '620914',
+        })
+      ).statusCode,
+    ).toBe(400);
+
+    // The CORRECT latest code is now rejected — the tuple is locked, proving
+    // the budget was tuple-wide and did not refresh on re-issue.
+    const correctButLocked = await post('/v0/identity/recovery/pin/verify', {
+      email,
+      passcode: codeB,
+      new_pin: '620914',
+    });
+    expect(correctButLocked.statusCode).toBe(400);
+
+    // PIN never changed.
+    expect((await post('/v0/identity/login/pin', { email, pin: oldPin })).statusCode).toBe(200);
+    expect((await post('/v0/identity/login/pin', { email, pin: '620914' })).statusCode).toBe(401);
+  });
+});
+
 describe('email+PIN — tenant isolation (I-023/I-025)', () => {
   it('E1. a US email+PIN cannot log in on the Ghana host', async () => {
     const email = uniqueEmail();
@@ -381,8 +432,9 @@ describe('email+PIN — locked-probe audit trail (Codex round-11 MEDIUM)', () =>
     // Audit row appended for the locked probe.
     expect(lockoutAuditsAfter).toBe(lockoutAuditsBefore + 1);
     // Lockout state unchanged — no re-increment, no cooldown extension.
+    // (locked_until comes back as a Date; compare by value, not reference.)
     expect(afterProbe?.failed_attempts).toBe(afterLock?.failed_attempts);
-    expect(afterProbe?.locked_until).toBe(afterLock?.locked_until);
+    expect(String(afterProbe?.locked_until)).toBe(String(afterLock?.locked_until));
   });
 });
 

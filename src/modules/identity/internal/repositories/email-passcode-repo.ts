@@ -80,6 +80,10 @@ export interface CreatePasscodeInput {
   purpose: EmailPasscodePurpose;
   code_hash: string;
   expires_at: string; // ISO 8601
+  // Starting attempt budget. Defaults to 3, but issuance carries forward the
+  // remaining budget of an existing active challenge so re-issuing does NOT
+  // refresh the tuple-wide guessing window (Codex round-12 HIGH).
+  attempts_remaining?: number;
 }
 
 export async function findLatestActivePasscode(
@@ -151,12 +155,16 @@ export async function createPasscode(
   externalTx?: DbTransaction,
 ): Promise<EmailPasscode> {
   const runFn = async (tx: DbTransaction): Promise<EmailPasscode> => {
+    // Clamp the starting budget to [1, 3]: never above the 3-attempt default,
+    // and never 0 (a 0-attempt row would be a no-op that findLatestActivePasscode
+    // excludes anyway). The tuple-wide lockout is what actually stops guessing.
+    const startingAttempts = Math.max(1, Math.min(3, input.attempts_remaining ?? 3));
     const result = await tx.query<PasscodeRow>(
       `INSERT INTO email_passcodes (
           passcode_id, tenant_id, account_id, email, purpose,
           code_hash, attempts_remaining, created_at, expires_at
        ) VALUES (
-          $1, $2, $3, $4, $5, $6, 3, NOW(), $7::timestamptz
+          $1, $2, $3, $4, $5, $6, $8, NOW(), $7::timestamptz
        )
        RETURNING ${PASSCODE_COLUMNS}`,
       [
@@ -167,6 +175,7 @@ export async function createPasscode(
         input.purpose,
         input.code_hash,
         input.expires_at,
+        startingAttempts,
       ],
     );
     const row = result.rows[0];
