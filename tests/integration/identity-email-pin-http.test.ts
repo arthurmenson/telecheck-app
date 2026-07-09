@@ -426,4 +426,39 @@ describe('email+PIN — passcode lockout is not bypassed by a correct code (Code
     // And the would-be new PIN does not.
     expect((await post('/v0/identity/login/pin', { email, pin: '620914' })).statusCode).toBe(401);
   });
+
+  it('D5. tuple-wide lockout: with two issued codes, locking the newer one blocks the older correct code too', async () => {
+    const email = uniqueEmail();
+    const oldPin = '481975';
+    expect((await registerEmailPin(email, oldPin)).statusCode).toBe(201);
+
+    // Two unconsumed recovery challenges for the same (email, purpose).
+    const codeA = await issuePasscode(email, 'pin_recovery'); // older
+    const codeB = await issuePasscode(email, 'pin_recovery'); // newer (targeted by verify)
+    expect(codeA).not.toBe(codeB);
+
+    // Burn the 3 attempts against the newest challenge (B) with wrong codes →
+    // the (email, purpose) tuple locks.
+    for (let i = 0; i < 3; i++) {
+      const wrong = await post('/v0/identity/recovery/pin/verify', {
+        email,
+        passcode: '000001',
+        new_pin: '620914',
+      });
+      expect(wrong.statusCode).toBe(400);
+    }
+
+    // The older correct code A must NOT slip through during the cooldown — the
+    // lockout is tuple-wide, not per-passcode-row.
+    const olderCorrect = await post('/v0/identity/recovery/pin/verify', {
+      email,
+      passcode: codeA,
+      new_pin: '620914',
+    });
+    expect(olderCorrect.statusCode).toBe(400);
+
+    // PIN unchanged.
+    expect((await post('/v0/identity/login/pin', { email, pin: oldPin })).statusCode).toBe(200);
+    expect((await post('/v0/identity/login/pin', { email, pin: '620914' })).statusCode).toBe(401);
+  });
 });

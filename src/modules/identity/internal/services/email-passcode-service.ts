@@ -113,6 +113,25 @@ export async function verifyPasscode(
   input: { email: string; purpose: EmailPasscodePurpose; code: string },
   externalTx: DbTransaction,
 ): Promise<VerifyPasscodeResult> {
+  // Tuple-wide lockout gate (Codex round-9 HIGH). Excluding a locked row from
+  // findLatestActivePasscode is not enough: a user can hold more than one
+  // unconsumed passcode (issue A, then issue B — issue only blocks on an
+  // ACTIVE lockout, not on an existing active code). If B is then locked, the
+  // locked row is skipped and the query falls through to the still-active
+  // older code A, letting the correct A bypass the cooldown. Gating on the
+  // (tenant, email, purpose) lockout FIRST makes the cooldown tuple-wide:
+  // once any passcode for the tuple is locked, no code verifies until it
+  // expires. Tenant-blind — an unknown email is simply never locked.
+  const activeLockout = await passcodeRepo.findActiveLockout(
+    ctx.tenantId,
+    input.email,
+    input.purpose,
+    externalTx,
+  );
+  if (activeLockout !== null) {
+    return { ok: false, consumed: null, errorCode: PASSCODE_LOCKOUT_TRIGGERED };
+  }
+
   const passcode = await passcodeRepo.findLatestActivePasscode(
     ctx.tenantId,
     input.email,
