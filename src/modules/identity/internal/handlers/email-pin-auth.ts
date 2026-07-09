@@ -516,22 +516,22 @@ export async function pinRecoveryVerifyHandler(
     reply,
     mapServiceError,
     async (tx: DbTransaction) => {
-      const account = await accountService.findAccountByEmail(ctx, email, tx);
-      // Verify the passcode regardless (tenant-blind: same failure envelope
-      // whether the account is missing or the code is wrong).
-      if (account === null || account.status !== 'active') {
-        return {
-          status: 400,
-          view: makeErrorEnvelope(req.id, PASSCODE_FAILED, 'Passcode verification failed.'),
-        };
-      }
+      // Codex HIGH (round-7): run the passcode verification for EVERY email —
+      // registered or not — BEFORE branching on account existence. Since
+      // recovery/start now always issues a passcode (account_id=null for
+      // unknown emails), an unknown email has a real challenge to consume /
+      // decrement, so verify does the same work + state mutation as for a
+      // registered email. Skipping it for unknown emails was a state/timing
+      // oracle. The combined check below returns the identical PASSCODE_FAILED
+      // whether the code was wrong OR the account is missing/inactive.
       const verify = await passcodeService.verifyPasscode(
         ctx,
         { actorId: 'system' },
         { email, purpose: 'pin_recovery', code: passcode },
         tx,
       );
-      if (!verify.ok) {
+      const account = await accountService.findAccountByEmail(ctx, email, tx);
+      if (!verify.ok || account === null || account.status !== 'active') {
         return {
           status: 400,
           view: makeErrorEnvelope(req.id, PASSCODE_FAILED, 'Passcode verification failed.'),

@@ -357,3 +357,32 @@ describe('email+PIN — recovery/start is a non-oracle (Codex HIGH)', () => {
     expect(locked.body).toBe(unknown.body);
   });
 });
+
+describe('email+PIN — recovery/verify is a non-oracle (Codex round-7 HIGH)', () => {
+  it('D3. /recovery/pin/verify returns an identical 400 PASSCODE_FAILED for a wrong code on a registered email and on an unknown email', async () => {
+    // Registered email, but a wrong passcode → 400 PASSCODE_FAILED.
+    const known = uniqueEmail();
+    expect((await registerEmailPin(known, '481975')).statusCode).toBe(201);
+    await post('/v0/identity/recovery/pin/start', { email: known });
+    const knownWrong = await post('/v0/identity/recovery/pin/verify', {
+      email: known,
+      passcode: '000001',
+      new_pin: '620914',
+    });
+
+    // Unknown email → recovery/start issued a real (account_id=null) challenge,
+    // so verify runs the same passcode consumption before the account lookup
+    // fails. Same 400 PASSCODE_FAILED body — no account-existence oracle.
+    const unknown = uniqueEmail();
+    await post('/v0/identity/recovery/pin/start', { email: unknown });
+    const unknownWrong = await post('/v0/identity/recovery/pin/verify', {
+      email: unknown,
+      passcode: '000001',
+      new_pin: '620914',
+    });
+
+    expect(knownWrong.statusCode).toBe(400);
+    expect(unknownWrong.statusCode).toBe(400);
+    expect(knownWrong.body).toBe(unknownWrong.body);
+  });
+});
