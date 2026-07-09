@@ -336,24 +336,26 @@ export async function pinLoginHandler(req: FastifyRequest, reply: FastifyReply):
       }
 
       if (!pinService.verifyPin(pin, cred.pin_hash, cred.pin_salt)) {
-        const next = pinService.nextFailureState({
-          failedAttempts: cred.failed_attempts,
-          lockedUntil,
-        });
-        await pinRepo.recordFailure(
+        // Codex HIGH fix: account the failure with a single row-atomic SQL
+        // increment so N concurrent wrong-PIN attempts each count (Postgres
+        // row-locking serializes them) — the prior read-in-app / write-
+        // absolute path let parallel failures collapse into one.
+        const state = await pinRepo.recordFailureAtomic(
           ctx.tenantId,
           account.account_id,
-          next.failedAttempts,
-          next.lockedUntil === null ? null : next.lockedUntil.toISOString(),
+          pinService.MAX_PIN_ATTEMPTS,
+          pinService.PIN_LOCKOUT_MINUTES,
           tx,
         );
+        const lockedNow =
+          state.lockedUntil !== null && new Date(state.lockedUntil).getTime() > Date.now();
         await emitPinLoginFailedAudit(
           {
             tenantId: ctx.tenantId,
             accountId: account.account_id,
             actorId: 'system',
             countryOfCare: ctx.countryOfCare,
-            lockedOut: next.lockedUntil !== null,
+            lockedOut: lockedNow,
           },
           tx,
         );
@@ -406,16 +408,32 @@ export async function pinRecoveryStartHandler(
     mapServiceError,
     async (tx: DbTransaction) => {
       const account = await accountService.findAccountByEmail(ctx, email, tx);
-      // Issue a passcode ONLY if the account exists — but ALWAYS return 200 so
-      // a caller cannot learn whether the email is registered (I-025 enumeration
-      // defense; this diverges intentionally from registration/start).
+      // Issue a passcode ONLY if the account exists — but ALWAYS return the
+      // SAME 200 body so a caller cannot learn whether the email is registered
+      // (I-025 enumeration defense; diverges intentionally from
+      // registration/start).
+      //
+      // Codex HIGH fix: issuePasscode throws PASSCODE_LOCKOUT_ACTIVE when a
+      // recovery cooldown is active for this email. If that propagated, the
+      // shared mapper would turn it into a 400 — which, since unknown emails
+      // return 200, becomes an existence oracle (an attacker locks a real
+      // email then reads 400=registered vs 200=unknown). Swallow the cooldown
+      // and still return the identical 200. Truly-unexpected errors still
+      // propagate (they 500 regardless of existence, so they leak nothing).
       if (account !== null && account.status === 'active') {
-        await passcodeService.issuePasscode(
-          ctx,
-          { actorId: 'system' },
-          { passcode_id: ulid(), account_id: account.account_id, email, purpose: 'pin_recovery' },
-          tx,
-        );
+        try {
+          await passcodeService.issuePasscode(
+            ctx,
+            { actorId: 'system' },
+            { passcode_id: ulid(), account_id: account.account_id, email, purpose: 'pin_recovery' },
+            tx,
+          );
+        } catch (err) {
+          if (!(err instanceof Error && err.message === passcodeService.PASSCODE_LOCKOUT_ACTIVE)) {
+            throw err;
+          }
+          // Cooldown active — do not reveal it on this endpoint.
+        }
       }
       return { status: 200, view: { status: 'ok' } };
     },

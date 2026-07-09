@@ -142,24 +142,59 @@ export async function recordSuccess(
   });
 }
 
-/** Persist the post-FAILURE lockout state computed by pin-service. */
-export async function recordFailure(
+/**
+ * Atomically record a FAILED PIN attempt (Codex review 2026-07-09 HIGH:
+ * the previous read-in-app / write-absolute-count path let N concurrent
+ * wrong-PIN requests all read the same failed_attempts and write the same
+ * next value — undercounting the lockout under parallel brute force).
+ *
+ * The increment + lockout derivation happen in ONE UPDATE that reads
+ * failed_attempts from the current row value, so Postgres row-locking
+ * serializes concurrent failures on the same credential — every wrong PIN
+ * counts. When the incremented count reaches maxAttempts, the cooldown is
+ * set and the counter resets to 0 (the cooldown IS the penalty; a fresh
+ * window starts after it elapses). Returns the post-update state.
+ */
+export async function recordFailureAtomic(
   tenantId: TenantId,
   accountId: string,
-  failedAttempts: number,
-  lockedUntil: string | null,
+  maxAttempts: number,
+  lockoutMinutes: number,
   externalTx?: DbClient,
-): Promise<void> {
+): Promise<{ failedAttempts: number; lockedUntil: string | null }> {
   const runner = externalTx
-    ? (fn: (c: DbClient) => Promise<void>) => fn(externalTx)
-    : (fn: (c: DbClient) => Promise<void>) => withTenantBoundConnection(tenantId, fn);
-  await runner(async (client) => {
-    await client.query(
+    ? (fn: (c: DbClient) => Promise<{ failedAttempts: number; lockedUntil: string | null }>) =>
+        fn(externalTx)
+    : (fn: (c: DbClient) => Promise<{ failedAttempts: number; lockedUntil: string | null }>) =>
+        withTenantBoundConnection(tenantId, fn);
+  return runner(async (client) => {
+    const result = await client.query<{
+      failed_attempts: number;
+      locked_until: Date | string | null;
+    }>(
       `UPDATE account_pin_credentials
-          SET failed_attempts = $3,
-              locked_until = $4::timestamptz
-        WHERE tenant_id = $1 AND account_id = $2`,
-      [tenantId, accountId, failedAttempts, lockedUntil],
+          SET failed_attempts = CASE
+                  WHEN failed_attempts + 1 >= $3 THEN 0
+                  ELSE failed_attempts + 1
+              END,
+              locked_until = CASE
+                  WHEN failed_attempts + 1 >= $3
+                      THEN NOW() + ($4 || ' minutes')::interval
+                  ELSE locked_until
+              END
+        WHERE tenant_id = $1 AND account_id = $2
+       RETURNING failed_attempts, locked_until`,
+      [tenantId, accountId, maxAttempts, lockoutMinutes],
     );
+    const row = result.rows[0];
+    if (row === undefined) {
+      // Credential vanished mid-flight (deleted account); treat as locked-out
+      // fail-closed rather than silently succeeding.
+      return { failedAttempts: 0, lockedUntil: new Date(Date.now() + 60_000).toISOString() };
+    }
+    return {
+      failedAttempts: row.failed_attempts,
+      lockedUntil: row.locked_until === null ? null : tsToIso(row.locked_until),
+    };
   });
 }

@@ -243,3 +243,42 @@ describe('email+PIN — tenant isolation (I-023/I-025)', () => {
     expect(res.statusCode).toBe(401);
   });
 });
+
+describe('email+PIN — lockout counting boundary (Codex HIGH: row-atomic accounting)', () => {
+  it('C2. 4 wrong attempts do NOT lock — the 5th (correct) PIN still logs in', async () => {
+    const email = uniqueEmail();
+    const pin = '481975';
+    expect((await registerEmailPin(email, pin)).statusCode).toBe(201);
+    for (let i = 0; i < 4; i++) {
+      expect((await post('/v0/identity/login/pin', { email, pin: '000001' })).statusCode).toBe(401);
+    }
+    // Not locked at 4 — a correct PIN succeeds (and resets the counter).
+    expect((await post('/v0/identity/login/pin', { email, pin })).statusCode).toBe(200);
+  });
+});
+
+describe('email+PIN — recovery/start is a non-oracle (Codex HIGH)', () => {
+  it('D2. /recovery/pin/start returns an identical 200 for a lockout-active registered email and an unknown email', async () => {
+    const email = uniqueEmail();
+    expect((await registerEmailPin(email, '481975')).statusCode).toBe(201);
+
+    // Drive the recovery passcode into cooldown: issue one, then exhaust its
+    // 3 verify attempts with wrong codes.
+    expect((await post('/v0/identity/recovery/pin/start', { email })).statusCode).toBe(200);
+    for (let i = 0; i < 3; i++) {
+      await post('/v0/identity/recovery/pin/verify', {
+        email,
+        passcode: '000001',
+        new_pin: '620914',
+      });
+    }
+
+    // Registered-but-locked: MUST still be 200 with the same body (not 400).
+    const locked = await post('/v0/identity/recovery/pin/start', { email });
+    expect(locked.statusCode).toBe(200);
+    // Unknown email: 200 with the same body.
+    const unknown = await post('/v0/identity/recovery/pin/start', { email: uniqueEmail() });
+    expect(unknown.statusCode).toBe(200);
+    expect(locked.body).toBe(unknown.body);
+  });
+});

@@ -120,23 +120,13 @@ export interface LockoutState {
   lockedUntil: Date | null;
 }
 
-/** True if the credential is currently in cooldown lockout. */
+/**
+ * True if the credential is currently in cooldown lockout. This is the
+ * pre-verify optimization (short-circuits before a scrypt derivation); the
+ * authoritative, concurrency-safe accounting is the row-atomic
+ * `recordFailureAtomic` in pin-credentials-repo (Codex 2026-07-09 HIGH — the
+ * lockout must not be computed read-modify-write in app code).
+ */
 export function isLockedOut(state: LockoutState, now: Date = new Date()): boolean {
   return state.lockedUntil !== null && state.lockedUntil.getTime() > now.getTime();
-}
-
-/**
- * Compute the next lockout state after a FAILED attempt. When the incremented
- * count reaches MAX_PIN_ATTEMPTS, set a cooldown and reset the counter to 0
- * (the cooldown IS the penalty; a fresh window starts after it elapses).
- */
-export function nextFailureState(current: LockoutState, now: Date = new Date()): LockoutState {
-  const attempts = current.failedAttempts + 1;
-  if (attempts >= MAX_PIN_ATTEMPTS) {
-    return {
-      failedAttempts: 0,
-      lockedUntil: new Date(now.getTime() + PIN_LOCKOUT_MINUTES * 60 * 1000),
-    };
-  }
-  return { failedAttempts: attempts, lockedUntil: null };
 }
