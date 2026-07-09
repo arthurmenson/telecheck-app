@@ -45,10 +45,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../../../../lib/tenant-context.js', () => ({
   requireTenantContext: vi.fn(),
 }));
-vi.mock('../../../../lib/admin-role.js', () => ({
-  requireAdminRole: vi.fn(),
-}));
 vi.mock('../../../../lib/auth-context.js', () => ({
+  requireSliceRoleMembership: vi.fn(),
   resolveActorTenantIdForAudit: vi.fn(),
 }));
 vi.mock('../../../../lib/rls.js', () => ({
@@ -69,8 +67,10 @@ vi.mock('../../audit.js', () => ({
 
 // Imports AFTER vi.mock declarations.
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { requireAdminRole } from '../../../../lib/admin-role.js';
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
+import {
+  requireSliceRoleMembership,
+  resolveActorTenantIdForAudit,
+} from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -171,7 +171,7 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
   vi.mocked(requireTenantContext).mockReturnValue(
     FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
   );
-  vi.mocked(requireAdminRole).mockReturnValue('platform_admin');
+  vi.mocked(requireSliceRoleMembership).mockImplementation((_req, role) => role);
   vi.mocked(resolveActorTenantIdForAudit).mockReturnValue(FAKE_TENANT_CTX.tenantId);
   vi.mocked(withIdempotentExecution).mockImplementation(async (_req, _reply, _mapErr, body) => {
     // Pass the fake tx into the body callback + return whatever it
@@ -218,7 +218,7 @@ describe('postFormsTemplateSubmitHandler §1 — happy path composition (initial
     };
 
     expect(requireTenantContext).toHaveBeenCalledWith(req);
-    expect(requireAdminRole).toHaveBeenCalledWith(req);
+    expect(requireSliceRoleMembership).toHaveBeenCalledWith(req, 'admin_basic_operator');
     expect(withIdempotentExecution).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledWith(tx, 'Telecheck-US', expect.any(Function));
@@ -252,7 +252,7 @@ describe('postFormsTemplateSubmitHandler §1 — happy path composition (initial
 // ---------------------------------------------------------------------------
 
 describe('postFormsTemplateSubmitHandler §2 — tenant guard precedes tx', () => {
-  it('§2a requireTenantContext throw aborts before requireAdminRole + withIdempotentExecution are called', async () => {
+  it('§2a requireTenantContext throw aborts before requireSliceRoleMembership + withIdempotentExecution are called', async () => {
     vi.mocked(requireTenantContext).mockImplementation(() => {
       throw new Error('tenantContext absent — programming error');
     });
@@ -261,7 +261,7 @@ describe('postFormsTemplateSubmitHandler §2 — tenant guard precedes tx', () =
       /tenantContext absent/,
     );
 
-    expect(requireAdminRole).not.toHaveBeenCalled();
+    expect(requireSliceRoleMembership).not.toHaveBeenCalled();
     expect(withIdempotentExecution).not.toHaveBeenCalled();
   });
 });
@@ -271,11 +271,11 @@ describe('postFormsTemplateSubmitHandler §2 — tenant guard precedes tx', () =
 // ---------------------------------------------------------------------------
 
 describe('postFormsTemplateSubmitHandler §3 — admin-role guard precedes tx', () => {
-  it('§3a requireAdminRole throw aborts before withIdempotentExecution is called', async () => {
+  it('§3a requireSliceRoleMembership throw aborts before withIdempotentExecution is called', async () => {
     vi.mocked(requireTenantContext).mockReturnValue(
       FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
     );
-    vi.mocked(requireAdminRole).mockImplementation(() => {
+    vi.mocked(requireSliceRoleMembership).mockImplementation(() => {
       throw new Error('forbidden: actor lacks admin role');
     });
 

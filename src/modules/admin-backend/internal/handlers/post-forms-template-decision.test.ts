@@ -43,10 +43,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../../../../lib/tenant-context.js', () => ({
   requireTenantContext: vi.fn(),
 }));
-vi.mock('../../../../lib/admin-role.js', () => ({
-  requireAdminRole: vi.fn(),
-}));
 vi.mock('../../../../lib/auth-context.js', () => ({
+  requireSliceRoleMembership: vi.fn(),
   resolveActorTenantIdForAudit: vi.fn(),
 }));
 vi.mock('../../../../lib/rls.js', () => ({
@@ -63,16 +61,22 @@ vi.mock('../../../../lib/idempotent-handler.js', () => ({
 }));
 vi.mock('../../audit.js', () => ({
   emitTemplateReviewDecisionAudit: vi.fn(),
+  emitTemplatePublishedViaReviewWorkflowAudit: vi.fn(),
 }));
 
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { requireAdminRole } from '../../../../lib/admin-role.js';
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
+import {
+  requireSliceRoleMembership,
+  resolveActorTenantIdForAudit,
+} from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
-import { emitTemplateReviewDecisionAudit } from '../../audit.js';
+import {
+  emitTemplatePublishedViaReviewWorkflowAudit,
+  emitTemplateReviewDecisionAudit,
+} from '../../audit.js';
 
 import { postFormsTemplateDecisionHandler } from './post-forms-template-decision.js';
 
@@ -134,7 +138,7 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
   vi.mocked(requireTenantContext).mockReturnValue(
     FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
   );
-  vi.mocked(requireAdminRole).mockReturnValue('platform_admin');
+  vi.mocked(requireSliceRoleMembership).mockImplementation((_req, role) => role);
   vi.mocked(resolveActorTenantIdForAudit).mockReturnValue('Telecheck-US');
   vi.mocked(withIdempotentExecution).mockImplementation(async (_req, _reply, _mapper, fn) =>
     fn(
@@ -150,6 +154,7 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
   vi.mocked(withActorContext).mockImplementation(async (_client, _nonce, fn) => fn());
   vi.mocked(withDbRole).mockImplementation(async (_tx, _role, fn) => fn());
   vi.mocked(emitTemplateReviewDecisionAudit).mockResolvedValue({} as never);
+  vi.mocked(emitTemplatePublishedViaReviewWorkflowAudit).mockResolvedValue({} as never);
 }
 
 // ---------------------------------------------------------------------------
@@ -162,10 +167,11 @@ describe('postFormsTemplateDecisionHandler §1 — happy path approve', () => {
   it('§1a composes withIdempotentExecution → withTenantContext → withActorContext → withDbRole(admin_template_reviewer) → SECDEF call → audit', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
-    await postFormsTemplateDecisionHandler(makeReq({ actorNonce: 'nonce-x' }), makeReply());
+    const req = makeReq({ actorNonce: 'nonce-x' });
+    await postFormsTemplateDecisionHandler(req, makeReply());
 
     expect(requireTenantContext).toHaveBeenCalledTimes(1);
-    expect(requireAdminRole).toHaveBeenCalledTimes(1);
+    expect(requireSliceRoleMembership).toHaveBeenCalledWith(req, 'admin_template_reviewer');
     expect(withIdempotentExecution).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledTimes(1);
     expect(withActorContext).toHaveBeenCalledTimes(1);
@@ -217,7 +223,7 @@ describe('postFormsTemplateDecisionHandler §3 — admin role guard precedence',
     vi.mocked(requireTenantContext).mockReturnValue(
       FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
     );
-    vi.mocked(requireAdminRole).mockImplementation(() => {
+    vi.mocked(requireSliceRoleMembership).mockImplementation(() => {
       throw new Error('AdminRoleRequired');
     });
     await expect(postFormsTemplateDecisionHandler(makeReq(), makeReply())).rejects.toThrow(
@@ -407,5 +413,46 @@ describe('postFormsTemplateDecisionHandler §7 — decision-value branch', () =>
       postFormsTemplateDecisionHandler(makeReq({ body: { decision: 'maybe' } }), makeReply()),
     ).rejects.toThrow(/Invalid request body/);
     expect(withIdempotentExecution).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §8 — approve-path publish audit (admin.template_published_via_review_workflow)
+//      Per SI-023 §3 row 4, the approve path additionally emits the publish
+//      audit; reject / request_revision do NOT.
+// ---------------------------------------------------------------------------
+
+describe('postFormsTemplateDecisionHandler §8 — publish audit on approve path only', () => {
+  beforeEach(() => vi.resetAllMocks());
+
+  it('§8a decision=approve emits emitTemplatePublishedViaReviewWorkflowAudit alongside the decision audit', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    await postFormsTemplateDecisionHandler(
+      makeReq({ actorNonce: 'nonce-x', body: { decision: 'approve', decision_payload: {} } }),
+      makeReply(),
+    );
+
+    expect(emitTemplateReviewDecisionAudit).toHaveBeenCalledTimes(1);
+    expect(emitTemplatePublishedViaReviewWorkflowAudit).toHaveBeenCalledTimes(1);
+    const publishArgs = vi.mocked(emitTemplatePublishedViaReviewWorkflowAudit).mock.calls[0]![0];
+    expect(publishArgs.tenantId).toBe('Telecheck-US');
+    expect(publishArgs.reviewId).toBe(VALID_REVIEW_ID);
+    expect(publishArgs.formsTemplateId).toBe(VALID_TEMPLATE_ID);
+  });
+
+  it('§8b decision=reject / request_revision do NOT emit the publish audit', async () => {
+    for (const decision of ['reject', 'request_revision'] as const) {
+      vi.resetAllMocks();
+      const tx = makeFakeTx();
+      installDefaultCompositionMocks(tx);
+      await postFormsTemplateDecisionHandler(
+        makeReq({ actorNonce: 'nonce-x', body: { decision, decision_payload: {} } }),
+        makeReply(),
+      );
+
+      expect(emitTemplateReviewDecisionAudit).toHaveBeenCalledTimes(1);
+      expect(emitTemplatePublishedViaReviewWorkflowAudit).not.toHaveBeenCalled();
+    }
   });
 });

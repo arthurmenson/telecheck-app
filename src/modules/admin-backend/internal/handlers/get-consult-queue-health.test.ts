@@ -31,8 +31,9 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // vi.mock hoists ABOVE imports.
-vi.mock('../../../../lib/admin-role.js', () => ({
-  requireAdminRole: vi.fn(),
+vi.mock('../../../../lib/auth-context.js', () => ({
+  requireSliceRoleMembership: vi.fn(),
+  resolveActorTenantIdForAudit: vi.fn(),
 }));
 vi.mock('../../../../lib/tenant-context.js', () => ({
   requireTenantContext: vi.fn(),
@@ -49,9 +50,15 @@ vi.mock('../../../../lib/actor-context-binding.js', () => ({
 vi.mock('../../../../lib/with-db-role.js', () => ({
   withDbRole: vi.fn(),
 }));
+vi.mock('../../audit.js', () => ({
+  emitDashboardQueryExecutedAudit: vi.fn(async () => ({})),
+}));
 
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { requireAdminRole } from '../../../../lib/admin-role.js';
+import {
+  requireSliceRoleMembership,
+  resolveActorTenantIdForAudit,
+} from '../../../../lib/auth-context.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -108,6 +115,10 @@ function makeReq(opts?: { actorNonce?: string | undefined }): FastifyRequest {
   };
   return {
     actorNonce: opts?.actorNonce,
+    // Sprint 4: handler reads req.actorContext?.accountId ?? req.headers
+    // ['x-actor-id'] for Cat A audit attribution — provide empty defaults.
+    actorContext: undefined,
+    headers: {},
     server: { httpErrors },
   } as unknown as FastifyRequest;
 }
@@ -120,7 +131,8 @@ function installDefaultCompositionMocks(tx: FakeTx): void {
   vi.mocked(requireTenantContext).mockReturnValue(
     FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
   );
-  vi.mocked(requireAdminRole).mockReturnValue('platform_admin');
+  vi.mocked(requireSliceRoleMembership).mockImplementation((_req, role) => role);
+  vi.mocked(resolveActorTenantIdForAudit).mockReturnValue('Telecheck-US');
   vi.mocked(withTransaction).mockImplementation(async (fn) =>
     fn(tx as unknown as Parameters<typeof fn>[0]),
   );
@@ -148,7 +160,7 @@ describe('getConsultQueueHealthHandler §1 — happy path composition (post-hygi
     const result = await getConsultQueueHealthHandler(req, makeReply());
 
     expect(requireTenantContext).toHaveBeenCalledWith(req);
-    expect(requireAdminRole).toHaveBeenCalledWith(req);
+    expect(requireSliceRoleMembership).toHaveBeenCalledWith(req, 'admin_basic_operator');
     expect(withTransaction).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledTimes(1);
     expect(withTenantContext).toHaveBeenCalledWith(tx, 'Telecheck-US', expect.any(Function));
@@ -192,7 +204,7 @@ describe('getConsultQueueHealthHandler §2 — tenant guard precedes tx', () => 
       /tenantContext absent/,
     );
 
-    expect(requireAdminRole).not.toHaveBeenCalled();
+    expect(requireSliceRoleMembership).not.toHaveBeenCalled();
     expect(withTransaction).not.toHaveBeenCalled();
   });
 });
@@ -202,11 +214,11 @@ describe('getConsultQueueHealthHandler §2 — tenant guard precedes tx', () => 
 // ---------------------------------------------------------------------------
 
 describe('getConsultQueueHealthHandler §3 — admin-role guard precedes tx', () => {
-  it('§3a requireAdminRole throw aborts before withTransaction is called', async () => {
+  it('§3a requireSliceRoleMembership throw aborts before withTransaction is called', async () => {
     vi.mocked(requireTenantContext).mockReturnValue(
       FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
     );
-    vi.mocked(requireAdminRole).mockImplementation(() => {
+    vi.mocked(requireSliceRoleMembership).mockImplementation(() => {
       throw new Error('forbidden: actor lacks admin role');
     });
 

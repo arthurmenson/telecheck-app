@@ -33,6 +33,7 @@ import fp from 'fastify-plugin';
 import type { PoolClient } from 'pg';
 
 import { type BindActorRole, bindActorContextForRequest } from './actor-context-binding.js';
+import { requireAdminRole } from './admin-role.js';
 import { config } from './config.js';
 import { getBindActorContextPool } from './db.js';
 import type { TenantId } from './glossary.js';
@@ -779,6 +780,108 @@ export function requireAdminActorContext(
     throw new UnauthorizedRoleError(['tenant_admin', 'platform_admin'], actor.role);
   }
   return actor as ActorContext & { role: 'tenant_admin' | 'platform_admin' };
+}
+
+// ---------------------------------------------------------------------------
+// SI-023 admin slice-role membership gate (Sprint 4 hardening 2026-07-09)
+//
+// Replaces the legacy `requireAdminRole` shim call at the 5 SI-023 §5 admin
+// handlers with a slice-role-membership gate that mirrors the ratified
+// crisis-response pattern (`requireCrisisInitiatorActorContext` above) so
+// the LAYER B authorization is honest-fail-closed rather than
+// deferred-permissive.
+//
+// **Why this is fail-closed, not permissive** (the /ready-flip criterion,
+// contrast with the med-interaction PR #262 counter-example that stayed
+// 503 for a permissive LAYER B):
+//
+//   1. `requireAdminRole(req)` is the ratified admin-authorization boundary
+//      (src/lib/admin-role.ts). It already fails closed on every axis:
+//        - verified non-admin JWT (patient/clinician) → 403 (no header
+//          fall-through; Phase 2 R1 HIGH closure)
+//        - presented-but-rejected JWT → 401 (Phase 2 R2 HIGH closure)
+//        - tenant_admin with wrong tenant binding → 403 (cross-tenant
+//          admin defense enforced at authContextPlugin + re-checked in
+//          admin-role.ts)
+//        - production without ALLOW_ACTOR_HEADER_AUTH + no JWT → 401
+//      This gate calls it FIRST, so a non-admin actor never reaches the
+//      slice-role binding.
+//
+//   2. The DB layer is the security FLOOR. Each SI-023 §5 endpoint's
+//      SECDEF wrapper is EXECUTE-granted ONLY to its ratified slice role
+//      (`admin_basic_operator` for dashboards + submit;
+//      `admin_template_reviewer` for decision — SI-023 §7 grant matrix +
+//      migration 043/044). `telecheck_app_role` is NOINHERIT-member per
+//      migration 051, so the wrapper only runs after an explicit
+//      `withDbRole(tx, <the bound slice role>, ...)` elevation. Binding
+//      the WRONG slice role here (e.g., admin_basic_operator on the
+//      decision endpoint) would raise 42501 at the wrapper EXECUTE-grant
+//      boundary → tenant-blind 403, NOT a silent authorization bypass.
+//
+// The gate returns the bound `SliceRole` so the handler threads the SAME
+// role into `withDbRole` — single source of truth for the endpoint's
+// slice-role identity, eliminating the prior hazard of the shim call and
+// the `withDbRole` literal drifting apart.
+//
+// **Closest-available eligibility (mirrors crisis's clinician-only
+// stopgap):** both canonical RBAC v1.1 admin JWT roles (tenant_admin,
+// platform_admin) map to "entitled to the admin slice roles" at this
+// slice's v0.1 — the per-actor slice-role membership table
+// (`tenant_account_membership` per SI-023 §5, deferred under the Option 2
+// carryforward) is not in the code repo. When that lands, this gate gains
+// a DB membership lookup keyed on (actor, requiredRole) without any
+// call-site refactor: the handler already passes the required role in and
+// receives the bound role out.
+//
+// Spec references:
+//   - SI-023 §5 endpoint→role map (dashboards + submit = admin_basic_operator;
+//     decision = admin_template_reviewer)
+//   - SI-023 §7 RBAC grant matrix
+//   - migrations 043/044 (wrapper EXECUTE grants) + 051 §2 (Option B
+//     NOINHERIT membership bridge)
+//   - crisis-response `requireCrisisInitiatorActorContext` precedent
+//     (P-041/P-042 slice-role-gate pattern)
+// ---------------------------------------------------------------------------
+
+/**
+ * The two SI-023 admin slice roles. Kept as a local literal union (not an
+ * import from `with-db-role.ts`) so the gate's accepted set is the narrow
+ * admin subset, not the full 24-role `SliceRole` allowlist — passing a
+ * non-admin slice role here is a compile error.
+ */
+export type AdminSliceRole = 'admin_basic_operator' | 'admin_template_reviewer';
+
+/**
+ * Assert that the request carries an authenticated admin actor authorized
+ * for the resolved tenant (via the ratified `requireAdminRole` boundary),
+ * and return the required admin slice role bound for this endpoint.
+ *
+ * The caller threads the returned role into `withDbRole(tx, role, ...)`
+ * so the handler's slice-role elevation cannot drift from its LAYER B
+ * assertion.
+ *
+ * @param req           The Fastify request (must have run tenantContext +
+ *                      authContext plugins).
+ * @param requiredRole  The endpoint's ratified SI-023 §5 slice role.
+ * @returns             The bound `AdminSliceRole` (=== requiredRole).
+ * @throws              Whatever `requireAdminRole` throws — 401
+ *                      (unauthenticated / presented-but-rejected JWT /
+ *                      prod-no-opt-in) or 403 (non-admin role / wrong
+ *                      tenant binding). All tenant-blind per I-025.
+ */
+export function requireSliceRoleMembership(
+  req: FastifyRequest,
+  requiredRole: AdminSliceRole,
+): AdminSliceRole {
+  // Delegate the admin-authorization decision to the ratified boundary.
+  // It fails closed on every non-admin / wrong-tenant / rejected-JWT axis
+  // (see admin-role.ts). We do NOT re-implement that logic here — a single
+  // authorization boundary is the correct discipline.
+  requireAdminRole(req);
+  // Actor is a tenant-scoped-authorized admin. Bind the endpoint's ratified
+  // slice role. The DB `withDbRole` elevation + wrapper EXECUTE grant is the
+  // enforcing floor: binding the wrong role raises 42501 → tenant-blind 403.
+  return requiredRole;
 }
 
 // ---------------------------------------------------------------------------

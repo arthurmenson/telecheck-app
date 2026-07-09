@@ -110,8 +110,10 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { requireAdminRole } from '../../../../lib/admin-role.js';
-import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
+import {
+  resolveActorTenantIdForAudit,
+  requireSliceRoleMembership,
+} from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
@@ -275,15 +277,15 @@ export async function postFormsTemplateSubmitHandler(
   // absent → tenant-blind 400 via error-envelope).
   const ctx = requireTenantContext(req);
 
-  // Phase 2 — LAYER B authorization (admin role gate). See file-header
-  // docstring for the deferred-permissive rationale + Sprint 4 swap TODO.
-  //
-  // TODO(SI-023 Sprint 4): replace with explicit
-  // `requireSliceRoleMembership('admin_basic_operator')` once identity
-  // surfaces per-actor slice-role membership. Until then the admin-role
-  // shim provides the conservative gate (admin identities only) without
-  // leaving the endpoint open to any authenticated actor.
-  requireAdminRole(req);
+  // Phase 2 — LAYER B authorization (SI-023 §5 slice-role-membership gate;
+  // Sprint 4 hardening). Binds `admin_basic_operator` (the ratified role
+  // for submit-for-review per SI-023 §5 endpoint 4 — R6 HIGH-3 closure:
+  // admin_basic_operator ONLY) after asserting the actor is a
+  // tenant-authorized admin. Bound role threaded into `withDbRole` below
+  // (single source of truth; binding the wrong role → 42501 → 403 at the
+  // DB EXECUTE-grant floor). Fail-closed on every non-admin / wrong-tenant
+  // / rejected-JWT axis via the ratified admin-role boundary.
+  const sliceRole = requireSliceRoleMembership(req, 'admin_basic_operator');
 
   // Phase 3 — URL params validation at the HTTP boundary.
   const paramsParsed = PathParamsSchema.safeParse(req.params);
@@ -342,7 +344,7 @@ export async function postFormsTemplateSubmitHandler(
         // tenant-scope guard.
         let reviewId: string;
         try {
-          reviewId = await withDbRole(tx, 'admin_basic_operator', async () => {
+          reviewId = await withDbRole(tx, sliceRole, async () => {
             // Call the SECDEF wrapper. RETURNS UUID (initial review_id OR
             // existing revision_requested review_id).
             const wrapperResult = await tx.query<{ review_id: string }>(
