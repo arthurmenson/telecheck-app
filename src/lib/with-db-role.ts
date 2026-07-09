@@ -94,7 +94,9 @@ import type { DbClient } from './db.js';
 // crisis + admin + med-interaction) PLUS
 // migrations/061_async_consult_app_role_bridge.sql §1 (5 async-consult
 // roles) PLUS migrations/064 §4 (ai_service_account) PLUS
-// migrations/068 §3 (ai_service_mode1) — 20 roles total.
+// migrations/068 §3 (ai_service_mode1) PLUS
+// migrations/076_subscription_app_role_bridge.sql (4 subscription
+// roles) — 24 roles total.
 //
 // Adding a new role to this list WITHOUT a corresponding GRANT
 // in 051 (or a follow-up foundation migration) will cause SET LOCAL ROLE
@@ -140,6 +142,15 @@ export const SLICE_ROLES = [
   // conversation lifecycle tables, and bridges telecheck_app_role
   // membership per the 051 §2 Option B pattern)
   'ai_service_mode1',
+  // Subscription (CDM v1.2 §4.7/§4.8; State Machines v1.1 §15 — migration
+  // 074 creates the roles, 075 grants table privileges on subscriptions +
+  // subscription_events (direct-INSERT write path; no SECDEF wrappers per
+  // the Pharmacy + Refill v2.1 §8 non-prescription of wrappers), 076
+  // bridges telecheck_app_role membership per the 051 §2 Option B pattern)
+  'subscription_patient_manager',
+  'subscription_clinician_reviewer',
+  'subscription_system_scheduler',
+  'subscription_staff_reader',
 ] as const;
 
 export type SliceRole = (typeof SLICE_ROLES)[number];
