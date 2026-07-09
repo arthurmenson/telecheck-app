@@ -103,7 +103,7 @@ describe('admin-backend slice — §1 plugin wiring', () => {
         runtime_impact: string;
       }>;
     };
-    expect(body.status).toBe('ok');
+    expect(body.status).toBe('ready');
     expect(body.module).toBe('admin-backend');
     expect(Array.isArray(body.spec_gated_gaps)).toBe(true);
     // The single remaining gap is the catalog ratification — fail-conservative,
