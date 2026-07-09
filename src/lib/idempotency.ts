@@ -402,6 +402,14 @@ const ENDPOINT_TTL_OVERRIDES: ReadonlyMap<string, number> = new Map([
   // purged the moment its bearer token would expire anyway.
   ['/v0/identity/login/verify', 900], // plaintext access_token + refresh_token in body
   ['/v0/identity/registration/verify', 900], // plaintext PatientAccountView + tokens
+  // Email+PIN auth path (migration 078). Both endpoints issue a session and
+  // return plaintext access_token + refresh_token in the body, so they carry
+  // the same 900s = access_token-TTL cap as the phone-OTP auth endpoints
+  // above (Codex round-10 HIGH: without these, the token bodies fall through
+  // to DEFAULT_TTL_SECONDS = 24h, a 96x dwell-time regression). recovery/verify
+  // is deliberately absent — it resets the PIN and returns no tokens.
+  ['/v0/identity/registration/email/verify', 900], // plaintext access_token + refresh_token
+  ['/v0/identity/login/pin', 900], // plaintext access_token + refresh_token
 ]);
 
 const DEFAULT_TTL_SECONDS = 86400; // 24h per IDEMPOTENCY v5.1
