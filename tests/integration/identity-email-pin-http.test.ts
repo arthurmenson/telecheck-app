@@ -199,16 +199,43 @@ describe('email+PIN — login', () => {
 });
 
 describe('email+PIN — lockout', () => {
-  it('C1. 5 wrong PINs → the 6th attempt is 401 pin_locked', async () => {
+  it('C1. after 5 wrong PINs, the correct PIN is refused (locked) — 401 invalid_credentials (tenant-blind, not a distinct pin_locked code)', async () => {
     const email = uniqueEmail();
     expect((await registerEmailPin(email, '481975')).statusCode).toBe(201);
     for (let i = 0; i < 5; i++) {
       const r = await post('/v0/identity/login/pin', { email, pin: '000001' });
       expect(r.statusCode).toBe(401);
     }
+    // Locked: even the CORRECT PIN is refused — proving the lockout is enforced
+    // — but with the SAME code as any invalid attempt (Codex HIGH: no oracle).
     const locked = await post('/v0/identity/login/pin', { email, pin: '481975' });
     expect(locked.statusCode).toBe(401);
-    expect(json<{ error: { code: string } }>(locked).error.code).toBe('identity.login.pin_locked');
+    expect(json<{ error: { code: string } }>(locked).error.code).toBe(
+      'identity.login.invalid_credentials',
+    );
+  });
+
+  it('C3. lockout is not an enumeration oracle: a locked registered email and an unknown email return the same status + code after the same attempt pattern (Codex HIGH)', async () => {
+    const registered = uniqueEmail();
+    const unknown = uniqueEmail();
+    expect((await registerEmailPin(registered, '481975')).statusCode).toBe(201);
+
+    const drive = async (email: string): Promise<{ statusCode: number; code: string }> => {
+      let last = await post('/v0/identity/login/pin', { email, pin: '000001' });
+      for (let i = 0; i < 5; i++) {
+        last = await post('/v0/identity/login/pin', { email, pin: '000001' });
+      }
+      return {
+        statusCode: last.statusCode,
+        code: json<{ error: { code: string } }>(last).error.code,
+      };
+    };
+
+    const reg = await drive(registered);
+    const unk = await drive(unknown);
+    expect(reg.statusCode).toBe(unk.statusCode);
+    expect(reg.code).toBe(unk.code);
+    expect(reg.code).toBe('identity.login.invalid_credentials');
   });
 });
 

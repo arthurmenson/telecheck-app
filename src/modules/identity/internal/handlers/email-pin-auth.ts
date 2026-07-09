@@ -48,7 +48,6 @@ import { asAccountId, asSessionId } from '../types.js';
 
 const EMAIL_TAKEN = 'identity.registration.email_taken';
 const INVALID_CREDENTIALS = 'identity.login.invalid_credentials';
-const PIN_LOCKED = 'identity.login.pin_locked';
 const PASSCODE_FAILED = 'identity.email_passcode.verification_failed';
 const WEAK_PIN = 'identity.pin.weak';
 
@@ -333,13 +332,16 @@ export async function pinLoginHandler(req: FastifyRequest, reply: FastifyReply):
 
       const lockedUntil = cred.locked_until === null ? null : new Date(cred.locked_until);
       if (pinService.isLockedOut({ failedAttempts: cred.failed_attempts, lockedUntil })) {
+        // Codex HIGH fix: lockout is enforced (we stop here, no verify/session),
+        // but the RESPONSE must be indistinguishable from wrong-PIN / unknown-
+        // email — a distinct `pin_locked` code let an attacker drive any email
+        // into lockout and then read the code to tell registered-active
+        // accounts from unknown ones (enumeration + lockout-DoS oracle). Return
+        // the identical INVALID_CREDENTIALS envelope; the lockout audit already
+        // captured the event internally.
         return {
           status: 401,
-          view: makeErrorEnvelope(
-            req.id,
-            PIN_LOCKED,
-            'Too many failed attempts. Please try again later or reset your PIN.',
-          ),
+          view: makeErrorEnvelope(req.id, INVALID_CREDENTIALS, 'Invalid email or PIN.'),
         };
       }
 
