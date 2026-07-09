@@ -383,7 +383,14 @@ describe('email+PIN — recovery/verify is a non-oracle (Codex round-7 HIGH)', (
 
     expect(knownWrong.statusCode).toBe(400);
     expect(unknownWrong.statusCode).toBe(400);
-    expect(knownWrong.body).toBe(unknownWrong.body);
+    // Compare the error code + message (the tenant-blind surface). request_id
+    // is intentionally unique per request and is not an existence oracle, so
+    // it is normalised out of the comparison.
+    const errShape = (body: string) => {
+      const { code, message } = JSON.parse(body).error;
+      return { code, message };
+    };
+    expect(errShape(knownWrong.body)).toEqual(errShape(unknownWrong.body));
   });
 });
 
