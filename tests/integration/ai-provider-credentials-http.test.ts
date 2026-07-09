@@ -335,9 +335,9 @@ describe('SI-025 ai-providers — Group E: Cat B audit (no plaintext)', () => {
     const audits = await getTestClient().query<{
       action: string;
       category: string;
-      detail: unknown;
+      payload: unknown;
     }>(
-      `SELECT action, category, detail
+      `SELECT action, category, payload
          FROM audit_records
         WHERE tenant_id = $1 AND action LIKE 'ai_provider_credential.%'
         ORDER BY sequence_number DESC
@@ -350,7 +350,7 @@ describe('SI-025 ai-providers — Group E: Cat B audit (no plaintext)', () => {
     expect(actions).toContain('ai_provider_credential.revoked');
     for (const row of audits.rows) {
       expect(row.category).toBe('B');
-      const detailStr = JSON.stringify(row.detail);
+      const detailStr = JSON.stringify(row.payload);
       expect(detailStr).not.toContain(SAMPLE_KEY);
       expect(detailStr).not.toContain(ROTATED_KEY);
     }
