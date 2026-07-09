@@ -96,7 +96,8 @@ import type { DbClient } from './db.js';
 // roles) PLUS migrations/064 §4 (ai_service_account) PLUS
 // migrations/068 §3 (ai_service_mode1) PLUS
 // migrations/077_subscription_app_role_bridge.sql (4 subscription
-// roles) — 24 roles total.
+// roles) PLUS migration 079 (ai_provider_credential_writer +
+// ai_service_credential_reader) — 26 roles total.
 //
 // Adding a new role to this list WITHOUT a corresponding GRANT
 // in 051 (or a follow-up foundation migration) will cause SET LOCAL ROLE
@@ -151,6 +152,14 @@ export const SLICE_ROLES = [
   'subscription_clinician_reviewer',
   'subscription_system_scheduler',
   'subscription_staff_reader',
+  // SI-025 AI Provider Credentials (migration 079; 2 app roles bridged
+  // per the 051 §2 Option B pattern). The writer role holds INSERT/UPDATE
+  // + column-SELECT on ai_provider_credential; the reader role is the sole
+  // grantee of EXECUTE on the read_active_ai_provider_key() SECDEF wrapper.
+  // The ai_provider_credential_owner role is NOT a slice role (it is the
+  // table/SECDEF owner identity, never SET-ROLEd into by handlers).
+  'ai_provider_credential_writer',
+  'ai_service_credential_reader',
 ] as const;
 
 export type SliceRole = (typeof SLICE_ROLES)[number];

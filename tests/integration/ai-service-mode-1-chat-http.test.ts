@@ -122,7 +122,16 @@ beforeAll(async () => {
   // dedicated superuser connection per the async-consult-v1-http
   // precedent — do NOT rely on another suite's SLICE_ROLES-wide grant
   // loop having run first (fork order is nondeterministic).
-  await grantSliceRolesToTestApp(['ai_service_mode1']);
+  await grantSliceRolesToTestApp([
+    'ai_service_mode1',
+    // SI-025: the Mode 1 chat path now resolves the LLM provider via
+    // resolveClinicalProvider, which elevates to ai_service_credential_reader
+    // to read the admin-managed DB credential (read_active_ai_provider_key).
+    // Grant it so the SET LOCAL ROLE elevation does not 42501. With no
+    // credential + no env key configured the resolver returns NullLLMProvider,
+    // preserving the fail-soft assertions in this suite.
+    'ai_service_credential_reader',
+  ]);
   app = await buildApp({ logger: false });
   await app.ready();
 });
