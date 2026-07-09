@@ -1,9 +1,9 @@
 -- =============================================================================
--- File:    migrations/075_subscription_entities.sql
+-- File:    migrations/076_subscription_entities.sql
 -- Purpose: Subscription slice DB layer — `subscriptions` + `subscription_events`
 --          per CDM v1.2 §4.7 (Subscription) + §4.8 (SubscriptionEvent)
 --          (entities #32 / #33 in CDM §3.12 Ecom & Subscription Management),
---          plus table grants to the migration 074 slice roles and closure of
+--          plus table grants to the migration 075 slice roles and closure of
 --          the migration 060 DEFERRED-FK TODO on `refills.subscription_id`.
 --
 --          SI-001 closure context: this build was unblocked by Promotion
@@ -28,7 +28,7 @@
 --            025_medication_requests.sql (composite-UNIQUE FK targets)
 --          - migrations/060_pharmacy_refill_entities.sql (the deferred
 --            refills.subscription_id FK this migration closes)
---          - migrations/074_subscription_rbac_roles.sql (grantee roles)
+--          - migrations/075_subscription_rbac_roles.sql (grantee roles)
 --
 -- Option 2 adaptations from spec (recorded divergences; same class as the
 -- migration 033/040/047/056/060/067 recorded divergences):
@@ -77,14 +77,14 @@
 --   record their trail via AUDIT records only (app layer) until the enum is
 --   ratified. Fail-closed: no unratified enum value is invented.
 --
--- Preconditions: migrations 000-074 applied (001 tenants, 003 rls helpers,
+-- Preconditions: migrations 000-075 applied (001 tenants, 003 rls helpers,
 --   012 accounts, 024 product_catalog, 025 medication_requests, 060 refills,
---   074 subscription roles).
+--   075 subscription roles).
 -- Invariants: I-023 (RLS + composite tenant-scoped FKs on every child edge),
 --   I-025 (tenant-blind errors — handler layer), I-027 (audit tenancy —
 --   handler layer), CDM §4.7 constraints (pause window, terminal states),
 --   CDM §4.8 append-only.
--- Rollback: migrations/rollback/075_rollback.sql
+-- Rollback: migrations/rollback/076_rollback.sql
 -- =============================================================================
 
 -- =============================================================================
@@ -97,12 +97,12 @@ BEGIN
        OR to_regrole('subscription_clinician_reviewer') IS NULL
        OR to_regrole('subscription_system_scheduler') IS NULL
        OR to_regrole('subscription_staff_reader') IS NULL THEN
-        RAISE EXCEPTION 'migration-075-prerequisite-missing: subscription slice roles '
-            'missing (apply migration 074 first)'
+        RAISE EXCEPTION 'migration-076-prerequisite-missing: subscription slice roles '
+            'missing (apply migration 075 first)'
             USING ERRCODE = 'undefined_object';
     END IF;
     IF to_regclass('public.medication_requests') IS NULL THEN
-        RAISE EXCEPTION 'migration-075-prerequisite-missing: medication_requests missing '
+        RAISE EXCEPTION 'migration-076-prerequisite-missing: medication_requests missing '
             '(apply migration 025 first; SI-001 / P-011 target)'
             USING ERRCODE = 'undefined_object';
     END IF;
@@ -373,8 +373,8 @@ ALTER TABLE refills
         REFERENCES subscriptions (tenant_id, id);
 
 -- =============================================================================
--- Section 4 — Table grants to the migration 074 slice roles (direct-INSERT
--- write path; see 074 header WRITE-PATH NOTE). RLS (FORCEd above) remains the
+-- Section 4 — Table grants to the migration 075 slice roles (direct-INSERT
+-- write path; see 075 header WRITE-PATH NOTE). RLS (FORCEd above) remains the
 -- tenant floor beneath every grant.
 --
 --   subscription_patient_manager    INSERT (DRAFT create on behalf of the
@@ -418,7 +418,7 @@ BEGIN
             WHERE n.nspname = 'public' AND c.relname = v_table
               AND c.relrowsecurity AND c.relforcerowsecurity
         ) THEN
-            RAISE EXCEPTION 'migration-075-verification: table % missing or RLS not FORCED', v_table
+            RAISE EXCEPTION 'migration-076-verification: table % missing or RLS not FORCED', v_table
                 USING ERRCODE = 'check_violation';
         END IF;
     END LOOP;
@@ -429,7 +429,7 @@ BEGIN
        AND tablename = ANY (v_tables)
        AND policyname = 'tenant_isolation';
     IF v_count <> 2 THEN
-        RAISE EXCEPTION 'migration-075-verification: expected 2 tenant_isolation policies, found %', v_count
+        RAISE EXCEPTION 'migration-076-verification: expected 2 tenant_isolation policies, found %', v_count
             USING ERRCODE = 'check_violation';
     END IF;
 
@@ -442,7 +442,7 @@ BEGIN
        AND c.relname = 'subscription_events'
        AND NOT t.tgisinternal;
     IF v_count <> 2 THEN
-        RAISE EXCEPTION 'migration-075-verification: expected 2 append-only triggers on subscription_events, found %', v_count
+        RAISE EXCEPTION 'migration-076-verification: expected 2 append-only triggers on subscription_events, found %', v_count
             USING ERRCODE = 'check_violation';
     END IF;
 
@@ -451,14 +451,14 @@ BEGIN
         SELECT 1 FROM pg_constraint
          WHERE conname = 'refills_tenant_subscription_fk'
     ) THEN
-        RAISE EXCEPTION 'migration-075-verification: refills_tenant_subscription_fk missing (Section 3 did not apply)'
+        RAISE EXCEPTION 'migration-076-verification: refills_tenant_subscription_fk missing (Section 3 did not apply)'
             USING ERRCODE = 'check_violation';
     END IF;
 
     -- Grant posture: staff reader is SELECT-only on both tables
     IF has_table_privilege('subscription_staff_reader', 'public.subscriptions', 'INSERT, UPDATE, DELETE')
        OR has_table_privilege('subscription_staff_reader', 'public.subscription_events', 'INSERT, UPDATE, DELETE') THEN
-        RAISE EXCEPTION 'migration-075-verification: subscription_staff_reader holds a write privilege — must be read-only'
+        RAISE EXCEPTION 'migration-076-verification: subscription_staff_reader holds a write privilege — must be read-only'
             USING ERRCODE = 'check_violation';
     END IF;
 END $$;

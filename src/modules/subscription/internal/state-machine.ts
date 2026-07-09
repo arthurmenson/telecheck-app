@@ -30,7 +30,7 @@
  *
  * Guard invariants carried from §15:
  *   - SAFETY_HOLD release is clinician-only (no system/patient release).
- *   - Pause maximum is 90 days from paused_at (durable CHECK in 075 §1;
+ *   - Pause maximum is 90 days from paused_at (durable CHECK in 076 §1;
  *     also validated here for a friendly 400 before the DB 23514).
  *   - Cancellation deflection is bounded and NON-BLOCKING — the patient's
  *     choice to cancel is sovereign; deflection metadata is recorded,
@@ -39,14 +39,10 @@
  *     for switches at launch).
  *
  * Spec references: State Machines v1.1 §15; CDM v1.2 §4.7/§4.8;
- * Pharmacy + Refill Slice PRD v2.1 §8; migrations/075.
+ * Pharmacy + Refill Slice PRD v2.1 §8; migrations/076.
  */
 
-import type {
-  SubscriptionActorType,
-  SubscriptionEventType,
-  SubscriptionStatus,
-} from './types.js';
+import type { SubscriptionActorType, SubscriptionEventType, SubscriptionStatus } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Transition vocabulary
@@ -79,7 +75,7 @@ export interface TransitionSpec {
   actorTypes: readonly SubscriptionActorType[];
   /** CDM §4.8 event_type recorded in subscription_events, or null when the
    *  §15 emission has no ratified enum value (SPEC GAP — audit-only trail;
-   *  see migration 075 header + module README §Spec issues). */
+   *  see migration 076 header + module README §Spec issues). */
   eventType: SubscriptionEventType | null;
   /** AUDIT_EVENTS category per §15: "Switch approvals and SAFETY_HOLD events
    *  are Category A (safety-critical clinical); other transitions are

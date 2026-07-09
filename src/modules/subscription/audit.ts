@@ -179,7 +179,10 @@ export async function emitSubscriptionCreatedAudit(
   common: SubscriptionAuditCommon,
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
-  return emitAudit(buildEnvelope(subscriptionAuditPlaceholder('subscription_created'), 'C', common), tx);
+  return emitAudit(
+    buildEnvelope(subscriptionAuditPlaceholder('subscription_created'), 'C', common),
+    tx,
+  );
 }
 
 /**

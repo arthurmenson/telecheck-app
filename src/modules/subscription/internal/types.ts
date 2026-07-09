@@ -6,7 +6,7 @@
  * (MedicationRequest schema gap). SI-001 closed at Promotion Ledger P-011
  * (2026-05-11; migration 025 landed medication_requests); operator (Evans)
  * confirmed 2026-07-08 that P-011 closure authorizes this build. Row shapes
- * now mirror migrations 075 §1/§2 exactly.
+ * now mirror migrations 076 §1/§2 exactly.
  *
  * ID conventions: TYPES contract (v5.1 additions) defines `sub_` (subscription)
  * and `sue_` (subscription event) prefixes; OpenAPI v0.2 §20 shows the
@@ -17,7 +17,7 @@
  *   - CDM v1.2 §4.7 / §4.8 / §3.12
  *   - State Machines v1.1 §15 (status vocabulary)
  *   - Pharmacy + Refill Slice PRD v2.1 §8
- *   - migrations/075_subscription_entities.sql (durable shapes)
+ *   - migrations/076_subscription_entities.sql (durable shapes)
  */
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ export function asSubscriptionPauseId(s: string): SubscriptionPauseId {
 }
 
 // ---------------------------------------------------------------------------
-// Enums (mirror migration 075 CHECK constraints)
+// Enums (mirror migration 076 CHECK constraints)
 // ---------------------------------------------------------------------------
 
 /** State Machines v1.1 §15 — the 10 ratified states. */
@@ -116,7 +116,7 @@ export type SubscriptionStatus = (typeof SUBSCRIPTION_STATUSES)[number];
 export const SUBSCRIPTION_CADENCES = ['monthly', 'quarterly', 'biannual'] as const;
 export type SubscriptionCadence = (typeof SUBSCRIPTION_CADENCES)[number];
 
-/** CDM v1.2 §4.8 event_type enum — VERBATIM 13 values. See the migration 075
+/** CDM v1.2 §4.8 event_type enum — VERBATIM 13 values. See the migration 076
  *  header SPEC GAP note: the State Machines v1.1 §15 emissions `fulfilled`,
  *  `switch_declined`, and `terminated_clinical` (and any period_end marker)
  *  have NO ratified enum value; those transitions are audit-only until the
@@ -180,12 +180,12 @@ export const DEFLECTION_OUTCOMES = [
 export type DeflectionOutcome = (typeof DEFLECTION_OUTCOMES)[number];
 
 // ---------------------------------------------------------------------------
-// Row shapes (mirror migration 075 §1/§2)
+// Row shapes (mirror migration 076 §1/§2)
 // ---------------------------------------------------------------------------
 
-/** subscriptions row (CDM v1.2 §4.7 / migration 075 §1). The DB column
+/** subscriptions row (CDM v1.2 §4.7 / migration 076 §1). The DB column
  *  `prescription_id` is CDM-verbatim; app-layer naming uses the canonical
- *  glossary term (medicationRequestId) — see the migration 075 header
+ *  glossary term (medicationRequestId) — see the migration 076 header
  *  GLOSSARY TENSION note. */
 export interface SubscriptionRow {
   id: string;
@@ -212,7 +212,7 @@ export interface SubscriptionRow {
   updated_at: Date;
 }
 
-/** subscription_events row (CDM v1.2 §4.8 / migration 075 §2). */
+/** subscription_events row (CDM v1.2 §4.8 / migration 076 §2). */
 export interface SubscriptionEventRow {
   id: string;
   tenant_id: string;

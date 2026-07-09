@@ -213,8 +213,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       '/v0/pharmacy/ready',
       '/v0/med-interaction/health',
       '/v0/med-interaction/ready',
-      '/v0/subscription/health',
-      '/v0/subscription/ready',
+      '/v0/subscriptions/health',
+      '/v0/subscriptions/ready',
       '/v0/async-consult/health',
       '/v0/async-consult/ready',
       '/v0/crisis-events/health',
@@ -318,12 +318,11 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // activation audit event per ADR-029.
   await app.register(aiServicePlugin);
 
-  // Subscription — routes mounted under /v0/subscription.
-  // SKELETON ONLY at v0.1: only /health (200) + /ready (503) are mounted;
-  // full implementation (POST /subscriptions, PATCH .../pause|resume|cancel|switch
-  // + state machine + Pharmacy + Payment adapter wiring) is BLOCKED on
-  // SI-001 (MedicationRequest schema gap — Subscription binds via
-  // medication_request_id). See src/modules/subscription/README.md.
+  // Subscription — routes mounted under /v0/subscriptions (OpenAPI v0.2 §20).
+  // SI-001 CLOSED (P-011): the 7 §20 endpoints (list/get/pause/resume/switch/
+  // cancel/events) are live; /ready returns 200. DRAFT create rides the
+  // Payments module; clinician/system transitions are exported service
+  // functions. See src/modules/subscription/README.md.
   await app.register(subscriptionPlugin);
 
   // Async Consult — routes mounted under /v0/async-consult.
@@ -405,7 +404,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   const MODULE_READY_PATHS: Record<string, string> = {
     pharmacy: '/v0/pharmacy/ready',
     'med-interaction': '/v0/med-interaction/ready',
-    subscription: '/v0/subscription/ready',
+    subscription: '/v0/subscriptions/ready',
     'async-consult': '/v0/async-consult/ready',
     'crisis-response': '/v0/crisis-events/ready',
     admin: '/v0/admin/ready',

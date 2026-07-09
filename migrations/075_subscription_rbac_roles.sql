@@ -1,12 +1,12 @@
 -- =============================================================================
--- File:    migrations/074_subscription_rbac_roles.sql
+-- File:    migrations/075_subscription_rbac_roles.sql
 -- Purpose: Create the 4 application roles for the Subscription slice
 --          (CDM v1.2 §4.7 Subscription + §4.8 SubscriptionEvent; State
 --          Machines v1.1 §15 Subscription State Machine; OpenAPI v0.2 §20
 --          Subscriptions module; Pharmacy + Refill Slice PRD v2.1 §8).
 --
 --          This is PR-part 1 of the Subscription slice implementation
---          (074 roles → 075 entities + grants → 076 app-role bridge +
+--          (075 roles → 076 entities + grants → 077 app-role bridge +
 --          actor-helper grants), following the Async Consult cadence
 --          (055 → 056 → 061/063) adapted to the direct-INSERT (non-SECDEF)
 --          write path.
@@ -37,13 +37,13 @@
 --          pharmacy-precedent class): handlers compose
 --          withTransaction → withTenantContext → withActorContext →
 --          withDbRole(<subscription role>) → plain SQL, with RLS
---          ENABLE+FORCE on every table (075) as the enforcement floor.
+--          ENABLE+FORCE on every table (076) as the enforcement floor.
 --          No wrapper-owner roles are needed.
 --
 --          All 4 roles are NOLOGIN + non-BYPASSRLS per the canonical
 --          pattern (matches 032/039/046/055/066). NO grants in this
---          migration — table grants land with the entities (075), and
---          telecheck_app_role membership bridges land in 076, per the
+--          migration — table grants land with the entities (076), and
+--          telecheck_app_role membership bridges land in 077, per the
 --          natural-phase grant discipline (P-040 §8.2 R9 HIGH-1 closure
 --          pattern).
 --
@@ -55,7 +55,7 @@
 --          - Pharmacy + Refill Slice PRD v2.1 §8
 --          - Promotion Ledger P-011 (SI-001 closure)
 --          - I-023 (three-layer tenant isolation)
--- Rollback: migrations/rollback/074_rollback.sql
+-- Rollback: migrations/rollback/075_rollback.sql
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -124,7 +124,7 @@ BEGIN
      );
     IF v_count <> 4 THEN
         RAISE EXCEPTION
-            'migration-074-subscription-rbac-count-mismatch: expected 4 roles, found %',
+            'migration-075-subscription-rbac-count-mismatch: expected 4 roles, found %',
             v_count;
     END IF;
 
@@ -139,7 +139,7 @@ BEGIN
            AND rolbypassrls
     ) THEN
         RAISE EXCEPTION
-            'migration-074-subscription-role-has-bypassrls: subscription slice roles '
+            'migration-075-subscription-role-has-bypassrls: subscription slice roles '
             'must be non-BYPASSRLS (I-023 three-layer enforcement floor).';
     END IF;
 END $$;

@@ -11,8 +11,8 @@
  * tx, restored app role — the latent-defect discipline: audits are never
  * emitted inside the elevated block).
  *
- * Write path: direct INSERT/UPDATE under the migration 074 slice roles
- * (Pharmacy + Refill v2.1 §8 prescribes no SECDEF wrappers — see the 074
+ * Write path: direct INSERT/UPDATE under the migration 075 slice roles
+ * (Pharmacy + Refill v2.1 §8 prescribes no SECDEF wrappers — see the 075
  * header WRITE-PATH NOTE). Guard failures RETURN outcome objects (never
  * throw) so the caller can commit the transaction WITH the rejection audit
  * (I-003: bare suppression on rejection forbidden; a rollback would
@@ -25,7 +25,7 @@
  *
  * Spec references: State Machines v1.1 §15 (+§16 cross-machine rows),
  * CDM v1.2 §4.7/§4.8, Pharmacy + Refill v2.1 §8, OpenAPI v0.2 §20,
- * I-003 / I-023 / I-025 / I-027, migrations/074-076.
+ * I-003 / I-023 / I-025 / I-027, migrations/075-077.
  */
 
 import type { DbClient } from '../../../lib/db.js';
@@ -83,7 +83,7 @@ export interface TransitionContext {
   actorTenantIdForAudit: string | null;
 }
 
-/** Slice-role selection per §15 actor class (074 role comments). */
+/** Slice-role selection per §15 actor class (075 role comments). */
 function roleForActor(actor: SubscriptionActor): SliceRole {
   switch (actor.type) {
     case 'patient':
@@ -157,7 +157,7 @@ export interface CreateSubscriptionDraftArgs {
   patientId: string;
   productId: string;
   /** Canonical medication_request binding (DB column `prescription_id` is
-   *  CDM-verbatim; see migration 075 GLOSSARY TENSION note). */
+   *  CDM-verbatim; see migration 076 GLOSSARY TENSION note). */
   medicationRequestId: string;
   cadence: SubscriptionCadence;
   unitPrice: string; // decimal string, e.g. '199.00'

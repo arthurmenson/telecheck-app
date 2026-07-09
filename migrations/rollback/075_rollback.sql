@@ -1,45 +1,35 @@
 -- =============================================================================
 -- File:    migrations/rollback/075_rollback.sql
--- Purpose: Rollback migration 075_subscription_entities.sql.
+-- Purpose: Rollback migration 075_subscription_rbac_roles.sql.
 --
--- Re-opens the migration 060 DEFERRED-FK TODO (drops the refills FK + narrows
--- the column back to VARCHAR(26)), then drops subscription_events before
--- subscriptions (FK dependency order), then the standalone trigger function.
--- RLS policies, triggers, indexes, constraints, and table grants drop with
--- their tables, leaving the migration 074 roles grant-free (a precondition
--- for 074's rollback DROP ROLE).
+-- Drops the 4 Subscription slice roles. Precondition: migrations 076 + 077
+-- rolled back FIRST (table grants + telecheck_app_role memberships must be
+-- gone before DROP ROLE succeeds — matches the 066/067 rollback ordering
+-- discipline).
 --
--- Greenfield safety: this system has no production patient data. Rollback
--- destroys subscription rows irrecoverably — acceptable ONLY pre-pilot.
--- After first real patient data, forward-fix migrations replace rollbacks
--- per the F4 deploy runbook discipline.
+-- Greenfield safety: no production patient data; role drops are safe
+-- pre-pilot only. After first real patient data, forward-fix migrations
+-- replace rollbacks per the F4 deploy runbook discipline.
 -- =============================================================================
 
--- Re-open the 060 deferred FK (Section 3 of 075)
-ALTER TABLE refills DROP CONSTRAINT IF EXISTS refills_tenant_subscription_fk;
-ALTER TABLE refills ALTER COLUMN subscription_id TYPE VARCHAR(26);
-
--- Children before parents
-DROP TABLE IF EXISTS subscription_events;
-DROP TABLE IF EXISTS subscriptions;
-
--- Standalone trigger function
-DROP FUNCTION IF EXISTS subscription_events_block_mutation();
+DROP ROLE IF EXISTS subscription_patient_manager;
+DROP ROLE IF EXISTS subscription_clinician_reviewer;
+DROP ROLE IF EXISTS subscription_system_scheduler;
+DROP ROLE IF EXISTS subscription_staff_reader;
 
 DO $$
 DECLARE
     v_remaining INTEGER;
 BEGIN
     SELECT COUNT(*) INTO v_remaining
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = 'public'
-       AND c.relkind = 'r'
-       AND c.relname IN ('subscriptions', 'subscription_events');
+      FROM pg_roles
+     WHERE rolname IN (
+         'subscription_patient_manager',
+         'subscription_clinician_reviewer',
+         'subscription_system_scheduler',
+         'subscription_staff_reader'
+     );
     IF v_remaining <> 0 THEN
-        RAISE EXCEPTION 'rollback-075-verification: % subscription table(s) remain', v_remaining;
-    END IF;
-    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'refills_tenant_subscription_fk') THEN
-        RAISE EXCEPTION 'rollback-075-verification: refills_tenant_subscription_fk still present';
+        RAISE EXCEPTION 'rollback-075-verification: % subscription role(s) remain', v_remaining;
     END IF;
 END $$;
