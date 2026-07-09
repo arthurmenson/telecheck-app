@@ -77,16 +77,21 @@ import type { TenantId } from '../../lib/glossary.js';
 /**
  * Closed union of unratified `admin.*` action IDs used by this module.
  *
- * **Current population (Sprint 2 PR 3 — decision wrapper):**
+ * **Current population (Sprint 4 hardening — all 4 Cat A IDs live):**
+ * `admin.dashboard_query_executed` (Sprint 4 — the 3 dashboard reads),
  * `admin.template_submitted_for_review` (PR 2, on `main`),
- * `admin.template_review_decision` (THIS PR), and the approve-path
- * `admin.template_published_via_review_workflow` (enumerated ahead of its
- * emitter so the decision handler's publication branch can reference it).
- * The remaining SI-023 §3 cat A action ID (`admin.dashboard_query_executed`)
- * is added when its emitter lands. The union itself is the authoritative
- * inventory of what the canonical AUDIT_EVENTS catalog still owes us.
+ * `admin.template_review_decision` (PR 3, on `main`), and the approve-path
+ * `admin.template_published_via_review_workflow` (Sprint 4 — emitted from
+ * the decision handler's approve branch). All 4 SI-023 §3 Cat A action IDs
+ * are now emitted. The union itself is the authoritative inventory of what
+ * the canonical AUDIT_EVENTS catalog still owes us (Track-6 SPEC-GATED —
+ * bundle AUDIT_EVENTS v5.12 → v5.13 amendment per SI-023 §3; §12 SI
+ * candidate). Placeholder-cast has NO runtime impact (naming-provenance
+ * gap only — async-consult precedent, which ships /ready READY with 17
+ * placeholder-cast IDs).
  */
 type AdminBackendAuditActionPlaceholder =
+  | 'admin.dashboard_query_executed'
   | 'admin.template_submitted_for_review'
   | 'admin.template_review_decision'
   | 'admin.template_published_via_review_workflow';
@@ -264,6 +269,171 @@ export async function emitTemplateReviewDecisionAudit(
       decider_principal_id: args.deciderPrincipalId,
       decision: args.decision,
       decision_payload: args.decisionPayload,
+    },
+    engine_versions: null,
+    ai_workload_type: null,
+    autonomy_level: null,
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(envelope, tx);
+}
+
+// ---------------------------------------------------------------------------
+// admin.dashboard_query_executed (Cat A) — Sprint 4 hardening
+//
+// Emitted by each of the 3 dashboard read handlers immediately after the
+// SECDEF read-wrapper (read_admin_crisis_operational_health /
+// read_admin_consult_queue_health / read_admin_mode1_volume_health)
+// returns. Runs in the SAME transaction as the wrapper call so a partial
+// commit cannot leave the wrapper's co-transactional
+// admin_dashboard_query_execution read-trail INSERT without the
+// corresponding Cat A audit envelope (I-003 same-transaction durability +
+// FLOOR-020 fail-closed).
+//
+// **Two distinct records, one transaction:** the SECDEF wrapper itself
+// INSERTs an `admin_dashboard_query_execution` row (the I-027 read-trail;
+// Sub-decision 3 audit-trail entity). This emitter adds the canonical
+// AUDIT_EVENTS v5.x envelope (`admin.dashboard_query_executed` Cat A) —
+// the SI-023 §3 row 1 normative audit event. Both live in the same tx as
+// the wrapper SELECT; they are complementary, not redundant (read-trail =
+// entity row for the completeness tripwire §8.1 class N; audit envelope =
+// hash-chained operational audit).
+//
+// **Payload schema per SI-023 §3 row 1
+// (`{dashboard_name TEXT, row_count INTEGER, query_params JSONB}`).**
+//
+// **Actor attribution:** the executor is the `admin_basic_operator`
+// (per SI-023 §5 endpoints 1-3). `actor_type='operator'`; `actor_id` is
+// the actor-context account id (or 'unknown' fallback per the
+// resolveActorIdForAudit pattern).
+//
+// `target_patient_id` is `null` — dashboard reads are platform-scope
+// operational-monitoring actions (no patient touched); foundation maps
+// null to the 'PLATFORM' hash-chain partition sentinel.
+//
+// `ai_workload_type` / `autonomy_level` remain `null` — dashboard reads
+// are deterministic admin-monitoring actions, not in the I-012 action-
+// class set, per WORKLOAD_TAXONOMY v5.2 nullability rule.
+// ---------------------------------------------------------------------------
+
+/** Canonical dashboard view names per SI-023 §4.NEW1 CHECK constraint. */
+export type AdminDashboardName =
+  | 'admin_crisis_operational_health_v'
+  | 'admin_consult_queue_health_v'
+  | 'admin_mode1_volume_health_v';
+
+export async function emitDashboardQueryExecutedAudit(
+  args: {
+    tenantId: TenantId;
+    executorPrincipalId: string;
+    executorActorTenantId: string;
+    countryOfCare: string;
+    dashboardName: AdminDashboardName;
+    rowCount: number;
+    queryParams: Record<string, unknown>;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const envelope: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: args.tenantId,
+    actor_type: 'operator',
+    actor_id: args.executorPrincipalId,
+    actor_tenant_id: args.executorActorTenantId,
+    target_patient_id: null,
+    delegate_context: null,
+    action: adminBackendAuditPlaceholder('admin.dashboard_query_executed'),
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: 'admin_dashboard_query_execution',
+    resource_id: args.dashboardName,
+    detail: {
+      dashboard_name: args.dashboardName,
+      row_count: args.rowCount,
+      query_params: args.queryParams,
+    },
+    engine_versions: null,
+    ai_workload_type: null,
+    autonomy_level: null,
+    agent_id: null,
+    agent_version: null,
+    tool_call_id: null,
+    memory_read_set_id: null,
+    memory_write_set_id: null,
+    supervising_policy_id: null,
+    knowledge_source_versions: null,
+    signals: null,
+    override: null,
+    linked_events: [],
+    compliance_flags: [],
+    country_of_care: args.countryOfCare,
+    break_glass: null,
+  };
+  return emitAudit(envelope, tx);
+}
+
+// ---------------------------------------------------------------------------
+// admin.template_published_via_review_workflow (Cat A) — Sprint 4 hardening
+//
+// Emitted by the decision handler's APPROVE branch immediately after the
+// `record_forms_template_admin_decision` wrapper returns when
+// decision='approve' (the wrapper atomically UPDATEs forms_template.status
+// to published — canonical publish path, transition triple #2). Runs in
+// the SAME transaction as the wrapper INSERT + the paired
+// `admin.template_review_decision` audit (I-003 same-transaction
+// durability). Per SI-023 §3 row 4 the publish audit fires IFF the
+// decision was approve.
+//
+// **Payload schema per SI-023 §3 row 4
+// (`{review_id UUID, forms_template_id UUID, decider_principal_id UUID}`).**
+//
+// **Actor attribution:** identical to the decision audit — the
+// `admin_template_reviewer` per SI-023 §5 endpoint 5. `actor_type='operator'`.
+//
+// `target_patient_id` null (platform-scope governance); ai fields null
+// (deterministic admin-workflow action).
+// ---------------------------------------------------------------------------
+
+export async function emitTemplatePublishedViaReviewWorkflowAudit(
+  args: {
+    tenantId: TenantId;
+    reviewId: string;
+    formsTemplateId: string;
+    deciderPrincipalId: string;
+    deciderActorTenantId: string;
+    countryOfCare: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const envelope: AuditEnvelopeInput = {
+    timestamp: new Date().toISOString(),
+    tenant_id: args.tenantId,
+    actor_type: 'operator',
+    actor_id: args.deciderPrincipalId,
+    actor_tenant_id: args.deciderActorTenantId,
+    target_patient_id: null,
+    delegate_context: null,
+    action: adminBackendAuditPlaceholder('admin.template_published_via_review_workflow'),
+    category: 'A',
+    audit_sensitivity_level: 'standard',
+    resource_type: 'forms_template_admin_review',
+    resource_id: args.reviewId,
+    detail: {
+      review_id: args.reviewId,
+      forms_template_id: args.formsTemplateId,
+      decider_principal_id: args.deciderPrincipalId,
     },
     engine_versions: null,
     ai_workload_type: null,

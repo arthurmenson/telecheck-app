@@ -78,11 +78,15 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { requireAdminRole } from '../../../../lib/admin-role.js';
+import {
+  resolveActorTenantIdForAudit,
+  requireSliceRoleMembership,
+} from '../../../../lib/auth-context.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
+import { emitDashboardQueryExecutedAudit } from '../../audit.js';
 
 /**
  * Row shape returned by `read_admin_crisis_operational_health(text, jsonb)`.
@@ -137,23 +141,25 @@ export async function getCrisisOperationalHealthHandler(
   // Phase 1 — tenant context.
   const ctx = requireTenantContext(req);
 
-  // Phase 2 — LAYER B authorization (admin role gate).
-  //
-  // The Admin Backend slice's canonical LAYER B per SI-023 §3.5 is
-  // "actor must be member of admin_basic_operator". Until the proper
-  // RBAC v1.1 wiring lands (a future Identity & Auth slice extension),
-  // this handler reuses the platform-wide admin shim — same one every
-  // other admin surface uses (tenant_admin / platform_admin). Both
-  // canonical RBAC v1.1 admin roles map to "permitted to call
-  // admin_basic_operator wrappers" at this slice's v0.1.
-  //
-  // TODO(SI-023 Sprint 4): replace with explicit
-  // `requireSliceRoleMembership('admin_basic_operator')` once the
-  // identity slice surfaces per-actor slice-role membership. Until
-  // then the admin-role shim provides the conservative gate (admin
-  // identities only) without leaving the endpoint open to any
-  // authenticated actor.
-  requireAdminRole(req);
+  // Phase 2 — LAYER B authorization (SI-023 §5 slice-role-membership gate;
+  // Sprint 4 hardening). Binds `admin_basic_operator` (the ratified role
+  // for dashboard reads per SI-023 §5 endpoint 1) after asserting the
+  // actor is a tenant-authorized admin via the ratified admin-role
+  // boundary. The bound role is threaded into `withDbRole` below so the
+  // LAYER B assertion + the DB elevation cannot drift. Fail-closed: a
+  // non-admin / wrong-tenant / rejected-JWT actor never reaches the
+  // wrapper (see requireSliceRoleMembership docstring). The DB EXECUTE
+  // grant + LAYER C tenant-scope guard remain the enforcing floor.
+  const sliceRole = requireSliceRoleMembership(req, 'admin_basic_operator');
+
+  // Actor attribution for the Cat A `admin.dashboard_query_executed`
+  // audit emission (Sprint 4). The executor principal is the request's
+  // authenticated admin actor; the attribution tenant follows the F-4
+  // resolution (adminHomeTenantId for platform_admin acting cross-tenant,
+  // ctx.tenantId otherwise).
+  const executorPrincipalId =
+    req.actorContext?.accountId ?? (req.headers['x-actor-id'] as string | undefined) ?? 'unknown';
+  const executorActorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   // Phase 3-4 — open tx + compose context helpers in canonical order
   // (withTransaction → withTenantContext → withActorContext → withDbRole).
@@ -200,9 +206,11 @@ export async function getCrisisOperationalHealthHandler(
       // at that pre-callback boundary, escaping a catch placed inside
       // the callback. Wrapping the withDbRole(...) Promise covers BOTH
       // paths (privilege acquisition + SECDEF wrapper LAYER C guard).
+      const queryParams: Record<string, unknown> = {};
       const runWrapper = async (): Promise<CrisisOperationalHealthRow[]> => {
+        let rows: CrisisOperationalHealthRow[];
         try {
-          return await withDbRole(tx, 'admin_basic_operator', async () => {
+          rows = await withDbRole(tx, sliceRole, async () => {
             // The wrapper signature is
             //   read_admin_crisis_operational_health(p_tenant_id TEXT,
             //                                        p_query_params_jsonb JSONB)
@@ -212,7 +220,7 @@ export async function getCrisisOperationalHealthHandler(
             // string (e.g., ?severity=high) and forward them here.
             const result = await tx.query<CrisisOperationalHealthRow>(
               'SELECT * FROM read_admin_crisis_operational_health($1, $2)',
-              [ctx.tenantId, {}],
+              [ctx.tenantId, queryParams],
             );
             return result.rows;
           });
@@ -227,6 +235,29 @@ export async function getCrisisOperationalHealthHandler(
           }
           throw err;
         }
+
+        // Sprint 4 — same-tx Cat A `admin.dashboard_query_executed` audit
+        // emission (SI-023 §3 row 1). Runs AFTER withDbRole's finally-block
+        // restores telecheck_app_role (the slice role admin_basic_operator
+        // does NOT hold audit_records INSERT; the app role does). I-003
+        // same-transaction durability: this INSERT lives in the same tx as
+        // the wrapper SELECT + its co-transactional read-trail INSERT, so a
+        // partial commit cannot leave the dashboard read without its audit.
+        // FLOOR-020 fail-closed: a throw here rolls the whole tx back.
+        await emitDashboardQueryExecutedAudit(
+          {
+            tenantId: ctx.tenantId,
+            executorPrincipalId,
+            executorActorTenantId,
+            countryOfCare: ctx.countryOfCare,
+            dashboardName: 'admin_crisis_operational_health_v',
+            rowCount: rows.length,
+            queryParams,
+          },
+          tx,
+        );
+
+        return rows;
       };
 
       if (req.actorNonce !== undefined) {

@@ -82,11 +82,15 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { requireAdminRole } from '../../../../lib/admin-role.js';
+import {
+  resolveActorTenantIdForAudit,
+  requireSliceRoleMembership,
+} from '../../../../lib/auth-context.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
+import { emitDashboardQueryExecutedAudit } from '../../audit.js';
 
 /**
  * Row shape returned by `read_admin_consult_queue_health(text, jsonb)` —
@@ -141,10 +145,15 @@ export async function getConsultQueueHealthHandler(
   // Phase 1 — tenant context.
   const ctx = requireTenantContext(req);
 
-  // Phase 2 — LAYER B authorization (admin role gate).
-  // Same legacy shim as get-crisis-operational-health.ts; replaced in
-  // Sprint 4 with `requireSliceRoleMembership('admin_basic_operator')`.
-  requireAdminRole(req);
+  // Phase 2 — LAYER B authorization (SI-023 §5 slice-role-membership gate;
+  // Sprint 4 hardening). Binds `admin_basic_operator` (dashboard-read role)
+  // after asserting the actor is a tenant-authorized admin. Bound role
+  // threaded into `withDbRole` below (single source of truth).
+  const sliceRole = requireSliceRoleMembership(req, 'admin_basic_operator');
+
+  const executorPrincipalId =
+    req.actorContext?.accountId ?? (req.headers['x-actor-id'] as string | undefined) ?? 'unknown';
+  const executorActorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
   // Phase 3-4 — open tx + compose context helpers in canonical order.
   // The 42501 catch wraps the ENTIRE withDbRole call per the Sprint 2
@@ -158,9 +167,10 @@ export async function getConsultQueueHealthHandler(
   // canonical 503 tenant-blind envelope.
   const rows = await withTransaction<ConsultQueueHealthRow[]>(async (tx) => {
     return withTenantContext(tx, ctx.tenantId, async () => {
+      const queryParams: Record<string, unknown> = {};
       const runWrapper = async (): Promise<ConsultQueueHealthRow[]> => {
         try {
-          return await withDbRole(tx, 'admin_basic_operator', async () => {
+          const rows = await withDbRole(tx, sliceRole, async () => {
             // Wrapper signature (once authored per CDM §4.NEW8c):
             //   read_admin_consult_queue_health(p_tenant_id TEXT,
             //                                   p_query_params_jsonb JSONB)
@@ -169,10 +179,32 @@ export async function getConsultQueueHealthHandler(
             // filters from URL query string (?queue_status=waiting).
             const result = await tx.query<ConsultQueueHealthRow>(
               'SELECT * FROM read_admin_consult_queue_health($1, $2)',
-              [ctx.tenantId, {}],
+              [ctx.tenantId, queryParams],
             );
             return result.rows;
           });
+
+          // Sprint 4 — same-tx Cat A `admin.dashboard_query_executed` audit
+          // (SI-023 §3 row 1). Emitted only on the wrapper-SUCCESS path,
+          // after withDbRole restores telecheck_app_role. On the fail-closed
+          // 503 path (42883/0A000, wrapper undefined) NO read occurred, so
+          // no dashboard_query_executed audit — the completeness tripwire
+          // §8.1 class N counts audits against actual dashboard reads, and a
+          // 503 is not a read.
+          await emitDashboardQueryExecutedAudit(
+            {
+              tenantId: ctx.tenantId,
+              executorPrincipalId,
+              executorActorTenantId,
+              countryOfCare: ctx.countryOfCare,
+              dashboardName: 'admin_consult_queue_health_v',
+              rowCount: rows.length,
+              queryParams,
+            },
+            tx,
+          );
+
+          return rows;
         } catch (err) {
           if (typeof err === 'object' && err !== null && 'code' in err) {
             const code = (err as { code?: unknown }).code;

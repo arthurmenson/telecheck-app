@@ -62,7 +62,7 @@ afterAll(async () => {
 });
 
 describe('admin-backend slice — §1 plugin wiring', () => {
-  it('§1a GET /v1/admin/health returns 200 (liveness — module alive) with Sprint 2 v0.3 metadata', async () => {
+  it('§1a GET /v1/admin/health returns 200 (liveness — module alive) with post-Sprint-4-ready metadata', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v1/admin/health',
@@ -72,36 +72,48 @@ describe('admin-backend slice — §1 plugin wiring', () => {
     const body = r.json() as {
       status: string;
       module: string;
-      blocked: string;
-      blocked_message: string;
+      ready: boolean;
+      ready_message: string;
     };
     expect(body.status).toBe('ok');
     expect(body.module).toBe('admin-backend');
-    expect(body.blocked).toContain('Sprint 2 PR 2 of N at v0.3');
-    expect(body.blocked_message).toContain('DB layer COMPLETE through migration 044');
+    // Sprint 4 hardening closed — health metadata reflects the ready state.
+    expect(body.ready).toBe(true);
+    expect(body.ready_message).toContain('Sprint 4 hardening CLOSED');
   });
 
-  it('§1b GET /v1/admin/ready returns 503 (readiness — full surface incomplete) with BLOCKED reason', async () => {
+  it('§1b GET /v1/admin/ready returns 200 (readiness — Sprint 4 hardening closed) with machine-readable spec_gated_gaps', async () => {
     const r = await app!.inject({
       method: 'GET',
       url: '/v1/admin/ready',
       headers: { host: 'localhost' },
     });
-    expect(r.statusCode).toBe(503);
+    // Sprint 4 hardening (2026-07-09) flipped /ready to 200: the BUILDABLE
+    // hardening set closed (Cat A dashboard audit + LAYER B slice-role gate +
+    // cross-tenant tests). The ONLY remaining gap is Track-6 SPEC-GATED
+    // AUDIT_EVENTS catalog ratification (placeholder-cast; no runtime impact;
+    // async-consult precedent). It is surfaced machine-readably, not as a 503.
+    expect(r.statusCode).toBe(200);
     const body = r.json() as {
       status: string;
       module: string;
-      reason: string;
-      reason_message: string;
+      spec_gated_gaps: Array<{
+        gap: string;
+        fail_mode: string;
+        runtime_impact: string;
+      }>;
     };
-    expect(body.status).toBe('unavailable');
+    expect(body.status).toBe('ok');
     expect(body.module).toBe('admin-backend');
-    expect(body.reason).toBe('partial_handlers_mounted_full_surface_incomplete');
-    // Post-migration-069 truth: all 5 SI-023 §5 endpoints live (mode1-volume
-    // unlocked by migration 069); the Sprint 4 hardening set remains the
-    // named blocker.
-    expect(body.reason_message).toContain('5 of 5 SI-023 §5 endpoints are live');
-    expect(body.reason_message).toContain('mode1-volume-health (unlocked by migration 069');
+    expect(Array.isArray(body.spec_gated_gaps)).toBe(true);
+    // The single remaining gap is the catalog ratification — fail-conservative,
+    // no runtime impact.
+    const catalogGap = body.spec_gated_gaps.find(
+      (g) => g.gap === 'audit_events_catalog_ratification',
+    );
+    expect(catalogGap).toBeDefined();
+    expect(catalogGap!.fail_mode).toBe('fail_conservative');
+    expect(catalogGap!.runtime_impact).toBe('none');
   });
 
   // §1c — paired-probe coverage proving the template submit-for-review write
@@ -111,8 +123,9 @@ describe('admin-backend slice — §1 plugin wiring', () => {
   // asserted 404 ("route not mounted") until #205 landed, at which point it was
   // advanced to the next chain link's status code per the comment's own
   // instruction. With #205 merged, POST .../submit-for-review reaches
-  // postFormsTemplateSubmitHandler; requireAdminRole (legacy platform admin
-  // shim, pending RBAC v1.1 wiring) rejects the role-less probe → 403.
+  // postFormsTemplateSubmitHandler; the Sprint-4 LAYER B gate
+  // requireSliceRoleMembership → requireAdminRole rejects the role-less
+  // probe (no JWT, no x-actor-roles) → 403.
   //
   //   §1c-guard: POST WITHOUT Idempotency-Key → 400
   //     Exercises the global idempotency preHandler guard
@@ -173,6 +186,8 @@ describe('admin-backend slice — §1 plugin wiring', () => {
       url: '/v1/admin/ready',
       headers: { host: 'unresolved.load-balancer.invalid' },
     });
-    expect(r.statusCode).toBe(503);
+    // Post Sprint 4 flip: 200 (allowlisted probe reaches the handler without
+    // tenant resolution; readiness is now ok).
+    expect(r.statusCode).toBe(200);
   });
 });

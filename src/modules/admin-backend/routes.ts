@@ -74,55 +74,67 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'admin-backend',
-    blocked: 'Admin Backend Basics handler implementation (Sprint 2 PR 2 of N at v0.3)',
-    blocked_message:
-      'DB layer COMPLETE through migration 044 (12 RBAC roles + 4 entities + ' +
-      '2 derived views + 2 deferred + raw lifecycle writer + 2 template ' +
-      'wrappers + 1 dashboard read-wrapper + 2 deferred per Option 2 carryforward). ' +
-      'Foundation 051 (Option B app-role acquisition) merged. ' +
-      'Sprint 2 PR 1 mounted GET /v1/admin/dashboards/crisis-operational-health. ' +
-      'Sprint 2 PR 2 (THIS PR) mounts POST /v1/admin/templates/:template_id/' +
-      'submit-for-review (wraps submit_forms_template_for_admin_review SECDEF + ' +
-      'emits Cat A admin.template_submitted_for_review audit + idempotency-' +
-      'protected via withIdempotentExecution). Remaining Sprint 2+ work: ' +
-      '1 template wrapper (decision), Cat A audit emission for the remaining ' +
-      '3 admin.* action IDs (dashboard_query_executed + template_review_decision ' +
-      '+ template_published_via_review_workflow), proper LAYER B role-membership ' +
-      'check (replacing the legacy admin-role shim), cross-tenant isolation ' +
-      'tests, AUDIT_EVENTS catalog ratification of admin.* IDs (currently emitted ' +
-      'via adminBackendAuditPlaceholder). See src/modules/admin-backend/README.md.',
+    ready: true,
+    ready_message:
+      'Sprint 4 hardening CLOSED 2026-07-09. All 5 SI-023 §5 endpoints live: ' +
+      '3 dashboard reads (crisis-operational-health, consult-queue-health, ' +
+      'mode1-volume-health) + 2 template writes (submit-for-review, decision). ' +
+      'BUILDABLE hardening set complete: Cat A audit emission for all 4 admin.* ' +
+      'IDs (dashboard_query_executed + template_submitted_for_review + ' +
+      'template_review_decision + template_published_via_review_workflow); LAYER B ' +
+      'slice-role-membership gate (requireSliceRoleMembership) replacing the legacy ' +
+      'admin-role shim call; cross-tenant isolation integration tests. Only remaining ' +
+      'item is Track-6 SPEC-GATED AUDIT_EVENTS catalog ratification of the admin.* ' +
+      'namespace (placeholder-cast; no runtime impact; see /ready spec_gated_gaps + ' +
+      'src/modules/admin-backend/README.md).',
   }));
 
-  // Readiness probe — module is still NOT ready to serve full traffic:
-  // all 5 SI-023 §5 endpoints are LIVE (crisis dashboard + template
-  // submit + template decision + consult-queue dashboard post-migration
-  // 065 + mode1-volume dashboard post-migration 069), but the Sprint 4
-  // hardening set (Cat A dashboard audit emission + LAYER B
-  // role-membership check + cross-tenant isolation tests + admin.*
-  // catalog ratification) remains open. Continues returning 503 per
-  // the canonical BLOCKED-aware pattern.
-  app.get('/ready', async (_request, reply) => {
-    return reply.code(503).send({
-      status: 'unavailable',
-      module: 'admin-backend',
-      reason: 'partial_handlers_mounted_full_surface_incomplete',
-      reason_message:
-        '5 of 5 SI-023 §5 endpoints are live: GET /v1/admin/dashboards/' +
-        'crisis-operational-health, POST /v1/admin/templates/:template_id/submit-for-review, ' +
-        'POST /v1/admin/templates/:template_id/reviews/:review_id/decision, ' +
-        'GET /v1/admin/dashboards/consult-queue-health (unlocked by migration 065 — ' +
-        'CDM §4.NEW6/§4.NEW8c after the P-038 consult entities landed at 055-061), and ' +
-        'GET /v1/admin/dashboards/mode1-volume-health (unlocked by migration 069 — ' +
-        'CDM §4.NEW7/§4.NEW8d after the P-036 Mode 1 entities landed at 066-068). ' +
-        'Still pending: Cat A audit emission for the 3 remaining admin.* IDs ' +
-        '(dashboard_query_executed + template_review_decision + ' +
-        'template_published_via_review_workflow); proper LAYER B role-membership check ' +
-        '(replacing the legacy admin-role shim); cross-tenant isolation tests; ' +
-        'AUDIT_EVENTS catalog ratification of admin.* IDs (currently placeholder-cast). ' +
-        '/ready returns 200 once the hardening set closes. ' +
-        'See src/modules/admin-backend/README.md.',
-    });
-  });
+  // Readiness probe — module is READY to serve full traffic (Sprint 4
+  // hardening closed 2026-07-09). All 5 SI-023 §5 endpoints are LIVE with
+  // the BUILDABLE hardening set complete:
+  //   - Cat A audit emission for all 4 admin.* action IDs (dashboard_query_executed
+  //     on the 3 dashboard reads; template_submitted_for_review + template_review_decision
+  //     + template_published_via_review_workflow on the write paths), each same-tx
+  //     with its SECDEF wrapper call under the restored telecheck_app_role.
+  //   - Proper LAYER B slice-role-membership check (requireSliceRoleMembership),
+  //     replacing the legacy admin-role shim call — fail-closed via the
+  //     ratified admin-role boundary + the DB EXECUTE-grant floor
+  //     (admin_basic_operator for dashboards + submit; admin_template_reviewer
+  //     for decision).
+  //   - Cross-tenant isolation integration tests (I-023/I-025).
+  //
+  // The ONLY remaining gap is Track-6 SPEC-GATED (not buildable here):
+  // AUDIT_EVENTS catalog ratification of the admin.* action IDs. These are
+  // emitted via the module-local `adminBackendAuditPlaceholder()` cast
+  // (placeholder-cast) pending the bundle AUDIT_EVENTS v5.12 → v5.13
+  // amendment per SI-023 §3. This is a NAMING-PROVENANCE gap only — it has
+  // ZERO runtime impact: the audit rows commit correctly, the hash chain
+  // validates, the payloads conform to SI-023 §3. This qualifies for the
+  // 200 flip per the async-consult precedent (async-consult /ready is READY
+  // with 17 placeholder-cast IDs). The gap is fail-conservative (audits
+  // still emitted; only the canonical-catalog registration is pending) and
+  // surfaced machine-readably in `spec_gated_gaps` below.
+  app.get('/ready', async () => ({
+    status: 'ok',
+    module: 'admin-backend',
+    spec_gated_gaps: [
+      {
+        gap: 'audit_events_catalog_ratification',
+        detail:
+          'The 4 admin.* Cat A action IDs (admin.dashboard_query_executed, ' +
+          'admin.template_submitted_for_review, admin.template_review_decision, ' +
+          'admin.template_published_via_review_workflow) are emitted via the ' +
+          'module-local adminBackendAuditPlaceholder() cast pending the canonical ' +
+          'AUDIT_EVENTS v5.12 → v5.13 amendment (SI-023 §3). Naming-provenance only; ' +
+          'no runtime impact (audit rows commit, hash chain validates, payloads ' +
+          'conform to SI-023 §3). Async-consult precedent: READY with placeholder-cast IDs.',
+        track: 'Track-6 spec-corpus ratification',
+        si_candidate: 'AUDIT_EVENTS admin.* namespace amendment (§12 SI)',
+        fail_mode: 'fail_conservative',
+        runtime_impact: 'none',
+      },
+    ],
+  }));
 
   // -------------------------------------------------------------------------
   // Sprint 2 PR 1 — LIVE dashboard handler (post-foundation-051).
