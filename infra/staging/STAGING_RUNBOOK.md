@@ -117,3 +117,17 @@ ssh root@87.99.159.214 "cd /home/deploy/telecheck-app && \
 
 Caddy picks up the new files immediately (static file_server); the
 `up -d caddy` is only needed when the compose/Caddyfile config changed.
+
+### Patient-host tenant mapping (REQUIRED — Codex Phase-D R1 MEDIUM closure)
+
+The patient host's same-origin API proxy (`/v0`, `/v1` → app) only works if
+the host is mapped in `TENANT_HOST_OVERRIDES`; an unmapped Host fails closed
+at tenant resolution (by design). Whenever `PATIENT_APP_DOMAIN` is set, the
+same host MUST appear in `TENANT_HOST_OVERRIDES` mapped to `Telecheck-US`,
+and in `STAGING_DOMAINS` so Caddy mints its certificate:
+
+```
+STAGING_DOMAINS="<IP>.sslip.io, ghana.<IP>.sslip.io"
+PATIENT_APP_DOMAIN=patient.<IP>.sslip.io
+TENANT_HOST_OVERRIDES=patient.<IP>.sslip.io=Telecheck-US,<IP>.sslip.io=Telecheck-US,ghana.<IP>.sslip.io=Telecheck-Ghana
+```
