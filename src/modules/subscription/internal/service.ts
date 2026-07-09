@@ -407,7 +407,16 @@ export async function executeSubscriptionTransition(
         expectedFrom: spec.from,
       };
     }
-    return { outcome: 'guard_failed', reason: check.reason ?? 'actor_not_permitted' };
+    // Codex review 2026-07-09 (MED): a state-machine guard failure against a
+    // VISIBLE row (the row was read + locked above) MUST leave the I-003
+    // rejection trail — an unauthorized transition attempt on an existing
+    // subscription is exactly what incident review needs to detect. Emit the
+    // rejection audit before returning guard_failed (same discipline as the
+    // period_end payment/renewal guards below). Rows that were not found are
+    // handled at Phase 1 and never reach here (no audit — tenant-blind 404).
+    const guardReason = check.reason ?? 'actor_not_permitted';
+    await emitRejection(tx, args, current, guardReason);
+    return { outcome: 'guard_failed', reason: guardReason };
   }
 
   // Phase 3 — transition-specific guards.
@@ -419,6 +428,28 @@ export async function executeSubscriptionTransition(
   if (args.transition === 'switch_approve') {
     if (args.switchTo === undefined) {
       return { outcome: 'guard_failed', reason: 'switch_bindings_required' };
+    }
+  }
+  // Codex review 2026-07-09 (HIGH): system-driven PAUSED exits must respect
+  // the persisted pause deadline. Without this, a scheduler bug, a queue
+  // replay, or a wrong job payload could immediately reactivate (`resume`) or
+  // cancel (`pause_expires`) a still-valid paused subscription — user-visible
+  // corruption emitted WITH a success audit. §15 permits a PATIENT (or
+  // tenant_operator) to resume EARLY, but a SYSTEM auto-resume/expiry only
+  // fires once `pause_until` has elapsed. Fail-closed with a rejection audit
+  // (same posture as the period_end due-check above).
+  if (args.transition === 'resume' && args.actor.type === 'system') {
+    if (current.pause_until === null || current.pause_until.getTime() > Date.now()) {
+      await emitRejection(tx, args, current, 'pause_window_not_elapsed');
+      return { outcome: 'guard_failed', reason: 'pause_window_not_elapsed' };
+    }
+  }
+  if (args.transition === 'pause_expires') {
+    // `pause_expires` is system-only (enforced by the §15 actor gate); the
+    // pause window MUST have elapsed for the auto-cancel to be legitimate.
+    if (current.pause_until === null || current.pause_until.getTime() > Date.now()) {
+      await emitRejection(tx, args, current, 'pause_window_not_elapsed');
+      return { outcome: 'guard_failed', reason: 'pause_window_not_elapsed' };
     }
   }
   if (args.transition === 'period_end') {
