@@ -386,3 +386,37 @@ describe('email+PIN — recovery/verify is a non-oracle (Codex round-7 HIGH)', (
     expect(knownWrong.body).toBe(unknownWrong.body);
   });
 });
+
+describe('email+PIN — passcode lockout is not bypassed by a correct code (Codex round-8 HIGH)', () => {
+  it('D4. once a recovery challenge is locked (3 wrong), the CORRECT code is rejected and the PIN is unchanged', async () => {
+    const email = uniqueEmail();
+    const oldPin = '481975';
+    expect((await registerEmailPin(email, oldPin)).statusCode).toBe(201);
+
+    // Issue a recovery challenge and learn its plaintext.
+    const code = await issuePasscode(email, 'pin_recovery');
+
+    // Exhaust the 3 attempts with wrong codes → challenge locks.
+    for (let i = 0; i < 3; i++) {
+      const wrong = await post('/v0/identity/recovery/pin/verify', {
+        email,
+        passcode: '000001',
+        new_pin: '620914',
+      });
+      expect(wrong.statusCode).toBe(400);
+    }
+
+    // The CORRECT code must now be rejected — the lockout is not bypassable.
+    const correctButLocked = await post('/v0/identity/recovery/pin/verify', {
+      email,
+      passcode: code,
+      new_pin: '620914',
+    });
+    expect(correctButLocked.statusCode).toBe(400);
+
+    // The PIN was never reset: the original PIN still logs in.
+    expect((await post('/v0/identity/login/pin', { email, pin: oldPin })).statusCode).toBe(200);
+    // And the would-be new PIN does not.
+    expect((await post('/v0/identity/login/pin', { email, pin: '620914' })).statusCode).toBe(401);
+  });
+});

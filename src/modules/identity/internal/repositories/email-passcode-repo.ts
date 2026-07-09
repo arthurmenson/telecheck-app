@@ -93,6 +93,11 @@ export async function findLatestActivePasscode(
     : (fn: (c: DbClient) => Promise<EmailPasscode | null>) =>
         withTenantBoundConnection(tenantId, fn);
   return runner(async (client) => {
+    // A locked/exhausted challenge (attempts spent → locked_until in the
+    // future) is NOT active: it must not be verifiable, so a subsequent
+    // *correct* code cannot bypass the lockout (Codex round-8 HIGH). Excluding
+    // it here means verify returns no-active-challenge for both wrong and
+    // correct codes during the cooldown — tenant-blind, no bypass.
     const result = await client.query<PasscodeRow>(
       `SELECT ${PASSCODE_COLUMNS}
          FROM email_passcodes
@@ -101,6 +106,8 @@ export async function findLatestActivePasscode(
           AND purpose = $3
           AND consumed_at IS NULL
           AND expires_at > NOW()
+          AND attempts_remaining > 0
+          AND (locked_until IS NULL OR locked_until <= NOW())
         ORDER BY created_at DESC
         LIMIT 1`,
       [tenantId, email, purpose],
@@ -184,6 +191,9 @@ export async function consumePasscode(
     : (fn: (c: DbClient) => Promise<EmailPasscode | null>) =>
         withTenantBoundConnection(tenantId, fn);
   return runner(async (client) => {
+    // Atomic backstop for the lockout-bypass fix in findLatestActivePasscode:
+    // even if a locked/exhausted row reached this call, it must not be
+    // consumable (Codex round-8 HIGH). The WHERE mirrors the active predicate.
     const result = await client.query<PasscodeRow>(
       `UPDATE email_passcodes
           SET consumed_at = NOW()
@@ -191,6 +201,8 @@ export async function consumePasscode(
           AND passcode_id = $2
           AND consumed_at IS NULL
           AND expires_at > NOW()
+          AND attempts_remaining > 0
+          AND (locked_until IS NULL OR locked_until <= NOW())
        RETURNING ${PASSCODE_COLUMNS}`,
       [tenantId, passcodeId],
     );
