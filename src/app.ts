@@ -407,7 +407,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     subscription: '/v0/subscriptions/ready',
     'async-consult': '/v0/async-consult/ready',
     'crisis-response': '/v0/crisis-events/ready',
-    admin: '/v0/admin/ready',
+    admin: '/v1/admin/ready', // SI-023 admin surface (the /v0 alias is the separate legacy admin-write slice v1.1, out of pilot scope)
     'ai-service': '/v0/ai/ready',
   };
 

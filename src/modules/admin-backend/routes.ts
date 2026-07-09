@@ -115,7 +115,10 @@ export const registerAdminBackendRoutes: FastifyPluginAsync = async (
   // still emitted; only the canonical-catalog registration is pending) and
   // surfaced machine-readably in `spec_gated_gaps` below.
   app.get('/ready', async () => ({
-    status: 'ok',
+    // 'ready' (not 'ok') to match the readiness vocabulary the other
+    // module /ready probes use (async-consult / crisis-response /
+    // subscription) so the aggregate /ready display is consistent.
+    status: 'ready',
     module: 'admin-backend',
     spec_gated_gaps: [
       {
