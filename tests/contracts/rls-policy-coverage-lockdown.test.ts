@@ -110,6 +110,7 @@ import { getTestClient } from '../setup.ts';
 // per-table assertions in §1.
 // ---------------------------------------------------------------------------
 const TENANT_SCOPED_TABLES = [
+  'account_pin_credentials', // migration 078 — email+PIN auth path
   'accounts',
   'adapter_configs',
   'admin_dashboard_query_execution', // migration 040 — Admin Backend slice
@@ -157,6 +158,7 @@ const TENANT_SCOPED_TABLES = [
   'notification_crisis_dispatch_ledger', // migration 033 — Crisis Response slice
   'notification_crisis_escalation_obligation', // migration 033 — Crisis Response slice
   'notification_crisis_provider_attempt', // migration 033 — Crisis Response slice
+  'email_passcodes', // migration 078 — email+PIN auth path
   'otp_challenges',
   'product_catalog', // migration 024 — per CDM v1.2 §4.9 ProductCatalog
   'refills', // migration 060 — Pharmacy Refill sub-slice (SI-007 / P-046)

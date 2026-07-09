@@ -58,7 +58,13 @@ type IdentityAuditActionPlaceholder =
   | 'identity_otp_consumed'
   | 'identity_otp_lockout_triggered'
   | 'identity_device_registered'
-  | 'identity_device_revoked';
+  | 'identity_device_revoked'
+  // Email + PIN auth path (migration 078; docs/SI-EMAIL-PIN-AUTH.md)
+  | 'identity_email_passcode_issued'
+  | 'identity_email_passcode_consumed'
+  | 'identity_pin_set'
+  | 'identity_pin_login_failed'
+  | 'identity_pin_lockout_triggered';
 
 /**
  * identityAuditPlaceholder — single sanctioned `as AuditAction` cast site.
@@ -150,7 +156,8 @@ export async function emitAccountCreatedAudit(
     accountId: AccountId;
     actorId: string;
     countryOfCare: string;
-    phoneE164: string; // recorded in detail for audit trail; PHI but not at high_pii level
+    // Nullable since migration 078 (email-only accounts have no phone).
+    phoneE164: string | null; // recorded in detail for audit trail; PHI but not at high_pii level
     accountType: 'patient' | 'delegate' | 'clinician' | 'tenant_admin' | 'platform_admin';
   },
   tx: AuditDbClient,
@@ -420,6 +427,118 @@ export async function emitDeviceRevokedAudit(
       detail: {
         revoked_reason: args.reason,
       },
+    }),
+    tx,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Email + PIN auth path (migration 078; docs/SI-EMAIL-PIN-AUTH.md)
+// ---------------------------------------------------------------------------
+
+export async function emitEmailPasscodeIssuedAudit(
+  args: {
+    tenantId: TenantId;
+    passcodeId: string;
+    accountId: string | null;
+    actorId: string;
+    countryOfCare: string;
+    purpose: string;
+    email: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildEnvelope(identityAuditPlaceholder('identity_email_passcode_issued'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'system',
+      actor_id: args.actorId,
+      actor_tenant_id: args.tenantId,
+      target_patient_id: args.accountId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'email_passcode',
+      resource_id: args.passcodeId,
+      detail: { purpose: args.purpose, email: args.email },
+    }),
+    tx,
+  );
+}
+
+export async function emitEmailPasscodeConsumedAudit(
+  args: {
+    tenantId: TenantId;
+    passcodeId: string;
+    accountId: string | null;
+    actorId: string;
+    countryOfCare: string;
+    purpose: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildEnvelope(identityAuditPlaceholder('identity_email_passcode_consumed'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'system',
+      actor_id: args.actorId,
+      actor_tenant_id: args.tenantId,
+      target_patient_id: args.accountId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'email_passcode',
+      resource_id: args.passcodeId,
+      detail: { purpose: args.purpose },
+    }),
+    tx,
+  );
+}
+
+export async function emitPinSetAudit(
+  args: {
+    tenantId: TenantId;
+    accountId: AccountId;
+    actorId: string;
+    countryOfCare: string;
+    context: 'registration' | 'recovery';
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildEnvelope(identityAuditPlaceholder('identity_pin_set'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'system',
+      actor_id: args.actorId,
+      actor_tenant_id: args.tenantId,
+      target_patient_id: args.accountId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'account_pin_credential',
+      resource_id: args.accountId,
+      detail: { context: args.context },
+    }),
+    tx,
+  );
+}
+
+export async function emitPinLoginFailedAudit(
+  args: {
+    tenantId: TenantId;
+    accountId: AccountId;
+    actorId: string;
+    countryOfCare: string;
+    lockedOut: boolean;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  const action = args.lockedOut ? 'identity_pin_lockout_triggered' : 'identity_pin_login_failed';
+  return emitAudit(
+    buildEnvelope(identityAuditPlaceholder(action), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'system',
+      actor_id: args.actorId,
+      actor_tenant_id: args.tenantId,
+      target_patient_id: args.accountId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'account_pin_credential',
+      resource_id: args.accountId,
+      detail: { locked_out: args.lockedOut },
     }),
     tx,
   );

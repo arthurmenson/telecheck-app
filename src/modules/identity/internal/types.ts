@@ -78,7 +78,9 @@ export type AccountGender = 'female' | 'male' | 'non_binary' | 'prefer_not_to_sa
 export interface Account {
   account_id: AccountId;
   tenant_id: TenantId;
-  phone_e164: string;
+  // Nullable since migration 078: email-only accounts (email+PIN auth path)
+  // have no phone. Phone+OTP accounts always carry it.
+  phone_e164: string | null;
   email: string | null;
   first_name: string;
   last_name: string;

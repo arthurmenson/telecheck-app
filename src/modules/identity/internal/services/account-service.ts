@@ -47,7 +47,9 @@ export function toPatientAccountView(account: Account): PatientAccountView {
 
 export interface CreateAccountServiceInput {
   account_id: AccountId;
-  phone_e164: string;
+  // Optional since migration 078 (email+PIN accounts have no phone). Provide
+  // phone OR email (the DB account_has_identifier CHECK enforces at least one).
+  phone_e164?: string;
   email?: string | null;
   first_name: string;
   last_name: string;
@@ -87,7 +89,6 @@ export async function createAccount(
   const repoInput: accountRepo.CreateAccountInput = {
     account_id: input.account_id,
     tenant_id: ctx.tenantId,
-    phone_e164: input.phone_e164,
     first_name: input.first_name,
     last_name: input.last_name,
     date_of_birth: input.date_of_birth,
@@ -95,6 +96,7 @@ export async function createAccount(
     country_of_residence: input.country_of_residence ?? ctx.countryOfCare,
     country_of_care: ctx.countryOfCare,
   };
+  if (input.phone_e164 !== undefined) repoInput.phone_e164 = input.phone_e164;
   if (input.email !== undefined) repoInput.email = input.email;
   if (input.national_id !== undefined) repoInput.national_id = input.national_id;
   if (input.locale !== undefined) repoInput.locale = input.locale;
@@ -225,4 +227,12 @@ export async function findAccountByPhoneE164(
   externalTx?: DbClient,
 ): Promise<Account | null> {
   return accountRepo.findAccountByPhoneE164(ctx.tenantId, phoneE164, externalTx);
+}
+
+export async function findAccountByEmail(
+  ctx: TenantContext,
+  email: string,
+  externalTx?: DbClient,
+): Promise<Account | null> {
+  return accountRepo.findAccountByEmail(ctx.tenantId, email, externalTx);
 }

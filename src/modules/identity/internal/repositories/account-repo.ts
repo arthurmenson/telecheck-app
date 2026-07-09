@@ -30,7 +30,7 @@ import type { Account, AccountId, AccountStatus, AccountType, AccountGender } fr
 interface AccountRow {
   account_id: string;
   tenant_id: string;
-  phone_e164: string;
+  phone_e164: string | null;
   email: string | null;
   first_name: string;
   last_name: string;
@@ -90,7 +90,8 @@ function tsToIso(v: Date | string | null): string | null {
 export interface CreateAccountInput {
   account_id: AccountId;
   tenant_id: TenantId;
-  phone_e164: string;
+  // Optional since migration 078 (email-only accounts). Omit for email+PIN.
+  phone_e164?: string | null;
   email?: string | null;
   first_name: string;
   last_name: string;
@@ -189,6 +190,35 @@ export async function findAccountByPhoneE164(
 }
 
 // ---------------------------------------------------------------------------
+// findAccountByEmail — case-insensitive tenant-scoped email lookup
+// (email+PIN auth path, migration 078). Uniqueness index uq_account_tenant_email
+// is on (tenant_id, lower(email)); match lower() so lookups are case-blind.
+// ---------------------------------------------------------------------------
+
+export async function findAccountByEmail(
+  tenantId: TenantId,
+  email: string,
+  externalTx?: DbClient,
+): Promise<Account | null> {
+  const runner = externalTx
+    ? (fn: (client: DbClient) => Promise<Account | null>) => fn(externalTx)
+    : (fn: (client: DbClient) => Promise<Account | null>) =>
+        withTenantBoundConnection(tenantId, fn);
+  return runner(async (client) => {
+    const result = await client.query<AccountRow>(
+      `SELECT ${ACCOUNT_COLUMNS}
+         FROM accounts
+        WHERE tenant_id = $1
+          AND lower(email) = lower($2)
+          AND deleted_at IS NULL`,
+      [tenantId, email],
+    );
+    const row = result.rows[0];
+    return row === undefined ? null : rowToAccount(row);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // createAccount — INSERT a fresh account row (lifecycle = pending_verification)
 // ---------------------------------------------------------------------------
 
@@ -231,7 +261,7 @@ export async function createAccount(
       [
         input.account_id,
         input.tenant_id,
-        input.phone_e164,
+        input.phone_e164 ?? null,
         input.email ?? null,
         input.first_name,
         input.last_name,

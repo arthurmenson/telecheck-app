@@ -21,6 +21,13 @@ import {
   revokeDeviceHandler,
 } from './internal/handlers/devices.js';
 import {
+  emailRegistrationStartHandler,
+  emailRegistrationVerifyHandler,
+  pinLoginHandler,
+  pinRecoveryStartHandler,
+  pinRecoveryVerifyHandler,
+} from './internal/handlers/email-pin-auth.js';
+import {
   loginStartHandler,
   loginVerifyHandler,
   sessionLogoutHandler,
@@ -61,6 +68,25 @@ export const registerIdentityRoutes: FastifyPluginAsync = async (
    */
   app.post('/registration/start', registrationStartHandler);
   app.post('/registration/verify', registrationVerifyHandler);
+
+  /**
+   * Email + 6-digit-PIN auth path (migration 078; docs/SI-EMAIL-PIN-AUTH.md).
+   * Runs ALONGSIDE the phone+OTP flow above. Signup = email + set PIN
+   * (email verified via a one-time emailed passcode); login = email + PIN;
+   * reset = emailed passcode → new PIN. All POSTs are idempotency-protected
+   * and emit tenant-blind envelopes (I-025).
+   *
+   *   POST /registration/email/start   — emailed passcode for a new email
+   *   POST /registration/email/verify  — verify + create account + set PIN + session
+   *   POST /login/pin                  — email + PIN → session (rate-limited)
+   *   POST /recovery/pin/start         — emailed recovery passcode (always 200)
+   *   POST /recovery/pin/verify        — verify passcode + set new PIN
+   */
+  app.post('/registration/email/start', emailRegistrationStartHandler);
+  app.post('/registration/email/verify', emailRegistrationVerifyHandler);
+  app.post('/login/pin', pinLoginHandler);
+  app.post('/recovery/pin/start', pinRecoveryStartHandler);
+  app.post('/recovery/pin/verify', pinRecoveryVerifyHandler);
 
   /**
    * Login flow per Identity Spec v1.0 §3.
