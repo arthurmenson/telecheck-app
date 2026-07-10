@@ -22,17 +22,22 @@
  *     pin.login_failed/lockout, passcode.issued/consumed — all same-tx.
  *   - PIN never logged; passcode plaintext emailed once, never persisted.
  *
- * Email delivery is a stub (same posture as the SMS OTP stub) — the plaintext
- * passcode is returned to the caller's provider hook, not exposed on the wire.
+ * Email delivery: the start endpoints hand the freshly-issued passcode to the
+ * configured EmailSender (src/lib/email) AFTER the DB transaction commits, as
+ * fire-and-forget — so provider latency never skews the uniform-work response
+ * timing (Codex round-6) and a provider outage never fails signup/recovery.
+ * Default provider is 'noop' (log-only); staging additionally echoes the code
+ * as dev_passcode. Real delivery is a config flip (EMAIL_PROVIDER=resend).
  *
  * Spec references: migration 078; Identity Spec v1.0 §2/§3 (analogue flows);
- * I-003 / I-025; IDEMPOTENCY v5.1.
+ * I-003 / I-025; IDEMPOTENCY v5.1; docs/SI-EMAIL-DELIVERY-PROVIDER.md.
  */
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { config } from '../../../../lib/config.js';
 import type { DbTransaction } from '../../../../lib/db.js';
+import { getEmailSender } from '../../../../lib/email/index.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
@@ -106,6 +111,40 @@ function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): bool
 // POST /registration/email/start
 // ---------------------------------------------------------------------------
 
+/**
+ * Fire-and-forget passcode-email dispatch. Call AFTER withIdempotentExecution
+ * resolves — the tx has committed (never email a rolled-back code) and, on an
+ * idempotent replay, the body callback did not run so `code` was never set
+ * (no duplicate email). NOT awaited: provider latency must not skew the
+ * uniform-work response timing (Codex round-6 enumeration/timing defense), and
+ * a provider outage must not fail signup/recovery. The passcode is still
+ * issued + persisted regardless; delivery is best-effort.
+ */
+function dispatchPasscodeEmail(
+  req: FastifyRequest,
+  args: {
+    to: string;
+    code: string;
+    purpose: 'email_registration' | 'pin_recovery';
+    consumerDba: string;
+  },
+): void {
+  void getEmailSender()
+    .sendPasscode({
+      to: args.to,
+      code: args.code,
+      purpose: args.purpose,
+      consumerDba: args.consumerDba,
+      ttlMinutes: passcodeService.PASSCODE_TTL_MINUTES,
+    })
+    .catch((err: unknown) => {
+      req.log.error(
+        { err, event: 'passcode_email_dispatch_failed', purpose: args.purpose },
+        'passcode email dispatch failed',
+      );
+    });
+}
+
 export async function emailRegistrationStartHandler(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -118,7 +157,10 @@ export async function emailRegistrationStartHandler(
       .send(makeErrorEnvelope(req.id, 'internal.request.invalid', 'A valid email is required.'));
   }
 
-  return withIdempotentExecution<unknown>(
+  // Captured inside the tx callback; read AFTER commit to dispatch the email
+  // (never on an idempotent replay, where the callback doesn't run).
+  let issuedCode: string | null = null;
+  const result = await withIdempotentExecution<unknown>(
     req,
     reply,
     mapServiceError,
@@ -130,9 +172,9 @@ export async function emailRegistrationStartHandler(
       // passcode, WITHOUT first looking up the account. A passcode for an
       // already-registered email is harmless — a verify attempt creates a NEW
       // account which fails the unique index → the same PASSCODE_FAILED as a
-      // wrong code. (When real email delivery lands, an already-registered
-      // address should instead receive a "you already have an account, sign
-      // in" variant; the API response stays identical.)
+      // wrong code. (A future refinement could email an already-registered
+      // address a "you already have an account, sign in" variant; the API
+      // response — and the always-send timing — stay identical.)
       let devPasscode: string | undefined;
       try {
         const { codePlaintext } = await passcodeService.issuePasscode(
@@ -141,6 +183,7 @@ export async function emailRegistrationStartHandler(
           { passcode_id: ulid(), account_id: null, email, purpose: 'email_registration' },
           tx,
         );
+        issuedCode = codePlaintext;
         // Staging echoes the code as dev_passcode (AUTH_DEV_OTP_ECHO gate +
         // production fail-fast, same as the OTP dev_otp echo) so the Track-4
         // app can complete the flow without a real email provider.
@@ -162,6 +205,15 @@ export async function emailRegistrationStartHandler(
       };
     },
   );
+  if (issuedCode !== null) {
+    dispatchPasscodeEmail(req, {
+      to: email,
+      code: issuedCode,
+      purpose: 'email_registration',
+      consumerDba: ctx.consumerDba,
+    });
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +500,8 @@ export async function pinRecoveryStartHandler(
       .send(makeErrorEnvelope(req.id, 'internal.request.invalid', 'A valid email is required.'));
   }
 
-  return withIdempotentExecution<unknown>(
+  let issuedCode: string | null = null;
+  const result = await withIdempotentExecution<unknown>(
     req,
     reply,
     mapServiceError,
@@ -470,6 +523,7 @@ export async function pinRecoveryStartHandler(
           { passcode_id: ulid(), account_id: accountId, email, purpose: 'pin_recovery' },
           tx,
         );
+        issuedCode = codePlaintext;
         // Staging echoes the code as dev_passcode (AUTH_DEV_OTP_ECHO gate +
         // production fail-fast). Because a passcode is now ALWAYS issued, the
         // echo is present for every email → not even a staging-mode oracle.
@@ -489,6 +543,17 @@ export async function pinRecoveryStartHandler(
       };
     },
   );
+  // recovery/start always issues a passcode for every email (existent or not),
+  // so this always fires when a code was issued — uniform, no existence oracle.
+  if (issuedCode !== null) {
+    dispatchPasscodeEmail(req, {
+      to: email,
+      code: issuedCode,
+      purpose: 'pin_recovery',
+      consumerDba: ctx.consumerDba,
+    });
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

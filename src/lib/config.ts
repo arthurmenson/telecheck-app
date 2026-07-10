@@ -226,6 +226,18 @@ const ConfigSchema = z.object({
   // production toggle.
   AUTH_DEV_OTP_ECHO: z.enum(['false', 'true']).default('false'),
 
+  // Transactional email delivery (email+PIN passcodes; see src/lib/email/).
+  // Provider-agnostic. Default 'noop' = log-only, NO external send — so an
+  // unconfigured/dev/test/CI environment changes no behavior (the passcode is
+  // still issued + persisted; staging's dev_passcode echo still completes the
+  // flow). Activation is a pure config flip to 'resend' + RESEND_API_KEY.
+  // Flagged §12 SI (docs/SI-EMAIL-DELIVERY-PROVIDER.md), same posture as the
+  // pending SMS-provider SI. `sending data to an external provider` is an
+  // operator decision — this stays 'noop' until explicitly flipped.
+  EMAIL_PROVIDER: z.enum(['noop', 'resend']).default('noop'),
+  RESEND_API_KEY: z.string().optional(),
+  EMAIL_FROM: z.string().min(1).default('Heros Health <no-reply@heroshealth.com>'),
+
   // Deployment-environment label, DISTINCT from NODE_ENV: the staging
   // stack runs NODE_ENV=production for runtime parity (prod code paths,
   // no dev middleware), so NODE_ENV cannot express "is this the
@@ -421,6 +433,17 @@ function loadConfig() {
     );
   }
 
+  // Fail-fast if a real email provider is selected without its credential —
+  // a silent fall-back to noop would drop every passcode email. (noop itself
+  // is always valid: it is the intentional no-delivery default.)
+  if (parsed.EMAIL_PROVIDER === 'resend' && (parsed.RESEND_API_KEY ?? '').length === 0) {
+    throw new Error(
+      'EMAIL_PROVIDER=resend requires RESEND_API_KEY to be set. Set a valid ' +
+        'Resend API key (with a verified sending domain matching EMAIL_FROM), ' +
+        'or leave EMAIL_PROVIDER=noop.',
+    );
+  }
+
   return {
     nodeEnv: parsed.NODE_ENV,
     port: parsed.PORT,
@@ -458,6 +481,11 @@ function loadConfig() {
     researchDataPartnershipActive: parsed.RESEARCH_DATA_PARTNERSHIP_ACTIVE === 'active',
     aiMode2Enabled: parsed.AI_MODE2_ENABLED === 'true',
     authDevOtpEcho: parsed.AUTH_DEV_OTP_ECHO === 'true',
+    email: {
+      provider: parsed.EMAIL_PROVIDER,
+      resendApiKey: parsed.RESEND_API_KEY,
+      from: parsed.EMAIL_FROM,
+    },
     deployEnv,
     resumeTokenSecret,
   } as const;
