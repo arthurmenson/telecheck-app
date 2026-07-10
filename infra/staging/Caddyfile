@@ -54,3 +54,40 @@
 		file_server
 	}
 }
+
+# Admin / clinician console (Track 4, SI-025 Phase 2) — static Vite web
+# build served from the host directory mounted at /srv/admin-console (see
+# docker-compose.yml caddy volumes). Real-API-backed: the console's
+# VITE_API_MODE=real HTTP client fetches this SAME host (same-origin, no
+# CORS surface). Tenant resolution works because TENANT_HOST_OVERRIDES maps
+# this host to Telecheck-US in infra/staging/.env — mirrors the patient
+# host block above. SPA fallback via try_files (client-side routing).
+{$ADMIN_APP_DOMAIN} {
+	tls {$ACME_EMAIL}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	# Same-origin API proxy: the console's fetches go to THIS host. An
+	# unmapped Host fails closed at tenant resolution (by design), so the
+	# admin host MUST be in TENANT_HOST_OVERRIDES=admin.<host>=Telecheck-US.
+	handle /v0/* {
+		reverse_proxy app:3000
+	}
+	handle /v1/* {
+		reverse_proxy app:3000
+	}
+	handle /health {
+		reverse_proxy app:3000
+	}
+
+	# Everything else: the static Vite web build (SPA fallback).
+	handle {
+		root * /srv/admin-console
+		try_files {path} /index.html
+		file_server
+	}
+}

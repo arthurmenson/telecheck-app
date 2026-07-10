@@ -4,8 +4,13 @@
 -- PHI, intended for the authenticated E2E smoke (scripts/staging-e2e-smoke.sh).
 --
 -- Identities (Telecheck-US):
---   01JZZZ00000000000000000P01  patient    (Staging Patient)
---   01JZZZ00000000000000000C01  clinician  (Staging Clinician)
+--   01JZZZ00000000000000000P01  patient         (Staging Patient)
+--   01JZZZ00000000000000000C01  clinician       (Staging Clinician)
+--   01JZZZ00000000000000000A02  platform_admin  (Staging Platform Admin)
+--     — SI-025 Phase 2: lets the clinician/admin console OTP-log-in as a
+--       platform_admin (phone +15550100003) to reach Settings → AI Providers.
+--       platform_admin is global scope (admin_tenant_binding NULL); its home
+--       tenant is Telecheck-US.
 --
 -- Identities (Telecheck-Ghana — second operating tenant, GH country of care,
 -- host ghana.87.99.159.214.sslip.io via TENANT_HOST_OVERRIDES on staging):
@@ -34,6 +39,13 @@ INSERT INTO accounts (
         'Staging', 'Clinician', DATE '1985-01-01', 'prefer_not_to_say',
         'US', 'US', 'en-US',
         'clinician', 'active', NOW()
+    ),
+    (
+        '01JZZZ00000000000000000A02', 'Telecheck-US', '+15550100003',
+        'staging-platform-admin@example.invalid',
+        'Staging', 'Platform Admin', DATE '1980-01-01', 'prefer_not_to_say',
+        'US', 'US', 'en-US',
+        'platform_admin', 'active', NOW()
     ),
     (
         '01JZZZ00000000000000000P02', 'Telecheck-Ghana', '+233550100001',
@@ -76,8 +88,8 @@ INSERT INTO forms_template (
     )
 ON CONFLICT (template_id) DO NOTHING;
 
--- Verification: all four synthetic accounts present and active (two per
--- operating tenant).
+-- Verification: all five synthetic accounts present and active (patient +
+-- clinician per operating tenant, plus the SI-025 platform_admin on US).
 DO $$
 DECLARE
     v_count INTEGER;
@@ -86,11 +98,12 @@ BEGIN
       FROM accounts
      WHERE account_id IN (
                '01JZZZ00000000000000000P01', '01JZZZ00000000000000000C01',
+               '01JZZZ00000000000000000A02',
                '01JZZZ00000000000000000P02', '01JZZZ00000000000000000C02'
            )
        AND status = 'active';
-    IF v_count <> 4 THEN
-        RAISE EXCEPTION 'seed-staging-accounts: expected 4 active seed accounts, found %', v_count;
+    IF v_count <> 5 THEN
+        RAISE EXCEPTION 'seed-staging-accounts: expected 5 active seed accounts, found %', v_count;
     END IF;
-    RAISE NOTICE 'seed-staging-accounts: 4 active synthetic accounts present (US + Ghana)';
+    RAISE NOTICE 'seed-staging-accounts: 5 active synthetic accounts present (US patient/clinician/platform_admin + Ghana patient/clinician)';
 END $$;

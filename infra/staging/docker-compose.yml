@@ -119,12 +119,19 @@ services:
       # Patient app (Track 4) static-host site address. The default keeps
       # the Caddyfile placeholder resolvable when .env doesn't set it.
       PATIENT_APP_DOMAIN: ${PATIENT_APP_DOMAIN:-patient.87.99.159.214.sslip.io}
+      # Admin / clinician console (Track 4, SI-025 Phase 2) static-host site
+      # address. Default keeps the Caddyfile placeholder resolvable when
+      # .env doesn't set it. Must appear in TENANT_HOST_OVERRIDES too.
+      ADMIN_APP_DOMAIN: ${ADMIN_APP_DOMAIN:-admin.87.99.159.214.sslip.io}
       ACME_EMAIL: ${ACME_EMAIL:?set in infra/staging/.env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       # Expo web export of telecheck-patient-app (deployed by scp per the
       # STAGING_RUNBOOK patient-app note; mock-backed at this stage).
       - /home/deploy/patient-app-web:/srv/patient-app:ro
+      # Vite web build of telecheck-clinician-console (deployed by scp per
+      # the STAGING_RUNBOOK admin-console note; real-API-backed, SI-025 Ph2).
+      - /home/deploy/admin-console-web:/srv/admin-console:ro
       - caddydata:/data
       - caddyconfig:/config
 
