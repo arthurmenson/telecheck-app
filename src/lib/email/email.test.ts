@@ -154,9 +154,9 @@ describe('ResendEmailSender', () => {
     });
     expect(caught).toBeInstanceOf(Error);
     const e = caught as Error & { cause?: unknown };
-    // Sanitized wrapper: stable name only — never the original message,
+    // Sanitized wrapper: closed-set label only — never the original message,
     // never a cause chain, never the key or the passcode.
-    expect(e.message).toBe('resend transport failure: Error');
+    expect(e.message).toBe('resend transport failure: transport_error');
     expect(e.cause).toBeUndefined();
     expect(e.message).not.toContain('re_test');
     expect(e.message).not.toContain(CODE);
@@ -164,6 +164,54 @@ describe('ResendEmailSender', () => {
     expect(dump).not.toContain(CODE);
     expect(dump).not.toContain('re_test');
     expect(dump).not.toContain('ECONNREFUSED');
+  });
+
+  it('a poisoned Error.name cannot smuggle secrets through the boundary (Codex r2 HIGH)', async () => {
+    const log = capturingLogger();
+    // Error.name is as attacker/runtime-controllable as message/cause — the
+    // exact vector Codex round-2 flagged. It must never be propagated.
+    const poisoned = new Error('transport failed');
+    poisoned.name = `Bearer re_test code ${CODE}`;
+    const fetchImpl = vi.fn(async () => {
+      throw poisoned;
+    });
+    const sender = new ResendEmailSender({
+      apiKey: 're_test',
+      from: 'x@y.z',
+      log,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    let caught: unknown;
+    await sender.sendPasscode(baseMsg('pin_recovery')).catch((e: unknown) => {
+      caught = e;
+    });
+    // The wrapper carries only the closed-set label.
+    expect((caught as Error).message).toBe('resend transport failure: transport_error');
+    const dump = JSON.stringify(log.entries);
+    expect(dump).not.toContain('re_test');
+    expect(dump).not.toContain(CODE);
+    expect(dump).not.toContain('Bearer');
+  });
+
+  it('a non-snake_case provider error name is clamped to "unknown" in logs', async () => {
+    const log = capturingLogger();
+    // Provider body is external input — an echo of request content must not
+    // reach the logs; only Resend-shaped snake_case tokens pass.
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ name: `Bearer re_test code ${CODE}` }), { status: 422 }),
+    );
+    const sender = new ResendEmailSender({
+      apiKey: 're_test',
+      from: 'x@y.z',
+      log,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(sender.sendPasscode(baseMsg('pin_recovery'))).rejects.toThrow(/HTTP 422/);
+    const dump = JSON.stringify(log.entries);
+    expect(dump).toContain('unknown');
+    expect(dump).not.toContain('re_test');
+    expect(dump).not.toContain(CODE);
   });
 
   it('a stalled non-2xx error body cannot hang past the 10s timeout (Codex r1 MEDIUM)', async () => {

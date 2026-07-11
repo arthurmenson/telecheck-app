@@ -107,9 +107,16 @@ export class ResendEmailSender implements EmailSender {
   }
 }
 
-function errName(err: unknown): string {
-  if (err instanceof Error) return err.name === 'AbortError' ? 'timeout' : err.name;
-  return 'unknown';
+/**
+ * Map a transport failure to a CLOSED SET of labels (Codex PR#274 r2 HIGH):
+ * `Error.name` is as attacker/runtime-controllable as `message`/`cause` — a
+ * poisoned error could smuggle request options (API key, passcode) through it
+ * into logs and the sanitized wrapper. Only these two literals ever escape:
+ * the raw name is used solely for an equality check, never propagated.
+ */
+function errName(err: unknown): 'timeout' | 'transport_error' {
+  if (err instanceof Error && err.name === 'AbortError') return 'timeout';
+  return 'transport_error';
 }
 
 /** Rejects when (or if already) aborted — used to bound provider body reads. */
@@ -135,7 +142,12 @@ async function safeErrorName(resp: Response, signal: AbortSignal): Promise<strin
     const body = (await Promise.race([resp.json(), abortRejection(signal)])) as {
       name?: unknown;
     };
-    return typeof body.name === 'string' ? body.name : 'unknown';
+    // Same closed-shape discipline as errName (r2 HIGH class): the provider
+    // body is external input — only a snake_case token shaped like Resend's
+    // documented error names ('validation_error', …) may reach the logs.
+    return typeof body.name === 'string' && /^[a-z_]{1,64}$/.test(body.name)
+      ? body.name
+      : 'unknown';
   } catch {
     return 'unparseable';
   }
