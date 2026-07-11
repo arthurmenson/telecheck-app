@@ -33,9 +33,7 @@ export function renderPasscodeEmail(msg: PasscodeMessage): RenderedEmail {
   const purposeLine = isRecovery
     ? `Use this code to reset your ${brand} PIN.`
     : `Use this code to verify your email and finish setting up your ${brand} account.`;
-  const subject = isRecovery
-    ? `Your ${brand} PIN reset code`
-    : `Your ${brand} verification code`;
+  const subject = isRecovery ? `Your ${brand} PIN reset code` : `Your ${brand} verification code`;
 
   // Code is validated as 6 digits upstream; escape defensively anyway.
   const code = escapeHtml(msg.code);

@@ -72,7 +72,12 @@ export class ResendEmailSender implements EmailSender {
       // the payload. Log status + Resend's error name only.
       const detail = await safeErrorName(resp);
       this.#log.error(
-        { event: 'passcode_email_send_rejected', purpose: msg.purpose, status: resp.status, detail },
+        {
+          event: 'passcode_email_send_rejected',
+          purpose: msg.purpose,
+          status: resp.status,
+          detail,
+        },
         'Resend rejected the passcode email.',
       );
       throw new Error(`resend rejected passcode email: HTTP ${resp.status}`);

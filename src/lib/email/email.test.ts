@@ -71,9 +71,9 @@ describe('createEmailSender', () => {
   });
 
   it('throws for provider=resend without a key (never silently falls back to noop)', () => {
-    expect(() => createEmailSender({ provider: 'resend', from: 'x@y.z' }, capturingLogger())).toThrow(
-      /RESEND_API_KEY/,
-    );
+    expect(() =>
+      createEmailSender({ provider: 'resend', from: 'x@y.z' }, capturingLogger()),
+    ).toThrow(/RESEND_API_KEY/);
   });
 });
 
@@ -90,7 +90,9 @@ describe('NoopEmailSender', () => {
 
 describe('ResendEmailSender', () => {
   it('POSTs to the Resend API with bearer auth and the rendered body', async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ id: 'e_1' }), { status: 200 }));
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ id: 'e_1' }), { status: 200 }),
+    );
     const sender = new ResendEmailSender({
       apiKey: 're_test',
       from: 'Heros Health <no-reply@heroshealth.com>',
