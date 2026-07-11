@@ -130,10 +130,17 @@ describe('ResendEmailSender', () => {
     expect(dump).not.toContain(CODE);
   });
 
-  it('rejects and logs a transport error without the code', async () => {
+  it('transport errors cross the boundary SANITIZED: name only, no message/cause/key/code (Codex r1 HIGH)', async () => {
     const log = capturingLogger();
+    // Simulate a runtime fetch error that carries the request options (some
+    // runtimes attach them via cause/metadata) — none of it may escape.
+    const nasty = new Error('connect ECONNREFUSED to api.resend.com with Bearer re_test');
+    (nasty as Error & { cause?: unknown }).cause = {
+      headers: { Authorization: 'Bearer re_test' },
+      body: `code ${CODE}`,
+    };
     const fetchImpl = vi.fn(async () => {
-      throw new Error('ECONNREFUSED');
+      throw nasty;
     });
     const sender = new ResendEmailSender({
       apiKey: 're_test',
@@ -141,8 +148,53 @@ describe('ResendEmailSender', () => {
       log,
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
-    await expect(sender.sendPasscode(baseMsg('email_registration'))).rejects.toThrow();
-    expect(JSON.stringify(log.entries)).not.toContain(CODE);
+    let caught: unknown;
+    await sender.sendPasscode(baseMsg('email_registration')).catch((e: unknown) => {
+      caught = e;
+    });
+    expect(caught).toBeInstanceOf(Error);
+    const e = caught as Error & { cause?: unknown };
+    // Sanitized wrapper: stable name only — never the original message,
+    // never a cause chain, never the key or the passcode.
+    expect(e.message).toBe('resend transport failure: Error');
+    expect(e.cause).toBeUndefined();
+    expect(e.message).not.toContain('re_test');
+    expect(e.message).not.toContain(CODE);
+    const dump = JSON.stringify(log.entries);
+    expect(dump).not.toContain(CODE);
+    expect(dump).not.toContain('re_test');
+    expect(dump).not.toContain('ECONNREFUSED');
+  });
+
+  it('a stalled non-2xx error body cannot hang past the 10s timeout (Codex r1 MEDIUM)', async () => {
+    vi.useFakeTimers();
+    try {
+      const log = capturingLogger();
+      // fetch resolves on headers, but the error body never arrives: json()
+      // pends forever. The sender must still settle once the abort fires.
+      const stalledResp = {
+        ok: false,
+        status: 503,
+        json: () => new Promise(() => undefined),
+      } as unknown as Response;
+      const fetchImpl = vi.fn(async () => stalledResp);
+      const sender = new ResendEmailSender({
+        apiKey: 're_test',
+        from: 'x@y.z',
+        log,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+      const pending = sender.sendPasscode(baseMsg('pin_recovery'));
+      // Attach the rejection expectation BEFORE advancing time (no unhandled
+      // rejection window), then fire the 10s abort timer.
+      const assertion = expect(pending).rejects.toThrow(/HTTP 503/);
+      await vi.advanceTimersByTimeAsync(10_001);
+      await assertion;
+      // The stalled body parse resolved as 'unparseable' via the abort race.
+      expect(JSON.stringify(log.entries)).toContain('unparseable');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('constructor rejects an empty API key', () => {

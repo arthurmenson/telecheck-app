@@ -42,45 +42,67 @@ export class ResendEmailSender implements EmailSender {
   async sendPasscode(msg: PasscodeMessage): Promise<void> {
     const { subject, text, html } = renderPasscodeEmail(msg);
 
+    // The abort timer stays live until ALL response handling is done (Codex
+    // PR#274 r1 MEDIUM): fetch can resolve on headers while a stalled error
+    // body keeps `resp.json()` pending forever — which would pin the caller's
+    // un-awaited dispatch promise indefinitely. The non-2xx body parse below
+    // is raced against this same signal, so the 10s bound covers it.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
-    let resp: Response;
     try {
-      resp = await this.#fetch(RESEND_EMAILS_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.#apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ from: this.#from, to: [msg.to], subject, text, html }),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      // Network/timeout. Log WITHOUT the code or full recipient, then rethrow
-      // so the fire-and-forget caller records a delivery failure.
-      this.#log.error(
-        { event: 'passcode_email_send_error', purpose: msg.purpose, err: errName(err) },
-        'Resend passcode email send failed (transport).',
-      );
-      throw err instanceof Error ? err : new Error('resend send failed');
+      let resp: Response;
+      try {
+        resp = await this.#fetch(RESEND_EMAILS_URL, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.#apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ from: this.#from, to: [msg.to], subject, text, html }),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        // Network/timeout. Log WITHOUT the code or full recipient.
+        const name = errName(err);
+        this.#log.error(
+          { event: 'passcode_email_send_error', purpose: msg.purpose, err: name },
+          'Resend passcode email send failed (transport).',
+        );
+        // SANITIZED rethrow (Codex PR#274 r1 HIGH): never let the ORIGINAL
+        // transport error cross the fire-and-forget boundary — runtime fetch
+        // errors can carry the request options (Authorization header = API
+        // key; body = passcode plaintext) via cause/metadata properties,
+        // which a caller-side `log.error({ err })` would serialize. Only a
+        // stable name crosses.
+        throw new Error(`resend transport failure: ${name}`);
+      }
+
+      if (!resp.ok) {
+        // Do not log the response body verbatim — a misconfig echo could
+        // contain the payload. Log status + Resend's error name only. Parse
+        // is bounded by the abort signal (see timer note above).
+        const detail = await safeErrorName(resp, controller.signal);
+        this.#log.error(
+          {
+            event: 'passcode_email_send_rejected',
+            purpose: msg.purpose,
+            status: resp.status,
+            detail,
+          },
+          'Resend rejected the passcode email.',
+        );
+        throw new Error(`resend rejected passcode email: HTTP ${resp.status}`);
+      }
+
+      // Success: release the (small) response body without reading it so an
+      // unread stream cannot hold the connection open past this call.
+      try {
+        await resp.body?.cancel();
+      } catch {
+        // Body already consumed/closed — nothing to release.
+      }
     } finally {
       clearTimeout(timer);
-    }
-
-    if (!resp.ok) {
-      // Do not log the response body verbatim — a misconfig echo could contain
-      // the payload. Log status + Resend's error name only.
-      const detail = await safeErrorName(resp);
-      this.#log.error(
-        {
-          event: 'passcode_email_send_rejected',
-          purpose: msg.purpose,
-          status: resp.status,
-          detail,
-        },
-        'Resend rejected the passcode email.',
-      );
-      throw new Error(`resend rejected passcode email: HTTP ${resp.status}`);
     }
   }
 }
@@ -90,10 +112,29 @@ function errName(err: unknown): string {
   return 'unknown';
 }
 
-/** Resend error bodies are `{ name, message, statusCode }`; return `name` only. */
-async function safeErrorName(resp: Response): Promise<string> {
+/** Rejects when (or if already) aborted — used to bound provider body reads. */
+function abortRejection(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    const onAbort = (): void => reject(new Error('aborted'));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Resend error bodies are `{ name, message, statusCode }`; return `name` only.
+ * The read is raced against the request's abort signal so a stalled error
+ * body resolves as 'unparseable' at the timeout instead of hanging forever
+ * (Codex PR#274 r1 MEDIUM).
+ */
+async function safeErrorName(resp: Response, signal: AbortSignal): Promise<string> {
   try {
-    const body = (await resp.json()) as { name?: unknown };
+    const body = (await Promise.race([resp.json(), abortRejection(signal)])) as {
+      name?: unknown;
+    };
     return typeof body.name === 'string' ? body.name : 'unknown';
   } catch {
     return 'unparseable';

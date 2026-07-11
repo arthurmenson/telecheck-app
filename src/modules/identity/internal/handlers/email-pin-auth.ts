@@ -138,8 +138,16 @@ function dispatchPasscodeEmail(
       ttlMinutes: passcodeService.PASSCODE_TTL_MINUTES,
     })
     .catch((err: unknown) => {
+      // Message-only logging (Codex PR#274 r1 HIGH): never serialize the raw
+      // error object across this boundary — a runtime transport error can
+      // carry the request options (API-key header, passcode body). The sender
+      // already rethrows sanitized errors; this is defense-in-depth.
       req.log.error(
-        { err, event: 'passcode_email_dispatch_failed', purpose: args.purpose },
+        {
+          event: 'passcode_email_dispatch_failed',
+          purpose: args.purpose,
+          reason: err instanceof Error ? err.message : 'unknown',
+        },
         'passcode email dispatch failed',
       );
     });
