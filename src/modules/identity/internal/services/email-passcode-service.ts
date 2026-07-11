@@ -25,7 +25,9 @@ export const PASSCODE_NO_ACTIVE_CHALLENGE = 'identity.email_passcode.no_active_c
 export const PASSCODE_INVALID_CODE = 'identity.email_passcode.invalid_code';
 export const PASSCODE_LOCKOUT_TRIGGERED = 'identity.email_passcode.lockout_triggered';
 
-const PASSCODE_TTL_MINUTES = 5;
+/** Passcode lifetime in minutes. Exported so the email template can render
+ *  the "expires in N minutes" line from the single source of truth. */
+export const PASSCODE_TTL_MINUTES = 5;
 const MS_PER_MINUTE = 60 * 1000;
 
 export interface IssuePasscodeInput {
