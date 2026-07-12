@@ -65,7 +65,9 @@ export const OTP_LOCKOUT_TRIGGERED = 'identity.otp.lockout_triggered';
 // IssueOtpInput
 // ---------------------------------------------------------------------------
 
-const OTP_TTL_MINUTES = 5; // Identity Spec §2.1
+/** OTP lifetime in minutes (Identity Spec §2.1). Exported so the SMS template
+ *  can render the "expires in N minutes" line from one source of truth. */
+export const OTP_TTL_MINUTES = 5;
 const MS_PER_MINUTE = 60 * 1000;
 
 export interface IssueOtpInput {

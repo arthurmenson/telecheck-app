@@ -238,6 +238,18 @@ const ConfigSchema = z.object({
   RESEND_API_KEY: z.string().optional(),
   EMAIL_FROM: z.string().min(1).default('Heros Health <no-reply@heroshealth.com>'),
 
+  // Transactional SMS delivery (phone OTP; see src/lib/sms/). Provider-
+  // agnostic. Default 'noop' = log-only, NO external send — unconfigured/dev/
+  // test changes no behavior (the OTP is still issued + persisted). Activation
+  // is a config flip to 'telnyx' + TELNYX_API_KEY + a sender (SMS_FROM number
+  // or TELNYX_MESSAGING_PROFILE_ID). Flagged §12 SI
+  // (docs/SI-SMS-DELIVERY-PROVIDER.md). Sending data to an external provider
+  // is an operator decision — stays 'noop' until explicitly flipped.
+  SMS_PROVIDER: z.enum(['noop', 'telnyx']).default('noop'),
+  TELNYX_API_KEY: z.string().optional(),
+  SMS_FROM: z.string().optional(),
+  TELNYX_MESSAGING_PROFILE_ID: z.string().optional(),
+
   // Deployment-environment label, DISTINCT from NODE_ENV: the staging
   // stack runs NODE_ENV=production for runtime parity (prod code paths,
   // no dev middleware), so NODE_ENV cannot express "is this the
@@ -444,6 +456,25 @@ function loadConfig() {
     );
   }
 
+  // Same posture for SMS: a real provider without its credential + a sender
+  // would silently drop every OTP. (noop is always valid.)
+  if (parsed.SMS_PROVIDER === 'telnyx') {
+    if ((parsed.TELNYX_API_KEY ?? '').length === 0) {
+      throw new Error(
+        'SMS_PROVIDER=telnyx requires TELNYX_API_KEY to be set, or leave SMS_PROVIDER=noop.',
+      );
+    }
+    if (
+      (parsed.SMS_FROM ?? '').length === 0 &&
+      (parsed.TELNYX_MESSAGING_PROFILE_ID ?? '').length === 0
+    ) {
+      throw new Error(
+        'SMS_PROVIDER=telnyx requires a sender: set SMS_FROM (E.164 number) or ' +
+          'TELNYX_MESSAGING_PROFILE_ID.',
+      );
+    }
+  }
+
   return {
     nodeEnv: parsed.NODE_ENV,
     port: parsed.PORT,
@@ -485,6 +516,12 @@ function loadConfig() {
       provider: parsed.EMAIL_PROVIDER,
       resendApiKey: parsed.RESEND_API_KEY,
       from: parsed.EMAIL_FROM,
+    },
+    sms: {
+      provider: parsed.SMS_PROVIDER,
+      telnyxApiKey: parsed.TELNYX_API_KEY,
+      from: parsed.SMS_FROM,
+      messagingProfileId: parsed.TELNYX_MESSAGING_PROFILE_ID,
     },
     deployEnv,
     resumeTokenSecret,
