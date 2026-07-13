@@ -43,6 +43,8 @@ import * as accountService from '../services/account-service.js';
 import * as otpService from '../services/otp-service.js';
 import { asAccountId, asOtpId, type Account } from '../types.js';
 
+import { dispatchPasscodeSms } from './login.js';
+
 // ---------------------------------------------------------------------------
 // Sentinel error codes (mapped to HTTP envelope shapes by the handlers)
 // ---------------------------------------------------------------------------
@@ -138,7 +140,8 @@ export async function registrationStartHandler(
 
   const phone = body.phone_e164;
 
-  return withIdempotentExecution<unknown>(
+  let issuedCode: string | null = null;
+  const result = await withIdempotentExecution<unknown>(
     req,
     reply,
     mapServiceError,
@@ -160,7 +163,7 @@ export async function registrationStartHandler(
       // Issue OTP. issueOtp throws OTP_LOCKOUT_ACTIVE on cooldown — the
       // mapServiceError closure (passed to withIdempotentExecution) maps
       // that to the 400 envelope.
-      const { otp } = await otpService.issueOtp(
+      const { otp, codePlaintext } = await otpService.issueOtp(
         ctx,
         { actorId: 'system' },
         {
@@ -171,9 +174,20 @@ export async function registrationStartHandler(
         },
         tx,
       );
+      issuedCode = codePlaintext;
       return { status: 200, view: { otp_id: otp.otp_id } };
     },
   );
+  // Fire the OTP SMS after commit (best-effort; not on an idempotent replay).
+  if (issuedCode !== null) {
+    dispatchPasscodeSms(req, {
+      to: phone,
+      code: issuedCode,
+      purpose: 'registration',
+      consumerDba: ctx.consumerDba,
+    });
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

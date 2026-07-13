@@ -62,12 +62,42 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { config } from '../../../../lib/config.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
+import { getSmsSender } from '../../../../lib/sms/index.js';
+import type { OtpPurpose } from '../../../../lib/sms/index.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import * as accountService from '../services/account-service.js';
 import * as otpService from '../services/otp-service.js';
 import * as sessionService from '../services/session-service.js';
 import { asOtpId, asSessionId } from '../types.js';
+
+/**
+ * Fire-and-forget OTP-SMS dispatch. Call AFTER withIdempotentExecution
+ * resolves — the tx has committed (never text a rolled-back code) and, on an
+ * idempotent replay, the body callback did not run so `code` was never set.
+ * NOT awaited: provider latency must not skew response timing, and a provider
+ * outage must not fail login/registration. The OTP is issued + persisted
+ * regardless; delivery is best-effort. Mirrors the email dispatch helper.
+ */
+export function dispatchPasscodeSms(
+  req: FastifyRequest,
+  args: { to: string; code: string; purpose: OtpPurpose; consumerDba: string },
+): void {
+  void getSmsSender()
+    .sendPasscode({
+      to: args.to,
+      code: args.code,
+      purpose: args.purpose,
+      consumerDba: args.consumerDba,
+      ttlMinutes: otpService.OTP_TTL_MINUTES,
+    })
+    .catch((err: unknown) => {
+      req.log.error(
+        { err, event: 'passcode_sms_dispatch_failed', purpose: args.purpose },
+        'passcode SMS dispatch failed',
+      );
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Sentinel error codes
@@ -155,7 +185,8 @@ export async function loginStartHandler(
 
   const phone = body.phone_e164;
 
-  return withIdempotentExecution<unknown>(
+  let issuedCode: string | null = null;
+  const result = await withIdempotentExecution<unknown>(
     req,
     reply,
     mapServiceError,
@@ -199,17 +230,26 @@ export async function loginStartHandler(
         },
         tx,
       );
+      issuedCode = codePlaintext;
       // Staging-only OTP echo (AUTH_DEV_OTP_ECHO; production fail-fast in
-      // config.ts): no SMS provider is wired at v1.0, so the plaintext is
-      // otherwise discarded and the real login flow is unreachable. The
-      // Track-4 patient app's staging login consumes `dev_otp`. Removed
-      // in lockstep with the SMS-provider SI.
+      // config.ts): a debugging affordance that coexists with real SMS
+      // delivery. When SMS_PROVIDER=telnyx the code is also texted (below);
+      // the echo is dropped once testers no longer need it.
       if (config.authDevOtpEcho) {
         return { status: 200, view: { otp_id: otp.otp_id, dev_otp: codePlaintext } };
       }
       return { status: 200, view: { otp_id: otp.otp_id } };
     },
   );
+  if (issuedCode !== null) {
+    dispatchPasscodeSms(req, {
+      to: phone,
+      code: issuedCode,
+      purpose: 'login',
+      consumerDba: ctx.consumerDba,
+    });
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
