@@ -54,7 +54,12 @@ echo ">> apply migrations"
 echo ">> provision SI-010 bind-pool credentials (idempotent)"
 # migration 031 creates bind_actor_context_role LOGIN without a password;
 # the operator provisions credentials post-migration (031 header §Role).
-source infra/staging/.env
+# Extract ONLY the one value we need — do NOT `source` the whole .env: it is
+# also a docker-compose env_file and legitimately holds values with spaces and
+# shell metacharacters (e.g. EMAIL_FROM="Heros Health <no-reply@...>"), which
+# `source` chokes on ("syntax error near unexpected token"). cut -f2- keeps
+# everything after the first '=' so a value containing '=' survives.
+BIND_ROLE_PASSWORD=$(grep -E '^BIND_ROLE_PASSWORD=' infra/staging/.env | head -1 | cut -d= -f2-)
 "${COMPOSE[@]}" exec -T db psql -U "${POSTGRES_USER:-telecheck}" -d "${POSTGRES_DB:-telecheck}" -q -c \
   "ALTER ROLE bind_actor_context_role WITH LOGIN PASSWORD '${BIND_ROLE_PASSWORD}';"
 
