@@ -138,14 +138,74 @@ Three options below. Each has different trade-offs on time-to-signal, cost, comp
 - **HIPAA BAA path with Hetzner** — one-off question: does Hetzner offer a BAA at all? If yes, that could shift Option A vs. B calculus. (Hetzner does NOT offer HIPAA BAA to my knowledge; AWS does; this needs verification.)
 - **Ghana DPA processor agreement path** — who advises? Ghana Data Protection Commission is the counterparty; is there existing Heros Health Ghana counsel who has this relationship?
 
-## Codex Pass-2 (contrast-and-synthesize) — pending
+## Codex Pass-2 (contrast-and-synthesize) — completed 2026-08-30
 
-Per the two-pass dual-recommendation flow, Codex Pass-2 will be invoked next with:
-- Codex Pass-1 output (the R1 findings above)
-- Claude's Option A recommendation + rationale + trade-off analysis
-- Request: reconcile, surface disagreements, catch framing defects, propose final synthesis
+**Verdict:** `needs-attention` — **CONDITIONAL CONCURRENCE with Option A over B/C**, not ratification as-written.
 
-Pass-2 output will be appended to this ERR before ratifier decision.
+**Verbatim summary:** *"Conditionally concur with Option A over B/C, but do not ratify it as written. Pilot 1 is the least unsafe path only after enforceable synthetic-only and operational-safety gates replace the unsupported 'zero compliance exposure' claim; Pilot 2 also needs jurisdictional and cross-border-data review beyond the listed infrastructure checklist."*
+
+### Pass-2 finding 1 — HIGH: "Zero compliance exposure" is categorical and unsupported by enforceable gates
+
+*ERR §80–93 (Option A framing).* Consent + synthetic intent are not sufficient. Volunteers can enter real names, symptoms, medications, or third-party details into free-text; logs, support artifacts, backups, and AI-provider payloads retain any leakage. Consent does not make real health data synthetic. Pilot 1 therefore retains a credible PHI/privacy exposure path on infrastructure explicitly deemed non-PHI-capable.
+
+**Pass-2 recommendation:** Block Pilot 1 until enforceable technical + operational gates exist:
+- Synthetic identities + approved scenarios only
+- Explicit prohibition + training against real personal/clinical data
+- Automated input/output + log checks (regex + LLM screening for PII patterns)
+- Verified redaction + telemetry/AI-vendor data controls
+- Least-privilege access + tenant-isolation tests
+- Environment purge/reset procedure
+- Named incident owner + isolation/session-revocation steps + rehearsed stop criterion
+
+**Wording fix:** replace "zero compliance exposure" with "materially reduced compliance exposure."
+
+### Pass-2 finding 2 — HIGH: Pilot 2 prerequisites omit cross-border and full processor-chain authorization
+
+*ERR §86–88 (Pilot 2 requirements).* The gate assumes AWS us-east-1 + BAA + KMS + Ghana DPA processor agreement establishes compliance. For Ghana patients, US-hosted infrastructure + US AI + US SMS + US email + US logging subprocessors creates separate data-transfer / controller-processor / retention / data-residency questions. A US HIPAA BAA is not a substitute for Ghana-law authorization.
+
+**Pass-2 recommendation:** Require counsel/privacy-owner approval of:
+- Data classification (what qualifies as PHI under Ghana law)
+- Controller/processor roles (who owns the data, who processes it)
+- Cross-border transfer basis (Ghana → US legal basis)
+- DPIA or equivalent assessment
+- Residency requirements (is any category data-residency-locked to Ghana?)
+- Retention/deletion rules
+- Data-subject rights (Ghana DPA equivalents of HIPAA/GDPR rights)
+- Breach duties (Ghana DPC notification timelines + content)
+- **Every subprocessor** (Anthropic, Resend, Telnyx, AWS, Hetzner) — separately authorized
+
+Select region + vendors only after that review — do not pre-commit to us-east-1.
+
+### Pass-2 finding 3 — MEDIUM: Pilot 1 has no measurable exit criteria and overstates the signal it produces
+
+*ERR §64–78 (what Pilot 1 delivers).* "Real workflow signal" + "~80% validation" from team members or friendly clinicians acting from contrived cases has no acceptance thresholds, representative scenario set, independence safeguards, failure budget, or Pilot-1-to-Pilot-2 exit criteria. Such participants know the product and may avoid confusion, accessibility constraints, poor connectivity, language variation, and unsafe inputs seen in the target population. Ratifier could approve Pilot 2 based on a green but non-representative rehearsal.
+
+**Pass-2 recommendation:** Before ratification:
+- Define Pilot 1 as a **workflow rehearsal, not clinical validation**
+- Specify representative scripted + adversarial cases (coverage matrix)
+- Success + abort thresholds
+- Observability requirements
+- Rollback/recovery drills
+- Independent issue capture (not just self-report)
+- Explicit evidence required to advance to Pilot 2
+- Remove the "80%+" claim unless backed by a traceable coverage matrix
+
+### Pass-2 next steps
+
+- Ratify Option A only **conditionally**, subject to the Pilot 1 gates above.
+- Require a **revised ERR** with a qualified exposure statement, measurable Pilot 1 exit criteria, and counsel-approved Pilot 2 jurisdiction/subprocessor gates.
+
+## Convergence check (per auto-proceed rule, CLAUDE.md 2026-05-20)
+
+| View | Position on Option A |
+|---|---|
+| Claude recommendation | Option A, ratify + execute |
+| Codex Pass-1 (R1) | The runbook as written is NO-SHIP; Option A framing not yet reviewed |
+| Codex Pass-2 (synthesis) | Option A over B/C, ratify **conditionally** with three specific gate additions |
+
+**All three concur on direction (Option A over B/C).** Divergence is on ratification cadence: Claude ready to ratify + execute; Pass-2 wants ERR revision first with gates baked in.
+
+Auto-proceed determination pending ratifier's chosen framing (see next section).
 
 ## Ratifier decision (pending)
 
