@@ -164,9 +164,23 @@
 
 The purge script itself performs NO raw evidence capture. Any forensic artifact must have been produced by the single fail-closed capture path documented in `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Capture procedure BEFORE this script runs.
 
-**Purge table allowlist policy (implementation enumerates from live schema; documentation illustrates):**
+**Purge table classification policy (spec = policy; Sprint 1.3 implementation PR = FK-graph resolution):**
 
-Env-purge truncates ONLY participant-data tables on an explicit allowlist. The allowlist is authored in the implementation PR (Sprint 1.3) by enumerating every table introduced by migrations 000–HEAD that carries participant-generated content, then classifying each as either allowlisted (participant PHI-ish; purged) or preserved (schema fixture, immutable evidence, or tenant baseline).
+This specification defines POLICY:
+- Participant-data tables are removed to reset the environment
+- Schema fixtures, tenant baseline, and immutable evidence (`audit_records`, `audit_dedupe_markers`, `domain_events_outbox`) are preserved
+- No blanket truncation — every table must be classified explicitly
+- The append-only audit chain must survive purge to carry `env.purge.executed` attestation (I-003)
+
+The **FK-graph resolution** (what SQL operation on which tables in which order) is the responsibility of the Sprint 1.3 implementation PR, which:
+1. Enumerates every table in migrations 000–HEAD
+2. Classifies each as `allowlist` (participant PHI-ish) or `preserved` (fixture / immutable / tenant baseline)
+3. Models the FK edges between classifications
+4. **Prohibits `TRUNCATE ... CASCADE` where CASCADE would reach a preserved table** — instead uses scoped `DELETE` with an explicit dependency plan, or reclassifies participant-bound tables that hang off preserved parents (e.g., `forms_snapshot` may reference `forms_submission`; if `forms_snapshot` is participant-scoped it moves to allowlist)
+5. For `accounts` and other tables that mix baseline operators + participants, uses scoped `DELETE` that preserves baseline rows (operator accounts, tenant-service accounts) while removing participant rows
+6. Produces the CI test that verifies (a) schema-drift classification completeness, (b) canary purge behavior across allowlist + preserved, (c) **no FK edge crosses from preserved-scope evidence into truncated-scope data** (or, if intentional, the edge is documented + tested for correct scoped-DELETE handling)
+
+Illustrative classification below reflects a first-pass reading of migrations 000–079. Sprint 1.3 PR revises it against actual FK graph and adds the operational plan (TRUNCATE vs scoped DELETE) per table.
 
 **Illustrative allowlist (verified against migrations 000–079 as of 2026-08-30; Sprint 1.3 PR must re-verify against migrations at merge time):**
 - **Identity + auth:** `accounts`, `sessions`, `otp_challenges`, `auth_devices`, `account_pin_credentials`, `email_passcodes`
@@ -191,15 +205,12 @@ Env-purge truncates ONLY participant-data tables on an explicit allowlist. The a
 - `schema_migrations` — migrations tracker
 - Any Postgres system catalog
 
-**Schema-drift regression test (mandatory in Sprint 1.3 PR):**
-CI test enumerates all tables in the live schema (`information_schema.tables` filtered to public schema) at test time, cross-references against a checked-in classification map (`allowlist` | `preserved`), and FAILS if any live table lacks a classification. Any new migration that adds a table must also add its classification in the same PR; otherwise the CI test blocks. This prevents silent schema drift from leaving participant tables preserved by omission or preserved tables truncated by over-inclusion.
+**Sprint 1.3 CI test suite (mandatory):**
 
-**Seeded-canary integration test (mandatory in Sprint 1.3 PR):**
-- Seed identifiable canary rows into every allowlisted table via `pilot-1-baseline-seed.sql --with-canaries`
-- Seed identifiable canary rows into every preserved table
-- Run env-purge (both modes: routine-reset from clean; incident-mode with manifest)
-- Verify: every allowlist-canary is GONE; every preserved-canary is INTACT; `audit_records` contains the `env.purge.executed` event with matching incidentId (incident-mode only)
-- FK behavior: any allowlisted table with a FK to another allowlisted table should be truncated with `CASCADE` in the correct dependency order — or the transaction fails deterministically. Test verifies clean truncation completes without leaving orphaned rows
+1. **Schema-drift classification test:** enumerate live schema (`information_schema.tables` filtered to `public`) at test time; cross-reference against checked-in classification map (`allowlist` | `preserved` | `scoped-delete` — the last for mixed-baseline tables like `accounts`); FAIL if any live table lacks classification. New migrations adding tables MUST add classification in the same PR.
+2. **Preserved-to-purged FK-edge test:** enumerate FK constraints from `information_schema.referential_constraints`; FAIL if any FK edge points from a `preserved`-scope table to an `allowlist`-scope table (would break under TRUNCATE) OR from a `preserved`-scope table to a `scoped-delete`-scope table where the scoped-delete plan does not preserve the referenced rows.
+3. **Seeded-canary purge integration test:** seed identifiable canary rows into every classified table via `pilot-1-baseline-seed.sql --with-canaries`; run env-purge (both modes: routine-reset from clean; incident-mode with manifest); verify (a) every allowlist-canary is GONE, (b) every preserved-canary is INTACT, (c) every scoped-delete-canary has ONLY its participant-scoped rows removed with baseline rows INTACT, (d) `audit_records` contains the `env.purge.executed` event with matching incidentId (incident-mode only), (e) no orphaned FK rows across the entire schema post-purge.
+4. **Attestation-transaction test:** simulate a truncation failure mid-transaction; verify the `env.purge.executed` audit event is rolled back atomically; verify the incident-mode purge exits non-zero and no partial state is left.
 
 **Post-purge:** re-seed synthetic tenant baseline + participant handles per `pilot-1-baseline-seed.sql`. Baseline seed is idempotent (uses `ON CONFLICT DO NOTHING`).
 
