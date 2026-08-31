@@ -204,6 +204,32 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
     // discussion; for AI-bound routes still block (defense-in-depth).
     regex: /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g,
   },
+  {
+    id: 'ipv6',
+    label: 'IPv6 address',
+    confidence: 'low_confidence',
+    // IPv6 in three common forms:
+    //   (1) full 8-group: 2001:0db8:85a3:0000:0000:8a2e:0370:7334
+    //   (2) compressed with `::` (one or more all-zero groups collapsed):
+    //       2001:db8::8a2e:370:7334, ::1, fe80::, ::
+    //   (3) IPv4-mapped: ::ffff:192.0.2.1
+    //
+    // The alternation covers:
+    //   (a) 8 full groups
+    //   (b) any occurrence of `::` between valid group runs, requiring
+    //       at least one hex group total (avoids matching bare `::`
+    //       without context — though bare `::` is a valid loopback
+    //       address; we include it as its own alternate)
+    //   (c) IPv4-mapped form `::ffff:d.d.d.d`
+    //
+    // Boundaries: word-boundary would be wrong (colons + hex are word-
+    // like); use surrounding-non-address-char lookaround approximation
+    // via (?<![:.0-9a-fA-F]) and (?![:.0-9a-fA-F]).
+    //
+    // Codex R9 finding (2026-08-31): the spec explicitly requires IPv6
+    // detection; prior version shipped IPv4-only.
+    regex: /(?<![:.0-9a-fA-F])(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|::(?:ffff(?::0{1,4})?:)?(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?))(?![:.0-9a-fA-F])/g,
+  },
 
   // ---------------------------------------------------------------------
   // Medical record identifiers — high confidence (structural patterns)

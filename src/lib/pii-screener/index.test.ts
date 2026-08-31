@@ -47,6 +47,7 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       { patternId: 'us_phone', input: 'call (415) 555-0123 or leave a message', expectMatch: '(415) 555-0123' },
       { patternId: 'ghana_phone', input: 'my number +233241234567 works too', expectMatch: '+233241234567' },
       { patternId: 'ipv4', input: 'the box at 10.0.0.42 is down', expectMatch: '10.0.0.42' },
+      { patternId: 'ipv6', input: 'client 2001:db8:85a3::8a2e:370:7334 connected', expectMatch: '2001:db8:85a3::8a2e:370:7334' },
       { patternId: 'medical_record_number', input: 'MRN 1234567 in the chart', expectMatch: 'MRN 1234567' },
     ];
 
@@ -146,6 +147,59 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(ccHit?.match.endsWith(' ')).toBe(false);
       expect(ccHit?.match.endsWith('-')).toBe(false);
       expect(ccHit?.match).toBe('4111 1111 1111 1111');
+    });
+
+    it('IPv6 full form is detected', () => {
+      // R9 HIGH: spec requires IPv6; prior version shipped IPv4-only.
+      const r = screenInput('client 2001:0db8:85a3:0000:0000:8a2e:0370:7334 connected', 'ai_bound');
+      expect(r.action).toBe('block');
+      expect(r.hits.some((h) => h.patternId === 'ipv6')).toBe(true);
+    });
+
+    it('IPv6 compressed forms detected (::, ::1, fe80::, mid-compress)', () => {
+      const cases: Array<[string, string]> = [
+        ['loopback ::1 is local', '::1'],
+        ['link-local fe80:: is available', 'fe80::'],
+        ['compressed 2001:db8::8a2e:370:7334 example', '2001:db8::8a2e:370:7334'],
+      ];
+      for (const [input, expected] of cases) {
+        const r = screenInput(input, 'ai_bound');
+        const hit = r.hits.find((h) => h.patternId === 'ipv6');
+        expect(hit, `no ipv6 hit for: ${input}`).toBeDefined();
+        expect(hit?.match).toBe(expected);
+      }
+    });
+
+    it('IPv6 IPv4-mapped form detected', () => {
+      const r = screenInput('mapped ::ffff:192.0.2.1 legacy', 'ai_bound');
+      const hit = r.hits.find((h) => h.patternId === 'ipv6');
+      expect(hit).toBeDefined();
+      expect(hit?.match).toBe('::ffff:192.0.2.1');
+    });
+
+    it('IPv6 does not match malformed strings', () => {
+      // Bad hex, too many groups, non-address text
+      const negatives = [
+        'not an address: 2001:0dbg:...',
+        'a:b:c is not enough groups',
+        'no colons here 2001db8',
+      ];
+      for (const input of negatives) {
+        const r = screenInput(input, 'internal');
+        expect(r.hits.some((h) => h.patternId === 'ipv6'),
+          `false-positive ipv6 hit on: ${input}`).toBe(false);
+      }
+    });
+
+    it('IPv6 blocks on ai_bound (low_confidence still blocks per matrix)', () => {
+      const r = screenInput('the server 2001:db8::1 is up', 'ai_bound');
+      expect(r.action).toBe('block');
+    });
+
+    it('IPv6 redacts on internal route (low_confidence)', () => {
+      const r = screenInput('the server 2001:db8::1 is up', 'internal');
+      expect(r.action).toBe('redact');
+      expect(r.redactedInput).toContain('[REDACTED:IPv6 address]');
     });
   });
 
