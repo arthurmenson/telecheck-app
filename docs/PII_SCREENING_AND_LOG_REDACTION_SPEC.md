@@ -169,7 +169,7 @@ The purge script itself performs NO raw evidence capture. Any forensic artifact 
 7. `docker compose exec db psql -U telecheck telecheck -f /migrations/pilot-1-baseline-seed.sql` (reseed synthetic accounts + tenant baseline)
 8. `docker compose start app`
 9. Verify `/health` returns 200 on both tenant hosts
-10. **Regression test:** verify no raw `.log` / `.sql` files were created by this script under `/home/deploy/incident-logs/` (only `.age`-suffixed artifacts from the capture script may exist; anything else is a purge-script defect)
+10. **Regression test — this script MUST NOT touch `/home/deploy/incident-logs/` under any code path.** No delete, no create, no modify. The directory is owned entirely by `incident-capture.sh` (creates), `incident-clear.sh` (removes lock), and `incident-log-gc.sh` (removes aged consumed manifests + artifacts). If purge script ever writes or removes anything under `incident-logs/`, that is a purge-script defect. Add a CI test that runs purge against a stub directory and asserts zero changes to `incident-logs/` contents.
 
 **Runtime:** ~60–120 s.
 

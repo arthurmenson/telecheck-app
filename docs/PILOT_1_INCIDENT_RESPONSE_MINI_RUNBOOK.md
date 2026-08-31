@@ -157,9 +157,14 @@ Non-incident environment resets use `scripts/pilot-1-env-purge.sh --routine-rese
 
 ### Retention + destruction
 
-- **Retention:** 30 days maximum for encrypted incident logs; auto-purge via `scripts/incident-log-gc.sh` (weekly cron; deletes files older than 30 days)
-- **Explicit destruction on Pilot 1 close:** on Pilot 1 exit (win or abort), Evans authorizes full `/home/deploy/incident-logs/` wipe; wipe is recorded in the incident log
-- **Never off-VPS-backup-eligible** — the incident-log path is on VPS-local disk only, not eligible for the VPS's backup rotation (should there be one; presently Pilot 1 has no VPS-backup rotation on purpose)
+- **Preserved always (cannot be deleted by any generic wipe):**
+  - `/home/deploy/incident-logs/.incident.lock` while it exists
+  - Any `*.manifest.json` where `consumed: false` OR the corresponding incident-lock still names its incidentId
+  - Any `*-<incident-id>-*.age` artifact whose incident-id matches an unconsumed manifest
+- **Retention (encrypted incident logs whose manifest is `consumed: true` and lock cleared):** 30 days maximum; auto-purge via `scripts/incident-log-gc.sh` (weekly cron). The GC script's contract: enumerate `*.manifest.json` files; for each, only delete the manifest + its artifacts if manifest.consumed=true AND no incident-lock references that incidentId AND age of file ≥30 days. Never touches `.incident.lock` under any condition. Never deletes an unconsumed manifest.
+- **Explicit destruction on Pilot 1 close:** on Pilot 1 exit (win or abort), Evans authorizes full `/home/deploy/incident-logs/` wipe via `scripts/pilot-1-close-wipe.sh --confirm` — script REFUSES if `.incident.lock` exists OR any manifest has `consumed: false`. Any incidents opened but not disposed must be closed via `incident-clear.sh` first. Wipe is recorded in the Pilot 1 close report.
+- **Env-purge (both modes) preserves incident state:** neither `pilot-1-env-purge.sh --routine-reset` nor `pilot-1-env-purge.sh --incident-id <id>` deletes `.incident.lock` or any `*.manifest.json`. Only `incident-clear.sh --incident-id <id> --disposition ...` removes the lock; only `incident-log-gc.sh` (after ≥30 days, consumed manifest, cleared lock) removes retained artifacts.
+- **Never off-VPS-backup-eligible** — the incident-log path is on VPS-local disk only, not eligible for VPS backup rotation (which presently doesn't exist by design for Pilot 1).
 
 ### Include incident-logs in verified purge
 
