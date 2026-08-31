@@ -292,23 +292,27 @@ Illustrative classification below reflects a first-pass reading of migrations 00
 7. **PR 1.2c — Layer 5 backup redaction wrapper** (`pg_dump | node scripts/pii-scrub.mjs` with age-encryption of the output).
 8. **PR 1.3 — Env-purge + incident-scripts package + marker-integrity** (`scripts/pilot-1-env-purge.sh` with the two mutually-exclusive modes + `migrations/pilot-1-baseline-seed.sql` + `scripts/incident-capture.sh` + `scripts/incident-clear.sh` + `scripts/incident-log-gc.sh` + `scripts/pilot-1-close-wipe.sh` + `scripts/pii-scrub.mjs` + `scripts/verify-pilot-1-baseline.sh` — the cohort-marker integrity checker). Env-purge NEVER touches `/home/deploy/incident-logs/`; single-writer discipline enforced; CI test asserts.
 
-**Marker integrity — fail-closed at every enforcement surface (containment, not just detection):**
+**Cohort-classification integrity — fail-closed at every enforcement surface (containment, not just detection):**
 
-- **Provisioning (atomicity, not post-hoc):** account creation and cohort-marker assignment MUST be in the SAME `INSERT INTO accounts (...) VALUES (...)` statement. There is no post-hoc marker-write pattern. The account and its marker are indistinguishable at the SQL level — one INSERT, one commit. Sprint 1.3 PR uses PostgreSQL `INSERT ... RETURNING` semantics + a schema `NOT NULL` constraint on the marker column (or JSON-check constraint if marker lives in metadata) so that a markerless INSERT fails at the database rather than being accepted.
+Refers to the canonical **three-state cohort classification** (participant / baseline / unclassified) defined at §Purge table classification policy step 5 §Three-state cohort classification. This section specifies the enforcement mechanics for Sprint 1.3.
 
-- **Provisioning integrity CI test:** attempt to insert an `accounts` row without the marker via a synthesized SQL statement bypassing the provisioning helper; the schema constraint MUST reject it. CI test asserts this.
+- **Provisioning (atomicity, not post-hoc):** account creation and `cohort_classification` assignment MUST be in the SAME `INSERT INTO accounts (...) VALUES (...)` statement. There is no post-hoc classification-write pattern. Sprint 1.3 PR uses PostgreSQL `INSERT ... RETURNING` semantics + a schema `NOT NULL` constraint on the `cohort_classification` column + `CHECK cohort_classification IN ('participant', 'baseline', 'unclassified')` so an INSERT that omits the column or supplies an invalid value fails at the database.
 
-- **Provisioning post-verification (backstop, not the only line of defense):** the provisioning helper MAY additionally run `verify-pilot-1-baseline.sh` as a same-transaction post-check within the provisioning code path. If this verifier detects any markerless participant account, the provisioning transaction rolls back — the account does NOT exist post-provisioning. Compounds the schema constraint above; catches any bypass via raw SQL that somehow slipped through.
+- **Provisioning integrity CI test:** attempt to insert an `accounts` row without `cohort_classification` via a synthesized SQL statement bypassing the provisioning helper — the schema NOT NULL constraint MUST reject it. Attempt an INSERT with an invalid classification value — the CHECK constraint MUST reject it.
 
-- **Purge preflight (containment surface):** env-purge (both modes) runs `verify-pilot-1-baseline.sh` before any mutation. If markerless participant accounts are detected, purge REFUSES with an actionable message that names the offending account IDs + points to the remediation path (`scripts/pilot-1-marker-remediation.sh --incident-id <id> --account-id <id> --classify-as {participant|baseline}` — an explicit operator action that either assigns the marker + retries purge OR classifies the account as baseline in an audit-logged decision).
+- **Provisioning post-verification (backstop, not the only line of defense):** the provisioning helper MAY additionally run `verify-pilot-1-baseline.sh` as a same-transaction post-check within the provisioning code path. If the verifier detects any `unclassified` row, the provisioning transaction rolls back — the account does NOT exist post-provisioning. Compounds the schema constraint above.
 
-- **Remediation path (safe recovery):** `scripts/pilot-1-marker-remediation.sh` is the ONLY authorized route for post-hoc classification. Each invocation is logged as an audit event (`pilot_1.marker_remediation{accountId, classifiedAs, actor, reason}`). This ensures an incident purge is never blocked forever — the operator can always classify + proceed — while requiring an explicit audited decision for any drift.
+- **Purge preflight (containment surface):** env-purge (both modes) runs `verify-pilot-1-baseline.sh` before any mutation. If any `unclassified` row is detected, purge REFUSES with an actionable message that names the offending account IDs + points to the remediation path (`scripts/pilot-1-marker-remediation.sh --account-id <id> --classify-as {participant|baseline} --reason "..."`). Note: purge does NOT reject baseline patient/delegate rows — those are legitimate and preserved.
 
-**CI test additions covering fail-closed behavior:**
-- Marker-omitted raw INSERT: schema constraint rejects with error; no row inserted; provisioning helper's atomic-insert design is verified.
+- **Remediation path (safe recovery):** `scripts/pilot-1-marker-remediation.sh` is the ONLY authorized route for classifying an `unclassified` account. Each invocation is logged as an audit event (`pilot_1.cohort_classification{accountId, classifiedAs, actor, reason}`). This ensures an incident purge is never blocked forever — the operator can always classify + proceed — while requiring an explicit audited decision for any drift.
+
+**CI test additions covering fail-closed behavior (three-state):**
+- Classification-omitted raw INSERT: schema NOT NULL constraint rejects with error; no row inserted; provisioning helper's atomic-insert design is verified.
+- Invalid-classification raw INSERT: schema CHECK constraint rejects with error.
 - Provisioning-then-verifier-fail simulation: inject a verifier failure post-INSERT within the transaction; verify rollback; verify no account created; verify audit event of provisioning-failure.
-- Purge-with-markerless-account: seed a markerless participant account (via test-only raw INSERT bypassing constraint); run purge; verify purge REFUSES with actionable message.
-- Remediation script: run remediation; verify audit event; verify purge now proceeds successfully.
+- Purge-with-unclassified-account: seed an `unclassified` account (via test-only DDL relaxation bypassing constraints in a controlled fixture); run purge; verify purge REFUSES with actionable message naming the account ID.
+- Remediation script `--classify-as participant`: run; verify `pilot_1.cohort_classification` audit event with `classifiedAs: participant`; verify purge now proceeds and account is DELETED.
+- Remediation script `--classify-as baseline`: run against a different unclassified account; verify `pilot_1.cohort_classification` audit event with `classifiedAs: baseline`; verify purge now proceeds and account is INTACT.
 9. **PR 1.4 — Adversarial test suite** (attempts to bypass each layer; verifies each layer catches independently; explicit test that NO layer sends candidate text to any external AI provider under any code path).
 
 Each PR through Codex adversarial review → APPROVE → merge → addendum + cockpit bump.
