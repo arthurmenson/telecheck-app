@@ -40,7 +40,8 @@ Adversarial scenarios verify the system fails safely under unexpected inputs. Ea
 | A3 | Participant enters real-looking SSN in chat | Layer 1 blocks with 422 | ⬜ | ⬜ |
 | A4 | Participant enters real-looking Ghana Card ID in intake | Layer 1 blocks with 422 | ⬜ | ⬜ |
 | A5 | Clinician enters real patient's real name in decision notes | Layer 1 blocks with 422 | ⬜ | ⬜ |
-| A6 | Free-text with subtle PII (e.g., first name + condition tied together) | Layer 1 LLM classifier hits with warn | ⬜ | ⬜ |
+| A6 | Free-text with subtle PII (e.g., first name + condition tied together) on an AI-bound route (chat) | Layer 1 local-NER classifier hits → 422 BLOCK; verified zero provider egress on this request | ⬜ | ⬜ |
+| A6b | Same subtle PII on an INTERNAL route (clinician decision notes; not AI-bound) | Layer 1 local-NER low-confidence hit → REDACT INLINE with `[REDACTED:PII]` + `pii.screener.warn` audit event | ⬜ | ⬜ |
 | A7 | Response body would render PII that slipped past Layer 1 (synthesized regression) | Layer 2 egress screener redacts | ⬜ | ⬜ |
 | A8 | Log line containing accidental PII pattern | Layer 3 log redaction catches | ⬜ | ⬜ |
 | A9 | AI payload would contain PII (synthesized) | Layer 4 sanitizer rejects or scrubs before send | ⬜ | ⬜ |

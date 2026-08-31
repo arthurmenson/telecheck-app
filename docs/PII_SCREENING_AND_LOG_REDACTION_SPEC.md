@@ -164,10 +164,32 @@
 
 The purge script itself performs NO raw evidence capture. Any forensic artifact must have been produced by the single fail-closed capture path documented in `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Capture procedure BEFORE this script runs.
 
+**Purge table allowlist (must be explicit; no blanket truncation):**
+
+Env-purge truncates ONLY tables on this allowlist. Any table not on the list is preserved. The allowlist is the participant-facing PHI-ish tables:
+- `patient_profiles`, `patient_intake_submissions`, `patient_free_text_notes`
+- `ai_mode1_conversations`, `ai_mode1_turns`, `ai_prep_summaries`
+- `async_consults`, `consult_events`, `consult_claims`, `consult_decisions`
+- `medication_requests`, `refill_requests`, `dispensing_events`
+- `crisis_events`, `crisis_actions`
+- `sessions`, `session_devices`, `pii_screener_incidents`
+- Redis: FLUSHALL (Redis is cache/queues; nothing there is source of truth)
+
+**Explicitly PRESERVED (never truncated by env-purge):**
+- `audit_records` — I-003 append-only; the vehicle for `env.purge.executed` attestation + `env.incident.abandoned` and all other audit events. Truncating would break the manifest-clear flow AND violate I-003.
+- `tenant` / `tenant_config` / any tenant-baseline table — schema fixture, not participant data
+- `roles` / `role_bindings` (unless a specific role was seeded per-participant, in which case add it to the allowlist explicitly)
+- `schema_migrations` — the migrations tracker
+- Any Postgres system catalog
+
+**Post-purge:** re-seed synthetic tenant baseline + participant handles per `pilot-1-baseline-seed.sql`. Baseline seed is idempotent (uses `ON CONFLICT DO NOTHING`).
+
+**Attestation transaction:** the `env.purge.executed` audit event is inserted BEFORE the truncation of participant tables, in the same transaction; if the truncation fails, the audit event rolls back — no false attestation. Order: BEGIN → INSERT audit event → TRUNCATE allowlisted tables → COMMIT. Second stage (reseed) is a separate transaction after commit.
+
 **Steps:**
 1. `docker compose exec app pkill -TERM node` (graceful app shutdown)
 2. `docker compose stop app` (freeze app container)
-3. `docker compose exec db psql -U telecheck telecheck -c 'TRUNCATE TABLE ... CASCADE'` for every non-system-config table (schema preserved, data wiped)
+3. `docker compose exec db psql -U telecheck telecheck` — single transaction: INSERT `env.purge.executed` audit event → TRUNCATE only the allowlisted tables above → COMMIT. Any error rolls back; on rollback env-purge exits non-zero without touching Redis or app logs.
 4. `docker compose exec redis redis-cli FLUSHALL`
 5. `docker compose exec caddy sh -c '> /var/log/access.log'` (Caddy access log truncate — no cleartext capture; the incident-capture script already captured caddy)
 6. `docker compose exec app rm -f /app/logs/*.log` (app-log truncate — no cleartext capture; the incident-capture script already captured app logs sanitized+encrypted)

@@ -46,9 +46,14 @@ You are being invited to help test the Telecheck telehealth software before it i
 
 **What happens to the test data:**
 - Kept in the staging environment for defect analysis and workflow-review purposes.
-- Periodically purged as part of test-session hygiene.
-- Not shared with anyone outside the Telecheck engineering team.
-- Not used for any commercial purpose.
+- Periodically purged as part of test-session hygiene per the incident + reset procedures.
+- **Third-party services that receive your test interactions during Pilot 1:**
+  - **Anthropic (Claude AI):** every message you send in the AI Mode 1 chat is sent to Anthropic's servers for the AI to respond. Anthropic retains prompts per their standard API terms. Because you agree to enter only synthetic data (per the consent statements below), no real personal information should reach Anthropic. If our automated screening detects and blocks real information, it never reaches Anthropic.
+  - **Resend (email provider):** verification emails (login passcodes) sent to your provided email address flow through Resend's infrastructure. Resend retains delivery metadata per their standard terms. Your provided email is by definition an identifier you gave to receive login codes.
+  - **Hetzner (VPS host):** the staging server itself runs on Hetzner cloud infrastructure in Ashburn, VA (US). Data at rest on the VPS is what you enter in the app.
+- Not shared with any OTHER third parties beyond those above.
+- Not used for any commercial purpose beyond the workflow-test purpose stated here.
+- **Withdrawal:** if you withdraw from Pilot 1, we run the environment purge to remove your test-session data from the staging environment. Data already delivered to Anthropic / Resend is subject to their retention policies — we cannot force a third-party purge on your behalf; we can only submit deletion requests where those services support them.
 
 **What happens next:**
 - **Pilot 2** is a separate program. It uses **real patients** in **Ghana** with **real prescribing** on **regulated infrastructure**. Pilot 2 uses a completely different consent form and different substrate. Pilot 1 participation does not enroll you in Pilot 2.
