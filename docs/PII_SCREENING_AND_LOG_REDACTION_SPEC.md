@@ -54,12 +54,18 @@
    - Fail-closed on classifier error (treat as "yes" and warn/block)
    - **Adversarial test required:** integration test proving raw candidate text never egresses to any external provider from within the Layer 1 code path
 
-3. **Decision:**
-   - Regex hit OR local-NER hit on high-confidence category → **BLOCK** with 422 + machine-readable reason + participant-visible message: *"This looks like real personal information. Pilot 1 uses synthetic data only. Please re-enter with synthetic values (see participant kit)."*
-   - Local-NER hit on low-confidence category → **WARN** with 200 + audit-event `pii.screener.warn` + participant-visible message
+3. **Decision (routes that eventually reach an external AI provider — `POST /v1/ai/mode1/turns` and any other AI-bound endpoint):**
+   - Regex hit OR ANY local-NER hit (high OR low confidence) → **BLOCK** with 422 + machine-readable reason + participant-visible message: *"This looks like real personal information. Pilot 1 uses synthetic data only. Please re-enter with synthetic values (see participant kit)."*
    - No hit → pass through
 
-**Sprint 1 phasing note:** if a production-quality local NER classifier is not available in the first shipped PR (Sprint 1.1a-b), the initial implementation uses **regex-only** with a conservative pattern set + explicit gate that Pilot 1 Day-0 dry run does NOT authorize until the local NER classifier ships. The regex-only interim is safe because it fail-closes (it does not send candidate text anywhere) — it may over-block synthetic content but never leaks candidate content to a provider.
+   **Invariant:** on AI-bound routes, low-confidence NER hits are NEVER admitted to the request handler. Prose-form real names and addresses trigger NER but not regex; if they were admitted with only a warn, they could reach Layer 4 (which is regex-only) and cross into the provider payload. Blocking on any NER hit for AI-bound routes closes that path.
+
+4. **Decision (routes that do NOT reach an external AI provider — clinician decision notes, purely internal free-text):**
+   - Regex hit OR local-NER hit on high-confidence category → **BLOCK** with 422 (same as above)
+   - Local-NER hit on low-confidence category → **REDACT INLINE** in the persisted record with `[REDACTED:PII]` before storage + emit `pii.screener.warn` audit event + participant-visible warning
+   - No hit → pass through
+
+**Sprint 1 phasing note:** if a production-quality local NER classifier is not available in the first shipped PR (Sprint 1.1a-b), the initial implementation uses **regex-only** with a conservative pattern set + explicit gate that Pilot 1 Day-0 dry run does NOT authorize until the local NER classifier ships. The regex-only interim is safe because it fail-closes (it does not send candidate text anywhere) — it may under-catch prose-form PII but never leaks candidate content to a provider. **The provider boundary is only opened for participants after the local NER classifier ships.**
 
 **Response contract:**
 ```json
@@ -79,7 +85,7 @@
 
 **Where:** every response body rendered to clinician console + patient app.
 
-**How:** response-serialization middleware — same regex + LLM stack as Layer 1 — applied to any field that came from patient free-text (never on system-generated content like protocol names).
+**How:** response-serialization middleware — same regex + **local NER** stack as Layer 1 (identical prohibition on external-provider classification) — applied to any field that came from patient free-text (never on system-generated content like protocol names).
 
 **Decision:**
 - Regex or high-confidence LLM hit → **REDACT** the specific token with `[REDACTED:PII]`
@@ -157,15 +163,15 @@
 
 ## Implementation plan (Sprint 1 breakdown)
 
-1. **PR 1.1a — Layer 1 input screener core** (`src/lib/pii-screener/index.ts` + regex library + interface). Unit + integration tests. Wired into `POST /v1/ai/mode1/turns` first.
-2. **PR 1.1b — LLM classifier for input screener** (Anthropic prompt-cached call). Cost telemetry.
-3. **PR 1.1c — Layer 1 wired to remaining routes** (async-consults intake + decision + any other free-text ingress).
-4. **PR 1.1d — Layer 2 output screener** (response middleware; redaction not block on egress).
-5. **PR 1.2a — Layer 3 log-redaction extension** (`LOG_REDACT_PATHS` + regex final pass).
-6. **PR 1.2b — Layer 4 AI-vendor sanitization** (integrate screener with provider adapters).
-7. **PR 1.2c — Layer 5 backup redaction wrapper** (pg_dump wrapper script).
-8. **PR 1.3 — Env-purge script + baseline-seed migration** (`scripts/pilot-1-env-purge.sh` + `migrations/pilot-1-baseline-seed.sql`).
-9. **PR 1.4 — Adversarial test suite** (attempts to bypass each layer; verifies each layer catches independently).
+1. **PR 1.1a — Layer 1 input screener regex core** (`src/lib/pii-screener/index.ts` + regex library + interface). Unit + integration tests. Wired into `POST /v1/ai/mode1/turns` first. AI-bound routes fail-closed on any hit; internal routes fail-closed on high-confidence, redact-inline on low-confidence (initially the two behaviors are identical since only regex exists).
+2. **PR 1.1b — Layer 1 local NER classifier** (Microsoft Presidio OR spaCy NER OR Node-native pattern classifier — decision recorded in the PR). **Never Anthropic / Bedrock / Azure.** Cost is compute-local. Wires into the same Layer 1 middleware; AI-bound routes now BLOCK on any NER hit; internal routes REDACT-INLINE on low-confidence NER hit. Integration test proves raw candidate text does not egress to any provider.
+3. **PR 1.1c — Layer 1 wired to remaining routes** (async-consults intake + decision + any other free-text ingress). Each route classified as AI-bound-vs-internal per §Layer 1 Decision rules.
+4. **PR 1.1d — Layer 2 output screener** (response middleware; regex + local NER same discipline; redact inline in response body; never call provider).
+5. **PR 1.2a — Layer 3 log-redaction extension** (`LOG_REDACT_PATHS` + regex final pass on all log lines).
+6. **PR 1.2b — Layer 4 AI-vendor sanitization** (regex-only local pass before every outbound provider call; never calls provider to classify). Integrates with existing provider adapters.
+7. **PR 1.2c — Layer 5 backup redaction wrapper** (`pg_dump | node scripts/pii-scrub.mjs` with age-encryption of the output).
+8. **PR 1.3 — Env-purge script + baseline-seed migration** (`scripts/pilot-1-env-purge.sh` + `migrations/pilot-1-baseline-seed.sql`; purge includes `/home/deploy/incident-logs/` with active-RCA opt-out).
+9. **PR 1.4 — Adversarial test suite** (attempts to bypass each layer; verifies each layer catches independently; explicit test that NO layer sends candidate text to any external AI provider under any code path).
 
 Each PR through Codex adversarial review → APPROVE → merge → addendum + cockpit bump.
 

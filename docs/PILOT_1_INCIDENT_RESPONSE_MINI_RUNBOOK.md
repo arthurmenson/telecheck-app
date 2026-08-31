@@ -28,7 +28,11 @@
 
 1. **Immediate:** the layer that caught the pattern has already blocked / redacted. Log the incident: `docs/pilot-1-incident-log.md` entry with participant handle, timestamp, category, layer that fired.
 2. **Notify participant** (Evans): explain the block, ask them to re-enter with synthetic values, point at Participant Kit.
-3. **If CRITICAL** (all layers bypassed): execute `bash scripts/pilot-1-env-purge.sh` per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Environment purge. Preserve forensic snapshot BEFORE purge: `docker compose logs --no-color > /home/deploy/incident-logs/incident-$(date -u +%FT%TZ).log`. Halt Pilot 1 until root-cause analysis complete.
+3. **If CRITICAL** (all layers bypassed):
+   - Halt Pilot 1 (`docker compose stop app`).
+   - **Capture forensic evidence via the single fail-closed capture script:** `bash scripts/incident-capture.sh <incident-id>`. This script (per §Forensic-evidence preservation) is the ONLY authorized capture path — it sanitizes via regex + local NER, encrypts with age to the project public key, verifies successful encryption, and aborts the purge if capture fails. **Never write raw `docker compose logs` or raw `pg_dump` to disk during an incident** — the capture script exists precisely so no operator has to compose those commands under pressure.
+   - Once capture is verified successful, execute `bash scripts/pilot-1-env-purge.sh` per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Environment purge.
+   - Halt Pilot 1 until root-cause analysis complete.
 4. **Root cause:** file a defect on the layer that should have caught it. Add adversarial test to prevent regression. Codex adversarial review on the fix before re-opening Pilot 1.
 
 ### Category 2 — Cross-tenant isolation failure
@@ -40,8 +44,8 @@
 **Response:**
 
 1. **Immediate:** halt Pilot 1. All participant sessions suspended.
-2. **Isolate:** `docker compose stop app` to freeze the API surface. Read replicas + Redis remain up for forensic access.
-3. **Preserve:** capture full DB snapshot (`docker compose exec db pg_dump …`) + app-log snapshot BEFORE any recovery step. Store in `/home/deploy/incident-logs/`.
+2. **Isolate:** `docker compose stop app` to freeze the API surface. Postgres + Redis remain up for forensic access.
+3. **Preserve via the single fail-closed capture script:** `bash scripts/incident-capture.sh <incident-id>` (per §Forensic-evidence preservation). Script sanitizes + encrypts + verifies before writing. **Never invoke `pg_dump` or `docker compose logs` directly during an incident** — the isolation-failure category is exactly where raw evidence is most likely to contain cross-tenant PHI.
 4. **Root cause:** trace the specific query / endpoint / RLS-policy path that allowed the leak. Verify against SI-010 bind-pool discipline. This is likely an SI-class defect requiring ratifier escalation per hard-floor item 6 (invariant amendment scope).
 5. **Fix + verify:** patch, add regression test, Codex adversarial review, verify cross-tenant isolation across ALL sibling paths before re-opening.
 6. **Escalate:** if root cause implicates a canonical schema / invariant amendment, STOP + author ERR + ratifier decision required.
@@ -115,14 +119,25 @@
 
 **Cardinal rule:** an incident-log capture on the non-PHI substrate is a legitimate operational need for defect-attribution, but if the incident involves real-PHI leakage, preserving raw leaked content in cleartext on Hetzner extends the exposure rather than closing it. All evidence handling therefore honors: **sanitize where feasible, encrypt where preserved, retain briefly, destroy verifiably, escalate when real data touches the substrate**.
 
-### Capture procedure
+### Capture procedure — single fail-closed script
 
-Every incident triggers preservation BEFORE any recovery action, with per-artifact treatment:
+**The one authorized capture path is `scripts/incident-capture.sh <incident-id>`.** Operators do not compose raw `docker compose logs` or `pg_dump` commands during an incident — the script exists precisely because the moments requiring evidence preservation are also the moments where a raw redirect would extend PHI exposure.
 
-- **App log snapshot** — capture via `docker compose logs --no-color app`, immediately pipe through the same regex + local-NER redaction as Layer 3 (`node scripts/pii-scrub.mjs`), THEN encrypt the redacted output with age or gpg to a project-owned key. Path: `/home/deploy/incident-logs/app-<timestamp>.log.age`. Raw unredacted content NEVER hits disk.
-- **DB snapshot** — capture via `pg_dump | node scripts/pii-scrub.mjs` (same regex + local-NER pass) with output encrypted the same way. Path: `/home/deploy/incident-logs/db-<timestamp>.sql.age`.
-- **Caddy access-log snapshot** — captured raw (URLs + status codes + timings only; no request bodies). Encrypted. Path: `/home/deploy/incident-logs/caddy-<timestamp>.log.age`.
-- **Audit-record snapshot** — captured raw (audit records are by design non-PHI per I-027 attribution discipline). Encrypted for consistency. Path: `/home/deploy/incident-logs/audit-<timestamp>.csv.age`.
+**Script contract** (per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Layer 3 + §Layer 5):
+
+1. **Sanitize before write** — all captured content flows through `node scripts/pii-scrub.mjs` (regex + local NER pass, same code path as Layer 3) BEFORE any bytes hit disk. Raw unsanitized content never touches the filesystem.
+2. **Encrypt before finalize** — sanitized output is encrypted with age to `/home/deploy/.age-recipients` (project public key) before the `.age` suffix is applied. The intermediate sanitized-but-unencrypted file is created in a tmpfs mount that gets unmounted on script exit.
+3. **Verify encryption** — script re-reads the `.age` file and confirms it decrypts back to the sanitized content (round-trip verification). If verification fails, script aborts + logs the failure + does NOT allow env-purge to proceed.
+4. **Abort purge on capture failure** — a failed `scripts/incident-capture.sh` invocation exits non-zero; `scripts/pilot-1-env-purge.sh` checks the last capture-status file and refuses to run if the last capture failed (fail-closed).
+
+**Artifacts captured (all via the single script; per-artifact sanitize + encrypt semantics identical):**
+
+- App log — `/home/deploy/incident-logs/<incident-id>-app.log.age`
+- DB snapshot — `/home/deploy/incident-logs/<incident-id>-db.sql.age`
+- Caddy access log — `/home/deploy/incident-logs/<incident-id>-caddy.log.age` (URLs + status + timings; no bodies)
+- Audit records — `/home/deploy/incident-logs/<incident-id>-audit.csv.age` (audit records are non-PHI per I-027 but encrypted for consistency + defense-in-depth)
+
+**Implementation status:** ⬜ `scripts/incident-capture.sh` + `scripts/pii-scrub.mjs` ship as part of Sprint 1.3. Until they ship, Pilot 1 Day-0 is NOT authorized — no operator manually runs raw evidence-capture commands.
 
 ### Encryption key management
 
