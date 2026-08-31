@@ -137,17 +137,21 @@
 
 **Purpose:** idempotent full reset of the Pilot 1 substrate — DB, Redis, Caddy access logs, application logs. Rehearsed before every Pilot 1 session start and available on-demand for incident response.
 
+**Preconditions checked at script start (fail-closed):**
+- If the most recent `scripts/incident-capture.sh` run for the current incident-id exited non-zero (per `/home/deploy/incident-logs/<incident-id>.status`), the purge script REFUSES to run and exits non-zero with an operator-visible message directing to fix capture first.
+- The purge script itself performs NO raw evidence capture. Any forensic artifact must have been produced by the single fail-closed capture path documented in `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Capture procedure BEFORE this script runs.
+
 **Steps:**
 1. `docker compose exec app pkill -TERM node` (graceful app shutdown)
 2. `docker compose stop app` (freeze app container)
 3. `docker compose exec db psql -U telecheck telecheck -c 'TRUNCATE TABLE ... CASCADE'` for every non-system-config table (schema preserved, data wiped)
 4. `docker compose exec redis redis-cli FLUSHALL`
-5. `docker compose exec caddy sh -c '> /var/log/access.log'` (Caddy access log truncate)
-6. `docker compose logs --no-color app > /home/deploy/incident-logs/purge-$(date -u +%FT%TZ).log` (preserve app-log tail for forensics BEFORE truncate)
-7. `docker compose exec app rm -f /app/logs/*.log` (app-log truncate)
-8. `docker compose exec db psql -U telecheck telecheck -f /migrations/pilot-1-baseline-seed.sql` (reseed synthetic accounts + tenant baseline)
-9. `docker compose start app`
-10. Verify `/health` returns 200 on both tenant hosts
+5. `docker compose exec caddy sh -c '> /var/log/access.log'` (Caddy access log truncate — no cleartext capture; the incident-capture script already captured caddy)
+6. `docker compose exec app rm -f /app/logs/*.log` (app-log truncate — no cleartext capture; the incident-capture script already captured app logs sanitized+encrypted)
+7. `docker compose exec db psql -U telecheck telecheck -f /migrations/pilot-1-baseline-seed.sql` (reseed synthetic accounts + tenant baseline)
+8. `docker compose start app`
+9. Verify `/health` returns 200 on both tenant hosts
+10. **Regression test:** verify no raw `.log` / `.sql` files were created by this script under `/home/deploy/incident-logs/` (only `.age`-suffixed artifacts from the capture script may exist; anything else is a purge-script defect)
 
 **Runtime:** ~60–120 s.
 
