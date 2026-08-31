@@ -102,7 +102,7 @@ Pilot 1 Day-0 dry run is NOT authorized until:
 - [ ] Every ⬜ above flipped to ✅ with cited implementation PR + adversarial-test evidence
 - [ ] Codex adversarial review completed on each implementation PR with APPROVE verdict
 - [ ] Full incident-response STOP-and-purge drill executed once end-to-end with recorded runtime + friction findings
-- [ ] **Cohort-marker integrity verified:** `bash scripts/verify-pilot-1-baseline.sh` returns exit 0 with output confirming `count(*) FROM accounts WHERE account_type IN ('patient','delegate') AND <not pilot_1_cohort_marker> = 0`. Command + output captured in the startup log per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Cohort-marker integrity test.
+- [ ] **Cohort-classification integrity verified:** `bash scripts/verify-pilot-1-baseline.sh` returns exit 0 with output confirming `count(*) FROM accounts WHERE cohort_classification = 'unclassified' = 0`. Any offending account IDs surface for `scripts/pilot-1-marker-remediation.sh` handling. Command + output captured in the startup log per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Three-state cohort classification + §Cohort-classification integrity test.
 - [ ] Evans's explicit chat-message go-ahead confirming (a) participant roster signed + kit-distributed, (b) VPS reachability verified, (c) startup authorization
 
 Documentation-only completion of this runbook (i.e., merging this PR) does NOT authorize Day-0. It authorizes STARTING the Sprint 1 implementation work.
