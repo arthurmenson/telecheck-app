@@ -203,6 +203,60 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
     });
   });
 
+  describe('Sprint 1.1b — NER coverage (wink-nlp local classifier)', () => {
+    it('A1 — real-looking person name in chat blocks on ai_bound (PERSON)', () => {
+      const r = screenInput('Hello, I am John Smith and I have a headache', 'ai_bound');
+      expect(r.action).toBe('block');
+      expect(r.hits.some((h) => h.patternId === 'ner_person')).toBe(true);
+    });
+
+    it('A5 — clinician real patient name in decision notes (internal route blocks)', () => {
+      // Internal route + high-confidence hit → BLOCK per decision matrix.
+      const r = screenInput('Patient Jane Doe reports symptom resolution', 'internal');
+      expect(r.action).toBe('block');
+      const nerHit = r.hits.find((h) => h.patternId === 'ner_person');
+      expect(nerHit).toBeDefined();
+      expect(nerHit?.confidence).toBe('high_confidence');
+    });
+
+    it('A6 — subtle PII (name + condition tied) on AI-bound blocks', () => {
+      const r = screenInput('Michael Johnson has severe hypertension', 'ai_bound');
+      expect(r.action).toBe('block');
+    });
+
+    it('A6b — subtle PII on internal-only route with GPE (low-confidence) redacts inline', () => {
+      // GPE (country/city name) alone is low-confidence; internal
+      // route → redact. Explicitly free of PERSON entities (which would
+      // be high-confidence block).
+      //
+      // R1 finding: prior version accepted redact OR pass, so a broken
+      // NER integration would silently satisfy this test. Fix — require
+      // deterministic detection: use a well-known GPE fixture ("United
+      // States") that wink-eng-lite-web-model reliably surfaces, and
+      // assert the concrete post-redaction output.
+      const r = screenInput('the clinic is in the United States today', 'internal');
+      expect(r.action).toBe('redact');
+      const gpeHit = r.hits.find((h) => h.patternId === 'ner_gpe');
+      expect(gpeHit).toBeDefined();
+      expect(gpeHit?.confidence).toBe('low_confidence');
+      // Concrete redaction must place the GPE label at the right position.
+      expect(r.redactedInput).toContain('[REDACTED:Geopolitical entity (country / city / state)]');
+    });
+
+    it('synthetic participant handle does NOT trigger PERSON (does not look like a name)', () => {
+      const r = screenInput('I am pilot1-participant-01 and I feel great', 'ai_bound');
+      expect(r.hits.some((h) => h.patternId === 'ner_person')).toBe(false);
+    });
+
+    it('ordinary medical prose without proper nouns does NOT trigger NER', () => {
+      const r = screenInput(
+        'the patient reports chest pain lasting three days with associated fatigue',
+        'ai_bound',
+      );
+      expect(r.action).toBe('pass');
+    });
+  });
+
   describe('Luhn validator (credit card false-positive guard)', () => {
     it('accepts a valid test card number', () => {
       // Visa test card, Luhn-valid.
@@ -406,8 +460,15 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
        * Sprint 1.1b (NER integration) will extend this via its own PR.
        */
       const IMPORT_ALLOWLIST: Record<string, ReadonlySet<string>> = {
-        'index.ts': new Set(['./patterns.js']),
+        'index.ts': new Set(['./patterns.js', './ner.js']),
         'patterns.ts': new Set([]),
+        // Sprint 1.1b: NER classifier module allowlist. wink-nlp and
+        // wink-eng-lite-web-model are Evans-ratified 2026-08-31 as the
+        // local NER path (chat message "B"). Both are pure JS, no
+        // native bindings, no network. Adding any other specifier to
+        // ner.ts requires Sprint 1.1b Codex re-review because it
+        // could introduce a network reach or a new capability surface.
+        'ner.ts': new Set(['wink-nlp', 'wink-eng-lite-web-model']),
       };
 
       const violations: Array<{ file: string; kind: string; detail: string }> = [];
