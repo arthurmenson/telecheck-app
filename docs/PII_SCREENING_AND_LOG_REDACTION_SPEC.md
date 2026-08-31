@@ -110,11 +110,61 @@ That is **Track 4 work**, not backend work. It is a **Pilot 1 startup-authorizat
 
 **Testing:** unit tests per category; integration tests against the routes above; adversarial tests confirming known-tricky patterns (e.g. names spelled with unusual capitalization; addresses in international format; phone numbers embedded in prose).
 
-## Layer 2 — Output screener (block-or-redact at egress)
+## Layer 2 — Output screener (REDACT-ONLY at egress)
 
-**Where:** every response body rendered to clinician console + patient app.
+### Egress inventory (established Sprint 1.1d, 2026-08-31)
 
-**How:** response-serialization middleware — same regex + **local NER** stack as Layer 1 (identical prohibition on external-provider classification) — applied to any field that came from patient free-text (never on system-generated content like protocol names).
+As with the Layer 1 ingress sweep, the assumed surface was wider than the real one. Actual response-side plaintext:
+
+| Egress surface | Content | Screenable? |
+|---|---|---|
+| Mode 1 `response_text` | **model-generated prose** | ✅ **YES — wired Sprint 1.1d** |
+| async-consult reads (consult / follow-up / decision) | pre-encrypted KMS envelopes (I-026) | ❌ ciphertext |
+| Admin dashboards (`consult-queue-health`, `crisis-operational-health`, `mode1-volume-health`) | aggregate counts | ❌ no free-text echo |
+| Mode 1 crisis sentinel | fixed server-side constant `CRISIS_RESPONSE_TEXT` | ❌ not user-derived |
+
+### Threat model — what Layer 2 actually defends against
+
+It is NOT the participant's own PII round-tripping. Layer 1 blocks that at ingress: the Mode 1 route is class `ai_bound`, which blocks on ANY hit, so the provider never receives participant PII in the first place. Verified independently: conversation history is **not** replayed to the provider — the prompt is built as `messages: [{ role: 'user', content: rawMessageText }]`, current turn only, so crisis-path-persisted PII cannot leak forward into a later completion.
+
+What remains, and what Layer 2 exists for: **the model emitting PII-shaped text of its own accord** — a hallucinated person name, a plausible-looking SSN, an invented email address. That output is not real PII, but it is indistinguishable from real PII to the participant reading it, and if it coincides with a real identifier it becomes a genuine hazard.
+
+### Why REDACT-ONLY, never block
+
+By the time content reaches egress the work is already done — the LLM has been called, the rows have been written. Blocking the response would cost the participant their turn while leaving upstream state intact: strictly worse than redacting. Layer 1 is the blocking gate; Layer 2 is the safety net.
+
+**Contract:** `screenOutput(text) → { hits, output, redacted }`. There is deliberately **no `action` field** — the only outcomes are redacted-or-not. Pinned by test.
+
+**Both surfaces receive the redacted text.** The Mode 1 handler assigns `egress.output` to *both* `responseText` (what the participant sees) and `persistedAssistantMessage` (what lands in `turn_result`). They must not diverge — a later reader of the stored turn should see exactly what the participant saw.
+
+**How:** same regex + **local NER** stack as Layer 1, with the identical prohibition on external-provider classification.
+
+---
+
+## Route class `audit_bound` (Sprint 1.1d)
+
+A third route class, stricter than `internal` and distinct in rationale from `ai_bound`.
+
+**Where it applies:** `POST /v1/admin/templates/:template_id/reviews/:review_id/decision` — the `decision_payload` object (`review_notes`, `required_revisions[]`, and any forward-extensible string field). **This route was missed by the Sprint 1.1c ingress sweep**, which searched patient-facing routes; this one is reviewer-facing.
+
+**Why it is stricter than `internal`:**
+
+The audit chain is **append-only per I-003**, and the Pilot 1 env-purge allowlist explicitly **PRESERVES** `audit_records` — it has to, because it carries the `env.purge.executed` attestation. So PII that reaches an audit row **survives the environment purge entirely**. The mitigation Pilot 1 leans on everywhere else — capture, then purge — simply does not apply.
+
+Redact-inline is not available either: rewriting an audit payload after the fact would itself violate I-003.
+
+Therefore `audit_bound` **blocks on ANY hit, high or low confidence**, before the audit row is written. Reason code `match_any_audit_bound`.
+
+**Screening walks every string in the payload, recursively** (including inside arrays), because the shape is deliberately forward-extensible. Pinning the screener to `review_notes` alone would silently stop screening the next field someone adds. Depth-bounded at 16.
+
+### Decision matrix (complete, all three classes)
+
+| Route class | Any hit | Rationale |
+|---|---|---|
+| `ai_bound` | **BLOCK** | Content reaches an external provider with no BAA |
+| `audit_bound` | **BLOCK** | Content reaches append-only, purge-exempt storage |
+| `internal` + high-confidence | **BLOCK** | Persists to DB, but purgeable |
+| `internal` + low-confidence only | **REDACT INLINE** | Preserves workflow; purgeable |
 
 **Decision:**
 - Regex or high-confidence LLM hit → **REDACT** the specific token with `[REDACTED:PII]`

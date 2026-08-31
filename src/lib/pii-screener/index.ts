@@ -42,7 +42,7 @@ import { PII_PATTERNS, type PiiPattern } from './patterns.js';
  * The class of route being screened. Determines fail-closed semantics.
  * See module header §Decision matrix.
  */
-export type RouteClass = 'ai_bound' | 'internal';
+export type RouteClass = 'ai_bound' | 'audit_bound' | 'internal';
 
 /**
  * A single pattern hit inside a candidate string.
@@ -104,7 +104,10 @@ export interface ScreeningResult {
    * When `action === 'block'`, a machine-readable reason code for the
    * response envelope. Undefined otherwise.
    */
-  readonly blockReason?: 'regex_match_high_confidence' | 'regex_match_any_ai_bound';
+  readonly blockReason?:
+    | 'regex_match_high_confidence'
+    | 'regex_match_any_ai_bound'
+    | 'match_any_audit_bound';
   /**
    * When `action === 'block'`, a participant-visible message pointing to
    * the participant kit's synthetic values. Undefined otherwise.
@@ -235,6 +238,29 @@ export function screenInput(text: string, routeClass: RouteClass): ScreeningResu
     };
   }
 
+  if (routeClass === 'audit_bound') {
+    // Audit-bound routes fail-closed on ANY hit for a reason distinct
+    // from (and arguably stronger than) the ai_bound rationale:
+    //
+    //   The audit chain is APPEND-ONLY per I-003, and the Pilot 1
+    //   env-purge allowlist explicitly PRESERVES `audit_records` (it is
+    //   the vehicle for the `env.purge.executed` attestation). So PII
+    //   that reaches an audit record survives the environment purge
+    //   ENTIRELY — the one mitigation Pilot 1 relies on for the
+    //   crisis-path residual risk does not apply here.
+    //
+    //   There is no redact-inline option either: rewriting an audit
+    //   payload after the fact would itself violate I-003.
+    //
+    // Therefore: block at ingress, before the audit row is written.
+    return {
+      hits,
+      action: 'block',
+      blockReason: 'match_any_audit_bound',
+      participantMessage: PARTICIPANT_BLOCK_MESSAGE,
+    };
+  }
+
   // routeClass === 'internal'
   if (hasHighConfidence) {
     return {
@@ -280,6 +306,78 @@ function applyRedactions(text: string, hits: readonly PiiHit[]): string {
   }
   chunks.push(text.slice(cursor));
   return chunks.join('');
+}
+
+/**
+ * Result of a Layer 2 egress screening pass.
+ *
+ * Layer 2 is REDACT-ONLY by design — it never blocks. Rationale:
+ *   - By the time content reaches egress, the work is already done
+ *     (the LLM has been called, the row has been written). Blocking the
+ *     response would cost the participant their turn while leaving the
+ *     upstream state intact — strictly worse than redacting.
+ *   - Layer 1 is the blocking gate. Layer 2 is the safety net for
+ *     content Layer 1 could not have seen: model-GENERATED text that
+ *     happens to contain PII-shaped output.
+ */
+export interface EgressScreeningResult {
+  /** Every hit found in the candidate output, in match-order. */
+  readonly hits: readonly PiiHit[];
+  /**
+   * The output with every hit replaced by `[REDACTED:<label>]`.
+   * Equals the input verbatim when there are no hits.
+   */
+  readonly output: string;
+  /** True when at least one redaction was applied. */
+  readonly redacted: boolean;
+}
+
+/**
+ * Screen a candidate egress string (Layer 2) and return it with any PII
+ * redacted inline.
+ *
+ * **Where this matters (Sprint 1.1d egress inventory).** Most Telecheck
+ * response surfaces carry NO screenable plaintext:
+ *   - async-consult reads return pre-encrypted KMS envelopes (I-026) —
+ *     ciphertext, nothing to screen
+ *   - admin dashboards return aggregate counts — no free-text echo
+ *   - the Mode 1 crisis sentinel is a fixed server-side constant
+ *
+ * The one genuine surface is **Mode 1 `response_text`** — model-generated
+ * prose. Note what this does and does not defend against:
+ *   - It does NOT defend against the participant's own PII round-tripping,
+ *     because Layer 1 already blocked that input before the provider saw
+ *     it (route class `ai_bound` blocks on ANY hit).
+ *   - It DOES defend against the model EMITTING PII-shaped text of its
+ *     own accord — a hallucinated name, a plausible-looking SSN, an
+ *     invented email. That output is not real PII, but it is
+ *     indistinguishable from real PII to a reader, and rendering it to a
+ *     Pilot 1 participant is both confusing and (if it coincides with a
+ *     real identifier) a genuine hazard.
+ *
+ * @param text - Candidate egress string.
+ * @returns The redacted output plus the hits that drove it.
+ *
+ * SAFETY: same absolute prohibition as Layer 1 — this performs only
+ * local regex + local NER classification and never calls an external
+ * provider. The import allowlist enforced by the SAFETY checker in
+ * index.test.ts covers this function's dependencies.
+ */
+export function screenOutput(text: string): EgressScreeningResult {
+  if (text.length === 0) {
+    return { hits: [], output: text, redacted: false };
+  }
+  // Reuse the Layer 1 detection pipeline with `internal` semantics —
+  // we only need the hit list here; the action is always redact.
+  const detected = screenInput(text, 'internal');
+  if (detected.hits.length === 0) {
+    return { hits: [], output: text, redacted: false };
+  }
+  return {
+    hits: detected.hits,
+    output: applyRedactions(text, detected.hits),
+    redacted: true,
+  };
 }
 
 /**
