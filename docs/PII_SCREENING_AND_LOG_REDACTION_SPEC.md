@@ -271,7 +271,25 @@ Illustrative classification below reflects a first-pass reading of migrations 00
 5. **PR 1.2a — Layer 3 log-redaction extension** (`LOG_REDACT_PATHS` + regex final pass on all log lines).
 6. **PR 1.2b — Layer 4 AI-vendor sanitization** (regex-only local pass before every outbound provider call; never calls provider to classify). Integrates with existing provider adapters.
 7. **PR 1.2c — Layer 5 backup redaction wrapper** (`pg_dump | node scripts/pii-scrub.mjs` with age-encryption of the output).
-8. **PR 1.3 — Env-purge + incident-scripts package + marker-integrity** (`scripts/pilot-1-env-purge.sh` with the two mutually-exclusive modes + `migrations/pilot-1-baseline-seed.sql` + `scripts/incident-capture.sh` + `scripts/incident-clear.sh` + `scripts/incident-log-gc.sh` + `scripts/pilot-1-close-wipe.sh` + `scripts/pii-scrub.mjs` + `scripts/verify-pilot-1-baseline.sh` — the cohort-marker integrity checker). Env-purge NEVER touches `/home/deploy/incident-logs/`; single-writer discipline enforced; CI test asserts. **Env-purge (both modes) MUST run `verify-pilot-1-baseline.sh` before mutation** as a preflight — failure blocks purge with an actionable message ("markerless participant accounts detected: fix seed path or manually classify before purge"). Every participant-provisioning code path MUST run the same verifier immediately after creation as a post-hook — failure logs a startup-defect audit event + surfaces a fix-me warning.
+8. **PR 1.3 — Env-purge + incident-scripts package + marker-integrity** (`scripts/pilot-1-env-purge.sh` with the two mutually-exclusive modes + `migrations/pilot-1-baseline-seed.sql` + `scripts/incident-capture.sh` + `scripts/incident-clear.sh` + `scripts/incident-log-gc.sh` + `scripts/pilot-1-close-wipe.sh` + `scripts/pii-scrub.mjs` + `scripts/verify-pilot-1-baseline.sh` — the cohort-marker integrity checker). Env-purge NEVER touches `/home/deploy/incident-logs/`; single-writer discipline enforced; CI test asserts.
+
+**Marker integrity — fail-closed at every enforcement surface (containment, not just detection):**
+
+- **Provisioning (atomicity, not post-hoc):** account creation and cohort-marker assignment MUST be in the SAME `INSERT INTO accounts (...) VALUES (...)` statement. There is no post-hoc marker-write pattern. The account and its marker are indistinguishable at the SQL level — one INSERT, one commit. Sprint 1.3 PR uses PostgreSQL `INSERT ... RETURNING` semantics + a schema `NOT NULL` constraint on the marker column (or JSON-check constraint if marker lives in metadata) so that a markerless INSERT fails at the database rather than being accepted.
+
+- **Provisioning integrity CI test:** attempt to insert an `accounts` row without the marker via a synthesized SQL statement bypassing the provisioning helper; the schema constraint MUST reject it. CI test asserts this.
+
+- **Provisioning post-verification (backstop, not the only line of defense):** the provisioning helper MAY additionally run `verify-pilot-1-baseline.sh` as a same-transaction post-check within the provisioning code path. If this verifier detects any markerless participant account, the provisioning transaction rolls back — the account does NOT exist post-provisioning. Compounds the schema constraint above; catches any bypass via raw SQL that somehow slipped through.
+
+- **Purge preflight (containment surface):** env-purge (both modes) runs `verify-pilot-1-baseline.sh` before any mutation. If markerless participant accounts are detected, purge REFUSES with an actionable message that names the offending account IDs + points to the remediation path (`scripts/pilot-1-marker-remediation.sh --incident-id <id> --account-id <id> --classify-as {participant|baseline}` — an explicit operator action that either assigns the marker + retries purge OR classifies the account as baseline in an audit-logged decision).
+
+- **Remediation path (safe recovery):** `scripts/pilot-1-marker-remediation.sh` is the ONLY authorized route for post-hoc classification. Each invocation is logged as an audit event (`pilot_1.marker_remediation{accountId, classifiedAs, actor, reason}`). This ensures an incident purge is never blocked forever — the operator can always classify + proceed — while requiring an explicit audited decision for any drift.
+
+**CI test additions covering fail-closed behavior:**
+- Marker-omitted raw INSERT: schema constraint rejects with error; no row inserted; provisioning helper's atomic-insert design is verified.
+- Provisioning-then-verifier-fail simulation: inject a verifier failure post-INSERT within the transaction; verify rollback; verify no account created; verify audit event of provisioning-failure.
+- Purge-with-markerless-account: seed a markerless participant account (via test-only raw INSERT bypassing constraint); run purge; verify purge REFUSES with actionable message.
+- Remediation script: run remediation; verify audit event; verify purge now proceeds successfully.
 9. **PR 1.4 — Adversarial test suite** (attempts to bypass each layer; verifies each layer catches independently; explicit test that NO layer sends candidate text to any external AI provider under any code path).
 
 Each PR through Codex adversarial review → APPROVE → merge → addendum + cockpit bump.
