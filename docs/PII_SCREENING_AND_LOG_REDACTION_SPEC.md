@@ -146,7 +146,7 @@
 **Two invocation modes (mutually exclusive; script errors if both flags are set or neither):**
 
 - **Routine-reset mode:** `bash scripts/pilot-1-env-purge.sh --routine-reset` — no active incident; used at end-of-session or between test days. Skips all incident-manifest checks. Performs env wipe + reseed only. **Fails-closed if `/home/deploy/incident-logs/.incident.lock` exists OR any unconsumed manifest file exists.** Cannot be forced past the lock — the operator MUST first run `scripts/incident-clear.sh` after disposing of the incident.
-- **Incident-mode:** `bash scripts/pilot-1-env-purge.sh --incident-id <id>` — proceeds ONLY when a fresh, matching, SUCCESS-verified capture manifest exists for `<id>` AND the incident-lock file's `incidentId` matches `<id>`. Mismatched lock → refuse (protects against invoking purge with wrong incident id while a different incident is open).
+- **Incident-mode:** `bash scripts/pilot-1-env-purge.sh --incident-id <id>` — READS `/home/deploy/incident-logs/` to verify preconditions (manifest existence/status/freshness/identity/inventory/consumed=false; lock's incidentId matches). Executes purge. Emits **an append-only DB audit event `env.purge.executed`** with `{incidentId, purgedAt, actor}` into `audit_records` (which is I-003 append-only + preserved across purge by design). **Env-purge writes zero files, zero modifications, zero deletions under `/home/deploy/incident-logs/`.** The audit event is the sole attestation that this incident's purge ran; `incident-clear.sh` verifies it. Mismatched lock → refuse (protects against invoking purge with wrong incident id while a different incident is open).
 
 **Incident-mode preconditions checked at script start (fail-closed):**
 - **Manifest existence:** `/home/deploy/incident-logs/<id>.manifest.json` must exist. Missing manifest → refuse.
@@ -192,7 +192,7 @@ The purge script itself performs NO raw evidence capture. Any forensic artifact 
 5. **PR 1.2a — Layer 3 log-redaction extension** (`LOG_REDACT_PATHS` + regex final pass on all log lines).
 6. **PR 1.2b — Layer 4 AI-vendor sanitization** (regex-only local pass before every outbound provider call; never calls provider to classify). Integrates with existing provider adapters.
 7. **PR 1.2c — Layer 5 backup redaction wrapper** (`pg_dump | node scripts/pii-scrub.mjs` with age-encryption of the output).
-8. **PR 1.3 — Env-purge script + baseline-seed migration** (`scripts/pilot-1-env-purge.sh` + `migrations/pilot-1-baseline-seed.sql`; purge includes `/home/deploy/incident-logs/` with active-RCA opt-out).
+8. **PR 1.3 — Env-purge + incident-scripts package** (`scripts/pilot-1-env-purge.sh` with the two mutually-exclusive modes + `migrations/pilot-1-baseline-seed.sql` + `scripts/incident-capture.sh` + `scripts/incident-clear.sh` + `scripts/incident-log-gc.sh` + `scripts/pilot-1-close-wipe.sh` + `scripts/pii-scrub.mjs`). Env-purge NEVER touches `/home/deploy/incident-logs/`; single-writer discipline enforced; CI test asserts.
 9. **PR 1.4 — Adversarial test suite** (attempts to bypass each layer; verifies each layer catches independently; explicit test that NO layer sends candidate text to any external AI provider under any code path).
 
 Each PR through Codex adversarial review → APPROVE → merge → addendum + cockpit bump.

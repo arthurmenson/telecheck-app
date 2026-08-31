@@ -134,9 +134,16 @@
 
 6. **Incident-lock file** — `scripts/incident-capture.sh <id>` atomically creates `/home/deploy/incident-logs/.incident.lock` on its first byte written. The lock's presence machine-enforces "an incident is active" — routine-reset purge REFUSES while the lock exists.
 
-7. **Purge gate — incident-mode is manifest + lock bound** — `scripts/pilot-1-env-purge.sh --incident-id <id>` (per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Environment purge preconditions) fails-closed unless the manifest for `<id>` exists + is SUCCESS + is fresh (≤30 min) + matches the id argument + lists ≥1 artifact + each artifact structurally verifies + `consumed: false` + the incident-lock's `incidentId` matches `<id>`. On successful purge the script flips `consumed: true`. The incident-lock remains until an explicit incident-owner disposition (see step 8).
+7. **Purge gate — incident-mode is manifest + lock bound** — `scripts/pilot-1-env-purge.sh --incident-id <id>` (per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Environment purge preconditions) fails-closed unless the manifest for `<id>` exists + is SUCCESS + is fresh (≤30 min) + matches the id argument + lists ≥1 artifact + each artifact structurally verifies + `consumed: false` + the incident-lock's `incidentId` matches `<id>`. On successful purge, the script emits an **append-only DB audit event** `env.purge.executed{incidentId, purgedAt, actor}` and does NOT touch any file under `/home/deploy/incident-logs/`. The incident-lock remains until an explicit incident-owner disposition (see step 8).
 
-8. **Incident closure — explicit disposition** — after RCA + fix + Codex re-review, the incident owner (Evans) runs `scripts/incident-clear.sh --incident-id <id> --disposition RESOLVED` (requires manifest `consumed: true`) OR `--disposition ABANDONED --force-abandoned` (records reason as audit event). Only this explicit action removes the incident-lock. Routine-reset then becomes available again.
+8. **Incident closure — explicit disposition** — after RCA + fix + Codex re-review, the incident owner (Evans) runs `scripts/incident-clear.sh --incident-id <id> --disposition RESOLVED`. Script preconditions: (a) verifies audit_records contains an `env.purge.executed` event with matching incidentId; (b) reads manifest and confirms consumed=false; (c) atomically writes manifest.consumed=true AND removes the incident-lock. Alternative: `--disposition ABANDONED --force-abandoned <reason>` records the reason as `env.incident.abandoned` audit event + writes manifest.consumed=true + removes lock without requiring env-purge to have run. Only this explicit action removes the incident-lock. Routine-reset then becomes available again.
+
+**Single-writer discipline for `/home/deploy/incident-logs/`:**
+- `incident-capture.sh` creates lock + manifest (consumed:false) + artifacts
+- `incident-clear.sh` atomically sets manifest.consumed=true + removes lock (only route)
+- `incident-log-gc.sh` deletes aged consumed manifests + artifacts (≥30 days + consumed:true + no active lock referencing)
+- `pilot-1-close-wipe.sh` full incident-logs wipe on Pilot 1 exit (refuses if lock exists OR any consumed:false manifest)
+- `pilot-1-env-purge.sh` READS but writes zero, modifies zero, deletes zero under incident-logs; attestation lives in the append-only DB audit trail
 
 Non-incident environment resets use `scripts/pilot-1-env-purge.sh --routine-reset` (mutually exclusive with `--incident-id`; skips all manifest checks; **fails-closed if the incident-lock exists**) — used at end-of-session, provably never while an incident is under RCA.
 
@@ -166,9 +173,9 @@ Non-incident environment resets use `scripts/pilot-1-env-purge.sh --routine-rese
 - **Env-purge (both modes) preserves incident state:** neither `pilot-1-env-purge.sh --routine-reset` nor `pilot-1-env-purge.sh --incident-id <id>` deletes `.incident.lock` or any `*.manifest.json`. Only `incident-clear.sh --incident-id <id> --disposition ...` removes the lock; only `incident-log-gc.sh` (after ≥30 days, consumed manifest, cleared lock) removes retained artifacts.
 - **Never off-VPS-backup-eligible** — the incident-log path is on VPS-local disk only, not eligible for VPS backup rotation (which presently doesn't exist by design for Pilot 1).
 
-### Include incident-logs in verified purge
+### incident-logs is NEVER wiped by env-purge
 
-The Pilot 1 env-purge script (`scripts/pilot-1-env-purge.sh` per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md`) MUST include `/home/deploy/incident-logs/` in its wipe step OR explicitly leave it (with recorded reason) if the current incident is under active RCA. Purge script is updated to prompt on this decision + record in the run log.
+The Pilot 1 env-purge script (`scripts/pilot-1-env-purge.sh` per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md`) has strict single-writer discipline — it **never** touches `/home/deploy/incident-logs/` under any mode or code path. Aged consumed incident artifacts are removed only by `scripts/incident-log-gc.sh` (≥30 days + consumed:true + no active lock referencing). Full pilot-close wipe is a separate script (`scripts/pilot-1-close-wipe.sh`) that refuses while any incident is unresolved.
 
 ### Escalation trigger — real data touches the substrate
 

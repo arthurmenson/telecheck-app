@@ -79,7 +79,7 @@ Per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md`:
 - ⬜ Log redaction of any PII pattern that reaches pino (extends `LOG_REDACT_PATHS`). **Evidence required:** implementation PR + regression-test.
 - ⬜ AI-vendor payload sanitization — regex-only local pass before every outbound AI provider call. **Evidence required:** implementation PR + test proving no candidate text egresses.
 - ⬜ Backup redaction — any Postgres dump pre-scrubs patterns before hitting durable storage. **Evidence required:** implementation PR + verified test dump.
-- ⬜ Environment purge/reset procedure — `scripts/pilot-1-env-purge.sh` — wipes DB + Redis + Caddy access logs + `/home/deploy/incident-logs/` (with active-RCA opt-out); idempotent; rehearsed. **Evidence required:** script + rehearsal log recording <120s runtime + verified clean baseline post-purge.
+- ⬜ Environment purge/reset procedure — `scripts/pilot-1-env-purge.sh` — wipes DB + Redis + Caddy access logs + app logs; idempotent; rehearsed. Does NOT touch `/home/deploy/incident-logs/` (single-writer discipline; incident-logs owned by incident-capture / incident-clear / incident-log-gc / close-wipe scripts only). **Evidence required:** script + rehearsal log recording <120s runtime + verified clean baseline post-purge + CI test asserting zero writes/deletes under `/home/deploy/incident-logs/`.
 
 ### Operational gates (owned jointly)
 
