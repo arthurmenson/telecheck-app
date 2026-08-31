@@ -216,15 +216,19 @@ Illustrative classification below reflects a first-pass reading of migrations 00
 1. **Schema-drift classification test:** enumerate live schema (`information_schema.tables` filtered to `public`) at test time; cross-reference against checked-in classification map (`allowlist` | `preserved` | `scoped-delete` — the last for mixed-baseline tables like `accounts`); FAIL if any live table lacks classification. New migrations adding tables MUST add classification in the same PR.
 2. **Preserved-to-purged FK-edge test:** enumerate FK constraints from `information_schema.referential_constraints`; FAIL if any FK edge points from a `preserved`-scope table to an `allowlist`-scope table (would break under TRUNCATE) OR from a `preserved`-scope table to a `scoped-delete`-scope table where the scoped-delete plan does not preserve the referenced rows.
 3. **Seeded-canary purge integration test:** seed identifiable canary rows into every classified table via `pilot-1-baseline-seed.sql --with-canaries`. For `scoped-delete` tables and specifically for `accounts`, seed BOTH participant-scoped canaries AND baseline canaries across every mixed identity type. Explicit canaries required for `accounts`:
-   - `patient` account with pilot_1_cohort_marker (participant; expected DELETED)
-   - `delegate` account with pilot_1_cohort_marker (participant; expected DELETED)
-   - `patient` account WITHOUT pilot_1_cohort_marker (pre-window / retried; test decides whether this qualifies as participant — implementation predicate must handle it)
-   - `clinician` account (baseline; expected INTACT)
-   - `tenant_admin` account (baseline; expected INTACT)
-   - `platform_admin` account (baseline; expected INTACT)
-   - Any service account (baseline; expected INTACT)
+   - `patient` account WITH pilot_1_cohort_marker (participant; expected **DELETED**)
+   - `delegate` account WITH pilot_1_cohort_marker (participant; expected **DELETED**)
+   - `patient` account WITHOUT pilot_1_cohort_marker (expected **INTACT** — the marker is the sole cohort authority; a markerless patient account is treated as either baseline test-data or a seed-path defect, NOT as a participant. If any markerless patient account exists at Pilot-1 Day-0 that IS a real Pilot-1 participant, the marker-integrity CI test below will have already blocked; if it survives to this test, treating it as INTACT is the fail-closed choice on the purge side because deleting-because-unclassified would be worse than preserving-a-classified-baseline)
+   - `clinician` account (baseline; expected **INTACT**)
+   - `tenant_admin` account (baseline; expected **INTACT**)
+   - `platform_admin` account (baseline; expected **INTACT**)
+   - Any service account (baseline; expected **INTACT**)
 
    Run env-purge (both modes: routine-reset from clean; incident-mode with manifest); verify (a) every `allowlist`-canary is GONE, (b) every `preserved`-canary is INTACT, (c) every `scoped-delete`-canary matches expectation per above enumeration, (d) `audit_records` contains the `env.purge.executed` event with matching incidentId (incident-mode only), (e) no orphaned FK rows across the entire schema post-purge, (f) no baseline account of ANY type deleted under any code path.
+
+5. **Cohort-marker integrity test:** every account-creation path in Pilot-1 baseline-seed + participant-provisioning flows MUST atomically write the pilot_1_cohort_marker as part of the same INSERT. CI test enumerates every code path that inserts into `accounts` under Pilot-1 seed/provisioning (in-scope: `pilot-1-baseline-seed.sql`, any provisioning route wired into the participant kit generator); asserts each writes the marker in the same statement. FAIL if any Pilot-1 provisioning path can create a participant account without the marker.
+
+6. **Day-0 marker-integrity startup gate:** the Pilot-1 startup authorization checklist (see `PATH_A_PILOT_COMPLETION_RUNBOOK.md` §Pilot 1 startup authorization checklist) has a required check: at Day-0 dry-run start, script `scripts/verify-pilot-1-baseline.sh` runs `SELECT COUNT(*) FROM accounts WHERE account_type IN ('patient', 'delegate') AND <not-pilot_1_cohort_marker>` — MUST return 0. Any markerless participant-type account at Day-0 indicates a seed-path defect and blocks Day-0 until fixed. Complements the CI test above — CI catches at code level, this catches at runtime state.
 4. **Attestation-transaction test:** verify FK-aware atomic purge rollback across BOTH operation kinds:
    - Inject a failure AFTER at least one successful `TRUNCATE` on an `allowlist` table but before COMMIT — verify the entire transaction rolls back: audit event GONE + truncated table's rows RESTORED + purge exits non-zero
    - Inject a failure AFTER at least one successful scoped `DELETE` on a `scoped-delete` table but before COMMIT — verify the same: audit event GONE + deleted rows RESTORED + purge exits non-zero
