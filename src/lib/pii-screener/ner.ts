@@ -124,12 +124,30 @@ function getNlp(): WinkMethods {
  *
  * @param text - Candidate free-text.
  * @returns Zero or more NerHit records in match-order.
+ *
+ * Character-offset strategy (Codex R3 finding on Sprint 1.1a Sprint 1.1b —
+ * the merge-critical risk in wink-nlp integration):
+ *   wink-nlp's `its.span` on an entity returns token-index ranges, and
+ *   the mapping from token span to character span is subtle (multi-token
+ *   entities, punctuation attachment). Rather than reconstruct character
+ *   offsets from token metadata, we ask wink-nlp for the entity's
+ *   matched text via `its.value` and locate it via `indexOf` starting
+ *   from a monotonically-advancing cursor. This is:
+ *     - correct by construction (the text we redact IS the text we matched)
+ *     - order-preserving (entities come in appearance order + cursor
+ *       advances)
+ *     - safe against multi-occurrence collisions (if the same entity
+ *       text appears twice, each hit gets its own occurrence via cursor)
+ *     - independent of wink-nlp's internal token/span representation
  */
 export function classifyEntities(text: string): readonly NerHit[] {
   if (text.length === 0) return [];
   const nlp = getNlp();
   const doc = nlp.readDoc(text);
   const hits: NerHit[] = [];
+  // Cursor advances after each matched entity so a repeated entity text
+  // resolves to its next occurrence in the source, not the first.
+  let cursor = 0;
   doc.entities().each((entity: ItemEntity) => {
     const detail = entity.out(nlp.its.detail) as Detail;
     // wink-nlp entity types are typically lowercased; normalize.
@@ -138,23 +156,21 @@ export function classifyEntities(text: string): readonly NerHit[] {
     if (!SURFACED_ENTITY_TYPES.includes(entityType)) {
       return;
     }
-    const value = entity.out(nlp.its.value);
-    const span = entity.out(nlp.its.span) as number[];
-    // wink-nlp span is [tokenStartIdx, tokenEndIdx]. Convert to character
-    // offsets via the tokens' own offsets.
-    const tokens = doc.tokens();
-    const startToken = tokens.itemAt(span[0] ?? 0);
-    const endToken = tokens.itemAt(span[1] ?? span[0] ?? 0);
-    if (!startToken || !endToken) return;
-    const startOffset = startToken.out(nlp.its.span) as number[];
-    const endOffset = endToken.out(nlp.its.span) as number[];
-    const start = startOffset[0] ?? 0;
-    const end = (endOffset[1] ?? start) + 1;
+    const value = String(entity.out(nlp.its.value));
+    if (value.length === 0) return;
+    // Locate this entity's text at or after the cursor. wink-nlp emits
+    // entities in appearance order; if indexOf returns -1 (misalignment
+    // due to normalization by wink-nlp), skip this entity rather than
+    // record a wrong offset.
+    const start = text.indexOf(value, cursor);
+    if (start < 0) return;
+    const end = start + value.length;
+    cursor = end;
     const confidence = ENTITY_CONFIDENCE[entityType] ?? 'low_confidence';
     hits.push({
       entityType,
       confidence,
-      match: String(value),
+      match: value,
       start,
       end,
     });
