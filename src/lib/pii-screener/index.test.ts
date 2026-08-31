@@ -293,27 +293,37 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       }
     });
 
-    it('does NOT call global.fetch (network call would leak candidate PII to a provider)', async () => {
-      // R1 MEDIUM: prior test only checked return-type wasn't a Promise;
-      // did not enforce the actual invariant that no network primitive
-      // is invoked. Stub fetch + assert zero calls across a screener run.
-      const originalFetch = globalThis.fetch;
-      let fetchCallCount = 0;
-      globalThis.fetch = ((..._args: unknown[]) => {
-        fetchCallCount++;
-        return Promise.reject(new Error('fetch should not be called by pii-screener'));
-      }) as typeof globalThis.fetch;
+    it('does NOT call any network primitive at runtime (fetch/WebSocket/EventSource/XMLHttpRequest)', async () => {
+      // R1/R4/R5: install runtime traps on every supported network
+      // primitive AND rebind them on globalThis so a computed-access
+      // bypass (globalThis['fetch']) still routes to the trap. Assert
+      // zero calls across representative screener invocations.
+      const gt = globalThis as unknown as Record<string, unknown>;
+      const originals: Record<string, unknown> = {};
+      const trapNames = ['fetch', 'WebSocket', 'EventSource', 'XMLHttpRequest'];
+      const callCounts: Record<string, number> = {};
+      for (const name of trapNames) {
+        originals[name] = gt[name];
+        callCounts[name] = 0;
+        // Some primitives (WebSocket, EventSource, XMLHttpRequest) are
+        // constructors — trap via a function that increments and throws.
+        gt[name] = ((..._args: unknown[]) => {
+          callCounts[name] = (callCounts[name] ?? 0) + 1;
+          throw new Error(`${name} must not be called by pii-screener`);
+        }) as unknown;
+      }
       try {
-        // Run screener across a variety of inputs that could tempt an
-        // "escalate to an LLM classifier" implementation.
         screenInput('subtle name John Smith at 415 555 1212', 'ai_bound');
         screenInput('SSN 123-45-6789', 'ai_bound');
         screenInput('the box at 10.0.0.42 is down', 'internal');
         screenInput('all-synthetic clean prose without PII', 'ai_bound');
       } finally {
-        globalThis.fetch = originalFetch;
+        for (const name of trapNames) {
+          gt[name] = originals[name];
+        }
       }
-      expect(fetchCallCount).toBe(0);
+      const totalCalls = trapNames.reduce((sum, n) => sum + (callCounts[n] ?? 0), 0);
+      expect(totalCalls, `network primitives called: ${JSON.stringify(callCounts)}`).toBe(0);
     });
 
     it('production source files pass the strict SAFETY checker (import allowlist + global-usage denylist)', async () => {
@@ -397,6 +407,13 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         ['eval bypass', `eval('fetch("https://x")');`],
         ['Function constructor bypass', `new Function('return fetch("https://x")')();`],
         ['require bypass (CJS in TS)', `const https = require('https'); https.request();`],
+        // R5 finding — computed global access bypasses:
+        ['globalThis bracket fetch', `globalThis['fetch']('https://x');`],
+        ['self bracket WebSocket', `new (self['WebSocket'])('wss://x');`],
+        ['window bracket process', `window['process'].getBuiltinModule('node:https');`],
+        ['Reflect.get on globalThis for fetch (string literal)', `Reflect.get(globalThis, 'fetch')('https://x');`],
+        ['Reflect.get on globalThis (any string)', `Reflect.get(globalThis, someRuntimeString)('https://x');`],
+        ['aliased-global bracket access', `const g = globalThis; g['fetch']('https://x');`],
       ];
 
       const failedToDetect: string[] = [];
@@ -494,23 +511,15 @@ function checkSafety(
       }
     }
 
-    // Class (2) — prohibited globals. Identifier appears in a call or
-    // new expression at the head; also matches property-access chains
-    // rooted at a prohibited global (e.g., navigator.sendBeacon,
-    // process.getBuiltinModule).
+    // Class (2a) — prohibited globals via direct identifier reference.
+    // (fetch(...), new WebSocket(...), navigator.sendBeacon(...), etc.)
     if (ts.isIdentifier(node)) {
       const name = node.text;
       if (PROHIBITED_GLOBALS.includes(name)) {
-        // Skip identifier occurrences inside string literals or the
-        // PROHIBITED_GLOBALS array itself (this file). The AST walk
-        // is over source code; string content is not part of the AST
-        // outside literals which we don't recurse into as identifiers,
-        // so filtering here is unnecessary for real production files.
-        // However, an identifier used as a parameter name is not a
-        // reach-through — skip named parameters + local declarations
-        // that shadow the global.
         const parent = node.parent;
         if (parent) {
+          // Skip identifiers used as the name-position of a local
+          // declaration (they aren't reach-throughs to the global).
           if (ts.isParameter(parent) && parent.name === node) return;
           if (ts.isVariableDeclaration(parent) && parent.name === node) return;
           if (ts.isPropertyAssignment(parent) && parent.name === node) return;
@@ -523,6 +532,55 @@ function checkSafety(
           kind: 'prohibited-global',
           detail: name,
         });
+      }
+    }
+
+    // Class (2b) — prohibited globals via bracket-string access.
+    // (globalThis['fetch'], self['WebSocket'], window['process'], etc.)
+    // Reject any ElementAccessExpression whose argument is a string
+    // literal naming a prohibited global. Base object doesn't matter —
+    // an implementer could alias globalThis first.
+    if (ts.isElementAccessExpression(node)
+      && ts.isStringLiteral(node.argumentExpression)
+      && PROHIBITED_GLOBALS.includes(node.argumentExpression.text)) {
+      violations.push({
+        file: fileLabel,
+        kind: 'prohibited-global-bracket-access',
+        detail: `[${JSON.stringify(node.argumentExpression.text)}]`,
+      });
+    }
+
+    // Class (2c) — prohibited globals via Reflect.get / Reflect.apply.
+    // (Reflect.get(globalThis, 'fetch'))
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const receiver = node.expression.expression;
+      const method = node.expression.name;
+      if (ts.isIdentifier(receiver) && receiver.text === 'Reflect'
+        && (method.text === 'get' || method.text === 'apply' || method.text === 'construct')) {
+        // If any argument is a string literal naming a prohibited
+        // global, flag it. This is defensive — Reflect.get is
+        // legitimate in general but its use to access globals is
+        // a code smell in a screener that MUST NEVER touch the network.
+        for (const arg of node.arguments) {
+          if (ts.isStringLiteral(arg) && PROHIBITED_GLOBALS.includes(arg.text)) {
+            violations.push({
+              file: fileLabel,
+              kind: 'prohibited-global-reflect',
+              detail: `Reflect.${method.text}(..., ${JSON.stringify(arg.text)})`,
+            });
+          }
+        }
+        // Even without a string-literal match, flag Reflect.get on
+        // globalThis-like receivers as suspicious.
+        const firstArg = node.arguments[0];
+        if (firstArg && ts.isIdentifier(firstArg)
+          && ['globalThis', 'self', 'window', 'global'].includes(firstArg.text)) {
+          violations.push({
+            file: fileLabel,
+            kind: 'prohibited-reflect-on-global',
+            detail: `Reflect.${method.text}(${firstArg.text}, ...)`,
+          });
+        }
       }
     }
 
