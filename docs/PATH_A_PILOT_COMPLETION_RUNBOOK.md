@@ -70,27 +70,41 @@ Pass-2 finding 1: "zero compliance exposure" is overstated. Consent alone does n
 
 ### Technical gates (implementation required; owned by Claude)
 
+**Status legend:** ⬜ = spec'd but not yet implemented + deployed + adversarial-tested. ✅ = implemented + deployed + adversarial-tested + rehearsed. **Documentation completion does NOT flip ⬜ → ✅.** Only shipped, tested, deployed implementation does, and each transition must cite the implementation PR + adversarial-test evidence.
+
 Per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md`:
 
-- ✅ Input screener on all patient-facing free-text endpoints — regex + LLM PII detection; block-or-warn on real-name / real-phone / real-address / real-SSN / real-DoB / real-medical-record-number patterns
-- ✅ Output screener on all clinician-facing rendered content — same categories
-- ✅ Log redaction of any PII pattern that reaches pino (extends `LOG_REDACT_PATHS`)
-- ✅ AI-vendor payload sanitization — prompts to Anthropic/Bedrock/Azure are pre-scrubbed of any pattern the input screener flagged
-- ✅ Backup redaction — any Postgres dump pre-scrubs same patterns before hitting durable storage
-- ✅ Environment purge/reset procedure — `scripts/pilot-1-env-purge.sh` — wipes DB + Redis + Caddy access logs; idempotent; rehearsed
+- ⬜ Input screener on all patient-facing free-text endpoints — regex + local NER PII detection (NEVER external LLM); block-or-warn on real-name / real-phone / real-address / real-SSN / real-DoB / real-medical-record-number patterns. **Evidence required:** implementation PR + adversarial-test suite result + deployment verification.
+- ⬜ Output screener on all clinician-facing rendered content — same categories. **Evidence required:** implementation PR + adversarial-test.
+- ⬜ Log redaction of any PII pattern that reaches pino (extends `LOG_REDACT_PATHS`). **Evidence required:** implementation PR + regression-test.
+- ⬜ AI-vendor payload sanitization — regex-only local pass before every outbound AI provider call. **Evidence required:** implementation PR + test proving no candidate text egresses.
+- ⬜ Backup redaction — any Postgres dump pre-scrubs patterns before hitting durable storage. **Evidence required:** implementation PR + verified test dump.
+- ⬜ Environment purge/reset procedure — `scripts/pilot-1-env-purge.sh` — wipes DB + Redis + Caddy access logs + `/home/deploy/incident-logs/` (with active-RCA opt-out); idempotent; rehearsed. **Evidence required:** script + rehearsal log recording <120s runtime + verified clean baseline post-purge.
 
 ### Operational gates (owned jointly)
 
-- ✅ Synthetic-identity discipline (Claude authors identity kit; Evans distributes to participants):
+- ⬜ Synthetic-identity discipline — kit generated + distributed to participants:
   - Participant handles: `pilot1-participant-01` … `pilot1-participant-10` (no real names)
   - Synthetic DoB from a controlled range (all 1990-01-01; discriminator is participant number)
   - Synthetic phone: reserved Telnyx test numbers only (never a participant's real number)
   - Synthetic address: `[SYNTHETIC ADDR] 1 Test Way, Test City TC 00000`
-- ✅ Explicit prohibition + training against real personal/clinical data — one-pager training document delivered with consent form
-- ✅ Named incident owner: Evans (with Claude as on-call responder for technical isolation)
-- ✅ Rehearsed stop criterion: `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Stop
-- ✅ Least-privilege access: pilot participants get patient-role only; no admin console access
-- ✅ Tenant-isolation live tests: `scripts/staging-e2e-smoke.sh` cross-tenant negative assertion run before every Pilot 1 session
+  - **Evidence required:** kit-generator script + Evans-confirmed distribution
+- ⬜ Explicit prohibition + training against real personal/clinical data — one-pager training document delivered with consent form. **Evidence required:** document + Evans confirmation delivered.
+- ⬜ Named incident owner: Evans (with Claude as on-call responder). **Evidence required:** Evans's explicit acknowledgment in chat/commit.
+- ⬜ Rehearsed stop criterion per `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Stop — **rehearsed at least once end-to-end before Day-0**. **Evidence required:** rehearsal log entry.
+- ⬜ Least-privilege access: pilot participants get patient-role only; no admin console access. **Evidence required:** RBAC verification test.
+- ⬜ Tenant-isolation live tests: `scripts/staging-e2e-smoke.sh --tenant Telecheck-Ghana` cross-tenant negative assertion run before every Pilot 1 session. **Evidence required:** rehearsal log entry + green smoke.
+
+### Pilot 1 startup authorization checklist (blocks Day-0)
+
+Pilot 1 Day-0 dry run is NOT authorized until:
+
+- [ ] Every ⬜ above flipped to ✅ with cited implementation PR + adversarial-test evidence
+- [ ] Codex adversarial review completed on each implementation PR with APPROVE verdict
+- [ ] Full incident-response STOP-and-purge drill executed once end-to-end with recorded runtime + friction findings
+- [ ] Evans's explicit chat-message go-ahead confirming (a) participant roster signed + kit-distributed, (b) VPS reachability verified, (c) startup authorization
+
+Documentation-only completion of this runbook (i.e., merging this PR) does NOT authorize Day-0. It authorizes STARTING the Sprint 1 implementation work.
 
 ### Compliance posture (rewritten per Pass-2)
 

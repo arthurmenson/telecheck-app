@@ -113,13 +113,45 @@
 
 ## Forensic-evidence preservation
 
-Every incident triggers preservation BEFORE any recovery action:
-- App log snapshot: `docker compose logs --no-color app > /home/deploy/incident-logs/app-$(date -u +%FT%TZ).log`
-- DB snapshot: `docker compose exec db pg_dump -U telecheck telecheck > /home/deploy/incident-logs/db-$(date -u +%FT%TZ).sql` (may be large; okay for Pilot 1 scale)
-- Caddy access-log snapshot
-- Audit-record snapshot: `docker compose exec db psql -U telecheck telecheck -c 'SELECT * FROM audit_records ORDER BY id DESC LIMIT 10000;' > /home/deploy/incident-logs/audit-$(date -u +%FT%TZ).csv`
+**Cardinal rule:** an incident-log capture on the non-PHI substrate is a legitimate operational need for defect-attribution, but if the incident involves real-PHI leakage, preserving raw leaked content in cleartext on Hetzner extends the exposure rather than closing it. All evidence handling therefore honors: **sanitize where feasible, encrypt where preserved, retain briefly, destroy verifiably, escalate when real data touches the substrate**.
 
-Files stored on VPS `/home/deploy/incident-logs/` — off-repo, off-repo-backup-eligible-but-not-required-for-Pilot-1.
+### Capture procedure
+
+Every incident triggers preservation BEFORE any recovery action, with per-artifact treatment:
+
+- **App log snapshot** — capture via `docker compose logs --no-color app`, immediately pipe through the same regex + local-NER redaction as Layer 3 (`node scripts/pii-scrub.mjs`), THEN encrypt the redacted output with age or gpg to a project-owned key. Path: `/home/deploy/incident-logs/app-<timestamp>.log.age`. Raw unredacted content NEVER hits disk.
+- **DB snapshot** — capture via `pg_dump | node scripts/pii-scrub.mjs` (same regex + local-NER pass) with output encrypted the same way. Path: `/home/deploy/incident-logs/db-<timestamp>.sql.age`.
+- **Caddy access-log snapshot** — captured raw (URLs + status codes + timings only; no request bodies). Encrypted. Path: `/home/deploy/incident-logs/caddy-<timestamp>.log.age`.
+- **Audit-record snapshot** — captured raw (audit records are by design non-PHI per I-027 attribution discipline). Encrypted for consistency. Path: `/home/deploy/incident-logs/audit-<timestamp>.csv.age`.
+
+### Encryption key management
+
+- Public key stored on VPS at `/home/deploy/.age-recipients` (age encryption, safe to store publicly)
+- Private key stored OFF-VPS by Evans (personal secure storage; not committed anywhere; used only for evidence decryption during root-cause analysis)
+- Key rotation: quarterly at minimum; immediately after any Pilot 1 STOP incident
+
+### Retention + destruction
+
+- **Retention:** 30 days maximum for encrypted incident logs; auto-purge via `scripts/incident-log-gc.sh` (weekly cron; deletes files older than 30 days)
+- **Explicit destruction on Pilot 1 close:** on Pilot 1 exit (win or abort), Evans authorizes full `/home/deploy/incident-logs/` wipe; wipe is recorded in the incident log
+- **Never off-VPS-backup-eligible** — the incident-log path is on VPS-local disk only, not eligible for the VPS's backup rotation (should there be one; presently Pilot 1 has no VPS-backup rotation on purpose)
+
+### Include incident-logs in verified purge
+
+The Pilot 1 env-purge script (`scripts/pilot-1-env-purge.sh` per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md`) MUST include `/home/deploy/incident-logs/` in its wipe step OR explicitly leave it (with recorded reason) if the current incident is under active RCA. Purge script is updated to prompt on this decision + record in the run log.
+
+### Escalation trigger — real data touches the substrate
+
+If forensic evidence confirms real personal or clinical data reached ANY part of the substrate (DB rows, in-flight AI payloads, logs, backups, incident-log captures), Category 1 elevates to **CRITICAL** and additional obligations attach beyond the Category 1 procedure:
+
+1. **STOP Pilot 1 immediately** (not just the affected session).
+2. **Notify affected participant** within 1 business day; Evans owns communication.
+3. **Notify any external processor** that received the leaked data (Anthropic, Resend, etc.) with request for their-side purge confirmation.
+4. **Assess whether Ghana DPC notification obligations attach** (usually not — Pilot 1 participants are volunteer testers not covered patients — but counsel confirmation required).
+5. **Escalate to ratifier ceremony** — the incident triggers an SI-class review of why the technical gates failed. Codex adversarial review on the root-cause + fix; no Pilot 1 re-open without Evans's re-ratification.
+6. **Document in Promotion Ledger** as a P-XXX entry with lessons-learned.
+
+Real-data-on-substrate is a hard STOP with wide implications; the mini-runbook explicitly acknowledges it exceeds Pilot 1's normal scope and hands off to the Pilot 2 full IR runbook framework (draft under `PILOT_1_TO_PILOT_2_GATING_CHECKLIST.md` Gate 6) if the pattern repeats.
 
 ---
 

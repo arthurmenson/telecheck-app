@@ -48,16 +48,18 @@
    - Common medical record number patterns
    - IPv4 / IPv6
 
-2. **LLM-based classifier** — for anything that passes regex but might still be PII:
-   - Small dedicated Claude call: *"Does this free-text contain: real person name, real medical condition tied to identifiable person, real address, real date-of-birth, real medical record identifier, real prescription details tied to identifiable person?"*
-   - Returns yes/no + category
-   - Deterministic temperature (0.0); prompt-cached for cost control
-   - Fail-closed on API error (treat as "yes" and warn/block)
+2. **Local NER-based classifier** — for anything that passes regex but might still be PII, use a classifier that runs **entirely inside the trusted staging boundary**:
+   - Candidate stack: Microsoft Presidio (open-source PII detection library; runs locally) OR spaCy NER model with a `PERSON`/`GPE`/`ORG` filter, OR a lightweight Node-native pattern classifier
+   - **Absolute prohibition:** never send suspected-PHI candidate text to any external AI provider (Anthropic, Bedrock, Azure) to determine if it contains PHI. That would defeat the entire purpose of the layer — the whole reason a candidate reaches Layer 1's secondary classifier is because it MIGHT be real PHI, and sending real PHI to the unauthorized processor is exactly what Layer 4 exists to prevent.
+   - Fail-closed on classifier error (treat as "yes" and warn/block)
+   - **Adversarial test required:** integration test proving raw candidate text never egresses to any external provider from within the Layer 1 code path
 
 3. **Decision:**
-   - Regex hit OR LLM hit on high-confidence category → **BLOCK** with 422 + machine-readable reason + participant-visible message: *"This looks like real personal information. Pilot 1 uses synthetic data only. Please re-enter with synthetic values (see participant kit)."*
-   - LLM hit on low-confidence category → **WARN** with 200 + audit-event `pii.screener.warn` + participant-visible message
+   - Regex hit OR local-NER hit on high-confidence category → **BLOCK** with 422 + machine-readable reason + participant-visible message: *"This looks like real personal information. Pilot 1 uses synthetic data only. Please re-enter with synthetic values (see participant kit)."*
+   - Local-NER hit on low-confidence category → **WARN** with 200 + audit-event `pii.screener.warn` + participant-visible message
    - No hit → pass through
+
+**Sprint 1 phasing note:** if a production-quality local NER classifier is not available in the first shipped PR (Sprint 1.1a-b), the initial implementation uses **regex-only** with a conservative pattern set + explicit gate that Pilot 1 Day-0 dry run does NOT authorize until the local NER classifier ships. The regex-only interim is safe because it fail-closes (it does not send candidate text anywhere) — it may over-block synthetic content but never leaks candidate content to a provider.
 
 **Response contract:**
 ```json
@@ -101,9 +103,13 @@
 
 **Where:** every call to `src/lib/ai-service/` provider adapters (Anthropic primary; Bedrock + Azure secondary).
 
-**How:** before sending a prompt to the provider, run the message-body through Layer 1's screener. If any block-condition fires, do NOT send the prompt — return an error to the caller stating the input needs re-entry. If any warn-condition fires, redact the specific tokens with `[REDACTED:PII]` before sending.
+**How:** the input screener at Layer 1 has already blocked or warned on suspected PHI before the request handler runs. Layer 4 is defense-in-depth on the egress side:
+- Re-run **regex-only** screening (never NER — Layer 1's NER may not have been invoked on system-generated prompt scaffolding that only Layer 4 sees) against the assembled outbound prompt (system prompt + prior turns + current turn + tool inputs)
+- If any high-confidence regex pattern fires in the outbound payload, do NOT send the prompt — return `500 ai.provider.egress_blocked` to the caller with audit event `pii.screener.egress_block`
+- Redact any lower-confidence regex hit with `[REDACTED:PII]` before send and emit `pii.screener.egress_redact` audit event
+- **Absolute:** all screening on outbound payloads happens LOCALLY. Layer 4 never calls the AI provider to determine if content is PHI (see Layer 1 §Local NER-based classifier §Absolute prohibition).
 
-**Rationale:** the AI vendor is a subprocessor that has NOT been authorized for PHI under Ghana law + does NOT have a BAA. Under no circumstances does real PII cross into Anthropic's / Bedrock's / Azure's data plane during Pilot 1.
+**Rationale:** the AI vendor is a subprocessor NOT authorized for PHI under Ghana law + no BAA. Under no circumstances does real PII cross into Anthropic's / Bedrock's / Azure's data plane during Pilot 1.
 
 **Bonus:** this discipline directly reduces AI cost by refusing to send garbage prompts (real names + real medical details are irrelevant to a Mode 1 conversational reply anyway).
 

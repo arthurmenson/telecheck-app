@@ -42,18 +42,49 @@ Evans is the sole ratifier for advancing to Pilot 2. Every box must be checked, 
 - [ ] SIEM shipping pipeline live — pino stdout → SIEM (candidate: AWS CloudWatch → Wazuh / Splunk / Datadog)
 - [ ] Request nonce in `LOG_REDACT_PATHS` per SI-010 nonce-as-secret discipline (already spec'd; verify in production)
 
-## Gate 3 — Vendor procurement (each subprocessor separately authorized)
+## Gate 3 — Processor inventory (every production data recipient authorized separately)
 
-- [ ] **AWS** — HIPAA BAA executed
-- [ ] **AWS** — Ghana counsel approval for AWS as controller/processor under Ghana Data Protection Act (Act 843)
-- [ ] **Anthropic** — HIPAA BAA executed (if available; if not, alternative Claude provider via AWS Bedrock or Azure OpenAI with BAA)
-- [ ] **Anthropic (or Bedrock/Azure alternate)** — Ghana counsel approval for AI processor role
-- [ ] **Resend** — HIPAA BAA executed OR replaced with a HIPAA-compliant email provider (Amazon SES with BAA)
-- [ ] **Resend (or SES)** — Ghana counsel approval for email processor role
-- [ ] **Telnyx** — HIPAA BAA executed OR replaced with HIPAA-compliant SMS provider
-- [ ] **Telnyx (or replacement)** — Ghana counsel approval for SMS processor role
+**Inventory principle:** every service that receives, stores, transmits, or processes Pilot 2 patient data (identified or de-identified) is a processor requiring counsel-approved authorization BEFORE Gate 3 passes. Inventory is maintained continuously — no processor is added silently.
+
+Each inventory row must have counsel-approved values for: **transfer basis** (Ghana → recipient jurisdiction legal basis), **contract type** (BAA / DPA / SCC / equivalent — status: executed / negotiating / N/A), **data categories** (PHI / PII / telemetry / audit), **retention** (days), **region** (physical processing location), **subprocessors** (their subprocessors, recursively at least one level).
+
+### Substrate + compute
+- [ ] **AWS (compute + storage)** — HIPAA BAA + Ghana counsel approval for controller/processor role under Ghana Data Protection Act (Act 843)
+- [ ] **AWS (KMS)** — same BAA + counsel approval; specifically for encryption-key-processing role
+- [ ] **AWS (Secrets Manager)** — same BAA + counsel approval
 - [ ] **Hetzner** — DELISTED from Pilot 2 substrate (staging only; not a Pilot 2 vendor)
-- [ ] Full subprocessor list published in a data-processing addendum (DPA) for any external counterparty who asks
+
+### AI processors
+- [ ] **Anthropic** — HIPAA BAA (if available) + Ghana counsel approval for AI processor role — OR replaced with alternative provider (AWS Bedrock with BAA OR Azure OpenAI with BAA)
+
+### Communication processors
+- [ ] **Resend (email)** — HIPAA BAA (Resend does not currently offer BAA at time of filing — verify) OR replaced with Amazon SES + BAA
+- [ ] **Email provider** (whoever ends up being it) — Ghana counsel approval for email processor role
+- [ ] **Telnyx (SMS)** — HIPAA BAA + Ghana counsel approval; if unavailable, replaced with HIPAA-compliant SMS provider
+- [ ] **SMS provider** (whoever ends up being it) — Ghana counsel approval
+
+### Observability + logging processors (previously omitted per Codex R1 R2 finding)
+- [ ] **AWS CloudWatch (logs + metrics)** — covered by AWS BAA; counsel approval that log content classification is honored
+- [ ] **SIEM vendor** (Wazuh self-hosted / Splunk / Datadog / other) — HIPAA BAA + Ghana counsel approval BEFORE selection. If SIEM ingests logs that may contain patient identifiers, this is a full processor.
+- [ ] **Application performance monitoring** (if any — Datadog APM / New Relic / Sentry / other) — HIPAA BAA + Ghana counsel approval
+- [ ] **Error tracking** (if any — Sentry / Rollbar / other) — HIPAA BAA + Ghana counsel approval; consider disabling entirely for Pilot 2 if BAAs unavailable
+
+### Backup + DR processors
+- [ ] **Backup destination** (AWS S3 / off-region S3 / third-party) — HIPAA BAA + Ghana counsel approval
+- [ ] **Backup encryption** (KMS-managed OR customer-managed keys) — key custody documented
+
+### Support + customer-facing processors
+- [ ] **Support ticket system** (if any — Zendesk / Intercom / other) — HIPAA BAA + Ghana counsel approval; consider email-only for Pilot 2 to avoid a subprocessor
+- [ ] **Analytics** (if any — PostHog / Amplitude / other) — HIPAA BAA + Ghana counsel approval; consider first-party-only analytics for Pilot 2
+
+### Payment processors (if Gate 8 requires; may be N/A per Pilot 2 launch decision)
+- [ ] **MTN MoMo (Ghana)** — Ghana Payment System regulatory + counsel approval for payment processor role
+- [ ] **Any card processor** (Stripe / other for potential future US-side) — HIPAA BAA + counsel approval; likely N/A for Pilot 2 (Ghana-only)
+
+### Inventory publication + discipline
+- [ ] Full processor inventory published as a data-processing addendum (DPA) — required document, not on-request
+- [ ] Inventory added-to via named process only (not silently); any new processor gets Gate-3-blocking status until authorized
+- [ ] Quarterly review of processor list + BAA/DPA/counsel-approval status by Evans + Ghana counsel
 
 ## Gate 4 — Ghana regulatory (counsel-approved before Pilot 2 opens)
 
