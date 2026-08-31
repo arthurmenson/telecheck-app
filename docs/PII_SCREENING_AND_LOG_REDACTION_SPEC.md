@@ -137,10 +137,16 @@
 
 **Purpose:** idempotent full reset of the Pilot 1 substrate — DB, Redis, Caddy access logs, application logs. Rehearsed before every Pilot 1 session start and available on-demand for incident response.
 
+**Incident-lock file (machine-enforced incident state):**
+
+- Location: `/home/deploy/incident-logs/.incident.lock` — a JSON file created atomically by `scripts/incident-capture.sh <id>` on its FIRST byte written (before any capture work). Content: `{"incidentId": "<id>", "openedAt": "<ISO-8601>", "openedBy": "<hostname/user>"}`.
+- Cleared ONLY by `scripts/incident-clear.sh --incident-id <id> --disposition <RESOLVED|ABANDONED>` — an explicit, audited, incident-owner action. Requires manifest for `<id>` to be marked `consumed: true` OR requires `--force-abandoned` (which writes an audit event + records the reason). Clearing script is separate from purge to prevent accidental clearance during purge.
+- The presence of the lock file signals: an incident is active; routine-reset MUST refuse; only incident-mode purge with the matching `<id>` is permitted.
+
 **Two invocation modes (mutually exclusive; script errors if both flags are set or neither):**
 
-- **Routine-reset mode:** `bash scripts/pilot-1-env-purge.sh --routine-reset` — no active incident; used at end-of-session or between test days. Skips all incident-manifest checks. Performs env wipe + reseed only. Never invoked while an incident is under RCA (operator asserts this by choosing the flag).
-- **Incident-mode:** `bash scripts/pilot-1-env-purge.sh --incident-id <id>` — proceeds ONLY when a fresh, matching, SUCCESS-verified capture manifest exists for `<id>`.
+- **Routine-reset mode:** `bash scripts/pilot-1-env-purge.sh --routine-reset` — no active incident; used at end-of-session or between test days. Skips all incident-manifest checks. Performs env wipe + reseed only. **Fails-closed if `/home/deploy/incident-logs/.incident.lock` exists OR any unconsumed manifest file exists.** Cannot be forced past the lock — the operator MUST first run `scripts/incident-clear.sh` after disposing of the incident.
+- **Incident-mode:** `bash scripts/pilot-1-env-purge.sh --incident-id <id>` — proceeds ONLY when a fresh, matching, SUCCESS-verified capture manifest exists for `<id>` AND the incident-lock file's `incidentId` matches `<id>`. Mismatched lock → refuse (protects against invoking purge with wrong incident id while a different incident is open).
 
 **Incident-mode preconditions checked at script start (fail-closed):**
 - **Manifest existence:** `/home/deploy/incident-logs/<id>.manifest.json` must exist. Missing manifest → refuse.
