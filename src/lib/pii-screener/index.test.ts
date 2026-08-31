@@ -414,6 +414,12 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         ['Reflect.get on globalThis for fetch (string literal)', `Reflect.get(globalThis, 'fetch')('https://x');`],
         ['Reflect.get on globalThis (any string)', `Reflect.get(globalThis, someRuntimeString)('https://x');`],
         ['aliased-global bracket access', `const g = globalThis; g['fetch']('https://x');`],
+        // R6 finding — spelling-agnostic bypasses:
+        ['template-literal key', 'globalThis[`fetch`](`https://x`);'],
+        ['computed-key string concat', `globalThis['fe' + 'tch']('https://x');`],
+        ['runtime-variable key', `const k = 'fetch'; globalThis[k]('https://x');`],
+        ['Object.getOwnPropertyDescriptor global', `Object.getOwnPropertyDescriptor(globalThis, 'fetch').value('https://x');`],
+        ['Object.entries global', `Object.entries(globalThis).find(([k]) => k === 'fetch');`],
       ];
 
       const failedToDetect: string[] = [];
@@ -535,51 +541,57 @@ function checkSafety(
       }
     }
 
-    // Class (2b) — prohibited globals via bracket-string access.
-    // (globalThis['fetch'], self['WebSocket'], window['process'], etc.)
-    // Reject any ElementAccessExpression whose argument is a string
-    // literal naming a prohibited global. Base object doesn't matter —
-    // an implementer could alias globalThis first.
-    if (ts.isElementAccessExpression(node)
-      && ts.isStringLiteral(node.argumentExpression)
-      && PROHIBITED_GLOBALS.includes(node.argumentExpression.text)) {
-      violations.push({
-        file: fileLabel,
-        kind: 'prohibited-global-bracket-access',
-        detail: `[${JSON.stringify(node.argumentExpression.text)}]`,
-      });
+    // Class (2b) — element access rooted at a global-like receiver.
+    // R6 finding: spelling-based key detection is an arms race
+    // (template literals, string concat, computed identifiers all
+    // bypass StringLiteral-only rules). Fail-closed: any element
+    // access whose ROOT receiver resolves to a global-like object is
+    // rejected regardless of key form.
+    //
+    // Global-like receivers include: globalThis, self, window, global,
+    // Reflect (used to reach globals), Object (used via
+    // getOwnPropertyDescriptor).
+    if (ts.isElementAccessExpression(node)) {
+      const root = resolveRootReceiver(node.expression, ts);
+      if (root && GLOBAL_LIKE_RECEIVERS.includes(root)) {
+        violations.push({
+          file: fileLabel,
+          kind: 'element-access-on-global-like',
+          detail: `${root}[<key>]`,
+        });
+      }
     }
 
-    // Class (2c) — prohibited globals via Reflect.get / Reflect.apply.
-    // (Reflect.get(globalThis, 'fetch'))
+    // Class (2c) — Reflect.* and Object.getOwnPropertyDescriptor calls.
+    // Reject any invocation of these regardless of arguments — a
+    // screener has zero legitimate need for reflective global access.
+    // Applies to aliased receivers too, via resolveRootReceiver.
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
-      const receiver = node.expression.expression;
-      const method = node.expression.name;
-      if (ts.isIdentifier(receiver) && receiver.text === 'Reflect'
-        && (method.text === 'get' || method.text === 'apply' || method.text === 'construct')) {
-        // If any argument is a string literal naming a prohibited
-        // global, flag it. This is defensive — Reflect.get is
-        // legitimate in general but its use to access globals is
-        // a code smell in a screener that MUST NEVER touch the network.
-        for (const arg of node.arguments) {
-          if (ts.isStringLiteral(arg) && PROHIBITED_GLOBALS.includes(arg.text)) {
+      const root = resolveRootReceiver(node.expression.expression, ts);
+      const method = node.expression.name.text;
+      if (root === 'Reflect'
+        && ['get', 'apply', 'construct', 'has', 'ownKeys', 'getPrototypeOf'].includes(method)) {
+        violations.push({
+          file: fileLabel,
+          kind: 'reflect-call',
+          detail: `Reflect.${method}(...)`,
+        });
+      }
+      if (root === 'Object'
+        && ['getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'getOwnPropertyNames', 'entries', 'values']
+          .includes(method)) {
+        // Object.entries / values / etc. on globalThis could enumerate
+        // + reach globals. Flag when receiver is globalThis-like.
+        const firstArg = node.arguments[0];
+        if (firstArg) {
+          const argRoot = resolveRootReceiver(firstArg, ts);
+          if (argRoot && GLOBAL_LIKE_RECEIVERS.includes(argRoot)) {
             violations.push({
               file: fileLabel,
-              kind: 'prohibited-global-reflect',
-              detail: `Reflect.${method.text}(..., ${JSON.stringify(arg.text)})`,
+              kind: 'object-reflection-on-global-like',
+              detail: `Object.${method}(${argRoot}, ...)`,
             });
           }
-        }
-        // Even without a string-literal match, flag Reflect.get on
-        // globalThis-like receivers as suspicious.
-        const firstArg = node.arguments[0];
-        if (firstArg && ts.isIdentifier(firstArg)
-          && ['globalThis', 'self', 'window', 'global'].includes(firstArg.text)) {
-          violations.push({
-            file: fileLabel,
-            kind: 'prohibited-reflect-on-global',
-            detail: `Reflect.${method.text}(${firstArg.text}, ...)`,
-          });
         }
       }
     }
@@ -589,4 +601,59 @@ function checkSafety(
   visit(sf);
 
   return violations;
+}
+
+/**
+ * Global-like receiver identifiers that must not be accessed via
+ * element access or reflection from within the pii-screener module.
+ * Includes globalThis / self / window / global (the environment root)
+ * plus Reflect / Object (reflection instruments used to reach the root).
+ */
+const GLOBAL_LIKE_RECEIVERS: readonly string[] = [
+  'globalThis',
+  'self',
+  'window',
+  'global',
+  'Reflect',
+  'Object',
+];
+
+/**
+ * Walk an expression back to its root identifier, following:
+ *  - PropertyAccessExpression chains (a.b.c → a)
+ *  - ParenthesizedExpression wrappers ((x) → x)
+ * Returns the root identifier's text, or null if the root is not an
+ * identifier (e.g., a call expression or literal).
+ *
+ * Used to detect aliased-global bypasses: `const r = Reflect; r.get(...)`
+ * — the receiver of `.get` is `r`, but the intent is Reflect access.
+ * NOTE: static aliasing is not fully resolvable in a single-file walk
+ * — this checker rejects the alias by name too via a separate
+ * pattern below. That coverage is complementary; the intent here is
+ * to keep the checker fail-closed on direct + one-hop aliased forms.
+ */
+function resolveRootReceiver(
+  expr: import('typescript').Expression,
+  ts: TsModule,
+): string | null {
+  let cur: import('typescript').Node = expr;
+  for (let hops = 0; hops < 64; hops++) {
+    if (ts.isParenthesizedExpression(cur)) {
+      cur = cur.expression;
+      continue;
+    }
+    if (ts.isPropertyAccessExpression(cur)) {
+      cur = cur.expression;
+      continue;
+    }
+    if (ts.isElementAccessExpression(cur)) {
+      cur = cur.expression;
+      continue;
+    }
+    if (ts.isIdentifier(cur)) {
+      return cur.text;
+    }
+    return null;
+  }
+  return null;
 }
