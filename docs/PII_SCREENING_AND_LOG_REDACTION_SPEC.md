@@ -137,9 +137,21 @@
 
 **Purpose:** idempotent full reset of the Pilot 1 substrate — DB, Redis, Caddy access logs, application logs. Rehearsed before every Pilot 1 session start and available on-demand for incident response.
 
-**Preconditions checked at script start (fail-closed):**
-- If the most recent `scripts/incident-capture.sh` run for the current incident-id exited non-zero (per `/home/deploy/incident-logs/<incident-id>.status`), the purge script REFUSES to run and exits non-zero with an operator-visible message directing to fix capture first.
-- The purge script itself performs NO raw evidence capture. Any forensic artifact must have been produced by the single fail-closed capture path documented in `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Capture procedure BEFORE this script runs.
+**Two invocation modes (mutually exclusive; script errors if both flags are set or neither):**
+
+- **Routine-reset mode:** `bash scripts/pilot-1-env-purge.sh --routine-reset` — no active incident; used at end-of-session or between test days. Skips all incident-manifest checks. Performs env wipe + reseed only. Never invoked while an incident is under RCA (operator asserts this by choosing the flag).
+- **Incident-mode:** `bash scripts/pilot-1-env-purge.sh --incident-id <id>` — proceeds ONLY when a fresh, matching, SUCCESS-verified capture manifest exists for `<id>`.
+
+**Incident-mode preconditions checked at script start (fail-closed):**
+- **Manifest existence:** `/home/deploy/incident-logs/<id>.manifest.json` must exist. Missing manifest → refuse.
+- **Manifest status:** must contain `"status": "SUCCESS"`. Any other value (including missing / FAILED / IN_PROGRESS / null) → refuse.
+- **Manifest freshness:** manifest's `capturedAt` timestamp must be within 30 minutes of the purge invocation. Stale manifest → refuse. (Rationale: an old incident's manifest cannot authorize purge for a new incident.)
+- **Manifest identity:** manifest's `incidentId` field must exactly match the `--incident-id` argument. Mismatch → refuse.
+- **Manifest inventory:** manifest must list ≥1 captured artifact with paths under `/home/deploy/incident-logs/<id>-*.age`. Empty inventory → refuse.
+- **Artifact structural verification:** for each listed artifact, script re-runs the same structural check as the capture script (file exists + non-empty + age-header valid + size ≥ recorded plaintext byte count). Any check fail → refuse.
+- **Manifest single-use:** on successful purge, script writes `"consumed": true` back to the manifest. Re-invoking the purge with the same incident-id → refuse. Prevents accidental double-purge on the same incident.
+
+The purge script itself performs NO raw evidence capture. Any forensic artifact must have been produced by the single fail-closed capture path documented in `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Capture procedure BEFORE this script runs.
 
 **Steps:**
 1. `docker compose exec app pkill -TERM node` (graceful app shutdown)

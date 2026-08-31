@@ -30,8 +30,9 @@
 2. **Notify participant** (Evans): explain the block, ask them to re-enter with synthetic values, point at Participant Kit.
 3. **If CRITICAL** (all layers bypassed):
    - Halt Pilot 1 (`docker compose stop app`).
-   - **Capture forensic evidence via the single fail-closed capture script:** `bash scripts/incident-capture.sh <incident-id>`. This script (per §Forensic-evidence preservation) is the ONLY authorized capture path — it sanitizes via regex + local NER, encrypts with age to the project public key, verifies successful encryption, and aborts the purge if capture fails. **Never write raw `docker compose logs` or raw `pg_dump` to disk during an incident** — the capture script exists precisely so no operator has to compose those commands under pressure.
-   - Once capture is verified successful, execute `bash scripts/pilot-1-env-purge.sh` per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Environment purge.
+   - **Capture forensic evidence via the single fail-closed capture script:** `bash scripts/incident-capture.sh <incident-id>` (assign a fresh incident-id like `2026-08-30T15-45Z-cat1-01`). This script (per §Forensic-evidence preservation) is the ONLY authorized capture path — it sanitizes via regex + local NER, encrypts with age to the project public key, structurally verifies, and emits a SUCCESS manifest tied to the incident-id. **Never write raw `docker compose logs` or raw `pg_dump` to disk during an incident** — the capture script exists precisely so no operator has to compose those commands under pressure.
+   - Verify the manifest exists at `/home/deploy/incident-logs/<incident-id>.manifest.json` with `status: SUCCESS`.
+   - **Execute manifest-bound purge:** `bash scripts/pilot-1-env-purge.sh --incident-id <incident-id>`. The purge script fails-closed if the manifest is missing / stale / mismatched / already consumed.
    - Halt Pilot 1 until root-cause analysis complete.
 4. **Root cause:** file a defect on the layer that should have caught it. Add adversarial test to prevent regression. Codex adversarial review on the fix before re-opening Pilot 1.
 
@@ -102,7 +103,7 @@
 **Stop procedure:**
 
 1. Evans posts "Pilot 1 STOP" in the coordination channel + notifies all active participants.
-2. Claude executes `bash scripts/pilot-1-env-purge.sh` after forensic-log capture.
+2. Claude assigns a fresh incident-id, runs `bash scripts/incident-capture.sh <id>`, verifies SUCCESS manifest, then executes `bash scripts/pilot-1-env-purge.sh --incident-id <id>` (manifest-bound).
 3. Root-cause analysis begins. No re-open until Codex adversarial review of the fix + Evans's re-authorization.
 
 **Rehearsal:** before Pilot 1 Day-0 dry run, execute a full STOP-and-purge cycle against a contrived incident to verify the runbook works. Record the drill in the incident log with duration + any friction findings.
@@ -129,7 +130,11 @@
 2. **Encrypt before finalize** — sanitized output is encrypted with age to `/home/deploy/.age-recipients` (project public key) before the `.age` suffix is applied. The intermediate sanitized-but-unencrypted file is created in a tmpfs mount that gets unmounted on script exit.
 3. **Structural verification (public-key-only, on-VPS)** — script verifies each `.age` file: (a) exists, (b) is non-empty, (c) has a byte size ≥ the plaintext byte count (age adds framing overhead so the ciphertext should never be smaller), (d) begins with the canonical age header (`age-encryption.org/v1` in the file header per age file format spec — script checks the first 32 bytes). If any check fails, script exits non-zero + logs the failure + writes an incident-status file marking capture unsuccessful. **The script does NOT decrypt on the VPS** — the age private key is deliberately off-VPS and the VPS cannot be trusted with it during an incident.
 4. **Off-VPS decryption verification (out-of-band, Evans-owned)** — Evans separately downloads the `.age` artifacts to the trusted host holding the age private key, decrypts, and confirms the decrypted content is the expected sanitized content. This step is BEST-PRACTICE for high-severity incidents; not blocking on emergency purge (the structural verification in step 3 gates the purge).
-5. **Abort purge on capture failure** — a failed `scripts/incident-capture.sh` invocation writes `/home/deploy/incident-logs/<incident-id>.status` = `FAILED`; `scripts/pilot-1-env-purge.sh` reads that file and refuses to run if the last capture for the current incident failed (fail-closed at the purge gate).
+5. **Manifest emitted on success** — a successful `scripts/incident-capture.sh <incident-id>` invocation writes `/home/deploy/incident-logs/<incident-id>.manifest.json` with fields: `{"incidentId": "...", "status": "SUCCESS", "capturedAt": "<ISO-8601>", "artifacts": [{"path": ".../id-app.log.age", "plaintextBytes": N, "ciphertextBytes": M}, ...], "consumed": false}`. A failed invocation writes the manifest with `"status": "FAILED"`, no artifact list. Malformed / incomplete manifests count as FAILED.
+
+6. **Purge gate — incident-mode is manifest-bound** — `scripts/pilot-1-env-purge.sh --incident-id <id>` (per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` §Environment purge preconditions) fails-closed unless the manifest for `<id>` exists, is SUCCESS, is fresh (≤30 min), matches the id argument, lists ≥1 artifact, each artifact structurally verifies, and `consumed: false`. On successful purge the script flips `consumed: true` (single-use). This binds forensic capture to exactly the incident being purged and prevents stale-manifest attacks / accidental double-purge.
+
+Non-incident environment resets use `scripts/pilot-1-env-purge.sh --routine-reset` (mutually exclusive with `--incident-id`; skips all manifest checks) — used at end-of-session, never while an incident is under RCA.
 
 **Artifacts captured (all via the single script; per-artifact sanitize + encrypt semantics identical):**
 
