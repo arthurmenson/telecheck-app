@@ -1,233 +1,230 @@
-# Path A — Ghana Pilot Completion Runbook
+# Path A — Pilot Completion Runbook (RATIFIED, Pass-2 gates baked in)
 
-**Filed:** 2026-08-30
-**Status:** ACTIVE — Path A authorized to completion per Evans 2026-08-30
+**Filed:** 2026-08-30 (original)
+**Revised:** 2026-08-30 (post-ratification; supersedes original)
+**Status:** RATIFIED — Path α per Evans 2026-08-30 chat message *"go with your recommendation and continue working nonstop"*
+**Ratifier decision record:** `Engineering-Review-Request-Path-A-Compliance-Reframe-2026-08-30.md`
 **Owner:** Evans (workstream lead) + Claude (autonomous execution under standing directive)
-**Adversarial reviewer:** Codex (per-PR; sweep resumed under this runbook)
-**Target:** Ghana pilot soft launch — 10 real chronic-care patients on Telecheck-Ghana tenant
+**Adversarial reviewer:** Codex per-PR
+**Target:** Pilot 1 (synthetic-only workflow rehearsal on Hetzner staging) → Pilot 2 (real-PHI Ghana chronic-care on compliant substrate)
 
 ---
 
-## Purpose
+## Why this document was rewritten
 
-This runbook is the single source of truth for driving the Ghana pilot to first revenue under Path A (the recommended path from the 2026-08-30 completion assessment). It supersedes ad-hoc sprint planning between now and pilot go-live.
+The original filing (commit `e86719f`) framed Path A as a 10-real-Ghana-patient pilot on the Hetzner staging VPS. Codex R1 correctly identified this as NO-SHIP:
+- Hetzner staging is synthetic-data-only per `STAGING_RUNBOOK.md`; loading real PHI violates the substrate's own posture
+- SI-014 crisis detection has zero Twi coverage per ADR-030; per-patient I-019 invariant does not scale down with cohort size
+- Rollback plan was not real recovery (audit append-only; no PITR)
+- PII-leak mitigation was not incident response
 
-**Explicitly out of scope:** Phase E (US regulatory + pharmacy portal) and Phase F (multi-tenant production on AWS). Those are separate workstreams that begin after pilot is stable OR in parallel if Evans wants to widen scope.
+Codex Pass-2 concurred with Option A over B/C directionally but flagged three additional gates:
+1. "Zero compliance exposure" is overstated → **materially reduced**; needs enforceable synthetic-only technical gates
+2. Pilot 2 prerequisites omit cross-border + full subprocessor authorization (US HIPAA BAA ≠ Ghana DPA authorization)
+3. Pilot 1 needs measurable exit criteria + coverage matrix; must be framed as **workflow rehearsal not clinical validation**
+
+This revision bakes all three gates in.
 
 ---
 
-## Current pilot readiness
+## Two-pilot structure
 
-Per the 2026-08-30 assessment + cockpit rev 462 + Addenda through 357:
+### Pilot 1 — Synthetic-only closed beta (workflow rehearsal)
 
-| Layer | State | Notes |
-|---|---|---|
-| Backend slices (7/7 pilot-required) | ✅ Green | Mode 1 chat, Med-Interaction, Crisis Response, Subscription, Admin Backend, Mode-1-volume dashboard, Email+PIN auth all live-verified |
-| Both operating tenants | ✅ Live | Cross-tenant isolation verified end-to-end (Addendum 345) |
-| Staging infra (Hetzner CX22) | 🟡 Reachability unverified 2026-08-30 | Curl to `87.99.159.214.sslip.io/*` timed out from Windows dev machine — VPS reachability needs Evans-side confirmation before pilot |
-| Email delivery (Resend) | ✅ Live | Real passcode emails delivering (Addendum 353) |
-| SMS delivery (Telnyx) | ⛔ Blocked | Code deployed + key staged; **inert on 10DLC** |
-| Admin console (SI-025 Phase 2) | ✅ Live | Platform admin can provision AI credentials |
-| Patient app on real API | ✅ Live | Email+PIN signup verified end-to-end (Addenda 340, 350) |
-| Migration chain | 🟡 Gap at slot 072 | 070, 071, 073…079 — slot 072 empty; verify no dangling reference before pilot |
-| Codex Phase-D sweep | ▶ RESUMED under this runbook | Was paused 2026-07-08; resumed on Evans's 2026-08-30 "go" |
+**Purpose:** validate the clinical workflow end-to-end with synthetic identities + scripted scenarios + adversarial edge cases, on the existing Hetzner staging substrate. **NOT clinical validation.**
 
-**Rollup:** Pilot is ~90% code-complete, ~80% infra-complete. Gap-closing work is the scope of this runbook.
+**Participants:** ~10 volunteer testers (Heros team, friendly clinicians, contracted UX researchers) who sign the synthetic-participant consent form (`PILOT_1_SYNTHETIC_PARTICIPANT_CONSENT.md`) and agree to use synthetic identities + approved scenarios only.
+
+**What it validates:**
+- End-to-end workflow shape (patient signup → intake → AI Mode 1 → consult submit → clinician claim → decision → medication_request lifecycle)
+- Cross-tenant isolation under real (synthetic) traffic
+- Audit chain integrity under real volume
+- Ghana clinician console UX on real console with synthetic cases
+- Crisis-detection heuristic behavior against contrived English distress prompts
+- AI Mode 1 cost baseline per synthetic patient
+- Bug surface in staging without patient risk
+
+**What it does NOT validate:**
+- Real patient outcomes
+- Real regulatory prescribing path
+- Real payment
+- Real 10DLC deliverability
+- Ghana Twi crisis detection (deferred to Pilot 2 gate)
+- Ghana-population representative use patterns
+
+**Exit criteria to advance to Pilot 2:** `PILOT_1_COVERAGE_MATRIX.md` §Exit Gate
+
+### Pilot 2 — Real-PHI Ghana chronic-care
+
+**Purpose:** first revenue on real regulatory footing with real patients receiving real care.
+
+**Gated on:** every checkbox in `PILOT_1_TO_PILOT_2_GATING_CHECKLIST.md` marked ✅
+
+Not scoped in this runbook. Executed under a separate Pilot-2 runbook to be filed at Pilot 1 exit gate.
+
+---
+
+## Pilot 1 substrate — enforceable synthetic-only gates
+
+Pass-2 finding 1: "zero compliance exposure" is overstated. Consent alone does not sanitize the data path — volunteers can leak real PHI/PII into free text, AI-vendor payloads, logs, backups. Pilot 1 requires enforceable **technical** + **operational** gates before any participant onboards.
+
+### Technical gates (implementation required; owned by Claude)
+
+Per `PII_SCREENING_AND_LOG_REDACTION_SPEC.md`:
+
+- ✅ Input screener on all patient-facing free-text endpoints — regex + LLM PII detection; block-or-warn on real-name / real-phone / real-address / real-SSN / real-DoB / real-medical-record-number patterns
+- ✅ Output screener on all clinician-facing rendered content — same categories
+- ✅ Log redaction of any PII pattern that reaches pino (extends `LOG_REDACT_PATHS`)
+- ✅ AI-vendor payload sanitization — prompts to Anthropic/Bedrock/Azure are pre-scrubbed of any pattern the input screener flagged
+- ✅ Backup redaction — any Postgres dump pre-scrubs same patterns before hitting durable storage
+- ✅ Environment purge/reset procedure — `scripts/pilot-1-env-purge.sh` — wipes DB + Redis + Caddy access logs; idempotent; rehearsed
+
+### Operational gates (owned jointly)
+
+- ✅ Synthetic-identity discipline (Claude authors identity kit; Evans distributes to participants):
+  - Participant handles: `pilot1-participant-01` … `pilot1-participant-10` (no real names)
+  - Synthetic DoB from a controlled range (all 1990-01-01; discriminator is participant number)
+  - Synthetic phone: reserved Telnyx test numbers only (never a participant's real number)
+  - Synthetic address: `[SYNTHETIC ADDR] 1 Test Way, Test City TC 00000`
+- ✅ Explicit prohibition + training against real personal/clinical data — one-pager training document delivered with consent form
+- ✅ Named incident owner: Evans (with Claude as on-call responder for technical isolation)
+- ✅ Rehearsed stop criterion: `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Stop
+- ✅ Least-privilege access: pilot participants get patient-role only; no admin console access
+- ✅ Tenant-isolation live tests: `scripts/staging-e2e-smoke.sh` cross-tenant negative assertion run before every Pilot 1 session
+
+### Compliance posture (rewritten per Pass-2)
+
+**"Materially reduced compliance exposure — not zero."** Consent + synthetic-identity discipline + enforceable technical screening + rehearsed incident response together reduce exposure to a range where the residual risk is (a) a participant deliberately violating consent by injecting real data (mitigated by input screening + participant training + immediate purge on detection), or (b) a subtle screening bypass (mitigated by defense-in-depth + audit-chain reconstruction of any incident).
+
+Pilot 1 remains inappropriate for real patient PHI regardless. That is what Pilot 2 substrate exists to solve.
 
 ---
 
 ## Operator-owned blockers (Evans only)
 
-These items **must** clear before pilot patients can be onboarded. Ordered by criticality.
+Ordered by criticality. Numbered O-N to preserve traceability from prior runbook drafts.
 
-### O-1 — Telnyx 10DLC brand + campaign registration ⛔ CRITICAL
+### O-1 — Pilot 1 participant recruitment ⛔ CRITICAL
 
-**Blocker for:** real patient phone-OTP delivery on any US-sourced traffic. Ghana patients receiving on non-US carriers are less blocked but the sender number `+13468450373` is a US-registered number, so 10DLC completion protects deliverability broadly.
+Recruit ~10 volunteers to sign the synthetic-participant consent form. Ideal mix:
+- 3–4 Heros team members
+- 2–3 friendly clinicians (Ghana-licensed preferred for realistic clinician workflow; US-licensed acceptable)
+- 2–3 contracted UX researchers or friendly patient-persona testers
 
-**Steps:** follow `telecheck-app/docs/TELNYX_10DLC_ACTIVATION_CHECKLIST.md` verbatim.
+**Evans deliverables to Claude:**
+- List of 10 participants (real names for records; handles for use in system)
+- Consent form signatures (kept off-repo per consent template `PILOT_1_SYNTHETIC_PARTICIPANT_CONSENT.md` §Storage)
+- Ghana clinician identity for the clinical-review side of the workflow
 
-**Rough effort:** ~30 min portal work + ~1–3 business days TCR approval (healthcare 2FA is a fastest-approved category).
+### O-2 — Track 5 kickoff signal ⛔ REQUIRED FOR PILOT 2
 
-**Cost:** ~$4 brand + ~$40 optional vetting (recommended for healthcare) + ~$10/mo campaign + carrier per-campaign fees.
+Track 5 (Pilot 2 substrate: AWS + BAA + KMS + backups + SIEM + IR runbook + Ghana counsel prep) is the long-lead work. Starting now = Pilot 2 substrate exists when Pilot 1 exits.
 
-**Evans deliverables to Claude when complete:**
-- Brand ID
-- Campaign ID
-- Messaging profile ID to use for OTP (reuse `heros-console-messaging` or new dedicated)
-- Confirmation the sender number `+13468450373` is attached to the approved campaign
+**Evans decisions to unblock Track 5:**
+- AWS root-account + IAM setup path (Evans owns; Claude cannot create AWS accounts)
+- Ghana counsel engagement — who? (existing Heros Health Ghana counsel? new engagement? via which firm?)
+- Region selection (us-east-1 was assumed in ADR-026; Pass-2 flagged this should follow counsel review, not precede it)
+- Budget approval for AWS baseline (~$500–$2,000/mo per prior estimate)
 
-**Claude flip on receipt (~2 min):** set `SMS_PROVIDER=telnyx` + `TELNYX_MESSAGING_PROFILE_ID=<...>` in `infra/staging/.env`, recreate app, live-verify a real OTP text to a destination number Evans provides. Rollback remains `SMS_PROVIDER=noop`.
+### O-3 — Telnyx 10DLC (deferred to Pilot 2)
 
-### O-2 — First pilot cohort logistics 🟡 REQUIRED
+Under Path α, Pilot 1 does NOT need real SMS — synthetic identities use reserved Telnyx test numbers or email-only auth. 10DLC becomes Pilot 2 gate. Checklist at `TELNYX_10DLC_ACTIVATION_CHECKLIST.md` remains valid but non-blocking for Pilot 1.
 
-**Blocker for:** actually seeing patients. Claude cannot recruit patients or credential clinicians.
+### O-4 — DNS (deferred to Pilot 2)
 
-**Evans decisions needed:**
-1. **Ghana clinician-on-call identity** — who is the licensed prescriber for the first cohort? What are their Ghana Medical & Dental Council credentials? Physical practice location (jurisdictional anchor for prescribing per CCR)?
-2. **Recruitment channel** — where do the first 10 patients come from? (Existing GLP-1 waitlist from Heros Health Ghana marketing? Clinician referrals? Recruit fresh?)
-3. **Medication scope** — pilot to chronic-care anchor per Ghana ADR. Confirm: GLP-1 only, or broader chronic-care (hypertension, diabetes management, cholesterol)?
-4. **Consent flow** — is the standard consent template acceptable for pilot, or does Ghana MDC/DPA require anything specific?
-5. **First cohort seed data** — for each of 10 patients: name, phone (E.164), email, DoB, condition, initial medication. Once Evans provides this, Claude seeds via `scripts/seed-staging-accounts.sql` extension.
+Pilot 1 stays on sslip.io wildcard. `ghana.heroshealth.com` DNS cutover becomes Pilot 2 gate.
 
-### O-3 — Payment processor decision 🟡 CHOICE
+### O-5 — VPS reachability confirmation 🟡 SESSION-1 CHECK
 
-**Blocker for:** revenue capture. Two acceptable paths:
-
-**Option A (recommended for pilot):** Bill offline for the first cohort. Charge via existing Heros Health Ghana payment rail; Telecheck just handles clinical care. Pilot proves out clinical workflow before wiring payment integration.
-
-**Option B:** Wire MTN MoMo now. Adds ~2 sprints (merchant account, callback wiring, subscription slice CCR routing, testing). Would delay pilot go-live.
-
-**Claude default if no Evans input:** Option A — bill offline, unblock pilot fast, wire MTN MoMo post-launch when volume justifies.
-
-### O-4 — Production DNS decision 🟡 CHOICE
-
-**Blocker for:** how "real" pilot looks to patients.
-
-**Option A (recommended for pilot):** Keep the sslip.io wildcard for the 10-patient pilot. Patients receive links to `ghana.87.99.159.214.sslip.io`. Ugly URL but zero DNS surface to manage. Cheap.
-
-**Option B:** Cut `ghana.heroshealth.com` over now. Requires: DNS A record → `87.99.159.214`, Caddy config update to add new site block, cert re-issue, `TENANT_HOST_OVERRIDES` update in `.env`. ~1 hour work; adds one thing to break.
-
-**Claude default if no Evans input:** Option A for the first 10 patients, cut over to `ghana.heroshealth.com` at cohort 2 (20–50 patients) once we've observed pilot-1 without domain-cutover risk in the mix.
-
-### O-5 — Migration slot 072 gap ✅ RESOLVED (no action needed)
-
-**Verified 2026-08-30:** the 072 gap is **intentional + documented**. Migration 074's header comment reads verbatim: *"This migration takes slot 074, the next free number above the merged 073 — 072 was never used."* Migration 073 cross-references the deliberate skip. The chain checker (`scripts/check-migration-chain.sh`) iterates existing `NNN_*.sql` files and does not enforce contiguous numbering; a skipped slot is not a chain defect.
-
-Root cause of the confusion: a 52-day-old memory (`project_phase_d_sweep_paused.md`) suggested uncommitted partial work sat as migration 072. Working tree is clean; that work either dropped or landed via a different vehicle. Memory updated 2026-08-30.
-
-**No PR needed. Chain integrity is honest as-is.**
+I could not reach `87.99.159.214.sslip.io/*` from my machine 2026-08-30 (curl timeout). Evans confirms VPS reachability from a browser or their own curl before Pilot 1 Day-0 dry run. If VPS is down, reprovision from `infra/staging/STAGING_RUNBOOK.md` (~20 min).
 
 ---
 
-## Claude execution slate (in order, autonomous under standing directive)
+## Claude execution slate (autonomous under standing directive)
 
-Each item is a discrete PR. Each PR goes through Codex adversarial review to APPROVE, gets an addendum + cockpit bump on merge.
+**Immediate work (this PR):**
+- ✅ Runbook revised with Pass-2 gates baked in (this file)
+- ✅ Pilot-1 → Pilot-2 gating checklist authored
+- ✅ Synthetic-participant consent form authored
+- ✅ Pilot 1 coverage matrix + adversarial scenarios authored
+- ✅ Pilot 1 IR mini-runbook authored
+- ✅ PII-screening + log-redaction spec authored
 
-### Sprint 1 — Pilot readiness pass (this cycle)
+**Sprint 1 — Pilot 1 substrate implementation** *(next autonomous cycles)*
 
-**1.1 — Migration-072-gap resolution** ✅ CLOSED 2026-08-30
-- Verified intentional skip; documented in migrations 073/074 headers; chain checker unaffected. No PR needed.
+1.1 — PII-screening implementation (per spec) — backend engineer subagent
+1.2 — Log-redaction extension (per spec) — backend engineer subagent
+1.3 — Env-purge script implementation — DevOps subagent
+1.4 — Synthetic-identity kit generator (deterministic seed script variant)
+1.5 — Coverage-matrix adversarial-scenario harness (integration test additions)
+1.6 — Codex Phase-D corpus-wide 42702 sweep resume (paused-work continuation)
 
-**1.2 — Codex Phase-D sweep resume** *(this session)*
-- Re-invoke corpus-wide 42702 RETURNS-TABLE OUT-param scan (memory notes this was the R1 charter)
-- Any surviving findings → separate PRs, one per class
-- Explicit target: converge to zero HIGH/CRITICAL
+Each ships as separate PR through Codex convergence → APPROVE → merge → addendum + cockpit bump.
 
-**1.3 — Staging reachability + health verification** *(gated on Evans confirming VPS is up)*
-- On Evans's go, curl `/ready` on both tenant hosts, run `scripts/staging-e2e-smoke.sh` for both `Telecheck-US` and `Telecheck-Ghana`
-- Verify: audit chain intact, both tenants isolation-verified, no drift since Addendum 357
-- If red: triage + fix; if green: mark pilot-infrastructure GREEN
+**Sprint 2 — Track 5 (Pilot 2 substrate) kickoff** *(parallel with Sprint 1)*
 
-**1.4 — Ghana pilot seed template** *(this cycle)*
-- Extend `scripts/seed-staging-accounts.sql` with a `--pilot-cohort` parameterized template
-- 10-patient slot structure; fills in from a CSV Evans provides
-- Ghana clinician provisioning stub pending O-2 answers
+Starts on Evans's O-2 signal (AWS account + counsel engagement):
+2.1 — AWS Terraform skeleton (VPC + IAM + KMS + Secrets Manager scaffold)
+2.2 — Ghana counsel prep document (cross-border transfer basis + subprocessor authorization matrix + DPIA scoping questions)
+2.3 — HIPAA BAA vendor inventory (AWS, Anthropic, Resend, Telnyx — status + procurement path per each)
+2.4 — SIEM shipping design (pino → SIEM candidate options)
+2.5 — IR runbook full draft (extends the Pilot 1 mini-runbook to real-PHI incident response)
 
-### Sprint 2 — Ratification burst (parallel with Sprint 1; ratifier-availability-gated)
+**Sprint 3 — Ratifier queue burn-down** *(parallel with Sprints 1+2, ratifier-quorum-gated)*
 
-**2.1 — SI queue triage + priority ranking**
-- Enumerate all 25 queued SIs by pilot-blocking status
-- Pilot-blocking: SI-013 (CCR crisis helpline keys — Ghana needs), SI-014 (crisis detection classifier — I-019 live path)
-- Not pilot-blocking (defer to post-launch): SI-006, SI-007, SI-012, SI-016 and others
-- Draft dual-recommendation (Claude + Codex Pass-1 + Pass-2) briefs for each pilot-blocking SI
+3.1 — Enumerate + prioritize 25 queued SIs by Pilot-1-vs-Pilot-2 blocking status
+3.2 — Draft dual-recommendation briefs for SI-013 (Ghana crisis helplines), SI-014 (Twi crisis coverage — Pilot 2 gate), SI-007, SI-012, SI-016
+3.3 — Ratifier ceremonies as quorum availability permits
 
-**2.2 — SI-013 ratification cycle**
-- Draft canonical CCR key set for Ghana crisis helplines (Ghana Suicide Prevention 2333 / other Ghana MOH-published lines)
-- Codex Pass-1 + Pass-2 → surface to Evans → ratifier decision → Promotion Ledger entry
-- Implementation PR follows ratification
+**Sprint 4 — Pilot 1 dry run + execution** *(gated on Sprints 1 + O-1)*
 
-**2.3 — SI-014 ratification cycle** *(if pilot-blocking; otherwise defer)*
-- Determine whether Mode 1 crisis-signal detection is heuristic-adequate for pilot volume (10 patients)
-- If yes: defer classifier build; document ADR
-- If no: draft classifier scoping brief; ratifier decides scope
-
-### Sprint 3 — 10DLC-ready + operator-cutover (gated on O-1)
-
-**3.1 — SMS provider flip verification** *(on Evans's Telnyx completion)*
-- Flip `SMS_PROVIDER=telnyx`; restart app; verify one OTP end-to-end to Evans-provided destination
-- Roll back to `noop` if any smoke failure
-- Addendum + cockpit bump
-
-**3.2 — Ghana pilot seed load** *(on Evans's cohort roster)*
-- Run seed script against staging with Evans's 10-patient CSV
-- Verify each patient can email-PIN in and phone-OTP in
-- Verify Ghana clinician can log into console + see queue
-
-**3.3 — Pilot Day-0 dry run**
-- Full E2E: patient signs up → intake → AI Mode 1 chat → consult submit → Ghana clinician claims → decision → medication_request created → patient sees decision
-- Both under phone-OTP and email-PIN paths
-- Audit chain verification post-run
-
-### Sprint 4 — Pilot Day-1 → Day-30 monitoring cadence
-
-**4.1 — Daily health check**
-- Cron or manual: audit chain integrity, `/ready` both tenants, error-rate baseline, AI cost per patient
-- Findings → Addendum
-
-**4.2 — Weekly cohort review**
-- Together with Evans: patient volume, clinician load, defect log, hardening opportunities
-
-**4.3 — Cohort-2 gate**
-- Explicit go-decision after 30 days of pilot-1 stability
-- Cohort-2 (20–50 patients) triggers: `ghana.heroshealth.com` DNS cutover (O-4 Option B), pharmacy portal decision, MTN MoMo wiring decision
+4.1 — Pilot 1 Day-0 dry run: full E2E with one synthetic participant across every coverage-matrix scenario
+4.2 — Pilot 1 Day-1 through Day-N: real synthetic participants; daily audit-chain check; weekly coverage-matrix advancement
+4.3 — Pilot 1 exit-gate assessment: coverage matrix completion + defect log + Pilot-2-readiness recommendation
 
 ---
 
-## Hard sequencing rules (do not violate)
+## Hard sequencing rules (unchanged from Master Completion Plan)
 
-1. **Nothing goes to real patients until Sprint 3 dry run is green.** Even if 10DLC clears early. The pilot Day-0 dry run is non-negotiable.
-2. **Codex APPROVE mandatory per PR.** No exceptions.
-3. **Every ratification requires Evans + Engineering Lead + CDM owner quorum.** Claude prepares dual-recommendation briefs; Claude does NOT ratify.
-4. **Audit invariants (I-003, I-019, I-023, I-025, I-027) are platform-floor.** No relaxation.
-5. **Rollback path documented before every mutation.** SMS flip, DNS cutover, seed load — each has an explicit rollback command.
-6. **Cross-tenant isolation verified on every pilot-touching PR.** Never regressed silently.
-7. **Every merged PR gets an Addendum + cockpit revision bump.** Addendum-trail is the continuity mechanism.
+1. **Nothing goes to real patients until Pilot 2 gate is green.** Pilot 1 is synthetic-only, period.
+2. **Codex APPROVE mandatory per PR.**
+3. **Every ratification requires quorum (Evans + Engineering Lead + CDM owner).** Claude prepares dual-recommendation briefs; Claude does not ratify.
+4. **Audit invariants (I-003, I-019, I-023, I-025, I-027) are platform-floor.**
+5. **Rollback path documented before every mutation.** For Pilot 1: env-purge script IS the rollback; audit chain reconstruction IS the forensic path.
+6. **Cross-tenant isolation verified on every pilot-touching PR.**
+7. **Every merged PR gets an Addendum + cockpit revision bump.**
 
----
-
-## Cadence
-
-**Under standing autonomous-work directive (CLAUDE.md 2026-05-16+):**
-- Claude works continuously through per-PR Codex cycle without per-action confirmation
-- Auto-proceed rule applies: Claude recommendation + Codex Pass-2 synthesis converge → Claude executes
-- STOP conditions: any of hard-floor items 1–6 in CLAUDE.md, any operator-gated blocker above, any Codex CRITICAL finding on architectural judgment
-
-**Update format per merged PR:**
-- Addendum N+1 in `Telecheck_v1_10_PRD_Update/AI_Service_Rollout_24h_Status_2026-05-14.md`
-- `progress.json` revision bump
-- Git commit with Codex APPROVE artifact reference in body
-
-**Reporting to Evans:**
-- Batched at natural breakpoints (Sprint boundaries, blocker-clear moments, operator-input needed)
-- Not per-PR (would be noise given the standing authorization)
-
----
-
-## Failure modes + mitigations
+## Failure modes + mitigations (revised per Pass-2)
 
 | Failure | Mitigation |
 |---|---|
-| Staging VPS unreachable | Evans confirms + restarts; if VPS lost, reprovision from `infra/staging/STAGING_RUNBOOK.md` in ~20 min |
-| Codex Phase-D sweep surfaces CRITICAL on architectural judgment | STOP + escalate to ratifier per hard-floor item 6 |
-| Telnyx 10DLC rejected | Fallback: recruit pilot patients on non-US phone numbers where 10DLC doesn't apply, OR use email+PIN auth path exclusively for pilot-1 (already live) |
-| Ghana clinician provisioning delayed | Pilot Day-0 slides right; Claude cannot substitute |
-| Ratifier quorum unavailable | SI-013 defer if not pilot-blocking; document decision |
-| Patient PII leak during pilot | Audit chain trace + tenant-blindness check per I-023/I-025; kill switch = `SMS_PROVIDER=noop` + take app offline; ceremony post-incident |
-| First real patient reports harmful AI Mode 1 response | I-019 crisis floor triggers; escalate manually; document; pause Mode 1 if pattern |
+| Participant injects real PHI into free-text | Input screener blocks + immediate participant notification + purge affected records + audit-chain event; if persistent pattern, participant removal + consent violation ceremony |
+| Screening bypass (novel PII pattern) | Defense-in-depth: log-redaction + backup-scrub catch escapes; incident-response mini-runbook triggers on detection |
+| VPS reachability lost | Reprovision from `STAGING_RUNBOOK.md`; pilot pauses (no PHI loss because Pilot 1 has none) |
+| Codex Phase-D sweep surfaces CRITICAL on architectural judgment | STOP + escalate per hard-floor item 6 |
+| Track 5 stalls on AWS/counsel availability | Pilot 1 continues; Pilot 2 gate simply lengthens; no Pilot 1 impact |
+| Ratifier quorum unavailable for Pilot 2 SIs | Pilot 2 gates lengthen; Pilot 1 stability data accumulates in the interim (positive) |
+| Cross-tenant isolation regression detected mid-Pilot-1 | Immediate participant pause + isolation-restoration ceremony; participant data quarantined (synthetic, low-risk) |
+| Pilot 1 coverage matrix stalls under-representative | Add adversarial scenarios; extend Pilot 1; do NOT advance to Pilot 2 on incomplete matrix |
 
----
+## Cadence
+
+Standing autonomous-work directive (CLAUDE.md 2026-05-16+) applies. Auto-proceed rule active. Reporting to Evans at natural checkpoints: Sprint boundaries, blocker-clear moments, operator-input-needed moments, Pilot 1 exit-gate assessment.
 
 ## Status pointer
 
-- **This runbook is canonical for Path A execution 2026-08-30 onward.**
-- **Cockpit revision:** to be bumped 463 on first merged PR under this runbook.
-- **Latest merged PR under Path A:** none yet — this doc itself is the first Path A merge.
-- **Next action:** Claude executes Sprint 1.1 (migration-072-gap resolution).
+- **Ratifier decision:** Path α ratified 2026-08-30 (Evans chat message).
+- **Cockpit revision:** to be bumped 463 on merge of this PR.
+- **Next action after merge:** Sprint 1.1 (PII-screening implementation) + Sprint 2.1 (AWS Terraform skeleton) begin in parallel on the O-2 signal.
 
 ## Companion docs
 
-- `TELNYX_10DLC_ACTIVATION_CHECKLIST.md` — Evans's O-1 checklist
-- `STAGING_RUNBOOK.md` (in `infra/staging/`) — VPS provisioning + recurring ops
-- `Telecheck_Master_Completion_Plan_v1_0.md` (in spec bundle) — parent plan; this runbook operationalizes Phase D
-- `AI_Service_Rollout_24h_Status_2026-05-14.md` — Addendum trail (running log)
-- `progress.json` (repo root) — cockpit state
+- `Engineering-Review-Request-Path-A-Compliance-Reframe-2026-08-30.md` — the ratifier decision record + full R1/Pass-2 findings
+- `PILOT_1_TO_PILOT_2_GATING_CHECKLIST.md` — the Pilot-2 exit-gate matrix
+- `PILOT_1_SYNTHETIC_PARTICIPANT_CONSENT.md` — consent template
+- `PILOT_1_COVERAGE_MATRIX.md` — scripted + adversarial scenarios + exit gate
+- `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` — named owner + rehearsed stop
+- `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` — technical gate spec
+- `TELNYX_10DLC_ACTIVATION_CHECKLIST.md` — deferred Pilot 2 checklist
+- `infra/staging/STAGING_RUNBOOK.md` — VPS provisioning + recurring ops
+- `Telecheck_Master_Completion_Plan_v1_0.md` (spec bundle) — parent plan; this runbook operationalizes Phase D under Path α reframe

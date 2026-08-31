@@ -207,12 +207,30 @@ Select region + vendors only after that review — do not pre-commit to us-east-
 
 Auto-proceed determination pending ratifier's chosen framing (see next section).
 
-## Ratifier decision (pending)
+## Ratifier decision — RATIFIED 2026-08-30 (Path α)
 
-Evans to decide between:
-- Option A (Claude recommendation)
-- Option B (compress Phase E/F)
-- Option C (hybrid staging + out-of-band prescribing)
-- Explicit variant or reframing not listed
+**Ratifier:** Evans, via chat message *"go with your recommendation and continue working nonstop"* 2026-08-30.
 
-Decision recorded here + carried to Promotion Ledger.
+**Chosen path:** **Path α** — ratify Option A + treat Pass-2's three additional gates as first execution work items (rather than requiring pre-ratification ERR revision under Path β). Rationale accepted: the gates ARE the first work anyway; a second ratification round adds cycle time without adding rigor.
+
+**Ratified position:**
+- **Option A over B/C** for pilot framing
+- **Pilot 1 = synthetic-only closed beta on Hetzner staging as workflow rehearsal** (NOT clinical validation)
+- **Pilot 2 = real-PHI Ghana chronic-care** gated on Phase E/F prerequisites including counsel-approved cross-border + subprocessor authorization
+- All three Pass-2 gates baked into revised runbook (see `PATH_A_PILOT_COMPLETION_RUNBOOK.md` at merge; supersedes the original filed 2026-08-30)
+
+**Companion artifacts landing under this ratification (this PR):**
+1. `PATH_A_PILOT_COMPLETION_RUNBOOK.md` — REWRITTEN with Pass-2 gates baked in
+2. `PILOT_1_TO_PILOT_2_GATING_CHECKLIST.md` — Pass-2 finding-2 subprocessor + counsel authorization matrix
+3. `PILOT_1_SYNTHETIC_PARTICIPANT_CONSENT.md` — consent template
+4. `PILOT_1_COVERAGE_MATRIX.md` — scripted + adversarial scenarios; success/abort thresholds (Pass-2 finding-3)
+5. `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` — named owner + rehearsed stop criterion (Pass-2 finding-1)
+6. `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` — enforceable synthetic-only gate (Pass-2 finding-1)
+
+**Promotion Ledger entry:** P-045 (to be appended at merge of this PR).
+
+**Autonomous-work authorization confirmed:** Evans authorized "continue working nonstop" alongside ratification. Auto-proceed rule active for Pilot 1 substrate work + parallel Track 5 (Pilot 2 AWS + BAA + KMS + backups + SIEM + IR runbook + counsel prep) initiation. STOP conditions unchanged.
+
+---
+
+## Cycle close
