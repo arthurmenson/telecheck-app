@@ -1056,3 +1056,148 @@ describe('Mode 1 chat — Group P: conversation/turn persistence', () => {
     expect(rows.turnResults).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Group PII — Sprint 1.1c Layer 1 PII screener wiring
+//
+// The screener runs AFTER the I-019 crisis gate and BEFORE Stage-2
+// validation / persistence / any LLM call. Route class is `ai_bound`
+// (this endpoint reaches an external provider on the non-crisis path),
+// so ANY screener hit blocks per the Layer 1 decision matrix.
+//
+// Ordering invariant proved here: the crisis floor (I-019 / FLOOR-013)
+// OUTRANKS the PII block. A crisis-positive turn that also contains PII
+// still surfaces the safety sentinel — it is NOT 422'd.
+//
+// Spec references:
+//   - docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Layer 1
+//   - docs/PILOT_1_COVERAGE_MATRIX.md A1-A6b
+//   - I-019 / FLOOR-013 (crisis detection is platform-floor, always-on)
+// ---------------------------------------------------------------------------
+
+describe('Mode 1 chat — Group PII: Layer 1 screener wiring (Sprint 1.1c)', () => {
+  it('PII-1 regex hit (US SSN) on non-crisis turn → 422 (blocked before provider)', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: 'My SSN is 123-45-6789, can you help with my medication?' },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('PII-2 regex hit (email) on non-crisis turn → 422', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: 'Please email me at real.person@example.com about my refill' },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('PII-3 NER hit (PERSON) on non-crisis turn → 422', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: 'Hello, my name is John Smith and I need a refill' },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('PII-4 low-confidence hit (IPv4) on non-crisis turn → 422 (ai_bound blocks ANY hit)', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: 'The clinic portal at 10.0.0.42 is not loading for me' },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('PII-5 clean synthetic message → 200 (screener passes through)', async () => {
+    // Success path reaches persistence, so the patient must exist —
+    // ai_mode1_conversation.patient_id carries a composite tenant-scoped
+    // FK to accounts. (Codex R1 finding: the 422 groups above can use a
+    // synthetic id because they reject before persistence; the 200
+    // groups cannot.)
+    const accountId = await seedPatientAccount();
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: SAFE_TEXT_SHORT },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('PII-6 ORDERING INVARIANT: crisis + PII → 200 crisis sentinel + raw message persisted (accepted residual risk)', async () => {
+    // I-019 / FLOOR-013 is platform-floor: a distressed participant who
+    // also typed real PII MUST still receive the crisis safety surface.
+    // The crisis path makes no LLM call, so no PII crosses the provider
+    // boundary.
+    //
+    // This test pins BOTH halves of the documented tradeoff:
+    //   1. the crisis sentinel surfaces (NOT a 422)
+    //   2. the raw message — PII and all — lands in turn_admission
+    //
+    // Half 2 is the accepted residual risk, asserted explicitly rather
+    // than left implicit, so that if a future change starts scrubbing
+    // the persisted message this test fails and forces the spec's
+    // §Accepted residual risk paragraph to be updated in the same PR.
+    // Mitigations for it: Layer 3 log redaction, Layer 5 backup
+    // redaction, IR runbook Category 1 CRITICAL capture-then-purge.
+    const accountId = await seedPatientAccount();
+    const token = mintPatientToken(accountId);
+    const piiFragment = '123-45-6789';
+    const crisisPlusPii = `${CRISIS_TEXT_SHORT}. My SSN is ${piiFragment} if you need it.`;
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: crisisPlusPii },
+    });
+    // Half 1 — MUST be 200 with the crisis sentinel, NOT 422.
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{ crisis_detected: boolean; ai_model_version: string }>();
+    expect(body.crisis_detected).toBe(true);
+    // No LLM call was made — this is what keeps the PII off the provider.
+    expect(body.ai_model_version).toBe('crisis-bypass:no-llm-call');
+
+    // Half 2 — the documented residual: raw message persisted verbatim.
+    const conversationId = response.json<Record<string, unknown>>()[
+      'ai_chat_session_id'
+    ] as string;
+    const rows = await loadMode1Rows(conversationId);
+    expect(rows.admissions).toHaveLength(1);
+    expect(rows.admissions[0]!.user_message).toBe(crisisPlusPii);
+    expect(rows.admissions[0]!.user_message).toContain(piiFragment);
+  });
+
+  it('PII-7 block response body does NOT echo the offending text', async () => {
+    // Layer 3 discipline: the raw candidate must never reach the
+    // response body or the log stream. Only the participant guidance
+    // message is surfaced.
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const secretish = '123-45-6789';
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: `My SSN is ${secretish} please help` },
+    });
+    expect(response.statusCode).toBe(422);
+    expect(response.body).not.toContain(secretish);
+  });
+});
