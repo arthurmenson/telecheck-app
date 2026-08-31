@@ -225,13 +225,22 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
     });
 
     it('A6b — subtle PII on internal-only route with GPE (low-confidence) redacts inline', () => {
-      // GPE (city name) alone is low-confidence; internal route → redact.
-      // Explicitly free of PERSON entities (which would be high-confidence
-      // block).
-      const r = screenInput('the clinic in Boston is open today', 'internal');
-      // Either pass (if NER misclassifies Boston as not-GPE) or redact.
-      // Assertion: no BLOCK — only high-confidence entities block internal.
-      expect(['redact', 'pass']).toContain(r.action);
+      // GPE (country/city name) alone is low-confidence; internal
+      // route → redact. Explicitly free of PERSON entities (which would
+      // be high-confidence block).
+      //
+      // R1 finding: prior version accepted redact OR pass, so a broken
+      // NER integration would silently satisfy this test. Fix — require
+      // deterministic detection: use a well-known GPE fixture ("United
+      // States") that wink-eng-lite-web-model reliably surfaces, and
+      // assert the concrete post-redaction output.
+      const r = screenInput('the clinic is in the United States today', 'internal');
+      expect(r.action).toBe('redact');
+      const gpeHit = r.hits.find((h) => h.patternId === 'ner_gpe');
+      expect(gpeHit).toBeDefined();
+      expect(gpeHit?.confidence).toBe('low_confidence');
+      // Concrete redaction must place the GPE label at the right position.
+      expect(r.redactedInput).toContain('[REDACTED:Geopolitical entity (country / city / state)]');
     });
 
     it('synthetic participant handle does NOT trigger PERSON (does not look like a name)', () => {
