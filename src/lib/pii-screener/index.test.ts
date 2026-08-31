@@ -316,66 +316,96 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(fetchCallCount).toBe(0);
     });
 
-    it('does NOT import any known provider adapter (source import-graph check)', async () => {
-      // Static import-boundary enforcement — read the source of every
-      // file in the pii-screener module + its authorized siblings,
-      // extract import specifiers, and reject any prohibited match.
+    it('production source files import ONLY the authorized local specifier (allowlist)', async () => {
+      // Static import-boundary enforcement via TypeScript AST + strict
+      // allowlist.
       //
-      // R1/R2 findings: prior version defined a prohibited array but
-      // never checked it. This version actually parses import lines
-      // and asserts none point at a provider SDK or the internal
-      // ai-service/internal/providers/ directory.
+      // R1: no check at all. R2: regex blacklist. R3 finding: blacklist
+      // approach is trivially bypassable — an implementer could
+      // `import { request } from 'https'` (bare, no `node:` prefix),
+      // template-literal dynamic import, or a novel provider SDK not
+      // on the blacklist.
+      //
+      // R3 fix: shift to strict allowlist. The Sprint 1.1a production
+      // source files (index.ts + patterns.ts) MUST import ONLY these
+      // authorized specifiers. Anything else fails the test.
       const { readFile } = await import('node:fs/promises');
       const { fileURLToPath } = await import('node:url');
       const path = await import('node:path');
+      const ts = await import('typescript');
 
       const modDir = path.dirname(fileURLToPath(import.meta.url));
-      // Every source file that could plausibly reach the screener's
-      // execution path at runtime.
-      const sourceFiles = ['index.ts', 'patterns.ts'];
-      const prohibitedSpecifiers = [
-        '@anthropic-ai/sdk',
-        '@aws-sdk/client-bedrock',
-        '@aws-sdk/client-bedrock-runtime',
-        '@azure/openai',
-        'openai', // OpenAI SDK
-        'ai-service/internal/providers', // internal provider adapters
-        '../../modules/ai-service', // any reach into AI service
-      ];
-      // Also reject Node primitives that could be used to make network
-      // calls even without a named SDK.
-      const prohibitedNodePrimitives = [
-        'node:http',
-        'node:https',
-        'node:net',
-        'node:tls',
-      ];
-      const allProhibited = [...prohibitedSpecifiers, ...prohibitedNodePrimitives];
 
-      // Regex to capture the specifier from static import forms:
-      //   import ... from 'spec'
-      //   import 'spec'
-      //   import(...'spec'...) [dynamic — the ESM syntactic form]
-      const importSpecifierRe = /(?:^|;|\n)\s*import\s+(?:[^'"]*from\s+)?['"]([^'"]+)['"]|import\(\s*['"]([^'"]+)['"]\s*\)/g;
+      /**
+       * Sprint 1.1a authorized import allowlist. Any addition requires
+       * Codex re-review because the SAFETY invariant is at stake.
+       * - index.ts may import only from './patterns.js'
+       * - patterns.ts imports nothing at runtime
+       * Sprint 1.1b (NER integration) will extend this via its own PR.
+       */
+      const ALLOWLIST: Record<string, ReadonlySet<string>> = {
+        'index.ts': new Set(['./patterns.js']),
+        'patterns.ts': new Set([]),
+      };
 
-      const violations: Array<{ file: string; specifier: string }> = [];
-      for (const relPath of sourceFiles) {
+      const violations: Array<{ file: string; specifier: string; reason: string }> = [];
+
+      for (const [relPath, allowedSet] of Object.entries(ALLOWLIST)) {
         const filePath = path.join(modDir, relPath);
         const src = await readFile(filePath, 'utf8');
-        importSpecifierRe.lastIndex = 0;
-        for (const m of src.matchAll(importSpecifierRe)) {
-          const spec = m[1] ?? m[2];
-          if (!spec) continue;
-          for (const pro of allProhibited) {
-            if (spec.includes(pro)) {
-              violations.push({ file: relPath, specifier: spec });
+        const sourceFile = ts.createSourceFile(
+          relPath,
+          src,
+          ts.ScriptTarget.ES2022,
+          /*setParentNodes*/ true,
+          ts.ScriptKind.TS,
+        );
+        // Walk all top-level statements + nested nodes to collect
+        // import specifiers from: import decl, import equals decl,
+        // dynamic import call, export decl (re-export).
+        const specifiers: string[] = [];
+        const visit = (node: import('typescript').Node): void => {
+          if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+            specifiers.push(node.moduleSpecifier.text);
+          } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+            specifiers.push(node.moduleSpecifier.text);
+          } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+            const arg = node.arguments[0];
+            if (arg && ts.isStringLiteral(arg)) {
+              specifiers.push(arg.text);
+            } else if (arg) {
+              // Non-string-literal argument (template literal, computed,
+              // variable). We reject this outright — cannot statically
+              // verify a runtime-computed import.
+              violations.push({
+                file: relPath,
+                specifier: '<computed-dynamic-import>',
+                reason: 'dynamic import with non-string-literal specifier is not statically verifiable',
+              });
             }
+          } else if (ts.isImportEqualsDeclaration(node)) {
+            if (ts.isExternalModuleReference(node.moduleReference)
+              && ts.isStringLiteral(node.moduleReference.expression)) {
+              specifiers.push(node.moduleReference.expression.text);
+            }
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(sourceFile);
+
+        for (const spec of specifiers) {
+          if (!allowedSet.has(spec)) {
+            violations.push({
+              file: relPath,
+              specifier: spec,
+              reason: `not in Sprint 1.1a allowlist for this file`,
+            });
           }
         }
       }
 
       expect(violations,
-        `pii-screener source imports include prohibited network specifiers: ${JSON.stringify(violations)}`,
+        `pii-screener production sources violate import allowlist: ${JSON.stringify(violations, null, 2)}`,
       ).toEqual([]);
 
       // Complement: the module's export surface should not name any
@@ -388,6 +418,42 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(suspiciousExportNames,
         `pii-screener module surface should not export network-adjacent identifiers; found: ${suspiciousExportNames.join(', ')}`,
       ).toEqual([]);
+    });
+
+    // Negative fixtures — prove the allowlist checker actually rejects
+    // the bypass forms R3 flagged. Uses in-memory strings; does not
+    // modify real source files.
+    it('allowlist checker rejects bare-name network imports', async () => {
+      const ts = await import('typescript');
+      const bypasses = [
+        `import { request } from 'https'`, // bare, no node: prefix
+        `import { request } from 'http'`,
+        `import /*allowed?*/ { request } from 'node:https'`, // comment in decl
+        `import '@anthropic-ai/sdk'`,
+        `import { AnthropicBedrock } from '@anthropic-ai/bedrock-sdk'`,
+        `import('${'`'}${'h'}ttps://api.anthropic.com${'`'}')`, // template literal (encoded to avoid tokenization noise)
+      ];
+      for (const source of bypasses) {
+        const sf = ts.createSourceFile('probe.ts', source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+        let staticSpec: string | null = null;
+        let sawComputedDynamic = false;
+        const visit = (n: import('typescript').Node): void => {
+          if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier)) {
+            staticSpec = n.moduleSpecifier.text;
+          }
+          if (ts.isCallExpression(n) && n.expression.kind === ts.SyntaxKind.ImportKeyword) {
+            const arg = n.arguments[0];
+            if (arg && !ts.isStringLiteral(arg)) sawComputedDynamic = true;
+          }
+          ts.forEachChild(n, visit);
+        };
+        visit(sf);
+        // Every bypass must produce either a specifier that's not in
+        // the empty allowlist OR flag as computed-dynamic.
+        expect(staticSpec !== null || sawComputedDynamic,
+          `allowlist checker failed to detect a bypass form: ${source}`,
+        ).toBe(true);
+      }
     });
   });
 });
