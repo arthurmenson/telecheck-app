@@ -164,23 +164,42 @@
 
 The purge script itself performs NO raw evidence capture. Any forensic artifact must have been produced by the single fail-closed capture path documented in `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Capture procedure BEFORE this script runs.
 
-**Purge table allowlist (must be explicit; no blanket truncation):**
+**Purge table allowlist policy (implementation enumerates from live schema; documentation illustrates):**
 
-Env-purge truncates ONLY tables on this allowlist. Any table not on the list is preserved. The allowlist is the participant-facing PHI-ish tables:
-- `patient_profiles`, `patient_intake_submissions`, `patient_free_text_notes`
-- `ai_mode1_conversations`, `ai_mode1_turns`, `ai_prep_summaries`
-- `async_consults`, `consult_events`, `consult_claims`, `consult_decisions`
-- `medication_requests`, `refill_requests`, `dispensing_events`
-- `crisis_events`, `crisis_actions`
-- `sessions`, `session_devices`, `pii_screener_incidents`
-- Redis: FLUSHALL (Redis is cache/queues; nothing there is source of truth)
+Env-purge truncates ONLY participant-data tables on an explicit allowlist. The allowlist is authored in the implementation PR (Sprint 1.3) by enumerating every table introduced by migrations 000–HEAD that carries participant-generated content, then classifying each as either allowlisted (participant PHI-ish; purged) or preserved (schema fixture, immutable evidence, or tenant baseline).
+
+**Illustrative allowlist (verified against migrations 000–079 as of 2026-08-30; Sprint 1.3 PR must re-verify against migrations at merge time):**
+- **Identity + auth:** `accounts`, `sessions`, `otp_challenges`, `auth_devices`, `account_pin_credentials`, `email_passcodes`
+- **Consent (participant records only; schema `consent_versions` preserved):** `consent`, `delegations`, `delegation_scopes`
+- **Forms + intake:** `forms_submission`, `forms_resume_state`, `consult_intake_submission`
+- **Consults + clinical:** `consult`, `consult_lifecycle_transition`, `consult_review_claim`, `consult_clinical_summary`, `consult_clinician_decision`, `consult_follow_up_message`, `consults`, `consult_events` (dual naming from schema evolution — both preserved in the list until reconciliation)
+- **AI Mode 1:** `ai_mode1_conversation`, `ai_mode1_conversation_turn_admission`, `ai_mode1_conversation_turn_detector_result`, `ai_mode1_conversation_turn_result`, `ai_mode1_conversation_archival_event`
+- **Medication + pharmacy:** `medication_requests`, `refills`, `dispensings`, `shipments`
+- **Interactions:** `interaction_engine_evaluation`, `interaction_signal`, `interaction_signal_override`, `interaction_signal_lifecycle_transition`
+- **Crisis:** `crisis_event`, `crisis_event_lifecycle_transition`, `crisis_sweep_execution`, `notification_crisis_dispatch_ledger`, `notification_crisis_provider_attempt`, `notification_crisis_escalation_obligation`
+- **Subscription:** `subscriptions`, `subscription_events`
+- **Idempotency:** `idempotency_keys`
+- **Redis:** FLUSHALL (Redis is cache/queues; nothing there is source of truth)
 
 **Explicitly PRESERVED (never truncated by env-purge):**
-- `audit_records` — I-003 append-only; the vehicle for `env.purge.executed` attestation + `env.incident.abandoned` and all other audit events. Truncating would break the manifest-clear flow AND violate I-003.
-- `tenant` / `tenant_config` / any tenant-baseline table — schema fixture, not participant data
-- `roles` / `role_bindings` (unless a specific role was seeded per-participant, in which case add it to the allowlist explicitly)
-- `schema_migrations` — the migrations tracker
+- `audit_records` — I-003 append-only; vehicle for `env.purge.executed` attestation + `env.incident.abandoned` and all other audit events. Truncating would break the manifest-clear flow AND violate I-003.
+- `audit_dedupe_markers` — companion to audit_records (dedup discipline requires preservation across purge)
+- `tenants`, `tenant_brands`, `tenant_users`, `country_profiles`, `ccr_configs`, `adapter_configs` — tenant baseline
+- `forms_template`, `forms_deployment`, `forms_snapshot`, `forms_variant`, `consent_versions`, `product_catalog`, `ai_provider_credential`, `forms_template_admin_review`, `forms_template_admin_review_lifecycle_transition`, `admin_template_decision_idempotency_key`, `admin_dashboard_query_execution` — configuration + admin-review artifacts
+- `_session_actor_context`, `_session_tenant_context` — session-context scaffolding (transient at request scope; not participant-owned data)
+- `domain_events_outbox` — event-emission ledger (preserved across purge; downstream consumers may need historical events)
+- `schema_migrations` — migrations tracker
 - Any Postgres system catalog
+
+**Schema-drift regression test (mandatory in Sprint 1.3 PR):**
+CI test enumerates all tables in the live schema (`information_schema.tables` filtered to public schema) at test time, cross-references against a checked-in classification map (`allowlist` | `preserved`), and FAILS if any live table lacks a classification. Any new migration that adds a table must also add its classification in the same PR; otherwise the CI test blocks. This prevents silent schema drift from leaving participant tables preserved by omission or preserved tables truncated by over-inclusion.
+
+**Seeded-canary integration test (mandatory in Sprint 1.3 PR):**
+- Seed identifiable canary rows into every allowlisted table via `pilot-1-baseline-seed.sql --with-canaries`
+- Seed identifiable canary rows into every preserved table
+- Run env-purge (both modes: routine-reset from clean; incident-mode with manifest)
+- Verify: every allowlist-canary is GONE; every preserved-canary is INTACT; `audit_records` contains the `env.purge.executed` event with matching incidentId (incident-mode only)
+- FK behavior: any allowlisted table with a FK to another allowlisted table should be truncated with `CASCADE` in the correct dependency order — or the transaction fails deterministically. Test verifies clean truncation completes without leaving orphaned rows
 
 **Post-purge:** re-seed synthetic tenant baseline + participant handles per `pilot-1-baseline-seed.sql`. Baseline seed is idempotent (uses `ON CONFLICT DO NOTHING`).
 
