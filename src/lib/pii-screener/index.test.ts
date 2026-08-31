@@ -316,19 +316,19 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(fetchCallCount).toBe(0);
     });
 
-    it('production source files import ONLY the authorized local specifier (allowlist)', async () => {
-      // Static import-boundary enforcement via TypeScript AST + strict
-      // allowlist.
+    it('production source files pass the strict SAFETY checker (import allowlist + global-usage denylist)', async () => {
+      // Static SAFETY enforcement via TypeScript AST.
       //
-      // R1: no check at all. R2: regex blacklist. R3 finding: blacklist
-      // approach is trivially bypassable — an implementer could
-      // `import { request } from 'https'` (bare, no `node:` prefix),
-      // template-literal dynamic import, or a novel provider SDK not
-      // on the blacklist.
+      // Convergence trajectory:
+      //   R1: no check.
+      //   R2: regex import blacklist (bypassable via bare-name / comment).
+      //   R3: AST-based import allowlist (misses global-fetch bypass).
+      //   R4: AST-based import allowlist + global-usage denylist.
       //
-      // R3 fix: shift to strict allowlist. The Sprint 1.1a production
-      // source files (index.ts + patterns.ts) MUST import ONLY these
-      // authorized specifiers. Anything else fails the test.
+      // The R4 checker rejects two classes of bypass:
+      //   (a) any imported specifier not on the per-file allowlist
+      //   (b) any use of a prohibited global (fetch, WebSocket, etc.)
+      //       that could reach the network without an import.
       const { readFile } = await import('node:fs/promises');
       const { fileURLToPath } = await import('node:url');
       const path = await import('node:path');
@@ -337,75 +337,25 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       const modDir = path.dirname(fileURLToPath(import.meta.url));
 
       /**
-       * Sprint 1.1a authorized import allowlist. Any addition requires
-       * Codex re-review because the SAFETY invariant is at stake.
-       * - index.ts may import only from './patterns.js'
-       * - patterns.ts imports nothing at runtime
+       * Sprint 1.1a authorized import allowlist per file. Any addition
+       * requires Codex re-review because the SAFETY invariant is at stake.
        * Sprint 1.1b (NER integration) will extend this via its own PR.
        */
-      const ALLOWLIST: Record<string, ReadonlySet<string>> = {
+      const IMPORT_ALLOWLIST: Record<string, ReadonlySet<string>> = {
         'index.ts': new Set(['./patterns.js']),
         'patterns.ts': new Set([]),
       };
 
-      const violations: Array<{ file: string; specifier: string; reason: string }> = [];
-
-      for (const [relPath, allowedSet] of Object.entries(ALLOWLIST)) {
+      const violations: Array<{ file: string; kind: string; detail: string }> = [];
+      for (const [relPath, allowedSet] of Object.entries(IMPORT_ALLOWLIST)) {
         const filePath = path.join(modDir, relPath);
         const src = await readFile(filePath, 'utf8');
-        const sourceFile = ts.createSourceFile(
-          relPath,
-          src,
-          ts.ScriptTarget.ES2022,
-          /*setParentNodes*/ true,
-          ts.ScriptKind.TS,
-        );
-        // Walk all top-level statements + nested nodes to collect
-        // import specifiers from: import decl, import equals decl,
-        // dynamic import call, export decl (re-export).
-        const specifiers: string[] = [];
-        const visit = (node: import('typescript').Node): void => {
-          if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-            specifiers.push(node.moduleSpecifier.text);
-          } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
-            specifiers.push(node.moduleSpecifier.text);
-          } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-            const arg = node.arguments[0];
-            if (arg && ts.isStringLiteral(arg)) {
-              specifiers.push(arg.text);
-            } else if (arg) {
-              // Non-string-literal argument (template literal, computed,
-              // variable). We reject this outright — cannot statically
-              // verify a runtime-computed import.
-              violations.push({
-                file: relPath,
-                specifier: '<computed-dynamic-import>',
-                reason: 'dynamic import with non-string-literal specifier is not statically verifiable',
-              });
-            }
-          } else if (ts.isImportEqualsDeclaration(node)) {
-            if (ts.isExternalModuleReference(node.moduleReference)
-              && ts.isStringLiteral(node.moduleReference.expression)) {
-              specifiers.push(node.moduleReference.expression.text);
-            }
-          }
-          ts.forEachChild(node, visit);
-        };
-        visit(sourceFile);
-
-        for (const spec of specifiers) {
-          if (!allowedSet.has(spec)) {
-            violations.push({
-              file: relPath,
-              specifier: spec,
-              reason: `not in Sprint 1.1a allowlist for this file`,
-            });
-          }
-        }
+        const fileViolations = checkSafety(src, relPath, allowedSet, ts);
+        violations.push(...fileViolations);
       }
 
       expect(violations,
-        `pii-screener production sources violate import allowlist: ${JSON.stringify(violations, null, 2)}`,
+        `pii-screener production sources violate SAFETY: ${JSON.stringify(violations, null, 2)}`,
       ).toEqual([]);
 
       // Complement: the module's export surface should not name any
@@ -420,40 +370,165 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       ).toEqual([]);
     });
 
-    // Negative fixtures — prove the allowlist checker actually rejects
-    // the bypass forms R3 flagged. Uses in-memory strings; does not
-    // modify real source files.
-    it('allowlist checker rejects bare-name network imports', async () => {
+    // Negative fixtures — prove the checker actually rejects known
+    // bypass forms surfaced across R1..R4. Uses in-memory strings; does
+    // not modify real source files. Runs the FIXTURES through the
+    // EXACT checker used against the production source (§checkSafety).
+    it('safety checker rejects known bypass forms (regression suite)', async () => {
       const ts = await import('typescript');
-      const bypasses = [
-        `import { request } from 'https'`, // bare, no node: prefix
-        `import { request } from 'http'`,
-        `import /*allowed?*/ { request } from 'node:https'`, // comment in decl
-        `import '@anthropic-ai/sdk'`,
-        `import { AnthropicBedrock } from '@anthropic-ai/bedrock-sdk'`,
-        `import('${'`'}${'h'}ttps://api.anthropic.com${'`'}')`, // template literal (encoded to avoid tokenization noise)
+      const emptyAllow: ReadonlySet<string> = new Set([]);
+
+      // Each fixture is (label, source) — every one MUST produce at
+      // least one violation from checkSafety().
+      const bypasses: Array<[string, string]> = [
+        ['bare-name https import', `import { request } from 'https'; request();`],
+        ['bare-name http import', `import { request } from 'http'; request();`],
+        ['node: prefixed https with comment', `import /*allowed?*/ { request } from 'node:https'; request();`],
+        ['anthropic sdk side-effect', `import '@anthropic-ai/sdk';`],
+        ['anthropic bedrock sdk named', `import { AnthropicBedrock } from '@anthropic-ai/bedrock-sdk'; new AnthropicBedrock();`],
+        ['template-literal dynamic import', 'import(`https://api.anthropic.com`)'],
+        // R4 finding — the global-fetch bypasses:
+        ['bare global fetch call', `fetch('https://api.anthropic.com/v1/messages');`],
+        ['conditional global fetch', `if (Math.random() > 0.5) fetch('https://x');`],
+        ['top-level fetch (executes at import time)', `const x = fetch('https://x');`],
+        ['WebSocket global', `new WebSocket('wss://x');`],
+        ['EventSource global', `new EventSource('https://x');`],
+        ['navigator.sendBeacon', `navigator.sendBeacon('https://x', 'payload');`],
+        ['eval bypass', `eval('fetch("https://x")');`],
+        ['Function constructor bypass', `new Function('return fetch("https://x")')();`],
+        ['require bypass (CJS in TS)', `const https = require('https'); https.request();`],
       ];
-      for (const source of bypasses) {
-        const sf = ts.createSourceFile('probe.ts', source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
-        let staticSpec: string | null = null;
-        let sawComputedDynamic = false;
-        const visit = (n: import('typescript').Node): void => {
-          if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier)) {
-            staticSpec = n.moduleSpecifier.text;
-          }
-          if (ts.isCallExpression(n) && n.expression.kind === ts.SyntaxKind.ImportKeyword) {
-            const arg = n.arguments[0];
-            if (arg && !ts.isStringLiteral(arg)) sawComputedDynamic = true;
-          }
-          ts.forEachChild(n, visit);
-        };
-        visit(sf);
-        // Every bypass must produce either a specifier that's not in
-        // the empty allowlist OR flag as computed-dynamic.
-        expect(staticSpec !== null || sawComputedDynamic,
-          `allowlist checker failed to detect a bypass form: ${source}`,
-        ).toBe(true);
+
+      const failedToDetect: string[] = [];
+      for (const [label, source] of bypasses) {
+        const viols = checkSafety(source, 'probe.ts', emptyAllow, ts);
+        if (viols.length === 0) {
+          failedToDetect.push(label);
+        }
       }
+      expect(failedToDetect,
+        `safety checker failed to detect bypass form(s): ${failedToDetect.join('; ')}`,
+      ).toEqual([]);
+    });
+
+    it('safety checker accepts pristine source (positive control)', async () => {
+      const ts = await import('typescript');
+      const goodSource = `
+        import { foo } from './patterns.js';
+        export function screen(x: string): boolean {
+          return x.length > 0 && foo(x);
+        }
+      `;
+      const allow = new Set(['./patterns.js']);
+      const viols = checkSafety(goodSource, 'probe.ts', allow, ts);
+      expect(viols).toEqual([]);
     });
   });
 });
+
+// ---------------------------------------------------------------------
+// checkSafety — shared static SAFETY checker used by both the
+// production-file assertion and the negative-fixture regression suite.
+// Exported at module scope (not inside describe) so both tests use the
+// EXACT same implementation. Detects two violation classes:
+//   (1) import specifier not in per-file allowlist (or non-verifiable
+//       dynamic import argument)
+//   (2) use of a prohibited network/exec global identifier
+// Excluding these classes is the SAFETY invariant per PII spec §Layer 1.
+// ---------------------------------------------------------------------
+type TsModule = typeof import('typescript');
+
+const PROHIBITED_GLOBALS: readonly string[] = [
+  'fetch',
+  'WebSocket',
+  'EventSource',
+  'navigator', // navigator.sendBeacon
+  'require', // CJS reach-through inside TS
+  'eval',
+  'Function', // via `new Function(...)`
+  'process', // process.getBuiltinModule + process.env-driven config leak
+  'XMLHttpRequest',
+  'importScripts',
+];
+
+function checkSafety(
+  source: string,
+  fileLabel: string,
+  importAllowlist: ReadonlySet<string>,
+  ts: TsModule,
+): Array<{ file: string; kind: string; detail: string }> {
+  const violations: Array<{ file: string; kind: string; detail: string }> = [];
+  const sf = ts.createSourceFile(fileLabel, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+
+  const visit = (node: import('typescript').Node): void => {
+    // Class (1) — imports.
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      const spec = node.moduleSpecifier.text;
+      if (!importAllowlist.has(spec)) {
+        violations.push({ file: fileLabel, kind: 'import', detail: spec });
+      }
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+      const spec = node.moduleSpecifier.text;
+      if (!importAllowlist.has(spec)) {
+        violations.push({ file: fileLabel, kind: 'reexport', detail: spec });
+      }
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const arg = node.arguments[0];
+      if (arg && ts.isStringLiteral(arg)) {
+        if (!importAllowlist.has(arg.text)) {
+          violations.push({ file: fileLabel, kind: 'dynamic-import', detail: arg.text });
+        }
+      } else if (arg) {
+        violations.push({
+          file: fileLabel,
+          kind: 'dynamic-import',
+          detail: '<non-string-literal specifier — not statically verifiable>',
+        });
+      }
+    } else if (ts.isImportEqualsDeclaration(node)
+      && ts.isExternalModuleReference(node.moduleReference)
+      && ts.isStringLiteral(node.moduleReference.expression)) {
+      const spec = node.moduleReference.expression.text;
+      if (!importAllowlist.has(spec)) {
+        violations.push({ file: fileLabel, kind: 'import-equals', detail: spec });
+      }
+    }
+
+    // Class (2) — prohibited globals. Identifier appears in a call or
+    // new expression at the head; also matches property-access chains
+    // rooted at a prohibited global (e.g., navigator.sendBeacon,
+    // process.getBuiltinModule).
+    if (ts.isIdentifier(node)) {
+      const name = node.text;
+      if (PROHIBITED_GLOBALS.includes(name)) {
+        // Skip identifier occurrences inside string literals or the
+        // PROHIBITED_GLOBALS array itself (this file). The AST walk
+        // is over source code; string content is not part of the AST
+        // outside literals which we don't recurse into as identifiers,
+        // so filtering here is unnecessary for real production files.
+        // However, an identifier used as a parameter name is not a
+        // reach-through — skip named parameters + local declarations
+        // that shadow the global.
+        const parent = node.parent;
+        if (parent) {
+          if (ts.isParameter(parent) && parent.name === node) return;
+          if (ts.isVariableDeclaration(parent) && parent.name === node) return;
+          if (ts.isPropertyAssignment(parent) && parent.name === node) return;
+          if (ts.isImportSpecifier(parent)) return;
+          if (ts.isImportClause(parent)) return;
+          if (ts.isNamespaceImport(parent)) return;
+        }
+        violations.push({
+          file: fileLabel,
+          kind: 'prohibited-global',
+          detail: name,
+        });
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+
+  return violations;
+}
