@@ -87,7 +87,7 @@
 **Response:**
 
 1. **First warning:** Evans direct-message the participant. Point at consent form § "You agree not to enter your real name…". Confirm understanding.
-2. **Second occurrence:** pause participant's access. Purge affected records for that participant per `pilot-1-env-purge.sh` scoped variant (or full purge if scoped isn't safe).
+2. **Second occurrence:** pause participant's access. Follow the defined incident-mode flow: assign a fresh incident-id, run `bash scripts/incident-capture.sh <id>` to preserve forensic evidence, then `bash scripts/pilot-1-env-purge.sh --incident-id <id>` for the full manifest-bound wipe. No participant-scoped purge variant exists — the two invocation modes are `--routine-reset` (no active incident) and `--incident-id <id>` (manifest-bound full wipe); scoping by participant would require design + implementation + Codex re-review beyond the Pilot 1 scope. Follow-up: post-purge, re-seed only the non-offending participants + re-invite them to resume from Day-0.
 3. **Third occurrence:** remove participant from Pilot 1. Document in incident log + defect log. Backfill with alternate participant if roster permits.
 
 ---
