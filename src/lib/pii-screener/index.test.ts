@@ -316,39 +316,78 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(fetchCallCount).toBe(0);
     });
 
-    it('does NOT import any known provider adapter (module import-boundary check)', async () => {
-      // Import-time introspection: load the module and its transitive
-      // dependencies via Node's require.cache / dynamic-import, then
-      // assert none of the loaded module specifiers match known provider
-      // paths (Anthropic SDK, Bedrock, Azure OpenAI, the internal
-      // provider-adapter directory).
-      const mod = await import('./index.js');
-      expect(mod).toBeDefined();
-      const prohibited = [
+    it('does NOT import any known provider adapter (source import-graph check)', async () => {
+      // Static import-boundary enforcement — read the source of every
+      // file in the pii-screener module + its authorized siblings,
+      // extract import specifiers, and reject any prohibited match.
+      //
+      // R1/R2 findings: prior version defined a prohibited array but
+      // never checked it. This version actually parses import lines
+      // and asserts none point at a provider SDK or the internal
+      // ai-service/internal/providers/ directory.
+      const { readFile } = await import('node:fs/promises');
+      const { fileURLToPath } = await import('node:url');
+      const path = await import('node:path');
+
+      const modDir = path.dirname(fileURLToPath(import.meta.url));
+      // Every source file that could plausibly reach the screener's
+      // execution path at runtime.
+      const sourceFiles = ['index.ts', 'patterns.ts'];
+      const prohibitedSpecifiers = [
         '@anthropic-ai/sdk',
         '@aws-sdk/client-bedrock',
+        '@aws-sdk/client-bedrock-runtime',
         '@azure/openai',
-        '/providers/', // src/modules/ai-service/internal/providers/
+        'openai', // OpenAI SDK
+        'ai-service/internal/providers', // internal provider adapters
+        '../../modules/ai-service', // any reach into AI service
       ];
-      // In an ESM context we can't fully enumerate imports at runtime
-      // without instrumenting the loader; the structural check below is
-      // a defense-in-depth complement to code review (which is the
-      // authoritative gate). Sprint 1.1b should extend this via a
-      // build-time import-graph lint rule.
-      // We assert the API surface of the loaded module contains ONLY
-      // pure-function exports + type re-exports — no client/factory.
-      const exportNames = Object.keys(mod);
-      const suspiciousExportNames = exportNames.filter((n) =>
+      // Also reject Node primitives that could be used to make network
+      // calls even without a named SDK.
+      const prohibitedNodePrimitives = [
+        'node:http',
+        'node:https',
+        'node:net',
+        'node:tls',
+      ];
+      const allProhibited = [...prohibitedSpecifiers, ...prohibitedNodePrimitives];
+
+      // Regex to capture the specifier from static import forms:
+      //   import ... from 'spec'
+      //   import 'spec'
+      //   import(...'spec'...) [dynamic — the ESM syntactic form]
+      const importSpecifierRe = /(?:^|;|\n)\s*import\s+(?:[^'"]*from\s+)?['"]([^'"]+)['"]|import\(\s*['"]([^'"]+)['"]\s*\)/g;
+
+      const violations: Array<{ file: string; specifier: string }> = [];
+      for (const relPath of sourceFiles) {
+        const filePath = path.join(modDir, relPath);
+        const src = await readFile(filePath, 'utf8');
+        importSpecifierRe.lastIndex = 0;
+        for (const m of src.matchAll(importSpecifierRe)) {
+          const spec = m[1] ?? m[2];
+          if (!spec) continue;
+          for (const pro of allProhibited) {
+            if (spec.includes(pro)) {
+              violations.push({ file: relPath, specifier: spec });
+            }
+          }
+        }
+      }
+
+      expect(violations,
+        `pii-screener source imports include prohibited network specifiers: ${JSON.stringify(violations)}`,
+      ).toEqual([]);
+
+      // Complement: the module's export surface should not name any
+      // provider-adjacent identifier (defense-in-depth against an
+      // implementation that reaches a provider via an aliased symbol).
+      const mod = await import('./index.js');
+      const suspiciousExportNames = Object.keys(mod).filter((n) =>
         /client|provider|fetch|http|anthropic|bedrock|azure/i.test(n),
       );
       expect(suspiciousExportNames,
         `pii-screener module surface should not export network-adjacent identifiers; found: ${suspiciousExportNames.join(', ')}`,
       ).toEqual([]);
-      // For each prohibited spec, verify it doesn't appear as a
-      // direct import in the source (grep-style textual check via
-      // reading the source). This is a Sprint 1.1a acceptable-precision
-      // check; import-graph enforcement is Sprint 1.1b work.
-      expect(prohibited).toBeDefined(); // reference the array to keep intent visible
     });
   });
 });
