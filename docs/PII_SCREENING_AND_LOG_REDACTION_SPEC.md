@@ -169,8 +169,9 @@ The purge script itself performs NO raw evidence capture. Any forensic artifact 
 This specification defines POLICY:
 - Participant-data tables are removed to reset the environment
 - Schema fixtures, tenant baseline, and immutable evidence (`audit_records`, `audit_dedupe_markers`, `domain_events_outbox`) are preserved
-- No blanket truncation — every table must be classified explicitly
+- No blanket truncation — every table must be classified explicitly as one of: **`allowlist`** (participant-only; TRUNCATE), **`preserved`** (never touched), or **`scoped-delete`** (mixed baseline + participant; DELETE with WHERE preserving baseline rows)
 - The append-only audit chain must survive purge to carry `env.purge.executed` attestation (I-003)
+- The complete FK-aware purge plan (all TRUNCATEs + all scoped DELETEs) executes in a SINGLE transaction with the attestation — failure of any step rolls back all mutations AND the attestation atomically
 
 The **FK-graph resolution** (what SQL operation on which tables in which order) is the responsibility of the Sprint 1.3 implementation PR, which:
 1. Enumerates every table in migrations 000–HEAD
@@ -210,16 +211,19 @@ Illustrative classification below reflects a first-pass reading of migrations 00
 1. **Schema-drift classification test:** enumerate live schema (`information_schema.tables` filtered to `public`) at test time; cross-reference against checked-in classification map (`allowlist` | `preserved` | `scoped-delete` — the last for mixed-baseline tables like `accounts`); FAIL if any live table lacks classification. New migrations adding tables MUST add classification in the same PR.
 2. **Preserved-to-purged FK-edge test:** enumerate FK constraints from `information_schema.referential_constraints`; FAIL if any FK edge points from a `preserved`-scope table to an `allowlist`-scope table (would break under TRUNCATE) OR from a `preserved`-scope table to a `scoped-delete`-scope table where the scoped-delete plan does not preserve the referenced rows.
 3. **Seeded-canary purge integration test:** seed identifiable canary rows into every classified table via `pilot-1-baseline-seed.sql --with-canaries`; run env-purge (both modes: routine-reset from clean; incident-mode with manifest); verify (a) every allowlist-canary is GONE, (b) every preserved-canary is INTACT, (c) every scoped-delete-canary has ONLY its participant-scoped rows removed with baseline rows INTACT, (d) `audit_records` contains the `env.purge.executed` event with matching incidentId (incident-mode only), (e) no orphaned FK rows across the entire schema post-purge.
-4. **Attestation-transaction test:** simulate a truncation failure mid-transaction; verify the `env.purge.executed` audit event is rolled back atomically; verify the incident-mode purge exits non-zero and no partial state is left.
+4. **Attestation-transaction test:** verify FK-aware atomic purge rollback across BOTH operation kinds:
+   - Inject a failure AFTER at least one successful `TRUNCATE` on an `allowlist` table but before COMMIT — verify the entire transaction rolls back: audit event GONE + truncated table's rows RESTORED + purge exits non-zero
+   - Inject a failure AFTER at least one successful scoped `DELETE` on a `scoped-delete` table but before COMMIT — verify the same: audit event GONE + deleted rows RESTORED + purge exits non-zero
+   - Inject a failure INSIDE the audit event INSERT — verify no participant mutation occurred + purge exits non-zero
 
 **Post-purge:** re-seed synthetic tenant baseline + participant handles per `pilot-1-baseline-seed.sql`. Baseline seed is idempotent (uses `ON CONFLICT DO NOTHING`).
 
-**Attestation transaction:** the `env.purge.executed` audit event is inserted BEFORE the truncation of participant tables, in the same transaction; if the truncation fails, the audit event rolls back — no false attestation. Order: BEGIN → INSERT audit event → TRUNCATE allowlisted tables → COMMIT. Second stage (reseed) is a separate transaction after commit.
+**Attestation transaction (FK-aware):** the `env.purge.executed` audit event is inserted BEFORE any participant-data mutation, in the same transaction as the complete FK-aware purge plan. Order: BEGIN → INSERT `env.purge.executed` audit event → execute the complete purge plan (all `TRUNCATE` operations for `allowlist` tables in FK dependency order + all `DELETE ... WHERE` operations for `scoped-delete` tables per their scoping predicate) → COMMIT. Any error at any step rolls back the entire transaction including the attestation — no false attestation, no partial participant deletion. Second stage (reseed) is a separate transaction executed only after successful COMMIT.
 
 **Steps:**
 1. `docker compose exec app pkill -TERM node` (graceful app shutdown)
 2. `docker compose stop app` (freeze app container)
-3. `docker compose exec db psql -U telecheck telecheck` — single transaction: INSERT `env.purge.executed` audit event → TRUNCATE only the allowlisted tables above → COMMIT. Any error rolls back; on rollback env-purge exits non-zero without touching Redis or app logs.
+3. `docker compose exec db psql -U telecheck telecheck` — single atomic transaction: BEGIN → INSERT `env.purge.executed` audit event → execute complete FK-aware purge plan (all TRUNCATEs + all scoped DELETEs per the Sprint 1.3 classification map) → COMMIT. On any error, transaction rolls back completely (audit event + any partial deletion); env-purge exits non-zero; Redis + app logs are NOT touched (steps 4-6 are gated on step 3 success).
 4. `docker compose exec redis redis-cli FLUSHALL`
 5. `docker compose exec caddy sh -c '> /var/log/access.log'` (Caddy access log truncate — no cleartext capture; the incident-capture script already captured caddy)
 6. `docker compose exec app rm -f /app/logs/*.log` (app-log truncate — no cleartext capture; the incident-capture script already captured app logs sanitized+encrypted)
