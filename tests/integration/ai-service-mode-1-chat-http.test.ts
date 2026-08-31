@@ -1056,3 +1056,124 @@ describe('Mode 1 chat — Group P: conversation/turn persistence', () => {
     expect(rows.turnResults).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Group PII — Sprint 1.1c Layer 1 PII screener wiring
+//
+// The screener runs AFTER the I-019 crisis gate and BEFORE Stage-2
+// validation / persistence / any LLM call. Route class is `ai_bound`
+// (this endpoint reaches an external provider on the non-crisis path),
+// so ANY screener hit blocks per the Layer 1 decision matrix.
+//
+// Ordering invariant proved here: the crisis floor (I-019 / FLOOR-013)
+// OUTRANKS the PII block. A crisis-positive turn that also contains PII
+// still surfaces the safety sentinel — it is NOT 422'd.
+//
+// Spec references:
+//   - docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Layer 1
+//   - docs/PILOT_1_COVERAGE_MATRIX.md A1-A6b
+//   - I-019 / FLOOR-013 (crisis detection is platform-floor, always-on)
+// ---------------------------------------------------------------------------
+
+describe('Mode 1 chat — Group PII: Layer 1 screener wiring (Sprint 1.1c)', () => {
+  it('PII-1 regex hit (US SSN) on non-crisis turn → 422 (blocked before provider)', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: 'My SSN is 123-45-6789, can you help with my medication?' },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('PII-2 regex hit (email) on non-crisis turn → 422', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: 'Please email me at real.person@example.com about my refill' },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('PII-3 NER hit (PERSON) on non-crisis turn → 422', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: 'Hello, my name is John Smith and I need a refill' },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('PII-4 low-confidence hit (IPv4) on non-crisis turn → 422 (ai_bound blocks ANY hit)', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: 'The clinic portal at 10.0.0.42 is not loading for me' },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('PII-5 clean synthetic message → 200 (screener passes through)', async () => {
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: SAFE_TEXT_SHORT },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('PII-6 ORDERING INVARIANT: crisis + PII → 200 crisis sentinel (crisis floor outranks PII block)', async () => {
+    // I-019 / FLOOR-013 is platform-floor: a distressed participant who
+    // also typed real PII MUST still receive the crisis safety surface.
+    // The crisis path makes no LLM call, so no PII crosses the provider
+    // boundary. Accepted residual risk: the raw message persists into
+    // turn_admission — mitigated by Layer 3/5 redaction + the IR runbook
+    // Category 1 CRITICAL capture-then-purge path.
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: {
+        message_text: `${CRISIS_TEXT_SHORT}. My SSN is 123-45-6789 if you need it.`,
+      },
+    });
+    // MUST be 200 with the crisis sentinel — NOT 422.
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{ crisis_detected: boolean; ai_model_version: string }>();
+    expect(body.crisis_detected).toBe(true);
+    expect(body.ai_model_version).toBe('crisis-bypass:no-llm-call');
+  });
+
+  it('PII-7 block response body does NOT echo the offending text', async () => {
+    // Layer 3 discipline: the raw candidate must never reach the
+    // response body or the log stream. Only the participant guidance
+    // message is surfaced.
+    const accountId = `acct_${ulid()}`;
+    const token = mintPatientToken(accountId);
+    const secretish = '123-45-6789';
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/ai/chat',
+      headers: patientRequestHeaders(token),
+      payload: { message_text: `My SSN is ${secretish} please help` },
+    });
+    expect(response.statusCode).toBe(422);
+    expect(response.body).not.toContain(secretish);
+  });
+});

@@ -30,11 +30,40 @@
 
 ## Layer 1 — Input screener (block-or-warn at ingress)
 
-**Where:** every route that accepts free-text patient-facing content. Enumerate:
-- `POST /v1/ai/mode1/turns` (chat messages)
-- `POST /v1/async-consults/:id/intake` (intake form free-text fields)
-- `POST /v1/async-consults/:id/decision` (clinician decision notes)
-- Any other endpoint accepting `body.text`, `body.notes`, `body.freeText`, `body.symptomDescription`, etc.
+**Where:** every route that accepts **server-visible plaintext** free-text patient-facing content.
+
+### ⚠️ Sprint 1.1c finding — the server-visible surface is ONE route, not four
+
+The original enumeration in this spec assumed four screenable routes. Implementation (Sprint 1.1c, 2026-08-31) established that **only one route in the current codebase exposes plaintext free-text to the server**:
+
+| Route | Free-text posture | Layer 1 screenable? |
+|---|---|---|
+| `POST /v0/ai/chat` (Mode 1) | **Plaintext** `message_text` in request body | ✅ **YES — wired Sprint 1.1c** |
+| `POST /v1/async-consults/:id/intake` | Pre-encrypted 8-field KMS envelope (`intake_payload_envelope`) per I-026 | ❌ NO — server never sees plaintext |
+| `POST /v1/async-consults/:id/decision` | Pre-encrypted 8-field KMS envelope (`decision_rationale_envelope`) per I-026 | ❌ NO — server never sees plaintext |
+| `POST /v1/async-consults/:id/follow-up-messages` | Pre-encrypted 8-field KMS envelope (`message_envelope`) per I-026 | ❌ NO — server never sees plaintext |
+
+The async-consult family encrypts client-side per I-026 (KMS envelope posture; `v1-shared.ts`). The backend receives ciphertext + DEK id + IV + tag and stores it verbatim. There is no plaintext for a server-side screener to inspect — this is not a wiring gap, it is the architecture working as designed.
+
+### Consequence — client-side screening gap (Pilot 1 open item)
+
+Layer 1 as implemented protects the Mode 1 chat route ONLY. For the async-consult routes, PII screening must run **client-side, before encryption**, in:
+- `telecheck-patient-app` (Expo/React Native) — intake form + follow-up message composer
+- `telecheck-clinician-console` (Vite/React) — decision-rationale composer
+
+That is **Track 4 work**, not backend work. It is a **Pilot 1 startup-authorization gate item** — see `PATH_A_PILOT_COMPLETION_RUNBOOK.md` §Technical gates.
+
+**Interim Pilot 1 mitigation until client-side screening ships:** participant training (the one-pager delivered with the consent form) explicitly instructs participants to use only scripted synthetic scenario content in intake + decision + follow-up fields. Layer 5 (backup redaction) cannot help here either — the stored value is ciphertext. The residual risk is real and must be accepted explicitly by the ratifier before Day-0, or client-side screening must land first.
+
+### Screenable-route implementation
+
+- `POST /v0/ai/chat` — `message_text` field. **Route class: `ai_bound`** (reaches Anthropic / Bedrock / Azure on the non-crisis path), so ANY hit blocks per the decision matrix.
+
+**Ordering invariant (Sprint 1.1c, non-negotiable):** the screener runs **AFTER** the I-019 crisis gate and **BEFORE** Stage-2 validation / persistence / the LLM call.
+- *After the crisis gate* because I-019 / FLOOR-013 is platform-floor: crisis detection must run on raw text and must not be suppressible. A distressed participant who also typed real PII still gets the crisis sentinel + Category A audit. The crisis path makes no LLM call (AI_LAYERING §6 crisis-write exception), so no PII crosses the provider boundary on it.
+- *Before persistence + LLM call* on the non-crisis path, so a blocked turn never persists and the provider never sees the text.
+
+**Accepted residual risk (documented, not hidden):** a crisis-positive turn that ALSO contains real PII persists the raw `user_message` into `ai_mode1_conversation_turn_admission`. The crisis floor outranks the PII block by design. Mitigations: Layer 3 log redaction, Layer 5 backup redaction, and the IR runbook Category 1 CRITICAL path (capture → purge). Test `PII-6` in `tests/integration/ai-service-mode-1-chat-http.test.ts` pins this ordering invariant.
 
 **How:** shared middleware `src/lib/pii-screener/` invoked before route handler. On each free-text input:
 

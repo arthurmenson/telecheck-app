@@ -36,10 +36,14 @@ Adversarial scenarios verify the system fails safely under unexpected inputs. Ea
 | # | Adversarial scenario | Expected failure mode | Actual failure mode | Status |
 |---|---|---|---|---|
 | A1 | Participant enters real-looking name in chat | Layer 1 input screener blocks with 422 + guidance | ⬜ | ⬜ |
-| A2 | Participant enters real-looking phone in intake free-text | Layer 1 blocks with 422 | ⬜ | ⬜ |
+| A2 | Participant enters real-looking phone in intake free-text | ⚠️ **REVISED Sprint 1.1c** — intake is client-side-encrypted (I-026); the server never sees plaintext, so Layer 1 cannot fire. Expected: **client-side** screener blocks pre-encryption. Until Track 4 ships that, this scenario has NO technical control (participant training only) and the result must be recorded as a known gap, not a pass. | ⬜ | ⬜ |
+| A2b | Participant enters real-looking phone in **Mode 1 chat** | Layer 1 blocks with 422 (server-visible plaintext route) | ⬜ | ⬜ |
 | A3 | Participant enters real-looking SSN in chat | Layer 1 blocks with 422 | ⬜ | ⬜ |
-| A4 | Participant enters real-looking Ghana Card ID in intake | Layer 1 blocks with 422 | ⬜ | ⬜ |
-| A5 | Clinician enters real patient's real name in decision notes | Layer 1 blocks with 422 | ⬜ | ⬜ |
+| A4 | Participant enters real-looking Ghana Card ID in intake | ⚠️ **REVISED Sprint 1.1c** — intake is client-side-encrypted (I-026). Expected: **client-side** screener blocks pre-encryption. Known gap until Track 4 ships. | ⬜ | ⬜ |
+| A4b | Participant enters real-looking Ghana Card ID in **Mode 1 chat** | Layer 1 blocks with 422 (server-visible plaintext route) | ⬜ | ⬜ |
+| A5 | Clinician enters real patient's real name in decision notes | ⚠️ **REVISED Sprint 1.1c** — decision rationale is client-side-encrypted (I-026). Expected: **client-side** screener in clinician console blocks pre-encryption. Known gap until Track 4 ships. | ⬜ | ⬜ |
+| A5b | Real person name entered in **Mode 1 chat** | Layer 1 local-NER PERSON hit → 422 | ⬜ | ⬜ |
+| A5c | **ORDERING INVARIANT** — crisis content + real PII in one Mode 1 message | 200 crisis sentinel (NOT 422). I-019 / FLOOR-013 outranks the PII block; crisis path makes no LLM call. Pinned by test PII-6. | ⬜ | ⬜ |
 | A6 | Free-text with subtle PII (e.g., first name + condition tied together) on an AI-bound route (chat) | Layer 1 local-NER classifier hits → 422 BLOCK; verified zero provider egress on this request | ⬜ | ⬜ |
 | A6b | Same subtle PII on an INTERNAL route (clinician decision notes; not AI-bound) | Layer 1 local-NER low-confidence hit → REDACT INLINE with `[REDACTED:PII]` + `pii.screener.warn` audit event | ⬜ | ⬜ |
 | A7 | Response body would render PII that slipped past Layer 1 (synthesized regression) | Layer 2 egress screener redacts | ⬜ | ⬜ |
