@@ -1125,7 +1125,12 @@ describe('Mode 1 chat — Group PII: Layer 1 screener wiring (Sprint 1.1c)', () 
   });
 
   it('PII-5 clean synthetic message → 200 (screener passes through)', async () => {
-    const accountId = `acct_${ulid()}`;
+    // Success path reaches persistence, so the patient must exist —
+    // ai_mode1_conversation.patient_id carries a composite tenant-scoped
+    // FK to accounts. (Codex R1 finding: the 422 groups above can use a
+    // synthetic id because they reject before persistence; the 200
+    // groups cannot.)
+    const accountId = await seedPatientAccount();
     const token = mintPatientToken(accountId);
     const response = await app!.inject({
       method: 'POST',
@@ -1136,28 +1141,47 @@ describe('Mode 1 chat — Group PII: Layer 1 screener wiring (Sprint 1.1c)', () 
     expect(response.statusCode).toBe(200);
   });
 
-  it('PII-6 ORDERING INVARIANT: crisis + PII → 200 crisis sentinel (crisis floor outranks PII block)', async () => {
+  it('PII-6 ORDERING INVARIANT: crisis + PII → 200 crisis sentinel + raw message persisted (accepted residual risk)', async () => {
     // I-019 / FLOOR-013 is platform-floor: a distressed participant who
     // also typed real PII MUST still receive the crisis safety surface.
     // The crisis path makes no LLM call, so no PII crosses the provider
-    // boundary. Accepted residual risk: the raw message persists into
-    // turn_admission — mitigated by Layer 3/5 redaction + the IR runbook
-    // Category 1 CRITICAL capture-then-purge path.
-    const accountId = `acct_${ulid()}`;
+    // boundary.
+    //
+    // This test pins BOTH halves of the documented tradeoff:
+    //   1. the crisis sentinel surfaces (NOT a 422)
+    //   2. the raw message — PII and all — lands in turn_admission
+    //
+    // Half 2 is the accepted residual risk, asserted explicitly rather
+    // than left implicit, so that if a future change starts scrubbing
+    // the persisted message this test fails and forces the spec's
+    // §Accepted residual risk paragraph to be updated in the same PR.
+    // Mitigations for it: Layer 3 log redaction, Layer 5 backup
+    // redaction, IR runbook Category 1 CRITICAL capture-then-purge.
+    const accountId = await seedPatientAccount();
     const token = mintPatientToken(accountId);
+    const piiFragment = '123-45-6789';
+    const crisisPlusPii = `${CRISIS_TEXT_SHORT}. My SSN is ${piiFragment} if you need it.`;
     const response = await app!.inject({
       method: 'POST',
       url: '/v0/ai/chat',
       headers: patientRequestHeaders(token),
-      payload: {
-        message_text: `${CRISIS_TEXT_SHORT}. My SSN is 123-45-6789 if you need it.`,
-      },
+      payload: { message_text: crisisPlusPii },
     });
-    // MUST be 200 with the crisis sentinel — NOT 422.
+    // Half 1 — MUST be 200 with the crisis sentinel, NOT 422.
     expect(response.statusCode).toBe(200);
     const body = response.json<{ crisis_detected: boolean; ai_model_version: string }>();
     expect(body.crisis_detected).toBe(true);
+    // No LLM call was made — this is what keeps the PII off the provider.
     expect(body.ai_model_version).toBe('crisis-bypass:no-llm-call');
+
+    // Half 2 — the documented residual: raw message persisted verbatim.
+    const conversationId = response.json<Record<string, unknown>>()[
+      'ai_chat_session_id'
+    ] as string;
+    const rows = await loadMode1Rows(conversationId);
+    expect(rows.admissions).toHaveLength(1);
+    expect(rows.admissions[0]!.user_message).toBe(crisisPlusPii);
+    expect(rows.admissions[0]!.user_message).toContain(piiFragment);
   });
 
   it('PII-7 block response body does NOT echo the offending text', async () => {
