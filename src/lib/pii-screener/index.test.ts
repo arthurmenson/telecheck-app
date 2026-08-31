@@ -30,6 +30,7 @@ import {
   PARTICIPANT_BLOCK_MESSAGE,
   PII_PATTERNS,
   screenInput,
+  screenOutput,
   type ScreeningResult,
 } from './index.js';
 
@@ -898,3 +899,83 @@ function resolveRootReceiver(
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Sprint 1.1d — audit_bound route class + Layer 2 egress screener
+// ---------------------------------------------------------------------------
+
+describe('pii-screener — audit_bound route class (Sprint 1.1d)', () => {
+  it('blocks on a HIGH-confidence hit', () => {
+    const r = screenInput('reviewer note: patient SSN 123-45-6789 on file', 'audit_bound');
+    expect(r.action).toBe('block');
+    expect(r.blockReason).toBe('match_any_audit_bound');
+  });
+
+  it('blocks on a LOW-confidence hit too (append-only audit is unpurgeable)', () => {
+    // IPv4 is low-confidence. On an `internal` route this would redact;
+    // on audit_bound it must block, because an audit row cannot later be
+    // scrubbed (I-003 append-only) and env-purge PRESERVES audit_records.
+    const r = screenInput('reviewer note: portal at 10.0.0.42 was slow', 'audit_bound');
+    expect(r.action).toBe('block');
+    expect(r.blockReason).toBe('match_any_audit_bound');
+    expect(r.redactedInput).toBeUndefined();
+  });
+
+  it('is strictly stricter than internal for the same input', () => {
+    const lowConfidenceInput = 'the box at 10.0.0.42 is down';
+    expect(screenInput(lowConfidenceInput, 'internal').action).toBe('redact');
+    expect(screenInput(lowConfidenceInput, 'audit_bound').action).toBe('block');
+  });
+
+  it('passes clean synthetic reviewer prose', () => {
+    const r = screenInput('Template rejected: question 4 wording is ambiguous.', 'audit_bound');
+    expect(r.action).toBe('pass');
+  });
+});
+
+describe('pii-screener — screenOutput (Layer 2 egress, Sprint 1.1d)', () => {
+  it('redacts a high-confidence hit in model-generated output', () => {
+    const r = screenOutput('Sure — you can reach the office at test.user@example.com.');
+    expect(r.redacted).toBe(true);
+    expect(r.output).toContain('[REDACTED:Email address]');
+    expect(r.output).not.toContain('test.user@example.com');
+  });
+
+  it('redacts a low-confidence hit too (egress redacts everything it finds)', () => {
+    const r = screenOutput('Try the portal at 10.0.0.42 instead.');
+    expect(r.redacted).toBe(true);
+    expect(r.output).toContain('[REDACTED:IPv4 address]');
+  });
+
+  it('NEVER blocks — there is no block action on egress', () => {
+    const r = screenOutput('SSN 123-45-6789 and email a@b.com and IP 10.0.0.1');
+    // The contract exposes no `action` field at all; the only outcomes
+    // are redacted-or-not. This test pins that shape.
+    expect(r).toHaveProperty('redacted');
+    expect(r).not.toHaveProperty('action');
+    expect(r.output).not.toContain('123-45-6789');
+  });
+
+  it('returns clean output verbatim with redacted=false', () => {
+    const clean = 'Take one tablet each morning with food.';
+    const r = screenOutput(clean);
+    expect(r.redacted).toBe(false);
+    expect(r.output).toBe(clean);
+    expect(r.hits).toEqual([]);
+  });
+
+  it('handles empty string', () => {
+    const r = screenOutput('');
+    expect(r.redacted).toBe(false);
+    expect(r.output).toBe('');
+  });
+
+  it('redacts a hallucinated PERSON name (the actual Layer 2 threat model)', () => {
+    // Layer 1 already blocked participant-supplied PII at ingress, so
+    // the model never saw it. What Layer 2 defends against is the model
+    // EMITTING a plausible identity of its own accord.
+    const r = screenOutput('I checked with Dr. Sarah Whitfield about your dosage.');
+    expect(r.redacted).toBe(true);
+    expect(r.output).toContain('[REDACTED:Person name]');
+  });
+});

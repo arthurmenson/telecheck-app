@@ -124,7 +124,11 @@ import type { DbTransaction } from '../../../../lib/db.js';
 import { asTenantId } from '../../../../lib/glossary.js';
 import { buildIdempotencyCtx, type IdempotencyCtx } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
-import { PARTICIPANT_BLOCK_MESSAGE, screenInput } from '../../../../lib/pii-screener/index.js';
+import {
+  PARTICIPANT_BLOCK_MESSAGE,
+  screenInput,
+  screenOutput,
+} from '../../../../lib/pii-screener/index.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { emitMode1ChatResponseAudit } from '../../audit.js';
@@ -753,11 +757,45 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
           temperature: 0,
           tenant_id: ctx.tenantId,
         });
-        responseText = result.text;
+        // -------------------------------------------------------------
+        // Layer 2 egress screener (Sprint 1.1d).
+        //
+        // The model's OWN output is screened here. This is not about the
+        // participant's PII round-tripping — Layer 1 already blocked
+        // that at ingress (route class `ai_bound` blocks on ANY hit, so
+        // the provider never saw it). This defends against the model
+        // EMITTING PII-shaped text of its own accord: a hallucinated
+        // name, a plausible-looking SSN, an invented email. Such output
+        // is not real PII, but it is indistinguishable from real PII to
+        // the participant reading it, and if it happens to coincide
+        // with a real identifier it is a genuine hazard.
+        //
+        // Layer 2 is REDACT-ONLY — never block. By this point the LLM
+        // call has already happened; failing the turn would cost the
+        // participant their message while leaving upstream state
+        // intact. Redaction preserves the workflow and the evidence.
+        //
+        // The REDACTED text is what both surfaces receive: the response
+        // to the participant AND the persisted assistant_message. They
+        // must not diverge — a reader of the stored turn should see
+        // exactly what the participant saw.
+        // -------------------------------------------------------------
+        const egress = screenOutput(result.text);
+        if (egress.redacted) {
+          req.log.warn(
+            {
+              turn_id: turnId,
+              pii_egress_hit_pattern_ids: egress.hits.map((h) => h.patternId),
+              pii_egress_hit_count: egress.hits.length,
+            },
+            'mode1_chat: Layer 2 egress screener REDACTED model-generated output',
+          );
+        }
+        responseText = egress.output;
         providerUnavailable = false;
         aiModelVersion = `${result.provider_name}:${result.model_version}`;
         turnOutcome = 'completed';
-        persistedAssistantMessage = result.text;
+        persistedAssistantMessage = egress.output;
         persistedProvider = result.provider_name;
         persistedModelId = result.model;
         promptTokenCount = result.usage.input_tokens;
