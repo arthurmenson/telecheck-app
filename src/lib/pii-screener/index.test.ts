@@ -420,6 +420,12 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         ['runtime-variable key', `const k = 'fetch'; globalThis[k]('https://x');`],
         ['Object.getOwnPropertyDescriptor global', `Object.getOwnPropertyDescriptor(globalThis, 'fetch').value('https://x');`],
         ['Object.entries global', `Object.entries(globalThis).find(([k]) => k === 'fetch');`],
+        // R7 finding — alias-tracking bypasses:
+        ['aliased-global bracket then invocation', `const g = globalThis; g['fetch']('https://x');`],
+        ['aliased Reflect', `const r = Reflect; r.get(globalThis, 'fetch')('https://x');`],
+        ['aliased Object', `const o = Object; o.getOwnPropertyDescriptor(globalThis, 'fetch').value('https://x');`],
+        ['destructured from globalThis', `const { fetch: f } = globalThis; f('https://x');`],
+        ['destructured Reflect', `const { get } = Reflect; get(globalThis, 'fetch')('https://x');`],
       ];
 
       const failedToDetect: string[] = [];
@@ -482,6 +488,42 @@ function checkSafety(
 ): Array<{ file: string; kind: string; detail: string }> {
   const violations: Array<{ file: string; kind: string; detail: string }> = [];
   const sf = ts.createSourceFile(fileLabel, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+
+  // Pre-pass: collect identifiers that alias a global-like receiver.
+  // Handles: `const g = globalThis` → g is tainted global-like.
+  // Also handles: `const g = self.globalThis` → g is tainted.
+  // Destructuring alias: `const { fetch } = globalThis` → any use of
+  // `fetch` as a call target originated from globalThis; we treat that
+  // as a violation at the declaration site rather than tracking the
+  // destructured name (see class 3 below).
+  const globalAliases = new Set<string>();
+  const preVisit = (node: import('typescript').Node): void => {
+    if (ts.isVariableDeclaration(node) && node.initializer && ts.isIdentifier(node.name)) {
+      const root = resolveRootReceiver(node.initializer, ts);
+      if (root && GLOBAL_LIKE_RECEIVERS.includes(root)) {
+        globalAliases.add(node.name.text);
+      }
+    }
+    // Destructured alias — flag at declaration: `const { fetch } = globalThis;`
+    if (ts.isVariableDeclaration(node)
+      && node.initializer
+      && (ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name))) {
+      const root = resolveRootReceiver(node.initializer, ts);
+      if (root && GLOBAL_LIKE_RECEIVERS.includes(root)) {
+        violations.push({
+          file: fileLabel,
+          kind: 'destructured-from-global-like',
+          detail: `destructure from ${root}`,
+        });
+      }
+    }
+    ts.forEachChild(node, preVisit);
+  };
+  preVisit(sf);
+
+  // globalAliases is now the tainted set. Merge into the effective
+  // global-like receiver check.
+  const effectiveGlobalLike = new Set<string>([...GLOBAL_LIKE_RECEIVERS, ...globalAliases]);
 
   const visit = (node: import('typescript').Node): void => {
     // Class (1) — imports.
@@ -553,11 +595,11 @@ function checkSafety(
     // getOwnPropertyDescriptor).
     if (ts.isElementAccessExpression(node)) {
       const root = resolveRootReceiver(node.expression, ts);
-      if (root && GLOBAL_LIKE_RECEIVERS.includes(root)) {
+      if (root && effectiveGlobalLike.has(root)) {
         violations.push({
           file: fileLabel,
           kind: 'element-access-on-global-like',
-          detail: `${root}[<key>]`,
+          detail: `${root}[<key>]${globalAliases.has(root) ? ` (alias for global-like receiver)` : ''}`,
         });
       }
     }
@@ -565,10 +607,13 @@ function checkSafety(
     // Class (2c) — Reflect.* and Object.getOwnPropertyDescriptor calls.
     // Reject any invocation of these regardless of arguments — a
     // screener has zero legitimate need for reflective global access.
-    // Applies to aliased receivers too, via resolveRootReceiver.
+    // Applies to aliased receivers too, via resolveRootReceiver +
+    // globalAliases taint set.
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const root = resolveRootReceiver(node.expression.expression, ts);
       const method = node.expression.name.text;
+      // Reflect is treated as a Reflect-alias if the identifier itself
+      // is Reflect OR is an alias whose initializer resolved to Reflect.
       if (root === 'Reflect'
         && ['get', 'apply', 'construct', 'has', 'ownKeys', 'getPrototypeOf'].includes(method)) {
         violations.push({
@@ -581,11 +626,12 @@ function checkSafety(
         && ['getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'getOwnPropertyNames', 'entries', 'values']
           .includes(method)) {
         // Object.entries / values / etc. on globalThis could enumerate
-        // + reach globals. Flag when receiver is globalThis-like.
+        // + reach globals. Flag when receiver is globalThis-like (or
+        // aliased-to-globalThis-like via the pre-pass taint set).
         const firstArg = node.arguments[0];
         if (firstArg) {
           const argRoot = resolveRootReceiver(firstArg, ts);
-          if (argRoot && GLOBAL_LIKE_RECEIVERS.includes(argRoot)) {
+          if (argRoot && effectiveGlobalLike.has(argRoot)) {
             violations.push({
               file: fileLabel,
               kind: 'object-reflection-on-global-like',
