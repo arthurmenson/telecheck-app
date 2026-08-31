@@ -90,10 +90,17 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
     id: 'us_ssn',
     label: 'US Social Security Number',
     confidence: 'high_confidence',
-    // Standard SSN format XXX-XX-XXXX with word boundaries to avoid
-    // matching inside longer digit sequences. Also matches without
-    // hyphens if surrounded by non-digit boundaries.
-    regex: /\b\d{3}-\d{2}-\d{4}\b/g,
+    // Both forms: XXX-XX-XXXX (hyphenated) OR XXXXXXXXX (9 contiguous
+    // digits — the "compact" SSN form). Lookaround-bounded on digits
+    // to prevent matching inside longer digit sequences (e.g., 16-digit
+    // card numbers or MRN sequences).
+    //
+    // Codex R1 finding (2026-08-31): the prior `\b\d{3}-\d{2}-\d{4}\b`
+    // did NOT match the compact 9-digit form despite the comment
+    // claiming it did, so `123456789` was being classified as the
+    // low-confidence `us_passport` pattern instead — a decision-matrix
+    // violation on internal routes (would redact instead of block).
+    regex: /(?<!\d)(?:\d{3}-\d{2}-\d{4}|\d{9})(?!\d)/g,
   },
   {
     id: 'ghana_card',
@@ -105,13 +112,21 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
   },
   {
     id: 'us_passport',
-    label: 'US Passport number',
+    label: 'US Passport number (context-bound)',
     confidence: 'low_confidence',
-    // 9 alphanumeric chars, often mixed. Low confidence because a bare
-    // 9-char alphanumeric could be many things; we require an
-    // adjacent "passport" word context in the calling code if we want
-    // to raise confidence.
-    regex: /\b[A-Z0-9]{9}\b/g,
+    // 9 alphanumeric chars ADJACENT to a "passport" keyword (case-
+    // insensitive). Codex R1 finding (2026-08-31): the prior
+    // context-free `\b[A-Z0-9]{9}\b` matched any 9-char uppercase word
+    // — `SYNTHETIC`, `EMERGENCY`, `EDUCATION` — over-blocking on
+    // AI-bound routes and false-positive on internal.
+    //
+    // Contextual form: `passport(?: (?:no\.?|number|#))?\s*[:#]?\s*
+    // [A-Z0-9]{9}` — matches "passport 123456789", "passport no. AB1234567",
+    // "passport #: ABCDE1234", etc. When the 9-char string appears
+    // WITHOUT the passport-context word, Sprint 1.1b's local NER is the
+    // authoritative detector (this narrow regex is a fast-path for the
+    // labeled case).
+    regex: /\bpassport(?:\s+(?:no\.?|number|#))?\s*[:#]?\s*([A-Z0-9]{9})\b/gi,
   },
 
   // ---------------------------------------------------------------------
@@ -121,9 +136,18 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
     id: 'credit_card',
     label: 'Credit card number',
     confidence: 'high_confidence',
-    // 13-19 digit sequences with optional separators (spaces/hyphens).
-    // The Luhn validator below filters out arithmetic false positives.
-    regex: /\b(?:\d[ -]?){13,19}\b/g,
+    // 13-19 digit sequences with optional inter-digit separators
+    // (spaces/hyphens ONLY between digits — never trailing).
+    // Codex R1 finding (2026-08-31): the prior `\b(?:\d[ -]?){13,19}\b`
+    // put the separator inside the repeated group, greedy-including
+    // any trailing space, so `4111 1111 1111 1111 expires` matched
+    // `4111 1111 1111 1111 ` (with trailing space) — wrong boundary
+    // + broken canonical test.
+    //
+    // Fix: separators appear ONLY between digits; final char must be a
+    // digit. Structure: digit, then 12-18 repetitions of
+    // [optional separator + digit].
+    regex: /(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)/g,
     validate: (match: string) => isLuhnValid(match),
   },
 
@@ -155,9 +179,17 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
     label: 'Ghana phone number',
     confidence: 'high_confidence',
     // +233 followed by 9 digits (Ghana country code + subscriber),
-    // or 0 followed by 9 digits (Ghana local format). Word boundaries
-    // matter.
-    regex: /\b(?:\+233\d{9}|0\d{9})\b/g,
+    // or 0 followed by 9 digits (Ghana local format).
+    //
+    // Codex R1 finding (2026-08-31): the prior `\b(?:\+233\d{9}|0\d{9})\b`
+    // used `\b` which does NOT match before `+` because both are
+    // non-word chars (\b is a word/non-word transition; +/space are
+    // both non-word). So the documented + tested `+233241234567` form
+    // silently produced zero hits and would pass through an AI-bound
+    // route. Fix: digit-lookaround boundaries `(?<!\d)...(?!\d)` on
+    // the digit portion — matches after any non-digit context
+    // (whitespace, punctuation, string start).
+    regex: /(?<!\d)(?:\+233\d{9}|0\d{9})(?!\d)/g,
   },
 
   // ---------------------------------------------------------------------
