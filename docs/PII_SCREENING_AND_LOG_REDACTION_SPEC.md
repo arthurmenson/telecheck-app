@@ -140,7 +140,10 @@
 **Incident-lock file (machine-enforced incident state):**
 
 - Location: `/home/deploy/incident-logs/.incident.lock` — a JSON file created atomically by `scripts/incident-capture.sh <id>` on its FIRST byte written (before any capture work). Content: `{"incidentId": "<id>", "openedAt": "<ISO-8601>", "openedBy": "<hostname/user>"}`.
-- Cleared ONLY by `scripts/incident-clear.sh --incident-id <id> --disposition <RESOLVED|ABANDONED>` — an explicit, audited, incident-owner action. Requires manifest for `<id>` to be marked `consumed: true` OR requires `--force-abandoned` (which writes an audit event + records the reason). Clearing script is separate from purge to prevent accidental clearance during purge.
+- Cleared ONLY by `scripts/incident-clear.sh --incident-id <id> --disposition <RESOLVED|ABANDONED>` — an explicit, audited, incident-owner action.
+  - `--disposition RESOLVED` requires: (a) matching `env.purge.executed{incidentId=<id>}` audit event exists in `audit_records` (proves purge ran), AND (b) manifest for `<id>` currently has `consumed: false` (proves not double-consumed). On success, atomically writes manifest.consumed=true + removes the lock.
+  - `--disposition ABANDONED --force-abandoned <reason>` writes an `env.incident.abandoned{incidentId, reason}` audit event, then atomically writes manifest.consumed=true + removes the lock. Used when RCA determines purge was not appropriate.
+  - Clearing script is separate from purge to prevent accidental clearance during purge.
 - The presence of the lock file signals: an incident is active; routine-reset MUST refuse; only incident-mode purge with the matching `<id>` is permitted.
 
 **Two invocation modes (mutually exclusive; script errors if both flags are set or neither):**
@@ -155,7 +158,9 @@
 - **Manifest identity:** manifest's `incidentId` field must exactly match the `--incident-id` argument. Mismatch → refuse.
 - **Manifest inventory:** manifest must list ≥1 captured artifact with paths under `/home/deploy/incident-logs/<id>-*.age`. Empty inventory → refuse.
 - **Artifact structural verification:** for each listed artifact, script re-runs the same structural check as the capture script (file exists + non-empty + age-header valid + size ≥ recorded plaintext byte count). Any check fail → refuse.
-- **Manifest single-use:** on successful purge, script writes `"consumed": true` back to the manifest. Re-invoking the purge with the same incident-id → refuse. Prevents accidental double-purge on the same incident.
+- **Manifest single-use enforced via audit-event attestation:** env-purge NEVER writes to the manifest. Instead, on successful purge it emits an `env.purge.executed{incidentId, purgedAt, actor}` audit event (append-only, I-003). Re-invoking env-purge with the same incident-id → refuse (script queries audit_records; if event exists for this incidentId, purge is already attested and re-execution is blocked). Prevents accidental double-purge on the same incident. Only `incident-clear.sh --disposition RESOLVED` transitions the manifest to `consumed: true` (verifying the audit event first).
+
+**Conformance test required:** the CI/test suite must include an assertion that env-purge (both modes) leaves the entire `/home/deploy/incident-logs/` tree byte-for-byte unchanged. Diff-based comparison; any change is a purge-script defect.
 
 The purge script itself performs NO raw evidence capture. Any forensic artifact must have been produced by the single fail-closed capture path documented in `PILOT_1_INCIDENT_RESPONSE_MINI_RUNBOOK.md` §Capture procedure BEFORE this script runs.
 
