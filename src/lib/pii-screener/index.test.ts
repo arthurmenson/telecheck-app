@@ -426,6 +426,12 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         ['aliased Object', `const o = Object; o.getOwnPropertyDescriptor(globalThis, 'fetch').value('https://x');`],
         ['destructured from globalThis', `const { fetch: f } = globalThis; f('https://x');`],
         ['destructured Reflect', `const { get } = Reflect; get(globalThis, 'fetch')('https://x');`],
+        // R8 finding — transitive-taint bypasses:
+        ['two-hop global alias', `const g = globalThis; const h = g; h['fetch']('https://x');`],
+        ['three-hop global alias', `const g = globalThis; const h = g; const i = h; i['fetch']('https://x');`],
+        ['assignment-mediated alias', `let g; g = globalThis; g['fetch']('https://x');`],
+        ['multi-hop Reflect alias', `const r = Reflect; const r2 = r; r2.get(globalThis, 'fetch')('https://x');`],
+        ['multi-hop Object alias', `const o = Object; const o2 = o; o2.getOwnPropertyDescriptor(globalThis, 'fetch');`],
       ];
 
       const failedToDetect: string[] = [];
@@ -489,41 +495,114 @@ function checkSafety(
   const violations: Array<{ file: string; kind: string; detail: string }> = [];
   const sf = ts.createSourceFile(fileLabel, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
 
-  // Pre-pass: collect identifiers that alias a global-like receiver.
-  // Handles: `const g = globalThis` → g is tainted global-like.
-  // Also handles: `const g = self.globalThis` → g is tainted.
-  // Destructuring alias: `const { fetch } = globalThis` → any use of
-  // `fetch` as a call target originated from globalThis; we treat that
-  // as a violation at the declaration site rather than tracking the
-  // destructured name (see class 3 below).
-  const globalAliases = new Set<string>();
-  const preVisit = (node: import('typescript').Node): void => {
-    if (ts.isVariableDeclaration(node) && node.initializer && ts.isIdentifier(node.name)) {
-      const root = resolveRootReceiver(node.initializer, ts);
-      if (root && GLOBAL_LIKE_RECEIVERS.includes(root)) {
-        globalAliases.add(node.name.text);
-      }
-    }
-    // Destructured alias — flag at declaration: `const { fetch } = globalThis;`
-    if (ts.isVariableDeclaration(node)
-      && node.initializer
-      && (ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name))) {
-      const root = resolveRootReceiver(node.initializer, ts);
-      if (root && GLOBAL_LIKE_RECEIVERS.includes(root)) {
-        violations.push({
-          file: fileLabel,
-          kind: 'destructured-from-global-like',
-          detail: `destructure from ${root}`,
-        });
-      }
-    }
-    ts.forEachChild(node, preVisit);
-  };
-  preVisit(sf);
+  // Pre-pass: collect identifier aliases by CATEGORY of tainted origin.
+  // Three categories, tracked separately because their downstream
+  // checks differ:
+  //   globalRootAliases → aliases of globalThis / self / window / global
+  //   reflectAliases    → aliases of Reflect (or aliases of aliases)
+  //   objectAliases     → aliases of Object (or aliases of aliases)
+  //
+  // Fixed-point iteration: keep re-walking declarations until no set
+  // grows. Handles multi-hop aliases (const g = globalThis; const h = g;
+  // const i = h; ...). Bounded to `MAX_HOPS` iterations to guard against
+  // pathological source.
+  const globalRootAliases = new Set<string>();
+  const reflectAliases = new Set<string>();
+  const objectAliases = new Set<string>();
+  const GLOBAL_ROOTS: readonly string[] = ['globalThis', 'self', 'window', 'global'];
+  const MAX_HOPS = 32;
 
-  // globalAliases is now the tainted set. Merge into the effective
-  // global-like receiver check.
-  const effectiveGlobalLike = new Set<string>([...GLOBAL_LIKE_RECEIVERS, ...globalAliases]);
+  const collectDeclarations = (): boolean => {
+    let grew = false;
+    const walk = (node: import('typescript').Node): void => {
+      // Identifier binding: `const alias = <expr>`
+      if (ts.isVariableDeclaration(node) && node.initializer && ts.isIdentifier(node.name)) {
+        const root = resolveRootReceiver(node.initializer, ts);
+        if (root) {
+          const currentGlobalSet = new Set<string>([...GLOBAL_ROOTS, ...globalRootAliases]);
+          const currentReflectSet = new Set<string>(['Reflect', ...reflectAliases]);
+          const currentObjectSet = new Set<string>(['Object', ...objectAliases]);
+          if (currentGlobalSet.has(root) && !globalRootAliases.has(node.name.text)) {
+            globalRootAliases.add(node.name.text);
+            grew = true;
+          } else if (currentReflectSet.has(root) && !reflectAliases.has(node.name.text)) {
+            reflectAliases.add(node.name.text);
+            grew = true;
+          } else if (currentObjectSet.has(root) && !objectAliases.has(node.name.text)) {
+            objectAliases.add(node.name.text);
+            grew = true;
+          }
+        }
+      }
+      // Destructuring binding: `const { fetch } = globalThis` etc. —
+      // recorded as a violation at the destructure site because the
+      // destructured names could carry the taint anywhere.
+      if (ts.isVariableDeclaration(node)
+        && node.initializer
+        && (ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name))) {
+        const root = resolveRootReceiver(node.initializer, ts);
+        const currentAll = new Set<string>([
+          ...GLOBAL_ROOTS, ...globalRootAliases,
+          'Reflect', ...reflectAliases,
+          'Object', ...objectAliases,
+        ]);
+        if (root && currentAll.has(root)) {
+          // Only push once per destructure decl (dedupe on line-start).
+          const detail = `destructure from ${root}`;
+          const already = violations.some((v) => v.kind === 'destructured-from-global-like' && v.detail === detail);
+          if (!already) {
+            violations.push({ file: fileLabel, kind: 'destructured-from-global-like', detail });
+            grew = true;
+          }
+        }
+      }
+      // Also track assignment-mediated aliases: `let g; g = globalThis`
+      if (ts.isBinaryExpression(node)
+        && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && ts.isIdentifier(node.left)) {
+        const root = resolveRootReceiver(node.right, ts);
+        if (root) {
+          const currentGlobalSet = new Set<string>([...GLOBAL_ROOTS, ...globalRootAliases]);
+          const currentReflectSet = new Set<string>(['Reflect', ...reflectAliases]);
+          const currentObjectSet = new Set<string>(['Object', ...objectAliases]);
+          if (currentGlobalSet.has(root) && !globalRootAliases.has(node.left.text)) {
+            globalRootAliases.add(node.left.text);
+            grew = true;
+          } else if (currentReflectSet.has(root) && !reflectAliases.has(node.left.text)) {
+            reflectAliases.add(node.left.text);
+            grew = true;
+          } else if (currentObjectSet.has(root) && !objectAliases.has(node.left.text)) {
+            objectAliases.add(node.left.text);
+            grew = true;
+          }
+        }
+      }
+      ts.forEachChild(node, walk);
+    };
+    walk(sf);
+    return grew;
+  };
+
+  // Fixed-point iteration until no set grows (multi-hop aliases).
+  let hop = 0;
+  while (collectDeclarations() && hop < MAX_HOPS) {
+    hop++;
+  }
+
+  // Effective sets for downstream checks.
+  const effectiveGlobalLikeReceivers = new Set<string>([
+    ...GLOBAL_ROOTS, ...globalRootAliases,
+    'Reflect', ...reflectAliases,
+    'Object', ...objectAliases,
+  ]);
+  const effectiveReflectReceivers = new Set<string>(['Reflect', ...reflectAliases]);
+  const effectiveObjectReceivers = new Set<string>(['Object', ...objectAliases]);
+  // Backwards-compat: previously used `globalAliases` name is retained
+  // for the receiver-detail annotation logic below.
+  const globalAliases = new Set<string>([
+    ...globalRootAliases, ...reflectAliases, ...objectAliases,
+  ]);
+  const effectiveGlobalLike = effectiveGlobalLikeReceivers;
 
   const visit = (node: import('typescript').Node): void => {
     // Class (1) — imports.
@@ -613,16 +692,19 @@ function checkSafety(
       const root = resolveRootReceiver(node.expression.expression, ts);
       const method = node.expression.name.text;
       // Reflect is treated as a Reflect-alias if the identifier itself
-      // is Reflect OR is an alias whose initializer resolved to Reflect.
-      if (root === 'Reflect'
+      // is Reflect OR is an alias whose initializer resolved to Reflect
+      // (transitively via the pre-pass fixed-point taint set).
+      if (root
+        && effectiveReflectReceivers.has(root)
         && ['get', 'apply', 'construct', 'has', 'ownKeys', 'getPrototypeOf'].includes(method)) {
         violations.push({
           file: fileLabel,
           kind: 'reflect-call',
-          detail: `Reflect.${method}(...)`,
+          detail: `${root}.${method}(...)${reflectAliases.has(root) ? ` (Reflect alias)` : ''}`,
         });
       }
-      if (root === 'Object'
+      if (root
+        && effectiveObjectReceivers.has(root)
         && ['getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'getOwnPropertyNames', 'entries', 'values']
           .includes(method)) {
         // Object.entries / values / etc. on globalThis could enumerate
@@ -655,14 +737,12 @@ function checkSafety(
  * Includes globalThis / self / window / global (the environment root)
  * plus Reflect / Object (reflection instruments used to reach the root).
  */
-const GLOBAL_LIKE_RECEIVERS: readonly string[] = [
-  'globalThis',
-  'self',
-  'window',
-  'global',
-  'Reflect',
-  'Object',
-];
+// Note: the canonical global-like receiver set (globalThis, self, window,
+// global, Reflect, Object) is inlined inside checkSafety() as GLOBAL_ROOTS
+// (for element-access) plus the literal 'Reflect' + 'Object' bases for
+// reflection-call guards. Alias-tracking taint sets extend those at
+// runtime. This comment is the design anchor referenced from checkSafety()
+// so future maintainers know where to update the canonical set.
 
 /**
  * Walk an expression back to its root identifier, following:
