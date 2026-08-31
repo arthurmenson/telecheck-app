@@ -175,16 +175,21 @@ This specification defines POLICY:
 
 The **FK-graph resolution** (what SQL operation on which tables in which order) is the responsibility of the Sprint 1.3 implementation PR, which:
 1. Enumerates every table in migrations 000–HEAD
-2. Classifies each as `allowlist` (participant PHI-ish) or `preserved` (fixture / immutable / tenant baseline)
+2. Classifies each as one of the three: **`allowlist`** (participant-only; TRUNCATE) / **`preserved`** (never touched) / **`scoped-delete`** (mixed baseline + participant; DELETE WHERE clause preserves baseline rows)
 3. Models the FK edges between classifications
-4. **Prohibits `TRUNCATE ... CASCADE` where CASCADE would reach a preserved table** — instead uses scoped `DELETE` with an explicit dependency plan, or reclassifies participant-bound tables that hang off preserved parents (e.g., `forms_snapshot` may reference `forms_submission`; if `forms_snapshot` is participant-scoped it moves to allowlist)
-5. For `accounts` and other tables that mix baseline operators + participants, uses scoped `DELETE` that preserves baseline rows (operator accounts, tenant-service accounts) while removing participant rows
-6. Produces the CI test that verifies (a) schema-drift classification completeness, (b) canary purge behavior across allowlist + preserved, (c) **no FK edge crosses from preserved-scope evidence into truncated-scope data** (or, if intentional, the edge is documented + tested for correct scoped-DELETE handling)
+4. **Prohibits `TRUNCATE ... CASCADE` where CASCADE would reach a preserved table** — instead uses `scoped-delete` for the parent + reclassifies participant-bound child tables (`forms_snapshot` referencing `forms_submission`) or moves the parent to `scoped-delete` with a WHERE predicate that removes only participant rows
+5. **Mixed-baseline tables (`accounts` and any table that persists both operators + participants) MUST be classified `scoped-delete`, NEVER `allowlist`.** Truncating `accounts` would erase operator + tenant-service accounts + admin identities — a baseline-loss defect. The scoped-delete predicate for `accounts` removes rows where the role is participant-scoped (e.g., `WHERE role = 'patient' AND created_at > '<pilot-1-window-start>'`) — Sprint 1.3 PR defines the exact predicate against actual schema.
+6. Produces the CI test suite that verifies (a) schema-drift classification completeness, (b) canary purge behavior across all three classifications, (c) no FK edge crosses from preserved-scope evidence into truncated-scope data (or, if intentional, is documented + tested for correct scoped-DELETE handling), (d) mixed-baseline-table safeguard: known mixed-baseline tables (`accounts` at minimum) MUST be classified `scoped-delete`; CI test rejects any classification of `accounts` as `allowlist`.
 
 Illustrative classification below reflects a first-pass reading of migrations 000–079. Sprint 1.3 PR revises it against actual FK graph and adds the operational plan (TRUNCATE vs scoped DELETE) per table.
 
-**Illustrative allowlist (verified against migrations 000–079 as of 2026-08-30; Sprint 1.3 PR must re-verify against migrations at merge time):**
-- **Identity + auth:** `accounts`, `sessions`, `otp_challenges`, `auth_devices`, `account_pin_credentials`, `email_passcodes`
+**Illustrative classification (verified against migrations 000–079 as of 2026-08-30; Sprint 1.3 PR must re-verify against migrations at merge time):**
+
+**Classification `scoped-delete` (mixed baseline + participant — DELETE WHERE preserves baseline):**
+- `accounts` — DELETE WHERE role in (participant roles); preserves operator + tenant-service + admin accounts. Sprint 1.3 PR authors the exact predicate against schema. MUST NOT be `allowlist`.
+
+**Classification `allowlist` (participant-only — TRUNCATE):**
+- **Identity + auth (participant-only child tables):** `sessions`, `otp_challenges`, `auth_devices`, `account_pin_credentials`, `email_passcodes` — these have FK to `accounts`; dependency order: TRUNCATE these BEFORE the `accounts` scoped-DELETE (or handle via DELETE-then-DELETE with correct ordering)
 - **Consent (participant records only; schema `consent_versions` preserved):** `consent`, `delegations`, `delegation_scopes`
 - **Forms + intake:** `forms_submission`, `forms_resume_state`, `consult_intake_submission`
 - **Consults + clinical:** `consult`, `consult_lifecycle_transition`, `consult_review_claim`, `consult_clinical_summary`, `consult_clinician_decision`, `consult_follow_up_message`, `consults`, `consult_events` (dual naming from schema evolution — both preserved in the list until reconciliation)
