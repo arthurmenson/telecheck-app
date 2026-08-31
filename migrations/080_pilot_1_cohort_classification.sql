@@ -24,17 +24,30 @@
 --   'baseline'     — legitimate baseline (any account_type); preserved
 --   'unclassified' — data-model defect; purge REFUSES until remediated
 --
--- Adding as NOT NULL requires a backfill for existing rows. Existing
--- (pre-Pilot-1) rows are, by definition, NOT Pilot 1 participants — they
--- are baseline artifacts of prior slice implementation testing. Backfill
--- assigns 'baseline' to every existing row.
+-- Adding as NOT NULL requires a backfill for existing rows. The ratified
+-- contract (PII spec §Three-state cohort classification) requires
+-- OPERATOR-REVIEWED classification for pre-existing patient/delegate rows,
+-- NOT auto-assumption. Backfill therefore SPLITS by account_type:
 --
--- This backfill is safe on staging because:
---   1. Pilot 1 has not yet run — no participant rows exist yet
---   2. Pilot-1-baseline-seed.sql (separate) will insert new participant
---      rows atomically with cohort_classification = 'participant'
---   3. The staging tenant / operator / seed accounts that pre-exist are
---      correctly baseline
+--   - Operator + admin + service account types (clinician, tenant_admin,
+--     platform_admin) are unambiguously baseline; auto-classify.
+--   - Patient + delegate rows carry potential participant-scope data and
+--     MUST be operator-reviewed; auto-classify as 'unclassified' — which
+--     forces the audited scripts/pilot-1-marker-remediation.sh path
+--     BEFORE Day-0 authorization (verify-pilot-1-baseline.sh will refuse
+--     to green until every one is classified explicitly by the operator).
+--
+-- This preserves the ratified contract even on staging where the operator
+-- assumed no participants pre-existed — if any patient/delegate row IS
+-- purge-scoped data, forcing operator review catches it. If none are
+-- participants, remediation is a one-time bulk-classify to baseline via
+-- the audited path (each classification emits a pilot_1.cohort_classification
+-- audit event).
+--
+-- Codex R1 finding (2026-08-31): the initial version blanket-backfilled
+-- to 'baseline' — a silent violation of the ratified contract's
+-- operator-review requirement. Fixed by the split-by-account_type
+-- backfill below.
 --
 -- ---------------------------------------------------------------------------
 -- Spec references
@@ -62,34 +75,53 @@
 BEGIN;
 
 -- ---------------------------------------------------------------------------
--- Step 1 — Add the column with a backfill DEFAULT
+-- Step 1 — Add the column as NULLABLE (backfill happens in step 2)
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE accounts
-    ADD COLUMN cohort_classification TEXT NOT NULL DEFAULT 'baseline'
+    ADD COLUMN cohort_classification TEXT
         CHECK (cohort_classification IN ('participant', 'baseline', 'unclassified'));
 
--- The DEFAULT populates every existing row with 'baseline'. This is safe
--- per §Design above: no Pilot 1 participants exist yet at migration time.
+-- ---------------------------------------------------------------------------
+-- Step 2 — Split-by-account_type backfill per Codex R1 finding
+-- ---------------------------------------------------------------------------
+--
+-- Clinicians, tenant admins, platform admins, and service accounts are
+-- unambiguously baseline; auto-classify. Patient + delegate rows carry
+-- potential participant-scope data and MUST be operator-reviewed via
+-- pilot-1-marker-remediation.sh — auto-classify as 'unclassified' to
+-- force the audited path.
+--
+-- Note: migration 012 (account_type CHECK) currently only allows
+-- 'patient' and 'delegate'; migrations 027/028 expand to include
+-- clinician/tenant_admin/platform_admin. This CASE handles both
+-- worlds — any account_type NOT in the operator-baseline set falls
+-- through to 'unclassified' (fail-closed if a new account_type value
+-- is introduced without updating this migration).
+
+UPDATE accounts
+SET cohort_classification = CASE
+    WHEN account_type IN ('clinician', 'tenant_admin', 'platform_admin', 'service')
+        THEN 'baseline'
+    ELSE
+        'unclassified'
+END
+WHERE cohort_classification IS NULL;
 
 -- ---------------------------------------------------------------------------
--- Step 2 — Drop the DEFAULT so future INSERTs must specify the value
+-- Step 3 — Add NOT NULL constraint now that every row has a value
 -- ---------------------------------------------------------------------------
 --
--- Retaining the DEFAULT would risk silent baseline classification of
--- new Pilot 1 participants if a provisioning code path forgot to
--- specify cohort_classification. Fail-closed: every INSERT into
--- accounts MUST specify cohort_classification explicitly, or fail at
--- the NOT NULL constraint.
---
--- The pilot-1-baseline-seed.sql + participant-kit generator (Sprint
--- 1.3) will set the column explicitly for every provisioned row.
+-- No DEFAULT is set — every future INSERT MUST specify
+-- cohort_classification explicitly. Provisioning code paths that
+-- forget the field fail loudly at the NOT NULL constraint rather
+-- than silently baseline-classifying.
 
 ALTER TABLE accounts
-    ALTER COLUMN cohort_classification DROP DEFAULT;
+    ALTER COLUMN cohort_classification SET NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- Step 3 — Index for the pilot-1-env-purge scoped-DELETE query
+-- Step 4 — Index for the pilot-1-env-purge scoped-DELETE query
 -- ---------------------------------------------------------------------------
 --
 -- The scoped DELETE runs during Pilot 1 env-purge (both routine-reset
@@ -111,7 +143,7 @@ CREATE INDEX IF NOT EXISTS idx_accounts_cohort_unclassified
     WHERE cohort_classification = 'unclassified';
 
 -- ---------------------------------------------------------------------------
--- Step 4 — Column + constraint comments (self-documenting schema)
+-- Step 5 — Column + constraint comments (self-documenting schema)
 -- ---------------------------------------------------------------------------
 
 COMMENT ON COLUMN accounts.cohort_classification IS
@@ -130,6 +162,8 @@ COMMENT ON COLUMN accounts.cohort_classification IS
 -- ---------------------------------------------------------------------------
 
 DO $$
+DECLARE
+    unclassified_patient_delegate_count INT;
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
@@ -145,6 +179,27 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'migration 080 failed: cohort_classification is NULL for at least one existing row';
     END IF;
+
+    -- Every patient/delegate row must be either 'participant' (impossible
+    -- at migration time — no INSERTs happened yet) or 'unclassified'
+    -- (per the operator-review requirement from PII spec + Codex R1).
+    -- If any patient/delegate row is 'baseline' at migration exit, the
+    -- backfill violated the ratified contract.
+    SELECT COUNT(*)
+    INTO unclassified_patient_delegate_count
+    FROM accounts
+    WHERE account_type IN ('patient', 'delegate')
+      AND cohort_classification = 'baseline';
+
+    IF unclassified_patient_delegate_count > 0 THEN
+        RAISE EXCEPTION 'migration 080 failed: % patient/delegate row(s) auto-classified as baseline; contract requires operator review via pilot-1-marker-remediation.sh',
+            unclassified_patient_delegate_count;
+    END IF;
+
+    RAISE NOTICE 'migration 080 verify: patient/delegate rows requiring operator review = %',
+        (SELECT COUNT(*) FROM accounts
+         WHERE account_type IN ('patient', 'delegate')
+           AND cohort_classification = 'unclassified');
 END;
 $$;
 
