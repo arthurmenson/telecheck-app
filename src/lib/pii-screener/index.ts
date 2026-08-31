@@ -35,6 +35,7 @@
  *   - docs/PILOT_1_COVERAGE_MATRIX.md scenarios A1-A6, A6b (adversarial coverage)
  */
 
+import { classifyEntities } from './ner.js';
 import { PII_PATTERNS, type PiiPattern } from './patterns.js';
 
 /**
@@ -149,6 +150,7 @@ export function screenInput(text: string, routeClass: RouteClass): ScreeningResu
   }
 
   const hits: PiiHit[] = [];
+  // Layer 1a — regex fast-path.
   for (const pattern of PII_PATTERNS) {
     // Reset regex lastIndex to allow reuse (regexes in PII_PATTERNS use /g flag).
     pattern.regex.lastIndex = 0;
@@ -169,6 +171,21 @@ export function screenInput(text: string, routeClass: RouteClass): ScreeningResu
         end: start + matchedText.length,
       });
     }
+  }
+
+  // Layer 1b — local NER classifier (Sprint 1.1b; wink-nlp).
+  // Runs after regex so regex-matched substrings still surface as
+  // regex hits with their own labels; NER surfaces entities the regex
+  // library does not express (real names, addresses, DOBs, orgs).
+  for (const ner of classifyEntities(text)) {
+    hits.push({
+      patternId: `ner_${ner.entityType.toLowerCase()}`,
+      label: nerLabelFor(ner.entityType),
+      confidence: ner.confidence,
+      match: ner.match,
+      start: ner.start,
+      end: ner.end,
+    });
   }
 
   if (hits.length === 0) {
@@ -237,6 +254,27 @@ function applyRedactions(text: string, hits: readonly PiiHit[]): string {
   }
   chunks.push(text.slice(cursor));
   return chunks.join('');
+}
+
+/**
+ * Human-readable label for NER-detected entity types. Used by the
+ * participant-visible message + inline-redact placeholder.
+ */
+function nerLabelFor(entityType: string): string {
+  switch (entityType) {
+    case 'PERSON':
+      return 'Person name';
+    case 'GPE':
+      return 'Geopolitical entity (country / city / state)';
+    case 'LOCATION':
+      return 'Location';
+    case 'DATE':
+      return 'Date';
+    case 'ORG':
+      return 'Organization';
+    default:
+      return `Named entity (${entityType})`;
+  }
 }
 
 /**
