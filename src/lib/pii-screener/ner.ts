@@ -145,9 +145,6 @@ export function classifyEntities(text: string): readonly NerHit[] {
   const nlp = getNlp();
   const doc = nlp.readDoc(text);
   const hits: NerHit[] = [];
-  // Cursor advances after each matched entity so a repeated entity text
-  // resolves to its next occurrence in the source, not the first.
-  let cursor = 0;
   doc.entities().each((entity: ItemEntity) => {
     const detail = entity.out(nlp.its.detail) as Detail;
     // wink-nlp entity types are typically lowercased; normalize.
@@ -158,14 +155,30 @@ export function classifyEntities(text: string): readonly NerHit[] {
     }
     const value = String(entity.out(nlp.its.value));
     if (value.length === 0) return;
-    // Locate this entity's text at or after the cursor. wink-nlp emits
-    // entities in appearance order; if indexOf returns -1 (misalignment
-    // due to normalization by wink-nlp), skip this entity rather than
-    // record a wrong offset.
-    const start = text.indexOf(value, cursor);
-    if (start < 0) return;
-    const end = start + value.length;
-    cursor = end;
+    // Positional anchoring via wink-nlp's canonical span metadata.
+    // The entity's span is [tokenStartIdx, tokenEndIdx] (inclusive).
+    // Each token exposes ITS char-offset via its.span → [startChar,
+    // endChar] (endChar exclusive per wink-nlp conventions).
+    // Composite entity char-span = [firstToken.startChar, lastToken.endChar].
+    const tokenSpan = entity.out(nlp.its.span);
+    if (!Array.isArray(tokenSpan) || tokenSpan.length < 2) return;
+    const [tokenStartIdx, tokenEndIdx] = tokenSpan as [number, number];
+    const tokens = doc.tokens();
+    const startToken = tokens.itemAt(tokenStartIdx);
+    const endToken = tokens.itemAt(tokenEndIdx);
+    if (!startToken || !endToken) return;
+    const startSpan = startToken.out(nlp.its.span);
+    const endSpan = endToken.out(nlp.its.span);
+    if (!Array.isArray(startSpan) || !Array.isArray(endSpan)) return;
+    const start = Number(startSpan[0]);
+    const end = Number(endSpan[1]);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+    if (start < 0 || end > text.length || start >= end) return;
+    // Codex R4 verification requirement: the computed slice MUST equal
+    // the entity's value. If not, wink-nlp's positional metadata is
+    // ambiguous under this model version; fail closed for this entity
+    // (skip) rather than emit an offset that could misredact.
+    if (text.slice(start, end) !== value) return;
     const confidence = ENTITY_CONFIDENCE[entityType] ?? 'low_confidence';
     hits.push({
       entityType,
