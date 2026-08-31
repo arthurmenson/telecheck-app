@@ -192,26 +192,59 @@ const DecisionBodySchema = z.object({
 });
 
 /**
- * Recursively collect every string value inside the (deliberately
- * forward-extensible) `decision_payload` object so the Layer 1 screener
- * can inspect all of them — `review_notes`, each element of
- * `required_revisions[]`, and any field a future decision variant adds.
- *
- * Depth-bounded to guard against a pathological nested payload. Anything
- * deeper than the bound is not silently skipped: the caller treats a
- * truncated walk as a screening failure is NOT the posture here —
- * instead the bound is set high enough (16) that legitimate review
- * payloads never approach it, and JSONB nesting beyond that is itself
- * rejected by the wrapper's shape validation downstream.
+ * Maximum traversal depth for `decision_payload`. Legitimate review
+ * payloads are flat (`review_notes` string + `required_revisions`
+ * string array); 16 is far above any real shape.
  */
-function collectPayloadStrings(value: unknown, depth = 0): string[] {
-  if (depth > 16) return [];
+export const DECISION_PAYLOAD_MAX_DEPTH = 16;
+
+/**
+ * Raised when `decision_payload` nests deeper than
+ * `DECISION_PAYLOAD_MAX_DEPTH`. This FAILS CLOSED — an unscreenable
+ * payload is rejected, never admitted.
+ *
+ * Codex R1 finding (Sprint 1.1d): the first version returned `[]` at
+ * the depth bound, which silently admitted anything nested past it into
+ * append-only, purge-exempt audit storage. The accompanying comment
+ * claimed downstream wrapper shape-validation would catch it; no such
+ * validation exists — the wrapper persists `p_decision_payload` as
+ * JSONB directly.
+ */
+export class DecisionPayloadTooDeepError extends Error {
+  constructor() {
+    super(`decision_payload nests deeper than ${DECISION_PAYLOAD_MAX_DEPTH} levels`);
+    this.name = 'DecisionPayloadTooDeepError';
+  }
+}
+
+/**
+ * Recursively collect every screenable string inside the (deliberately
+ * forward-extensible) `decision_payload` — `review_notes`, each element
+ * of `required_revisions[]`, and any field a future decision variant
+ * adds.
+ *
+ * Collects **object KEYS as well as values**. Codex R1 finding: keys are
+ * caller-controlled too, so a payload shaped
+ * `{ "john.smith@example.com": "ok" }` would otherwise carry PII into
+ * the audit record entirely unscreened.
+ *
+ * Throws `DecisionPayloadTooDeepError` past the depth bound so the
+ * handler can reject rather than silently under-screen.
+ */
+export function collectPayloadStrings(value: unknown, depth = 0): string[] {
+  if (depth > DECISION_PAYLOAD_MAX_DEPTH) {
+    throw new DecisionPayloadTooDeepError();
+  }
   if (typeof value === 'string') return [value];
   if (Array.isArray(value)) {
     return value.flatMap((v) => collectPayloadStrings(v, depth + 1));
   }
   if (value !== null && typeof value === 'object') {
-    return Object.values(value).flatMap((v) => collectPayloadStrings(v, depth + 1));
+    return Object.entries(value).flatMap(([key, v]) => [
+      // The key itself is caller-controlled — screen it.
+      key,
+      ...collectPayloadStrings(v, depth + 1),
+    ]);
   }
   return [];
 }
@@ -364,12 +397,36 @@ export async function postFormsTemplateDecisionHandler(
   //   after the fact would itself violate I-003.
   //   So this route fails closed on ANY hit, high or low confidence.
   //
-  // Screening walks every string in the payload (including inside
-  // arrays) because the shape is deliberately forward-extensible —
-  // pinning it to `review_notes` alone would silently stop screening
-  // the next field someone adds.
+  // Screening walks every string in the payload — object KEYS as well
+  // as values, recursing through nested objects and arrays — because
+  // the shape is deliberately forward-extensible. Pinning it to
+  // `review_notes` alone would silently stop screening the next field
+  // someone adds, and skipping keys would admit a payload shaped
+  // `{ "john.smith@example.com": "ok" }` unscreened.
+  //
+  // A payload nested past the depth bound is REJECTED, not partially
+  // screened — an unscreenable payload must never reach append-only
+  // storage.
   // -------------------------------------------------------------------
-  for (const candidate of collectPayloadStrings(decisionPayload)) {
+  let payloadStrings: string[];
+  try {
+    payloadStrings = collectPayloadStrings(decisionPayload);
+  } catch (err) {
+    if (err instanceof DecisionPayloadTooDeepError) {
+      req.log.warn(
+        { review_id: paramsParsed.data.review_id },
+        'admin_template_decision: decision_payload exceeds screenable depth; rejecting ' +
+          'rather than admitting an unscreened payload to append-only audit storage',
+      );
+      throw req.server.httpErrors.unprocessableEntity(
+        `decision_payload nests deeper than ${DECISION_PAYLOAD_MAX_DEPTH} levels and cannot be ` +
+          'screened for personal information. Flatten the payload and retry.',
+      );
+    }
+    throw err;
+  }
+
+  for (const candidate of payloadStrings) {
     const screening = screenInput(candidate, 'audit_bound');
     if (screening.action === 'block') {
       // Log pattern ids + count ONLY — never the offending text.
