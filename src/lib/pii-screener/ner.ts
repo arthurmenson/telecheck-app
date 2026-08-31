@@ -54,7 +54,7 @@
  * is the correct posture for library API conformance. */
 
 import model from 'wink-eng-lite-web-model';
-import winkNLP, { type WinkMethods, type Detail, type ItemEntity } from 'wink-nlp';
+import winkNLP, { type WinkMethods, type Detail, type ItemEntity, type ItemToken } from 'wink-nlp';
 
 /**
  * A single NER-detected entity hit in the input, normalized to the
@@ -140,14 +140,54 @@ function getNlp(): WinkMethods {
  *       text appears twice, each hit gets its own occurrence via cursor)
  *     - independent of wink-nlp's internal token/span representation
  */
+/**
+ * Sentinel thrown when NER offset derivation fails for a surfaced
+ * entity. Per Codex R5's directive — the screener must not silently
+ * omit a detected entity because we can't compute where it is; that
+ * would leak PII into the pipeline. Instead, throw and let the caller
+ * (index.ts screenInput → route handler) treat this as a screening
+ * failure that blocks the request.
+ */
+export class NerOffsetDerivationError extends Error {
+  constructor(public readonly entityValue: string, public readonly entityType: string) {
+    super(
+      `pii-screener: could not derive character offsets for detected ${entityType} entity "${entityValue}". ` +
+      `Fail-closed per Layer 1 SAFETY discipline.`,
+    );
+    this.name = 'NerOffsetDerivationError';
+  }
+}
+
 export function classifyEntities(text: string): readonly NerHit[] {
   if (text.length === 0) return [];
   const nlp = getNlp();
   const doc = nlp.readDoc(text);
+
+  // Step 1 — deterministically reconstruct character offsets for every
+  // token by walking the token stream and accumulating (precedingSpaces
+  // + token value) length. wink-nlp's `its.precedingSpaces` returns the
+  // whitespace string that preceded each token in the source (may be
+  // empty for the first token if the source has no leading whitespace).
+  //
+  // We do NOT use `its.span` on tokens because it is documented only
+  // for documents / sentences / entities (Codex R5). Reconstruction
+  // from precedingSpaces + value is the documented deterministic path.
+  const tokens = doc.tokens();
+  const tokenCharSpans: Array<[number, number]> = [];
+  let cursor = 0;
+  tokens.each((token: ItemToken) => {
+    const preceding = String(token.out(nlp.its.precedingSpaces));
+    cursor += preceding.length;
+    const tokenValue = String(token.out(nlp.its.value));
+    const tokenStart = cursor;
+    const tokenEnd = cursor + tokenValue.length;
+    tokenCharSpans.push([tokenStart, tokenEnd]);
+    cursor = tokenEnd;
+  });
+
   const hits: NerHit[] = [];
   doc.entities().each((entity: ItemEntity) => {
     const detail = entity.out(nlp.its.detail) as Detail;
-    // wink-nlp entity types are typically lowercased; normalize.
     const rawType = detail.type ?? '';
     const entityType = String(rawType).toUpperCase();
     if (!SURFACED_ENTITY_TYPES.includes(entityType)) {
@@ -155,30 +195,34 @@ export function classifyEntities(text: string): readonly NerHit[] {
     }
     const value = String(entity.out(nlp.its.value));
     if (value.length === 0) return;
-    // Positional anchoring via wink-nlp's canonical span metadata.
-    // The entity's span is [tokenStartIdx, tokenEndIdx] (inclusive).
-    // Each token exposes ITS char-offset via its.span → [startChar,
-    // endChar] (endChar exclusive per wink-nlp conventions).
-    // Composite entity char-span = [firstToken.startChar, lastToken.endChar].
+
+    // Step 2 — resolve entity span (token indices) → char offsets via
+    // the reconstructed tokenCharSpans map. wink-nlp entity `its.span`
+    // returns [tokenStartIdx, tokenEndIdx] inclusive; documented API.
     const tokenSpan = entity.out(nlp.its.span);
-    if (!Array.isArray(tokenSpan) || tokenSpan.length < 2) return;
+    if (!Array.isArray(tokenSpan) || tokenSpan.length < 2) {
+      throw new NerOffsetDerivationError(value, entityType);
+    }
     const [tokenStartIdx, tokenEndIdx] = tokenSpan as [number, number];
-    const tokens = doc.tokens();
-    const startToken = tokens.itemAt(tokenStartIdx);
-    const endToken = tokens.itemAt(tokenEndIdx);
-    if (!startToken || !endToken) return;
-    const startSpan = startToken.out(nlp.its.span);
-    const endSpan = endToken.out(nlp.its.span);
-    if (!Array.isArray(startSpan) || !Array.isArray(endSpan)) return;
-    const start = Number(startSpan[0]);
-    const end = Number(endSpan[1]);
-    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
-    if (start < 0 || end > text.length || start >= end) return;
-    // Codex R4 verification requirement: the computed slice MUST equal
-    // the entity's value. If not, wink-nlp's positional metadata is
-    // ambiguous under this model version; fail closed for this entity
-    // (skip) rather than emit an offset that could misredact.
-    if (text.slice(start, end) !== value) return;
+    const startPair = tokenCharSpans[tokenStartIdx];
+    const endPair = tokenCharSpans[tokenEndIdx];
+    if (!startPair || !endPair) {
+      throw new NerOffsetDerivationError(value, entityType);
+    }
+    const start = startPair[0];
+    const end = endPair[1];
+    if (start < 0 || end > text.length || start >= end) {
+      throw new NerOffsetDerivationError(value, entityType);
+    }
+
+    // Step 3 — verification. The reconstructed slice MUST equal the
+    // entity's value. If not, wink-nlp's tokenization + our
+    // reconstruction disagree (e.g., due to a normalization edge case);
+    // fail closed with the same error so the caller blocks the request.
+    if (text.slice(start, end) !== value) {
+      throw new NerOffsetDerivationError(value, entityType);
+    }
+
     const confidence = ENTITY_CONFIDENCE[entityType] ?? 'low_confidence';
     hits.push({
       entityType,
