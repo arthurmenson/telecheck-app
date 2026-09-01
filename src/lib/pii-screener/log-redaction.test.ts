@@ -21,6 +21,7 @@ import { Transform, Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 
 import {
+  LOG_OVERSIZED_LINE_SENTINEL,
   createRedactingStream,
   isIdentifierKey,
   redactLogLine,
@@ -444,5 +445,66 @@ describe('createRedactingStream — chunk-boundary safety', () => {
     const out = await feed(['{"msg":"cle', 'an"}\n']);
     expect(out).toContain('clean');
     expect(out.endsWith('\n')).toBe(true);
+  });
+});
+
+describe('createRedactingStream — overflow boundary', () => {
+  const CAP = 1_048_576;
+
+  function capture(): { dest: Writable; written: string[] } {
+    const written: string[] = [];
+    const dest = new Writable({
+      write(chunk: unknown, _enc, cb): void {
+        written.push(String(chunk));
+        cb();
+      },
+    });
+    return { dest, written };
+  }
+
+  async function feed(chunks: string[]): Promise<string> {
+    const { dest, written } = capture();
+    const stream = createRedactingStream(dest);
+    for (const c of chunks) {
+      await new Promise<void>((resolve, reject) => {
+        stream.write(c, (err) => (err ? reject(err) : resolve()));
+      });
+    }
+    await new Promise<void>((resolve) => stream.end(() => resolve()));
+    await new Promise((r) => setImmediate(r));
+    return written.join('');
+  }
+
+  const CASES: Array<[string, string]> = [
+    ['email', 'real.person@example.com'],
+    ['SSN', '123-45-6789'],
+    ['card', '4111111111111111'],
+  ];
+
+  for (const [label, value] of CASES) {
+    it(`${label} is not reassembled across the overflow boundary`, async () => {
+      // An earlier version redacted and EMITTED the oversized carry,
+      // then cleared it. If the emitted portion ended mid-token and the
+      // next chunk opened with the remainder, neither fragment matched
+      // and the destination concatenated them back — making overflow a
+      // deliberate way to defeat Layer 3. The record is now dropped.
+      const half = Math.floor(value.length / 2);
+      const filler = 'x'.repeat(CAP + 10 - half);
+      const out = await feed([filler + value.slice(0, half), value.slice(half) + '\n']);
+      expect(out).not.toContain(value);
+    });
+  }
+
+  it('emits a sentinel, drops the record, and resynchronises', async () => {
+    const out = await feed([
+      'y'.repeat(CAP + 10),
+      'tail-of-dropped-record\n',
+      JSON.stringify({ msg: 'clean after resync' }) + '\n',
+    ]);
+    expect(out).toContain(LOG_OVERSIZED_LINE_SENTINEL);
+    // No part of the dropped record reaches the destination…
+    expect(out).not.toContain('tail-of-dropped-record');
+    // …and the stream recovers for the next complete record.
+    expect(out).toContain('clean after resync');
   });
 });

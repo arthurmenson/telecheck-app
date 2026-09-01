@@ -549,11 +549,35 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
 
   /**
    * Hard cap on the carry buffer. If a producer never emits a newline
-   * we must not grow without bound. On overflow the buffer is redacted
-   * and flushed as-is — fail-safe: the content is still scrubbed, it
-   * just loses the guarantee that it was a complete record.
+   * we must not grow without bound.
+   *
+   * ## On overflow the record is DROPPED, not flushed
+   *
+   * An earlier version redacted and emitted the oversized carry, then
+   * cleared it — and that reintroduced the very leak the carry buffer
+   * exists to prevent. If the emitted portion ends mid-token
+   * (`real.person@ex`) and the next chunk opens with the remainder
+   * (`ample.com`), neither fragment matches independently and the
+   * destination concatenates them back into the original value. So the
+   * overflow path became a deliberate way to defeat Layer 3.
+   *
+   * Retaining an overlap does not fix it either: the overlap would be
+   * emitted twice, corrupting the record.
+   *
+   * A >1 MiB line with no terminator is not a legitimate pino record —
+   * pino always terminates its writes. So the honest handling is to
+   * discard it and say so: emit a sentinel, then keep discarding until
+   * the next newline resynchronises the stream. Nothing from the
+   * buffer reaches the destination, so nothing can be reassembled.
    */
   const MAX_CARRY_BYTES = 1_048_576; // 1 MiB
+
+  /**
+   * Set after an overflow drop. While true, input is discarded until a
+   * newline is seen — otherwise the tail of the dropped record would be
+   * treated as a fresh line and partially emitted.
+   */
+  let discardingUntilNewline = false;
 
   const toText = (chunk: unknown): string =>
     typeof chunk === 'string'
@@ -568,16 +592,32 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
 
     transform(chunk: unknown, _encoding, callback): void {
       try {
-        carry += toText(chunk);
+        let text = toText(chunk);
+
+        // Resynchronise after an overflow drop: throw away everything
+        // up to and including the next newline.
+        if (discardingUntilNewline) {
+          const nl = text.indexOf('\n');
+          if (nl === -1) {
+            callback();
+            return;
+          }
+          discardingUntilNewline = false;
+          text = text.slice(nl + 1);
+        }
+
+        carry += text;
 
         const lastNewline = carry.lastIndexOf('\n');
         if (lastNewline === -1) {
           // No complete record yet. Hold — unless the buffer has grown
-          // past the cap, in which case flush it scrubbed.
+          // past the cap, in which case DROP the pathological record
+          // (see MAX_CARRY_BYTES) and emit a sentinel. Emitting any part
+          // of it would let the destination reassemble a split token.
           if (carry.length > MAX_CARRY_BYTES) {
-            const overflow = carry;
             carry = '';
-            callback(null, redactChunk(overflow));
+            discardingUntilNewline = true;
+            callback(null, `{"level":50,"msg":"${LOG_OVERSIZED_LINE_SENTINEL}"}\n`);
             return;
           }
           callback();
@@ -623,3 +663,10 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
  * beats silent loss — and beats emitting the unredacted chunk.
  */
 export const LOG_REDACTION_FAILURE_SENTINEL = 'log-redaction-failed:chunk-dropped';
+
+/**
+ * Emitted in place of an unterminated line that exceeded the carry cap.
+ * The record is DROPPED rather than partially emitted — see
+ * MAX_CARRY_BYTES for why partial emission is unsafe.
+ */
+export const LOG_OVERSIZED_LINE_SENTINEL = 'log-redaction:oversized-unterminated-line-dropped';
