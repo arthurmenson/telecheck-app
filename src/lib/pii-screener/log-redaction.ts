@@ -132,6 +132,18 @@ function redactionToken(label: string): string {
  * DELIBERATELY ABSENT: `url`, `path`, `query`, `params`, `body`,
  * `headers`, `host`, `referer`, `user_agent` — all caller-influenced.
  * Their values ARE scrubbed.
+ *
+ * ALSO DELIBERATELY ABSENT: `hostname`. It is ambiguous — pino's base
+ * bindings use it for the OS hostname (server-generated, safe), but
+ * Fastify's `req` serializer uses the SAME key for the request's Host
+ * header (client-controlled). A name-based carve-out cannot tell the
+ * two apart, so the key is excluded. Scrubbing an OS hostname is
+ * harmless (it will not match a high-confidence pattern anyway); NOT
+ * scrubbing a caller-supplied Host header would be a leak.
+ *
+ * This ambiguity is the general hazard of name-based carve-outs, and
+ * the reason the set is kept deliberately small: a key earns a place
+ * here only when EVERY writer of that key is server-side.
  */
 const IDENTIFIER_KEYS: ReadonlySet<string> = new Set([
   'tenant',
@@ -145,7 +157,6 @@ const IDENTIFIER_KEYS: ReadonlySet<string> = new Set([
   'level',
   'time',
   'pid',
-  'hostname',
   'reqid',
   'responsetime',
   'node_env',

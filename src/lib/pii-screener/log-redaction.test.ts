@@ -95,6 +95,14 @@ describe('isIdentifierKey — carve-out surface', () => {
     expect(isIdentifierKey('host')).toBe(false);
   });
 
+  it('REJECTS hostname — ambiguous between pino base binding and Host header', () => {
+    // pino's base bindings use `hostname` for the OS hostname
+    // (server-generated), but Fastify's req serializer uses the SAME key
+    // for the client-supplied Host header. A name-based carve-out cannot
+    // tell them apart, so the key must not be carved out.
+    expect(isIdentifierKey('hostname')).toBe(false);
+  });
+
   it('rejects free-text keys', () => {
     expect(isIdentifierKey('note')).toBe(false);
     expect(isIdentifierKey('message')).toBe(false);
