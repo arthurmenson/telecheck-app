@@ -364,3 +364,85 @@ describe('createRedactingStream — destination wrapper', () => {
     expect(typeof s.on).toBe('function');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chunk-boundary safety
+//
+// Transform streams do NOT guarantee chunks align with newline-delimited
+// records. An earlier version treated every chunk as line-complete, so a
+// value split across a boundary — `real.person@ex` + `ample.com` —
+// matched in NEITHER fragment, both were forwarded, and the destination
+// reassembled the original PII.
+//
+// These tests split a record at EVERY character position and assert the
+// value never survives.
+// ---------------------------------------------------------------------------
+
+describe('createRedactingStream — chunk-boundary safety', () => {
+  function capture(): { dest: Writable; written: string[] } {
+    const written: string[] = [];
+    const dest = new Writable({
+      write(chunk: unknown, _enc, cb): void {
+        written.push(String(chunk));
+        cb();
+      },
+    });
+    return { dest, written };
+  }
+
+  async function feed(chunks: string[]): Promise<string> {
+    const { dest, written } = capture();
+    const stream = createRedactingStream(dest);
+    for (const c of chunks) {
+      await new Promise<void>((resolve, reject) => {
+        stream.write(c, (err) => (err ? reject(err) : resolve()));
+      });
+    }
+    await new Promise<void>((resolve) => stream.end(() => resolve()));
+    await new Promise((r) => setImmediate(r));
+    return written.join('');
+  }
+
+  const SPLIT_CASES: Array<[string, string]> = [
+    ['email', 'real.person@example.com'],
+    ['SSN', '123-45-6789'],
+    ['card', '4111111111111111'],
+  ];
+
+  for (const [label, value] of SPLIT_CASES) {
+    it(`${label} survives no split point`, async () => {
+      const record = JSON.stringify({ msg: `x ${value} y` }) + '\n';
+      const leaks: number[] = [];
+      for (let i = 1; i < record.length; i++) {
+        const out = await feed([record.slice(0, i), record.slice(i)]);
+        if (out.includes(value)) leaks.push(i);
+      }
+      expect(leaks, `${label} leaked at split points: ${leaks.join(', ')}`).toEqual([]);
+    });
+  }
+
+  it('PII in a property name survives no split point', async () => {
+    const record = '{"real.person@example.com":true}\n';
+    const leaks: number[] = [];
+    for (let i = 1; i < record.length; i++) {
+      const out = await feed([record.slice(0, i), record.slice(i)]);
+      if (out.includes('real.person@example.com')) leaks.push(i);
+    }
+    expect(leaks, `key leaked at split points: ${leaks.join(', ')}`).toEqual([]);
+  });
+
+  it('flushes an unterminated trailing line, scrubbed', async () => {
+    // No newline ever arrives; flush() must still emit it redacted
+    // rather than dropping the record or leaking it.
+    const out = await feed(['{"msg":"ssn 123-45-6789"}']);
+    expect(out.length).toBeGreaterThan(0);
+    expect(out).not.toContain('123-45-6789');
+    expect(out).toContain('[REDACTED:');
+  });
+
+  it('holds a partial line until its newline arrives', async () => {
+    const out = await feed(['{"msg":"cle', 'an"}\n']);
+    expect(out).toContain('clean');
+    expect(out.endsWith('\n')).toBe(true);
+  });
+});

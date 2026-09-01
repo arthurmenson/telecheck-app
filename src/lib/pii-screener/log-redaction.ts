@@ -529,27 +529,91 @@ export function redactChunk(chunk: string): string {
  * INCLUDING serializer-generated content such as the request URL.
  */
 export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
+  // Carry-over buffer for a trailing line that arrived without its
+  // terminating newline.
+  //
+  // ## Why this buffer is load-bearing, not an optimisation
+  //
+  // Transform streams do NOT guarantee that chunks align with
+  // newline-delimited records. An earlier version treated every chunk
+  // as line-complete, which meant a value split across a chunk boundary
+  // — `real.person@ex` + `ample.com` — matched the regex in NEITHER
+  // fragment. Both were forwarded unredacted and the destination
+  // reassembled the original PII. A last-line defense that depends on
+  // favourable chunking is not a defense.
+  //
+  // So only COMPLETE newline-terminated records are redacted and
+  // emitted; any trailing partial line is held until its newline
+  // arrives, and `flush` handles whatever remains at stream end.
+  let carry = '';
+
+  /**
+   * Hard cap on the carry buffer. If a producer never emits a newline
+   * we must not grow without bound. On overflow the buffer is redacted
+   * and flushed as-is — fail-safe: the content is still scrubbed, it
+   * just loses the guarantee that it was a complete record.
+   */
+  const MAX_CARRY_BYTES = 1_048_576; // 1 MiB
+
+  const toText = (chunk: unknown): string =>
+    typeof chunk === 'string'
+      ? chunk
+      : Buffer.isBuffer(chunk)
+        ? chunk.toString('utf8')
+        : String(chunk);
+
   const transform = new Transform({
     // Chunks are pino NDJSON text.
     decodeStrings: false,
+
     transform(chunk: unknown, _encoding, callback): void {
       try {
-        const text =
-          typeof chunk === 'string'
-            ? chunk
-            : Buffer.isBuffer(chunk)
-              ? chunk.toString('utf8')
-              : String(chunk);
-        callback(null, redactChunk(text));
+        carry += toText(chunk);
+
+        const lastNewline = carry.lastIndexOf('\n');
+        if (lastNewline === -1) {
+          // No complete record yet. Hold — unless the buffer has grown
+          // past the cap, in which case flush it scrubbed.
+          if (carry.length > MAX_CARRY_BYTES) {
+            const overflow = carry;
+            carry = '';
+            callback(null, redactChunk(overflow));
+            return;
+          }
+          callback();
+          return;
+        }
+
+        const complete = carry.slice(0, lastNewline + 1);
+        carry = carry.slice(lastNewline + 1);
+        callback(null, redactChunk(complete));
       } catch (err) {
         // Never let a redaction failure kill the log stream — that
         // would cost the operational record. Forward a sentinel line
         // instead so the loss is visible rather than silent.
+        carry = '';
+        callback(null, `{"level":50,"msg":"${LOG_REDACTION_FAILURE_SENTINEL}"}\n`);
+        void err;
+      }
+    },
+
+    flush(callback): void {
+      try {
+        if (carry.length === 0) {
+          callback();
+          return;
+        }
+        const remainder = carry;
+        carry = '';
+        callback(null, redactChunk(remainder));
+      } catch (err) {
+        carry = '';
         callback(null, `{"level":50,"msg":"${LOG_REDACTION_FAILURE_SENTINEL}"}\n`);
         void err;
       }
     },
   });
+
   transform.pipe(dest);
   return transform;
 }
