@@ -88,11 +88,13 @@
  * nine-digit run). The only casualty is the rare ULID that happens to
  * contain nine consecutive digits — roughly one in two thousand.
  *
- * NUMBERS are different and DO keep a carve-out, because there is no
- * value-shape test available for them and pino writes a 13-digit ms
- * epoch on every line. That carve-out is an explicit closed allowlist
- * of pino-written fields — see NUMERIC_PRESERVE_RULES — never a
- * generative rule.
+ * NUMBERS keep the one remaining carve-out, because pino writes a
+ * 13-digit ms epoch on every line and screening it mangled `time` on
+ * ~10% of records. It is an explicit closed allowlist — see
+ * NUMERIC_PRESERVE_RULES — requiring BOTH an exact case-sensitive
+ * root-relative path AND a value inside that field's real domain. Both
+ * halves are load-bearing: the path closes nested key shadowing, and
+ * the domain closes a merge object colliding with a root field name.
  *
  * ## Numeric losslessness — why a token scanner, not JSON.parse
  *
@@ -141,9 +143,7 @@ function redactionToken(label: string): string {
  *
  * It is a small, closed, explicit set — never a generative `*_id` rule.
  * A generative rule would let `{"patient_id":123456789}` preserve a bare
- * SSN and `{"trace_id":4111111111111111}` a Luhn-valid card. Unlike the
- * string path there is no value-shape test available to compensate, so
- * this set carries the entire weight on its own.
+ * SSN and `{"trace_id":4111111111111111}` a Luhn-valid card.
  *
  * ## Position AND value, because position alone is not provenance
  *
