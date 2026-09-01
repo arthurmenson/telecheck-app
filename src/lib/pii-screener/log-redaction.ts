@@ -608,25 +608,42 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
 
         carry += text;
 
-        const lastNewline = carry.lastIndexOf('\n');
-        if (lastNewline === -1) {
-          // No complete record yet. Hold — unless the buffer has grown
-          // past the cap, in which case DROP the pathological record
-          // (see MAX_CARRY_BYTES) and emit a sentinel. Emitting any part
-          // of it would let the destination reassemble a split token.
-          if (carry.length > MAX_CARRY_BYTES) {
-            carry = '';
-            discardingUntilNewline = true;
-            callback(null, `{"level":50,"msg":"${LOG_OVERSIZED_LINE_SENTINEL}"}\n`);
-            return;
+        // Process RECORD BY RECORD so the size cap is enforced per
+        // record, independent of how the producer happened to chunk.
+        //
+        // An earlier version only checked the cap when the chunk
+        // contained no newline at all. That made the bound
+        // chunking-dependent: a chunk that both pushed the record past
+        // 1 MiB AND supplied its newline took the normal path, so the
+        // oversized record was buffered and redacted anyway. It did not
+        // leak (the whole record was redacted together) but it broke
+        // the resource invariant the cap exists to hold.
+        let out = '';
+        for (;;) {
+          const nl = carry.indexOf('\n');
+          if (nl === -1) break;
+          const record = carry.slice(0, nl + 1);
+          carry = carry.slice(nl + 1);
+          if (record.length > MAX_CARRY_BYTES) {
+            // Oversized even though terminated — drop it rather than
+            // spend unbounded work redacting it.
+            out += `{"level":50,"msg":"${LOG_OVERSIZED_LINE_SENTINEL}"}\n`;
+          } else {
+            out += redactLogLine(record);
           }
-          callback();
-          return;
         }
 
-        const complete = carry.slice(0, lastNewline + 1);
-        carry = carry.slice(lastNewline + 1);
-        callback(null, redactChunk(complete));
+        // Trailing partial record: hold it unless it has already blown
+        // the cap, in which case DROP it (see MAX_CARRY_BYTES) — never
+        // emit part of it, or the destination could reassemble a token
+        // split across the emission boundary.
+        if (carry.length > MAX_CARRY_BYTES) {
+          carry = '';
+          discardingUntilNewline = true;
+          out += `{"level":50,"msg":"${LOG_OVERSIZED_LINE_SENTINEL}"}\n`;
+        }
+
+        callback(null, out.length > 0 ? out : undefined);
       } catch (err) {
         // Never let a redaction failure kill the log stream — that
         // would cost the operational record. Forward a sentinel line

@@ -508,3 +508,59 @@ describe('createRedactingStream — overflow boundary', () => {
     expect(out).toContain('clean after resync');
   });
 });
+
+describe('createRedactingStream — per-record cap enforcement', () => {
+  const CAP = 1_048_576;
+
+  function capture(): { dest: Writable; written: string[] } {
+    const written: string[] = [];
+    const dest = new Writable({
+      write(chunk: unknown, _enc, cb): void {
+        written.push(String(chunk));
+        cb();
+      },
+    });
+    return { dest, written };
+  }
+
+  async function feed(chunks: string[]): Promise<string> {
+    const { dest, written } = capture();
+    const stream = createRedactingStream(dest);
+    for (const c of chunks) {
+      await new Promise<void>((resolve, reject) => {
+        stream.write(c, (err) => (err ? reject(err) : resolve()));
+      });
+    }
+    await new Promise<void>((resolve) => stream.end(() => resolve()));
+    await new Promise((r) => setImmediate(r));
+    return written.join('');
+  }
+
+  it('drops an oversized record whose newline arrives in the SAME chunk', async () => {
+    // Codex finding: the cap was only checked when a chunk contained no
+    // newline at all, so a chunk that both crossed the threshold AND
+    // supplied the terminator took the normal path — making the bound
+    // depend on how the producer chunked.
+    const out = await feed(['z'.repeat(CAP - 10), 'z'.repeat(50) + 'ssn 123-45-6789\n']);
+    expect(out).toContain(LOG_OVERSIZED_LINE_SENTINEL);
+    expect(out).not.toContain('123-45-6789');
+  });
+
+  it('emits a preceding complete line, then drops an oversized tail', async () => {
+    const out = await feed([
+      JSON.stringify({ msg: 'first clean' }) + '\n',
+      'q'.repeat(CAP + 10),
+    ]);
+    expect(out).toContain('first clean');
+    expect(out).toContain(LOG_OVERSIZED_LINE_SENTINEL);
+  });
+
+  it('redacts every record in a batched multi-record chunk', async () => {
+    const many =
+      [1, 2, 3].map((i) => JSON.stringify({ msg: `r${i} a@b.com` })).join('\n') + '\n';
+    const out = await feed([many]);
+    expect(out).not.toContain('a@b.com');
+    expect(out).toContain('r1');
+    expect(out).toContain('r3');
+  });
+});
