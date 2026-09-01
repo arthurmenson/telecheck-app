@@ -159,6 +159,25 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
     }
   });
 
+  it('scrubs PII appearing in JSON PROPERTY NAMES', () => {
+    // Property names are caller-shaped too. An earlier version emitted
+    // key tokens raw, so  wrote the email
+    // verbatim — the same defect class fixed in the audit_bound walker
+    // (Sprint 1.1d) and reintroduced here.
+    const cases: Array<[string, string]> = [
+      ['{"person@example.com":true}', 'person@example.com'],
+      ['{"123-45-6789":"x"}', '123-45-6789'],
+      ['{"4111111111111111":1}', '4111111111111111'],
+      ['{"a":{"b":{"p@q.com":1}}}', 'p@q.com'],
+      ['{"xs":[{"p@q.com":1}]}', 'p@q.com'],
+    ];
+    for (const [line, leaked] of cases) {
+      const out = redactLogLine(line);
+      expect(out, ).not.toContain(leaked);
+      expect(() => JSON.parse(out) as unknown).not.toThrow();
+    }
+  });
+
   it('scrubs the same value under a non-identifier key', () => {
     const out = redactLogLine(JSON.stringify({ note: 'ssn 123-45-6789' }));
     expect(out).toContain('[REDACTED:US Social Security Number]');

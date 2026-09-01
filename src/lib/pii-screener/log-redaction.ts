@@ -367,8 +367,21 @@ function redactJsonStringTokens(text: string): string | null {
       const isKey = text[j] === ':';
 
       if (isKey) {
+        // Classify the carve-out on the ORIGINAL decoded key…
         keyStack[keyStack.length - 1] = decoded;
-        out += raw;
+        // …but EMIT a redacted key.
+        //
+        // Property names are caller-shaped too. An earlier version
+        // appended `raw` here, so a valid record like
+        // `{"person@example.com":true}` wrote the email verbatim —
+        // the same defect class already fixed in the `audit_bound`
+        // payload walker (Sprint 1.1d), reintroduced here.
+        //
+        // Redacting keys is safe for the identifier keys we care about:
+        // `consult_id`, `tenant_id`, `route` and friends match no
+        // high-confidence pattern, so they pass through unchanged.
+        const redactedKey = redactString(decoded);
+        out += redactedKey === decoded ? raw : JSON.stringify(redactedKey);
       } else {
         // Preserve verbatim ONLY when BOTH hold: the enclosing key
         // names an identifier AND the value actually looks like one.
