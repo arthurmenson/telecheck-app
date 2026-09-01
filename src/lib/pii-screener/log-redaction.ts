@@ -117,6 +117,7 @@
  */
 
 import { Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 import { PII_PATTERNS } from './patterns.js';
 
@@ -623,11 +624,28 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
     return carryBytes;
   };
 
+  /**
+   * Persistent streaming UTF-8 decoder for Buffer input.
+   *
+   * `Buffer.toString('utf8')` per chunk is WRONG here: Node may divide a
+   * valid multibyte UTF-8 character between Buffer chunks, and decoding
+   * each fragment independently turns both halves into U+FFFD
+   * replacement characters. The destination then receives corrupted log
+   * content even though the original byte stream was perfectly valid —
+   * and the corruption happens before `carry` is assembled, so no
+   * downstream fix can recover it.
+   *
+   * `StringDecoder` holds an incomplete trailing sequence until the
+   * bytes that finish it arrive, emitting only complete characters.
+   * `flush` drains whatever it is still holding.
+   */
+  const decoder = new StringDecoder('utf8');
+
   const toText = (chunk: unknown): string =>
     typeof chunk === 'string'
       ? chunk
       : Buffer.isBuffer(chunk)
-        ? chunk.toString('utf8')
+        ? decoder.write(chunk)
         : String(chunk);
 
   const transform = new Transform({
@@ -708,6 +726,8 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
 
     flush(callback): void {
       try {
+        // Drain any bytes the streaming decoder is still holding.
+        carry += decoder.end();
         if (carry.length === 0) {
           callback();
           return;

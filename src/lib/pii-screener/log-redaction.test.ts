@@ -679,3 +679,62 @@ describe('createRedactingStream — surrogate-split byte accounting', () => {
     expect(out).toContain(LOG_OVERSIZED_LINE_SENTINEL);
   });
 });
+
+describe('createRedactingStream — streaming UTF-8 decode of Buffer input', () => {
+  function capture(): { dest: Writable; written: string[] } {
+    const written: string[] = [];
+    const dest = new Writable({
+      write(chunk: unknown, _enc, cb): void {
+        written.push(String(chunk));
+        cb();
+      },
+    });
+    return { dest, written };
+  }
+
+  async function feedBuffers(bufs: Buffer[]): Promise<string> {
+    const { dest, written } = capture();
+    const stream = createRedactingStream(dest);
+    for (const b of bufs) {
+      await new Promise<void>((resolve, reject) => {
+        stream.write(b, (err) => (err ? reject(err) : resolve()));
+      });
+    }
+    await new Promise<void>((resolve) => stream.end(() => resolve()));
+    await new Promise((r) => setImmediate(r));
+    return written.join('');
+  }
+
+  // Codex finding: Buffer.toString('utf8') per chunk turns both halves
+  // of a split multibyte character into U+FFFD. A persistent
+  // StringDecoder holds the incomplete sequence until it completes.
+  const MULTIBYTE: Array<[string, string]> = [
+    ['2-byte', '\u00e9'],
+    ['3-byte', '\u4e2d'],
+    ['4-byte', '\u{1F600}'],
+  ];
+
+  for (const [label, char] of MULTIBYTE) {
+    it(`${label} character is not corrupted at any byte split`, async () => {
+      const line = JSON.stringify({ msg: `a${char}b clean` }) + '\n';
+      const buf = Buffer.from(line, 'utf8');
+      const bad: number[] = [];
+      for (let i = 1; i < buf.length; i++) {
+        const out = await feedBuffers([buf.subarray(0, i), buf.subarray(i)]);
+        if (out.includes('\uFFFD') || !out.includes(char)) bad.push(i);
+      }
+      expect(bad, `${label} corrupted at byte splits: ${bad.join(', ')}`).toEqual([]);
+    });
+  }
+
+  it('PII is still redacted at every Buffer byte split', async () => {
+    const line = JSON.stringify({ msg: '\u4e2d real.person@example.com \u4e2d' }) + '\n';
+    const buf = Buffer.from(line, 'utf8');
+    const leaks: number[] = [];
+    for (let i = 1; i < buf.length; i++) {
+      const out = await feedBuffers([buf.subarray(0, i), buf.subarray(i)]);
+      if (out.includes('real.person@example.com')) leaks.push(i);
+    }
+    expect(leaks, `leaked at byte splits: ${leaks.join(', ')}`).toEqual([]);
+  });
+});
