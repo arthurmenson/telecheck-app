@@ -227,8 +227,9 @@ export function redactString(value: string): string {
  * numeric lexemes are never interpreted.
  *
  * The scanner also tracks the enclosing key for each string value, which
- * is what gives identifier-key preservation. Array elements inherit the
- * array's key, so `{"notes":["<pii>"]}` is screened under `notes`.
+ * is what gives identifier-key preservation. The carve-out applies ONLY
+ * to a string that is the direct value of an object property; anything
+ * inside an array or nested container is screened normally.
  *
  * Recursion is gone too: this is a single O(n) pass with an explicit
  * stack, so the depth bound that guarded the recursive walker is not
@@ -245,9 +246,28 @@ export function redactLogLine(line: string): string {
   if (trimmed.length === 0) return line;
 
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    const scanned = redactJsonStringTokens(trimmed);
-    if (scanned !== null) return scanned + newline;
-    // Malformed JSON — fall through to the whole-line pass.
+    // Validate BEFORE scanning. `JSON.parse` is used purely as a
+    // grammar check and its result is discarded — the scanner still
+    // does the rewriting, so numeric lexemes are never interpreted and
+    // precision is preserved.
+    //
+    // This validation is load-bearing, not belt-and-braces. The scanner
+    // recognises quoted tokens but does not verify delimiters, balance,
+    // or unquoted content, so without it a line like
+    // `{email:real.person@example.com}` — which starts with `{` but is
+    // not JSON — would be copied through verbatim, with the unquoted
+    // email never reaching `redactString`.
+    let valid = true;
+    try {
+      JSON.parse(trimmed);
+    } catch {
+      valid = false;
+    }
+    if (valid) {
+      const scanned = redactJsonStringTokens(trimmed);
+      if (scanned !== null) return scanned + newline;
+    }
+    // Not valid JSON — fall through to the whole-line pass.
   }
   return redactString(trimmed) + newline;
 }
@@ -299,9 +319,22 @@ function redactJsonStringTokens(text: string): string | null {
     }
 
     if (ch === '[') {
-      // Elements inherit the array's own key so `notes: ["<pii>"]`
-      // resolves under `notes`.
-      keyStack.push(keyStack[keyStack.length - 1] ?? null);
+      // Array elements do NOT inherit the enclosing key.
+      //
+      // An earlier version pushed the current key so `notes: ["<pii>"]`
+      // resolved under `notes`. That was wrong in the dangerous
+      // direction: it also propagated IDENTIFIER keys into array
+      // frames, and nested arrays kept re-inheriting, so
+      // `{"request_id":[["person@example.com"]]}` preserved the email
+      // verbatim — recreating the nested-subtree bypass the carve-out
+      // is supposed to exclude.
+      //
+      // The carve-out is now strictly what it claims to be: it applies
+      // only to a string that is the DIRECT value of an object
+      // property. Anything inside a container is screened normally.
+      // The cost is that a genuine id inside an array (an unusual
+      // shape) gets scrubbed; that is the right side to err on.
+      keyStack.push(null);
       out += ch;
       i++;
       continue;

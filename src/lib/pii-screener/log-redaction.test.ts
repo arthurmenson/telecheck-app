@@ -152,11 +152,49 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
     expect(out).not.toContain('123-45-6789');
   });
 
-  it('array elements inherit the array key for the carve-out decision', () => {
-    const scrubbed = redactLogLine(JSON.stringify({ notes: ['a@b.com'] }));
-    expect(scrubbed).not.toContain('a@b.com');
-    const kept = redactLogLine(JSON.stringify({ trace_id: ['123456789'] }));
-    expect(kept).toContain('123456789');
+  it('the carve-out does NOT propagate into arrays under an identifier key', () => {
+    // Codex finding: an earlier version pushed the enclosing key onto
+    // array frames, so nested arrays kept re-inheriting it and
+    // `{"request_id":[["person@example.com"]]}` preserved the email —
+    // recreating the nested-subtree bypass the carve-out is meant to
+    // exclude. The carve-out now applies ONLY to a string that is the
+    // direct value of an object property.
+    const one = redactLogLine(JSON.stringify({ request_id: ['person@example.com'] }));
+    expect(one).not.toContain('person@example.com');
+
+    const nested = redactLogLine(JSON.stringify({ request_id: [['person@example.com']] }));
+    expect(nested).not.toContain('person@example.com');
+
+    const deep = redactLogLine(JSON.stringify({ trace_id: [[['a@b.com']]] }));
+    expect(deep).not.toContain('a@b.com');
+
+    // The direct scalar case still preserves.
+    const direct = redactLogLine(JSON.stringify({ consult_id: '123456789' }));
+    expect(direct).toContain('"consult_id":"123456789"');
+  });
+
+  it('rejects JSON-LIKE but invalid lines and falls back to whole-line scrub', () => {
+    // Codex finding: the scanner recognises quoted tokens but does not
+    // verify grammar, so `{email:real.person@example.com}` — which
+    // starts with `{` but is not JSON — was copied through verbatim
+    // with the unquoted email never reaching redactString. A JSON.parse
+    // validity check (result discarded) now gates the scanner.
+    const out = redactLogLine('{email:real.person@example.com}');
+    expect(out).not.toContain('real.person@example.com');
+    expect(out).toContain('[REDACTED:Email address]');
+  });
+
+  it('falls back for unbalanced containers', () => {
+    const out = redactLogLine('{"a":"ssn 123-45-6789"');
+    expect(out).not.toContain('123-45-6789');
+    expect(out).toContain('[REDACTED:');
+  });
+
+  it('handles unicode and control-character escapes, staying valid JSON', () => {
+    const line = JSON.stringify({ msg: 'é "q" \\ ssn 123-45-6789' });
+    const out = redactLogLine(line);
+    expect(out).not.toContain('123-45-6789');
+    expect(() => JSON.parse(out) as unknown).not.toThrow();
   });
 
   // --- Codex R-final finding: JSON.parse/stringify round trip was lossy ---
