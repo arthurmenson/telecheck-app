@@ -91,7 +91,7 @@
  * NUMBERS are different and DO keep a carve-out, because there is no
  * value-shape test available for them and pino writes a 13-digit ms
  * epoch on every line. That carve-out is an explicit closed allowlist
- * of pino-written fields — see NUMERIC_PRESERVE_KEYS — never a
+ * of pino-written fields — see NUMERIC_PRESERVE_PATHS — never a
  * generative rule.
  *
  * ## Numeric losslessness — why a token scanner, not JSON.parse
@@ -130,25 +130,61 @@ function redactionToken(label: string): string {
 }
 
 /**
- * Keys whose NUMERIC values are preserved verbatim.
+ * Record positions whose NUMERIC values are preserved verbatim.
  *
- * Deliberately an explicit, closed allowlist rather than the generative
- * `*_id` rule used for strings. Every member is written by pino or
- * Fastify itself — never by application code, never by a caller.
+ * This is the ONLY carve-out left anywhere in the redactor. Strings have
+ * none — every string value and property name is screened. Numbers keep
+ * one because pino emits `"time":<13-digit ms epoch>` on every single
+ * line, and 13 digits sits inside the credit-card pattern's 13–19 digit
+ * range, so roughly one timestamp in ten is Luhn-valid by chance.
+ * Screening numbers with no carve-out mangled `time` on ~10% of lines.
  *
- * The string carve-out can afford a generative rule because it ALSO
- * demands a UUID/ULID value shape. A number has no such shape to test,
- * so here the key set carries the entire weight — and a generative rule
- * would let `{"patient_id":123456789}` preserve a bare SSN or
- * `{"trace_id":4111111111111111}` a Luhn-valid card number.
+ * It is a small, closed, explicit set — never a generative `*_id` rule.
+ * A generative rule would let `{"patient_id":123456789}` preserve a bare
+ * SSN and `{"trace_id":4111111111111111}` a Luhn-valid card. Unlike the
+ * string path there is no value-shape test available to compensate, so
+ * this set carries the entire weight on its own.
+ *
+ * Anchored to ROOT-RELATIVE PATHS, not bare key names. A bare key set is
+ * depth-blind, so `{"payload":{"time":3125551212}}` preserved a phone
+ * number: `payload` is application data and its contents are
+ * caller-controlled, but the inner key spelled `time` matched. Every
+ * member below is written by pino or Fastify at a FIXED position in the
+ * record, so pinning the position costs nothing and removes the entire
+ * nested-shadowing class.
  */
-const NUMERIC_PRESERVE_KEYS: ReadonlySet<string> = new Set([
+const NUMERIC_PRESERVE_PATHS: ReadonlySet<string> = new Set([
+  // pino's own per-record metadata, always at the root object.
   'time',
   'pid',
   'level',
-  'statuscode',
+  // Fastify's request/response completion fields. `statusCode` appears at
+  // the root under some configurations and under pino's default `res`
+  // serializer in others; both fixed positions are listed rather than
+  // allowing the key at any depth.
   'responsetime',
+  'statuscode',
+  'res.statuscode',
 ]);
+
+/**
+ * Resolve the root-relative path of the value currently being scanned.
+ *
+ * `keyStack[0]` is the pre-root sentinel and is dropped. A `null` frame
+ * means an ARRAY is somewhere in the path; array elements have no key,
+ * so no allowlist entry can legitimately describe them and the path is
+ * reported as unresolvable (never preserved).
+ */
+function resolveNumericPath(keyStack: ReadonlyArray<string | null>): string | null {
+  if (keyStack.length < 2) return null;
+  const parts: string[] = [];
+  for (let i = 1; i < keyStack.length; i++) {
+    const frame = keyStack[i];
+    if (frame == null) return null;
+    parts.push(frame.toLowerCase());
+  }
+  return parts.join('.');
+}
 
 /**
  * Apply the high-confidence regex patterns to a single string, replacing
@@ -370,28 +406,30 @@ function redactJsonStringTokens(text: string): string | null {
     if (ch === '-' || (ch >= '0' && ch <= '9')) {
       const num = readJsonNumber(text, i);
       if (num !== null) {
-        // Numbers are preserved ONLY under an explicit allowlist of
-        // pino's own numeric fields — never under the generative
-        // `*_id` / `*Id` rule that governs strings.
+        // Numbers are preserved ONLY at the explicitly allowlisted
+        // record positions. This is the sole carve-out in the redactor.
         //
-        // Why a carve-out is needed at all: pino emits `"time":<ms
-        // epoch>` on EVERY line, a 13-digit number, and 13 digits sits
-        // inside the credit-card pattern's 13–19 digit range — so
-        // roughly one timestamp in ten is Luhn-valid by chance.
-        // Screening numbers with no carve-out mangled `time` on ~10% of
-        // all log lines.
+        // Why one is needed at all: pino emits `"time":<ms epoch>` on
+        // EVERY line, a 13-digit number, and 13 digits sits inside the
+        // credit-card pattern's 13–19 digit range — so roughly one
+        // timestamp in ten is Luhn-valid by chance. Screening numbers
+        // with no carve-out mangled `time` on ~10% of all log lines.
         //
-        // Why it must NOT reuse `isIdentifierKey`: that rule matches any
-        // `*_id` suffix, so `{"patient_id":123456789}` would preserve a
-        // bare SSN and `{"trace_id":4111111111111111}` a Luhn-valid card.
-        // Unlike the string path there is no value-shape test available
-        // to compensate — a number has no UUID/ULID form — so the key
-        // set itself has to carry the whole weight, and a generative
-        // rule is far too wide for that. The allowlist is small, fixed,
-        // and every member is written by pino or Fastify itself.
-        const enclosingKey = keyStack[keyStack.length - 1] ?? null;
-        const preserveNumber =
-          enclosingKey !== null && NUMERIC_PRESERVE_KEYS.has(enclosingKey.toLowerCase());
+        // Why it must NOT be a generative `*_id` / `*Id` rule: that
+        // would preserve a bare SSN under `{"patient_id":123456789}` and
+        // a Luhn-valid card under `{"trace_id":4111111111111111}`. The
+        // string path once had such a rule (paired with a UUID/ULID
+        // value-shape test) and it was removed as unsound. A number has
+        // no shape to test at all, so nothing would compensate here.
+        //
+        // It is matched on the ROOT-RELATIVE PATH, not the immediate key.
+        // A bare key set is depth-blind, so a caller-shaped subtree could
+        // shadow a trusted name: `{"payload":{"time":3125551212}}` emitted
+        // a phone number verbatim because the inner key spelled `time`.
+        // Every allowlisted field sits at a fixed position in the record,
+        // so requiring the position costs nothing.
+        const numericPath = resolveNumericPath(keyStack);
+        const preserveNumber = numericPath !== null && NUMERIC_PRESERVE_PATHS.has(numericPath);
         out += preserveNumber ? num.raw : redactNumericLexeme(num.raw);
         i = num.next;
         continue;

@@ -209,11 +209,13 @@ Each line is scanned as text and **only its string tokens are rewritten**. Every
 
 The obvious implementation — `JSON.parse` → walk → `JSON.stringify` — is **lossy, and silently so**: parse coerces every JSON number to an IEEE-754 double, so any integer beyond `Number.MAX_SAFE_INTEGER` (a 64-bit id, a nanosecond timestamp, a BigInt-backed counter) is rounded on the way out. Parsing succeeds, so no failure sentinel fires — the value is just quietly wrong. Corrupting an identifier *inside the redaction layer* would destroy exactly the correlation evidence an incident depends on.
 
-The scanner tracks the enclosing key for each string value, which is what gives identifier-key preservation. Array elements inherit the array's key, so `{"notes":["<pii>"]}` is screened under `notes`.
+The scanner tracks the enclosing key path for each value. That path is used **only** for the numeric allowlist below; string values and property names are screened unconditionally regardless of where they sit.
 
 It is a single O(n) pass with an explicit stack, so the depth bound an earlier recursive implementation needed is gone entirely rather than merely tuned.
 
-Non-JSON lines (a pretty-print transport, a partial chunk, a non-JSON warning) fall back to a whole-line regex scrub — **fail safe**: still scrubbed, just without the identifier carve-out. Batched multi-line chunks are handled per line, preserving framing.
+`JSON.parse` runs first purely as a **validity gate** and its result is discarded. Without it, JSON-*like* but invalid text (`{email:real.person@example.com}`) reached the token scanner, which found no quoted token to rewrite and copied the line through verbatim.
+
+Non-JSON lines (a pretty-print transport, a non-JSON warning) fall back to a whole-line regex scrub — **fail safe**: everything is scrubbed, including values the numeric allowlist would have preserved in a well-formed record. Batched multi-line chunks are handled per line, preserving framing.
 
 ### Regex-only — NER is deliberately NOT used at Layer 3
 
@@ -227,15 +229,47 @@ Layers 1 and 2 run regex + local NER. Layer 3 runs regex only:
 
 Low-confidence patterns (IPv4, IPv6, context-bound passport) are **not** scrubbed at Layer 3. An IP address in a log line is usually infrastructure, not PII; removing it would delete genuinely useful diagnostic signal during exactly the incident the logs exist for.
 
-### Identifier-key preservation — keys on the KEY NAME only
+### Strings and property names: no carve-out at all
 
-A blanket string scrub has a real false-positive mode: `us_ssn` also matches any bare 9-digit run. Most identifiers here are safe from it — UUIDs never expose a 9-digit run bounded by non-digits, and codes like `pg_sqlstate` are too short — but a ULID (26 chars of Crockford base32) can by chance contain exactly nine consecutive digits, and redacting a ULID mid-incident would break correlation.
+**Every string value and every JSON property name is screened.** There is no identifier exemption on the string path.
 
-So values under **server-generated** identifier keys are preserved verbatim, matched on the key name (`*_id` / `*Id` suffix, plus an explicit set: `tenant_id`, `route`, `method`, `status`, `pg_sqlstate`, `provider`, …).
+Three successive designs were tried and each was found bypassable:
 
-**Client-influenced keys are deliberately NOT carved out.** `url`, `path`, `query`, `params`, `body`, `headers`, `host` are all caller-shaped; their values ARE scrubbed. `url` was present in the first draft's carve-out and was a genuine leak — the claim that a key-name carve-out "cannot be steered by user input" holds only when the key's *value* is server-generated, which for `url` it is not.
+| Design | Bypass |
+|---|---|
+| Key name only (`*_id` suffix + an explicit set) | `{"request_id":"person@example.com"}` — the value is caller-shaped even when the key is not. `url` in the same set was a live leak, since its query string is entirely client-controlled. |
+| Key name **and** UUID/ULID value shape | A ULID is 26 chars of Crockford base32, so one containing a nine-digit SSN substring is still syntactically valid and was emitted verbatim. |
+| Either, applied inside containers | Array frames inherited the enclosing key, and nested arrays re-inherited it, so `{"request_id":[["person@example.com"]]}` preserved the email. |
 
-The carve-out also applies only to **scalar** values. A nested object under an identifier key is still walked, so `{ request_id: { note: "<pii>" } }` cannot slip through by nesting.
+The pattern is the lesson: inferring trust from a key name or a value shape is the wrong instinct for a layer whose entire premise is that Layers 1 and 2 already failed. Each carve-out was one more thing to get right, and each was gotten wrong.
+
+Removing it costs very little. Real identifiers do not match the high-confidence patterns and survive untouched with no exemption needed — `Telecheck-US`, `/v0/ai/chat`, `23505`, and any UUID (whose hex runs are hyphen-separated at lengths that never expose a bounded nine-digit run). The only casualty is the rare ULID that happens to contain nine consecutive digits, roughly one in two thousand, which is replaced by a token naming the pattern in a record that still carries its other identifiers. Losing correlation on one identifier occasionally beats a standing rule that emits caller-influenced values unscreened.
+
+Property names get the same treatment: `{"person@example.com":true}` is a leak exactly as much as the value form. An earlier revision emitted key tokens raw — the same defect class already fixed in the Sprint 1.1d `audit_bound` payload walker, reintroduced here.
+
+### Numbers: the one remaining carve-out, anchored to record POSITION
+
+Numbers keep an exemption because there is no value-shape test available for them and pino emits `"time":<13-digit ms epoch>` on **every** line — 13 digits sits inside the credit-card pattern's 13–19 digit range, so roughly one timestamp in ten is Luhn-valid by chance. Screening numbers with no exemption mangled `time` on ~10% of all log lines.
+
+Numeric lexemes are screened **as text and never parsed**, so a non-matching number is emitted byte-for-byte and precision is preserved. They are matched **whole**, never as substrings — otherwise the `us_phone` pattern would rewrite the legitimate 64-bit id `9007199254740993` as `900719[REDACTED:US phone number]`.
+
+The exemption is a small, closed, explicit allowlist keyed on the **root-relative path**, not the immediate key name:
+
+| Path | Written by |
+|---|---|
+| `time`, `pid`, `level` | pino, per record |
+| `responseTime`, `statusCode`, `res.statusCode` | Fastify request/response completion |
+
+Two properties matter:
+
+- **Not generative.** A `*_id` rule would preserve a bare SSN under `{"patient_id":123456789}` and a Luhn-valid card under `{"trace_id":4111111111111111}`.
+- **Not depth-blind.** A bare key set let a caller-shaped subtree shadow a trusted name — `{"payload":{"time":3125551212}}` emitted a phone number because the inner key spelled `time`. Every allowlisted field sits at a fixed position, so requiring the position costs nothing and removes the shadowing class entirely. An array frame has no key, so nothing inside one can resolve to an allowlisted path.
+
+### Chunk boundaries and oversized records
+
+The destination stream carries a partial-line buffer across chunks, so PII split across a chunk boundary cannot reassemble unscreened downstream. Split UTF-8 is handled with `StringDecoder`; the carry is bounded in **bytes** with a periodic exact resync rather than UTF-16 code units.
+
+On a record exceeding the per-record cap, the stream **drops the record and emits a sentinel** rather than flushing a partially-screened prefix — an earlier truncate-and-emit path recreated the very leak the buffer exists to prevent.
 
 ### No depth bound is needed on the line path
 

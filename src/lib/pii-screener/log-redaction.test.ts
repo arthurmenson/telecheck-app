@@ -8,10 +8,12 @@
  *
  * Coverage:
  *   - high-confidence patterns scrubbed; low-confidence deliberately not
- *   - server-generated identifier keys preserved; client-influenced keys
- *     (notably `url` with its query string) ARE scrubbed
+ *   - EVERY string value and property name is screened — no carve-out
+ *   - real identifiers survive because they match no pattern, not because
+ *     they are exempted
  *   - full serialized-record round trip incl. Fastify-shaped req records
- *   - identifier preservation requires BOTH key name and UUID/ULID value shape
+ *   - numbers are screened as whole lexemes, never parsed, and preserved
+ *     only at the fixed record positions pino/Fastify write
  *   - non-JSON lines fall back to a whole-line scrub (fail safe)
  *   - stream wrapper preserves chunk/line framing and handles batches
  */
@@ -95,7 +97,7 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
     expect(redactLogLine(line)).not.toContain('real.person@example.com');
   });
 
-  it('preserves a UUID/ULID under an identifier key', () => {
+  it('leaves real identifiers intact — because they match nothing, not by exemption', () => {
     const line = JSON.stringify({
       tenant_id: 'Telecheck-US',
       turn_id: '550e8400-e29b-41d4-a716-446655440000',
@@ -108,8 +110,12 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
   });
 
   it('does NOT preserve a PII-shaped value merely because the key looks like an id', () => {
-    // Codex finding: key-name-only exemption was a deterministic
-    // bypass. Preservation now requires the VALUE to be a UUID or ULID.
+    // Codex found a bypass in two successive carve-out designs here:
+    // key-name-only, then key name plus a UUID/ULID value shape (a
+    // 26-char Crockford string can contain a nine-digit run and still be
+    // a valid ULID). The carve-out is now gone entirely — every string
+    // is screened — so these cases hold for a structural reason rather
+    // than because a rule happens to exclude them.
     const cases: Array<[string, string]> = [
       [JSON.stringify({ request_id: 'person@example.com' }), 'person@example.com'],
       [JSON.stringify({ patient_id: '123-45-6789' }), '123-45-6789'],
@@ -145,20 +151,20 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
     expect(out).toContain('[REDACTED:US Social Security Number]');
   });
 
-  it('still scrubs inside a nested object under an identifier key', () => {
-    // The carve-out is about ID VALUES, not exempting whole subtrees.
+  it('scrubs inside a nested object under an identifier key', () => {
+    // An identifier key never exempted a whole subtree, and now exempts
+    // nothing at all.
     const out = redactLogLine(JSON.stringify({ request_id: { note: 'ssn 123-45-6789' } }));
     expect(out).toContain('[REDACTED:');
     expect(out).not.toContain('123-45-6789');
   });
 
-  it('the carve-out does NOT propagate into arrays under an identifier key', () => {
-    // Codex finding: an earlier version pushed the enclosing key onto
-    // array frames, so nested arrays kept re-inheriting it and
-    // `{"request_id":[["person@example.com"]]}` preserved the email —
-    // recreating the nested-subtree bypass the carve-out is meant to
-    // exclude. The carve-out now applies ONLY to a string that is the
-    // direct value of an object property.
+  it('scrubs inside arrays under an identifier key, at every nesting depth', () => {
+    // Codex finding against an earlier design: array frames inherited
+    // the enclosing key, and nested arrays kept re-inheriting it, so
+    // `{"request_id":[["person@example.com"]]}` preserved the email.
+    // Array frames now carry no key — and with the string carve-out
+    // removed there is nothing left for them to inherit.
     const one = redactLogLine(JSON.stringify({ request_id: ['person@example.com'] }));
     expect(one).not.toContain('person@example.com');
 
@@ -168,7 +174,7 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
     const deep = redactLogLine(JSON.stringify({ trace_id: [[['a@b.com']]] }));
     expect(deep).not.toContain('a@b.com');
 
-    // The direct scalar case still preserves when the value is a ULID.
+    // A real ULID still survives — it matches no high-confidence pattern.
     const direct = redactLogLine(JSON.stringify({ consult_id: '01ARZ3NDEKTSV4RRFFQ69G5FAV' }));
     expect(direct).toContain('01ARZ3NDEKTSV4RRFFQ69G5FAV');
   });
@@ -722,8 +728,8 @@ describe('redactLogLine — numeric JSON values', () => {
     // Regression for a would-be self-inflicted outage: a 13-digit ms
     // epoch sits inside the credit-card pattern's 13–19 digit range, so
     // roughly one timestamp in ten is Luhn-valid by chance. Screening
-    // numbers without the identifier-key carve-out mangled `time` on
-    // ~10% of ALL log lines.
+    // numbers with no allowlist at all mangled `time` on ~10% of ALL
+    // log lines.
     const line =
       '{"level":30,"time":1725196800123,"pid":12345,"reqId":"r1",' +
       '"responseTime":12.5,"msg":"request completed"}';
@@ -737,7 +743,7 @@ describe('redactLogLine — numeric JSON values', () => {
   it('does NOT preserve a numeric value merely because the key looks like an id', () => {
     // This assertion previously ran the other way, back when numeric
     // preservation reused the generative *_id key rule. That rule was
-    // replaced by the closed NUMERIC_PRESERVE_KEYS allowlist precisely
+    // replaced by the closed NUMERIC_PRESERVE_PATHS allowlist precisely
     // because it exempted PII: `consult_id` is attacker-influencable in
     // shape, and a nine-digit value under it is indistinguishable from
     // an SSN. See the allowlist block below for the full reasoning.
@@ -800,5 +806,41 @@ describe('redactLogLine — numeric preservation is an allowlist, not the *_id r
     expect(out).toContain('"pid":12345');
     expect(out).toContain('"responseTime":12.5');
     expect(out).toContain('"statusCode":200');
+  });
+
+  it('does NOT preserve an allowlisted key name shadowed inside a nested subtree', () => {
+    // Codex finding: the allowlist matched the IMMEDIATE key at any
+    // depth, so a caller-shaped subtree could shadow a trusted name.
+    // `payload` is application data — its contents are caller-controlled
+    // — but its inner key spelled `time` matched, and the phone number
+    // was emitted verbatim.
+    //
+    // Every allowlisted field sits at a FIXED position in the record, so
+    // matching the root-relative path instead of the bare key removes
+    // the whole shadowing class at no cost.
+    const cases: Array<[string, string]> = [
+      ['{"payload":{"time":3125551212}}', '3125551212'],
+      ['{"body":{"pid":123456789}}', '123456789'],
+      ['{"a":{"b":{"level":4111111111111111}}}', '4111111111111111'],
+      ['{"req":{"statusCode":123456789}}', '123456789'],
+      ['{"payload":[{"time":3125551212}]}', '3125551212'],
+      // An array frame has no key, so nothing inside one can resolve to
+      // an allowlisted path even directly under a trusted root name.
+      ['{"time":[3125551212]}', '3125551212'],
+    ];
+    for (const [line, leaked] of cases) {
+      const out = redactLogLine(line);
+      expect(out, `leaked numeric via: ${line}`).not.toContain(leaked);
+      expect(() => JSON.parse(out) as unknown).not.toThrow();
+    }
+  });
+
+  it('preserves statusCode at both fixed positions Fastify emits it', () => {
+    // Root-level under some configurations, under pino's default `res`
+    // serializer in others. Both positions are listed explicitly rather
+    // than allowing the key at any depth.
+    for (const line of ['{"statusCode":200,"msg":"x"}', '{"res":{"statusCode":200},"msg":"x"}']) {
+      expect(redactLogLine(line), `mangled: ${line}`).toBe(line);
+    }
   });
 });
