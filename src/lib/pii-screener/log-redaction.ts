@@ -65,35 +65,34 @@
  *     STRUCTURED identifiers — an SSN, an email, a phone, a card number.
  *     That is precisely regex's strength.
  *
- * ## Identifier preservation — BOTH the key name and the value shape
+ * ## No shape-based trust for strings
  *
- * A blanket string scrub has a real false-positive mode: `us_ssn` also
- * matches any bare 9-digit run, and a ULID (26 chars of Crockford
- * base32) can by chance contain exactly nine consecutive digits.
- * Redacting a ULID mid-incident would break correlation.
+ * EVERY string value and property name is screened. There is no
+ * identifier carve-out on the string path.
  *
- * So a narrow carve-out exists — but it requires **two** conditions,
- * not one:
+ * Earlier drafts had one — first keyed on the key NAME alone, then on
+ * key name plus a UUID/ULID value SHAPE. Codex found a bypass in each.
+ * The second is instructive: a 26-character Crockford string containing
+ * a nine-digit run is a syntactically valid ULID, so shape-based trust
+ * emitted it verbatim.
  *
- *   1. the enclosing KEY names an identifier (`*_id` / `*Id`, or a
- *      member of `IDENTIFIER_KEYS`), AND
- *   2. the VALUE is shaped like an identifier (a UUID or a ULID)
+ * The deeper lesson is that inferring trust from shape is the wrong
+ * instinct for a layer whose premise is that Layers 1 and 2 already
+ * failed. Each carve-out was one more thing to get right, and each was
+ * gotten wrong.
  *
- * Key name alone is not sufficient and was a deterministic bypass in an
- * earlier draft: `{"request_id":"person@example.com"}` and
- * `{"patient_id":"123-45-6789"}` were copied verbatim purely because of
- * the key. For a layer whose whole premise is that the earlier controls
- * failed, trusting a caller-influenced or mistakenly-populated field on
- * its name is exactly the wrong instinct. See `isPreservableIdentifier`.
+ * Removing it costs little. Real identifiers do not match the
+ * high-confidence patterns and survive untouched with no exemption:
+ * `Telecheck-US`, `/v0/ai/chat`, `23505`, and any UUID (whose hex runs
+ * are hyphen-separated at lengths that never expose a bounded
+ * nine-digit run). The only casualty is the rare ULID that happens to
+ * contain nine consecutive digits — roughly one in two thousand.
  *
- * The key set also excludes client-influenced fields. `url` was in the
- * first draft and was a genuine leak (query strings are
- * caller-controlled); it has been removed, so request URLs ARE scrubbed.
- * Only server-generated names remain.
- *
- * Nor does the carve-out propagate into containers: it applies only to a
- * string that is the DIRECT value of an object property. Array frames
- * reset it, so `{"request_id":[["<pii>"]]}` is screened normally.
+ * NUMBERS are different and DO keep a carve-out, because there is no
+ * value-shape test available for them and pino writes a 13-digit ms
+ * epoch on every line. That carve-out is an explicit closed allowlist
+ * of pino-written fields — see NUMERIC_PRESERVE_KEYS — never a
+ * generative rule.
  *
  * ## Numeric losslessness — why a token scanner, not JSON.parse
  *
@@ -131,57 +130,6 @@ function redactionToken(label: string): string {
 }
 
 /**
- * Keys whose values are preserved verbatim because they are
- * SERVER-GENERATED structural identifiers, not free-text and not
- * client-influenced. Matched case-insensitively, exact.
- *
- * The `*_id` / `*Id` suffix rule below covers most identifiers
- * generatively; this set catches the ones that do not carry the suffix.
- *
- * DELIBERATELY ABSENT: `url`, `path`, `query`, `params`, `body`,
- * `headers`, `host`, `referer`, `user_agent` — all caller-influenced.
- * Their values ARE scrubbed.
- *
- * ALSO DELIBERATELY ABSENT: `hostname`. It is ambiguous — pino's base
- * bindings use it for the OS hostname (server-generated, safe), but
- * Fastify's `req` serializer uses the SAME key for the request's Host
- * header (client-controlled). A name-based carve-out cannot tell the
- * two apart, so the key is excluded. Scrubbing an OS hostname is
- * harmless (it will not match a high-confidence pattern anyway); NOT
- * scrubbing a caller-supplied Host header would be a leak.
- *
- * This ambiguity is the general hazard of name-based carve-outs, and
- * the reason the set is kept deliberately small: a key earns a place
- * here only when EVERY writer of that key is server-side.
- */
-const IDENTIFIER_KEYS: ReadonlySet<string> = new Set([
-  'tenant',
-  'tenantid',
-  'route', // Fastify route PATTERN (e.g. '/v0/ai/chat'), server-defined
-  'method',
-  'status',
-  'statuscode',
-  'code',
-  'pg_sqlstate',
-  'level',
-  'time',
-  'pid',
-  'reqid',
-  'responsetime',
-  'node_env',
-  'node_env_observed',
-  'layer',
-  'gate',
-  'event',
-  'purpose',
-  'provider',
-  'model',
-  'severity',
-  'detector_version',
-  'name', // Error.name
-]);
-
-/**
  * Keys whose NUMERIC values are preserved verbatim.
  *
  * Deliberately an explicit, closed allowlist rather than the generative
@@ -201,75 +149,6 @@ const NUMERIC_PRESERVE_KEYS: ReadonlySet<string> = new Set([
   'statuscode',
   'responsetime',
 ]);
-
-/**
- * True when a key names a server-generated structural identifier whose
- * value must be preserved for debuggability.
- *
- * Rule: an exact match in IDENTIFIER_KEYS, or a `_id` / `Id` suffix
- * (`consult_id`, `turnId`, `ai_chat_session_id`, …).
- */
-export function isIdentifierKey(key: string): boolean {
-  const lower = key.toLowerCase();
-  if (IDENTIFIER_KEYS.has(lower)) return true;
-  return lower.endsWith('_id') || lower.endsWith('id');
-}
-
-/**
- * Canonical identifier VALUE shapes.
- *
- * The carve-out requires a match here in addition to an identifier key
- * name. Key name alone is not sufficient — see `isPreservableIdentifier`.
- */
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-/** Crockford base32, 26 chars — excludes I, L, O, U by design. */
-const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
-
-/**
- * True when a string may be preserved verbatim under an identifier key.
- *
- * ## Why the key name alone is NOT enough
- *
- * An earlier version exempted any string under an `*_id` / `*Id` key.
- * Codex correctly rejected that: it is a deterministic bypass. Records
- * like `{"request_id":"person@example.com"}` or
- * `{"patient_id":"123-45-6789"}` would be copied verbatim purely
- * because of the key's name. For a layer whose entire premise is that
- * the earlier controls were bypassed, trusting a caller-influenced or
- * mistakenly-populated field on its name is exactly the wrong instinct.
- *
- * So the carve-out now requires the VALUE to look like an identifier
- * too — and only two shapes qualify: a UUID or a ULID.
- *
- * ## Why exactly these two, and why NOT "pure digits"
- *
- * The carve-out only ever MATTERS for values that would otherwise be
- * redacted — i.e. values matching a high-confidence PII pattern.
- * Ordinary identifiers that match no pattern (`Telecheck-US`,
- * `/v0/ai/chat`, `GET`, the 5-digit `23505`) pass through
- * `redactString` untouched and never needed an exemption at all.
- *
- * The one genuine collision is a **ULID that happens to contain exactly
- * nine consecutive digits**, which `us_ssn` matches. UUIDs cannot
- * collide (their hex runs are hyphen-separated at lengths that never
- * expose a bounded 9-digit run) but are included for symmetry and
- * future-proofing.
- *
- * A `^\d+$` shape was in an earlier draft and has been REMOVED. It let
- * `{"trace_id":"4111111111111111"}` preserve a Luhn-valid card number,
- * and it would equally have preserved a 9-digit SSN written into an id
- * field. Since no identifier in this codebase is a long pure-digit
- * string — ids are ULIDs and UUIDs, and short numeric codes survive
- * without any exemption — dropping it costs nothing real and closes
- * both holes.
- *
- * The residual is now narrow: a value must be a syntactically valid
- * UUID or ULID to be exempted, and neither shape can encode an email,
- * a phone number, a hyphenated SSN, or a card number.
- */
-export function isPreservableIdentifier(value: string): boolean {
-  return UUID_RE.test(value) || ULID_RE.test(value);
-}
 
 /**
  * Apply the high-confidence regex patterns to a single string, replacing
@@ -405,16 +284,34 @@ function redactJsonStringTokens(text: string): string | null {
         const redactedKey = redactString(decoded);
         out += redactedKey === decoded ? raw : JSON.stringify(redactedKey);
       } else {
-        // Preserve verbatim ONLY when BOTH hold: the enclosing key
-        // names an identifier AND the value actually looks like one.
-        // Key name alone is a deterministic bypass — see
-        // `isPreservableIdentifier`.
-        const enclosingKey = keyStack[keyStack.length - 1] ?? null;
-        const preserve =
-          enclosingKey !== null &&
-          isIdentifierKey(enclosingKey) &&
-          isPreservableIdentifier(decoded);
-        out += preserve ? raw : JSON.stringify(redactString(decoded));
+        // EVERY string value is screened. There is no carve-out.
+        //
+        // Earlier drafts exempted values under identifier keys — first
+        // on key name alone, then on key name plus a UUID/ULID value
+        // shape. Codex found a bypass in each, and the second one is
+        // instructive: a 26-character Crockford string containing a
+        // nine-digit run is a syntactically valid ULID, so shape-based
+        // trust preserved it verbatim.
+        //
+        // The deeper problem is that inferring trust from shape is the
+        // wrong instinct for a layer whose entire premise is that
+        // Layers 1 and 2 already failed. Each carve-out was another
+        // thing to get right, and each was gotten wrong.
+        //
+        // Removing it costs almost nothing in practice. Real
+        // identifiers do not match the high-confidence patterns at all
+        // and so survive untouched with no exemption needed:
+        // `Telecheck-US`, `/v0/ai/chat`, `23505`, and any UUID (whose
+        // hex runs are hyphen-separated at lengths that never expose a
+        // bounded nine-digit run). The only casualty is the rare ULID
+        // that happens to contain nine consecutive digits — roughly one
+        // in two thousand — which is redacted with a token naming the
+        // pattern, in a record that still carries its other identifiers.
+        //
+        // Losing correlation on one identifier occasionally is a better
+        // trade than a standing rule that emits caller-influenced values
+        // unscreened.
+        out += JSON.stringify(redactString(decoded));
       }
       i = next;
       continue;

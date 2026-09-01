@@ -979,3 +979,36 @@ describe('pii-screener — screenOutput (Layer 2 egress, Sprint 1.1d)', () => {
     expect(r.output).toContain('[REDACTED:Person name]');
   });
 });
+
+describe('us_phone requires a separator, parens, or +1 (Sprint 1.2a tightening)', () => {
+  it('matches the forms humans actually write', () => {
+    for (const text of [
+      'call (415) 555-0123 now',
+      'call 415-555-0123 now',
+      'call 415.555.0123 now',
+      'call +1 415 555 0123 now',
+    ]) {
+      expect(screenInput(text, 'ai_bound').action, `missed: ${text}`).toBe('block');
+    }
+  });
+
+  it('does NOT match a bare ten-digit run', () => {
+    // The earlier form matched any ten consecutive digits with plausible
+    // leading digits, so it fired INSIDE longer identifiers: an ordinary
+    // UUID like 550e8400-e29b-41d4-a716-446655440000 contains
+    // 6655440000, and 9007199254740993 contains a match too. Those
+    // identifiers appear on nearly every log line, so the loose form
+    // damaged far more than it protected.
+    const hits = screenInput('ref 4155550123 ok', 'internal').hits;
+    expect(hits.some((h) => h.patternId === 'us_phone')).toBe(false);
+  });
+
+  it('leaves UUIDs and large integers intact', () => {
+    for (const text of ['550e8400-e29b-41d4-a716-446655440000', '9007199254740993']) {
+      const hits = screenInput(text, 'internal').hits;
+      expect(hits.some((h) => h.patternId === 'us_phone'), `phone matched in: ${text}`).toBe(
+        false,
+      );
+    }
+  });
+});

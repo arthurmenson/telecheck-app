@@ -168,11 +168,28 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
     id: 'us_phone',
     label: 'US phone number',
     confidence: 'high_confidence',
-    // Matches +1 XXX-XXX-XXXX, (XXX) XXX-XXXX, XXX-XXX-XXXX, XXX.XXX.XXXX
-    // and various compact forms. Word boundaries prevent matching inside
-    // longer digit sequences.
+    // Matches +1 XXX-XXX-XXXX, (XXX) XXX-XXXX, XXX-XXX-XXXX, XXX.XXX.XXXX.
+    //
+    // REQUIRES either a `+1` country prefix, parentheses, or at least one
+    // separator. A bare ten-digit run is deliberately NOT matched.
+    //
+    // Sprint 1.2a finding: the earlier form matched any ten consecutive
+    // digits with plausible leading digits, which made it fire inside
+    // longer identifiers. `550e8400-e29b-41d4-a716-446655440000` — an
+    // ordinary UUID — contains `6655440000`, so roughly 1–2% of UUIDs
+    // were rewritten as `...44[REDACTED:US phone number]`. Same cause
+    // mangled `9007199254740993` into `900719[REDACTED:...]`. Those
+    // identifiers appear on nearly every log line, so the loose form
+    // damaged far more than it protected.
+    //
+    // A bare ten-digit run is genuinely ambiguous — far more often an
+    // identifier than a phone number — whereas a human writing a phone
+    // number essentially always uses separators, parens, or a country
+    // code. Requiring one of those makes the pattern mean what its name
+    // says. Layer 1 blocks on ANY hit for AI-bound routes and local NER
+    // still sees the text, so the narrow loss is well covered upstream.
     regex:
-      /(?:\+?1[\s.-]?)?\(?([2-9]\d{2})\)?[\s.-]?([2-9]\d{2})[\s.-]?(\d{4})\b/g,
+      /(?:\+1[\s.-]?)?(?:\((?:[2-9]\d{2})\)[\s.-]?(?:[2-9]\d{2})[\s.-]?\d{4}|(?<!\d)(?:[2-9]\d{2})[\s.-](?:[2-9]\d{2})[\s.-]\d{4}(?!\d)|(?<!\d)\+1[\s.-]?(?:[2-9]\d{2})[\s.-]?(?:[2-9]\d{2})[\s.-]?\d{4}(?!\d))/g,
   },
   {
     id: 'ghana_phone',

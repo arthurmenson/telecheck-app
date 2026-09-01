@@ -23,7 +23,6 @@ import { describe, expect, it } from 'vitest';
 import {
   LOG_OVERSIZED_LINE_SENTINEL,
   createRedactingStream,
-  isIdentifierKey,
   redactLogLine,
   redactString,
 } from './log-redaction.js';
@@ -66,44 +65,6 @@ describe('redactString — high-confidence patterns only', () => {
   it('leaves clean operational prose untouched', () => {
     const s = 'mode1_chat: provider unavailable; surfaced fail-soft response';
     expect(redactString(s)).toBe(s);
-  });
-});
-
-describe('isIdentifierKey — carve-out surface', () => {
-  it('accepts *_id and *Id', () => {
-    expect(isIdentifierKey('consult_id')).toBe(true);
-    expect(isIdentifierKey('turnId')).toBe(true);
-    expect(isIdentifierKey('ai_chat_session_id')).toBe(true);
-  });
-
-  it('accepts explicitly-listed server-generated keys', () => {
-    expect(isIdentifierKey('tenant_id')).toBe(true);
-    expect(isIdentifierKey('pg_sqlstate')).toBe(true);
-    expect(isIdentifierKey('route')).toBe(true);
-  });
-
-  it('REJECTS client-influenced keys — url is not carved out', () => {
-    // Codex R1 finding: `url` was in the first draft's carve-out, which
-    // let `/?email=real.person@example.com` through unredacted. Query
-    // strings are caller-controlled; the value must be scrubbed.
-    expect(isIdentifierKey('url')).toBe(false);
-    expect(isIdentifierKey('path')).toBe(false);
-    expect(isIdentifierKey('query')).toBe(false);
-    expect(isIdentifierKey('headers')).toBe(false);
-    expect(isIdentifierKey('host')).toBe(false);
-  });
-
-  it('REJECTS hostname — ambiguous between pino base binding and Host header', () => {
-    // pino's base bindings use `hostname` for the OS hostname
-    // (server-generated), but Fastify's req serializer uses the SAME key
-    // for the client-supplied Host header. A name-based carve-out cannot
-    // tell them apart, so the key must not be carved out.
-    expect(isIdentifierKey('hostname')).toBe(false);
-  });
-
-  it('rejects free-text keys', () => {
-    expect(isIdentifierKey('note')).toBe(false);
-    expect(isIdentifierKey('message')).toBe(false);
   });
 });
 
