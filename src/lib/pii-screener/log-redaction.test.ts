@@ -802,3 +802,36 @@ describe('redactLogLine — numeric JSON values', () => {
     expect(out).not.toContain('REDACTED');
   });
 });
+
+describe('redactLogLine — numeric preservation is an allowlist, not the *_id rule', () => {
+  it('does NOT preserve numeric PII under a generative identifier key', () => {
+    // Codex finding: reusing isIdentifierKey for numbers meant any
+    // *_id / *Id key exempted its numeric value, so a bare SSN or a
+    // Luhn-valid card reached the destination. Unlike the string path
+    // there is no value-shape test to compensate — a number has no
+    // UUID/ULID form — so the key set carries the whole weight and a
+    // generative rule is far too wide.
+    const cases: Array<[string, string]> = [
+      ['{"patient_id":123456789}', '123456789'],
+      ['{"trace_id":4111111111111111}', '4111111111111111'],
+      ['{"consult_id":123456789}', '123456789'],
+    ];
+    for (const [line, leaked] of cases) {
+      const out = redactLogLine(line);
+      expect(out, `leaked numeric via: ${line}`).not.toContain(leaked);
+      expect(() => JSON.parse(out) as unknown).not.toThrow();
+    }
+  });
+
+  it('preserves exactly the pino-written numeric fields', () => {
+    const line =
+      '{"level":30,"time":1725196800123,"pid":12345,' +
+      '"responseTime":12.5,"statusCode":200,"msg":"done"}';
+    const out = redactLogLine(line);
+    expect(out).toContain('"time":1725196800123');
+    expect(out).toContain('"level":30');
+    expect(out).toContain('"pid":12345');
+    expect(out).toContain('"responseTime":12.5');
+    expect(out).toContain('"statusCode":200');
+  });
+});

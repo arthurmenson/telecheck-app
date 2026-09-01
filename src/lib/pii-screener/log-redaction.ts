@@ -182,6 +182,27 @@ const IDENTIFIER_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Keys whose NUMERIC values are preserved verbatim.
+ *
+ * Deliberately an explicit, closed allowlist rather than the generative
+ * `*_id` rule used for strings. Every member is written by pino or
+ * Fastify itself — never by application code, never by a caller.
+ *
+ * The string carve-out can afford a generative rule because it ALSO
+ * demands a UUID/ULID value shape. A number has no such shape to test,
+ * so here the key set carries the entire weight — and a generative rule
+ * would let `{"patient_id":123456789}` preserve a bare SSN or
+ * `{"trace_id":4111111111111111}` a Luhn-valid card number.
+ */
+const NUMERIC_PRESERVE_KEYS: ReadonlySet<string> = new Set([
+  'time',
+  'pid',
+  'level',
+  'statuscode',
+  'responsetime',
+]);
+
+/**
  * True when a key names a server-generated structural identifier whose
  * value must be preserved for debuggability.
  *
@@ -452,25 +473,28 @@ function redactJsonStringTokens(text: string): string | null {
     if (ch === '-' || (ch >= '0' && ch <= '9')) {
       const num = readJsonNumber(text, i);
       if (num !== null) {
-        // Numbers under an identifier key are preserved verbatim.
+        // Numbers are preserved ONLY under an explicit allowlist of
+        // pino's own numeric fields — never under the generative
+        // `*_id` / `*Id` rule that governs strings.
         //
-        // This carve-out is not optional. pino emits `"time":<ms epoch>`
-        // on EVERY line, a 13-digit number — and a 13-digit number is
-        // inside the credit-card pattern's 13–19 digit range, so roughly
-        // one timestamp in ten is Luhn-valid by chance. Without this the
-        // redactor would mangle the timestamp on ~10% of all log lines.
-        // `pid`, `level`, `statusCode` and `responseTime` are the same
-        // shape of server-generated numeric.
+        // Why a carve-out is needed at all: pino emits `"time":<ms
+        // epoch>` on EVERY line, a 13-digit number, and 13 digits sits
+        // inside the credit-card pattern's 13–19 digit range — so
+        // roughly one timestamp in ten is Luhn-valid by chance.
+        // Screening numbers with no carve-out mangled `time` on ~10% of
+        // all log lines.
         //
-        // Unlike the string carve-out there is no value-shape test to
-        // add: a number has no UUID/ULID form to check. The residual is
-        // that a numeric field named like an identifier is trusted —
-        // narrower than it sounds, since a national identifier stored as
-        // a JSON number under an `*_id` key is a data-model defect
-        // several layers upstream, and Layers 1, 2, 4 and 5 screen the
-        // paths that could put it there.
+        // Why it must NOT reuse `isIdentifierKey`: that rule matches any
+        // `*_id` suffix, so `{"patient_id":123456789}` would preserve a
+        // bare SSN and `{"trace_id":4111111111111111}` a Luhn-valid card.
+        // Unlike the string path there is no value-shape test available
+        // to compensate — a number has no UUID/ULID form — so the key
+        // set itself has to carry the whole weight, and a generative
+        // rule is far too wide for that. The allowlist is small, fixed,
+        // and every member is written by pino or Fastify itself.
         const enclosingKey = keyStack[keyStack.length - 1] ?? null;
-        const preserveNumber = enclosingKey !== null && isIdentifierKey(enclosingKey);
+        const preserveNumber =
+          enclosingKey !== null && NUMERIC_PRESERVE_KEYS.has(enclosingKey.toLowerCase());
         out += preserveNumber ? num.raw : redactNumericLexeme(num.raw);
         i = num.next;
         continue;
