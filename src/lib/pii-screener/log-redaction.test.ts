@@ -173,7 +173,7 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
     ];
     for (const [line, leaked] of cases) {
       const out = redactLogLine(line);
-      expect(out, ).not.toContain(leaked);
+      expect(out, `leaked key via: ${line}`).not.toContain(leaked);
       expect(() => JSON.parse(out) as unknown).not.toThrow();
     }
   });
