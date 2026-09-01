@@ -111,6 +111,27 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
   // ---------------------------------------------------------------------
   // Government identifiers — high confidence
   // ---------------------------------------------------------------------
+  // ORDER IS LOAD-BEARING between ghana_card and us_ssn.
+  //
+  // `redactString` applies patterns in sequence, so a broader pattern
+  // that fires first consumes the text a more specific one would have
+  // labelled. A Ghana Card is `GHA-<9 digits>-<check>`, and that
+  // 9-digit run is bounded by hyphens — exactly what `us_ssn` matches.
+  // With us_ssn first, `GHA-123456789-0` came out as
+  // `GHA-[REDACTED:US Social Security Number]-0`: the value was
+  // scrubbed, but under the wrong identity, in a pilot whose Ghana
+  // testers are exactly who would produce one.
+  //
+  // The specific pattern must precede the general one.
+  {
+    id: 'ghana_card',
+    label: 'Ghana National ID (Ghana Card)',
+    confidence: 'high_confidence',
+    redactInLogs: true,
+    // Ghana Card format: GHA-XXXXXXXXX-X (13 chars including hyphens,
+    // GHA prefix + 9 digits + check digit).
+    regex: /\bGHA-\d{9}-\d\b/g,
+  },
   {
     id: 'us_ssn',
     label: 'US Social Security Number',
@@ -127,15 +148,6 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
     // low-confidence `us_passport` pattern instead — a decision-matrix
     // violation on internal routes (would redact instead of block).
     regex: /(?<!\d)(?:\d{3}-\d{2}-\d{4}|\d{9})(?!\d)/g,
-  },
-  {
-    id: 'ghana_card',
-    label: 'Ghana National ID (Ghana Card)',
-    confidence: 'high_confidence',
-    redactInLogs: true,
-    // Ghana Card format: GHA-XXXXXXXXX-X (13 chars including hyphens,
-    // GHA prefix + 9 digits + check digit).
-    regex: /\bGHA-\d{9}-\d\b/g,
   },
   {
     id: 'us_passport',

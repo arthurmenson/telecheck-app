@@ -649,6 +649,9 @@ const tenantContextPluginImpl: FastifyPluginAsync<TenantContextPluginOptions> = 
     } catch {
       // Glossary format violation on a tenant in our own map — configuration error.
       request.log.error(
+        // pii-log-allow: the Host header IS the tenant selector, so it is the
+        // only useful diagnostic on a tenant-map config error. A hostname is
+        // not a free-text surface, and Layer 3 still screens it.
         { host },
         'Tenant map contains invalid tenant ID format — configuration error',
       );

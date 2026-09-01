@@ -367,9 +367,15 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         'internal',
       );
       expect(result.action).toBe('redact');
-      // No corruption of the output shape.
-      expect(result.redactedInput).toContain('[REDACTED:IPv4 address]');
-      expect(result.redactedInput).not.toMatch(/\[REDACTED:.*\[REDACTED/); // no nesting
+      expect(result.redactedInput).toBe(
+        'server1 [REDACTED:IPv4 address] server2 [REDACTED:IPv4 address]',
+      );
+      // No NESTED redaction — a token opened inside another token that has
+      // not closed yet. `[^\]]*` is what makes this precise: an earlier
+      // `.*` form spanned the closing bracket, so two perfectly correct
+      // sibling redactions matched it and the assertion failed on valid
+      // output. That made the test useless in both directions.
+      expect(result.redactedInput).not.toMatch(/\[REDACTED:[^\]]*\[REDACTED/);
     });
   });
 
