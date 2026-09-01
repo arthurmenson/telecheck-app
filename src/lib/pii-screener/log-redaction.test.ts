@@ -161,7 +161,7 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
 
   it('scrubs PII appearing in JSON PROPERTY NAMES', () => {
     // Property names are caller-shaped too. An earlier version emitted
-    // key tokens raw, so  wrote the email
+    // key tokens raw, so `{"person@example.com":true}` wrote the email
     // verbatim — the same defect class fixed in the audit_bound walker
     // (Sprint 1.1d) and reintroduced here.
     const cases: Array<[string, string]> = [
