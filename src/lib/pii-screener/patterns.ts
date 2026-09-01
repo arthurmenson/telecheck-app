@@ -168,28 +168,46 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
     id: 'us_phone',
     label: 'US phone number',
     confidence: 'high_confidence',
-    // Matches +1 XXX-XXX-XXXX, (XXX) XXX-XXXX, XXX-XXX-XXXX, XXX.XXX.XXXX.
+    // Matches +1 XXX-XXX-XXXX, (XXX) XXX-XXXX, XXX-XXX-XXXX, XXX.XXX.XXXX,
+    // AND the bare ten-digit form XXXXXXXXXX.
     //
-    // REQUIRES either a `+1` country prefix, parentheses, or at least one
-    // separator. A bare ten-digit run is deliberately NOT matched.
+    // ## The bug this shape fixes, and the over-correction after it
     //
-    // Sprint 1.2a finding: the earlier form matched any ten consecutive
-    // digits with plausible leading digits, which made it fire inside
-    // longer identifiers. `550e8400-e29b-41d4-a716-446655440000` — an
-    // ordinary UUID — contains `6655440000`, so roughly 1–2% of UUIDs
-    // were rewritten as `...44[REDACTED:US phone number]`. Same cause
-    // mangled `9007199254740993` into `900719[REDACTED:...]`. Those
-    // identifiers appear on nearly every log line, so the loose form
-    // damaged far more than it protected.
+    // The original form ended in `\b` with no leading digit guard, so it
+    // matched any ten consecutive digits with plausible leading digits —
+    // INCLUDING a run sitting inside a longer identifier. The UUID
+    // `550e8400-e29b-41d4-a716-446655440000` contains `6655440000`, so
+    // roughly 1–2% of UUIDs were rewritten as
+    // `...44[REDACTED:US phone number]`; `9007199254740993` became
+    // `900719[REDACTED:...]`. Those identifiers appear on nearly every
+    // log line, so the loose form damaged far more than it protected.
     //
-    // A bare ten-digit run is genuinely ambiguous — far more often an
-    // identifier than a phone number — whereas a human writing a phone
-    // number essentially always uses separators, parens, or a country
-    // code. Requiring one of those makes the pattern mean what its name
-    // says. Layer 1 blocks on ANY hit for AI-bound routes and local NER
-    // still sees the text, so the narrow loss is well covered upstream.
+    // My first fix dropped bare ten-digit detection altogether. That was
+    // an over-correction: it left a real bare phone number (`3125551212`)
+    // passing Layer 3 unredacted — precisely the case a last-line
+    // defense exists for.
+    //
+    // ## The actual fix: digit lookarounds, not fewer forms
+    //
+    // The problem was never the bare form; it was SUBSTRING matching.
+    // Bounding every alternative with `(?<!\d)` / `(?!\d)` means a
+    // ten-digit candidate embedded in a longer digit run is rejected
+    // because it is adjacent to another digit, while a standalone phone
+    // number still matches. UUIDs and large integers are safe by
+    // construction rather than by exclusion.
+    // The guards bracket the WHOLE match, not each alternative. Putting
+    // `(?<!\d)` inside the bare alternative instead made `+14155550123`
+    // fall through: the optional `+1` prefix was consumed first, so the
+    // guard saw `1` as the preceding character and failed.
+    //
+    // Trade-off accepted: a standalone ten-digit integer under an
+    // arbitrary key redacts even when it is not a phone number. Numeric
+    // fields pino itself emits are protected by NUMERIC_PRESERVE_KEYS;
+    // beyond those there is no shape test that separates a bare phone
+    // number from a bare ten-digit counter, and Layer 3 is a last-line
+    // defense where a false redaction costs less than a leak.
     regex:
-      /(?:\+1[\s.-]?)?(?:\((?:[2-9]\d{2})\)[\s.-]?(?:[2-9]\d{2})[\s.-]?\d{4}|(?<!\d)(?:[2-9]\d{2})[\s.-](?:[2-9]\d{2})[\s.-]\d{4}(?!\d)|(?<!\d)\+1[\s.-]?(?:[2-9]\d{2})[\s.-]?(?:[2-9]\d{2})[\s.-]?\d{4}(?!\d))/g,
+      /(?<!\d)(?:\+?1[\s.-]?)?(?:\([2-9]\d{2}\)[\s.-]?[2-9]\d{2}[\s.-]?\d{4}|[2-9]\d{2}[\s.-][2-9]\d{2}[\s.-]\d{4}|[2-9]\d{2}[2-9]\d{2}\d{4})(?!\d)/g,
   },
   {
     id: 'ghana_phone',

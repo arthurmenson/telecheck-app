@@ -734,8 +734,14 @@ describe('redactLogLine — numeric JSON values', () => {
     expect(out).toContain('"responseTime":12.5');
   });
 
-  it('preserves a numeric value under an identifier key', () => {
-    expect(redactLogLine('{"consult_id":123456789}')).toContain('"consult_id":123456789');
+  it('does NOT preserve a numeric value merely because the key looks like an id', () => {
+    // This assertion previously ran the other way, back when numeric
+    // preservation reused the generative *_id key rule. That rule was
+    // replaced by the closed NUMERIC_PRESERVE_KEYS allowlist precisely
+    // because it exempted PII: `consult_id` is attacker-influencable in
+    // shape, and a nine-digit value under it is indistinguishable from
+    // an SSN. See the allowlist block below for the full reasoning.
+    expect(redactLogLine('{"consult_id":123456789}')).not.toContain('123456789');
   });
 
   it('preserves non-matching numeric lexemes byte-for-byte', () => {

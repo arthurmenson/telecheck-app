@@ -980,31 +980,44 @@ describe('pii-screener — screenOutput (Layer 2 egress, Sprint 1.1d)', () => {
   });
 });
 
-describe('us_phone requires a separator, parens, or +1 (Sprint 1.2a tightening)', () => {
+describe('us_phone matches standalone numbers but never identifier substrings', () => {
   it('matches the forms humans actually write', () => {
     for (const text of [
       'call (415) 555-0123 now',
       'call 415-555-0123 now',
       'call 415.555.0123 now',
       'call +1 415 555 0123 now',
+      'call +14155550123 now',
+      'call 14155550123 now',
+      'call 1 (415) 555-0123 now',
     ]) {
       expect(screenInput(text, 'ai_bound').action, `missed: ${text}`).toBe('block');
     }
   });
 
-  it('does NOT match a bare ten-digit run', () => {
-    // The earlier form matched any ten consecutive digits with plausible
-    // leading digits, so it fired INSIDE longer identifiers: an ordinary
-    // UUID like 550e8400-e29b-41d4-a716-446655440000 contains
-    // 6655440000, and 9007199254740993 contains a match too. Those
-    // identifiers appear on nearly every log line, so the loose form
-    // damaged far more than it protected.
-    const hits = screenInput('ref 4155550123 ok', 'internal').hits;
-    expect(hits.some((h) => h.patternId === 'us_phone')).toBe(false);
+  it('matches a BARE ten-digit run', () => {
+    // Regression guard. An intermediate fix dropped the bare form to stop
+    // it firing inside identifiers; that left a real phone number passing
+    // Layer 3 unredacted — exactly the case a last-line defense exists
+    // for. The bare form is required.
+    const hits = screenInput('call 3125551212 now', 'internal').hits;
+    expect(hits.some((h) => h.patternId === 'us_phone')).toBe(true);
   });
 
   it('leaves UUIDs and large integers intact', () => {
-    for (const text of ['550e8400-e29b-41d4-a716-446655440000', '9007199254740993']) {
+    // The real defect was SUBSTRING matching, not the bare form. An
+    // ordinary UUID like 550e8400-e29b-41d4-a716-446655440000 contains
+    // 6655440000, and 9007199254740993 contains a candidate too — so the
+    // unguarded pattern mangled ~1-2% of UUIDs on nearly every log line.
+    // The `(?<!\d)` / `(?!\d)` guards bracketing the whole match reject
+    // any candidate adjacent to another digit, which makes long digit
+    // runs safe by construction rather than by dropping coverage.
+    for (const text of [
+      '550e8400-e29b-41d4-a716-446655440000',
+      '9007199254740993',
+      '123456789012',
+      'aaa-446655440000-bbb',
+    ]) {
       const hits = screenInput(text, 'internal').hits;
       expect(hits.some((h) => h.patternId === 'us_phone'), `phone matched in: ${text}`).toBe(
         false,
