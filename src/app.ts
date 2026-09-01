@@ -26,7 +26,7 @@ import { authContextPlugin } from './lib/auth-context.js';
 import { verifyBindActorContextPoolOrThrow } from './lib/db.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
-import { piiRedactingLogMethod } from './lib/pii-screener/log-redaction.js';
+import { createRedactingStream } from './lib/pii-screener/log-redaction.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
 import { adminBackendPlugin } from './modules/admin-backend/index.js';
 import { aiServicePlugin } from './modules/ai-service/index.js';
@@ -465,19 +465,26 @@ function defaultLoggerConfig(): object {
       paths: redactPaths.length > 0 ? redactPaths : ['req.headers.authorization'],
       remove: true,
     },
-    // Layer 3 whole-payload PII scrub (Sprint 1.2a). Complements —
-    // does not replace — `redact.paths` above. Paths cover the fields
-    // someone thought of; this pass covers the two residual vectors a
-    // path list structurally cannot: Error.message/.stack (which are
-    // caller-shaped and can interpolate user values) and log call sites
-    // that do not exist yet.
+    // Layer 3 PII scrub (Sprint 1.2a). Complements — does not replace —
+    // `redact.paths` above. Paths cover the fields someone thought of;
+    // this pass covers the three residual vectors a path list
+    // structurally cannot:
+    //   1. Error.message / .stack — caller-shaped, can interpolate
+    //      user values (a pg error echoes the offending key)
+    //   2. Serializer output — Fastify's req serializer emits the URL
+    //      WITH its query string, which is entirely client-controlled
+    //   3. Log call sites that do not exist yet
     //
-    // Regex-only, high-confidence patterns only, with identifier-keyed
-    // values preserved verbatim for debuggability. See
+    // Applied at the DESTINATION STREAM rather than `hooks.logMethod`,
+    // because logMethod runs BEFORE serializers (so it never sees
+    // vector 2) and rebuilding objects there corrupts Fastify's request
+    // object, whose properties are prototype getters. Redacting the
+    // already-serialized line avoids both problems.
+    //
+    // Regex-only, high-confidence patterns only, with server-generated
+    // identifier keys preserved verbatim for debuggability. See
     // src/lib/pii-screener/log-redaction.ts for the full rationale.
-    hooks: {
-      logMethod: piiRedactingLogMethod,
-    },
+    stream: createRedactingStream(process.stdout),
     // Pretty print in dev only; production emits structured JSON for ingestion
     // by the audit + observability pipeline.
     transport:

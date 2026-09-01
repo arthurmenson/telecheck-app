@@ -192,7 +192,20 @@ Both are structural, so the mitigation is structural.
 
 **Part 1 — `redact.paths` (allowlist).** Exact, cheap, configured via `LOG_REDACT_PATHS`. Runs first with `remove: true`, so a listed path is dropped entirely. Current value includes `req.headers.authorization`, `req.body.password`, `req.body.token`, `req.body.message_text`.
 
-**Part 2 — whole-payload regex pass (`hooks.logMethod`).** `src/lib/pii-screener/log-redaction.ts`, wired in `defaultLoggerConfig()`. pino's `logMethod` hook is used rather than `formatters.log` because the hook sees **both** the merge object and the message string; `formatters.log` never sees the message. Traverses strings, arrays, plain objects, `Error` instances, `Map`, `Set`.
+**Part 2 — whole-line regex pass at the DESTINATION STREAM.** `src/lib/pii-screener/log-redaction.ts`, wired as `stream: createRedactingStream(process.stdout)` in `defaultLoggerConfig()`.
+
+#### Why the stream, and NOT `hooks.logMethod`
+
+`hooks.logMethod` is the obvious seam and it is the wrong one. Two reasons, both surfaced by Codex review of the first implementation:
+
+- **It runs BEFORE pino's serializers.** Fastify's `req`/`res` serializers turn request objects into log records *after* the hook has run — so anything a serializer produces is never seen. That includes **the request URL with its query string**, which is entirely client-controlled. `/?email=real.person@example.com` was a live leak vector under the hook design.
+- **Rebuilding objects there corrupts them.** Fastify request properties (`method`, `url`, `headers`, `host`, `ip`) are prototype getters. `Object.entries()` does not copy prototype getters, so cloning the request into a plain object hands the downstream serializer a structurally damaged input, producing empty or incomplete request records — deleting exactly the diagnostics an incident needs.
+
+Redacting at the destination stream avoids both: the line is already fully serialized (serializer output, child bindings, and message all present), and no live object is ever touched.
+
+#### Line handling
+
+Each line is parsed as pino NDJSON, walked with key-awareness, and re-serialized. If a line is not parseable JSON (a pretty-print transport, a partial chunk, a non-JSON warning) it falls back to a whole-line regex scrub — **fail safe**: an unparseable line is still scrubbed, it just loses the identifier carve-out. Batched multi-line chunks are handled per line, preserving framing.
 
 ### Regex-only — NER is deliberately NOT used at Layer 3
 
@@ -206,20 +219,23 @@ Layers 1 and 2 run regex + local NER. Layer 3 runs regex only:
 
 Low-confidence patterns (IPv4, IPv6, context-bound passport) are **not** scrubbed at Layer 3. An IP address in a log line is usually infrastructure, not PII; removing it would delete genuinely useful diagnostic signal during exactly the incident the logs exist for.
 
-### Identifier-key preservation
+### Identifier-key preservation — keys on the KEY NAME only
 
-A naive value-scrub is worse than useless: `us_ssn` also matches any bare 9-digit run, and logs are full of legitimate numeric identifiers. Redacting `consult_id` would blind the operator mid-incident.
+A blanket string scrub has a real false-positive mode: `us_ssn` also matches any bare 9-digit run. Most identifiers here are safe from it — UUIDs never expose a 9-digit run bounded by non-digits, and codes like `pg_sqlstate` are too short — but a ULID (26 chars of Crockford base32) can by chance contain exactly nine consecutive digits, and redacting a ULID mid-incident would break correlation.
 
-Values under identifier keys are therefore **preserved verbatim** — matched on the KEY NAME (`*_id` / `*Id` suffix, plus an explicit safe set: `tenant_id`, `route`, `status`, `pg_sqlstate`, `provider`, …). Because the carve-out keys on the name and never the value's content, it cannot be steered by user input.
+So values under **server-generated** identifier keys are preserved verbatim, matched on the key name (`*_id` / `*Id` suffix, plus an explicit set: `tenant_id`, `route`, `method`, `status`, `pg_sqlstate`, `provider`, …).
 
-### Depth bound FAILS OPEN — a deliberate asymmetry
+**Client-influenced keys are deliberately NOT carved out.** `url`, `path`, `query`, `params`, `body`, `headers`, `host` are all caller-shaped; their values ARE scrubbed. `url` was present in the first draft's carve-out and was a genuine leak — the claim that a key-name carve-out "cannot be steered by user input" holds only when the key's *value* is server-generated, which for `url` it is not.
 
-`redactLogPayload` is depth-bounded at 32 and returns the value **unredacted** at the bound, rather than throwing. This is the opposite of the `audit_bound` payload walker, which fails closed. The asymmetry is intentional:
+The carve-out also applies only to **scalar** values. A nested object under an identifier key is still walked, so `{ request_id: { note: "<pii>" } }` cannot slip through by nesting.
 
-- Rejecting an over-deep **audit** payload costs one API call and protects append-only, purge-exempt storage.
-- Throwing from inside a **logger** would break logging itself. The failure mode is losing the operational record during an incident — strictly worse than a pathologically-nested log object going unscrubbed. Logs are also purgeable; audit rows are not.
+### Depth handling — fails CLOSED via sentinel
 
-Both behaviours are pinned by test.
+Past `LOG_REDACTION_MAX_DEPTH` (32) the subtree is replaced with the fixed `[REDACTED:DEPTH_LIMIT]` sentinel.
+
+The first implementation returned the raw subtree at the bound, arguing that throwing would break logging and that this was the only alternative. That was a false dichotomy, and it left a deterministic bypass: 33 nested containers followed by an email would emit unscreened. Substituting a sentinel keeps the logger available (no throw) **and** refuses to emit unscreened content.
+
+Note the contrast with the `audit_bound` payload walker, which fails closed by *rejecting the request*. Both fail closed; they differ in mechanism because the costs differ — rejecting an over-deep audit payload costs one API call, whereas refusing to log would cost the operational record during an incident. Both behaviours are pinned by test.
 
 ## Layer 4 — AI vendor payload sanitization
 

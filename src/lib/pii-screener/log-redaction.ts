@@ -3,7 +3,7 @@
  *
  * Layer 3 is the last line of defense on the LOGGING path. Layers 1 and 2
  * gate ingress and egress; this one assumes both were bypassed and scrubs
- * whatever is about to be serialized into the log stream.
+ * whatever is about to be written to the log stream.
  *
  * ## Why a whole-payload pass rather than more `redact.paths` entries
  *
@@ -17,15 +17,40 @@
  * name. It is:
  *
  *   1. **Error objects.** Four call sites log `err`. An `Error.message`
- *      is caller-shaped: a Postgres error can echo a offending value, a
+ *      is caller-shaped: a Postgres error can echo an offending value, a
  *      driver can interpolate a parameter, a future `throw new
  *      Error(\`bad input: ${x}\`)` can carry anything.
- *   2. **Future call sites.** A path allowlist protects the code that
+ *   2. **Serializer output.** Fastify's automatic request logging
+ *      serializes `req` — including the URL WITH ITS QUERY STRING, which
+ *      is entirely client-controlled. `/?email=real.person@example.com`
+ *      is a live leak vector.
+ *   3. **Future call sites.** A path allowlist protects the code that
  *      exists today; the next handler someone writes is unprotected
  *      until somebody remembers to extend the list.
  *
- * Both are structural, so the mitigation has to be structural: run the
- * detector over the whole payload, whatever shape it has.
+ * All three are structural, so the mitigation has to be structural.
+ *
+ * ## Why the redaction runs at the STREAM, not at `hooks.logMethod`
+ *
+ * The obvious hook — `hooks.logMethod` — is WRONG here, for two reasons
+ * found in Codex review of the first implementation:
+ *
+ *   - **It runs BEFORE pino's serializers.** Fastify's `req`/`res`
+ *     serializers turn request objects into log records after the hook
+ *     has already run, so anything a serializer produces (notably the
+ *     request URL + query string) is never seen by a `logMethod` pass.
+ *   - **Recursively rebuilding objects there corrupts them.** Fastify
+ *     request properties (`method`, `url`, `headers`, `host`, `ip`) are
+ *     prototype getters. `Object.entries()` does not copy prototype
+ *     getters, so cloning the request into a plain object hands the
+ *     downstream serializer a structurally damaged input and produces
+ *     empty or incomplete request records — deleting exactly the
+ *     diagnostics an incident needs.
+ *
+ * Redacting at the destination stream avoids both problems: the line is
+ * already fully serialized (serializer output, child bindings, and the
+ * message are all present), and no live object is ever touched or
+ * rebuilt.
  *
  * ## Regex-only — NER is deliberately NOT used here
  *
@@ -41,17 +66,35 @@
  *     STRUCTURED identifiers — an SSN, an email, a phone, a card number.
  *     That is precisely regex's strength.
  *
- * ## Identifier-key preservation
+ * ## Identifier-key preservation, and why it keys on the KEY only
  *
- * A naive value-scrub is worse than useless: the `us_ssn` pattern also
- * matches any bare 9-digit run, and logs are full of legitimate numeric
- * identifiers. Redacting `consult_id` or `tenant_id` would blind the
- * operator during exactly the incident the logs exist for.
+ * A blanket string scrub has a real false-positive mode: `us_ssn` also
+ * matches any bare 9-digit run. Most identifiers in this codebase are
+ * safe from it — UUIDs never expose a 9-digit run bounded by non-digits,
+ * and short codes like `pg_sqlstate` are too short — but a ULID
+ * (26 chars of Crockford base32) can by chance contain exactly nine
+ * consecutive digits, and redacting a ULID mid-incident would break
+ * correlation.
  *
- * So values under keys that are structurally identifiers (`*_id`, plus
- * an explicit safe set) are PRESERVED verbatim. This is a deliberate,
- * narrow carve-out — it applies to the KEY NAME, not the value's
- * content, so it cannot be steered by user input.
+ * So values under keys that are structurally identifiers are preserved
+ * verbatim. **The carve-out is deliberately narrow and keys ONLY on the
+ * key name**, never the value's content.
+ *
+ * Critically, it does NOT include client-influenced fields. `url` was in
+ * the first draft and was a genuine leak (query strings are
+ * caller-controlled); it has been removed, so request URLs ARE scrubbed.
+ * Only server-generated names remain.
+ *
+ * ## Depth handling — fails CLOSED via sentinel
+ *
+ * Past the depth bound the subtree is replaced with a fixed
+ * `[REDACTED:DEPTH_LIMIT]` sentinel rather than returned as-is. The
+ * first implementation returned the raw subtree, which let 33 nested
+ * containers followed by an email deterministically bypass Layer 3.
+ * Substituting a sentinel keeps the logger available (no throw) while
+ * still refusing to emit unscreened content — so unlike the
+ * `audit_bound` walker, this fails closed WITHOUT sacrificing the
+ * operational record.
  *
  * Spec references:
  *   - docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Layer 3
@@ -60,6 +103,12 @@
  */
 
 import { PII_PATTERNS } from './patterns.js';
+
+/** Sentinel written in place of a subtree that exceeded the depth bound. */
+export const DEPTH_LIMIT_SENTINEL = '[REDACTED:DEPTH_LIMIT]';
+
+/** Maximum nesting depth walked before the sentinel is substituted. */
+export const LOG_REDACTION_MAX_DEPTH = 32;
 
 /**
  * Replacement token written in place of a detected value. Deliberately
@@ -71,19 +120,22 @@ function redactionToken(label: string): string {
 }
 
 /**
- * Keys whose values are preserved verbatim because they are structural
- * identifiers, not free-text. Matched case-insensitively, exact.
+ * Keys whose values are preserved verbatim because they are
+ * SERVER-GENERATED structural identifiers, not free-text and not
+ * client-influenced. Matched case-insensitively, exact.
  *
- * The `*_id` / `*Id` suffix rule below covers most of these generatively;
- * this set catches the ones that do not carry the suffix.
+ * The `*_id` / `*Id` suffix rule below covers most identifiers
+ * generatively; this set catches the ones that do not carry the suffix.
+ *
+ * DELIBERATELY ABSENT: `url`, `path`, `query`, `params`, `body`,
+ * `headers`, `host`, `referer`, `user_agent` — all caller-influenced.
+ * Their values ARE scrubbed.
  */
 const IDENTIFIER_KEYS: ReadonlySet<string> = new Set([
   'tenant',
   'tenantid',
-  'actor',
-  'route',
+  'route', // Fastify route PATTERN (e.g. '/v0/ai/chat'), server-defined
   'method',
-  'url',
   'status',
   'statuscode',
   'code',
@@ -100,21 +152,21 @@ const IDENTIFIER_KEYS: ReadonlySet<string> = new Set([
   'gate',
   'event',
   'purpose',
-  'reason',
   'provider',
   'model',
   'severity',
   'detector_version',
+  'name', // Error.name
 ]);
 
 /**
- * True when a key names a structural identifier whose value must be
- * preserved for debuggability.
+ * True when a key names a server-generated structural identifier whose
+ * value must be preserved for debuggability.
  *
  * Rule: an exact match in IDENTIFIER_KEYS, or a `_id` / `Id` suffix
  * (`consult_id`, `turnId`, `ai_chat_session_id`, …).
  */
-function isIdentifierKey(key: string): boolean {
+export function isIdentifierKey(key: string): boolean {
   const lower = key.toLowerCase();
   if (IDENTIFIER_KEYS.has(lower)) return true;
   return lower.endsWith('_id') || lower.endsWith('id');
@@ -146,110 +198,110 @@ export function redactString(value: string): string {
 }
 
 /**
- * Recursively redact a log payload of arbitrary shape.
+ * Recursively redact an already-PARSED log record.
  *
- * Handles: strings, arrays, plain objects, Error instances, Maps, Sets.
- * Leaves numbers / booleans / null / undefined untouched (they cannot
- * carry a regex-detectable identifier).
+ * Operates on plain JSON values only (the output of `JSON.parse`), so
+ * there are no prototype getters, class instances, or live framework
+ * objects to damage — that hazard is structurally impossible here
+ * because this only ever runs on post-serialization data.
  *
- * Depth-bounded. Unlike the `audit_bound` payload walker — which FAILS
- * CLOSED by rejecting an unscreenable payload — this one fails OPEN at
- * the bound, returning the value unredacted. That asymmetry is
- * deliberate and worth stating plainly:
- *
- *   - Rejecting an over-deep AUDIT payload costs one API call and
- *     protects append-only, purge-exempt storage.
- *   - Throwing from inside a LOGGER would break logging itself — the
- *     failure mode is losing the operational record during an incident,
- *     which is strictly worse than a deeply-nested log object going
- *     unscrubbed. Logs are also purgeable; audit rows are not.
- *
- * The bound is set high (32) so realistic log payloads never reach it.
+ * Past `LOG_REDACTION_MAX_DEPTH` the subtree is replaced with
+ * `DEPTH_LIMIT_SENTINEL` (fails closed; see module header).
  */
-export function redactLogPayload(value: unknown, depth = 0): unknown {
-  if (depth > 32) return value;
+export function redactParsedRecord(value: unknown, depth = 0): unknown {
+  if (depth > LOG_REDACTION_MAX_DEPTH) return DEPTH_LIMIT_SENTINEL;
 
-  if (typeof value === 'string') {
-    return redactString(value);
-  }
-
+  if (typeof value === 'string') return redactString(value);
   if (value === null || value === undefined) return value;
+  if (typeof value !== 'object') return value;
 
   if (Array.isArray(value)) {
-    return value.map((v) => redactLogPayload(v, depth + 1));
+    return value.map((v) => redactParsedRecord(v, depth + 1));
   }
 
-  if (value instanceof Error) {
-    // Errors are the highest-value target here — `message` and `stack`
-    // are the fields most likely to have interpolated a user value.
-    // Return a plain object rather than mutating the Error (mutating a
-    // shared error object would corrupt it for other consumers).
-    const scrubbed: Record<string, unknown> = {
-      name: value.name,
-      message: redactString(value.message),
-    };
-    if (typeof value.stack === 'string') {
-      scrubbed['stack'] = redactString(value.stack);
-    }
-    // Preserve any enumerable own props (pg errors carry `code`,
-    // `detail`, `constraint`, …) — scrubbed the same way.
-    for (const [k, v] of Object.entries(value)) {
-      if (k === 'name' || k === 'message' || k === 'stack') continue;
-      scrubbed[k] = isIdentifierKey(k) ? v : redactLogPayload(v, depth + 1);
-    }
-    return scrubbed;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    // Identifier keys keep their values verbatim so the operator can
+    // still correlate the log line during an incident. Only applies
+    // when the value is a scalar — a nested object under an identifier
+    // key is still walked, since the carve-out is about ID values, not
+    // about exempting whole subtrees.
+    out[k] =
+      isIdentifierKey(k) && (typeof v !== 'object' || v === null)
+        ? v
+        : redactParsedRecord(v, depth + 1);
   }
-
-  if (value instanceof Map) {
-    const out = new Map<unknown, unknown>();
-    for (const [k, v] of value.entries()) {
-      out.set(k, redactLogPayload(v, depth + 1));
-    }
-    return out;
-  }
-
-  if (value instanceof Set) {
-    return new Set([...value].map((v) => redactLogPayload(v, depth + 1)));
-  }
-
-  if (typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) {
-      // Identifier keys keep their values verbatim so the operator can
-      // still correlate the log line during an incident.
-      out[k] = isIdentifierKey(k) ? v : redactLogPayload(v, depth + 1);
-    }
-    return out;
-  }
-
-  return value;
+  return out;
 }
 
 /**
- * pino `hooks.logMethod` implementation.
+ * Redact a single serialized log line.
  *
- * pino calls this in place of the underlying log method, giving access
- * to BOTH the merge object and the message string before serialization —
- * which `formatters.log` alone does not provide (it never sees the
- * message).
+ * Fast path: the line is pino NDJSON, so parse it, walk it with
+ * key-awareness, and re-serialize. That gives identifier-key
+ * preservation without a false-positive risk on ULIDs.
+ *
+ * Fallback: if the line is not parseable JSON (a transport wrote
+ * pretty-printed output, a partial chunk, a non-JSON warning), apply the
+ * whole-line regex instead. This FAILS SAFE — an unparseable line is
+ * still scrubbed, it just loses the identifier carve-out.
+ */
+export function redactLogLine(line: string): string {
+  const trimmed = line.trimEnd();
+  const newline = line.slice(trimmed.length);
+  if (trimmed.length === 0) return line;
+
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      return JSON.stringify(redactParsedRecord(parsed)) + newline;
+    } catch {
+      // Not valid JSON after all — fall through to the string pass.
+    }
+  }
+  return redactString(trimmed) + newline;
+}
+
+/**
+ * Minimal writable-stream shape pino accepts as a destination.
+ */
+export interface LogDestination {
+  write(chunk: string): void;
+}
+
+/**
+ * Wrap a destination stream so every line written to it passes through
+ * Layer 3 redaction.
  *
  * Wire it in `defaultLoggerConfig()`:
  *
- *   hooks: { logMethod: piiRedactingLogMethod }
+ *   stream: createRedactingStream(process.stdout)
  *
  * This composes with — does not replace — pino's `redact.paths`. Those
- * run first and use `remove: true`, so an explicitly-listed path is
- * dropped entirely; this pass then scrubs whatever survived.
+ * run during serialization with `remove: true`, so an explicitly-listed
+ * path is dropped entirely; this pass then scrubs whatever survived,
+ * INCLUDING serializer-generated content such as the request URL.
+ *
+ * A chunk may contain multiple newline-delimited records (pino batches
+ * under load), so each line is redacted independently.
  */
-export function piiRedactingLogMethod(
-  this: { [k: string]: unknown },
-  args: unknown[],
-  method: (...a: unknown[]) => void,
-): void {
-  const redacted = args.map((arg) =>
-    typeof arg === 'string' || (arg !== null && typeof arg === 'object')
-      ? redactLogPayload(arg)
-      : arg,
-  );
-  method.apply(this, redacted);
+export function createRedactingStream(dest: LogDestination): LogDestination {
+  return {
+    write(chunk: string): void {
+      if (typeof chunk !== 'string' || chunk.length === 0) {
+        dest.write(chunk);
+        return;
+      }
+      // Preserve the chunk's line structure exactly.
+      const parts = chunk.split('\n');
+      const redacted = parts
+        .map((part, i) =>
+          // The final element after a trailing '\n' is an empty string;
+          // leave it alone so join() reproduces the original framing.
+          i === parts.length - 1 && part === '' ? part : redactLogLine(part),
+        )
+        .join('\n');
+      dest.write(redacted);
+    },
+  };
 }
