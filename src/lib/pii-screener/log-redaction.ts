@@ -65,24 +65,35 @@
  *     STRUCTURED identifiers — an SSN, an email, a phone, a card number.
  *     That is precisely regex's strength.
  *
- * ## Identifier-key preservation, and why it keys on the KEY only
+ * ## Identifier preservation — BOTH the key name and the value shape
  *
  * A blanket string scrub has a real false-positive mode: `us_ssn` also
- * matches any bare 9-digit run. Most identifiers in this codebase are
- * safe from it — UUIDs never expose a 9-digit run bounded by non-digits,
- * and short codes like `pg_sqlstate` are too short — but a ULID
- * (26 chars of Crockford base32) can by chance contain exactly nine
- * consecutive digits, and redacting a ULID mid-incident would break
- * correlation.
+ * matches any bare 9-digit run, and a ULID (26 chars of Crockford
+ * base32) can by chance contain exactly nine consecutive digits.
+ * Redacting a ULID mid-incident would break correlation.
  *
- * So values under keys that are structurally identifiers are preserved
- * verbatim. **The carve-out is deliberately narrow and keys ONLY on the
- * key name**, never the value's content.
+ * So a narrow carve-out exists — but it requires **two** conditions,
+ * not one:
  *
- * Critically, it does NOT include client-influenced fields. `url` was in
- * the first draft and was a genuine leak (query strings are
+ *   1. the enclosing KEY names an identifier (`*_id` / `*Id`, or a
+ *      member of `IDENTIFIER_KEYS`), AND
+ *   2. the VALUE is shaped like an identifier (a UUID or a ULID)
+ *
+ * Key name alone is not sufficient and was a deterministic bypass in an
+ * earlier draft: `{"request_id":"person@example.com"}` and
+ * `{"patient_id":"123-45-6789"}` were copied verbatim purely because of
+ * the key. For a layer whose whole premise is that the earlier controls
+ * failed, trusting a caller-influenced or mistakenly-populated field on
+ * its name is exactly the wrong instinct. See `isPreservableIdentifier`.
+ *
+ * The key set also excludes client-influenced fields. `url` was in the
+ * first draft and was a genuine leak (query strings are
  * caller-controlled); it has been removed, so request URLs ARE scrubbed.
  * Only server-generated names remain.
+ *
+ * Nor does the carve-out propagate into containers: it applies only to a
+ * string that is the DIRECT value of an object property. Array frames
+ * reset it, so `{"request_id":[["<pii>"]]}` is screened normally.
  *
  * ## Numeric losslessness — why a token scanner, not JSON.parse
  *
@@ -180,6 +191,62 @@ export function isIdentifierKey(key: string): boolean {
   const lower = key.toLowerCase();
   if (IDENTIFIER_KEYS.has(lower)) return true;
   return lower.endsWith('_id') || lower.endsWith('id');
+}
+
+/**
+ * Canonical identifier VALUE shapes.
+ *
+ * The carve-out requires a match here in addition to an identifier key
+ * name. Key name alone is not sufficient — see `isPreservableIdentifier`.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Crockford base32, 26 chars — excludes I, L, O, U by design. */
+const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+/**
+ * True when a string may be preserved verbatim under an identifier key.
+ *
+ * ## Why the key name alone is NOT enough
+ *
+ * An earlier version exempted any string under an `*_id` / `*Id` key.
+ * Codex correctly rejected that: it is a deterministic bypass. Records
+ * like `{"request_id":"person@example.com"}` or
+ * `{"patient_id":"123-45-6789"}` would be copied verbatim purely
+ * because of the key's name. For a layer whose entire premise is that
+ * the earlier controls were bypassed, trusting a caller-influenced or
+ * mistakenly-populated field on its name is exactly the wrong instinct.
+ *
+ * So the carve-out now requires the VALUE to look like an identifier
+ * too — and only two shapes qualify: a UUID or a ULID.
+ *
+ * ## Why exactly these two, and why NOT "pure digits"
+ *
+ * The carve-out only ever MATTERS for values that would otherwise be
+ * redacted — i.e. values matching a high-confidence PII pattern.
+ * Ordinary identifiers that match no pattern (`Telecheck-US`,
+ * `/v0/ai/chat`, `GET`, the 5-digit `23505`) pass through
+ * `redactString` untouched and never needed an exemption at all.
+ *
+ * The one genuine collision is a **ULID that happens to contain exactly
+ * nine consecutive digits**, which `us_ssn` matches. UUIDs cannot
+ * collide (their hex runs are hyphen-separated at lengths that never
+ * expose a bounded 9-digit run) but are included for symmetry and
+ * future-proofing.
+ *
+ * A `^\d+$` shape was in an earlier draft and has been REMOVED. It let
+ * `{"trace_id":"4111111111111111"}` preserve a Luhn-valid card number,
+ * and it would equally have preserved a 9-digit SSN written into an id
+ * field. Since no identifier in this codebase is a long pure-digit
+ * string — ids are ULIDs and UUIDs, and short numeric codes survive
+ * without any exemption — dropping it costs nothing real and closes
+ * both holes.
+ *
+ * The residual is now narrow: a value must be a syntactically valid
+ * UUID or ULID to be exempted, and neither shape can encode an email,
+ * a phone number, a hyphenated SSN, or a card number.
+ */
+export function isPreservableIdentifier(value: string): boolean {
+  return UUID_RE.test(value) || ULID_RE.test(value);
 }
 
 /**
@@ -303,8 +370,15 @@ function redactJsonStringTokens(text: string): string | null {
         keyStack[keyStack.length - 1] = decoded;
         out += raw;
       } else {
+        // Preserve verbatim ONLY when BOTH hold: the enclosing key
+        // names an identifier AND the value actually looks like one.
+        // Key name alone is a deterministic bypass — see
+        // `isPreservableIdentifier`.
         const enclosingKey = keyStack[keyStack.length - 1] ?? null;
-        const preserve = enclosingKey !== null && isIdentifierKey(enclosingKey);
+        const preserve =
+          enclosingKey !== null &&
+          isIdentifierKey(enclosingKey) &&
+          isPreservableIdentifier(decoded);
         out += preserve ? raw : JSON.stringify(redactString(decoded));
       }
       i = next;

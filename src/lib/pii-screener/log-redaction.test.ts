@@ -11,7 +11,7 @@
  *   - server-generated identifier keys preserved; client-influenced keys
  *     (notably `url` with its query string) ARE scrubbed
  *   - full serialized-record round trip incl. Fastify-shaped req records
- *   - depth exhaustion fails CLOSED via sentinel
+ *   - identifier preservation requires BOTH key name and UUID/ULID value shape
  *   - non-JSON lines fall back to a whole-line scrub (fail safe)
  *   - stream wrapper preserves chunk/line framing and handles batches
  */
@@ -133,11 +133,30 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
     expect(redactLogLine(line)).not.toContain('real.person@example.com');
   });
 
-  it('preserves a scalar under an identifier key even if SSN-shaped', () => {
-    const line = JSON.stringify({ tenant_id: 'Telecheck-US', consult_id: '123456789' });
+  it('preserves a UUID/ULID under an identifier key', () => {
+    const line = JSON.stringify({
+      tenant_id: 'Telecheck-US',
+      turn_id: '550e8400-e29b-41d4-a716-446655440000',
+      account_id: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    });
     const out = redactLogLine(line);
-    expect(out).toContain('"tenant_id":"Telecheck-US"');
-    expect(out).toContain('"consult_id":"123456789"');
+    expect(out).toContain('Telecheck-US');
+    expect(out).toContain('550e8400-e29b-41d4-a716-446655440000');
+    expect(out).toContain('01ARZ3NDEKTSV4RRFFQ69G5FAV');
+  });
+
+  it('does NOT preserve a PII-shaped value merely because the key looks like an id', () => {
+    // Codex finding: key-name-only exemption was a deterministic
+    // bypass. Preservation now requires the VALUE to be a UUID or ULID.
+    const cases: Array<[string, string]> = [
+      [JSON.stringify({ request_id: 'person@example.com' }), 'person@example.com'],
+      [JSON.stringify({ patient_id: '123-45-6789' }), '123-45-6789'],
+      [JSON.stringify({ trace_id: '4111111111111111' }), '4111111111111111'],
+      [JSON.stringify({ consult_id: '123456789' }), '123456789'],
+    ];
+    for (const [line, leaked] of cases) {
+      expect(redactLogLine(line), `leaked via: ${line}`).not.toContain(leaked);
+    }
   });
 
   it('scrubs the same value under a non-identifier key', () => {
@@ -168,9 +187,9 @@ describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
     const deep = redactLogLine(JSON.stringify({ trace_id: [[['a@b.com']]] }));
     expect(deep).not.toContain('a@b.com');
 
-    // The direct scalar case still preserves.
-    const direct = redactLogLine(JSON.stringify({ consult_id: '123456789' }));
-    expect(direct).toContain('"consult_id":"123456789"');
+    // The direct scalar case still preserves when the value is a ULID.
+    const direct = redactLogLine(JSON.stringify({ consult_id: '01ARZ3NDEKTSV4RRFFQ69G5FAV' }));
+    expect(direct).toContain('01ARZ3NDEKTSV4RRFFQ69G5FAV');
   });
 
   it('rejects JSON-LIKE but invalid lines and falls back to whole-line scrub', () => {
