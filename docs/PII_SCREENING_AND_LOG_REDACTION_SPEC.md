@@ -253,17 +253,25 @@ Numbers keep an exemption because there is no value-shape test available for the
 
 Numeric lexemes are screened **as text and never parsed**, so a non-matching number is emitted byte-for-byte and precision is preserved. They are matched **whole**, never as substrings — otherwise the `us_phone` pattern would rewrite the legitimate 64-bit id `9007199254740993` as `900719[REDACTED:US phone number]`.
 
-The exemption is a small, closed, explicit allowlist keyed on the **root-relative path**, not the immediate key name:
+The exemption is a small, closed, explicit allowlist requiring **both** an exact root-relative path (case-sensitive) **and** a value inside that field's real domain:
 
-| Path | Written by |
-|---|---|
-| `time`, `pid`, `level` | pino, per record |
-| `responseTime`, `statusCode`, `res.statusCode` | Fastify request/response completion |
+| Path | Written by | Accepted domain |
+|---|---|---|
+| `time` | pino, per record | integer ms epoch, 2010-01-01 … 2100-01-01 |
+| `pid` | pino, per record | integer 1 … 4,194,304 (Linux PID max) |
+| `level` | pino, per record | integer 0 … 100 |
+| `responseTime` | Fastify | finite, 0 … 24h in ms |
+| `statusCode`, `res.statusCode` | Fastify | integer 100 … 599 |
 
-Two properties matter:
+Three properties matter, and each closes a bypass found in review:
 
 - **Not generative.** A `*_id` rule would preserve a bare SSN under `{"patient_id":123456789}` and a Luhn-valid card under `{"trace_id":4111111111111111}`.
-- **Not depth-blind.** A bare key set let a caller-shaped subtree shadow a trusted name — `{"payload":{"time":3125551212}}` emitted a phone number because the inner key spelled `time`. Every allowlisted field sits at a fixed position, so requiring the position costs nothing and removes the shadowing class entirely. An array frame has no key, so nothing inside one can resolve to an allowlisted path.
+- **Not depth-blind.** A bare key set let a caller-shaped subtree shadow a trusted name — `{"payload":{"time":3125551212}}` emitted a phone number because the inner key spelled `time`. An array frame has no key, so nothing inside one can resolve to an allowlisted path.
+- **Position is not provenance.** Path alone still trusts location over origin. The scanner sees serialized bytes and cannot tell whether pino wrote a root field or an application merge object collided with the name — `logger.info({ time: 3125551212 }, 'x')` puts a phone number at root `time`. The domain test is what actually closes this, and it is available precisely because these fields are machine-written with narrow ranges. Nothing matching `us_ssn` (9 digits) or `us_phone` (10 digits) fits any domain above.
+
+`time` deliberately does **not** accept an epoch in *seconds*: a 10-digit seconds epoch is indistinguishable from a bare phone number, and admitting that range would reopen the hole. If pino is ever reconfigured to seconds, timestamps get redacted — loud, safe, and immediately noticeable.
+
+**Known residual, and why it is the floor.** A 13-digit Luhn-valid integer inside the epoch window is preserved at `time`. This is not closable: a legitimate ms epoch *is* a 13-digit integer in that window, and about one in ten is Luhn-valid by chance. Distinguishing it from a 13-digit card number is impossible from the value alone, and screening it is what mangled `time` on ~10% of lines in the first place. Every other field's domain excludes every high-confidence pattern outright.
 
 ### Chunk boundaries and oversized records
 

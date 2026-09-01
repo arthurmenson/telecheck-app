@@ -91,7 +91,7 @@
  * NUMBERS are different and DO keep a carve-out, because there is no
  * value-shape test available for them and pino writes a 13-digit ms
  * epoch on every line. That carve-out is an explicit closed allowlist
- * of pino-written fields — see NUMERIC_PRESERVE_PATHS — never a
+ * of pino-written fields — see NUMERIC_PRESERVE_RULES — never a
  * generative rule.
  *
  * ## Numeric losslessness — why a token scanner, not JSON.parse
@@ -145,27 +145,99 @@ function redactionToken(label: string): string {
  * string path there is no value-shape test available to compensate, so
  * this set carries the entire weight on its own.
  *
- * Anchored to ROOT-RELATIVE PATHS, not bare key names. A bare key set is
+ * ## Position AND value, because position alone is not provenance
+ *
+ * Preservation requires BOTH an exact root-relative path AND a value
+ * inside that field's real domain.
+ *
+ * Position was added first, to close nested shadowing: a bare key set is
  * depth-blind, so `{"payload":{"time":3125551212}}` preserved a phone
- * number: `payload` is application data and its contents are
- * caller-controlled, but the inner key spelled `time` matched. Every
- * member below is written by pino or Fastify at a FIXED position in the
- * record, so pinning the position costs nothing and removes the entire
- * nested-shadowing class.
+ * number because the inner key spelled `time`.
+ *
+ * But position alone still trusts location rather than origin. The
+ * scanner sees serialized bytes and cannot tell whether pino wrote a
+ * root field or an application merge object collided with the name, so
+ * `logger.info({ time: 3125551212 }, 'x')` put a phone number at root
+ * `time` and it was preserved.
+ *
+ * Value validation is what actually closes that, and it is available
+ * here precisely because these fields are machine-written with narrow
+ * domains — a ms epoch, a PID, a log level, an HTTP status, a duration.
+ * Nothing matching `us_ssn` (9 digits) or `us_phone` (10 digits) fits
+ * any of them.
+ *
+ * Paths are matched CASE-SENSITIVELY. pino and Fastify write these names
+ * in exactly one spelling, so accepting `Time` or `STATUSCODE` only
+ * widens the surface.
+ *
+ * ## Known residual, and why it is the floor
+ *
+ * A 13-digit Luhn-valid integer inside the epoch window is preserved at
+ * `time`. That is not closable: a legitimate ms epoch IS a 13-digit
+ * integer in that window, and about one in ten is Luhn-valid by chance.
+ * Distinguishing it from a 13-digit card number is impossible from the
+ * value alone, and screening it is what mangled `time` on ~10% of lines
+ * in the first place. Every other field's domain excludes every
+ * high-confidence pattern outright.
  */
-const NUMERIC_PRESERVE_PATHS: ReadonlySet<string> = new Set([
-  // pino's own per-record metadata, always at the root object.
-  'time',
-  'pid',
-  'level',
-  // Fastify's request/response completion fields. `statusCode` appears at
-  // the root under some configurations and under pino's default `res`
-  // serializer in others; both fixed positions are listed rather than
-  // allowing the key at any depth.
-  'responsetime',
-  'statuscode',
-  'res.statuscode',
-]);
+interface NumericPreserveRule {
+  /** Exact root-relative path, case-sensitive. */
+  readonly path: string;
+  /**
+   * Domain test for the value. Receives the parsed number — safe because
+   * the RAW lexeme is what gets emitted, so this parse only informs a
+   * boolean and can never round-trip a value into the output.
+   */
+  readonly accepts: (value: number) => boolean;
+}
+
+const NUMERIC_PRESERVE_RULES: readonly NumericPreserveRule[] = [
+  {
+    // pino's ms epoch. Bounded to 2010-01-01 .. 2100-01-01, which is
+    // 13 digits throughout — so a 9-digit SSN or 10-digit phone placed
+    // here falls outside and is screened.
+    //
+    // Deliberately NOT widened to accept epoch SECONDS. A 10-digit
+    // seconds epoch is indistinguishable from a bare phone number, and
+    // admitting that range would reopen the hole. If pino is ever
+    // reconfigured to seconds, timestamps get redacted — loud, safe, and
+    // immediately noticeable.
+    path: 'time',
+    accepts: (v) => Number.isInteger(v) && v >= 1_262_304_000_000 && v <= 4_102_444_800_000,
+  },
+  {
+    // Linux caps PID at 2^22; 7 digits max excludes every pattern.
+    path: 'pid',
+    accepts: (v) => Number.isInteger(v) && v >= 1 && v <= 4_194_304,
+  },
+  {
+    // pino levels run 10..70; custom levels are permitted, so allow a
+    // little headroom while staying far below any pattern's digit count.
+    path: 'level',
+    accepts: (v) => Number.isInteger(v) && v >= 0 && v <= 100,
+  },
+  {
+    // Fastify duration in ms, fractional. Capped at 24h — well below the
+    // 9-digit floor of the shortest high-confidence numeric pattern.
+    path: 'responseTime',
+    accepts: (v) => Number.isFinite(v) && v >= 0 && v < 86_400_000,
+  },
+  // HTTP status. Root-level under some configurations, under pino's
+  // default `res` serializer in others; both fixed positions are listed
+  // rather than allowing the key at any depth.
+  {
+    path: 'statusCode',
+    accepts: (v) => Number.isInteger(v) && v >= 100 && v <= 599,
+  },
+  {
+    path: 'res.statusCode',
+    accepts: (v) => Number.isInteger(v) && v >= 100 && v <= 599,
+  },
+];
+
+const NUMERIC_PRESERVE_BY_PATH: ReadonlyMap<string, NumericPreserveRule> = new Map(
+  NUMERIC_PRESERVE_RULES.map((rule) => [rule.path, rule]),
+);
 
 /**
  * Resolve the root-relative path of the value currently being scanned.
@@ -181,9 +253,26 @@ function resolveNumericPath(keyStack: ReadonlyArray<string | null>): string | nu
   for (let i = 1; i < keyStack.length; i++) {
     const frame = keyStack[i];
     if (frame == null) return null;
-    parts.push(frame.toLowerCase());
+    parts.push(frame);
   }
   return parts.join('.');
+}
+
+/**
+ * Decide whether a numeric lexeme may be emitted verbatim.
+ *
+ * Requires an exact path match AND a value inside that field's domain.
+ * The raw lexeme is always what gets emitted; `Number(raw)` here only
+ * feeds the boolean.
+ */
+function shouldPreserveNumber(keyStack: ReadonlyArray<string | null>, raw: string): boolean {
+  const path = resolveNumericPath(keyStack);
+  if (path === null) return false;
+  const rule = NUMERIC_PRESERVE_BY_PATH.get(path);
+  if (rule === undefined) return false;
+  const value = Number(raw);
+  if (Number.isNaN(value)) return false;
+  return rule.accepts(value);
 }
 
 /**
@@ -422,15 +511,18 @@ function redactJsonStringTokens(text: string): string | null {
         // value-shape test) and it was removed as unsound. A number has
         // no shape to test at all, so nothing would compensate here.
         //
-        // It is matched on the ROOT-RELATIVE PATH, not the immediate key.
-        // A bare key set is depth-blind, so a caller-shaped subtree could
-        // shadow a trusted name: `{"payload":{"time":3125551212}}` emitted
-        // a phone number verbatim because the inner key spelled `time`.
+        // Preservation requires BOTH an exact root-relative path AND a
+        // value inside that field's domain — see NUMERIC_PRESERVE_RULES.
+        // Matching the immediate key let a caller-shaped subtree shadow a
+        // trusted name (`{"payload":{"time":3125551212}}`); matching the
+        // path alone still trusted location over provenance, since an
+        // application merge object can collide with a root field name
+        // (`logger.info({ time: 3125551212 }, 'x')`).
         // Every allowlisted field sits at a fixed position in the record,
         // so requiring the position costs nothing.
-        const numericPath = resolveNumericPath(keyStack);
-        const preserveNumber = numericPath !== null && NUMERIC_PRESERVE_PATHS.has(numericPath);
-        out += preserveNumber ? num.raw : redactNumericLexeme(num.raw);
+        out += shouldPreserveNumber(keyStack, num.raw)
+          ? num.raw
+          : redactNumericLexeme(num.raw);
         i = num.next;
         continue;
       }

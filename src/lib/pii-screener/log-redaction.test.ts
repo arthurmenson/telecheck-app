@@ -743,7 +743,7 @@ describe('redactLogLine — numeric JSON values', () => {
   it('does NOT preserve a numeric value merely because the key looks like an id', () => {
     // This assertion previously ran the other way, back when numeric
     // preservation reused the generative *_id key rule. That rule was
-    // replaced by the closed NUMERIC_PRESERVE_PATHS allowlist precisely
+    // replaced by the closed NUMERIC_PRESERVE_RULES allowlist precisely
     // because it exempted PII: `consult_id` is attacker-influencable in
     // shape, and a nine-digit value under it is indistinguishable from
     // an SSN. See the allowlist block below for the full reasoning.
@@ -832,6 +832,53 @@ describe('redactLogLine — numeric preservation is an allowlist, not the *_id r
       const out = redactLogLine(line);
       expect(out, `leaked numeric via: ${line}`).not.toContain(leaked);
       expect(() => JSON.parse(out) as unknown).not.toThrow();
+    }
+  });
+
+  it('does NOT preserve PII placed AT an allowlisted root key', () => {
+    // Codex finding: path matching authenticates location, not
+    // provenance. The scanner sees serialized bytes and cannot tell
+    // whether pino wrote a root field or an application merge object
+    // collided with the name — `logger.info({ time: 3125551212 }, 'x')`
+    // puts a phone number at root `time`.
+    //
+    // Closed by requiring the value to sit inside the field's real
+    // domain. These fields are machine-written with narrow ranges, and
+    // nothing matching us_ssn (9 digits) or us_phone (10 digits) fits
+    // any of them.
+    const cases: Array<[string, string]> = [
+      ['{"time":3125551212}', '3125551212'],
+      ['{"time":123456789}', '123456789'],
+      ['{"pid":123456789}', '123456789'],
+      ['{"pid":3125551212}', '3125551212'],
+      ['{"level":123456789}', '123456789'],
+      ['{"level":4111111111111111}', '4111111111111111'],
+      ['{"responseTime":3125551212}', '3125551212'],
+      ['{"statusCode":123456789}', '123456789'],
+      ['{"res":{"statusCode":3125551212}}', '3125551212'],
+    ];
+    for (const [line, leaked] of cases) {
+      const out = redactLogLine(line);
+      expect(out, `leaked numeric via: ${line}`).not.toContain(leaked);
+      expect(() => JSON.parse(out) as unknown).not.toThrow();
+    }
+  });
+
+  it('matches allowlisted paths case-SENSITIVELY', () => {
+    // pino and Fastify write these names in exactly one spelling, so
+    // accepting `Time` or `STATUSCODE` would only widen the surface.
+    const cases: Array<[string, string]> = [
+      ['{"Time":123456789}', '123456789'],
+      ['{"TIME":3125551212}', '3125551212'],
+      ['{"Pid":123456789}', '123456789'],
+      ['{"Level":3125551212}', '3125551212'],
+      ['{"ResponseTime":123456789}', '123456789'],
+      ['{"statuscode":123456789}', '123456789'],
+      ['{"Res":{"statusCode":123456789}}', '123456789'],
+      ['{"res":{"StatusCode":123456789}}', '123456789'],
+    ];
+    for (const [line, leaked] of cases) {
+      expect(redactLogLine(line), `leaked via case variant: ${line}`).not.toContain(leaked);
     }
   });
 

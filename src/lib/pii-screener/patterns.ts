@@ -202,7 +202,7 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
     //
     // Trade-off accepted: a standalone ten-digit integer under an
     // arbitrary key redacts even when it is not a phone number. Numeric
-    // fields pino itself emits are protected by NUMERIC_PRESERVE_PATHS;
+    // fields pino itself emits are protected by NUMERIC_PRESERVE_RULES;
     // beyond those there is no shape test that separates a bare phone
     // number from a bare ten-digit counter, and Layer 3 is a last-line
     // defense where a false redaction costs less than a leak.
