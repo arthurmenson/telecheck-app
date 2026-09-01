@@ -276,19 +276,29 @@ function shouldPreserveNumber(keyStack: ReadonlyArray<string | null>, raw: strin
 }
 
 /**
- * Apply the high-confidence regex patterns to a single string, replacing
- * every match with its redaction token.
+ * Apply the Layer-3-eligible regex patterns to a single string,
+ * replacing every match with its redaction token.
  *
- * Only `high_confidence` patterns run here. Low-confidence patterns
- * (IPv4, IPv6, the context-bound passport form) are the ones most likely
- * to collide with legitimate operational values in a log line — an IP
- * address in a log is usually infrastructure, not PII, and scrubbing it
- * would remove genuinely useful diagnostic signal.
+ * Selection is by `pattern.redactInLogs`, NOT by `pattern.confidence`.
+ *
+ * Filtering on `confidence` was the original implementation and it was
+ * wrong, because that field answers a different question — it drives the
+ * Layer 1 route decision (block vs redact-inline), and two patterns can
+ * share `low_confidence` for entirely unrelated reasons:
+ *
+ *   - `ipv4` / `ipv6` are genuinely ambiguous in a log line. An IP there
+ *     is usually infrastructure, and scrubbing it deletes the diagnostic
+ *     signal logs exist for. These stay excluded.
+ *   - `us_passport` is low-confidence only because it needs CONTEXT. The
+ *     pattern requires the literal word "passport" adjacent to the
+ *     value, so a match is high-signal rather than noisy. Excluding it
+ *     let `passport no. AB1234567` reach the log destination
+ *     unredacted (Codex finding, Sprint 1.2a).
  */
 export function redactString(value: string): string {
   let out = value;
   for (const pattern of PII_PATTERNS) {
-    if (pattern.confidence !== 'high_confidence') continue;
+    if (!pattern.redactInLogs) continue;
     // Fresh regex per call: PII_PATTERNS entries carry /g, and sharing
     // lastIndex across invocations would make redaction order-dependent.
     const re = new RegExp(pattern.regex.source, pattern.regex.flags);

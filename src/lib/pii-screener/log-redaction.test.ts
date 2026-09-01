@@ -7,7 +7,8 @@
  * corrupts Fastify's prototype-getter-backed request object).
  *
  * Coverage:
- *   - high-confidence patterns scrubbed; low-confidence deliberately not
+ *   - pattern selection is by `redactInLogs`, not `confidence`: the
+ *     context-bound passport form IS scrubbed; IP addresses are not
  *   - EVERY string value and property name is screened — no carve-out
  *   - real identifiers survive because they match no pattern, not because
  *     they are exempted
@@ -29,7 +30,7 @@ import {
   redactString,
 } from './log-redaction.js';
 
-describe('redactString — high-confidence patterns only', () => {
+describe('redactString — Layer-3-eligible patterns (redactInLogs)', () => {
   it('scrubs an SSN', () => {
     expect(redactString('failed for 123-45-6789')).toBe(
       'failed for [REDACTED:US Social Security Number]',
@@ -59,9 +60,46 @@ describe('redactString — high-confidence patterns only', () => {
     expect(redactString(s)).toBe(s);
   });
 
-  it('does NOT scrub low-confidence patterns (IPv4 stays for diagnostics)', () => {
-    const s = 'upstream 10.0.0.42 timed out';
-    expect(redactString(s)).toBe(s);
+  it('does NOT scrub IP addresses — operational signal, not PII', () => {
+    for (const s of ['upstream 10.0.0.42 timed out', 'peer 2001:db8::1 reset']) {
+      expect(redactString(s), `scrubbed diagnostic value: ${s}`).toBe(s);
+    }
+  });
+
+  it('DOES scrub a context-bound passport number', () => {
+    // Codex finding: Layer 3 selected patterns by `confidence`, which is
+    // the wrong axis — it drives the Layer 1 route decision, and two
+    // patterns can be low_confidence for unrelated reasons. `ipv4` is
+    // genuinely ambiguous in a log; `us_passport` is low-confidence only
+    // because it needs context, and the pattern now REQUIRES the literal
+    // word "passport" adjacent to the value. Excluding it let
+    // `passport no. AB1234567` reach the log destination unredacted.
+    //
+    // Selection is now by the explicit `redactInLogs` flag.
+    for (const s of [
+      'passport no. AB1234567 rejected',
+      'passport #: ABCDE1234',
+      'Passport Number XY9876543',
+    ]) {
+      expect(redactString(s), `not scrubbed: ${s}`).toContain('[REDACTED:');
+    }
+  });
+
+  it('scrubs Ghana phone numbers written with separators', () => {
+    // The pattern was contiguous-only, so it missed the way these
+    // numbers are normally written — while `us_phone` had accepted
+    // separators all along. Ghana testers are in Pilot 1 scope, so the
+    // gap was live on an AI-bound route.
+    for (const s of [
+      '+233241234567',
+      '+233 24 123 4567',
+      '+233-24-123-4567',
+      '0241234567',
+      '024 123 4567',
+      '024.123.4567',
+    ]) {
+      expect(redactString(s), `not scrubbed: ${s}`).toContain('[REDACTED:Ghana phone number]');
+    }
   });
 
   it('leaves clean operational prose untouched', () => {

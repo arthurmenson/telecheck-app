@@ -71,7 +71,7 @@ That is **Track 4 work**, not backend work. It is a **Pilot 1 startup-authorizat
    - US SSN (`\d{3}-\d{2}-\d{4}`)
    - Ghana National ID (per Ghana Card format — 15 chars)
    - US phone (`(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}`)
-   - Ghana phone (`\+233\d{9}` or `0\d{9}`)
+   - Ghana phone (`+233` or leading `0`, 2-3-4 digit grouping, optional separators)
    - Email address (`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
    - Credit card (Luhn-validated 13–19 digit sequences)
    - Common medical record number patterns
@@ -225,9 +225,16 @@ Layers 1 and 2 run regex + local NER. Layer 3 runs regex only:
 - **Precision.** NER's PERSON/GPE/ORG classes would fire on the operational vocabulary logs are made of — role names, tenant identifiers, provider names, module names. Redacting those destroys debuggability while protecting nothing.
 - **Value.** What actually shows up in a leaked log line is *structured* identifiers — SSN, email, phone, card. Regex's strength.
 
-### High-confidence patterns only
+### Pattern selection is its own axis — `redactInLogs`, not `confidence`
 
-Low-confidence patterns (IPv4, IPv6, context-bound passport) are **not** scrubbed at Layer 3. An IP address in a log line is usually infrastructure, not PII; removing it would delete genuinely useful diagnostic signal during exactly the incident the logs exist for.
+Layer 3 selects patterns with an explicit per-pattern `redactInLogs` flag. The field is **required**, so adding a pattern forces the decision rather than inheriting a default.
+
+Layer 3 originally filtered on `confidence` and that was wrong. `confidence` answers a different question — it drives the Layer 1 route decision (block vs redact-inline) — and two patterns can share `low_confidence` for entirely unrelated reasons:
+
+- `ipv4` / `ipv6` are genuinely ambiguous **in a log line**. An IP there is usually infrastructure, and scrubbing it would delete the diagnostic signal logs exist for during exactly the incident they are read in. Excluded (`redactInLogs: false`).
+- `us_passport` is low-confidence only because it needs **context**. The pattern requires the literal word "passport" adjacent to the value, so a match is high-signal rather than noisy. Excluding it meant `passport no. AB1234567` reached the log destination unredacted. Included (`redactInLogs: true`).
+
+Set `redactInLogs: false` only when a match is more likely to be an operational value than PII. When in doubt, set it true — Layer 3 is the last line of defense, where a false redaction costs less than a leak.
 
 ### Strings and property names: no carve-out at all
 
