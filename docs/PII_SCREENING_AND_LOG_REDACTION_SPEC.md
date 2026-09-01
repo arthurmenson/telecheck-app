@@ -173,16 +173,53 @@ Therefore `audit_bound` **blocks on ANY hit, high or low confidence**, before th
 
 **Rationale:** Layer 1 could miss a pattern; Layer 2 is the safety net. Clinician workflow degrades slightly (redaction is visible) but compliance is preserved.
 
-## Layer 3 — Log redaction (Pino)
+## Layer 3 — Log redaction (Pino) — implemented Sprint 1.2a
 
-**Where:** all `pino` log paths — extend `LOG_REDACT_PATHS` in `.env.example` and enforce at boot.
+**Rationale:** logs are the third leak vector (stdout → `docker logs` → potentially SIEM or external log aggregation). Even in Pilot 1 with no external SIEM, the discipline prepares for Pilot 2.
 
-**How:**
-- Existing redaction paths: `req.headers.authorization`, `req.body.password`, `req.body.token`
-- Add: `req.body.text`, `req.body.notes`, `req.body.freeText`, `req.body.symptomDescription`, `res.body.*.text`, `res.body.*.notes`, any field ever populated from patient input
-- Additionally: **regex-based redaction on the entire log line** as a final pass, catching any PII pattern that leaks via a path not in the explicit list
+### Log-surface audit (Sprint 1.2a, 2026-09-01)
 
-**Rationale:** logs are the third leak vector (stdout → `docker logs` → potentially SIEM or external log aggregation). Even in Pilot 1 with no external SIEM, the redaction discipline prepares for Pilot 2.
+Before implementing, the actual logging surface was enumerated. **The codebase's logging discipline is already sound**: across all 38 `log.*` call sites in `src/`, every merge-object key is an identifier, a status, a count, or a pattern-id list. None is raw user free-text. There are no template-literal log messages interpolating request data.
+
+So the residual risk is **not a forgotten field name**, and adding more `redact.paths` entries would not address it. Two structural vectors remain:
+
+1. **Error objects.** Four call sites log `err`. `Error.message` is caller-shaped — a Postgres error can echo an offending value (`Key (email)=(...) already exists`), a driver can interpolate a parameter, and a future `throw new Error(\`bad input: ${x}\`)` can carry anything.
+2. **Future call sites.** A path allowlist protects the code that exists today; the next handler written is unprotected until someone remembers to extend the list.
+
+Both are structural, so the mitigation is structural.
+
+### Two-part posture
+
+**Part 1 — `redact.paths` (allowlist).** Exact, cheap, configured via `LOG_REDACT_PATHS`. Runs first with `remove: true`, so a listed path is dropped entirely. Current value includes `req.headers.authorization`, `req.body.password`, `req.body.token`, `req.body.message_text`.
+
+**Part 2 — whole-payload regex pass (`hooks.logMethod`).** `src/lib/pii-screener/log-redaction.ts`, wired in `defaultLoggerConfig()`. pino's `logMethod` hook is used rather than `formatters.log` because the hook sees **both** the merge object and the message string; `formatters.log` never sees the message. Traverses strings, arrays, plain objects, `Error` instances, `Map`, `Set`.
+
+### Regex-only — NER is deliberately NOT used at Layer 3
+
+Layers 1 and 2 run regex + local NER. Layer 3 runs regex only:
+
+- **Cost.** NER is model inference. Logs are high-volume and on the hot path.
+- **Precision.** NER's PERSON/GPE/ORG classes would fire on the operational vocabulary logs are made of — role names, tenant identifiers, provider names, module names. Redacting those destroys debuggability while protecting nothing.
+- **Value.** What actually shows up in a leaked log line is *structured* identifiers — SSN, email, phone, card. Regex's strength.
+
+### High-confidence patterns only
+
+Low-confidence patterns (IPv4, IPv6, context-bound passport) are **not** scrubbed at Layer 3. An IP address in a log line is usually infrastructure, not PII; removing it would delete genuinely useful diagnostic signal during exactly the incident the logs exist for.
+
+### Identifier-key preservation
+
+A naive value-scrub is worse than useless: `us_ssn` also matches any bare 9-digit run, and logs are full of legitimate numeric identifiers. Redacting `consult_id` would blind the operator mid-incident.
+
+Values under identifier keys are therefore **preserved verbatim** — matched on the KEY NAME (`*_id` / `*Id` suffix, plus an explicit safe set: `tenant_id`, `route`, `status`, `pg_sqlstate`, `provider`, …). Because the carve-out keys on the name and never the value's content, it cannot be steered by user input.
+
+### Depth bound FAILS OPEN — a deliberate asymmetry
+
+`redactLogPayload` is depth-bounded at 32 and returns the value **unredacted** at the bound, rather than throwing. This is the opposite of the `audit_bound` payload walker, which fails closed. The asymmetry is intentional:
+
+- Rejecting an over-deep **audit** payload costs one API call and protects append-only, purge-exempt storage.
+- Throwing from inside a **logger** would break logging itself. The failure mode is losing the operational record during an incident — strictly worse than a pathologically-nested log object going unscrubbed. Logs are also purgeable; audit rows are not.
+
+Both behaviours are pinned by test.
 
 ## Layer 4 — AI vendor payload sanitization
 

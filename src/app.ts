@@ -26,6 +26,7 @@ import { authContextPlugin } from './lib/auth-context.js';
 import { verifyBindActorContextPoolOrThrow } from './lib/db.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
+import { piiRedactingLogMethod } from './lib/pii-screener/log-redaction.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
 import { adminBackendPlugin } from './modules/admin-backend/index.js';
 import { aiServicePlugin } from './modules/ai-service/index.js';
@@ -457,8 +458,25 @@ function defaultLoggerConfig(): object {
     redact: {
       // Per AUDIT_EVENTS v5.2 PHI redaction discipline: never log
       // authorization headers, passwords, tokens, or PHI fields.
+      //
+      // This is the ALLOWLIST half of the redaction posture: exact,
+      // cheap, and configured via LOG_REDACT_PATHS. It runs FIRST and
+      // uses remove:true, so a listed path is dropped entirely.
       paths: redactPaths.length > 0 ? redactPaths : ['req.headers.authorization'],
       remove: true,
+    },
+    // Layer 3 whole-payload PII scrub (Sprint 1.2a). Complements —
+    // does not replace — `redact.paths` above. Paths cover the fields
+    // someone thought of; this pass covers the two residual vectors a
+    // path list structurally cannot: Error.message/.stack (which are
+    // caller-shaped and can interpolate user values) and log call sites
+    // that do not exist yet.
+    //
+    // Regex-only, high-confidence patterns only, with identifier-keyed
+    // values preserved verbatim for debuggability. See
+    // src/lib/pii-screener/log-redaction.ts for the full rationale.
+    hooks: {
+      logMethod: piiRedactingLogMethod,
     },
     // Pretty print in dev only; production emits structured JSON for ingestion
     // by the audit + observability pipeline.
