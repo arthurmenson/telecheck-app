@@ -591,8 +591,37 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
    * O(carry) per chunk and quadratic across a large record, so the
    * count is carried incrementally: add the byte length of each
    * incoming chunk, subtract the byte length of each consumed record.
+   *
+   * ## It is an UPPER BOUND, not an exact count — and that is enough
+   *
+   * Per-chunk accumulation can OVERCOUNT when a UTF-16 surrogate pair
+   * is split across two chunks: each half measures as 3 bytes on its
+   * own (6 total) while the combined astral character is 4. Subtracting
+   * a consumed record's exact length does not reclaim that excess, so
+   * the counter can drift upward — and drift in this direction would
+   * eventually drop a perfectly valid near-cap record and emit a false
+   * oversized sentinel.
+   *
+   * Crucially the drift is always POSITIVE: chunk-wise measurement can
+   * overcount but never undercount. So `carryBytes <= cap` proves the
+   * true size is also `<= cap`, and the fast path is sound as-is.
+   *
+   * Only when the estimate EXCEEDS the cap does exactness matter, and
+   * there we recompute `Buffer.byteLength(carry)` once to resynchronise
+   * before acting. That keeps the common path O(chunk) while making the
+   * decision itself exact — no valid record is dropped on drift alone.
    */
   let carryBytes = 0;
+
+  /**
+   * Resynchronise the estimate to the true UTF-8 size. Called only when
+   * the upper-bound estimate has crossed the cap, so the O(carry) cost
+   * is paid at most once per threshold crossing rather than per chunk.
+   */
+  const exactCarryBytes = (): number => {
+    carryBytes = Buffer.byteLength(carry, 'utf8');
+    return carryBytes;
+  };
 
   const toText = (chunk: unknown): string =>
     typeof chunk === 'string'
@@ -655,7 +684,10 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
         // the cap, in which case DROP it (see MAX_CARRY_BYTES) — never
         // emit part of it, or the destination could reassemble a token
         // split across the emission boundary.
-        if (carryBytes > MAX_CARRY_BYTES) {
+        // The estimate is an upper bound, so only a crossing warrants
+        // the exact recount — and the drop decision is then made on the
+        // true size, never on accumulated surrogate-split drift.
+        if (carryBytes > MAX_CARRY_BYTES && exactCarryBytes() > MAX_CARRY_BYTES) {
           carry = '';
           carryBytes = 0;
           discardingUntilNewline = true;

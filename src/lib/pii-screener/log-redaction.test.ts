@@ -624,3 +624,58 @@ describe('createRedactingStream — cap is measured in UTF-8 BYTES', () => {
     expect(out).not.toContain('tail');
   });
 });
+
+describe('createRedactingStream — surrogate-split byte accounting', () => {
+  function capture(): { dest: Writable; written: string[] } {
+    const written: string[] = [];
+    const dest = new Writable({
+      write(chunk: unknown, _enc, cb): void {
+        written.push(String(chunk));
+        cb();
+      },
+    });
+    return { dest, written };
+  }
+
+  async function feed(chunks: string[]): Promise<string> {
+    const { dest, written } = capture();
+    const stream = createRedactingStream(dest);
+    for (const c of chunks) {
+      await new Promise<void>((resolve, reject) => {
+        stream.write(c, (err) => (err ? reject(err) : resolve()));
+      });
+    }
+    await new Promise<void>((resolve) => stream.end(() => resolve()));
+    await new Promise((r) => setImmediate(r));
+    return written.join('');
+  }
+
+  it('does NOT drop a valid near-cap record whose emoji are split across chunks', async () => {
+    // Codex finding: per-chunk Buffer.byteLength OVERCOUNTS when a
+    // UTF-16 surrogate pair straddles a chunk boundary — each half
+    // measures 3 bytes (6 total) while the combined astral character is
+    // 4. Subtracting a record's exact length never reclaims the excess,
+    // so the counter drifted upward and would eventually drop a
+    // perfectly valid record and emit a false oversized sentinel.
+    //
+    // 20k split seams inject ~40 KB of phantom bytes into the estimate.
+    const emoji = '\u{1F600}';
+    const hi = emoji.charAt(0);
+    const lo = emoji.charAt(1);
+    const chunks: string[] = [];
+    for (let i = 0; i < 20_000; i++) {
+      chunks.push('a'.repeat(45) + hi);
+      chunks.push(lo);
+    }
+    chunks.push('\n');
+
+    const out = await feed(chunks);
+    expect(out).not.toContain(LOG_OVERSIZED_LINE_SENTINEL);
+    expect(out.length).toBeGreaterThan(0);
+  });
+
+  it('still drops a genuinely oversized record', async () => {
+    const out = await feed(['z'.repeat(1_048_576 + 50), '\n']);
+    expect(out).toContain(LOG_OVERSIZED_LINE_SENTINEL);
+  });
+});
