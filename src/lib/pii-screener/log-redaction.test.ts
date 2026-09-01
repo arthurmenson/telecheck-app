@@ -21,12 +21,9 @@ import { Transform, Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 
 import {
-  DEPTH_LIMIT_SENTINEL,
-  LOG_REDACTION_MAX_DEPTH,
   createRedactingStream,
   isIdentifierKey,
   redactLogLine,
-  redactParsedRecord,
   redactString,
 } from './log-redaction.js';
 
@@ -109,101 +106,107 @@ describe('isIdentifierKey — carve-out surface', () => {
   });
 });
 
-describe('redactParsedRecord — key-aware traversal', () => {
-  it('preserves a scalar under an identifier key even if SSN-shaped', () => {
-    const out = redactParsedRecord({ consult_id: '123456789' }) as Record<string, unknown>;
-    expect(out['consult_id']).toBe('123456789');
-  });
-
-  it('scrubs the same value under a non-identifier key', () => {
-    const out = redactParsedRecord({ note: 'ssn 123-45-6789' }) as Record<string, unknown>;
-    expect(String(out['note'])).toContain('[REDACTED:US Social Security Number]');
-  });
-
-  it('still walks a nested object under an identifier key', () => {
-    // The carve-out is about ID VALUES, not exempting whole subtrees —
-    // otherwise `{ req_id: { note: '<pii>' } }` would slip through.
-    const out = redactParsedRecord({
-      request_id: { note: 'ssn 123-45-6789' },
-    }) as Record<string, Record<string, unknown>>;
-    expect(String(out['request_id']!['note'])).toContain('[REDACTED:');
-  });
-
-  it('traverses arrays', () => {
-    const out = redactParsedRecord({ notes: ['clean', 'ssn 123-45-6789'] }) as Record<
-      string,
-      string[]
-    >;
-    expect(out['notes']![0]).toBe('clean');
-    expect(out['notes']![1]).toContain('[REDACTED:');
-  });
-
-  it('leaves non-string scalars untouched', () => {
-    const out = redactParsedRecord({ n: 42, b: true, z: null }) as Record<string, unknown>;
-    expect(out['n']).toBe(42);
-    expect(out['b']).toBe(true);
-    expect(out['z']).toBeNull();
-  });
-
-  it('FAILS CLOSED past the depth bound via sentinel', () => {
-    // First implementation returned the raw subtree here, which let 33
-    // nested containers followed by an email deterministically bypass
-    // Layer 3. Substituting a sentinel keeps the logger alive AND
-    // refuses to emit unscreened content.
-    let deep: unknown = 'real.person@example.com';
-    for (let i = 0; i < LOG_REDACTION_MAX_DEPTH + 6; i++) deep = { next: deep };
-    const serialized = JSON.stringify(redactParsedRecord(deep));
-    expect(serialized).not.toContain('real.person@example.com');
-    expect(serialized).toContain(DEPTH_LIMIT_SENTINEL);
-  });
-});
-
-describe('redactLogLine — serialized-record pass', () => {
+describe('redactLogLine — string-token scanner (numeric-lossless)', () => {
   it('scrubs PII in a pino NDJSON record', () => {
     const line = JSON.stringify({ level: 30, msg: 'failed for 123-45-6789' });
     expect(redactLogLine(line)).toContain('[REDACTED:US Social Security Number]');
   });
 
-  it('scrubs query-string PII in a Fastify-shaped req record (Codex R1 vector)', () => {
+  it('scrubs query-string PII in a Fastify-shaped req record', () => {
     const line = JSON.stringify({
       level: 30,
       msg: 'incoming request',
-      req: {
-        method: 'GET',
-        url: '/v0/ai/chat?email=real.person@example.com',
-        hostname: 'localhost',
-      },
+      req: { method: 'GET', url: '/v0/ai/chat?email=real.person@example.com' },
     });
     const out = redactLogLine(line);
     expect(out).not.toContain('real.person@example.com');
     expect(out).toContain('[REDACTED:Email address]');
-    // The route/method survive so the record is still diagnostic.
+    // Server-defined fields survive so the record stays diagnostic.
     expect(out).toContain('"method":"GET"');
   });
 
   it('scrubs a serialized Error message', () => {
     const line = JSON.stringify({
       level: 50,
-      err: {
-        type: 'Error',
-        message: 'duplicate key value: (email)=(real.person@example.com)',
-        stack: 'Error: dup\n  at handler',
-      },
+      err: { type: 'Error', message: 'dup key: (email)=(real.person@example.com)' },
     });
-    const out = redactLogLine(line);
-    expect(out).not.toContain('real.person@example.com');
+    expect(redactLogLine(line)).not.toContain('real.person@example.com');
   });
 
-  it('preserves identifier values through the round trip', () => {
+  it('preserves a scalar under an identifier key even if SSN-shaped', () => {
     const line = JSON.stringify({ tenant_id: 'Telecheck-US', consult_id: '123456789' });
     const out = redactLogLine(line);
     expect(out).toContain('"tenant_id":"Telecheck-US"');
     expect(out).toContain('"consult_id":"123456789"');
   });
 
+  it('scrubs the same value under a non-identifier key', () => {
+    const out = redactLogLine(JSON.stringify({ note: 'ssn 123-45-6789' }));
+    expect(out).toContain('[REDACTED:US Social Security Number]');
+  });
+
+  it('still scrubs inside a nested object under an identifier key', () => {
+    // The carve-out is about ID VALUES, not exempting whole subtrees.
+    const out = redactLogLine(JSON.stringify({ request_id: { note: 'ssn 123-45-6789' } }));
+    expect(out).toContain('[REDACTED:');
+    expect(out).not.toContain('123-45-6789');
+  });
+
+  it('array elements inherit the array key for the carve-out decision', () => {
+    const scrubbed = redactLogLine(JSON.stringify({ notes: ['a@b.com'] }));
+    expect(scrubbed).not.toContain('a@b.com');
+    const kept = redactLogLine(JSON.stringify({ trace_id: ['123456789'] }));
+    expect(kept).toContain('123456789');
+  });
+
+  // --- Codex R-final finding: JSON.parse/stringify round trip was lossy ---
+
+  it('preserves integers beyond Number.MAX_SAFE_INTEGER byte-for-byte', () => {
+    // JSON.parse coerces to IEEE-754 double, silently rounding 64-bit
+    // ids. Parsing succeeds so no failure sentinel fires — the value is
+    // just quietly wrong. The scanner never interprets numeric lexemes.
+    const line = '{"id":9007199254740993,"msg":"clean"}';
+    expect(redactLogLine(line)).toContain('9007199254740993');
+  });
+
+  it('preserves a nanosecond-precision timestamp', () => {
+    const line = '{"nano":1725196800123456789,"msg":"clean"}';
+    expect(redactLogLine(line)).toContain('1725196800123456789');
+  });
+
+  it('preserves float formatting (1.0 does not become 1)', () => {
+    const line = '{"f":1.0,"msg":"clean"}';
+    expect(redactLogLine(line)).toContain('1.0');
+  });
+
+  it('preserves exponent notation verbatim', () => {
+    const line = '{"e":1e21,"msg":"clean"}';
+    expect(redactLogLine(line)).toContain('1e21');
+  });
+
+  it('preserves booleans and null verbatim', () => {
+    const line = '{"b":true,"z":null,"msg":"clean"}';
+    const out = redactLogLine(line);
+    expect(out).toContain('"b":true');
+    expect(out).toContain('"z":null');
+  });
+
+  it('handles escaped characters inside string values', () => {
+    const line = JSON.stringify({ msg: 'line1\nline2 "quoted" ssn 123-45-6789' });
+    const out = redactLogLine(line);
+    expect(out).toContain('[REDACTED:');
+    expect(out).not.toContain('123-45-6789');
+    // Still valid JSON after the rewrite.
+    expect(() => JSON.parse(out) as unknown).not.toThrow();
+  });
+
+  it('output remains parseable JSON', () => {
+    const line = JSON.stringify({ a: 1, msg: 'ssn 123-45-6789', nested: { b: ['a@b.com'] } });
+    expect(() => JSON.parse(redactLogLine(line)) as unknown).not.toThrow();
+  });
+
   it('falls back to a whole-line scrub for non-JSON input (fail safe)', () => {
-    const line = 'plain text log with ssn 123-45-6789';
-    expect(redactLogLine(line)).toContain('[REDACTED:US Social Security Number]');
+    expect(redactLogLine('plain text with ssn 123-45-6789')).toContain('[REDACTED:');
   });
 
   it('falls back for malformed JSON rather than throwing', () => {
@@ -213,8 +216,7 @@ describe('redactLogLine — serialized-record pass', () => {
   });
 
   it('preserves a trailing newline', () => {
-    const line = JSON.stringify({ msg: 'ok' }) + '\n';
-    expect(redactLogLine(line).endsWith('\n')).toBe(true);
+    expect(redactLogLine(JSON.stringify({ msg: 'ok' }) + '\n').endsWith('\n')).toBe(true);
   });
 
   it('returns empty input unchanged', () => {

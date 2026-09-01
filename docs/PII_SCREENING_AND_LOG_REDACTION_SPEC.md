@@ -203,9 +203,17 @@ Both are structural, so the mitigation is structural.
 
 Redacting at the destination stream avoids both: the line is already fully serialized (serializer output, child bindings, and message all present), and no live object is ever touched.
 
-#### Line handling
+#### Line handling — a string-token scanner, not JSON.parse
 
-Each line is parsed as pino NDJSON, walked with key-awareness, and re-serialized. If a line is not parseable JSON (a pretty-print transport, a partial chunk, a non-JSON warning) it falls back to a whole-line regex scrub — **fail safe**: an unparseable line is still scrubbed, it just loses the identifier carve-out. Batched multi-line chunks are handled per line, preserving framing.
+Each line is scanned as text and **only its string tokens are rewritten**. Every number, boolean, null and structural character is copied byte-for-byte.
+
+The obvious implementation — `JSON.parse` → walk → `JSON.stringify` — is **lossy, and silently so**: parse coerces every JSON number to an IEEE-754 double, so any integer beyond `Number.MAX_SAFE_INTEGER` (a 64-bit id, a nanosecond timestamp, a BigInt-backed counter) is rounded on the way out. Parsing succeeds, so no failure sentinel fires — the value is just quietly wrong. Corrupting an identifier *inside the redaction layer* would destroy exactly the correlation evidence an incident depends on.
+
+The scanner tracks the enclosing key for each string value, which is what gives identifier-key preservation. Array elements inherit the array's key, so `{"notes":["<pii>"]}` is screened under `notes`.
+
+It is a single O(n) pass with an explicit stack, so the depth bound an earlier recursive implementation needed is gone entirely rather than merely tuned.
+
+Non-JSON lines (a pretty-print transport, a partial chunk, a non-JSON warning) fall back to a whole-line regex scrub — **fail safe**: still scrubbed, just without the identifier carve-out. Batched multi-line chunks are handled per line, preserving framing.
 
 ### Regex-only — NER is deliberately NOT used at Layer 3
 
@@ -229,13 +237,11 @@ So values under **server-generated** identifier keys are preserved verbatim, mat
 
 The carve-out also applies only to **scalar** values. A nested object under an identifier key is still walked, so `{ request_id: { note: "<pii>" } }` cannot slip through by nesting.
 
-### Depth handling — fails CLOSED via sentinel
+### No depth bound is needed on the line path
 
-Past `LOG_REDACTION_MAX_DEPTH` (32) the subtree is replaced with the fixed `[REDACTED:DEPTH_LIMIT]` sentinel.
+An earlier implementation walked the parsed record recursively and needed a depth bound; at the bound it returned the raw subtree, which let 33 nested containers followed by an email deterministically bypass Layer 3. The token scanner removed the need for a bound at all — it is iterative with an explicit stack, so arbitrarily nested input is handled in a single linear pass with no recursion to guard.
 
-The first implementation returned the raw subtree at the bound, arguing that throwing would break logging and that this was the only alternative. That was a false dichotomy, and it left a deterministic bypass: 33 nested containers followed by an email would emit unscreened. Substituting a sentinel keeps the logger available (no throw) **and** refuses to emit unscreened content.
-
-Note the contrast with the `audit_bound` payload walker, which fails closed by *rejecting the request*. Both fail closed; they differ in mechanism because the costs differ — rejecting an over-deep audit payload costs one API call, whereas refusing to log would cost the operational record during an incident. Both behaviours are pinned by test.
+The  payload walker still fails closed by *rejecting the request*, because it is genuinely recursive over caller-supplied JSON and rejecting an over-deep audit payload costs only one API call.
 
 ## Layer 4 — AI vendor payload sanitization
 

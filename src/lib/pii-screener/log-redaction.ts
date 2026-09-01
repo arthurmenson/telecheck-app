@@ -5,7 +5,7 @@
  * gate ingress and egress; this one assumes both were bypassed and scrubs
  * whatever is about to be written to the log stream.
  *
- * ## Why a whole-payload pass rather than more `redact.paths` entries
+ * ## Why a whole-line pass rather than more `redact.paths` entries
  *
  * pino's built-in `redact.paths` is an ALLOWLIST of known field paths.
  * It is exact and cheap, and it stays configured (`LOG_REDACT_PATHS`).
@@ -32,25 +32,24 @@
  *
  * ## Why the redaction runs at the STREAM, not at `hooks.logMethod`
  *
- * The obvious hook — `hooks.logMethod` — is WRONG here, for two reasons
- * found in Codex review of the first implementation:
+ * The obvious hook is WRONG here, for two reasons found in Codex review
+ * of the first implementation:
  *
  *   - **It runs BEFORE pino's serializers.** Fastify's `req`/`res`
  *     serializers turn request objects into log records after the hook
  *     has already run, so anything a serializer produces (notably the
  *     request URL + query string) is never seen by a `logMethod` pass.
- *   - **Recursively rebuilding objects there corrupts them.** Fastify
- *     request properties (`method`, `url`, `headers`, `host`, `ip`) are
+ *   - **Rebuilding objects there corrupts them.** Fastify request
+ *     properties (`method`, `url`, `headers`, `host`, `ip`) are
  *     prototype getters. `Object.entries()` does not copy prototype
  *     getters, so cloning the request into a plain object hands the
  *     downstream serializer a structurally damaged input and produces
  *     empty or incomplete request records — deleting exactly the
  *     diagnostics an incident needs.
  *
- * Redacting at the destination stream avoids both problems: the line is
- * already fully serialized (serializer output, child bindings, and the
- * message are all present), and no live object is ever touched or
- * rebuilt.
+ * Redacting at the destination stream avoids both: the line is already
+ * fully serialized (serializer output, child bindings, and message all
+ * present), and no live object is ever touched.
  *
  * ## Regex-only — NER is deliberately NOT used here
  *
@@ -85,16 +84,20 @@
  * caller-controlled); it has been removed, so request URLs ARE scrubbed.
  * Only server-generated names remain.
  *
- * ## Depth handling — fails CLOSED via sentinel
+ * ## Numeric losslessness — why a token scanner, not JSON.parse
  *
- * Past the depth bound the subtree is replaced with a fixed
- * `[REDACTED:DEPTH_LIMIT]` sentinel rather than returned as-is. The
- * first implementation returned the raw subtree, which let 33 nested
- * containers followed by an email deterministically bypass Layer 3.
- * Substituting a sentinel keeps the logger available (no throw) while
- * still refusing to emit unscreened content — so unlike the
- * `audit_bound` walker, this fails closed WITHOUT sacrificing the
- * operational record.
+ * The line pass rewrites ONLY string tokens, copying every number,
+ * boolean, null and structural character through byte-for-byte. A
+ * `JSON.parse` → walk → `JSON.stringify` round trip would be lossy, and
+ * silently so: parse coerces every number to an IEEE-754 double, so a
+ * 64-bit id or nanosecond timestamp is rounded on the way out. Parsing
+ * succeeds, so no failure sentinel fires — the value is just quietly
+ * wrong. Corrupting an identifier inside the redaction layer would
+ * destroy the correlation evidence an incident depends on.
+ *
+ * The scanner is also a single O(n) pass with an explicit stack, so the
+ * depth bound that an earlier recursive implementation needed is gone
+ * entirely rather than merely tuned.
  *
  * Spec references:
  *   - docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Layer 3
@@ -105,12 +108,6 @@
 import { Transform } from 'node:stream';
 
 import { PII_PATTERNS } from './patterns.js';
-
-/** Sentinel written in place of a subtree that exceeded the depth bound. */
-export const DEPTH_LIMIT_SENTINEL = '[REDACTED:DEPTH_LIMIT]';
-
-/** Maximum nesting depth walked before the sentinel is substituted. */
-export const LOG_REDACTION_MAX_DEPTH = 32;
 
 /**
  * Replacement token written in place of a detected value. Deliberately
@@ -211,68 +208,153 @@ export function redactString(value: string): string {
 }
 
 /**
- * Recursively redact an already-PARSED log record.
- *
- * Operates on plain JSON values only (the output of `JSON.parse`), so
- * there are no prototype getters, class instances, or live framework
- * objects to damage — that hazard is structurally impossible here
- * because this only ever runs on post-serialization data.
- *
- * Past `LOG_REDACTION_MAX_DEPTH` the subtree is replaced with
- * `DEPTH_LIMIT_SENTINEL` (fails closed; see module header).
- */
-export function redactParsedRecord(value: unknown, depth = 0): unknown {
-  if (depth > LOG_REDACTION_MAX_DEPTH) return DEPTH_LIMIT_SENTINEL;
-
-  if (typeof value === 'string') return redactString(value);
-  if (value === null || value === undefined) return value;
-  if (typeof value !== 'object') return value;
-
-  if (Array.isArray(value)) {
-    return value.map((v) => redactParsedRecord(v, depth + 1));
-  }
-
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value)) {
-    // Identifier keys keep their values verbatim so the operator can
-    // still correlate the log line during an incident. Only applies
-    // when the value is a scalar — a nested object under an identifier
-    // key is still walked, since the carve-out is about ID values, not
-    // about exempting whole subtrees.
-    out[k] =
-      isIdentifierKey(k) && (typeof v !== 'object' || v === null)
-        ? v
-        : redactParsedRecord(v, depth + 1);
-  }
-  return out;
-}
-
-/**
  * Redact a single serialized log line.
  *
- * Fast path: the line is pino NDJSON, so parse it, walk it with
- * key-awareness, and re-serialize. That gives identifier-key
- * preservation without a false-positive risk on ULIDs.
+ * ## Why a string-token scanner and NOT `JSON.parse` → walk → `JSON.stringify`
  *
- * Fallback: if the line is not parseable JSON (a transport wrote
- * pretty-printed output, a partial chunk, a non-JSON warning), apply the
- * whole-line regex instead. This FAILS SAFE — an unparseable line is
- * still scrubbed, it just loses the identifier carve-out.
+ * The obvious implementation round-trips the record through
+ * `JSON.parse`/`JSON.stringify`. That is **lossy**, and silently so:
+ * `JSON.parse` coerces every JSON number to an IEEE-754 double, so any
+ * integer beyond `Number.MAX_SAFE_INTEGER` (2^53−1) — a 64-bit id, a
+ * BigInt-backed counter, a nanosecond timestamp — is rounded on the way
+ * out. Parsing succeeds, so no failure sentinel fires; the value is just
+ * quietly wrong. Corrupting an identifier inside the redaction layer
+ * would destroy exactly the correlation evidence an incident needs.
+ *
+ * So this scans the serialized text instead and rewrites **only string
+ * tokens**. Every number, boolean, null, and structural character is
+ * copied through byte-for-byte. Numeric precision is preserved because
+ * numeric lexemes are never interpreted.
+ *
+ * The scanner also tracks the enclosing key for each string value, which
+ * is what gives identifier-key preservation. Array elements inherit the
+ * array's key, so `{"notes":["<pii>"]}` is screened under `notes`.
+ *
+ * Recursion is gone too: this is a single O(n) pass with an explicit
+ * stack, so the depth bound that guarded the recursive walker is not
+ * needed on this path at all.
+ *
+ * Fallback: if the line is not JSON (a pretty-print transport, a partial
+ * chunk, a non-JSON warning), apply the whole-line regex instead. This
+ * FAILS SAFE — an unparseable line is still scrubbed, it just loses the
+ * identifier carve-out.
  */
 export function redactLogLine(line: string): string {
   const trimmed = line.trimEnd();
   const newline = line.slice(trimmed.length);
   if (trimmed.length === 0) return line;
 
-  if (trimmed.startsWith('{')) {
-    try {
-      const parsed: unknown = JSON.parse(trimmed);
-      return JSON.stringify(redactParsedRecord(parsed)) + newline;
-    } catch {
-      // Not valid JSON after all — fall through to the string pass.
-    }
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    const scanned = redactJsonStringTokens(trimmed);
+    if (scanned !== null) return scanned + newline;
+    // Malformed JSON — fall through to the whole-line pass.
   }
   return redactString(trimmed) + newline;
+}
+
+/**
+ * Scan serialized JSON and redact only its string tokens, preserving
+ * every other lexeme verbatim.
+ *
+ * @returns the rewritten JSON text, or `null` if the input is not
+ *   well-formed enough to scan (caller falls back to a whole-line pass).
+ */
+function redactJsonStringTokens(text: string): string | null {
+  let out = '';
+  let i = 0;
+  // Enclosing key per nesting level. An array pushes its own enclosing
+  // key so its elements inherit it.
+  const keyStack: Array<string | null> = [null];
+
+  while (i < text.length) {
+    const ch = text[i]!;
+
+    if (ch === '"') {
+      const token = readJsonString(text, i);
+      if (token === null) return null;
+      const { raw, decoded, next } = token;
+
+      // A string is a KEY when the next non-whitespace char is ':'.
+      let j = next;
+      while (j < text.length && /\s/.test(text[j] ?? '')) j++;
+      const isKey = text[j] === ':';
+
+      if (isKey) {
+        keyStack[keyStack.length - 1] = decoded;
+        out += raw;
+      } else {
+        const enclosingKey = keyStack[keyStack.length - 1] ?? null;
+        const preserve = enclosingKey !== null && isIdentifierKey(enclosingKey);
+        out += preserve ? raw : JSON.stringify(redactString(decoded));
+      }
+      i = next;
+      continue;
+    }
+
+    if (ch === '{') {
+      keyStack.push(null);
+      out += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === '[') {
+      // Elements inherit the array's own key so `notes: ["<pii>"]`
+      // resolves under `notes`.
+      keyStack.push(keyStack[keyStack.length - 1] ?? null);
+      out += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === '}' || ch === ']') {
+      if (keyStack.length > 1) keyStack.pop();
+      out += ch;
+      i++;
+      continue;
+    }
+
+    // Numbers, booleans, null, whitespace, ':' and ',' — verbatim.
+    // Numeric lexemes are deliberately never parsed.
+    out += ch;
+    i++;
+  }
+
+  return out;
+}
+
+/**
+ * Read one JSON string token starting at `start` (which must index the
+ * opening quote).
+ *
+ * @returns the raw token text (quotes + escapes intact), its decoded
+ *   value, and the index just past the closing quote — or `null` if the
+ *   token is unterminated or contains an invalid escape.
+ */
+function readJsonString(
+  text: string,
+  start: number,
+): { raw: string; decoded: string; next: number } | null {
+  let i = start + 1;
+  while (i < text.length) {
+    const ch = text[i]!;
+    if (ch === '\\') {
+      i += 2;
+      continue;
+    }
+    if (ch === '"') {
+      const raw = text.slice(start, i + 1);
+      try {
+        const decoded = JSON.parse(raw) as string;
+        if (typeof decoded !== 'string') return null;
+        return { raw, decoded, next: i + 1 };
+      } catch {
+        return null;
+      }
+    }
+    i++;
+  }
+  return null;
 }
 
 /**
