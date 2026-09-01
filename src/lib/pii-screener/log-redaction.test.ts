@@ -738,3 +738,67 @@ describe('createRedactingStream — streaming UTF-8 decode of Buffer input', () 
     expect(leaks, `leaked at byte splits: ${leaks.join(', ')}`).toEqual([]);
   });
 });
+
+describe('redactLogLine — numeric JSON values', () => {
+  it('redacts PII that appears as a JSON NUMBER, not a string', () => {
+    // Codex finding: the scanner copied every numeric lexeme verbatim
+    // on the reasoning that parsing loses precision. True, but
+    // over-applied — {"ssn":123456789} reached the destination intact.
+    const cases: Array<[string, string]> = [
+      ['{"ssn":123456789}', '123456789'],
+      ['{"card":4111111111111111}', '4111111111111111'],
+      ['{"phone":4155550123}', '4155550123'],
+      ['{"vals":[123456789]}', '123456789'],
+    ];
+    for (const [line, leaked] of cases) {
+      const out = redactLogLine(line);
+      expect(out, `leaked numeric via: ${line}`).not.toContain(leaked);
+      expect(() => JSON.parse(out) as unknown).not.toThrow();
+    }
+  });
+
+  it('preserves pino\'s own numeric fields on a realistic record', () => {
+    // Regression for a would-be self-inflicted outage: a 13-digit ms
+    // epoch sits inside the credit-card pattern's 13–19 digit range, so
+    // roughly one timestamp in ten is Luhn-valid by chance. Screening
+    // numbers without the identifier-key carve-out mangled `time` on
+    // ~10% of ALL log lines.
+    const line =
+      '{"level":30,"time":1725196800123,"pid":12345,"reqId":"r1",' +
+      '"responseTime":12.5,"msg":"request completed"}';
+    const out = redactLogLine(line);
+    expect(out).toContain('"time":1725196800123');
+    expect(out).toContain('"level":30');
+    expect(out).toContain('"pid":12345');
+    expect(out).toContain('"responseTime":12.5');
+  });
+
+  it('preserves a numeric value under an identifier key', () => {
+    expect(redactLogLine('{"consult_id":123456789}')).toContain('"consult_id":123456789');
+  });
+
+  it('preserves non-matching numeric lexemes byte-for-byte', () => {
+    const cases: Array<[string, string]> = [
+      ['9007199254740993', 'bigint beyond MAX_SAFE_INTEGER'],
+      ['1725196800123456789', 'nanosecond timestamp'],
+      ['1.0', 'float formatting'],
+      ['1e21', 'exponent notation'],
+      ['-42', 'negative'],
+    ];
+    for (const [value, label] of cases) {
+      const out = redactLogLine(`{"v":${value},"m":"x"}`);
+      expect(out, `${label} not preserved`).toContain(`"v":${value},`);
+    }
+  });
+
+  it('matches numeric lexemes WHOLE, never as a substring', () => {
+    // The US-phone pattern matches a 10-digit run inside
+    // 9007199254740993; substring matching would rewrite a legitimate
+    // 64-bit id as `900719[REDACTED:US phone number]` — mangling the
+    // value while protecting nothing. A phone number embedded in a
+    // longer digit run is not a phone number.
+    const out = redactLogLine('{"v":9007199254740993,"m":"x"}');
+    expect(out).toContain('9007199254740993');
+    expect(out).not.toContain('REDACTED');
+  });
+});

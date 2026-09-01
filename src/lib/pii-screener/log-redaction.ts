@@ -435,8 +435,49 @@ function redactJsonStringTokens(text: string): string | null {
       continue;
     }
 
-    // Numbers, booleans, null, whitespace, ':' and ',' — verbatim.
-    // Numeric lexemes are deliberately never parsed.
+    // Numeric lexemes.
+    //
+    // An earlier version copied every number through verbatim, on the
+    // reasoning that parsing them loses precision. That was true but
+    // over-applied: it meant `{"ssn":123456789}` and
+    // `{"card":4111111111111111}` — valid JSON NUMBERS matching
+    // high-confidence patterns — reached the destination unredacted.
+    //
+    // The two goals are not in conflict. The lexeme is screened AS TEXT
+    // and never converted to a Number, so a non-matching number is
+    // still emitted byte-for-byte and precision is preserved; a
+    // matching one is replaced with a JSON-encoded redaction token.
+    // Replacing a number with a string changes the JSON type, which is
+    // inherent to redacting it at all.
+    if (ch === '-' || (ch >= '0' && ch <= '9')) {
+      const num = readJsonNumber(text, i);
+      if (num !== null) {
+        // Numbers under an identifier key are preserved verbatim.
+        //
+        // This carve-out is not optional. pino emits `"time":<ms epoch>`
+        // on EVERY line, a 13-digit number — and a 13-digit number is
+        // inside the credit-card pattern's 13–19 digit range, so roughly
+        // one timestamp in ten is Luhn-valid by chance. Without this the
+        // redactor would mangle the timestamp on ~10% of all log lines.
+        // `pid`, `level`, `statusCode` and `responseTime` are the same
+        // shape of server-generated numeric.
+        //
+        // Unlike the string carve-out there is no value-shape test to
+        // add: a number has no UUID/ULID form to check. The residual is
+        // that a numeric field named like an identifier is trusted —
+        // narrower than it sounds, since a national identifier stored as
+        // a JSON number under an `*_id` key is a data-model defect
+        // several layers upstream, and Layers 1, 2, 4 and 5 screen the
+        // paths that could put it there.
+        const enclosingKey = keyStack[keyStack.length - 1] ?? null;
+        const preserveNumber = enclosingKey !== null && isIdentifierKey(enclosingKey);
+        out += preserveNumber ? num.raw : redactNumericLexeme(num.raw);
+        i = num.next;
+        continue;
+      }
+    }
+
+    // Booleans, null, whitespace, ':' and ',' — verbatim.
     out += ch;
     i++;
   }
@@ -761,3 +802,85 @@ export const LOG_REDACTION_FAILURE_SENTINEL = 'log-redaction-failed:chunk-droppe
  * MAX_CARRY_BYTES for why partial emission is unsafe.
  */
 export const LOG_OVERSIZED_LINE_SENTINEL = 'log-redaction:oversized-unterminated-line-dropped';
+
+/**
+ * Read one JSON number lexeme starting at `start`.
+ *
+ * Grammar per RFC 8259: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
+ *
+ * The lexeme is returned as TEXT and never converted to a Number, so a
+ * caller can screen it for PII patterns while still emitting
+ * non-matching values byte-for-byte — preserving 64-bit ids,
+ * nanosecond timestamps, and exact float formatting.
+ *
+ * @returns the raw lexeme and the index just past it, or `null` if the
+ *   text at `start` is not a well-formed number.
+ */
+function readJsonNumber(
+  text: string,
+  start: number,
+): { raw: string; next: number } | null {
+  let i = start;
+  if (text[i] === '-') i++;
+
+  // Integer part.
+  if (text[i] === '0') {
+    i++;
+  } else if (text[i] !== undefined && text[i]! >= '1' && text[i]! <= '9') {
+    while (i < text.length && text[i]! >= '0' && text[i]! <= '9') i++;
+  } else {
+    return null;
+  }
+
+  // Fraction.
+  if (text[i] === '.') {
+    i++;
+    const fracStart = i;
+    while (i < text.length && text[i]! >= '0' && text[i]! <= '9') i++;
+    if (i === fracStart) return null;
+  }
+
+  // Exponent.
+  if (text[i] === 'e' || text[i] === 'E') {
+    i++;
+    if (text[i] === '+' || text[i] === '-') i++;
+    const expStart = i;
+    while (i < text.length && text[i]! >= '0' && text[i]! <= '9') i++;
+    if (i === expStart) return null;
+  }
+
+  return { raw: text.slice(start, i), next: i };
+}
+
+/**
+ * Screen a JSON numeric lexeme, returning either the original lexeme
+ * verbatim or a JSON-encoded redaction token.
+ *
+ * ## Whole-lexeme matching only
+ *
+ * Unlike free text, a bare number must match a pattern in its ENTIRETY
+ * to count. Substring matching produces both false positives and
+ * corruption: the US-phone pattern happily matches a 10-digit run
+ * inside `9007199254740993`, which would rewrite a legitimate 64-bit
+ * identifier as `900719[REDACTED:US phone number]` — mangling the value
+ * while protecting nothing.
+ *
+ * A phone number embedded in a longer digit run is not a phone number.
+ * So each high-confidence pattern is anchored to the full lexeme.
+ *
+ * The lexeme is never converted to a Number, so a non-matching value is
+ * returned byte-for-byte and precision is preserved.
+ */
+function redactNumericLexeme(raw: string): string {
+  for (const pattern of PII_PATTERNS) {
+    if (pattern.confidence !== 'high_confidence') continue;
+    const anchored = new RegExp(
+      `^(?:${pattern.regex.source})$`,
+      pattern.regex.flags.replace(/g/g, ''),
+    );
+    if (!anchored.test(raw)) continue;
+    if (pattern.validate && !pattern.validate(raw)) continue;
+    return JSON.stringify(redactionToken(pattern.label));
+  }
+  return raw;
+}
