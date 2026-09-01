@@ -102,6 +102,8 @@
  *   - SI-010 nonce-as-secret discipline (request_nonce must stay redacted)
  */
 
+import { Transform } from 'node:stream';
+
 import { PII_PATTERNS } from './patterns.js';
 
 /** Sentinel written in place of a subtree that exceeded the depth bound. */
@@ -263,45 +265,84 @@ export function redactLogLine(line: string): string {
 }
 
 /**
- * Minimal writable-stream shape pino accepts as a destination.
+ * Redact every line in a (possibly batched) chunk, preserving the
+ * chunk's exact line framing.
+ *
+ * pino batches multiple newline-delimited records under load, so a
+ * chunk is not necessarily one record.
  */
-export interface LogDestination {
-  write(chunk: string): void;
+export function redactChunk(chunk: string): string {
+  if (chunk.length === 0) return chunk;
+  const parts = chunk.split('\n');
+  return parts
+    .map((part, i) =>
+      // The final element after a trailing '\n' is an empty string;
+      // leave it alone so join() reproduces the original framing.
+      i === parts.length - 1 && part === '' ? part : redactLogLine(part),
+    )
+    .join('\n');
 }
 
 /**
- * Wrap a destination stream so every line written to it passes through
- * Layer 3 redaction.
+ * Build a Transform stream that applies Layer 3 redaction to everything
+ * written through it, then forwards to `dest`.
  *
  * Wire it in `defaultLoggerConfig()`:
  *
  *   stream: createRedactingStream(process.stdout)
  *
+ * ## Why a real `Transform` and not a `{ write }` duck-type
+ *
+ * A plain `{ write(chunk) }` object works for `process.stdout`, but it
+ * silently drops every other stream method. That matters because the
+ * destination may be a pino transport (`pino.transport({ target:
+ * 'pino-pretty' })`), which is a worker-backed stream whose `flush`,
+ * `end`, and event plumbing pino and the process-exit path rely on.
+ * A `Transform` is a real stream, so composition with a transport works
+ * and nothing is lost.
+ *
+ * ## Interaction with pino's `transport` option
+ *
+ * pino REFUSES to accept both `options.transport` and a destination
+ * stream — `lib/tools.js` throws `'only one of option.transport or
+ * stream can be specified'`. So a config that wants pretty-printing
+ * AND redaction must NOT set `transport`; it must build the transport
+ * stream itself and pass the redacting wrapper around it as `stream`.
+ * `defaultLoggerConfig()` does exactly that.
+ *
  * This composes with — does not replace — pino's `redact.paths`. Those
  * run during serialization with `remove: true`, so an explicitly-listed
  * path is dropped entirely; this pass then scrubs whatever survived,
  * INCLUDING serializer-generated content such as the request URL.
- *
- * A chunk may contain multiple newline-delimited records (pino batches
- * under load), so each line is redacted independently.
  */
-export function createRedactingStream(dest: LogDestination): LogDestination {
-  return {
-    write(chunk: string): void {
-      if (typeof chunk !== 'string' || chunk.length === 0) {
-        dest.write(chunk);
-        return;
+export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
+  const transform = new Transform({
+    // Chunks are pino NDJSON text.
+    decodeStrings: false,
+    transform(chunk: unknown, _encoding, callback): void {
+      try {
+        const text =
+          typeof chunk === 'string'
+            ? chunk
+            : Buffer.isBuffer(chunk)
+              ? chunk.toString('utf8')
+              : String(chunk);
+        callback(null, redactChunk(text));
+      } catch (err) {
+        // Never let a redaction failure kill the log stream — that
+        // would cost the operational record. Forward a sentinel line
+        // instead so the loss is visible rather than silent.
+        callback(null, `{"level":50,"msg":"${LOG_REDACTION_FAILURE_SENTINEL}"}\n`);
+        void err;
       }
-      // Preserve the chunk's line structure exactly.
-      const parts = chunk.split('\n');
-      const redacted = parts
-        .map((part, i) =>
-          // The final element after a trailing '\n' is an empty string;
-          // leave it alone so join() reproduces the original framing.
-          i === parts.length - 1 && part === '' ? part : redactLogLine(part),
-        )
-        .join('\n');
-      dest.write(redacted);
     },
-  };
+  });
+  transform.pipe(dest);
+  return transform;
 }
+
+/**
+ * Emitted in place of a chunk whose redaction threw. Visible failure
+ * beats silent loss — and beats emitting the unredacted chunk.
+ */
+export const LOG_REDACTION_FAILURE_SENTINEL = 'log-redaction-failed:chunk-dropped';

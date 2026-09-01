@@ -16,6 +16,8 @@
  *   - stream wrapper preserves chunk/line framing and handles batches
  */
 
+import { Transform, Writable } from 'node:stream';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -213,45 +215,66 @@ describe('redactLogLine — serialized-record pass', () => {
 });
 
 describe('createRedactingStream — destination wrapper', () => {
-  function capture(): { dest: { write(c: string): void }; written: string[] } {
+  function capture(): { dest: Writable; written: string[] } {
     const written: string[] = [];
-    return { dest: { write: (c: string) => void written.push(c) }, written };
+    const dest = new Writable({
+      write(chunk: unknown, _enc, cb): void {
+        written.push(String(chunk));
+        cb();
+      },
+    });
+    return { dest, written };
   }
 
-  it('scrubs a single record', () => {
+  /** Write through the transform and let it flush to dest. */
+  async function pump(stream: Transform, chunk: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      stream.write(chunk, (err) => (err ? reject(err) : resolve()));
+    });
+    await new Promise((r) => setImmediate(r));
+  }
+
+  it('scrubs a single record', async () => {
     const { dest, written } = capture();
-    createRedactingStream(dest).write(
-      JSON.stringify({ msg: 'ssn 123-45-6789' }) + '\n',
-    );
-    expect(written[0]).toContain('[REDACTED:');
-    expect(written[0]).not.toContain('123-45-6789');
+    const s = createRedactingStream(dest);
+    await pump(s, JSON.stringify({ msg: 'ssn 123-45-6789' }) + '\n');
+    const all = written.join('');
+    expect(all).toContain('[REDACTED:');
+    expect(all).not.toContain('123-45-6789');
   });
 
-  it('scrubs every record in a batched multi-line chunk', () => {
+  it('scrubs every record in a batched multi-line chunk', async () => {
     const { dest, written } = capture();
+    const s = createRedactingStream(dest);
     const chunk =
       JSON.stringify({ msg: 'a real.person@example.com' }) +
       '\n' +
       JSON.stringify({ msg: 'b 123-45-6789' }) +
       '\n';
-    createRedactingStream(dest).write(chunk);
-    expect(written[0]).not.toContain('real.person@example.com');
-    expect(written[0]).not.toContain('123-45-6789');
+    await pump(s, chunk);
+    const all = written.join('');
+    expect(all).not.toContain('real.person@example.com');
+    expect(all).not.toContain('123-45-6789');
   });
 
-  it('preserves line framing (trailing newline count)', () => {
+  it('preserves line framing', async () => {
     const { dest, written } = capture();
+    const s = createRedactingStream(dest);
     const chunk = JSON.stringify({ msg: 'x' }) + '\n' + JSON.stringify({ msg: 'y' }) + '\n';
-    createRedactingStream(dest).write(chunk);
-    expect(written[0]!.split('\n')).toHaveLength(chunk.split('\n').length);
-    expect(written[0]!.endsWith('\n')).toBe(true);
+    await pump(s, chunk);
+    const all = written.join('');
+    expect(all.split('\n')).toHaveLength(chunk.split('\n').length);
+    expect(all.endsWith('\n')).toBe(true);
   });
 
-  it('passes a non-string chunk straight through', () => {
-    const { dest, written } = capture();
-    // Defensive: pino should only ever hand us strings, but a transport
-    // could differ. Do not throw.
-    createRedactingStream(dest).write('' as string);
-    expect(written).toHaveLength(1);
+  it('is a real stream (composes with a worker-backed pino transport)', () => {
+    const { dest } = capture();
+    const s = createRedactingStream(dest);
+    // A duck-typed { write } object would fail these. pino and the
+    // process-exit path rely on real stream plumbing when the
+    // destination is a worker-backed transport (pino-pretty).
+    expect(typeof s.pipe).toBe('function');
+    expect(typeof s.end).toBe('function');
+    expect(typeof s.on).toBe('function');
   });
 });

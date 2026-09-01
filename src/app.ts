@@ -20,6 +20,7 @@
 import fastifyHelmet from '@fastify/helmet';
 import fastifySensible from '@fastify/sensible';
 import Fastify, { type FastifyInstance } from 'fastify';
+import { transport as pinoTransport } from 'pino';
 
 import { aiContextPlugin } from './lib/ai-context.js';
 import { authContextPlugin } from './lib/auth-context.js';
@@ -484,18 +485,43 @@ function defaultLoggerConfig(): object {
     // Regex-only, high-confidence patterns only, with server-generated
     // identifier keys preserved verbatim for debuggability. See
     // src/lib/pii-screener/log-redaction.ts for the full rationale.
-    stream: createRedactingStream(process.stdout),
-    // Pretty print in dev only; production emits structured JSON for ingestion
-    // by the audit + observability pipeline.
-    transport:
-      process.env['NODE_ENV'] === 'development'
-        ? {
-            target: 'pino-pretty',
-            options: {
-              translateTime: 'HH:MM:ss',
-              ignore: 'pid,hostname',
-            },
-          }
-        : undefined,
+    // NOTE — `transport` is deliberately NOT set here.
+    //
+    // pino refuses both at once: `lib/tools.js` throws
+    // `'only one of option.transport or stream can be specified'`.
+    // Setting both would make the app fail to BOOT.
+    //
+    // Dev pretty-printing is preserved by building the pino-pretty
+    // transport stream ourselves and wrapping the redactor around it,
+    // then passing the result as `stream`. Production writes structured
+    // JSON straight to stdout for ingestion by the audit +
+    // observability pipeline. Either way the redactor is the outermost
+    // layer, so nothing reaches the destination unscrubbed.
+    stream: createRedactingStream(resolveLogDestination()),
   };
+}
+
+/**
+ * Resolve the underlying log destination.
+ *
+ * Development gets pino-pretty (built as a transport STREAM, not passed
+ * via the `transport` option — see the note in `defaultLoggerConfig`).
+ * Everything else writes to stdout.
+ *
+ * If pino-pretty cannot be loaded (it is a devDependency and may be
+ * absent in a production image), fall back to stdout rather than
+ * failing to boot — pretty output is a convenience; logging is not.
+ */
+function resolveLogDestination(): NodeJS.WritableStream {
+  if (process.env['NODE_ENV'] !== 'development') {
+    return process.stdout;
+  }
+  try {
+    return pinoTransport({
+      target: 'pino-pretty',
+      options: { translateTime: 'HH:MM:ss', ignore: 'pid,hostname' },
+    }) as unknown as NodeJS.WritableStream;
+  } catch {
+    return process.stdout;
+  }
 }
