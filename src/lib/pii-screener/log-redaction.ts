@@ -579,6 +579,21 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
    */
   let discardingUntilNewline = false;
 
+  /**
+   * UTF-8 byte length of `carry`, maintained incrementally.
+   *
+   * The cap is a BYTE cap, so it must be measured in bytes.
+   * `string.length` counts UTF-16 code units, which understates UTF-8
+   * size for any non-ASCII content — a record of ~1,048,575 CJK
+   * characters passes a code-unit check while occupying roughly 3 MiB.
+   *
+   * Recomputing `Buffer.byteLength(carry)` on every chunk would be
+   * O(carry) per chunk and quadratic across a large record, so the
+   * count is carried incrementally: add the byte length of each
+   * incoming chunk, subtract the byte length of each consumed record.
+   */
+  let carryBytes = 0;
+
   const toText = (chunk: unknown): string =>
     typeof chunk === 'string'
       ? chunk
@@ -607,6 +622,7 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
         }
 
         carry += text;
+        carryBytes += Buffer.byteLength(text, 'utf8');
 
         // Process RECORD BY RECORD so the size cap is enforced per
         // record, independent of how the producer happened to chunk.
@@ -624,7 +640,9 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
           if (nl === -1) break;
           const record = carry.slice(0, nl + 1);
           carry = carry.slice(nl + 1);
-          if (record.length > MAX_CARRY_BYTES) {
+          const recordBytes = Buffer.byteLength(record, 'utf8');
+          carryBytes -= recordBytes;
+          if (recordBytes > MAX_CARRY_BYTES) {
             // Oversized even though terminated — drop it rather than
             // spend unbounded work redacting it.
             out += `{"level":50,"msg":"${LOG_OVERSIZED_LINE_SENTINEL}"}\n`;
@@ -637,8 +655,9 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
         // the cap, in which case DROP it (see MAX_CARRY_BYTES) — never
         // emit part of it, or the destination could reassemble a token
         // split across the emission boundary.
-        if (carry.length > MAX_CARRY_BYTES) {
+        if (carryBytes > MAX_CARRY_BYTES) {
           carry = '';
+          carryBytes = 0;
           discardingUntilNewline = true;
           out += `{"level":50,"msg":"${LOG_OVERSIZED_LINE_SENTINEL}"}\n`;
         }
@@ -649,6 +668,7 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
         // would cost the operational record. Forward a sentinel line
         // instead so the loss is visible rather than silent.
         carry = '';
+        carryBytes = 0;
         callback(null, `{"level":50,"msg":"${LOG_REDACTION_FAILURE_SENTINEL}"}\n`);
         void err;
       }
@@ -662,9 +682,11 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
         }
         const remainder = carry;
         carry = '';
+        carryBytes = 0;
         callback(null, redactChunk(remainder));
       } catch (err) {
         carry = '';
+        carryBytes = 0;
         callback(null, `{"level":50,"msg":"${LOG_REDACTION_FAILURE_SENTINEL}"}\n`);
         void err;
       }

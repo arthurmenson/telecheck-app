@@ -564,3 +564,63 @@ describe('createRedactingStream — per-record cap enforcement', () => {
     expect(out).toContain('r3');
   });
 });
+
+describe('createRedactingStream — cap is measured in UTF-8 BYTES', () => {
+  function capture(): { dest: Writable; written: string[] } {
+    const written: string[] = [];
+    const dest = new Writable({
+      write(chunk: unknown, _enc, cb): void {
+        written.push(String(chunk));
+        cb();
+      },
+    });
+    return { dest, written };
+  }
+
+  async function feed(chunks: string[]): Promise<string> {
+    const { dest, written } = capture();
+    const stream = createRedactingStream(dest);
+    for (const c of chunks) {
+      await new Promise<void>((resolve, reject) => {
+        stream.write(c, (err) => (err ? reject(err) : resolve()));
+      });
+    }
+    await new Promise<void>((resolve) => stream.end(() => resolve()));
+    await new Promise((r) => setImmediate(r));
+    return written.join('');
+  }
+
+  it('drops a multibyte record over the BYTE cap', async () => {
+    // Codex finding: both checks used string.length (UTF-16 code
+    // units) against a constant named in BYTES. 400k CJK characters is
+    // only 400k code units but ~1.2 MiB in UTF-8, so it passed the cap
+    // while exceeding the intended bound.
+    const cjk = '\u4e2d'.repeat(400_000);
+    const out = await feed([cjk + 'ssn 123-45-6789\n']);
+    expect(out).toContain(LOG_OVERSIZED_LINE_SENTINEL);
+    expect(out).not.toContain('123-45-6789');
+  });
+
+  it('a normal ASCII record is unaffected', async () => {
+    const out = await feed([JSON.stringify({ msg: 'p'.repeat(1000) + ' a@b.com' }) + '\n']);
+    expect(out).not.toContain('a@b.com');
+    expect(out).toContain('[REDACTED:');
+  });
+
+  it('multibyte records remain split-PII safe at every boundary', async () => {
+    const record = JSON.stringify({ msg: '\u4e2d\u6587 real.person@example.com \u4e2d' }) + '\n';
+    const leaks: number[] = [];
+    for (let i = 1; i < record.length; i++) {
+      const out = await feed([record.slice(0, i), record.slice(i)]);
+      if (out.includes('real.person@example.com')) leaks.push(i);
+    }
+    expect(leaks, `leaked at: ${leaks.join(', ')}`).toEqual([]);
+  });
+
+  it('resynchronises after a multibyte drop', async () => {
+    const cjk = '\u4e2d'.repeat(400_000);
+    const out = await feed([cjk + 'x', 'tail\n', JSON.stringify({ msg: 'after' }) + '\n']);
+    expect(out).toContain('after');
+    expect(out).not.toContain('tail');
+  });
+});
