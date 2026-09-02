@@ -38,9 +38,7 @@ describe('redactString — Layer-3-eligible patterns (redactInLogs)', () => {
   });
 
   it('scrubs an email', () => {
-    expect(redactString('contact real.person@example.com')).toContain(
-      '[REDACTED:Email address]',
-    );
+    expect(redactString('contact real.person@example.com')).toContain('[REDACTED:Email address]');
   });
 
   it('scrubs a Ghana Card id', () => {
@@ -552,17 +550,13 @@ describe('createRedactingStream — per-record cap enforcement', () => {
   });
 
   it('emits a preceding complete line, then drops an oversized tail', async () => {
-    const out = await feed([
-      JSON.stringify({ msg: 'first clean' }) + '\n',
-      'q'.repeat(CAP + 10),
-    ]);
+    const out = await feed([JSON.stringify({ msg: 'first clean' }) + '\n', 'q'.repeat(CAP + 10)]);
     expect(out).toContain('first clean');
     expect(out).toContain(LOG_OVERSIZED_LINE_SENTINEL);
   });
 
   it('redacts every record in a batched multi-record chunk', async () => {
-    const many =
-      [1, 2, 3].map((i) => JSON.stringify({ msg: `r${i} a@b.com` })).join('\n') + '\n';
+    const many = [1, 2, 3].map((i) => JSON.stringify({ msg: `r${i} a@b.com` })).join('\n') + '\n';
     const out = await feed([many]);
     expect(out).not.toContain('a@b.com');
     expect(out).toContain('r1');
@@ -762,7 +756,7 @@ describe('redactLogLine — numeric JSON values', () => {
     }
   });
 
-  it('preserves pino\'s own numeric fields on a realistic record', () => {
+  it("preserves pino's own numeric fields on a realistic record", () => {
     // Regression for a would-be self-inflicted outage: a 13-digit ms
     // epoch sits inside the credit-card pattern's 13–19 digit range, so
     // roughly one timestamp in ten is Luhn-valid by chance. Screening

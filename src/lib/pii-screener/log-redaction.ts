@@ -53,7 +53,7 @@
  *
  * ## Regex-only — NER is deliberately NOT used here
  *
- * Layers 1 and 2 run regex + local NER. Layer 3 runs regex ONLY:
+ * Layer 3 runs regex ONLY:
  *
  *   - **Cost.** NER is model inference. Logs are high-volume and on the
  *     hot path; paying inference per log line is not viable.
@@ -64,6 +64,17 @@
  *   - **Value.** What actually shows up in a leaked log line is
  *     STRUCTURED identifiers — an SSN, an email, a phone, a card number.
  *     That is precisely regex's strength.
+ *
+ * ⚠️ This header previously said "Layers 1 and 2 run regex + local NER",
+ * and treated that as the reason Layer 3 need not. **That was false.**
+ * `wink-eng-lite-web-model` ships no statistical PERSON / GPE / ORG
+ * recogniser, so `ner.ts`'s filter for those types matches nothing and NO
+ * layer detects person names or prose addresses. The reasons above stand
+ * on their own — they are about cost and precision, not redundancy — but
+ * the unstructured classes are NOT covered elsewhere, and nothing here
+ * should be read as implying they are. Remedy pending ratifier decision:
+ *   telecheckONE/Telecheck_v1_10_PRD_Update/
+ *     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
  *
  * ## No shape-based trust for strings
  *
@@ -530,9 +541,7 @@ function redactJsonStringTokens(text: string): string | null {
         // (`logger.info({ time: 3125551212 }, 'x')`).
         // Every allowlisted field sits at a fixed position in the record,
         // so requiring the position costs nothing.
-        out += shouldPreserveNumber(keyStack, num.raw)
-          ? num.raw
-          : redactNumericLexeme(num.raw);
+        out += shouldPreserveNumber(keyStack, num.raw) ? num.raw : redactNumericLexeme(num.raw);
         i = num.next;
         continue;
       }
@@ -877,10 +886,7 @@ export const LOG_OVERSIZED_LINE_SENTINEL = 'log-redaction:oversized-unterminated
  * @returns the raw lexeme and the index just past it, or `null` if the
  *   text at `start` is not a well-formed number.
  */
-function readJsonNumber(
-  text: string,
-  start: number,
-): { raw: string; next: number } | null {
+function readJsonNumber(text: string, start: number): { raw: string; next: number } | null {
   let i = start;
   if (text[i] === '-') i++;
 

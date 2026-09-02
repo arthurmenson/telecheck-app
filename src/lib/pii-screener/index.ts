@@ -231,9 +231,7 @@ export function screenInput(text: string, routeClass: RouteClass): ScreeningResu
     return {
       hits,
       action: 'block',
-      blockReason: hasHighConfidence
-        ? 'regex_match_high_confidence'
-        : 'regex_match_any_ai_bound',
+      blockReason: hasHighConfidence ? 'regex_match_high_confidence' : 'regex_match_any_ai_bound',
       participantMessage: PARTICIPANT_BLOCK_MESSAGE,
     };
   }

@@ -149,10 +149,13 @@ function getNlp(): WinkMethods {
  * failure that blocks the request.
  */
 export class NerOffsetDerivationError extends Error {
-  constructor(public readonly entityValue: string, public readonly entityType: string) {
+  constructor(
+    public readonly entityValue: string,
+    public readonly entityType: string,
+  ) {
     super(
       `pii-screener: could not derive character offsets for detected ${entityType} entity "${entityValue}". ` +
-      `Fail-closed per Layer 1 SAFETY discipline.`,
+        `Fail-closed per Layer 1 SAFETY discipline.`,
     );
     this.name = 'NerOffsetDerivationError';
   }

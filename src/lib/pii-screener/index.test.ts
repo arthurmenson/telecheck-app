@@ -50,16 +50,52 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
     // otherwise it's dead code. This table is the authoritative sample
     // set + gets extended as new patterns land.
     const samples: Array<{ patternId: string; input: string; expectMatch: string }> = [
-      { patternId: 'us_ssn', input: 'my SSN is 123-45-6789 for the form', expectMatch: '123-45-6789' },
-      { patternId: 'ghana_card', input: 'Ghana Card GHA-123456789-0 issued', expectMatch: 'GHA-123456789-0' },
-      { patternId: 'us_passport', input: 'passport number AB1234567 issued', expectMatch: 'passport number AB1234567' },
-      { patternId: 'credit_card', input: 'card 4111 1111 1111 1111 expires', expectMatch: '4111 1111 1111 1111' },
-      { patternId: 'email', input: 'reach me at test.user@example.com anytime', expectMatch: 'test.user@example.com' },
-      { patternId: 'us_phone', input: 'call (415) 555-0123 or leave a message', expectMatch: '(415) 555-0123' },
-      { patternId: 'ghana_phone', input: 'my number +233241234567 works too', expectMatch: '+233241234567' },
+      {
+        patternId: 'us_ssn',
+        input: 'my SSN is 123-45-6789 for the form',
+        expectMatch: '123-45-6789',
+      },
+      {
+        patternId: 'ghana_card',
+        input: 'Ghana Card GHA-123456789-0 issued',
+        expectMatch: 'GHA-123456789-0',
+      },
+      {
+        patternId: 'us_passport',
+        input: 'passport number AB1234567 issued',
+        expectMatch: 'passport number AB1234567',
+      },
+      {
+        patternId: 'credit_card',
+        input: 'card 4111 1111 1111 1111 expires',
+        expectMatch: '4111 1111 1111 1111',
+      },
+      {
+        patternId: 'email',
+        input: 'reach me at test.user@example.com anytime',
+        expectMatch: 'test.user@example.com',
+      },
+      {
+        patternId: 'us_phone',
+        input: 'call (415) 555-0123 or leave a message',
+        expectMatch: '(415) 555-0123',
+      },
+      {
+        patternId: 'ghana_phone',
+        input: 'my number +233241234567 works too',
+        expectMatch: '+233241234567',
+      },
       { patternId: 'ipv4', input: 'the box at 10.0.0.42 is down', expectMatch: '10.0.0.42' },
-      { patternId: 'ipv6', input: 'client 2001:db8:85a3::8a2e:370:7334 connected', expectMatch: '2001:db8:85a3::8a2e:370:7334' },
-      { patternId: 'medical_record_number', input: 'MRN 1234567 in the chart', expectMatch: 'MRN 1234567' },
+      {
+        patternId: 'ipv6',
+        input: 'client 2001:db8:85a3::8a2e:370:7334 connected',
+        expectMatch: '2001:db8:85a3::8a2e:370:7334',
+      },
+      {
+        patternId: 'medical_record_number',
+        input: 'MRN 1234567 in the chart',
+        expectMatch: 'MRN 1234567',
+      },
     ];
 
     for (const { patternId, input, expectMatch } of samples) {
@@ -76,8 +112,10 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
     it('has a positive sample for every registered pattern (dead-code guard)', () => {
       const covered = new Set(samples.map((s) => s.patternId));
       const uncovered = PII_PATTERNS.filter((p) => !covered.has(p.id));
-      expect(uncovered, `patterns without a positive sample: ${uncovered.map((p) => p.id).join(', ')}`)
-        .toEqual([]);
+      expect(
+        uncovered,
+        `patterns without a positive sample: ${uncovered.map((p) => p.id).join(', ')}`,
+      ).toEqual([]);
     });
   });
 
@@ -138,8 +176,10 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       ];
       for (const input of negatives) {
         const r = screenInput(input, 'ai_bound');
-        expect(r.hits.some((h) => h.patternId === 'us_passport'),
-          `false-positive passport hit on: ${input}`).toBe(false);
+        expect(
+          r.hits.some((h) => h.patternId === 'us_passport'),
+          `false-positive passport hit on: ${input}`,
+        ).toBe(false);
       }
     });
 
@@ -197,8 +237,10 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       ];
       for (const input of negatives) {
         const r = screenInput(input, 'internal');
-        expect(r.hits.some((h) => h.patternId === 'ipv6'),
-          `false-positive ipv6 hit on: ${input}`).toBe(false);
+        expect(
+          r.hits.some((h) => h.patternId === 'ipv6'),
+          `false-positive ipv6 hit on: ${input}`,
+        ).toBe(false);
       }
     });
 
@@ -261,24 +303,29 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(r.action).toBe('block');
     });
 
-    it.fails('A6b — subtle PII on internal-only route with GPE (low-confidence) redacts inline', () => {
-      // GPE (country/city name) alone is low-confidence; internal
-      // route → redact. Explicitly free of PERSON entities (which would
-      // be high-confidence block).
-      //
-      // R1 finding: prior version accepted redact OR pass, so a broken
-      // NER integration would silently satisfy this test. Fix — require
-      // deterministic detection: use a well-known GPE fixture ("United
-      // States") that wink-eng-lite-web-model reliably surfaces, and
-      // assert the concrete post-redaction output.
-      const r = screenInput('the clinic is in the United States today', 'internal');
-      expect(r.action).toBe('redact');
-      const gpeHit = r.hits.find((h) => h.patternId === 'ner_gpe');
-      expect(gpeHit).toBeDefined();
-      expect(gpeHit?.confidence).toBe('low_confidence');
-      // Concrete redaction must place the GPE label at the right position.
-      expect(r.redactedInput).toContain('[REDACTED:Geopolitical entity (country / city / state)]');
-    });
+    it.fails(
+      'A6b — subtle PII on internal-only route with GPE (low-confidence) redacts inline',
+      () => {
+        // GPE (country/city name) alone is low-confidence; internal
+        // route → redact. Explicitly free of PERSON entities (which would
+        // be high-confidence block).
+        //
+        // R1 finding: prior version accepted redact OR pass, so a broken
+        // NER integration would silently satisfy this test. Fix — require
+        // deterministic detection: use a well-known GPE fixture ("United
+        // States") that wink-eng-lite-web-model reliably surfaces, and
+        // assert the concrete post-redaction output.
+        const r = screenInput('the clinic is in the United States today', 'internal');
+        expect(r.action).toBe('redact');
+        const gpeHit = r.hits.find((h) => h.patternId === 'ner_gpe');
+        expect(gpeHit).toBeDefined();
+        expect(gpeHit?.confidence).toBe('low_confidence');
+        // Concrete redaction must place the GPE label at the right position.
+        expect(r.redactedInput).toContain(
+          '[REDACTED:Geopolitical entity (country / city / state)]',
+        );
+      },
+    );
 
     it('synthetic participant handle does NOT trigger PERSON (does not look like a name)', () => {
       const r = screenInput('I am pilot1-participant-01 and I feel great', 'ai_bound');
@@ -382,10 +429,7 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
 
   describe('redaction correctness', () => {
     it('redacts multiple non-overlapping low-confidence hits in order', () => {
-      const result = screenInput(
-        'the servers 10.0.0.1 and 10.0.0.2 are both offline',
-        'internal',
-      );
+      const result = screenInput('the servers 10.0.0.1 and 10.0.0.2 are both offline', 'internal');
       expect(result.action).toBe('redact');
       expect(result.redactedInput).toBe(
         'the servers [REDACTED:IPv4 address] and [REDACTED:IPv4 address] are both offline',
@@ -398,10 +442,7 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       // sit adjacent to other tokens. If we ever add overlapping
       // patterns, this test locks the tie-break rule.
       // For now, verify redaction is well-formed even on adjacent hits.
-      const result = screenInput(
-        'server1 10.0.0.1 server2 10.0.0.2',
-        'internal',
-      );
+      const result = screenInput('server1 10.0.0.1 server2 10.0.0.2', 'internal');
       expect(result.action).toBe('redact');
       expect(result.redactedInput).toBe(
         'server1 [REDACTED:IPv4 address] server2 [REDACTED:IPv4 address]',
@@ -522,7 +563,8 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         violations.push(...fileViolations);
       }
 
-      expect(violations,
+      expect(
+        violations,
         `pii-screener production sources violate SAFETY: ${JSON.stringify(violations, null, 2)}`,
       ).toEqual([]);
 
@@ -533,7 +575,8 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       const suspiciousExportNames = Object.keys(mod).filter((n) =>
         /client|provider|fetch|http|anthropic|bedrock|azure/i.test(n),
       );
-      expect(suspiciousExportNames,
+      expect(
+        suspiciousExportNames,
         `pii-screener module surface should not export network-adjacent identifiers; found: ${suspiciousExportNames.join(', ')}`,
       ).toEqual([]);
     });
@@ -551,9 +594,15 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       const bypasses: Array<[string, string]> = [
         ['bare-name https import', `import { request } from 'https'; request();`],
         ['bare-name http import', `import { request } from 'http'; request();`],
-        ['node: prefixed https with comment', `import /*allowed?*/ { request } from 'node:https'; request();`],
+        [
+          'node: prefixed https with comment',
+          `import /*allowed?*/ { request } from 'node:https'; request();`,
+        ],
         ['anthropic sdk side-effect', `import '@anthropic-ai/sdk';`],
-        ['anthropic bedrock sdk named', `import { AnthropicBedrock } from '@anthropic-ai/bedrock-sdk'; new AnthropicBedrock();`],
+        [
+          'anthropic bedrock sdk named',
+          `import { AnthropicBedrock } from '@anthropic-ai/bedrock-sdk'; new AnthropicBedrock();`,
+        ],
         ['template-literal dynamic import', 'import(`https://api.anthropic.com`)'],
         // R4 finding — the global-fetch bypasses:
         ['bare global fetch call', `fetch('https://api.anthropic.com/v1/messages');`],
@@ -569,27 +618,51 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         ['globalThis bracket fetch', `globalThis['fetch']('https://x');`],
         ['self bracket WebSocket', `new (self['WebSocket'])('wss://x');`],
         ['window bracket process', `window['process'].getBuiltinModule('node:https');`],
-        ['Reflect.get on globalThis for fetch (string literal)', `Reflect.get(globalThis, 'fetch')('https://x');`],
-        ['Reflect.get on globalThis (any string)', `Reflect.get(globalThis, someRuntimeString)('https://x');`],
+        [
+          'Reflect.get on globalThis for fetch (string literal)',
+          `Reflect.get(globalThis, 'fetch')('https://x');`,
+        ],
+        [
+          'Reflect.get on globalThis (any string)',
+          `Reflect.get(globalThis, someRuntimeString)('https://x');`,
+        ],
         ['aliased-global bracket access', `const g = globalThis; g['fetch']('https://x');`],
         // R6 finding — spelling-agnostic bypasses:
         ['template-literal key', 'globalThis[`fetch`](`https://x`);'],
         ['computed-key string concat', `globalThis['fe' + 'tch']('https://x');`],
         ['runtime-variable key', `const k = 'fetch'; globalThis[k]('https://x');`],
-        ['Object.getOwnPropertyDescriptor global', `Object.getOwnPropertyDescriptor(globalThis, 'fetch').value('https://x');`],
+        [
+          'Object.getOwnPropertyDescriptor global',
+          `Object.getOwnPropertyDescriptor(globalThis, 'fetch').value('https://x');`,
+        ],
         ['Object.entries global', `Object.entries(globalThis).find(([k]) => k === 'fetch');`],
         // R7 finding — alias-tracking bypasses:
-        ['aliased-global bracket then invocation', `const g = globalThis; g['fetch']('https://x');`],
+        [
+          'aliased-global bracket then invocation',
+          `const g = globalThis; g['fetch']('https://x');`,
+        ],
         ['aliased Reflect', `const r = Reflect; r.get(globalThis, 'fetch')('https://x');`],
-        ['aliased Object', `const o = Object; o.getOwnPropertyDescriptor(globalThis, 'fetch').value('https://x');`],
+        [
+          'aliased Object',
+          `const o = Object; o.getOwnPropertyDescriptor(globalThis, 'fetch').value('https://x');`,
+        ],
         ['destructured from globalThis', `const { fetch: f } = globalThis; f('https://x');`],
         ['destructured Reflect', `const { get } = Reflect; get(globalThis, 'fetch')('https://x');`],
         // R8 finding — transitive-taint bypasses:
         ['two-hop global alias', `const g = globalThis; const h = g; h['fetch']('https://x');`],
-        ['three-hop global alias', `const g = globalThis; const h = g; const i = h; i['fetch']('https://x');`],
+        [
+          'three-hop global alias',
+          `const g = globalThis; const h = g; const i = h; i['fetch']('https://x');`,
+        ],
         ['assignment-mediated alias', `let g; g = globalThis; g['fetch']('https://x');`],
-        ['multi-hop Reflect alias', `const r = Reflect; const r2 = r; r2.get(globalThis, 'fetch')('https://x');`],
-        ['multi-hop Object alias', `const o = Object; const o2 = o; o2.getOwnPropertyDescriptor(globalThis, 'fetch');`],
+        [
+          'multi-hop Reflect alias',
+          `const r = Reflect; const r2 = r; r2.get(globalThis, 'fetch')('https://x');`,
+        ],
+        [
+          'multi-hop Object alias',
+          `const o = Object; const o2 = o; o2.getOwnPropertyDescriptor(globalThis, 'fetch');`,
+        ],
       ];
 
       const failedToDetect: string[] = [];
@@ -599,7 +672,8 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
           failedToDetect.push(label);
         }
       }
-      expect(failedToDetect,
+      expect(
+        failedToDetect,
         `safety checker failed to detect bypass form(s): ${failedToDetect.join('; ')}`,
       ).toEqual([]);
     });
@@ -695,19 +769,26 @@ function checkSafety(
       // Destructuring binding: `const { fetch } = globalThis` etc. —
       // recorded as a violation at the destructure site because the
       // destructured names could carry the taint anywhere.
-      if (ts.isVariableDeclaration(node)
-        && node.initializer
-        && (ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name))) {
+      if (
+        ts.isVariableDeclaration(node) &&
+        node.initializer &&
+        (ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name))
+      ) {
         const root = resolveRootReceiver(node.initializer, ts);
         const currentAll = new Set<string>([
-          ...GLOBAL_ROOTS, ...globalRootAliases,
-          'Reflect', ...reflectAliases,
-          'Object', ...objectAliases,
+          ...GLOBAL_ROOTS,
+          ...globalRootAliases,
+          'Reflect',
+          ...reflectAliases,
+          'Object',
+          ...objectAliases,
         ]);
         if (root && currentAll.has(root)) {
           // Only push once per destructure decl (dedupe on line-start).
           const detail = `destructure from ${root}`;
-          const already = violations.some((v) => v.kind === 'destructured-from-global-like' && v.detail === detail);
+          const already = violations.some(
+            (v) => v.kind === 'destructured-from-global-like' && v.detail === detail,
+          );
           if (!already) {
             violations.push({ file: fileLabel, kind: 'destructured-from-global-like', detail });
             grew = true;
@@ -715,9 +796,11 @@ function checkSafety(
         }
       }
       // Also track assignment-mediated aliases: `let g; g = globalThis`
-      if (ts.isBinaryExpression(node)
-        && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
-        && ts.isIdentifier(node.left)) {
+      if (
+        ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(node.left)
+      ) {
         const root = resolveRootReceiver(node.right, ts);
         if (root) {
           const currentGlobalSet = new Set<string>([...GLOBAL_ROOTS, ...globalRootAliases]);
@@ -749,16 +832,21 @@ function checkSafety(
 
   // Effective sets for downstream checks.
   const effectiveGlobalLikeReceivers = new Set<string>([
-    ...GLOBAL_ROOTS, ...globalRootAliases,
-    'Reflect', ...reflectAliases,
-    'Object', ...objectAliases,
+    ...GLOBAL_ROOTS,
+    ...globalRootAliases,
+    'Reflect',
+    ...reflectAliases,
+    'Object',
+    ...objectAliases,
   ]);
   const effectiveReflectReceivers = new Set<string>(['Reflect', ...reflectAliases]);
   const effectiveObjectReceivers = new Set<string>(['Object', ...objectAliases]);
   // Backwards-compat: previously used `globalAliases` name is retained
   // for the receiver-detail annotation logic below.
   const globalAliases = new Set<string>([
-    ...globalRootAliases, ...reflectAliases, ...objectAliases,
+    ...globalRootAliases,
+    ...reflectAliases,
+    ...objectAliases,
   ]);
   const effectiveGlobalLike = effectiveGlobalLikeReceivers;
 
@@ -769,7 +857,11 @@ function checkSafety(
       if (!importAllowlist.has(spec)) {
         violations.push({ file: fileLabel, kind: 'import', detail: spec });
       }
-    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+    } else if (
+      ts.isExportDeclaration(node) &&
+      node.moduleSpecifier &&
+      ts.isStringLiteral(node.moduleSpecifier)
+    ) {
       const spec = node.moduleSpecifier.text;
       if (!importAllowlist.has(spec)) {
         violations.push({ file: fileLabel, kind: 'reexport', detail: spec });
@@ -787,9 +879,11 @@ function checkSafety(
           detail: '<non-string-literal specifier — not statically verifiable>',
         });
       }
-    } else if (ts.isImportEqualsDeclaration(node)
-      && ts.isExternalModuleReference(node.moduleReference)
-      && ts.isStringLiteral(node.moduleReference.expression)) {
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      ts.isExternalModuleReference(node.moduleReference) &&
+      ts.isStringLiteral(node.moduleReference.expression)
+    ) {
       const spec = node.moduleReference.expression.text;
       if (!importAllowlist.has(spec)) {
         violations.push({ file: fileLabel, kind: 'import-equals', detail: spec });
@@ -852,19 +946,28 @@ function checkSafety(
       // Reflect is treated as a Reflect-alias if the identifier itself
       // is Reflect OR is an alias whose initializer resolved to Reflect
       // (transitively via the pre-pass fixed-point taint set).
-      if (root
-        && effectiveReflectReceivers.has(root)
-        && ['get', 'apply', 'construct', 'has', 'ownKeys', 'getPrototypeOf'].includes(method)) {
+      if (
+        root &&
+        effectiveReflectReceivers.has(root) &&
+        ['get', 'apply', 'construct', 'has', 'ownKeys', 'getPrototypeOf'].includes(method)
+      ) {
         violations.push({
           file: fileLabel,
           kind: 'reflect-call',
           detail: `${root}.${method}(...)${reflectAliases.has(root) ? ` (Reflect alias)` : ''}`,
         });
       }
-      if (root
-        && effectiveObjectReceivers.has(root)
-        && ['getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'getOwnPropertyNames', 'entries', 'values']
-          .includes(method)) {
+      if (
+        root &&
+        effectiveObjectReceivers.has(root) &&
+        [
+          'getOwnPropertyDescriptor',
+          'getOwnPropertyDescriptors',
+          'getOwnPropertyNames',
+          'entries',
+          'values',
+        ].includes(method)
+      ) {
         // Object.entries / values / etc. on globalThis could enumerate
         // + reach globals. Flag when receiver is globalThis-like (or
         // aliased-to-globalThis-like via the pre-pass taint set).
@@ -916,10 +1019,7 @@ function checkSafety(
  * pattern below. That coverage is complementary; the intent here is
  * to keep the checker fail-closed on direct + one-hop aliased forms.
  */
-function resolveRootReceiver(
-  expr: import('typescript').Expression,
-  ts: TsModule,
-): string | null {
+function resolveRootReceiver(expr: import('typescript').Expression, ts: TsModule): string | null {
   let cur: import('typescript').Node = expr;
   for (let hops = 0; hops < 64; hops++) {
     if (ts.isParenthesizedExpression(cur)) {
@@ -1064,9 +1164,10 @@ describe('us_phone matches standalone numbers but never identifier substrings', 
       'aaa-446655440000-bbb',
     ]) {
       const hits = screenInput(text, 'internal').hits;
-      expect(hits.some((h) => h.patternId === 'us_phone'), `phone matched in: ${text}`).toBe(
-        false,
-      );
+      expect(
+        hits.some((h) => h.patternId === 'us_phone'),
+        `phone matched in: ${text}`,
+      ).toBe(false);
     }
   });
 });

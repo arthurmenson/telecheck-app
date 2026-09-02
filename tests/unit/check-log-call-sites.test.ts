@@ -46,7 +46,7 @@ const rules = (vs: readonly Violation[]): string[] => vs.map((v) => v.rule);
 
 describe('check-log-call-sites — catches the leak shapes', () => {
   it('flags an interpolated message', () => {
-    const vs = check("req.log.error(`bad input: ${x}`);");
+    const vs = check('req.log.error(`bad input: ${x}`);');
     expect(rules(vs)).toContain('log-message-must-be-static');
   });
 
@@ -75,9 +75,7 @@ describe('check-log-call-sites — catches the leak shapes', () => {
   it('flags destructured request data', () => {
     // Destructuring is the most natural way to reach for the value, so it
     // must not be a way around the rule.
-    const vs = check(
-      'const { message_text } = req.body;\nreq.log.info({ message_text }, "x");',
-    );
+    const vs = check('const { message_text } = req.body;\nreq.log.info({ message_text }, "x");');
     expect(rules(vs)).toContain('no-request-data-in-logs');
   });
 
@@ -201,9 +199,11 @@ describe('check-log-call-sites — the opt-out', () => {
 
   it('does NOT let an opt-out leak across a blank line', () => {
     const vs = check(
-      ['// pii-log-allow: applies to something else', '', 'req.log.info({ v: req.body.x }, "y");'].join(
-        '\n',
-      ),
+      [
+        '// pii-log-allow: applies to something else',
+        '',
+        'req.log.info({ v: req.body.x }, "y");',
+      ].join('\n'),
     );
     expect(rules(vs)).toContain('no-request-data-in-logs');
   });

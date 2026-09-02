@@ -1175,9 +1175,7 @@ describe('Mode 1 chat — Group PII: Layer 1 screener wiring (Sprint 1.1c)', () 
     expect(body.ai_model_version).toBe('crisis-bypass:no-llm-call');
 
     // Half 2 — the documented residual: raw message persisted verbatim.
-    const conversationId = response.json<Record<string, unknown>>()[
-      'ai_chat_session_id'
-    ] as string;
+    const conversationId = response.json<Record<string, unknown>>()['ai_chat_session_id'] as string;
     const rows = await loadMode1Rows(conversationId);
     expect(rows.admissions).toHaveLength(1);
     expect(rows.admissions[0]!.user_message).toBe(crisisPlusPii);
