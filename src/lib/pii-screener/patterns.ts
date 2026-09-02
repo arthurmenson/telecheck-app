@@ -124,6 +124,40 @@ export const PII_PATTERNS: readonly PiiPattern[] = [
   //
   // The specific pattern must precede the general one.
   {
+    id: 'date_of_birth',
+    label: 'Date of birth (context-bound)',
+    confidence: 'high_confidence',
+    redactInLogs: true,
+    // A date adjacent to a DOB label. CONTEXT-BOUND on purpose.
+    //
+    // This replaces what the NER layer's DATE entity was nominally
+    // providing. That entity was not a DOB control: it fired on ANY date
+    // expression, so because `ai_bound` blocks on any hit, "What time
+    // should I take my medication today?" returned 422 on the Mode 1 chat
+    // route. Blocking every date word does not protect a date of birth;
+    // it just makes the route unusable, and it still would not have
+    // labelled the hit as a DOB.
+    //
+    // Binding to an explicit DOB label is strictly better on both sides:
+    // it catches the actual thing (a birth date a participant typed) with
+    // a correct label, and it leaves "today", "next Tuesday" and
+    // appointment dates alone. Same reasoning as `us_passport`, which is
+    // context-bound for exactly this reason.
+    //
+    // Covers numeric (01/15/1990, 1990-01-15, 15.01.1990) and month-name
+    // (15 Jan 1990, January 15, 1990) forms after any of: DOB, D.O.B.,
+    // "date of birth", "birth date", "born", "born on".
+    //
+    // No trailing `\b` after the label: "D.O.B." ends in a period, and a
+    // period followed by a space is not a word boundary, so the abbreviated
+    // form silently failed to match. The leading `\b` is what does the real
+    // work — it is why "reborn 1990-01-15" is not a hit — and the required
+    // date immediately after the optional separator prevents the looser
+    // label from over-matching on its own.
+    regex:
+      /\b(?:d\.?\s?o\.?\s?b\.?|date\s+of\s+birth|birth\s*date|born(?:\s+on)?)\s*[:#-]?\s*(?:\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}|\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})/gi,
+  },
+  {
     id: 'ghana_card',
     label: 'Ghana National ID (Ghana Card)',
     confidence: 'high_confidence',

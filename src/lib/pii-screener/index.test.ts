@@ -56,6 +56,11 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         expectMatch: '123-45-6789',
       },
       {
+        patternId: 'date_of_birth',
+        input: 'patient dob 12/31/1985 reports pain',
+        expectMatch: 'dob 12/31/1985',
+      },
+      {
         patternId: 'ghana_card',
         input: 'Ghana Card GHA-123456789-0 issued',
         expectMatch: 'GHA-123456789-0',
@@ -1122,6 +1127,59 @@ describe('pii-screener — screenOutput (Layer 2 egress, Sprint 1.1d)', () => {
     const r = screenOutput('I checked with Dr. Sarah Whitfield about your dosage.');
     expect(r.redacted).toBe(true);
     expect(r.output).toContain('[REDACTED:Person name]');
+  });
+});
+
+describe('date_of_birth is context-bound (replaces the NER DATE entity)', () => {
+  it('matches a date after any DOB label, in numeric and month-name forms', () => {
+    for (const text of [
+      'DOB: 01/15/1990',
+      'd.o.b 1990-01-15',
+      'D.O.B. 15.01.1990',
+      'date of birth 1990-01-15',
+      'Date Of Birth: 15 Jan 1990',
+      'birth date January 15, 1990',
+      'born on 1990-01-15',
+      'born 15 January 1990',
+    ]) {
+      const hits = screenInput(text, 'internal').hits;
+      expect(
+        hits.some((h) => h.patternId === 'date_of_birth'),
+        `missed: ${text}`,
+      ).toBe(true);
+    }
+  });
+
+  it('does NOT fire on ordinary dates — the defect this replaces', () => {
+    // The NER layer's DATE entity fired on ANY date expression, and
+    // `ai_bound` blocks on any hit, so the Mode 1 chat route returned 422
+    // for 'What time should I take my medication today?'. Blocking every
+    // date word protects no DOB; it just makes the route unusable.
+    for (const text of [
+      'What time should I take my medication today?',
+      'I have an appointment on 2026-09-15',
+      'see you next Tuesday',
+      'I took it at 8am yesterday',
+      'refill due 10/15',
+    ]) {
+      expect(screenInput(text, 'ai_bound').action, `over-blocked: ${text}`).toBe('pass');
+    }
+  });
+
+  it('does NOT fire on words merely containing the label', () => {
+    // The leading word boundary carries this; the trailing one had to go
+    // because "D.O.B." ends in a period, which is not a word boundary.
+    for (const text of [
+      'reborn 1990-01-15',
+      'stubborn 12/31/1985',
+      'date of birthday party 1990-01-15',
+    ]) {
+      const hits = screenInput(text, 'internal').hits;
+      expect(
+        hits.some((h) => h.patternId === 'date_of_birth'),
+        `false positive: ${text}`,
+      ).toBe(false);
+    }
   });
 });
 
