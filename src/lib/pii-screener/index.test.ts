@@ -13,13 +13,23 @@
  *   - SAFETY: exercised code path performs no network / process / I/O
  *
  * Adversarial coverage mapping (docs/PILOT_1_COVERAGE_MATRIX.md):
- *   - A1 (real-looking name in chat) — deferred to Sprint 1.1b (NER)
+ *   - A1 (real-looking name in chat) — ⚠️ NOT COVERED, see KNOWN GAP below
  *   - A2 (real-looking phone in intake free-text) → covered by us_phone / ghana_phone
  *   - A3 (real-looking SSN in chat) → covered by us_ssn
  *   - A4 (real-looking Ghana Card ID in intake) → covered by ghana_card
- *   - A5 (clinician real patient real name in decision notes) — deferred to 1.1b
- *   - A6 (subtle PII AI-bound) — deferred to 1.1b; regex covers structural subset
- *   - A6b (subtle PII internal route) — deferred to 1.1b
+ *   - A5 (clinician real patient real name in decision notes) — ⚠️ NOT COVERED
+ *   - A6 (subtle PII AI-bound) — ⚠️ NOT COVERED; regex covers structural subset
+ *   - A6b (subtle PII internal route) — ⚠️ NOT COVERED
+ *
+ * ⚠️ KNOWN GAP — the NER classifier is inert. A1 / A5 / A6 / A6b were
+ * recorded as "deferred to Sprint 1.1b (NER)" and 1.1b shipped, so they
+ * read as closed. They are not. `wink-eng-lite-web-model` has no
+ * statistical PERSON / GPE / ORG recogniser, so no layer detects person
+ * names or prose addresses. Those four tests plus the Layer 2 PERSON case
+ * are marked `it.fails` and explained in the Sprint 1.1b describe block.
+ * Remedy pending ratifier decision:
+ *   telecheckONE/Telecheck_v1_10_PRD_Update/
+ *     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
  */
 
 import { describe, expect, it } from 'vitest';
@@ -204,14 +214,40 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
     });
   });
 
-  describe('Sprint 1.1b — NER coverage (wink-nlp local classifier)', () => {
-    it('A1 — real-looking person name in chat blocks on ai_bound (PERSON)', () => {
+  describe('Sprint 1.1b — NER coverage (KNOWN GAP: the classifier is inert)', () => {
+    // ⚠️ EVERY TEST IN THIS BLOCK IS `it.fails`. That is not a suppression.
+    //
+    // `ner.ts` filters `doc.entities()` for PERSON / GPE / ORG, but
+    // `wink-eng-lite-web-model` emits only pattern-based entity types
+    // (DATE, MONEY, TIME, CARDINAL, ORDINAL, PERCENT, EMAIL, URL). It
+    // ships no statistical person/place/organisation recogniser, so the
+    // filter matches nothing and NO layer detects person names or prose
+    // addresses today.
+    //
+    // These assertions describe the behaviour the spec REQUIRES. They are
+    // marked `it.fails` so the gap is loud in every test run instead of
+    // sitting behind a permanently red pipeline that people learn to
+    // scroll past. `it.fails` is a ratchet, not a mute: the moment a
+    // remedy makes the classifier work, these tests FAIL and whoever
+    // fixed it is forced to come back here and remove the marker.
+    //
+    // Do NOT resolve this by deleting the tests or loosening the
+    // assertions. Note that A6b's own history is the cautionary tale —
+    // Codex flagged in Sprint 1.1b that a loose `redact OR pass`
+    // assertion would let a broken NER integration silently pass, and it
+    // was tightened. The tightening never caught anything, because the
+    // suite could not be executed locally at all.
+    //
+    // Remedy is a ratifier decision (four options, three-way consult):
+    //   telecheckONE/Telecheck_v1_10_PRD_Update/
+    //     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
+    it.fails('A1 — real-looking person name in chat blocks on ai_bound (PERSON)', () => {
       const r = screenInput('Hello, I am John Smith and I have a headache', 'ai_bound');
       expect(r.action).toBe('block');
       expect(r.hits.some((h) => h.patternId === 'ner_person')).toBe(true);
     });
 
-    it('A5 — clinician real patient name in decision notes (internal route blocks)', () => {
+    it.fails('A5 — clinician real patient name in decision notes (internal route blocks)', () => {
       // Internal route + high-confidence hit → BLOCK per decision matrix.
       const r = screenInput('Patient Jane Doe reports symptom resolution', 'internal');
       expect(r.action).toBe('block');
@@ -220,12 +256,12 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(nerHit?.confidence).toBe('high_confidence');
     });
 
-    it('A6 — subtle PII (name + condition tied) on AI-bound blocks', () => {
+    it.fails('A6 — subtle PII (name + condition tied) on AI-bound blocks', () => {
       const r = screenInput('Michael Johnson has severe hypertension', 'ai_bound');
       expect(r.action).toBe('block');
     });
 
-    it('A6b — subtle PII on internal-only route with GPE (low-confidence) redacts inline', () => {
+    it.fails('A6b — subtle PII on internal-only route with GPE (low-confidence) redacts inline', () => {
       // GPE (country/city name) alone is low-confidence; internal
       // route → redact. Explicitly free of PERSON entities (which would
       // be high-confidence block).
@@ -976,7 +1012,10 @@ describe('pii-screener — screenOutput (Layer 2 egress, Sprint 1.1d)', () => {
     expect(r.output).toBe('');
   });
 
-  it('redacts a hallucinated PERSON name (the actual Layer 2 threat model)', () => {
+  // KNOWN GAP — see the Sprint 1.1b block above. Layer 2 inherits the same
+  // inert classifier, so it cannot redact a name the model invents. `it.fails`
+  // keeps this visible and forces a revisit when the classifier works.
+  it.fails('redacts a hallucinated PERSON name (the actual Layer 2 threat model)', () => {
     // Layer 1 already blocked participant-supplied PII at ingress, so
     // the model never saw it. What Layer 2 defends against is the model
     // EMITTING a plausible identity of its own accord.
