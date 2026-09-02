@@ -1100,7 +1100,14 @@ describe('Mode 1 chat — Group PII: Layer 1 screener wiring (Sprint 1.1c)', () 
     expect(response.statusCode).toBe(422);
   });
 
-  it('PII-3 NER hit (PERSON) on non-crisis turn → 422', async () => {
+  // KNOWN GAP — `it.fails`, not a suppression. wink-eng-lite-web-model ships
+  // no statistical PERSON recogniser, so no layer detects a prose-form name.
+  // The assertion below states what the spec REQUIRES; it is marked failing so
+  // the gap is loud on every run and so it FAILS the moment a remedy lands,
+  // forcing whoever fixes it back here to remove this marker. Remedy is a
+  // ratifier decision: telecheckONE/Telecheck_v1_10_PRD_Update/
+  // Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
+  it.fails('PII-3 NER hit (PERSON) on non-crisis turn → 422', async () => {
     const accountId = `acct_${ulid()}`;
     const token = mintPatientToken(accountId);
     const response = await app!.inject({

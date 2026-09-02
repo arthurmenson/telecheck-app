@@ -83,8 +83,8 @@ const SURFACED_ENTITY_TYPES: readonly string[] = [
   'PERSON', // real names
   'GPE', // geopolitical entity (country, city, state)
   'LOCATION', // location
-  'DATE', // dates including DOBs
   'ORG', // organization names — could tie to real identity
+  // DATE was here. It was REMOVED — see below.
 ];
 
 /**
@@ -94,9 +94,40 @@ const ENTITY_CONFIDENCE: Readonly<Record<string, 'high_confidence' | 'low_confid
   PERSON: 'high_confidence',
   GPE: 'low_confidence',
   LOCATION: 'low_confidence',
-  DATE: 'low_confidence',
   ORG: 'low_confidence',
 };
+
+/**
+ * ## Why DATE was removed (2026-09-02)
+ *
+ * This layer was configured for five entity types. `wink-eng-lite-web-model`
+ * emits exactly one of them — DATE — because its recogniser is pattern-based
+ * (DATE, MONEY, TIME, CARDINAL, ORDINAL, PERCENT, EMAIL, URL) and it ships no
+ * statistical PERSON / GPE / LOCATION / ORG model at all.
+ *
+ * So the layer detected precisely the one configured class that is not
+ * identity-bearing, and none of the four that are. Its whole observable
+ * behaviour was: block on a date word, miss every real name.
+ *
+ * Concretely, `ai_bound` blocks on ANY hit, so
+ * `'What time should I take my medication today?'` returned 422 on the word
+ * "today". That is the Mode 1 chat route — the primary surface Pilot 1
+ * exists to exercise — rejecting ordinary language. CI surfaced it across
+ * three integration files the first time the suite ran.
+ *
+ * A bare date is not PII. The spec's stated purpose for this layer is
+ * prose-form real NAMES and ADDRESSES; DATE is not in that remit. A date of
+ * birth is PII, but blocking every occurrence of "today" is not a usable
+ * control for it — that needs a date-adjacent-to-identity rule, which is
+ * part of the pending remedy, not a reason to keep this.
+ *
+ * Removing DATE means the classifier now surfaces NOTHING, because the other
+ * four types never fire. That is the honest state and it is deliberately
+ * visible rather than masked behind spurious DATE blocks. Remedy is a
+ * ratifier decision:
+ *   telecheckONE/Telecheck_v1_10_PRD_Update/
+ *     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
+ */
 
 /**
  * The wink-nlp instance is loaded once at module init. wink-nlp is
