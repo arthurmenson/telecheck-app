@@ -125,7 +125,7 @@ const ENTITY_CONFIDENCE: Readonly<Record<string, 'high_confidence' | 'low_confid
  * four types never fire. That is the honest state and it is deliberately
  * visible rather than masked behind spurious DATE blocks. Remedy is a
  * ratifier decision:
- *   telecheckONE/Telecheck_v1_10_PRD_Update/
+ *   Telecheck_v1_10_PRD_Update/
  *     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
  */
 

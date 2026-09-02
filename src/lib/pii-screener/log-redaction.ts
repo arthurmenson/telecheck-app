@@ -73,7 +73,7 @@
  * on their own — they are about cost and precision, not redundancy — but
  * the unstructured classes are NOT covered elsewhere, and nothing here
  * should be read as implying they are. Remedy pending ratifier decision:
- *   telecheckONE/Telecheck_v1_10_PRD_Update/
+ *   Telecheck_v1_10_PRD_Update/
  *     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
  *
  * ## No shape-based trust for strings

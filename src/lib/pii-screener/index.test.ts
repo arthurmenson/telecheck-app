@@ -28,7 +28,7 @@
  * names or prose addresses. Those four tests plus the Layer 2 PERSON case
  * are marked `it.fails` and explained in the Sprint 1.1b describe block.
  * Remedy pending ratifier decision:
- *   telecheckONE/Telecheck_v1_10_PRD_Update/
+ *   Telecheck_v1_10_PRD_Update/
  *     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
  */
 
@@ -286,7 +286,7 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
     // suite could not be executed locally at all.
     //
     // Remedy is a ratifier decision (four options, three-way consult):
-    //   telecheckONE/Telecheck_v1_10_PRD_Update/
+    //   Telecheck_v1_10_PRD_Update/
     //     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
     it.fails('A1 — real-looking person name in chat blocks on ai_bound (PERSON)', () => {
       const r = screenInput('Hello, I am John Smith and I have a headache', 'ai_bound');
