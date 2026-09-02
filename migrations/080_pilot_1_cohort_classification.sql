@@ -109,13 +109,44 @@ END
 WHERE cohort_classification IS NULL;
 
 -- ---------------------------------------------------------------------------
--- Step 3 — Add NOT NULL constraint now that every row has a value
+-- Step 3 — DEFAULT 'unclassified', then NOT NULL
 -- ---------------------------------------------------------------------------
 --
--- No DEFAULT is set — every future INSERT MUST specify
--- cohort_classification explicitly. Provisioning code paths that
--- forget the field fail loudly at the NOT NULL constraint rather
--- than silently baseline-classifying.
+-- This step originally set NOT NULL with NO DEFAULT, reasoning that
+-- "every future INSERT MUST specify cohort_classification explicitly;
+-- provisioning paths that forget it fail loudly at the NOT NULL
+-- constraint rather than silently baseline-classifying."
+--
+-- The goal was right; the mechanism was not. `createAccount`
+-- (src/modules/identity/internal/repositories/account-repo.ts) is the
+-- single INSERT site for accounts and does not supply the column, so
+-- the no-DEFAULT form did not fail *loudly* — it failed *totally*,
+-- breaking every account-creation path in the product. CI surfaced it
+-- as 23502 across 55 test files the first time the suite ran on this
+-- branch.
+--
+-- DEFAULT 'unclassified' preserves the actual safety property. The
+-- stated fear was silent BASELINE-classification, and this does not
+-- baseline-classify: 'unclassified' is the explicit data-model-defect
+-- state that scripts/verify-pilot-1-baseline.sh REFUSES to purge on.
+-- A forgetful INSERT is still caught, and still caught fail-closed —
+-- the complaint just arrives at the purge preflight instead of at
+-- INSERT time. Nothing can be silently purged or silently preserved,
+-- which is the property that matters.
+--
+-- ⚠️ CONSEQUENCE FOR SPRINT 1.3 PHASE B: because `createAccount` does
+-- not yet classify, every account it creates lands 'unclassified', so
+-- the preflight gate will refuse until each is remediated. That is
+-- fail-closed but operationally noisy. Phase B must give `createAccount`
+-- an explicit classification argument — applying this migration's own
+-- backfill mapping (clinician / tenant_admin / platform_admin / service
+-- -> baseline; patient / delegate created during the pilot ->
+-- participant) with an override for baseline test fixtures, which the
+-- column comment already contemplates. That is a contract-completion
+-- task and is deliberately NOT decided here.
+
+ALTER TABLE accounts
+    ALTER COLUMN cohort_classification SET DEFAULT 'unclassified';
 
 ALTER TABLE accounts
     ALTER COLUMN cohort_classification SET NOT NULL;
