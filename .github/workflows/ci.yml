@@ -168,6 +168,15 @@ jobs:
           END $$;
           SQL
 
+      # Layer 3 structural boundary: user-controlled free text must never
+      # reach the logging path. Layer 3's regex screen covers structured
+      # identifiers only and cannot detect a name or an address, so this
+      # check is what keeps that gap from being reachable at all. It needs
+      # no database, so it runs before the suite and fails fast.
+      # See docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md.
+      - name: Check log call sites (Layer 3 boundary)
+        run: npm run check:log-call-sites
+
       # Tests run against the Postgres service container.
       # vitest setup applies migrations + seeds two tenants per tests/README.md.
       - name: Test (vitest)

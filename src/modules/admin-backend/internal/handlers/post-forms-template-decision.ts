@@ -138,6 +138,7 @@ import {
 } from '../../../../lib/auth-context.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
+import { PARTICIPANT_BLOCK_MESSAGE, screenInput } from '../../../../lib/pii-screener/index.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
@@ -189,6 +190,64 @@ const DecisionBodySchema = z.object({
   decision: z.enum(['approve', 'reject', 'request_revision'] as const),
   decision_payload: z.record(z.string(), z.unknown()).optional(),
 });
+
+/**
+ * Maximum traversal depth for `decision_payload`. Legitimate review
+ * payloads are flat (`review_notes` string + `required_revisions`
+ * string array); 16 is far above any real shape.
+ */
+export const DECISION_PAYLOAD_MAX_DEPTH = 16;
+
+/**
+ * Raised when `decision_payload` nests deeper than
+ * `DECISION_PAYLOAD_MAX_DEPTH`. This FAILS CLOSED — an unscreenable
+ * payload is rejected, never admitted.
+ *
+ * Codex R1 finding (Sprint 1.1d): the first version returned `[]` at
+ * the depth bound, which silently admitted anything nested past it into
+ * append-only, purge-exempt audit storage. The accompanying comment
+ * claimed downstream wrapper shape-validation would catch it; no such
+ * validation exists — the wrapper persists `p_decision_payload` as
+ * JSONB directly.
+ */
+export class DecisionPayloadTooDeepError extends Error {
+  constructor() {
+    super(`decision_payload nests deeper than ${DECISION_PAYLOAD_MAX_DEPTH} levels`);
+    this.name = 'DecisionPayloadTooDeepError';
+  }
+}
+
+/**
+ * Recursively collect every screenable string inside the (deliberately
+ * forward-extensible) `decision_payload` — `review_notes`, each element
+ * of `required_revisions[]`, and any field a future decision variant
+ * adds.
+ *
+ * Collects **object KEYS as well as values**. Codex R1 finding: keys are
+ * caller-controlled too, so a payload shaped
+ * `{ "john.smith@example.com": "ok" }` would otherwise carry PII into
+ * the audit record entirely unscreened.
+ *
+ * Throws `DecisionPayloadTooDeepError` past the depth bound so the
+ * handler can reject rather than silently under-screen.
+ */
+export function collectPayloadStrings(value: unknown, depth = 0): string[] {
+  if (depth > DECISION_PAYLOAD_MAX_DEPTH) {
+    throw new DecisionPayloadTooDeepError();
+  }
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) {
+    return value.flatMap((v) => collectPayloadStrings(v, depth + 1));
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.entries(value).flatMap(([key, v]) => [
+      // The key itself is caller-controlled — screen it.
+      key,
+      ...collectPayloadStrings(v, depth + 1),
+    ]);
+  }
+  return [];
+}
 
 /**
  * Service-error mapper for the withIdempotentExecution wrapper. Maps
@@ -318,6 +377,74 @@ export async function postFormsTemplateDecisionHandler(
     throw req.server.httpErrors.badRequest(`Invalid request body: ${messages}`);
   }
   const { decision, decision_payload: decisionPayload = {} } = bodyParsed.data;
+
+  // -------------------------------------------------------------------
+  // Pilot 1 Layer 1 PII screener — `audit_bound` route class
+  // (Sprint 1.1d; closes a gap missed by the Sprint 1.1c route sweep).
+  //
+  // `decision_payload` is free-text authored by a template reviewer
+  // (`review_notes`, `required_revisions[]`, and any forward-extensible
+  // string field). It is echoed verbatim into the Category B audit
+  // record for this decision — see ../../audit.ts §payload-schema note.
+  //
+  // WHY `audit_bound` RATHER THAN `internal`:
+  //   The audit chain is APPEND-ONLY per I-003, and the Pilot 1
+  //   env-purge allowlist explicitly PRESERVES `audit_records` (it
+  //   carries the `env.purge.executed` attestation). PII that reaches
+  //   an audit row therefore survives the environment purge ENTIRELY —
+  //   the mitigation Pilot 1 leans on everywhere else does not apply.
+  //   Redact-inline is not an option either: rewriting an audit payload
+  //   after the fact would itself violate I-003.
+  //   So this route fails closed on ANY hit, high or low confidence.
+  //
+  // Screening walks every string in the payload — object KEYS as well
+  // as values, recursing through nested objects and arrays — because
+  // the shape is deliberately forward-extensible. Pinning it to
+  // `review_notes` alone would silently stop screening the next field
+  // someone adds, and skipping keys would admit a payload shaped
+  // `{ "john.smith@example.com": "ok" }` unscreened.
+  //
+  // A payload nested past the depth bound is REJECTED, not partially
+  // screened — an unscreenable payload must never reach append-only
+  // storage.
+  // -------------------------------------------------------------------
+  let payloadStrings: string[];
+  try {
+    payloadStrings = collectPayloadStrings(decisionPayload);
+  } catch (err) {
+    if (err instanceof DecisionPayloadTooDeepError) {
+      req.log.warn(
+        { review_id: paramsParsed.data.review_id },
+        'admin_template_decision: decision_payload exceeds screenable depth; rejecting ' +
+          'rather than admitting an unscreened payload to append-only audit storage',
+      );
+      throw req.server.httpErrors.unprocessableEntity(
+        `decision_payload nests deeper than ${DECISION_PAYLOAD_MAX_DEPTH} levels and cannot be ` +
+          'screened for personal information. Flatten the payload and retry.',
+      );
+    }
+    throw err;
+  }
+
+  for (const candidate of payloadStrings) {
+    const screening = screenInput(candidate, 'audit_bound');
+    if (screening.action === 'block') {
+      // Log pattern ids + count ONLY — never the offending text.
+      req.log.warn(
+        {
+          review_id: paramsParsed.data.review_id,
+          pii_screener_block_reason: screening.blockReason,
+          pii_screener_hit_pattern_ids: screening.hits.map((h) => h.patternId),
+          pii_screener_hit_count: screening.hits.length,
+        },
+        'admin_template_decision: PII screener BLOCKED an audit_bound decision_payload ' +
+          'before the append-only audit row was written',
+      );
+      throw req.server.httpErrors.unprocessableEntity(
+        screening.participantMessage ?? PARTICIPANT_BLOCK_MESSAGE,
+      );
+    }
+  }
 
   // Phase 5 — actor attribution (for audit emission). The decider
   // principal_id is bound INSIDE the SECDEF wrapper from

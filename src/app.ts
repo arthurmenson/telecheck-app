@@ -20,12 +20,14 @@
 import fastifyHelmet from '@fastify/helmet';
 import fastifySensible from '@fastify/sensible';
 import Fastify, { type FastifyInstance } from 'fastify';
+import { transport as pinoTransport } from 'pino';
 
 import { aiContextPlugin } from './lib/ai-context.js';
 import { authContextPlugin } from './lib/auth-context.js';
 import { verifyBindActorContextPoolOrThrow } from './lib/db.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
+import { createRedactingStream } from './lib/pii-screener/log-redaction.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
 import { adminBackendPlugin } from './modules/admin-backend/index.js';
 import { aiServicePlugin } from './modules/ai-service/index.js';
@@ -457,20 +459,69 @@ function defaultLoggerConfig(): object {
     redact: {
       // Per AUDIT_EVENTS v5.2 PHI redaction discipline: never log
       // authorization headers, passwords, tokens, or PHI fields.
+      //
+      // This is the ALLOWLIST half of the redaction posture: exact,
+      // cheap, and configured via LOG_REDACT_PATHS. It runs FIRST and
+      // uses remove:true, so a listed path is dropped entirely.
       paths: redactPaths.length > 0 ? redactPaths : ['req.headers.authorization'],
       remove: true,
     },
-    // Pretty print in dev only; production emits structured JSON for ingestion
-    // by the audit + observability pipeline.
-    transport:
-      process.env['NODE_ENV'] === 'development'
-        ? {
-            target: 'pino-pretty',
-            options: {
-              translateTime: 'HH:MM:ss',
-              ignore: 'pid,hostname',
-            },
-          }
-        : undefined,
+    // Layer 3 PII scrub (Sprint 1.2a). Complements — does not replace —
+    // `redact.paths` above. Paths cover the fields someone thought of;
+    // this pass covers the three residual vectors a path list
+    // structurally cannot:
+    //   1. Error.message / .stack — caller-shaped, can interpolate
+    //      user values (a pg error echoes the offending key)
+    //   2. Serializer output — Fastify's req serializer emits the URL
+    //      WITH its query string, which is entirely client-controlled
+    //   3. Log call sites that do not exist yet
+    //
+    // Applied at the DESTINATION STREAM rather than `hooks.logMethod`,
+    // because logMethod runs BEFORE serializers (so it never sees
+    // vector 2) and rebuilding objects there corrupts Fastify's request
+    // object, whose properties are prototype getters. Redacting the
+    // already-serialized line avoids both problems.
+    //
+    // Regex-only, high-confidence patterns only, with server-generated
+    // identifier keys preserved verbatim for debuggability. See
+    // src/lib/pii-screener/log-redaction.ts for the full rationale.
+    // NOTE — `transport` is deliberately NOT set here.
+    //
+    // pino refuses both at once: `lib/tools.js` throws
+    // `'only one of option.transport or stream can be specified'`.
+    // Setting both would make the app fail to BOOT.
+    //
+    // Dev pretty-printing is preserved by building the pino-pretty
+    // transport stream ourselves and wrapping the redactor around it,
+    // then passing the result as `stream`. Production writes structured
+    // JSON straight to stdout for ingestion by the audit +
+    // observability pipeline. Either way the redactor is the outermost
+    // layer, so nothing reaches the destination unscrubbed.
+    stream: createRedactingStream(resolveLogDestination()),
   };
+}
+
+/**
+ * Resolve the underlying log destination.
+ *
+ * Development gets pino-pretty (built as a transport STREAM, not passed
+ * via the `transport` option — see the note in `defaultLoggerConfig`).
+ * Everything else writes to stdout.
+ *
+ * If pino-pretty cannot be loaded (it is a devDependency and may be
+ * absent in a production image), fall back to stdout rather than
+ * failing to boot — pretty output is a convenience; logging is not.
+ */
+function resolveLogDestination(): NodeJS.WritableStream {
+  if (process.env['NODE_ENV'] !== 'development') {
+    return process.stdout;
+  }
+  try {
+    return pinoTransport({
+      target: 'pino-pretty',
+      options: { translateTime: 'HH:MM:ss', ignore: 'pid,hostname' },
+    }) as unknown as NodeJS.WritableStream;
+  } catch {
+    return process.stdout;
+  }
 }

@@ -397,6 +397,8 @@ export async function publishVersionHandler(
       {
         node_env: killSwitchResult.nodeEnv ?? null,
         forbidden_vars: killSwitchResult.forbiddenVars,
+        // pii-log-allow: route-path id identifying the template version whose
+        // publish gates were bypassed; the id is the whole point of the record.
         attempted_version_id: versionIdParam,
       },
       PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME,

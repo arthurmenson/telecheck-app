@@ -494,6 +494,8 @@ export async function mode2CasePrepHandler(
             {
               err,
               ai_workflow_execution_id: workflowExecutionId,
+              // pii-log-allow: schema-bounded ULID-shaped id (max 64, CDM v1.2),
+              // not free text; required to correlate the fail-soft response.
               consult_id: rawConsultId,
             },
             'mode2_case_prep: LLM provider unavailable; surfaced AI-RESIL-001 fail-soft response',
@@ -556,6 +558,8 @@ export async function mode2CasePrepHandler(
         {
           err: auditErr,
           ai_workflow_execution_id: workflowExecutionId,
+          // pii-log-allow: schema-bounded ULID-shaped id (max 64, CDM v1.2),
+          // not free text; the audit-emission failure is unusable without it.
           consult_id: rawConsultId,
           crisis_detected: crisisDetected,
           provider_unavailable: providerUnavailable,

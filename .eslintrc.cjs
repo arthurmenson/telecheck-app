@@ -154,5 +154,6 @@ module.exports = {
     // excluding them from ESLint.
     'vitest.config.ts',
     'vitest.bench.config.ts',
+    'vitest.unit.config.ts',
   ],
 };

@@ -15,6 +15,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:unit": "vitest run -c vitest.unit.config.ts",
+    "check:log-call-sites": "node scripts/check-log-call-sites.mjs",
     "bench": "vitest bench --run -c vitest.bench.config.ts",
     "lint": "eslint . --ext .ts,.tsx --max-warnings 0",
     "lint:fix": "eslint . --ext .ts,.tsx --fix",
@@ -34,6 +36,8 @@
     "pg": "^8.12.0",
     "pino": "^10.3.1",
     "ulid": "^2.3.0",
+    "wink-eng-lite-web-model": "^1.6.0",
+    "wink-nlp": "^2.4.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

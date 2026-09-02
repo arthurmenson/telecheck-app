@@ -124,6 +124,11 @@ import type { DbTransaction } from '../../../../lib/db.js';
 import { asTenantId } from '../../../../lib/glossary.js';
 import { buildIdempotencyCtx, type IdempotencyCtx } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
+import {
+  PARTICIPANT_BLOCK_MESSAGE,
+  screenInput,
+  screenOutput,
+} from '../../../../lib/pii-screener/index.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { emitMode1ChatResponseAudit } from '../../audit.js';
@@ -474,6 +479,67 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
 
     const crisisDetected = inputCrisisOutcome.kind === 'crisis';
 
+    // -----------------------------------------------------------------
+    // Pilot 1 Layer 1 PII screener (Sprint 1.1c wiring).
+    //
+    // ORDERING RATIONALE — the screener runs AFTER the I-019 crisis gate
+    // and BEFORE Stage-2 validation / persistence / any LLM call:
+    //
+    //   1. AFTER the crisis gate, because I-019 / FLOOR-013 is a
+    //      platform floor: crisis detection MUST run on the patient's
+    //      raw text and MUST NOT be suppressible by any other check.
+    //      A distressed participant who also typed a real name must
+    //      still get the crisis sentinel + the Category A audit. The
+    //      crisis path makes NO LLM call (AI_LAYERING §6 crisis-write
+    //      exception), so no PII crosses the provider boundary on it.
+    //
+    //   2. BEFORE persistence + LLM call on the non-crisis path,
+    //      because that path DOES call the external provider. Layer 4
+    //      (AI-vendor sanitization, Sprint 1.2b) is the belt; this is
+    //      the braces — blocking here means the turn never persists
+    //      and the provider never sees the text.
+    //
+    // ACCEPTED RESIDUAL RISK (documented, not hidden): a crisis-positive
+    // turn that ALSO contains real PII persists the raw user_message
+    // into ai_mode1_conversation_turn_admission. The crisis floor
+    // outranks the PII block by design. Mitigations: Layer 3 log
+    // redaction, Layer 5 backup redaction, and the incident-response
+    // runbook Category 1 CRITICAL path (capture → purge) if it happens.
+    // Recorded in PII_SCREENING_AND_LOG_REDACTION_SPEC.md.
+    //
+    // Route class is `ai_bound` — this endpoint reaches Anthropic /
+    // Bedrock / Azure on the non-crisis path, so ANY screener hit
+    // (high OR low confidence) blocks per the Layer 1 decision matrix.
+    // -----------------------------------------------------------------
+    if (!crisisDetected) {
+      const screening = screenInput(rawMessageText, 'ai_bound');
+      if (screening.action === 'block') {
+        // Log the block WITHOUT the offending text (Layer 3 discipline:
+        // the raw candidate never reaches the log stream). Only the
+        // pattern ids + the count are recorded.
+        req.log.warn(
+          {
+            turn_id: turnId,
+            pii_screener_block_reason: screening.blockReason,
+            pii_screener_hit_pattern_ids: screening.hits.map((h) => h.patternId),
+            pii_screener_hit_count: screening.hits.length,
+          },
+          'mode1_chat: PII screener BLOCKED an ai_bound turn before provider call',
+        );
+        // 422 Unprocessable Entity — the request is syntactically valid
+        // but semantically unacceptable for Pilot 1's synthetic-only
+        // substrate. Participant-visible guidance points at the kit.
+        throw req.server.httpErrors.unprocessableEntity(
+          screening.participantMessage ?? PARTICIPANT_BLOCK_MESSAGE,
+        );
+      }
+      // `redact` is unreachable for ai_bound routes (the decision matrix
+      // blocks on ANY hit there), and `pass` needs no action. The
+      // exhaustive branch is intentional: if a future matrix change made
+      // ai_bound redact-capable, this would surface as a compile-time
+      // gap rather than silently forwarding unredacted text.
+    }
+
     // Stage 2 validation: enforce the full Zod constraints ONLY if no
     // crisis was detected. If crisis was detected, we proceed to the
     // crisis-sentinel response path regardless of message size or
@@ -691,11 +757,45 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
           temperature: 0,
           tenant_id: ctx.tenantId,
         });
-        responseText = result.text;
+        // -------------------------------------------------------------
+        // Layer 2 egress screener (Sprint 1.1d).
+        //
+        // The model's OWN output is screened here. This is not about the
+        // participant's PII round-tripping — Layer 1 already blocked
+        // that at ingress (route class `ai_bound` blocks on ANY hit, so
+        // the provider never saw it). This defends against the model
+        // EMITTING PII-shaped text of its own accord: a hallucinated
+        // name, a plausible-looking SSN, an invented email. Such output
+        // is not real PII, but it is indistinguishable from real PII to
+        // the participant reading it, and if it happens to coincide
+        // with a real identifier it is a genuine hazard.
+        //
+        // Layer 2 is REDACT-ONLY — never block. By this point the LLM
+        // call has already happened; failing the turn would cost the
+        // participant their message while leaving upstream state
+        // intact. Redaction preserves the workflow and the evidence.
+        //
+        // The REDACTED text is what both surfaces receive: the response
+        // to the participant AND the persisted assistant_message. They
+        // must not diverge — a reader of the stored turn should see
+        // exactly what the participant saw.
+        // -------------------------------------------------------------
+        const egress = screenOutput(result.text);
+        if (egress.redacted) {
+          req.log.warn(
+            {
+              turn_id: turnId,
+              pii_egress_hit_pattern_ids: egress.hits.map((h) => h.patternId),
+              pii_egress_hit_count: egress.hits.length,
+            },
+            'mode1_chat: Layer 2 egress screener REDACTED model-generated output',
+          );
+        }
+        responseText = egress.output;
         providerUnavailable = false;
         aiModelVersion = `${result.provider_name}:${result.model_version}`;
         turnOutcome = 'completed';
-        persistedAssistantMessage = result.text;
+        persistedAssistantMessage = egress.output;
         persistedProvider = result.provider_name;
         persistedModelId = result.model;
         promptTokenCount = result.usage.input_tokens;
