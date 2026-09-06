@@ -12,35 +12,23 @@
  * Spec references:
  *   - ADR-024 (country-driven config + per-tenant KMS keys): every tenant
  *     row carries `kms_key_alias` (e.g., `alias/telecheck-us-data-key`)
- *     pointing at an AWS KMS key. The application layer never holds the
- *     plaintext key material; AWS KMS enforces.
+ *     pointing at an AWS KMS key. The master key never leaves KMS; a fresh
+ *     plaintext data key is erased after each envelope operation.
  *   - I-023 (three-layer isolation): KMS is layer 3. RLS rejects rows from
  *     other tenants; app-layer middleware filters in queries; KMS rejects
  *     decrypt requests for ciphertext from another tenant.
  *
- * Status:
- *   v0.1 STUB — production AWS KMS integration is not yet wired. This module
- *   provides the API surface so slice authors can call kms.encrypt() /
- *   kms.decrypt() against their tenant context, but in non-test
- *   environments it THROWS rather than silently passing. Per the security
- *   discipline established in i029-gate.ts and audit.ts, a stub that
- *   silently passes production traffic is itself an invariant violation.
- *
- * Open questions for Engineering Lead:
- *   - When does the AWS KMS integration land? Likely as part of the Identity
- *     & Auth slice or a dedicated infrastructure slice. Until then, slice
- *     work that requires PHI encryption must either run under NODE_ENV=test
- *     (which gates the dev key) or wait for the real implementation.
- *   - Encryption context: AWS KMS supports an "encryption context" key-value
- *     pair that's bound to the ciphertext. We MUST set `tenant_id` as
- *     encryption context on every encrypt call so a stolen ciphertext from
- *     tenant A can't be decrypted under tenant B's key alias even if the
- *     KMS policy is misconfigured. The signatures below carry tenantId.
+ * The AWS envelope primitive is implemented in kms-aws.ts. Non-test entry
+ * remains fail-closed until mandatory caller data-class, tenant IAM/STS/CMK
+ * binding and decrypt-audit integration is supplied. Credentials or an env
+ * toggle cannot substitute for that integration. The legacy local format is
+ * retained strictly for tests.
  */
 
 import crypto from 'crypto';
 
 import { config } from './config.js';
+import { KmsOperationError } from './kms-aws.js';
 import type { TenantContext } from './tenant-context.js';
 
 // ---------------------------------------------------------------------------
@@ -54,19 +42,11 @@ import type { TenantContext } from './tenant-context.js';
  * @param plain    Plaintext bytes to encrypt
  * @returns        Ciphertext bytes (KMS envelope-encrypted; opaque to caller)
  *
- * @throws In non-test environments until the AWS KMS integration lands.
- *         Per the security discipline, a stub that silently passes
- *         production traffic would itself be an isolation-layer violation.
+ * @throws If the tenant key, request or KMS operation is unavailable/invalid.
  */
 export async function kmsEncrypt(tenant: TenantContext, plain: Buffer): Promise<Buffer> {
   if (process.env['NODE_ENV'] !== 'test') {
-    throw new Error(
-      `kms.kmsEncrypt: AWS KMS integration not yet wired. The application ` +
-        `layer cannot encrypt data for tenant '${tenant.tenantId}' until the ` +
-        `AWS KMS adapter (TODO: src/lib/kms-aws.ts) is authored. This stub ` +
-        `THROWS in non-test environments rather than silently encrypt with a ` +
-        `dev key — per ADR-024 + I-023 layer-3 enforcement.`,
-    );
+    throw new KmsOperationError();
   }
 
   // Test path: deterministic AES-256-GCM with the static dev key, scoped by
@@ -80,14 +60,11 @@ export async function kmsEncrypt(tenant: TenantContext, plain: Buffer): Promise<
  * Tenant context is required so the encryption context check (which AWS KMS
  * will perform in production) can be modeled in the test stub too.
  *
- * @throws Same as kmsEncrypt in non-test environments.
+ * @throws Same as kmsEncrypt; tampered and legacy local ciphertext fail closed.
  */
 export async function kmsDecrypt(tenant: TenantContext, cipher: Buffer): Promise<Buffer> {
   if (process.env['NODE_ENV'] !== 'test') {
-    throw new Error(
-      `kms.kmsDecrypt: AWS KMS integration not yet wired. Cannot decrypt for ` +
-        `tenant '${tenant.tenantId}' until the AWS KMS adapter is authored.`,
-    );
+    throw new KmsOperationError();
   }
 
   return localDevDecrypt(tenant.tenantId, cipher);
@@ -116,13 +93,17 @@ function deriveTenantKey(tenantId: string): Buffer {
 
 function localDevEncrypt(tenantId: string, plain: Buffer): Buffer {
   const key = deriveTenantKey(tenantId);
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  cipher.setAAD(Buffer.from(tenantId, 'utf8'));
-  const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  // Layout: [iv(12) | tag(16) | ciphertext(...)]
-  return Buffer.concat([iv, tag, ct]);
+  try {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    cipher.setAAD(Buffer.from(tenantId, 'utf8'));
+    const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    // Layout: [iv(12) | tag(16) | ciphertext(...)]
+    return Buffer.concat([iv, tag, ct]);
+  } finally {
+    key.fill(0);
+  }
 }
 
 function localDevDecrypt(tenantId: string, cipherBuf: Buffer): Buffer {
@@ -130,13 +111,20 @@ function localDevDecrypt(tenantId: string, cipherBuf: Buffer): Buffer {
     throw new Error('kms.localDevDecrypt: ciphertext too short');
   }
   const key = deriveTenantKey(tenantId);
-  const iv = cipherBuf.subarray(0, 12);
-  const tag = cipherBuf.subarray(12, 28);
-  const ct = cipherBuf.subarray(28);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAAD(Buffer.from(tenantId, 'utf8'));
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ct), decipher.final()]);
+  let unverifiedPlaintext: Buffer | undefined;
+  try {
+    const iv = cipherBuf.subarray(0, 12);
+    const tag = cipherBuf.subarray(12, 28);
+    const ct = cipherBuf.subarray(28);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAAD(Buffer.from(tenantId, 'utf8'));
+    decipher.setAuthTag(tag);
+    unverifiedPlaintext = decipher.update(ct);
+    return Buffer.concat([unverifiedPlaintext, decipher.final()]);
+  } finally {
+    key.fill(0);
+    unverifiedPlaintext?.fill(0);
+  }
 }
 
 // ---------------------------------------------------------------------------

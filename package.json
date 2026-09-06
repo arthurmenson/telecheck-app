@@ -29,6 +29,7 @@
     "prepare": "echo 'TODO: husky install once first slice begins'"
   },
   "dependencies": {
+    "@aws-sdk/client-kms": "3.1127.0",
     "@fastify/helmet": "^12.0.0",
     "@fastify/sensible": "^6.0.0",
     "fastify": "^5.0.0",
