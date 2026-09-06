@@ -1,37 +1,6 @@
-/**
- * pharmacy/routes.ts — Fastify route registration.
- *
- * Status at v0.3 (post-TLC-055 PR C 2026-05-13): the read surface is
- * wired — GET /v0/pharmacy/prescriptions/:id and
- * GET /v0/pharmacy/patients/:patientId/prescriptions are live, backed
- * by `medication-request-repo`'s `findById` and `listForPatient`. The
- * write surface (POST /prescriptions/draft, POST /:id/submit,
- * POST /:id/transitions, POST /:id/supersede) remains absent because
- * writes need a service layer to coordinate audit emission, domain
- * events, and idempotency atomically — that lands in TLC-055 PR D.
- *
- * The `/health` + `/ready` semantics distinguish:
- *   - SCHEMA RATIFICATION (DONE 2026-05-11 via P-011) — `schema_ratified: true`.
- *   - HANDLER WIRING (PARTIAL post-PR-C) — read endpoints wired
- *     (`read_surface_wired: true`); write endpoints pending TLC-055 PR D
- *     (`handlers_wired: false`).
- *
- * `/ready` continues to return 503 per the async-consult precedent
- * (Sprint 10 / TLC-021e): readiness flips to 200 only when the slice is
- * FULLY production-ready (every endpoint wired, including writes +
- * audit + domain events). A partial surface is intentionally not
- * readiness-acceptable so a Kubernetes / load-balancer probe keeps
- * traffic away from the module until the write surface lands.
- *
- * Spec references:
- *   - docs/SI-001-MedicationRequest-Schema-Gap.md (RATIFIED 2026-05-11)
- *   - CDM v1.3 §4.16 MedicationRequest (in telecheckONE; commit 879cd57)
- *   - migrations/025_medication_requests.sql
- *   - migrations/026_medication_requests_supersession_reciprocity.sql (PR B)
- *   - src/modules/pharmacy/internal/handlers/prescriptions.ts (PR C handlers)
- *   - src/modules/async-consult/routes.ts (readiness-flip precedent)
- *   - I-023 (tenant scoping via foundation tenantContext plugin)
- *   - I-025 (tenant-blind error envelopes)
+/** Pharmacy routes. Handler wiring does not establish production readiness.
+ * Patient reads use the live-identity capability from migration 087.
+ * Full prescribing, fulfillment and provider acceptance remain required.
  */
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
@@ -58,7 +27,7 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
   app.get('/health', async () => ({
     status: 'ok',
     module: 'pharmacy',
-    phase: 'fully_ready_post_tlc055',
+    phase: 'patient_read_capability',
     schema_ratified: true,
     schema_ratified_at: '2026-05-11',
     schema_ratified_by: 'P-011',
@@ -85,38 +54,21 @@ export const registerPharmacyRoutes: FastifyPluginAsync = async (
     clinician_modify_wired_by: 'TLC-055 PR K',
     handlers_wired: true,
     handlers_wired_at: '2026-05-13',
-    handlers_wired_by: 'TLC-055 PR K — slice complete; /ready flips to 200',
+    handlers_wired_by: 'TLC-055 PR K',
+    production_ready: false,
   }));
 
-  // Readiness probe — module is READY to serve traffic. Returns 503
-  // while the write surface is not yet wired. Per the async-consult
-  // precedent (Sprint 10 / TLC-021e), readiness flips to 200 only when
-  // the slice is FULLY production-ready, not when an arbitrary subset
-  // of endpoints responds. A partial surface is intentionally not
-  // readiness-acceptable so a Kubernetes / load-balancer probe keeps
-  // traffic away until the slice can serve every documented endpoint.
-  //
-  // When the write surface lands (TLC-055 PR D), this returns 200 and
-  // the `pending_*` fields are removed.
-  app.get('/ready', async () => ({
-    status: 'ready',
-    module: 'pharmacy',
-    phase: 'fully_ready_post_tlc055',
-    ready_at: '2026-05-13',
-    ready_by: 'TLC-055 PR K — clinician_modify lands; slice complete',
-    notes:
-      'Slice is fully production-ready. Every clinician transition from ' +
-      'State Machines v1.2 §19 has an HTTP handler: createDraft + submit ' +
-      '(PR E), clinician_discontinue + adverse_event_discontinue (PR F), ' +
-      'clinician_approve (PR G; first I-012-gated activation), ' +
-      'clinician_decline (PR H), supersede_by_new_prescription via the ' +
-      'paired clinician_approve route (PR J), and clinician_modify (PR K ' +
-      '2026-05-13). Engine writeback (PR I) is service-callable only at ' +
-      'v1.0 — system-actor JWT tokens do not yet exist; an HTTP surface ' +
-      'lands when the system-token issuance slice ships. Mode 2 ' +
-      'protocol_authorized_prescribing route is intentionally NOT exposed ' +
-      'at v1.0 — it ships with the protocol engine slice.',
-  }));
+  // Full-slice readiness remains false until the actual restricted-role
+  // write/fulfillment/provider journeys are verified. Patient reads stay usable.
+  app.get('/ready', async (_req, reply) =>
+    reply.code(503).send({
+      status: 'not_ready',
+      module: 'pharmacy',
+      phase: 'patient_read_capability',
+      production_ready: false,
+      pending: ['restricted_role_write_acceptance', 'refill_and_dispensing', 'provider_acceptance'],
+    }),
+  );
 
   // Read surface (PR C). PHI-safe views; tenant-blind / cross-patient-
   // blind 404 envelopes per I-025. See handler module for the

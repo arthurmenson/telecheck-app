@@ -49,11 +49,19 @@
  *   - Master PRD v1.10 §17 + Glossary v5.2 C3 (PHI-safe patient views)
  */
 
+import { randomBytes } from 'node:crypto';
+
 import type { FastifyInstance } from 'fastify';
+import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app.ts';
 import { config } from '../../src/lib/config.ts';
+import {
+  clearBindActorContextTestPool,
+  setBindActorContextTestPool,
+  type DbClient,
+} from '../../src/lib/db.ts';
 import { asTenantId, type TenantId } from '../../src/lib/glossary.ts';
 import { issueAccessToken } from '../../src/lib/jwt.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
@@ -75,8 +83,9 @@ import {
   type MedicationRequestStatus,
   type ProductCatalogId,
 } from '../../src/modules/pharmacy/internal/types.ts';
+import { configureBindRole } from '../helpers/configure-bind-role.ts';
+import { grantSliceRolesToTestApp } from '../helpers/grant-slice-roles.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
-import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
 
 // ---------------------------------------------------------------------------
@@ -107,26 +116,45 @@ const GH_CTX: TenantContext = {
 };
 
 let app: FastifyInstance | null = null;
+let bindPool: pg.Pool | null = null;
 
 beforeAll(async () => {
   process.env['NODE_ENV'] = 'test';
+  await grantSliceRolesToTestApp(['pharmacy_patient_reader']);
+  const migrationClient = new pg.Client({ connectionString: process.env['TEST_DATABASE_URL'] });
+  await migrationClient.connect();
+  try {
+    await configureBindRole(migrationClient, 'telecheck_test_bind_pw');
+  } finally {
+    await migrationClient.end();
+  }
+  const bindUrl = new URL(process.env['TEST_DATABASE_URL']!);
+  bindUrl.username = 'bind_actor_context_role';
+  bindUrl.password = 'telecheck_test_bind_pw';
+  bindPool = new pg.Pool({ connectionString: bindUrl.toString(), max: 2 });
+  setBindActorContextTestPool(bindPool as unknown as DbClient);
   app = await buildApp({ logger: false });
   await app.ready();
 });
 
 afterAll(async () => {
+  clearBindActorContextTestPool();
   if (app !== null) {
     await app.close();
   }
+  await bindPool?.end();
 });
 
 // ---------------------------------------------------------------------------
 // Seeding helpers
 // ---------------------------------------------------------------------------
 
+let syntheticPhoneSequence = 0;
 async function seedAccountInTenant(ctx: TenantContext, phonePrefix: string): Promise<AccountId> {
   const accountId = asAccountId(ulid());
-  const phone = uniquePhone(phonePrefix);
+  // File-local monotonic range; shared Date.now()+counter fixtures collide
+  // across parallel files. Twelve suffix digits still fit Ghana E.164 limits.
+  const phone = `${phonePrefix}555${String(++syntheticPhoneSequence).padStart(9, '0')}`;
   await withTenantContext(ctx.tenantId, () =>
     createAccount(
       {
@@ -144,6 +172,9 @@ async function seedAccountInTenant(ctx: TenantContext, phonePrefix: string): Pro
         /* no-op */
       },
     ),
+  );
+  await withTenantContext(ctx.tenantId, () =>
+    getTestClient().query("UPDATE accounts SET status='active' WHERE account_id=$1", [accountId]),
   );
   return accountId;
 }
@@ -223,7 +254,7 @@ async function seedMedicationRequest(
       quantity_unit: 'tablet',
       refills_allowed: 0,
       indication: null,
-      clinical_notes: null,
+      clinical_notes: 'INTERNAL-NOTE-NOT-A-PATIENT-INSTRUCTION',
       prescribing_consult_id: null,
       country_of_care: options.ctx.countryOfCare,
       protocol_id: null,
@@ -250,7 +281,7 @@ async function seedSession(tenantId: TenantId, accountId: AccountId): Promise<Se
   const sessionId = asSessionId(ulid());
   // A 64-char hex string satisfies the migration's CHECK constraint on
   // refresh_token_hash without exercising the real refresh-token flow.
-  const refreshTokenHash = '0'.repeat(64);
+  const refreshTokenHash = randomBytes(32).toString('hex');
   await withTenantContext(tenantId, () =>
     sessionRepo.createSession(
       {
@@ -312,6 +343,56 @@ function expectNoTenantLeak(response: { body: string }): void {
   expect(response.body).not.toContain('Telecheck-Ghana');
 }
 
+describe('pharmacy patient read — current account and query boundary', () => {
+  it.each(['deleted', 'suspended', 'retyped', 'country_changed'] as const)(
+    'rejects %s account state after token issuance',
+    async (state) => {
+      const patient = await seedAccountInTenant(US_CTX, '+1');
+      const token = await mintToken(T_US, patient);
+      await withTenantContext(T_US, async () => {
+        const statements = {
+          deleted: 'UPDATE accounts SET deleted_at=NOW() WHERE account_id=$1',
+          suspended: "UPDATE accounts SET status='suspended' WHERE account_id=$1",
+          retyped: "UPDATE accounts SET account_type='clinician' WHERE account_id=$1",
+          country_changed: "UPDATE accounts SET country_of_care='GH' WHERE account_id=$1",
+        };
+        await getTestClient().query(statements[state], [patient]);
+      });
+      for (const url of [
+        `/v0/pharmacy/patients/${patient}/prescriptions`,
+        `/v0/pharmacy/prescriptions/mrx_${ulid()}`,
+      ]) {
+        const response = await app!.inject({
+          method: 'GET',
+          url,
+          headers: { host: 'localhost', authorization: `Bearer ${token}` },
+        });
+        expect(response.statusCode).toBe(401);
+        expect(response.headers['cache-control']).toBe('no-store');
+        expectNoTenantLeak(response);
+      }
+    },
+  );
+
+  it.each([
+    'limit=1&limit=2',
+    'status=draft&status=active',
+    'patient_id=other',
+    'limit=1.5',
+    'limit=-1',
+  ])('rejects ambiguous or unsupported query %s', async (query) => {
+    const patient = await seedAccountInTenant(US_CTX, '+1');
+    const token = await mintToken(T_US, patient);
+    const response = await app!.inject({
+      method: 'GET',
+      url: `/v0/pharmacy/patients/${patient}/prescriptions?${query}`,
+      headers: { host: 'localhost', authorization: `Bearer ${token}` },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.headers['cache-control']).toBe('no-store');
+  });
+});
+
 // ===========================================================================
 // Group A — Happy path (GET /prescriptions/:id)
 // ===========================================================================
@@ -339,13 +420,29 @@ describe('pharmacy HTTP — Group A: GET /prescriptions/:id happy path', () => {
     expect(response.statusCode).toBe(200);
     const body = response.json<{
       id: MedicationRequestId;
-      patient_account_id: string;
       status: MedicationRequestStatus;
       medication_name: string;
       tenant_id?: undefined;
     }>();
     expect(body.id).toBe(seeded.id);
-    expect(body.patient_account_id).toBe(patient);
+    expect(Object.keys(body).sort()).toEqual(
+      [
+        'id',
+        'medication_name',
+        'strength',
+        'formulation',
+        'dose_instructions',
+        'quantity',
+        'quantity_unit',
+        'refills_allowed',
+        'status',
+        'prescribed_at',
+        'activated_at',
+        'expires_at',
+      ].sort(),
+    );
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(response.body).not.toContain('INTERNAL-NOTE');
     expect(body.status).toBe('draft');
     expect(body.medication_name).toBe('Test Medication');
     // PHI projection — the serialized body MUST NOT carry tenant_id.

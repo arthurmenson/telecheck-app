@@ -160,6 +160,8 @@ export const SLICE_ROLES = [
   // table/SECDEF owner identity, never SET-ROLEd into by handlers).
   'ai_provider_credential_writer',
   'ai_service_credential_reader',
+  // Patient-own medication projection (migration 087); no raw PHI-table grants.
+  'pharmacy_patient_reader',
 ] as const;
 
 export type SliceRole = (typeof SLICE_ROLES)[number];
