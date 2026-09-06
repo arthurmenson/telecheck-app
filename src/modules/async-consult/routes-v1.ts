@@ -85,6 +85,7 @@ import {
 import { getConsultV1Handler } from './internal/handlers/get-consult-v1.js';
 import { getQueueV1Handler } from './internal/handlers/get-queue-v1.js';
 import { initiateConsultV1Handler } from './internal/handlers/initiate-consult-v1.js';
+import { listConsultsV1Handler } from './internal/handlers/list-consults-v1.js';
 import {
   recordDecisionV1Handler,
   requestAdditionalDataV1Handler,
@@ -100,6 +101,7 @@ export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
   app.get('/queue', getQueueV1Handler);
 
   app.post('/', initiateConsultV1Handler);
+  app.get('/', listConsultsV1Handler);
   app.get('/:consult_id', getConsultV1Handler);
   app.post('/:consult_id/intake', submitIntakeV1Handler);
   app.post('/:consult_id/ai-preparation', aiPreparationV1Handler);

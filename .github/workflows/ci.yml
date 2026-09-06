@@ -145,6 +145,9 @@ jobs:
       - name: Typecheck (tsc --noEmit)
         run: npm run typecheck
 
+      - name: Build production server
+        run: npm run build
+
       # Provision the `postgres` role in the service container.
       #
       # Migration 047 (R2 MED-1 closure 2026-05-23) pins SECURITY DEFINER
@@ -222,6 +225,26 @@ jobs:
           ALTER ROLE identity_service_role LOGIN PASSWORD 'forms_ci_identity';
           SQL
           npm run verify:forms-publication
+      - name: Verify patient reads over real HTTP and restricted login roles
+        env:
+          NODE_ENV: development
+          PGPASSWORD: telecheck_ci
+          DATABASE_URL: postgres://telecheck_app_role:ephemeral-app-read@localhost:5432/telecheck_test
+          BIND_ACTOR_CONTEXT_DATABASE_URL: postgres://bind_actor_context_role:ephemeral-bind-read@localhost:5432/telecheck_test
+          IDENTITY_DATABASE_URL: postgres://identity_service_role:ephemeral-identity-read@localhost:5432/telecheck_test
+          PATIENT_READ_ACCEPTANCE_ADMIN_DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_test
+          JWT_SIGNING_KEY: synthetic-patient-read-jwt-key-for-ci-only
+          RESUME_TOKEN_SECRET: synthetic-patient-read-resume-key-for-ci-only
+          AUTH_DEV_OTP_ECHO: 'true'
+          EMAIL_PROVIDER: noop
+          SMS_PROVIDER: noop
+        run: |
+          psql -h localhost -U telecheck_ci -d telecheck_test -v ON_ERROR_STOP=1 <<'SQL'
+          ALTER ROLE telecheck_app_role LOGIN PASSWORD 'ephemeral-app-read';
+          ALTER ROLE bind_actor_context_role LOGIN PASSWORD 'ephemeral-bind-read';
+          ALTER ROLE identity_service_role LOGIN PASSWORD 'ephemeral-identity-read';
+          SQL
+          npm run verify:patient-reads
 
       # Coverage report retained as artifact for reviewer inspection.
       # Eventually feeds a coverage gate; for now upload-only.
