@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -49,6 +50,54 @@ const binding: TenantKeyBinding = {
 };
 const tx: DbTransaction = { query: async () => ({ rows: [], rowCount: 0 }) };
 
+describe('tenant KMS infrastructure launch contract', () => {
+  const template = JSON.parse(
+    readFileSync(new URL('../../infra/kms/tenant-primary.template.json', import.meta.url), 'utf8'),
+  ) as {
+    Parameters: {
+      TenantId: {
+        Type: string;
+        AllowedPattern?: string;
+        AllowedValues?: string[];
+        Default?: string;
+      };
+    };
+  };
+  const parameter = template.Parameters.TenantId;
+  // CloudFormation String constraints match the entire value. These are the
+  // real seeded launch tenant IDs, not invented ISO aliases or suffixes.
+  it.each([
+    ['Telecheck-US', true],
+    ['Telecheck-Ghana', true],
+    ['Telecheck-GH', false],
+    ['Telecheck-US-Test', false],
+    ['Telecheck-Ghana-Test', false],
+    ['Telecheck-Nigeria', false],
+    ['Heros', false],
+  ] as const)('validates %s as %s', (value, expected) => {
+    const accepted =
+      (!parameter.AllowedPattern || new RegExp(`^(?:${parameter.AllowedPattern})$`).test(value)) &&
+      (!parameter.AllowedValues || parameter.AllowedValues.includes(value));
+    expect(accepted).toBe(expected);
+  });
+  it('requires an explicit operating tenant at deployment', () => {
+    expect(parameter.Type).toBe('String');
+    expect(parameter.Default).toBeUndefined();
+  });
+  it('matches the launch identifiers actually seeded by migration 001', () => {
+    const migration = readFileSync(
+      new URL('../../migrations/001_tenants.sql', import.meta.url),
+      'utf8',
+    );
+    const seed = migration.slice(migration.indexOf('INSERT INTO tenants'));
+    const tenants = new Set(
+      [...seed.matchAll(/^\s*'(Telecheck-[A-Za-z]+)',/gm)].map((match) => match[1]),
+    );
+    expect(tenants.size).toBe(2);
+    expect([...(parameter.AllowedValues ?? [])].sort()).toEqual([...tenants].sort());
+  });
+});
+
 describe('classified row authentication', () => {
   it.each(KMS_DATA_CLASSES)('round-trips %s with independent random row keys', (dataClass) => {
     const key = randomBytes(32),
@@ -85,7 +134,7 @@ describe('classified row authentication', () => {
     const key = randomBytes(32),
       descriptor = { ...resource };
     const value = encryptRow(tenantId, resource, version, key, Buffer.from('confidential'));
-    if (target === 'tenant') tenant = 'Telecheck-GH' as TenantId;
+    if (target === 'tenant') tenant = 'Telecheck-Ghana' as TenantId;
     if (target === 'patient') descriptor.patientId = '01JZZZ00000000000000000005';
     if (target === 'class') descriptor.dataClass = 'pii_clinical';
     if (target === 'resourceType') descriptor.resourceType = 'clinical_decision';
@@ -113,7 +162,7 @@ describe('classified row authentication', () => {
   });
 });
 
-function transport() {
+function transport(activeBinding: TenantKeyBinding = binding) {
   const plaintext = randomBytes(32);
   const adapter: ClassifiedKeyTransport = {
     assumeRole: vi.fn(async () => ({
@@ -127,13 +176,13 @@ function transport() {
     })),
     generate: vi.fn(async () => ({
       $metadata: {},
-      KeyId: binding.cmkArn,
+      KeyId: activeBinding.cmkArn,
       Plaintext: plaintext,
       CiphertextBlob: Buffer.from('wrapped'),
     })),
     decrypt: vi.fn(async () => ({
       $metadata: {},
-      KeyId: binding.cmkArn,
+      KeyId: activeBinding.cmkArn,
       EncryptionAlgorithm: 'SYMMETRIC_DEFAULT' as const,
       Plaintext: plaintext,
     })),
@@ -142,23 +191,37 @@ function transport() {
 }
 
 describe('classified STS and KMS boundary', () => {
-  it('uses registered key/role and exact tenant/class context; erases AWS key response', async () => {
-    const { adapter, plaintext } = transport();
-    const expected = Buffer.from(plaintext);
-    const result = await createClassifiedKeyProvider(adapter).generate(binding, resource.dataClass);
-    expect(result.plaintext).toEqual(expected);
-    expect(plaintext).toEqual(Buffer.alloc(32));
-    const request = vi.mocked(adapter.assumeRole).mock.calls[0]![0];
-    expect(request.RoleArn).toBe(binding.serviceRoleArn);
-    expect(request.Tags).toEqual([{ Key: 'tenant_id', Value: tenantId }]);
-    expect(request.DurationSeconds).toBe(900);
-    expect(JSON.stringify(request)).not.toContain(resource.patientId);
-    expect(vi.mocked(adapter.generate).mock.calls[0]![2]).toEqual({
-      KeyId: binding.cmkArn,
-      KeySpec: 'AES_256',
-      EncryptionContext: { tenant_id: tenantId, data_class: resource.dataClass },
-    });
-  });
+  it.each([
+    binding,
+    {
+      ...binding,
+      tenantId: 'Telecheck-Ghana' as TenantId,
+      cmkArn: binding.cmkArn.replace('0b1978c6', '1b1978c6'),
+      serviceRoleArn: 'arn:aws:iam::123456789012:role/telecheck-tenant-ghana',
+    },
+  ])(
+    'uses $tenantId registered key/role and exact tenant/class context; erases AWS key response',
+    async (activeBinding) => {
+      const { adapter, plaintext } = transport(activeBinding);
+      const expected = Buffer.from(plaintext);
+      const result = await createClassifiedKeyProvider(adapter).generate(
+        activeBinding,
+        resource.dataClass,
+      );
+      expect(result.plaintext).toEqual(expected);
+      expect(plaintext).toEqual(Buffer.alloc(32));
+      const request = vi.mocked(adapter.assumeRole).mock.calls[0]![0];
+      expect(request.RoleArn).toBe(activeBinding.serviceRoleArn);
+      expect(request.Tags).toEqual([{ Key: 'tenant_id', Value: activeBinding.tenantId }]);
+      expect(request.DurationSeconds).toBe(900);
+      expect(JSON.stringify(request)).not.toContain(resource.patientId);
+      expect(vi.mocked(adapter.generate).mock.calls[0]![2]).toEqual({
+        KeyId: activeBinding.cmkArn,
+        KeySpec: 'AES_256',
+        EncryptionContext: { tenant_id: activeBinding.tenantId, data_class: resource.dataClass },
+      });
+    },
+  );
   it.each(['key', 'algorithm', 'length', 'credentialExpiry', 'blob'] as const)(
     'rejects an invalid AWS %s response',
     async (fault) => {
