@@ -62,6 +62,9 @@ DECLARE
     v_token TEXT;
     v_byte INTEGER;
 BEGIN
+    -- Match find-my-way's accepted absolute-form prefix, including an empty
+    -- authority. This is routing normalization, not standards URL validation.
+    p_path := regexp_replace(p_path, '^https?://[^/]*/', '/');
     WHILE v_position <= length(p_path) LOOP
         v_token := substring(p_path FROM v_position FOR 3);
         IF v_token ~ '^%[0-9a-fA-F]{2}$' THEN
@@ -77,9 +80,21 @@ BEGIN
     END LOOP;
     RETURN lower(v_result);
 END $decode$;
+-- Legacy key construction split at the first '?' even inside an absolute
+-- authority. Its original route is then unrecoverable. Do not trust/replay it
+-- as Identity or delete it and risk repeating a non-Identity side effect.
+-- Preserve a nonsecret reconciliation tombstone in BOTH cache capabilities.
+-- The reserved zero fingerprint is recognized before normal hash comparison.
+UPDATE public.idempotency_keys
+   SET request_hash = decode(repeat('00', 32), 'hex'),
+       response_status = 409,
+       response_body = '{"error":{"code":"internal.idempotency.legacy_result_unavailable","message":"The legacy operation result is unavailable. Reconcile its status before retrying."}}'::jsonb,
+       processing_state = 'completed'
+ WHERE endpoint ~ '^https?://[^/]*$';
 INSERT INTO public.identity_idempotency_keys
     SELECT * FROM public.idempotency_keys
-     WHERE pg_temp.identity_legacy_endpoint(endpoint) ~ '^/v0/identity(/|$)';
+     WHERE pg_temp.identity_legacy_endpoint(endpoint) ~ '^/v0/identity(/|$)'
+        OR endpoint ~ '^https?://[^/]*$';
 DELETE FROM public.idempotency_keys
  WHERE pg_temp.identity_legacy_endpoint(endpoint) ~ '^/v0/identity(/|$)'
     OR response_body ?| ARRAY['access_token','refresh_token','dev_otp','dev_passcode'];
