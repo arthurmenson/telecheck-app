@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 
 import pg, { type PoolClient } from 'pg';
 import { ulid } from 'ulid';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { bindActorContextForRequest } from '../../src/lib/actor-context-binding.js';
 import { createClassifiedKms } from '../../src/lib/classified-kms.js';
@@ -12,6 +12,7 @@ import { KmsOperationError } from '../../src/lib/kms-aws.js';
 import type { ClassifiedKeyProvider } from '../../src/lib/kms-classified-aws.js';
 import { createClassifiedKmsStore, type KmsPool } from '../../src/lib/kms-classified-store.js';
 import type { ClassifiedResource } from '../../src/lib/kms-classified-types.js';
+import { logger } from '../../src/lib/logger.js';
 
 const databaseUrl = process.env.KMS_INTEGRATION_DATABASE_URL;
 const enabled = databaseUrl !== undefined;
@@ -145,6 +146,57 @@ describe.skipIf(!enabled)('classified KMS database isolation and durable evidenc
     await admin?.end();
   });
 
+  it('signals an audit INSERT outage without details, rate limits repeats and refuses plaintext', async () => {
+    const f = await fixture();
+    f.descriptor.dataClass = 'pii_audit_payload';
+    try {
+      const envelope = await createClassifiedKms(
+        createClassifiedKmsStore(auditPool),
+        provider,
+      ).encrypt(f.business, f.descriptor, Buffer.from('synthetic private response'));
+      const outagePool: KmsPool = {
+        async connect() {
+          const client = await auditPool.connect();
+          return {
+            release: client.release,
+            async query<R>(sql: string, values?: readonly unknown[]) {
+              if (sql.startsWith('INSERT INTO public.audit_records'))
+                throw new Error(
+                  'synthetic SQL diagnostics, secret nonce and PHI must never be logged',
+                );
+              return client.query<R>(sql, values);
+            },
+          };
+        },
+      };
+      const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+      try {
+        const engine = createClassifiedKms(createClassifiedKmsStore(outagePool), provider);
+        await expect(engine.decrypt(f.business, f.descriptor, envelope)).rejects.toThrow(
+          KmsOperationError,
+        );
+        await expect(engine.decrypt(f.business, f.descriptor, envelope)).rejects.toThrow(
+          KmsOperationError,
+        );
+        expect(error).toHaveBeenCalledExactlyOnceWith(
+          { event: 'kms.audit.unavailable' },
+          'Tenant encryption audit unavailable',
+        );
+        expect(
+          (
+            await admin.query(
+              "SELECT count(*)::int AS n FROM public.audit_records WHERE resource_id=$1 AND action IN ('kms.decrypt_invoked','kms.decrypt_failed')",
+              [f.descriptor.resourceId],
+            )
+          ).rows[0].n,
+        ).toBe(0);
+      } finally {
+        error.mockRestore();
+      }
+    } finally {
+      await release(f.business);
+    }
+  });
   it('commits class creation and decryption evidence independently of business rollback', async () => {
     const f = await fixture();
     try {
@@ -324,7 +376,7 @@ describe.skipIf(!enabled)('classified KMS database isolation and durable evidenc
             release: client.release,
             async query<T>(sql: string, values?: readonly unknown[]) {
               if (
-                sql.startsWith('INSERT INTO audit_records') &&
+                sql.startsWith('INSERT INTO public.audit_records') &&
                 values?.includes('kms.decrypt_invoked')
               )
                 decryptAudit = true;
@@ -409,4 +461,200 @@ describe.skipIf(!enabled)('classified KMS database isolation and durable evidenc
       await release(f.business);
     }
   });
+  it('uses the real registry under temporary-table shadows and a hostile search_path', async () => {
+    const f = await fixture();
+    f.descriptor.dataClass = 'pii_research_consented';
+    const usedArns: string[] = [];
+    try {
+      await f.business.query(
+        'CREATE TEMP TABLE tenant_kms_bindings (LIKE public.tenant_kms_bindings INCLUDING DEFAULTS)',
+      );
+      await f.business.query(
+        "INSERT INTO pg_temp.tenant_kms_bindings (tenant_id,cmk_arn,service_role_arn,residency_policy) VALUES ($1,$2,$3,'us_only')",
+        [
+          tenant,
+          cmk.replace('0b1978c6', '1b1978c6'),
+          'arn:aws:iam::123456789012:role/unregistered',
+        ],
+      );
+      await f.business.query(
+        'CREATE TEMP TABLE pg_locks (pid INTEGER, locktype TEXT, granted BOOLEAN)',
+      );
+      await f.business.query('SET LOCAL search_path = pg_temp, pg_catalog');
+      const observed: ClassifiedKeyProvider = {
+        generate: async (binding, dataClass) => {
+          usedArns.push(binding.cmkArn);
+          return provider.generate(binding, dataClass);
+        },
+        decrypt: async (binding, dataClass, blob) => {
+          usedArns.push(binding.cmkArn);
+          return provider.decrypt(binding, dataClass, blob);
+        },
+      };
+      const engine = createClassifiedKms(createClassifiedKmsStore(auditPool), observed);
+      const envelope = await engine.encrypt(
+        f.business,
+        f.descriptor,
+        Buffer.from('canonical registry'),
+      );
+      expect((await engine.decrypt(f.business, f.descriptor, envelope)).toString()).toBe(
+        'canonical registry',
+      );
+      expect(usedArns.length).toBeGreaterThan(0);
+      expect(usedArns.every((arn) => arn === cmk)).toBe(true);
+    } finally {
+      await release(f.business);
+    }
+  });
+  it.each(['patient', 'clinician', 'tenant_admin'] as const)(
+    'denies a soft-deleted %s actor with a live session',
+    async (role) => {
+      const f = await fixture(role);
+      try {
+        const engine = createClassifiedKms(createClassifiedKmsStore(auditPool), provider);
+        const envelope = await engine.encrypt(
+          f.business,
+          f.descriptor,
+          Buffer.from('deleted account must not receive this'),
+        );
+        await admin.query(
+          'UPDATE public.accounts SET deleted_at=pg_catalog.clock_timestamp() WHERE account_id=$1',
+          [f.accountId],
+        );
+        await expect(
+          engine.encrypt(f.business, f.descriptor, Buffer.from('no write')),
+        ).rejects.toThrow(KmsOperationError);
+        await expect(engine.decrypt(f.business, f.descriptor, envelope)).rejects.toThrow(
+          KmsOperationError,
+        );
+        await expect(engine.rotateWriteVersion(f.business, f.descriptor)).rejects.toThrow(
+          KmsOperationError,
+        );
+        expect(
+          (
+            await admin.query(
+              "SELECT count(*)::int AS n FROM public.audit_records WHERE resource_id=$1 AND action='kms.decrypt_failed'",
+              [f.descriptor.resourceId],
+            )
+          ).rows[0].n,
+        ).toBe(1);
+      } finally {
+        await release(f.business);
+      }
+    },
+  );
+  it.each([
+    ['patient', 'encrypt'],
+    ['patient', 'decrypt'],
+    ['clinician', 'encrypt'],
+    ['clinician', 'decrypt'],
+    ['tenant_admin', 'encrypt'],
+    ['tenant_admin', 'decrypt'],
+    ['tenant_admin', 'rotate'],
+  ] as const)('rechecks %s deletion committed during provider %s', async (role, operation) => {
+    const f = await fixture(role);
+    try {
+      const normal = createClassifiedKms(createClassifiedKmsStore(auditPool), provider);
+      const envelope = await normal.encrypt(
+        f.business,
+        f.descriptor,
+        Buffer.from('concurrent deletion'),
+      );
+      const remove = () =>
+        admin.query(
+          'UPDATE public.accounts SET deleted_at=pg_catalog.clock_timestamp() WHERE account_id=$1',
+          [f.accountId],
+        );
+      const concurrent: ClassifiedKeyProvider = {
+        generate: async (binding, dataClass) => {
+          const result = await provider.generate(binding, dataClass);
+          await remove();
+          return result;
+        },
+        decrypt: async (binding, dataClass, blob) => {
+          const result = await provider.decrypt(binding, dataClass, blob);
+          await remove();
+          return result;
+        },
+      };
+      const engine = createClassifiedKms(createClassifiedKmsStore(auditPool), concurrent);
+      const attempted =
+        operation === 'encrypt'
+          ? engine.encrypt(f.business, f.descriptor, Buffer.from('no write'))
+          : operation === 'decrypt'
+            ? engine.decrypt(f.business, f.descriptor, envelope)
+            : engine.rotateWriteVersion(f.business, f.descriptor);
+      await expect(attempted).rejects.toThrow(KmsOperationError);
+      expect(decryptedKeys.every((key) => key.equals(Buffer.alloc(32)))).toBe(true);
+    } finally {
+      await release(f.business);
+    }
+  });
+  it.each(['role check', 'COMMIT', 'ROLLBACK'] as const)(
+    'discards a never-arriving %s reply, erases keys and recovers',
+    async (fault) => {
+      const f = await fixture();
+      try {
+        const envelope = await createClassifiedKms(
+          createClassifiedKmsStore(auditPool),
+          provider,
+        ).encrypt(f.business, f.descriptor, Buffer.from('deadline secret'));
+        let armed = true;
+        const releases: boolean[] = [];
+        const stalled: KmsPool = {
+          async connect() {
+            const client = await auditPool.connect();
+            let decryptAudit = false,
+              failedInsert = false;
+            return {
+              release: (broken = false) => {
+                releases.push(broken);
+                client.release(broken);
+              },
+              async query<R>(sql: string, values?: readonly unknown[]) {
+                if (
+                  sql.startsWith('INSERT INTO public.audit_records') &&
+                  values?.includes('kms.decrypt_invoked')
+                ) {
+                  decryptAudit = true;
+                  if (fault === 'ROLLBACK' && armed) {
+                    failedInsert = true;
+                    throw new Error('synthetic INSERT failure');
+                  }
+                }
+                const result = await client.query<R>(sql, values);
+                if (
+                  armed &&
+                  ((fault === 'role check' && sql === 'SELECT session_user') ||
+                    (fault === 'COMMIT' && sql === 'COMMIT' && decryptAudit) ||
+                    (fault === 'ROLLBACK' && sql === 'ROLLBACK' && failedInsert))
+                ) {
+                  armed = false;
+                  return new Promise<never>(() => undefined);
+                }
+                return result;
+              },
+            };
+          },
+        };
+        const engine = createClassifiedKms(
+          createClassifiedKmsStore(stalled, { queryMs: 500, transactionMs: 4000, acquireMs: 1500 }),
+          provider,
+          1,
+        );
+        const started = Date.now();
+        await expect(engine.decrypt(f.business, f.descriptor, envelope)).rejects.toThrow(
+          KmsOperationError,
+        );
+        expect(Date.now() - started).toBeLessThan(3500);
+        expect(releases).toContain(true);
+        expect(decryptedKeys.every((key) => key.equals(Buffer.alloc(32)))).toBe(true);
+        expect((await engine.decrypt(f.business, f.descriptor, envelope)).toString()).toBe(
+          'deadline secret',
+        );
+      } finally {
+        await release(f.business);
+      }
+    },
+  );
 });
