@@ -52,12 +52,11 @@ afterAll(async () => {
   }
 });
 
+let syntheticPhoneSequence = 0;
 function uniquePhone(): string {
-  const digits = ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0')
-    .padEnd(9, '0');
-  return `+1${digits}`;
+  // Deterministic uniqueness within this file, including two accounts in one
+  // test. Mapping random ULID letters to zero collapses most of its entropy.
+  return `+1555${String(++syntheticPhoneSequence).padStart(7, '0')}`;
 }
 
 const tokens = new Map<string, string>();
