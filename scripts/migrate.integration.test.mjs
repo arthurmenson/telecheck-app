@@ -82,6 +82,37 @@ test('real PostgreSQL: rollback, atomic tracking, replay and checksum refusal', 
       );
     }
     await rm(join(directory, '003_escape.sql'));
+    for (const source of [
+      String.raw`CREATE TABLE continuation_leak(id int);
+SELECT E''
+'\'; SELECT '; COMMIT; SELECT E''
+'\'; SELECT ';
+SELECT 1/0;`,
+      'CREATE TABLE continuation_leak(id int); DO $$ BEGIN COMMIT; END $$;',
+      `CREATE TABLE continuation_leak(id int);
+       CREATE PROCEDURE transaction_probe() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$;
+       CALL transaction_probe();`,
+    ]) {
+      await writeFile(join(directory, '003_containment.sql'), source);
+      await assert.rejects(
+        applyMigrations(client, directory),
+        /migration_apply_failed:003_containment.sql:/,
+      );
+      assert.equal(
+        (await client.query("SELECT to_regclass('continuation_leak') AS relation")).rows[0]
+          .relation,
+        null,
+      );
+      assert.equal(
+        (
+          await client.query(
+            "SELECT count(*)::int AS count FROM schema_migrations WHERE filename='003_containment.sql'",
+          )
+        ).rows[0].count,
+        0,
+      );
+    }
+    await rm(join(directory, '003_containment.sql'));
     await writeFile(
       join(directory, '003_string_mode.sql'),
       'SET standard_conforming_strings = off;',
