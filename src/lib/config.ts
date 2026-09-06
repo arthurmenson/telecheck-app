@@ -174,6 +174,8 @@ const ConfigSchema = z.object({
   // KMS — dev-only local key; prod uses AWS KMS via `kmsKeyAlias` from tenants table
   TENANT_KMS_LOCAL_DEV_KEY: z.string().optional(),
   TENANT_KMS_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1).max(30_000).default(5000),
+  KMS_DATABASE_URL: z.string().url().optional(),
+  KMS_MAX_CONCURRENT_OPERATIONS: z.coerce.number().int().min(1).max(16).default(4),
 
   // JWT signing key for Identity slice access tokens (HMAC-SHA256 at v1.0;
   // RSA/ECDSA upgrade lands when key rotation infrastructure is wired).
@@ -503,6 +505,8 @@ function loadConfig() {
     redisUrl: parsed.REDIS_URL,
     tenantKmsLocalDevKey: parsed.TENANT_KMS_LOCAL_DEV_KEY,
     tenantKmsRequestTimeoutMs: parsed.TENANT_KMS_REQUEST_TIMEOUT_MS,
+    kmsDatabaseUrl: parsed.KMS_DATABASE_URL,
+    kmsMaxConcurrentOperations: parsed.KMS_MAX_CONCURRENT_OPERATIONS,
     jwtSigningKey,
     anthropicApiKey: parsed.ANTHROPIC_API_KEY,
     anthropicModel: parsed.ANTHROPIC_MODEL,

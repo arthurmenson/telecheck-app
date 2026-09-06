@@ -1,0 +1,166 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Telecheck tenant-specific primary CMK and tenant-tagged normal service role. Deploy only in us-east-1. No cross-tenant break-glass or DR activation.",
+  "Parameters": {
+    "TenantId": {
+      "Type": "String",
+      "Description": "Exact operating tenant from the launch registry. Expansion requires an explicit reviewed tenant addition.",
+      "AllowedValues": ["Telecheck-US", "Telecheck-Ghana"]
+    },
+    "ApplicationRoleArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+"
+    },
+    "KeyAdministratorRoleArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+"
+    },
+    "MultiRegion": { "Type": "String", "Default": "false", "AllowedValues": ["false", "true"] }
+  },
+  "Conditions": { "UseMultiRegion": { "Fn::Equals": [{ "Ref": "MultiRegion" }, "true"] } },
+  "Resources": {
+    "TenantServiceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "MaxSessionDuration": 3600,
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "AWS": { "Ref": "ApplicationRoleArn" } },
+              "Action": ["sts:AssumeRole", "sts:TagSession"],
+              "Condition": {
+                "StringEquals": { "aws:RequestTag/tenant_id": { "Ref": "TenantId" } },
+                "ForAllValues:StringEquals": { "aws:TagKeys": ["tenant_id"] },
+                "Null": { "aws:RequestTag/tenant_id": "false" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "TenantKey": {
+      "Type": "AWS::KMS::Key",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Description": { "Fn::Sub": "Telecheck ${TenantId} data-class encryption" },
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "MultiRegion": { "Fn::If": ["UseMultiRegion", true, false] },
+        "EnableKeyRotation": true,
+        "RotationPeriodInDays": 365,
+        "PendingWindowInDays": 30,
+        "Tags": [{ "Key": "tenant_id", "Value": { "Ref": "TenantId" } }],
+        "KeyPolicy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AdministrationWithoutPlaintextAccess",
+              "Effect": "Allow",
+              "Principal": { "AWS": { "Ref": "KeyAdministratorRoleArn" } },
+              "Action": [
+                "kms:DescribeKey",
+                "kms:GetKeyPolicy",
+                "kms:PutKeyPolicy",
+                "kms:ListKeyPolicies",
+                "kms:GetKeyRotationStatus",
+                "kms:EnableKeyRotation",
+                "kms:RotateKeyOnDemand",
+                "kms:TagResource",
+                "kms:UntagResource",
+                "kms:ListResourceTags"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Sid": "TenantClassCryptography",
+              "Effect": "Allow",
+              "Principal": { "AWS": { "Fn::GetAtt": ["TenantServiceRole", "Arn"] } },
+              "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:PrincipalTag/tenant_id": { "Ref": "TenantId" },
+                  "kms:EncryptionContext:tenant_id": { "Ref": "TenantId" },
+                  "kms:EncryptionContext:data_class": [
+                    "pii_demographic",
+                    "pii_clinical",
+                    "pii_sensitive_clinical",
+                    "pii_financial",
+                    "pii_conversation",
+                    "pii_audit_payload",
+                    "pii_research_consented"
+                  ]
+                },
+                "ForAllValues:StringEquals": {
+                  "kms:EncryptionContextKeys": ["tenant_id", "data_class"]
+                },
+                "Null": {
+                  "kms:EncryptionContext:tenant_id": "false",
+                  "kms:EncryptionContext:data_class": "false"
+                }
+              }
+            },
+            {
+              "Sid": "DescribeKeyWithoutEncryptionContext",
+              "Effect": "Allow",
+              "Principal": { "AWS": { "Fn::GetAtt": ["TenantServiceRole", "Arn"] } },
+              "Action": "kms:DescribeKey",
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": { "aws:PrincipalTag/tenant_id": { "Ref": "TenantId" } }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "TenantServicePolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "TenantClassCryptography",
+        "Roles": [{ "Ref": "TenantServiceRole" }],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+              "Resource": { "Fn::GetAtt": ["TenantKey", "Arn"] },
+              "Condition": {
+                "StringEquals": {
+                  "aws:PrincipalTag/tenant_id": { "Ref": "TenantId" },
+                  "kms:EncryptionContext:tenant_id": { "Ref": "TenantId" },
+                  "kms:EncryptionContext:data_class": [
+                    "pii_demographic",
+                    "pii_clinical",
+                    "pii_sensitive_clinical",
+                    "pii_financial",
+                    "pii_conversation",
+                    "pii_audit_payload",
+                    "pii_research_consented"
+                  ]
+                },
+                "ForAllValues:StringEquals": {
+                  "kms:EncryptionContextKeys": ["tenant_id", "data_class"]
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": "kms:DescribeKey",
+              "Resource": { "Fn::GetAtt": ["TenantKey", "Arn"] }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "CmkArn": { "Value": { "Fn::GetAtt": ["TenantKey", "Arn"] } },
+    "ServiceRoleArn": { "Value": { "Fn::GetAtt": ["TenantServiceRole", "Arn"] } },
+    "Region": { "Value": { "Ref": "AWS::Region" } }
+  }
+}

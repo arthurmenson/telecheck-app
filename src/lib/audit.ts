@@ -69,6 +69,10 @@ import type { TenantId } from './glossary.js';
 
 /** Category A — Safety-critical clinical actions */
 type CategoryAAction =
+  | 'kms.dek_created'
+  | 'kms.dek_rotation_started'
+  | 'kms.decrypt_failed'
+  | 'kms.decrypt_invoked'
   | 'prescribing.initiated'
   | 'prescribing.approved'
   | 'prescribing.declined'
@@ -145,6 +149,7 @@ type CategoryBAction =
 
 /** Category C — Operational and engagement actions */
 type CategoryCAction =
+  | 'kms.dek_lookup'
   | 'patient_account_created'
   | 'patient_identity_verified'
   | 'consent_granted'
@@ -435,8 +440,8 @@ async function getPreviousHashForPartition(
   }
 
   const result = await tx.query(
-    `SELECT encode(record_hash, 'hex') AS record_hash_hex, sequence_number
-       FROM audit_records
+    `SELECT pg_catalog.encode(record_hash, 'hex') AS record_hash_hex, sequence_number
+       FROM public.audit_records
       WHERE tenant_id = $1
         AND COALESCE(target_patient_id, 'PLATFORM') = $2
       ORDER BY sequence_number DESC
@@ -884,7 +889,7 @@ export async function emitAudit(
       // tenant platform_admin attribution was lost on persistence.
       // Migration 029 adds the column; this INSERT now writes it.
       const result = await tx.query(
-        `INSERT INTO audit_records (
+        `INSERT INTO public.audit_records (
             audit_id, tenant_id, category, audit_sensitivity_level, action,
             actor_type, actor_id, actor_tenant_id, ai_workload_type, autonomy_level,
             target_patient_id, delegate_context, resource_type, resource_id,
@@ -894,12 +899,12 @@ export async function emitAudit(
             $1, $2, $3, $4, $5,
             $6, $7, $8, $9, $10,
             $11, $12::jsonb, $13, $14,
-            $15, $16::jsonb, $17::jsonb, decode($18, 'hex'), decode($19, 'hex'),
+            $15, $16::jsonb, $17::jsonb, pg_catalog.decode($18, 'hex'), pg_catalog.decode($19, 'hex'),
             $20, $21
          )
          RETURNING
-           encode(prev_hash,   'hex') AS prev_hash_hex,
-           encode(record_hash, 'hex') AS record_hash_hex,
+           pg_catalog.encode(prev_hash,   'hex') AS prev_hash_hex,
+           pg_catalog.encode(record_hash, 'hex') AS record_hash_hex,
            sequence_number`,
         [
           envelope.audit_id,

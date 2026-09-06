@@ -155,6 +155,8 @@ const TENANT_SCOPED_TABLES = [
   'interaction_signal', // migration 047 — Med-Interaction slice
   'interaction_signal_lifecycle_transition', // migration 047 — Med-Interaction slice
   'interaction_signal_override', // migration 047 — Med-Interaction slice
+  'kms_active_class_keys', // migration 085 — classified KMS write-version pointer
+  'kms_dek_keyring', // migration 085 — immutable wrapped class DEK versions
   'medication_requests', // migration 025 — per CDM v1.3 §4.16 (P-011 / SI-001 closure 2026-05-11)
   'notification_crisis_dispatch_ledger', // migration 033 — Crisis Response slice
   'notification_crisis_escalation_obligation', // migration 033 — Crisis Response slice
@@ -168,6 +170,7 @@ const TENANT_SCOPED_TABLES = [
   'subscription_events', // migration 076 — Subscription slice (CDM v1.2 §4.8; State Machines v1.1 §15)
   'subscriptions', // migration 076 — Subscription slice (CDM v1.2 §4.7; State Machines v1.1 §15)
   'tenant_brands',
+  'tenant_kms_bindings', // migration 084 — immutable tenant CMK / role / residency
   'tenant_users',
 ] as const;
 

@@ -1,0 +1,42 @@
+name: Classified KMS isolation
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: classified-kms-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  classified-kms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ephemeral-kms-ci-only
+          POSTGRES_DB: telecheck_classified_kms
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d telecheck_classified_kms"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ONNXRUNTIME_NODE_INSTALL: skip
+      NODE_ENV: test
+      DATABASE_URL: postgresql://postgres:ephemeral-kms-ci-only@localhost:5432/telecheck_classified_kms
+      MIGRATION_DATABASE_URL: postgresql://postgres:ephemeral-kms-ci-only@localhost:5432/telecheck_classified_kms
+      KMS_INTEGRATION_DATABASE_URL: postgresql://postgres:ephemeral-kms-ci-only@localhost:5432/telecheck_classified_kms
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run migrate:apply
+      - run: npm run test:kms
