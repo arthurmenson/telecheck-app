@@ -36,7 +36,8 @@
     "src/**/*",
     "tests/**/*",
     "scripts/verify-identity-runtime.ts",
-    "scripts/verify-forms-publication.ts"
+    "scripts/verify-forms-publication.ts",
+    "scripts/verify-forms-rollback.ts"
   ],
   "exclude": ["node_modules", "dist", ".tsbuildinfo"]
 }

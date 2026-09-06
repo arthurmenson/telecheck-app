@@ -193,7 +193,7 @@ END;
 $$;
 CREATE OR REPLACE FUNCTION public.submit_forms_template_for_admin_review(
     p_tenant_id   TEXT,
-    p_template_id TEXT    -- VARCHAR(26) at the forms_template(template_id) column
+    p_template_id TEXT
 ) RETURNS UUID
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -204,19 +204,16 @@ DECLARE
     v_submitter_principal_id                 TEXT;
     v_existing_revision_requested_review_id  UUID;
     v_actor_tenant_id                        TEXT;
+    v_template_status                        TEXT;
+    v_template_deleted_at                    TIMESTAMPTZ;
 BEGIN
     -- ---------------------------------------------------------------------
     -- LAYER B (role authorization) DEFERRED to application layer per Option 2.
-    -- The Fastify route handler in PR 6 will check the calling principal
-    -- holds admin_basic_operator before invoking this wrapper. The wrapper-
-    -- internal LAYER A (EXECUTE granted to admin_basic_operator only) is
-    -- sufficient against the SECDEF surface.
     -- ---------------------------------------------------------------------
 
     -- ---------------------------------------------------------------------
     -- LAYER C — tenant scope match. SI-010 trust anchor binds the actor's
-    -- tenant_id at request time; reject if mismatched (defense-in-depth
-    -- alongside LAYER A EXECUTE-grant).
+    -- tenant_id at request time; reject if mismatched.
     -- ---------------------------------------------------------------------
     v_actor_tenant_id := current_actor_account_tenant_id();
     IF v_actor_tenant_id IS NULL THEN
@@ -245,9 +242,18 @@ BEGIN
     -- LAYER 1 (R8 HIGH-1 from SI-023): shared parent-template FOR UPDATE
     -- serialization point. Acquired BEFORE any review-row reads so the
     -- submit + decision wrappers race-safe against each other at the
-    -- template grain. NOT FOUND → tenant-blind 02000 (no_data).
+    -- template grain.
+    --
+    -- PR #205 Codex R1 Finding 1 closure: derive status + deleted_at under
+    -- the FOR UPDATE so the draft-only guard is atomic with the row lock.
+    -- NOT FOUND → tenant-blind 02000 (no_data); existing-but-not-draft (or
+    -- soft-deleted) → 42P17 (invalid_object_state). Same FOR UPDATE
+    -- statement = no TOCTOU between the existence check and the state
+    -- guard.
     -- ---------------------------------------------------------------------
-    PERFORM 1 FROM forms_template
+    SELECT status, deleted_at
+      INTO v_template_status, v_template_deleted_at
+      FROM forms_template
      WHERE tenant_id = p_tenant_id AND template_id = p_template_id
        FOR UPDATE;
     IF NOT FOUND THEN
@@ -255,6 +261,24 @@ BEGIN
             'admin-template-submit-template-not-found: forms_template id % not found for tenant %',
             p_template_id, p_tenant_id
             USING ERRCODE = '02000';
+    END IF;
+
+    -- PR #205 Codex R1 Finding 1: state guard. Template MUST be in
+    -- `draft` status AND not soft-deleted to be eligible for admin-review
+    -- submission. Per SI-023 §4 + §6 transition triple #1 (initial
+    -- submission) and triple #5 (revision resubmission), the template is
+    -- expected to be `draft` throughout the review lifecycle — the
+    -- `published` flip only happens at the decision wrapper on approve.
+    -- A template in `published`, `superseded`, or `archived` status (or
+    -- one with deleted_at NOT NULL) is NOT a valid submit target. The
+    -- 42P17 ERRCODE is mapped to 409 at the Fastify handler with a
+    -- tenant-blind body (no template_id / tenant_id leak per I-025).
+    IF v_template_status IS DISTINCT FROM 'draft'
+       OR v_template_deleted_at IS NOT NULL THEN
+        RAISE EXCEPTION
+            'admin-template-submit-invalid-state: template % is not in draft state (status=%, deleted_at=%); only draft templates may be submitted for admin review',
+            p_template_id, v_template_status, v_template_deleted_at
+            USING ERRCODE = '42P17';
     END IF;
 
     -- ---------------------------------------------------------------------
@@ -285,10 +309,7 @@ BEGIN
         );
     ELSE
         -- INITIAL SUBMISSION PATH (transition triple #1).
-        -- Reject if an in-flight pending_review (or revision_requested,
-        -- though the previous block already handled revision_requested)
-        -- review already exists. Returns 40001 (serialization_failure) so
-        -- the HTTP layer can surface 409 Conflict.
+        -- Reject if an in-flight pending_review review already exists.
         PERFORM 1
           FROM forms_template_admin_review ftar
           JOIN LATERAL (
@@ -309,10 +330,7 @@ BEGIN
                 USING ERRCODE = '40001';
         END IF;
 
-        -- Insert the new review root. ai_guardrail_snapshot_jsonb is
-        -- omitted (NULL) at v0.1 — the column exists on forms_template per
-        -- the spec but the snapshot capture path is application-layer logic
-        -- not yet wired in code repo. The schema accepts NULL.
+        -- Insert the new review root.
         INSERT INTO forms_template_admin_review
             (tenant_id, forms_template_id, submitter_principal_id, ai_guardrail_snapshot_jsonb)
         VALUES
@@ -327,9 +345,6 @@ BEGIN
     END IF;
 
     -- Audit emission DEFERRED to application layer (per Option 2 carryforward).
-    -- The Fastify route handler in PR 6 wraps THIS wrapper call + the
-    -- audit_records INSERT for 'admin.template_submitted_for_review' Cat A
-    -- in a single DB transaction per FLOOR-020 fail-closed discipline.
 
     RETURN v_review_id;
 END;

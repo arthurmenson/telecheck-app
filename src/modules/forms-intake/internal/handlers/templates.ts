@@ -31,7 +31,10 @@ import {
   PUBLISH_VERSION_NOT_DRAFT,
   PUBLISH_VERSION_NOT_FOUND,
 } from '../repositories/template-repo.js';
-import { assertFormsGovernanceScope } from '../services/publication-evidence.js';
+import {
+  assertFormsGovernanceScope,
+  formsGovernanceTransaction,
+} from '../services/publication-evidence.js';
 import { checkPublishGateBypassAtRuntime } from '../services/publish-gates-killswitch.js';
 import * as templateService from '../services/template-service.js';
 import { PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME } from '../services/template-service.js';
@@ -427,34 +430,48 @@ export async function publishVersionHandler(
   } catch {
     throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
   }
-  return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
-    try {
-      const published = await withActorContext(tx, req.actorNonce!, () =>
-        templateService.publishVersion(
-          ctx,
-          { actorId, actorTenantId },
-          versionIdParam,
-          parsed.data,
-          tx,
-        ),
-      );
-      return { status: 200, view: published };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (message === PUBLISH_VERSION_NOT_FOUND || message === PUBLISH_VERSION_NOT_DRAFT) {
-        // Both sentinels map to the same tenant-blind 400 envelope per I-025
-        // — the response MUST NOT differentiate "doesn't exist" vs "exists
-        // in another tenant" vs "exists but isn't a draft." A precise
-        // operator-facing error code is preserved in the envelope's `code`
-        // field (mapped by the global error envelope plugin) so observability
-        // tooling can distinguish; the wire-out message is uniform.
-        // Throw inside body() so the surrounding tx rolls back and the
-        // idempotency reservation is purged — clean retry possible.
-        throw req.server.httpErrors.badRequest(
-          'The requested form version cannot be published in its current state.',
+  return withIdempotentExecution(
+    req,
+    reply,
+    mapServiceError,
+    async (tx) => {
+      try {
+        const published = await withActorContext(tx, req.actorNonce!, () =>
+          templateService.publishVersion(
+            ctx,
+            { actorId, actorTenantId },
+            versionIdParam,
+            parsed.data,
+            tx,
+          ),
         );
+        return { status: 200, view: published };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message === PUBLISH_VERSION_NOT_FOUND || message === PUBLISH_VERSION_NOT_DRAFT) {
+          // Both sentinels map to the same tenant-blind 400 envelope per I-025
+          // — the response MUST NOT differentiate "doesn't exist" vs "exists
+          // in another tenant" vs "exists but isn't a draft." A precise
+          // operator-facing error code is preserved in the envelope's `code`
+          // field (mapped by the global error envelope plugin) so observability
+          // tooling can distinguish; the wire-out message is uniform.
+          // Throw inside body() so the surrounding tx rolls back and the
+          // idempotency reservation is purged — clean retry possible.
+          throw req.server.httpErrors.badRequest(
+            'The requested form version cannot be published in its current state.',
+          );
+        }
+        throw err;
       }
-      throw err;
-    }
-  });
+    },
+    formsGovernanceTransaction(
+      {
+        tenantId: ctx.tenantId,
+        accountId: req.actorContext.accountId,
+        sessionId: req.actorContext.sessionId,
+        actorNonce: req.actorNonce,
+      },
+      'forms.publication.checked',
+    ),
+  );
 }

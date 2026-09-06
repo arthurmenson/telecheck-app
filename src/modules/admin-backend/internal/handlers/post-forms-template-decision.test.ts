@@ -65,6 +65,7 @@ vi.mock('../../audit.js', () => ({
 }));
 vi.mock('../../../forms-intake/index.js', () => ({
   assertFormsGovernanceScope: vi.fn(),
+  formsGovernanceTransaction: vi.fn(() => vi.fn()),
   recordFormsPublicationEvidence: vi.fn(),
 }));
 vi.mock('../../../../lib/db.js', async (original) => ({

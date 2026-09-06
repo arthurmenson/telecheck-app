@@ -64,7 +64,10 @@ vi.mock('../../../../lib/idempotent-handler.js', () => ({
 vi.mock('../../audit.js', () => ({
   emitTemplateSubmittedForReviewAudit: vi.fn(),
 }));
-vi.mock('../../../forms-intake/index.js', () => ({ assertFormsGovernanceScope: vi.fn() }));
+vi.mock('../../../forms-intake/index.js', () => ({
+  assertFormsGovernanceScope: vi.fn(),
+  formsGovernanceTransaction: vi.fn(() => vi.fn()),
+}));
 vi.mock('../../../../lib/db.js', async (original) => ({
   ...(await original<typeof import('../../../../lib/db.js')>()),
   withTransaction: vi.fn(),

@@ -224,6 +224,162 @@ const presentation = (country: string) => ({
   ],
   elements: [],
 });
+
+async function verifyProtectedReplay(tenant: Actor['tenant']) {
+  for (const family of [
+    'consult-create',
+    'legacy-publish',
+    'si023-submit',
+    'si023-decision',
+  ] as const) {
+    for (const invalidation of ['membership', 'session', 'nonce'] as const) {
+      const author = await actor(tenant, 'tenant_admin', ['operator']);
+      const isReview = family === 'legacy-publish' || family === 'si023-decision';
+      const who = isReview ? await actor(tenant, 'tenant_admin', ['reviewer']) : author;
+      const body = {
+        program_id: ulid(),
+        name: 'Synthetic replay authorization',
+        presentation: presentation(author.country),
+        branching_logic: {},
+        eligibility_logic: {},
+        approval_governance: { mode: 'mode1', development_only: true },
+      };
+      let url = '/v0/forms/consult-templates';
+      let payload: Record<string, unknown> = body;
+      if (family !== 'consult-create') {
+        const template = await request(author, 'POST', url, body);
+        if (family === 'legacy-publish')
+          url = `/v0/forms/templates/${template.template_id}/versions/${template.template_id}/publish`;
+        else if (family === 'si023-submit')
+          url = `/v1/admin/templates/${template.template_id}/submit-for-review`;
+        else {
+          const review = await request(
+            author,
+            'POST',
+            `/v1/admin/templates/${template.template_id}/submit-for-review`,
+            {},
+          );
+          url = `/v1/admin/templates/${template.template_id}/reviews/${review.review_id}/decision`;
+        }
+        payload = family === 'si023-decision' ? { decision: 'approve', decision_payload: {} } : {};
+      }
+      const options = {
+        method: 'POST' as const,
+        url,
+        headers: { ...who.headers, 'idempotency-key': randomUUID() },
+        payload,
+      };
+      const original = await app.inject(options);
+      assert.equal(original.statusCode, family === 'legacy-publish' ? 200 : 201, original.body);
+      const authorizedReplay = await app.inject(options);
+      assert.equal(authorizedReplay.statusCode, original.statusCode);
+      assert.deepEqual(authorizedReplay.json(), original.json());
+      await admin.query('BEGIN');
+      // The preHandler SELECT and early capability check can finish, while the
+      // reservation DELETE waits. This reproduces the independent review's race.
+      await admin.query('LOCK TABLE public.idempotency_keys IN SHARE MODE');
+      const pending = app.inject(options);
+      const response = pending.then((result) => result);
+      try {
+        let blocked = false;
+        for (let attempt = 0; attempt < 500; attempt++) {
+          await admin.query('SELECT pg_stat_clear_snapshot()');
+          blocked =
+            (
+              await admin.query(
+                "SELECT 1 FROM pg_stat_activity WHERE usename='telecheck_app_role' AND wait_event_type='Lock' AND query LIKE 'DELETE FROM idempotency_keys%' LIMIT 1",
+              )
+            ).rowCount === 1;
+          if (blocked) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.equal(blocked, true, `${family} replay reached the reservation wait`);
+        if (invalidation === 'membership')
+          await admin.query(
+            'UPDATE public.forms_governance_membership SET revoked_at=clock_timestamp() WHERE tenant_id=$1 AND account_id=$2 AND capability=$3',
+            [tenant, who.accountId, isReview ? 'reviewer' : 'operator'],
+          );
+        else if (invalidation === 'session')
+          await admin.query(
+            "UPDATE public.sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE session_id=$1",
+            [who.sessionId],
+          );
+        else
+          await admin.query(
+            "UPDATE public._session_actor_context SET expires_at=clock_timestamp()-interval '1 second' WHERE actor_account_id=$1",
+            [who.accountId],
+          );
+        await admin.query('COMMIT');
+        const denied = await response;
+        assert.equal(
+          denied.statusCode,
+          403,
+          `${tenant}/${family}/${invalidation} replay: ${denied.body}`,
+        );
+        assert.notDeepEqual(denied.json(), original.json());
+      } finally {
+        await admin.query('ROLLBACK');
+        await response;
+      }
+    }
+  }
+
+  // Fresh success must also recheck after audit/outbox and cache completion.
+  const author = await actor(tenant, 'tenant_admin', ['operator']);
+  const program = ulid();
+  await admin.query('BEGIN');
+  await admin.query('LOCK TABLE public.domain_events_outbox IN SHARE MODE');
+  const response = app
+    .inject({
+      method: 'POST',
+      url: '/v0/forms/consult-templates',
+      headers: { ...author.headers, 'idempotency-key': randomUUID() },
+      payload: {
+        program_id: program,
+        name: 'Synthetic outbox wait',
+        presentation: presentation(author.country),
+        branching_logic: {},
+        eligibility_logic: {},
+        approval_governance: { mode: 'mode1', development_only: true },
+      },
+    })
+    .then((result) => result);
+  try {
+    let blocked = false;
+    for (let attempt = 0; attempt < 500; attempt++) {
+      await admin.query('SELECT pg_stat_clear_snapshot()');
+      blocked =
+        (
+          await admin.query(
+            "SELECT 1 FROM pg_stat_activity WHERE usename='telecheck_app_role' AND wait_event_type='Lock' AND query LIKE '%INSERT INTO domain_events_outbox%' LIMIT 1",
+          )
+        ).rowCount === 1;
+      if (blocked) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(blocked, true, 'Fresh mutation reached its outbox write');
+    await admin.query(
+      "UPDATE public.forms_governance_membership SET revoked_at=clock_timestamp() WHERE tenant_id=$1 AND account_id=$2 AND capability='operator'",
+      [tenant, author.accountId],
+    );
+    await admin.query('COMMIT');
+    const denied = await response;
+    assert.equal(denied.statusCode, 403, denied.body);
+    assert.equal(
+      (
+        await admin.query(
+          'SELECT 1 FROM public.forms_template WHERE tenant_id=$1 AND program_id=$2',
+          [tenant, program],
+        )
+      ).rowCount,
+      0,
+      'Lost authorization rolls back the fresh business mutation',
+    );
+  } finally {
+    await admin.query('ROLLBACK');
+    await response;
+  }
+}
 try {
   const role = (
     await ordinary.query<{ rolsuper: boolean; rolbypassrls: boolean; rolinherit: boolean }>(
@@ -536,6 +692,57 @@ try {
       {},
       400,
     );
+    await admin.query(
+      "UPDATE public.accounts SET account_type='patient' WHERE tenant_id=$1 AND account_id=$2",
+      [tenant, contentReviewer.accountId],
+    );
+    try {
+      for (const source of [marketingBody, mode2Body]) {
+        for (const path of ['direct', 'si023']) {
+          const unqualified = await request(author, 'POST', '/v0/forms/consult-templates', {
+            ...source,
+            program_id: ulid(),
+          });
+          if (path === 'direct')
+            await request(
+              reviewer,
+              'POST',
+              `/v0/forms/consult-templates/${unqualified.template_id}/publish`,
+              {},
+              400,
+            );
+          else {
+            const review = await request(
+              author,
+              'POST',
+              `/v1/admin/templates/${unqualified.template_id}/submit-for-review`,
+              {},
+            );
+            await request(
+              adminReviewer,
+              'POST',
+              `/v1/admin/templates/${unqualified.template_id}/reviews/${review.review_id}/decision`,
+              { decision: 'approve', decision_payload: {} },
+              400,
+            );
+          }
+          assert.equal(
+            (
+              await admin.query(
+                "SELECT 1 FROM public.forms_template WHERE template_id=$1 AND status='draft'",
+                [unqualified.template_id],
+              )
+            ).rowCount,
+            1,
+          );
+        }
+      }
+    } finally {
+      await admin.query(
+        "UPDATE public.accounts SET account_type='tenant_admin' WHERE tenant_id=$1 AND account_id=$2",
+        [tenant, contentReviewer.accountId],
+      );
+    }
     // The SI-023 route must traverse the same publication and evidence gate.
     const adminTemplate = await request(author, 'POST', '/v0/forms/consult-templates', {
       ...body,
@@ -651,8 +858,9 @@ try {
       undefined,
       403,
     );
+    await verifyProtectedReplay(tenant);
     proofs.push(
-      `${tenant}: real-role create/publish/deploy/resolve; operator/reviewer separation; app SQL/owner denial; missing evidence rollback; research gate; independent exact-hash clinical review and stale hash rejection; approved marketing copy and Mode2 contract matching; SI023 shared gate; revoked-membership cached replay; immutable superseded pin; cross-tenant denial; session/nonce expiry during a blocked read; emergency retirement; revoked session`,
+      `${tenant}: real-role create/publish/deploy/resolve; operator/reviewer separation; app SQL/owner denial; missing evidence rollback; research gate; independent exact-hash clinical review and stale hash rejection; approved marketing copy and Mode2 contract matching; current staff role required for both content approvals and publication paths; SI023 shared gate; all four handler families deny membership/session/nonce invalidation during blocked cached replay; fresh mutation rolls back after outbox-wait revocation; immutable superseded pin; cross-tenant denial; session/nonce expiry during a blocked read; emergency retirement; revoked session`,
     );
   }
   console.log(JSON.stringify({ passed: true, proofs }, null, 2));

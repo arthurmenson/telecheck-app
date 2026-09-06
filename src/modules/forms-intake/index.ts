@@ -67,6 +67,7 @@ export type {
 } from './internal/services/consult-definition.js';
 export {
   assertFormsGovernanceScope,
+  formsGovernanceTransaction,
   recordFormsPublicationEvidence,
 } from './internal/services/publication-evidence.js';
 

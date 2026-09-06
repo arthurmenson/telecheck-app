@@ -224,7 +224,7 @@ BEGIN
   FOR el IN SELECT * FROM jsonb_array_elements(NEW.presentation_content->'elements') LOOP
     IF el->>'copy_classification' = 'molecule_level' THEN
       SELECT r.* INTO artifact FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='marketing_reviewer' AND m.revoked_at IS NULL
-      JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.status='active' AND approver.deleted_at IS NULL
+      JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type IN ('tenant_admin','clinician') AND approver.status='active' AND approver.deleted_at IS NULL
       WHERE r.tenant_id=NEW.tenant_id AND r.artifact_id=(el->>'marketing_copy_id')::UUID AND r.kind='marketing_copy' AND r.status='approved' AND r.content_hash=el->>'content_hash' AND r.content->>'country_of_care'=NEW.country_of_care AND (NOT r.development_only OR (g->>'development_only')::BOOLEAN);
       IF NOT FOUND THEN RAISE EXCEPTION 'forms_approved_marketing_copy_required' USING ERRCODE = '22023'; END IF;
     END IF;
@@ -235,7 +235,7 @@ BEGIN
     IF NOT(g ?& ARRAY['mode2_contract_id','mode2_contract_hash']) OR g->>'mode2_contract_id' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR g->>'mode2_contract_hash' !~ '^[a-f0-9]{64}$'
     THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE='22023'; END IF;
     SELECT r.* INTO artifact FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='mode2_reviewer' AND m.revoked_at IS NULL
-    JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.status='active' AND approver.deleted_at IS NULL
+    JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type IN ('tenant_admin','clinician') AND approver.status='active' AND approver.deleted_at IS NULL
     WHERE r.tenant_id=NEW.tenant_id AND r.artifact_id=(g->>'mode2_contract_id')::UUID AND r.kind='mode2_contract' AND r.status='approved' AND r.content_hash=g->>'mode2_contract_hash' AND (NOT r.development_only OR (g->>'development_only')::BOOLEAN);
     IF NOT FOUND OR artifact.content->'fields' IS DISTINCT FROM (SELECT jsonb_agg(jsonb_build_object('id',f->'id','type',f->'type','required',f->'required') ORDER BY f->>'id') FROM jsonb_array_elements(NEW.presentation_content->'fields') f)
     THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE = '22023'; END IF;

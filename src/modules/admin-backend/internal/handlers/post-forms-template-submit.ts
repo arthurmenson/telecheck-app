@@ -119,7 +119,10 @@ import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
-import { assertFormsGovernanceScope } from '../../../forms-intake/index.js';
+import {
+  assertFormsGovernanceScope,
+  formsGovernanceTransaction,
+} from '../../../forms-intake/index.js';
 import { emitTemplateSubmittedForReviewAudit } from '../../audit.js';
 import { TemplateStateConflictError } from '../errors.js';
 
@@ -345,129 +348,143 @@ export async function postFormsTemplateSubmitHandler(
     throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
   }
 
-  return withIdempotentExecution(req, reply, mapServiceError, async (tx, _idempotencyCtx) => {
-    // tx is the OPEN business transaction from withIdempotentExecution.
-    // withTransaction inside that helper has already been entered + tenant
-    // context bound at the idempotency_keys row level. We bind tenant
-    // context AGAIN here via withTenantContext to satisfy the SECDEF
-    // wrapper's LAYER C check (which reads current_actor_account_tenant_id()
-    // not the idempotency-keys tenant binding).
-    return withTenantContext(tx, ctx.tenantId, async () => {
-      const run = async (): Promise<{ status: number; view: { review_id: string } }> => {
-        // R2 MED-1 closure parity (mirrors get-crisis-operational-health.ts
-        // lines 195-230): the 42501 catch MUST wrap the ENTIRE withDbRole
-        // call, not just the inner SELECT. withDbRole issues SET LOCAL ROLE
-        // BEFORE invoking its callback; a role-membership gap would raise
-        // 42501 at that pre-callback boundary, escaping a catch inside the
-        // callback. Wrapping the withDbRole(...) Promise covers BOTH the
-        // privilege-acquisition path AND the SECDEF wrapper's LAYER C
-        // tenant-scope guard.
-        let reviewId: string;
-        try {
-          reviewId = await withDbRole(tx, sliceRole, async () => {
-            // Call the SECDEF wrapper. RETURNS UUID (initial review_id OR
-            // existing revision_requested review_id).
-            const wrapperResult = await tx.query<{ review_id: string }>(
-              'SELECT submit_forms_template_for_admin_review($1, $2) AS review_id',
-              [ctx.tenantId, templateId],
-            );
-            const row = wrapperResult.rows[0];
-            if (row === undefined || typeof row.review_id !== 'string') {
-              // Defensive: the wrapper always RETURNs a UUID on success;
-              // missing row would indicate an unexpected upstream change.
-              throw new Error(
-                'submit_forms_template_for_admin_review returned no row; ' +
-                  'expected RETURNS UUID per migration 043 §1.',
+  return withIdempotentExecution(
+    req,
+    reply,
+    mapServiceError,
+    async (tx, _idempotencyCtx) => {
+      // tx is the OPEN business transaction from withIdempotentExecution.
+      // withTransaction inside that helper has already been entered + tenant
+      // context bound at the idempotency_keys row level. We bind tenant
+      // context AGAIN here via withTenantContext to satisfy the SECDEF
+      // wrapper's LAYER C check (which reads current_actor_account_tenant_id()
+      // not the idempotency-keys tenant binding).
+      return withTenantContext(tx, ctx.tenantId, async () => {
+        const run = async (): Promise<{ status: number; view: { review_id: string } }> => {
+          // R2 MED-1 closure parity (mirrors get-crisis-operational-health.ts
+          // lines 195-230): the 42501 catch MUST wrap the ENTIRE withDbRole
+          // call, not just the inner SELECT. withDbRole issues SET LOCAL ROLE
+          // BEFORE invoking its callback; a role-membership gap would raise
+          // 42501 at that pre-callback boundary, escaping a catch inside the
+          // callback. Wrapping the withDbRole(...) Promise covers BOTH the
+          // privilege-acquisition path AND the SECDEF wrapper's LAYER C
+          // tenant-scope guard.
+          let reviewId: string;
+          try {
+            reviewId = await withDbRole(tx, sliceRole, async () => {
+              // Call the SECDEF wrapper. RETURNS UUID (initial review_id OR
+              // existing revision_requested review_id).
+              const wrapperResult = await tx.query<{ review_id: string }>(
+                'SELECT submit_forms_template_for_admin_review($1, $2) AS review_id',
+                [ctx.tenantId, templateId],
               );
+              const row = wrapperResult.rows[0];
+              if (row === undefined || typeof row.review_id !== 'string') {
+                // Defensive: the wrapper always RETURNs a UUID on success;
+                // missing row would indicate an unexpected upstream change.
+                throw new Error(
+                  'submit_forms_template_for_admin_review returned no row; ' +
+                    'expected RETURNS UUID per migration 043 §1.',
+                );
+              }
+              return row.review_id;
+            });
+          } catch (err) {
+            if (typeof err === 'object' && err !== null && 'code' in err) {
+              const errCode = (err as { code?: unknown }).code;
+              if (errCode === '42501') {
+                throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+              }
+              // PR #205 Codex R1 Finding 1: wrapper raises 42P17
+              // (invalid_object_state) when the parent template is not in
+              // `draft` status or has been soft-deleted. Wrap the raw PG
+              // error in a typed `TemplateStateConflictError` so the
+              // mapper can branch on a stable discriminator instead of
+              // stringly-typed SQLSTATE comparisons. Log the
+              // template_id / tenant_id internally via req.log.warn
+              // (server-side only); the tenant-blind 409 envelope at the
+              // mapper does NOT echo these IDs per I-025.
+              if (errCode === '42P17') {
+                const errMessageProp = (err as { message?: unknown }).message;
+                const errSummary: string | undefined =
+                  typeof errMessageProp === 'string' ? errMessageProp : undefined;
+                req.log.warn(
+                  {
+                    template_id: templateId,
+                    tenant_id: ctx.tenantId,
+                    pg_sqlstate: '42P17',
+                    err_summary: errSummary,
+                  },
+                  'submit-for-review rejected: template not in draft state (PR #205 Codex R1 Finding 1 guard)',
+                );
+                throw new TemplateStateConflictError(
+                  templateId,
+                  ctx.tenantId,
+                  'is not in draft state — submission rejected by SECDEF wrapper draft-only guard',
+                );
+              }
             }
-            return row.review_id;
-          });
-        } catch (err) {
-          if (typeof err === 'object' && err !== null && 'code' in err) {
-            const errCode = (err as { code?: unknown }).code;
-            if (errCode === '42501') {
-              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
-            }
-            // PR #205 Codex R1 Finding 1: wrapper raises 42P17
-            // (invalid_object_state) when the parent template is not in
-            // `draft` status or has been soft-deleted. Wrap the raw PG
-            // error in a typed `TemplateStateConflictError` so the
-            // mapper can branch on a stable discriminator instead of
-            // stringly-typed SQLSTATE comparisons. Log the
-            // template_id / tenant_id internally via req.log.warn
-            // (server-side only); the tenant-blind 409 envelope at the
-            // mapper does NOT echo these IDs per I-025.
-            if (errCode === '42P17') {
-              const errMessageProp = (err as { message?: unknown }).message;
-              const errSummary: string | undefined =
-                typeof errMessageProp === 'string' ? errMessageProp : undefined;
-              req.log.warn(
-                {
-                  template_id: templateId,
-                  tenant_id: ctx.tenantId,
-                  pg_sqlstate: '42P17',
-                  err_summary: errSummary,
-                },
-                'submit-for-review rejected: template not in draft state (PR #205 Codex R1 Finding 1 guard)',
-              );
-              throw new TemplateStateConflictError(
-                templateId,
-                ctx.tenantId,
-                'is not in draft state — submission rejected by SECDEF wrapper draft-only guard',
-              );
-            }
+            throw err;
           }
-          throw err;
-        }
 
-        // Same-transaction Cat A audit emission (I-003 durability). Runs
-        // AFTER withDbRole's finally-block restores telecheck_app_role; the
-        // app role holds the audit_records INSERT grant. Derive the `path`
-        // discriminator from the latest lifecycle_transition row for this
-        // review_id (initial_submission OR revision_resubmission per the
-        // migration 043 §1 wrapper body).
-        const txTyped: DbTransaction = tx;
-        const latestTransition = await txTyped.query<LatestTransitionRow>(
-          'SELECT public.forms_admin_submission_receipt($1) AS transition_reason',
-          [reviewId],
-        );
-        const transitionReason = latestTransition.rows[0]?.transition_reason;
-        // The wrapper always inserts exactly one lifecycle_transition row
-        // per call (either initial_submission triple #1 or
-        // revision_resubmission triple #5); fall back defensively.
-        const path: 'initial_submission' | 'revision_resubmission' =
-          transitionReason === 'revision_resubmission'
-            ? 'revision_resubmission'
-            : 'initial_submission';
+          // Same-transaction Cat A audit emission (I-003 durability). Runs
+          // AFTER withDbRole's finally-block restores telecheck_app_role; the
+          // app role holds the audit_records INSERT grant. Derive the `path`
+          // discriminator from the latest lifecycle_transition row for this
+          // review_id (initial_submission OR revision_resubmission per the
+          // migration 043 §1 wrapper body).
+          const txTyped: DbTransaction = tx;
+          const latestTransition = await txTyped.query<LatestTransitionRow>(
+            'SELECT public.forms_admin_submission_receipt($1) AS transition_reason',
+            [reviewId],
+          );
+          const transitionReason = latestTransition.rows[0]?.transition_reason;
+          // The wrapper always inserts exactly one lifecycle_transition row
+          // per call (either initial_submission triple #1 or
+          // revision_resubmission triple #5); fall back defensively.
+          const path: 'initial_submission' | 'revision_resubmission' =
+            transitionReason === 'revision_resubmission'
+              ? 'revision_resubmission'
+              : 'initial_submission';
 
-        await emitTemplateSubmittedForReviewAudit(
-          {
-            tenantId: ctx.tenantId,
-            reviewId,
-            formsTemplateId: templateId,
-            submitterPrincipalId: actorId,
-            submitterActorTenantId: actorTenantId,
-            countryOfCare: ctx.countryOfCare,
-            path,
-          },
-          tx,
-        );
+          await emitTemplateSubmittedForReviewAudit(
+            {
+              tenantId: ctx.tenantId,
+              reviewId,
+              formsTemplateId: templateId,
+              submitterPrincipalId: actorId,
+              submitterActorTenantId: actorTenantId,
+              countryOfCare: ctx.countryOfCare,
+              path,
+            },
+            tx,
+          );
 
-        return {
-          status: 201,
-          view: { review_id: reviewId },
+          return {
+            status: 201,
+            view: { review_id: reviewId },
+          };
         };
-      };
 
-      // Compose withActorContext when the SI-010 nonce is present (the
-      // wrapper's LAYER C check + internal actor binding depends on it).
-      // Without a nonce the wrapper itself fail-closes with 42501 ("no
-      // actor account bound") — mapped by the outer try/catch to a
-      // tenant-blind 403 per I-025.
-      if (req.actorNonce !== undefined) {
-        return withActorContext(tx, req.actorNonce, run);
-      }
-      return run();
-    });
-  });
+        // Compose withActorContext when the SI-010 nonce is present (the
+        // wrapper's LAYER C check + internal actor binding depends on it).
+        // Without a nonce the wrapper itself fail-closes with 42501 ("no
+        // actor account bound") — mapped by the outer try/catch to a
+        // tenant-blind 403 per I-025.
+        if (req.actorNonce !== undefined) {
+          return withActorContext(tx, req.actorNonce, run);
+        }
+        return run();
+      });
+    },
+    formsGovernanceTransaction(
+      {
+        tenantId: ctx.tenantId,
+        accountId: req.actorContext.accountId,
+        sessionId: req.actorContext.sessionId,
+        actorNonce: req.actorNonce,
+      },
+      'forms.governance.submitted',
+    ),
+  );
 }

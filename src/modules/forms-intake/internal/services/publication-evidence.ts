@@ -1,17 +1,46 @@
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import type { DbClient } from '../../../../lib/db.js';
+import { withTransaction, type DbClient, type DbTransaction } from '../../../../lib/db.js';
 import type { TenantId } from '../../../../lib/glossary.js';
+import { IdempotencyReplayError } from '../../../../lib/idempotency.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { emitFormsGovernanceEvidence } from '../../audit.js';
 
+type FormsGovernanceContext = {
+  tenantId: TenantId;
+  accountId: string;
+  sessionId: string;
+  actorNonce: string;
+};
+
+/** Authorize both sides of the entire idempotency transaction, including cache
+ * waits, outbox writes, cache completion and replay (which skips the body).
+ * SQL failures may have aborted the transaction: preserve them without issuing
+ * another query. A replay is a JavaScript control-flow exception with a live
+ * transaction, so its final authorization must run before it reaches HTTP. */
+export function formsGovernanceTransaction(
+  context: FormsGovernanceContext,
+  operation: string,
+  resourceId: string | null = null,
+): typeof withTransaction {
+  return <T>(body: (tx: DbTransaction) => Promise<T>, externalTx?: DbTransaction) =>
+    withTransaction(async (tx) => {
+      await assertFormsGovernanceScope(tx, context, operation, resourceId);
+      let result: T;
+      try {
+        result = await body(tx);
+      } catch (error) {
+        if (error instanceof IdempotencyReplayError)
+          await assertFormsGovernanceScope(tx, context, operation, resourceId);
+        throw error;
+      }
+      await assertFormsGovernanceScope(tx, context, operation, resourceId);
+      return result;
+    }, externalTx);
+}
+
 export async function assertFormsGovernanceScope(
   tx: DbClient,
-  context: {
-    tenantId: TenantId;
-    accountId: string;
-    sessionId: string;
-    actorNonce: string;
-  },
+  context: FormsGovernanceContext,
   operation: string,
   resourceId: string | null = null,
 ): Promise<void> {

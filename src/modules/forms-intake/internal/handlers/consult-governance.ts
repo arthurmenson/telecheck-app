@@ -15,6 +15,7 @@ import {
 } from '../services/consult-definition.js';
 import {
   assertFormsGovernanceScope,
+  formsGovernanceTransaction,
   recordFormsPublicationEvidence,
 } from '../services/publication-evidence.js';
 
@@ -108,28 +109,42 @@ async function mutate(
     if (mapError(error, reply)) return reply;
     throw error;
   }
-  return withIdempotentExecution(req, reply, mapError, (tx) =>
-    withTenantContext(tx, tenant.tenantId, () =>
-      withActorContext(tx, nonce, async () => {
-        const result = await operation(tx);
-        const resourceId = String(
-          result['template_id'] ?? result['artifact_id'] ?? result['deployment_id'],
-        );
-        const auditContext = {
-          tenantId: tenant.tenantId,
-          actorId: actor.accountId,
-          actorRole: actor.role === 'clinician' ? ('clinician' as const) : ('operator' as const),
-          countryOfCare: tenant.countryOfCare,
-        };
-        if (intent === 'forms.publication.checked')
-          await recordFormsPublicationEvidence(tx, auditContext, resourceId);
-        else
-          await emitFormsGovernanceEvidence(
-            { ...auditContext, resourceId, intent, detail: result },
-            tx,
+  return withIdempotentExecution(
+    req,
+    reply,
+    mapError,
+    (tx) =>
+      withTenantContext(tx, tenant.tenantId, () =>
+        withActorContext(tx, nonce, async () => {
+          const result = await operation(tx);
+          const resourceId = String(
+            result['template_id'] ?? result['artifact_id'] ?? result['deployment_id'],
           );
-        return { status: 201, view: result };
-      }),
+          const auditContext = {
+            tenantId: tenant.tenantId,
+            actorId: actor.accountId,
+            actorRole: actor.role === 'clinician' ? ('clinician' as const) : ('operator' as const),
+            countryOfCare: tenant.countryOfCare,
+          };
+          if (intent === 'forms.publication.checked')
+            await recordFormsPublicationEvidence(tx, auditContext, resourceId);
+          else
+            await emitFormsGovernanceEvidence(
+              { ...auditContext, resourceId, intent, detail: result },
+              tx,
+            );
+          return { status: 201, view: result };
+        }),
+      ),
+    formsGovernanceTransaction(
+      {
+        tenantId: tenant.tenantId,
+        accountId: actor.accountId,
+        sessionId: actor.sessionId,
+        actorNonce: nonce,
+      },
+      intent,
+      (req.params as { artifactId?: string }).artifactId ?? null,
     ),
   );
 }
