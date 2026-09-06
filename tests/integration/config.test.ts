@@ -84,6 +84,7 @@ interface FreshConfigModule {
 function applyBaseline(): void {
   vi.stubEnv('NODE_ENV', 'test');
   vi.stubEnv('DATABASE_URL', 'postgres://x:y@localhost:5432/z');
+  vi.stubEnv('IDENTITY_DATABASE_URL', 'postgres://identity_service_role:test@localhost:5432/z');
   vi.stubEnv('REDIS_URL', 'redis://localhost:6379');
   // Match the CI workflow value so kms.ts deriveTenantKey doesn't
   // surface here; the kms test file owns that contract.
@@ -662,6 +663,17 @@ describe('config — AWS region defaults (ADR-026 us-east-1 primary)', () => {
 // ---------------------------------------------------------------------------
 
 describe('config — AI_MODE2_ENABLED (Mode 2 case-prep mount gate)', () => {
+  it('requires the dedicated Identity URL in production', async () => {
+    applyBaseline();
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('DATABASE_SSL_MODE', 'require');
+    vi.stubEnv('BIND_ACTOR_CONTEXT_DATABASE_URL', 'postgres://bind:test@localhost:5432/z');
+    vi.stubEnv('RESUME_TOKEN_SECRET', 'x'.repeat(48));
+    vi.stubEnv('JWT_SIGNING_KEY', 'y'.repeat(48));
+    vi.stubEnv('IDENTITY_DATABASE_URL', undefined);
+    await expectLoadConfigToThrow(/IDENTITY_DATABASE_URL must be set in production/);
+  });
+
   it('§14a default (unset) → false (route stays unmounted)', async () => {
     applyBaseline();
     const fresh = await loadFreshConfig();

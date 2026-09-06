@@ -61,11 +61,11 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { config } from '../../../../lib/config.js';
 import type { DbTransaction } from '../../../../lib/db.js';
-import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { getSmsSender } from '../../../../lib/sms/index.js';
 import type { OtpPurpose } from '../../../../lib/sms/index.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
+import { withIdempotentExecution } from '../database.js';
 import * as accountService from '../services/account-service.js';
 import * as otpService from '../services/otp-service.js';
 import * as sessionService from '../services/session-service.js';

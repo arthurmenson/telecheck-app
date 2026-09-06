@@ -113,6 +113,7 @@ async function seedAccount(
         account_type: accountType,
       },
       async () => {},
+      getTestClient(), // beforeAll fixture uses the harness-owned connection
     ),
   );
   return accountId;

@@ -1,6 +1,10 @@
 # Identity runtime bootstrap
 
-Migrations 081–083 add the ordinary-role grants needed for tenant branding, registration, sessions, and device self-service. The application remains NOSUPERUSER, NOBYPASSRLS, and NOINHERIT. Tenant-owned Identity and configuration tables retain forced RLS. Audit records and domain events permit append/read only; opaque audit dedupe markers retain the explicit non-PHI, non-RLS contract of migration 022. Migration 083 restricts account INSERT to the twelve registration columns and UPDATE to status/activated_at. The app cannot insert or modify account_type or cohort_classification; ordinary registration uses the patient/unclassified database defaults. Privileged nonpatient provisioning and audited cohort remediation remain separate. No clinical base-table or actor-binding-table grants are added.
+Migrations 081–083 establish ordinary application reads and a separate Identity database boundary. The app and Identity roles remain NOSUPERUSER, NOBYPASSRLS, and NOINHERIT. Ordinary SQL cannot read or alter PINs, OTPs, email passcodes, devices or authentication replay records, create/rewrite sessions, or mutate accounts. The Identity role can insert twelve registration columns and update status/activated_at; it cannot write account_type or cohort_classification. Registration uses patient/unclassified defaults. Privileged staff provisioning and cohort governance remain separate.
+
+Every Identity handler transaction, including its idempotency reservation, credential mutation, audit and response cache, uses the dedicated login. Default public Identity service/repository calls also own a transaction, so audit failure rolls back their state changes. The connection's actual role and safety attributes are checked at boot and acquisition; application and bind principals must have no direct or transitive Identity membership. Tenant context is cleared before pool reuse. Missing Identity configuration fails production startup. Test fallback requires both NODE_ENV=test and the explicitly installed integration-harness connection; it is not a development or production fallback.
+
+The private identity_idempotency_keys table has forced tenant RLS and service-only grants. Authentication handlers never read the general replay cache, even for encoded URL spellings. All private completed responses expire within 900 seconds or the shorter endpoint limit. Migration083 moves existing canonical Identity entries with their original expiry and removes legacy bearer/passcode responses from the general cache. This one-time relocation requires the trusted migration principal to have SUPERUSER or BYPASSRLS so suspended tenants are included; table ownership alone is insufficient under FORCE RLS. Runtime principals never receive those privileges. An additional restrictive policy protects the general Identity namespace. This is an engineering correction to the implemented authentication trust boundary, not a new ratification claim for historical SI-010 documentation. Audit and domain-event history remain append-only.
 
 `GET /v0/identity/accounts/me` now resolves the account from a verified JWT and an active database session. The session must belong to that account; suspended, archived, deleted, stale-role, fabricated-session, and delegated contexts fail closed. Global administrators use their home tenant for their own identity operations.
 
@@ -8,7 +12,7 @@ Device registration and listing use the same authentication. The legacy optional
 
 ## Synthetic acceptance
 
-Install dependencies with `npm ci`, apply the reviewed migration chain to a dedicated local PostgreSQL cluster, and provision separate login secrets for `telecheck_app_role` and `bind_actor_context_role`. Keep the migration principal separate. `DATABASE_URL` must use the ordinary role; `BIND_ACTOR_CONTEXT_DATABASE_URL` must use the binding role. Use secret-manager or shell environment injection and never commit credentials.
+Install dependencies with `npm ci`, apply the reviewed migration chain to a dedicated local PostgreSQL cluster, and provision separate login secrets for `telecheck_app_role`, `identity_service_role` and `bind_actor_context_role`. Migration083 creates Identity as NOLOGIN; provisioning enables LOGIN and sets its secret without adding membership or changing safety attributes. Keep the migration principal separate. `DATABASE_URL`, `IDENTITY_DATABASE_URL` and `BIND_ACTOR_CONTEXT_DATABASE_URL` must use their respective logins. Use secret-manager or shell environment injection and never commit credentials.
 
 For this synthetic probe only, configure:
 
@@ -21,12 +25,12 @@ DATABASE_SSL_MODE=disable
 TENANT_HOST_OVERRIDES=localhost=Telecheck-US,ghana.localhost=Telecheck-Ghana
 ```
 
-Supply `JWT_SIGNING_KEY`, `RESUME_TOKEN_SECRET`, `REDIS_URL`, and both database URLs through the environment, then run:
+Supply `JWT_SIGNING_KEY`, `RESUME_TOKEN_SECRET`, `REDIS_URL`, and all three database URLs through the environment, then run:
 
 ```sh
 npm run verify:identity-runtime
 ```
 
-The probe checks actual application and bind connections, branding in both tenants, three synthetic registrations, account self-read, device registration/replay, same-tenant ownership, cross-tenant rejection, logout and rejected stale replay. It creates only `synthetic-runtime-…@example.invalid` accounts, prints no tokens or passcodes, delivers no messages, and retains its synthetic database/audit history. Custom local hosts can be supplied through `IDENTITY_PROBE_US_HOST` and `IDENTITY_PROBE_GH_HOST`. Development pretty logging now has its required `pino-pretty` dependency.
+The probe checks actual application, Identity and bind connections, branding in both tenants, three synthetic registrations, account self-read, device registration/replay, same-tenant ownership, cross-tenant rejection, logout and rejected stale replay. It creates only `synthetic-runtime-…@example.invalid` accounts, prints no tokens or passcodes, delivers no messages, and retains its synthetic database/audit history. Custom local hosts can be supplied through `IDENTITY_PROBE_US_HOST` and `IDENTITY_PROBE_GH_HOST`. Development pretty logging now has its required `pino-pretty` dependency.
 
-These controls and the standalone probe were verified on PostgreSQL 16.15 with real app/bind login connections. Automated integration tests also verify ordinary-role access, forced RLS and immutable-history privileges. This package establishes Identity and branding; production provider activation, clinical encrypted intake/review, and the rest of the launch platform remain separate required work.
+The standalone probe was verified on PostgreSQL16.15 with three actual runtime logins and a fresh82-file migration chain. Automated tests cover credential-write/role-assumption denial, private-cache tenant isolation and read/write denial, account control columns, audit rollback, and alias-independent replay TTL. Fixtures that seed privileged accounts use explicit harness connections; they do not imply that ordinary registration can create staff accounts. Production provider activation, clinical encrypted intake/review, and the remaining launch platform are still required work.

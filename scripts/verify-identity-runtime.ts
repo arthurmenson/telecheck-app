@@ -10,16 +10,22 @@ assert.equal(process.env['AUTH_DEV_OTP_ECHO'], 'true');
 assert.equal(process.env['EMAIL_PROVIDER'], 'noop');
 assert.equal(process.env['SMS_PROVIDER'], 'noop');
 assert.ok(process.env['BIND_ACTOR_CONTEXT_DATABASE_URL']);
+assert.ok(process.env['IDENTITY_DATABASE_URL']);
 const appConnection = new pg.Client({ connectionString: process.env['DATABASE_URL'] });
 await appConnection.connect();
 const bindConnection = new pg.Client({
   connectionString: process.env['BIND_ACTOR_CONTEXT_DATABASE_URL'],
 });
 await bindConnection.connect();
+const identityConnection = new pg.Client({
+  connectionString: process.env['IDENTITY_DATABASE_URL'],
+});
+await identityConnection.connect();
 try {
   for (const [connection, expectedRole] of [
     [appConnection, 'telecheck_app_role'],
     [bindConnection, 'bind_actor_context_role'],
+    [identityConnection, 'identity_service_role'],
   ] as const) {
     const role = (
       await connection.query(
@@ -29,11 +35,12 @@ try {
     assert.equal(role.rolname, expectedRole);
     assert.equal(role.rolsuper, false);
     assert.equal(role.rolbypassrls, false);
-    if (expectedRole === 'telecheck_app_role') assert.equal(role.rolinherit, false);
+    if (expectedRole !== 'bind_actor_context_role') assert.equal(role.rolinherit, false);
   }
 } finally {
   await appConnection.end();
   await bindConnection.end();
+  await identityConnection.end();
 }
 
 const { buildApp } = await import('../src/app.js');
@@ -142,7 +149,7 @@ try {
   });
   assert.equal(revokedReplay.statusCode, 401);
   console.log(
-    'PASS: ordinary app/bind roles, two-tenant registration, self-read, devices, ownership, idempotency, logout and revoked replay.',
+    'PASS: separate app/Identity/bind roles, two-tenant registration, self-read, devices, ownership, idempotency, logout and revoked replay.',
   );
 } finally {
   await app.close();

@@ -533,7 +533,13 @@ export async function withIdempotency<TBody>(
   client: DbClient,
   ctx: IdempotencyCtx,
   body: () => Promise<IdempotencyCachePayload<TBody>>,
+  cacheTable: 'idempotency_keys' | 'identity_idempotency_keys' = 'idempotency_keys',
 ): Promise<IdempotencyCachePayload<TBody>> {
+  // Internal literal capability, never an HTTP parameter. Preserve the runtime
+  // allowlist as well as the TypeScript type before interpolating an identifier.
+  if (cacheTable !== 'idempotency_keys' && cacheTable !== 'identity_idempotency_keys') {
+    throw new Error('idempotency_cache_table_invalid');
+  }
   // -------------------------------------------------------------------------
   // 0. Transaction-discipline check via SAVEPOINT (PR-A r2 / HIGH-1).
   //
@@ -578,7 +584,7 @@ export async function withIdempotency<TBody>(
   // effect for the subsequent INSERT.
   // -------------------------------------------------------------------------
   await client.query(
-    `DELETE FROM idempotency_keys
+    `DELETE FROM ${cacheTable}
       WHERE tenant_id = $1
         AND key       = $2
         AND endpoint  = $3
@@ -611,7 +617,7 @@ export async function withIdempotency<TBody>(
   // Per Codex Sprint 33 PR-F1 r3 adversarial review 2026-05-07
   // (HIGH-3).
   const insertResult = await client.query<{ tenant_id: string }>(
-    `INSERT INTO idempotency_keys
+    `INSERT INTO ${cacheTable}
        (tenant_id, key, endpoint, actor_id, request_hash,
         processing_state, response_status, response_body)
      VALUES ($1, $2, $3, $4, decode($5, 'hex'),
@@ -647,9 +653,12 @@ export async function withIdempotency<TBody>(
     // (see HIGH-3 closure note above). Sets expires_at to NOW() +
     // (ttlSeconds || ' seconds')::interval, replacing the column
     // default (24h) inherited at INSERT time.
-    const completedTtlSeconds = ttlSecondsForEndpoint(ctx.endpoint);
+    const completedTtlSeconds =
+      cacheTable === 'identity_idempotency_keys'
+        ? Math.min(900, ttlSecondsForEndpoint(ctx.endpoint))
+        : ttlSecondsForEndpoint(ctx.endpoint);
     await client.query(
-      `UPDATE idempotency_keys
+      `UPDATE ${cacheTable}
           SET processing_state = 'completed',
               response_status  = $5,
               response_body    = $6::jsonb,
@@ -690,7 +699,7 @@ export async function withIdempotency<TBody>(
             response_status,
             response_body,
             encode(request_hash, 'hex') AS request_hash_hex
-       FROM idempotency_keys
+       FROM ${cacheTable}
       WHERE tenant_id = $1
         AND key       = $2
         AND endpoint  = $3
@@ -876,6 +885,10 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
       });
       return;
     }
+
+    // Matched route metadata is server-owned, including encoded URL variants.
+    // Identity replays only from its private cache after endpoint authorization.
+    if (request.routeOptions.url?.startsWith('/v0/identity/')) return;
 
     // Extract tenant and actor from request context
     const tenantId = request.tenantContext?.tenantId ?? 'unknown';

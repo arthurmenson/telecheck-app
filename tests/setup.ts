@@ -298,6 +298,9 @@ async function installTestAppRole(client: Client): Promise<void> {
     await client.query(`GRANT USAGE ON SCHEMA public TO ${TEST_APP_ROLE}`);
     await client.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${TEST_APP_ROLE}`);
     await client.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${TEST_APP_ROLE}`);
+    // Integration fixtures share one rollback-only connection. Actual login
+    // isolation is verified separately with three real runtime connections.
+    await client.query(`GRANT identity_service_role TO ${TEST_APP_ROLE}`);
 
     // Strip UPDATE / DELETE on append-only tables to mirror the production
     // privilege posture per I-003 (and the matching forms-engine snapshot

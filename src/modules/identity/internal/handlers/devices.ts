@@ -32,8 +32,8 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { DbTransaction } from '../../../../lib/db.js';
-import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { ulid } from '../../../../lib/ulid.js';
+import { withIdempotentExecution } from '../database.js';
 import * as deviceService from '../services/auth-device-service.js';
 import { asAccountId, asDeviceId, type AttestationFormat, type DevicePlatform } from '../types.js';
 

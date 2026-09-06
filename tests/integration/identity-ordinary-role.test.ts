@@ -6,7 +6,7 @@ import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fi
 import { getTestClient } from '../setup.ts';
 
 describe('ordinary Identity application role', () => {
-  it('has required Identity privileges but cannot rewrite immutable audit or event history', async () => {
+  it('cannot write authentication state or rewrite immutable audit or event history', async () => {
     const client = getTestClient();
     const role = await client.query(
       "SELECT rolsuper, rolbypassrls, rolinherit, rolcreaterole FROM pg_roles WHERE rolname='telecheck_app_role'",
@@ -25,7 +25,7 @@ describe('ordinary Identity application role', () => {
         "SELECT (has_table_privilege('telecheck_app_role',$1,'SELECT') AND has_table_privilege('telecheck_app_role',$1,'INSERT') AND has_table_privilege('telecheck_app_role',$1,'UPDATE')) AS allowed, has_table_privilege('telecheck_app_role',$1,'DELETE') AS can_delete",
         [table],
       );
-      expect(result.rows).toEqual([{ allowed: true, can_delete: false }]);
+      expect(result.rows).toEqual([{ allowed: false, can_delete: false }]);
     }
     for (const table of ['audit_records', 'domain_events_outbox']) {
       const result = await client.query(
@@ -89,11 +89,11 @@ describe('ordinary Identity application role', () => {
   });
 });
 
-describe('ordinary account control fields', () => {
-  it('allows registration and activation but forbids privileged role/cohort writes', async () => {
+describe('trusted Identity account control fields', () => {
+  it('allows Identity registration and activation but forbids privileged role/cohort writes', async () => {
     const client = getTestClient();
     await client.query('RESET SESSION AUTHORIZATION');
-    await client.query('SET SESSION AUTHORIZATION telecheck_app_role');
+    await client.query('SET SESSION AUTHORIZATION identity_service_role');
     try {
       await client.query('SELECT set_tenant_context($1)', [TENANT_US]);
       const id = ulid();

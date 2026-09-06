@@ -19,8 +19,8 @@
  */
 
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
-import { withTenantBoundConnection } from '../../../../lib/db.js';
 import type { TenantId } from '../../../../lib/glossary.js';
+import { withTenantBoundConnection } from '../database.js';
 import type { Account, AccountId, AccountStatus, AccountType, AccountGender } from '../types.js';
 
 // ---------------------------------------------------------------------------

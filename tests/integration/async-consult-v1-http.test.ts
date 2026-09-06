@@ -71,6 +71,7 @@ import { ulid } from '../../src/lib/ulid.ts';
 import { SLICE_ROLES } from '../../src/lib/with-db-role.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
+import { configureBindRole } from '../helpers/configure-bind-role.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
@@ -121,6 +122,7 @@ async function seedAccount(accountType: 'patient' | 'clinician'): Promise<Accoun
         account_type: accountType,
       },
       async () => {},
+      getTestClient(), // beforeAll fixture uses the harness-owned connection
     ),
   );
   return accountId;
@@ -247,9 +249,7 @@ beforeAll(async () => {
   });
   await superuser.connect();
   try {
-    await superuser.query(
-      `ALTER ROLE bind_actor_context_role WITH LOGIN PASSWORD '${BIND_ROLE_TEST_PASSWORD}'`,
-    );
+    await configureBindRole(superuser, BIND_ROLE_TEST_PASSWORD);
     // Mirror the production app-role acquisition topology onto the test
     // principal: migrations 051/061/064 grant slice-role memberships to
     // telecheck_app_role, but the suite's shared client runs as

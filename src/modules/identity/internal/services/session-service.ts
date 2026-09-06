@@ -307,7 +307,7 @@ export async function revokeSession(
   externalTx?: DbTransaction,
 ): Promise<Session | null> {
   if (externalTx === undefined) {
-    const { withTenantBoundConnection } = await import('../../../../lib/db.js');
+    const { withTenantBoundConnection } = await import('../database.js');
     return withTenantBoundConnection(ctx.tenantId, async (tx) => {
       const revoked = await sessionRepo.revokeSession(ctx.tenantId, sessionId, reason, tx);
       if (revoked === null) return null;

@@ -9,10 +9,10 @@
 
 import type { ActorType } from '../../../../lib/audit.js';
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
-import { withTenantBoundConnection } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { emitDeviceRegisteredAudit, emitDeviceRevokedAudit } from '../../audit.js';
 import { emitDeviceRegisteredDomainEvent, emitDeviceRevokedDomainEvent } from '../../events.js';
+import { withTenantBoundConnection } from '../database.js';
 import * as deviceRepo from '../repositories/auth-device-repo.js';
 import type {
   AccountId,

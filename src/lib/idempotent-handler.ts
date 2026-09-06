@@ -101,21 +101,28 @@ export async function withIdempotentExecution<TView>(
      */
     idempotencyCtx: IdempotencyCtx,
   ) => Promise<{ status: number; view: TView }>,
+  runTransaction: typeof withTransaction = withTransaction,
+  cacheTable: 'idempotency_keys' | 'identity_idempotency_keys' = 'idempotency_keys',
 ): Promise<unknown> {
   const tenantCtx = requireTenantContext(req);
   const idempotencyCtx = buildIdempotencyCtx(req);
 
   try {
-    const payload = await withTransaction(async (tx) => {
+    const payload = await runTransaction(async (tx) => {
       // Set tenant context BEFORE calling withIdempotency — the
       // idempotency_keys table has FORCE RLS; absent context fails
       // closed via tenant_context_not_set.
       await tx.query('SELECT set_tenant_context($1)', [tenantCtx.tenantId]);
 
-      return await withIdempotency(tx, idempotencyCtx, async () => {
-        const result = await body(tx, idempotencyCtx);
-        return { status: result.status, body: result.view };
-      });
+      return await withIdempotency(
+        tx,
+        idempotencyCtx,
+        async () => {
+          const result = await body(tx, idempotencyCtx);
+          return { status: result.status, body: result.view };
+        },
+        cacheTable,
+      );
     });
 
     return reply.code(payload.status).send(payload.body);
