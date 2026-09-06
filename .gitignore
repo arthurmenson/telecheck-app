@@ -67,3 +67,6 @@ src/generated/
 infra/staging/.env
 infra/staging/.keys/
 infra/staging/.env.provisioned
+
+# Pinned NER assets are acquired explicitly and verified before use.
+assets/pii-ner/

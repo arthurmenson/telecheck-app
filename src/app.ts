@@ -28,6 +28,7 @@ import { verifyBindActorContextPoolOrThrow } from './lib/db.js';
 import { errorEnvelopePlugin } from './lib/error-envelope.js';
 import { idempotencyPlugin } from './lib/idempotency.js';
 import { createRedactingStream } from './lib/pii-screener/log-redaction.js';
+import { getNerReadiness } from './lib/pii-screener/ner.js';
 import { tenantContextPlugin } from './lib/tenant-context.js';
 import { adminBackendPlugin } from './modules/admin-backend/index.js';
 import { aiServicePlugin } from './modules/ai-service/index.js';
@@ -208,6 +209,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
       // /health is automatically allowlisted by the plugin.
       '/',
       '/ready',
+      '/ready/pii',
       '/v0/identity/health',
       '/v0/consent/health',
       '/v0/tenant-config/health',
@@ -403,7 +405,15 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // aggregate is 'degraded' unless every module reports ok. LB health
   // checks at AWS pre-go-live should target /health (liveness) or a
   // specific module's readiness, not this endpoint.
+  app.get('/ready/pii', async (_req, reply) => {
+    const readiness = getNerReadiness();
+    return reply
+      .code(readiness.ready ? 200 : 503)
+      .send({ status: readiness.ready ? 'ok' : 'degraded', ...readiness });
+  });
+
   const MODULE_READY_PATHS: Record<string, string> = {
+    'pii-screening': '/ready/pii',
     pharmacy: '/v0/pharmacy/ready',
     'med-interaction': '/v0/med-interaction/ready',
     subscription: '/v0/subscriptions/ready',
