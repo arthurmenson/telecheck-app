@@ -117,7 +117,9 @@ export function createClassifiedKmsStore(
     try {
       const role = await tx.query<{ session_user: string }>('SELECT session_user');
       if (role.rows[0]?.session_user !== 'kms_service_role') throw new KmsOperationError();
-      await tx.query('BEGIN');
+      // Revalidation must see committed deletion/revocation after provider or
+      // audit work, regardless of the dedicated connection's default.
+      await tx.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       await tx.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
       await tx.query("SET LOCAL lock_timeout = '1s'");
       await tx.query("SET LOCAL statement_timeout = '5s'");
@@ -225,6 +227,13 @@ export function createClassifiedKmsStore(
       const savepoint = `kms_actor_${randomUUID().replaceAll('-', '')}`;
       await tx.query(`SAVEPOINT ${savepoint}`);
       try {
+        // Stronger isolation retains an older snapshot even across actor
+        // SELECTs. Refuse before key/provider work; never alter the owner's
+        // active transaction. Recheck on post-provider validation as well.
+        const isolation = await tx.query<{ isolation: string }>(
+          "SELECT pg_catalog.current_setting('transaction_isolation') AS isolation",
+        );
+        if (isolation.rows[0]?.isolation !== 'read committed') throw new KmsOperationError();
         const actor = await readActor(tx);
         await tx.query('SELECT public.kms_assert_patient_scope($1)', [descriptor.patientId]);
         // Refuse before opening another connection: callers must order crypto

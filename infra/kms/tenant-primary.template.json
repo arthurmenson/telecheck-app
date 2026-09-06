@@ -2,7 +2,11 @@
   "AWSTemplateFormatVersion": "2010-09-09",
   "Description": "Telecheck tenant-specific primary CMK and tenant-tagged normal service role. Deploy only in us-east-1. No cross-tenant break-glass or DR activation.",
   "Parameters": {
-    "TenantId": { "Type": "String", "AllowedPattern": "Telecheck-[A-Z]{2}(?:-[A-Za-z0-9-]+)?" },
+    "TenantId": {
+      "Type": "String",
+      "Description": "Exact operating tenant from the launch registry. Expansion requires an explicit reviewed tenant addition.",
+      "AllowedValues": ["Telecheck-US", "Telecheck-Ghana"]
+    },
     "ApplicationRoleArn": {
       "Type": "String",
       "AllowedPattern": "arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+"
