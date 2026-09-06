@@ -54,6 +54,22 @@ async function release(client: PoolClient) {
   await client.query('RESET SESSION AUTHORIZATION');
   client.release();
 }
+async function removeAuthority(
+  f: { accountId: string; sessionId: string },
+  change: 'deleted account' | 'revoked session',
+) {
+  if (change === 'deleted account') {
+    await admin.query(
+      'UPDATE public.accounts SET deleted_at=pg_catalog.clock_timestamp() WHERE account_id=$1',
+      [f.accountId],
+    );
+  } else {
+    await admin.query(
+      "UPDATE public.sessions SET revoked_at=pg_catalog.clock_timestamp(), revoked_reason='admin_revoked' WHERE session_id=$1",
+      [f.sessionId],
+    );
+  }
+}
 async function fixture(role: 'patient' | 'clinician' | 'tenant_admin' = 'patient') {
   const patientId = ulid(),
     accountId = role === 'patient' ? patientId : ulid(),
@@ -543,7 +559,7 @@ describe.skipIf(!enabled)('classified KMS database isolation and durable evidenc
       }
     },
   );
-  it.each([
+  const providerOperations = [
     ['patient', 'encrypt'],
     ['patient', 'decrypt'],
     ['clinician', 'encrypt'],
@@ -551,45 +567,236 @@ describe.skipIf(!enabled)('classified KMS database isolation and durable evidenc
     ['tenant_admin', 'encrypt'],
     ['tenant_admin', 'decrypt'],
     ['tenant_admin', 'rotate'],
-  ] as const)('rechecks %s deletion committed during provider %s', async (role, operation) => {
-    const f = await fixture(role);
-    try {
-      const normal = createClassifiedKms(createClassifiedKmsStore(auditPool), provider);
-      const envelope = await normal.encrypt(
-        f.business,
-        f.descriptor,
-        Buffer.from('concurrent deletion'),
-      );
-      const remove = () =>
-        admin.query(
-          'UPDATE public.accounts SET deleted_at=pg_catalog.clock_timestamp() WHERE account_id=$1',
-          [f.accountId],
+  ] as const;
+  it.each(
+    providerOperations.flatMap(([role, operation]) =>
+      (['deleted account', 'revoked session'] as const).map((change) => ({
+        role,
+        operation,
+        change,
+      })),
+    ),
+  )(
+    'rechecks $role $change committed during provider $operation',
+    async ({ role, operation, change }) => {
+      const f = await fixture(role);
+      try {
+        const normal = createClassifiedKms(createClassifiedKmsStore(auditPool), provider);
+        const envelope = await normal.encrypt(
+          f.business,
+          f.descriptor,
+          Buffer.from('concurrent deletion'),
         );
-      const concurrent: ClassifiedKeyProvider = {
-        generate: async (binding, dataClass) => {
-          const result = await provider.generate(binding, dataClass);
-          await remove();
-          return result;
-        },
-        decrypt: async (binding, dataClass, blob) => {
-          const result = await provider.decrypt(binding, dataClass, blob);
-          await remove();
-          return result;
+        const remove = () => removeAuthority(f, change);
+        let providerCalls = 0;
+        const concurrent: ClassifiedKeyProvider = {
+          generate: async (binding, dataClass) => {
+            providerCalls++;
+            const result = await provider.generate(binding, dataClass);
+            await remove();
+            return result;
+          },
+          decrypt: async (binding, dataClass, blob) => {
+            providerCalls++;
+            const result = await provider.decrypt(binding, dataClass, blob);
+            await remove();
+            return result;
+          },
+        };
+        const engine = createClassifiedKms(createClassifiedKmsStore(auditPool), concurrent);
+        const attempted =
+          operation === 'encrypt'
+            ? engine.encrypt(f.business, f.descriptor, Buffer.from('no write'))
+            : operation === 'decrypt'
+              ? engine.decrypt(f.business, f.descriptor, envelope)
+              : engine.rotateWriteVersion(f.business, f.descriptor);
+        await expect(attempted).rejects.toThrow(KmsOperationError);
+        expect(providerCalls).toBe(1);
+        expect(
+          (
+            await admin.query(
+              "SELECT action FROM public.audit_records WHERE resource_id=$1 AND action IN ('kms.decrypt_invoked','kms.decrypt_failed','kms.dek_rotation_started')",
+              [f.descriptor.resourceId],
+            )
+          ).rows.map((row) => row.action),
+        ).toEqual(operation === 'decrypt' ? ['kms.decrypt_failed'] : []);
+        expect(decryptedKeys.every((key) => key.equals(Buffer.alloc(32)))).toBe(true);
+      } finally {
+        await release(f.business);
+      }
+    },
+  );
+  it.each(
+    (['REPEATABLE READ', 'SERIALIZABLE'] as const).flatMap((isolation) =>
+      (['encrypt', 'decrypt', 'rotate'] as const).flatMap((operation) =>
+        (['deleted account', 'revoked session'] as const).map((change) => ({
+          isolation,
+          operation,
+          change,
+        })),
+      ),
+    ),
+  )(
+    'rejects caller $isolation before $operation provider $change without changing isolation',
+    async ({ isolation, operation, change }) => {
+      const f = await fixture('tenant_admin');
+      try {
+        const normal = createClassifiedKms(createClassifiedKmsStore(auditPool), provider);
+        const envelope = await normal.encrypt(
+          f.business,
+          f.descriptor,
+          Buffer.from('known class key'),
+        );
+        await f.business.query('ROLLBACK');
+        await f.business.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+        await f.business.query('SELECT public.set_tenant_context($1)', [tenant]);
+        await f.business.query("SELECT pg_catalog.set_config('app.request_nonce', $1, true)", [
+          f.nonce,
+        ]);
+        const observed = {
+          generate: vi.fn<ClassifiedKeyProvider['generate']>(async (binding, dataClass) => {
+            const result = await provider.generate(binding, dataClass);
+            await removeAuthority(f, change);
+            return result;
+          }),
+          decrypt: vi.fn<ClassifiedKeyProvider['decrypt']>(async (binding, dataClass, blob) => {
+            const result = await provider.decrypt(binding, dataClass, blob);
+            await removeAuthority(f, change);
+            return result;
+          }),
+        };
+        const engine = createClassifiedKms(createClassifiedKmsStore(auditPool), observed);
+        const before = await admin.query('SELECT count(*)::int AS n FROM public.kms_dek_keyring');
+        const attempted =
+          operation === 'encrypt'
+            ? engine.encrypt(f.business, f.descriptor, Buffer.from('no write'))
+            : operation === 'decrypt'
+              ? engine.decrypt(f.business, f.descriptor, envelope)
+              : engine.rotateWriteVersion(f.business, f.descriptor);
+        await expect(attempted).rejects.toThrow(KmsOperationError);
+        expect(observed.generate).not.toHaveBeenCalled();
+        expect(observed.decrypt).not.toHaveBeenCalled();
+        expect(
+          (await f.business.query('SHOW transaction_isolation')).rows[0].transaction_isolation,
+        ).toBe(isolation.toLowerCase());
+        expect(
+          (await admin.query('SELECT count(*)::int AS n FROM public.kms_dek_keyring')).rows,
+        ).toEqual(before.rows);
+        expect(
+          (
+            await admin.query(
+              "SELECT action FROM public.audit_records WHERE resource_id=$1 AND action IN ('kms.decrypt_invoked','kms.decrypt_failed','kms.dek_rotation_started')",
+              [f.descriptor.resourceId],
+            )
+          ).rows.map((row) => row.action),
+        ).toEqual(operation === 'decrypt' ? ['kms.decrypt_failed'] : []);
+        expect(decryptedKeys.every((key) => key.equals(Buffer.alloc(32)))).toBe(true);
+        // The rejected call leaves the physical caller transaction usable. Its
+        // owner can choose a fresh supported transaction; KMS never changes it.
+        await f.business.query('ROLLBACK');
+        await f.business.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+        await f.business.query('SELECT public.set_tenant_context($1)', [tenant]);
+        await f.business.query("SELECT pg_catalog.set_config('app.request_nonce', $1, true)", [
+          f.nonce,
+        ]);
+        const recovered = await normal.decrypt(f.business, f.descriptor, envelope);
+        expect(recovered.toString()).toBe('known class key');
+        recovered.fill(0);
+      } finally {
+        await release(f.business);
+      }
+    },
+  );
+  it.each(
+    (['READ COMMITTED', 'REPEATABLE READ', 'SERIALIZABLE'] as const).flatMap((isolation) =>
+      (['deleted account', 'revoked session'] as const).map((change) => ({ isolation, change })),
+    ),
+  )(
+    'pins dedicated default $isolation and sees $change committed after audit INSERT',
+    async ({ isolation, change }) => {
+      const f = await fixture();
+      let changed = false;
+      const observedIsolations: string[] = [];
+      const defaultIsolations: string[] = [];
+      const configuredPool: KmsPool = {
+        async connect() {
+          const client = await asRole('kms_service_role');
+          try {
+            await client.query(
+              `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ${isolation}`,
+            );
+            defaultIsolations.push(
+              (await client.query('SHOW default_transaction_isolation')).rows[0]
+                .default_transaction_isolation,
+            );
+          } catch (error) {
+            client.release(true);
+            throw error;
+          }
+          return {
+            release: () => client.release(true),
+            async query<R>(sql: string, values?: readonly unknown[]) {
+              const result = await client.query(sql, values ? [...values] : undefined);
+              if (sql.startsWith('BEGIN')) {
+                observedIsolations.push(
+                  (await client.query('SHOW transaction_isolation')).rows[0].transaction_isolation,
+                );
+              }
+              if (
+                !changed &&
+                sql.startsWith('INSERT INTO public.audit_records') &&
+                values?.includes('kms.decrypt_invoked')
+              ) {
+                await removeAuthority(f, change);
+                changed = true;
+              }
+              return { rows: result.rows as R[], rowCount: result.rowCount };
+            },
+          };
         },
       };
-      const engine = createClassifiedKms(createClassifiedKmsStore(auditPool), concurrent);
-      const attempted =
-        operation === 'encrypt'
-          ? engine.encrypt(f.business, f.descriptor, Buffer.from('no write'))
-          : operation === 'decrypt'
-            ? engine.decrypt(f.business, f.descriptor, envelope)
-            : engine.rotateWriteVersion(f.business, f.descriptor);
-      await expect(attempted).rejects.toThrow(KmsOperationError);
-      expect(decryptedKeys.every((key) => key.equals(Buffer.alloc(32)))).toBe(true);
-    } finally {
-      await release(f.business);
-    }
-  });
+      try {
+        const engine = createClassifiedKms(createClassifiedKmsStore(configuredPool), provider);
+        const envelope = await engine.encrypt(
+          f.business,
+          f.descriptor,
+          Buffer.from('provisional plaintext'),
+        );
+        await expect(engine.decrypt(f.business, f.descriptor, envelope)).rejects.toThrow(
+          KmsOperationError,
+        );
+        expect(changed).toBe(true);
+        expect(defaultIsolations.length).toBeGreaterThan(0);
+        expect(defaultIsolations.every((value) => value === isolation.toLowerCase())).toBe(true);
+        expect(observedIsolations.length).toBe(defaultIsolations.length);
+        expect(observedIsolations.every((value) => value === 'read committed')).toBe(true);
+        expect(
+          (
+            await admin.query(
+              "SELECT action FROM public.audit_records WHERE resource_id=$1 AND action IN ('kms.decrypt_invoked','kms.decrypt_failed')",
+              [f.descriptor.resourceId],
+            )
+          ).rows.map((row) => row.action),
+        ).toEqual(['kms.decrypt_failed']);
+        expect(decryptedKeys.every((key) => key.equals(Buffer.alloc(32)))).toBe(true);
+        const healthy = await fixture();
+        try {
+          const next = await engine.encrypt(
+            healthy.business,
+            healthy.descriptor,
+            Buffer.from('fresh connection recovery'),
+          );
+          const plaintext = await engine.decrypt(healthy.business, healthy.descriptor, next);
+          expect(plaintext.toString()).toBe('fresh connection recovery');
+          plaintext.fill(0);
+        } finally {
+          await release(healthy.business);
+        }
+      } finally {
+        await release(f.business);
+      }
+    },
+  );
   it.each(['role check', 'COMMIT', 'ROLLBACK'] as const)(
     'discards a never-arriving %s reply, erases keys and recovers',
     async (fault) => {
