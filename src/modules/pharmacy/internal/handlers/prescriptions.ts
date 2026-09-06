@@ -81,8 +81,13 @@ import {
 } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
-import { asSessionId, findActiveSessionById } from '../../../identity/index.js';
-import * as medicationRequestRepo from '../repositories/medication-request-repo.js';
+import {
+  asAccountId,
+  asSessionId,
+  findAccountById,
+  findActiveSessionById,
+} from '../../../identity/index.js';
+import { readPatientMedicationRequests } from '../repositories/patient-medication-read-repo.js';
 import * as medicationRequestService from '../services/medication-request-service.js';
 import { asProductCatalogId } from '../types.js';
 import type { MedicationRequest, MedicationRequestStatus } from '../types.js';
@@ -142,6 +147,37 @@ async function requireLiveSession(req: FastifyRequest): Promise<{
     throw new UnauthenticatedError();
   }
   return { ctx, actor };
+}
+
+async function requireLivePatientRead(req: FastifyRequest) {
+  const { ctx, actor } = await requireLiveSession(req);
+  if (actor.delegateId !== null || !req.actorNonce) throw new UnauthenticatedError();
+  const account = await findAccountById(ctx, asAccountId(actor.accountId));
+  if (
+    account?.account_type !== 'patient' ||
+    account.status !== 'active' ||
+    account.deleted_at !== null ||
+    account.country_of_care !== ctx.countryOfCare
+  )
+    throw new UnauthenticatedError();
+  return { ctx, actor, nonce: req.actorNonce };
+}
+
+async function readPatientProjection(
+  req: FastifyRequest,
+  tenantId: ReturnType<typeof requireTenantContext>['tenantId'],
+  nonce: string,
+  options: Parameters<typeof readPatientMedicationRequests>[2],
+) {
+  try {
+    return await readPatientMedicationRequests(tenantId, nonce, options);
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error ? error.code : undefined;
+    if (code === 'PT401') throw new UnauthenticatedError();
+    if (code === 'PT503')
+      throw req.server.httpErrors.serviceUnavailable('Medication information is unavailable.');
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +251,9 @@ type ParseResult = { ok: true; value: ParsedListQuery } | { ok: false; message: 
  *   non-numeric / non-integer / non-positive values are rejected.
  */
 function parseListQuery(raw: ListQuery): ParseResult {
+  if (Object.keys(raw).some((key) => key !== 'status' && key !== 'limit')) {
+    return { ok: false, message: 'Invalid query parameter.' };
+  }
   let status: MedicationRequestStatus | undefined;
   if (raw.status !== undefined) {
     if (typeof raw.status !== 'string') {
@@ -261,7 +300,8 @@ export async function getMedicationRequestByIdHandler(
   req: FastifyRequest<{ Params: { id: string } }>,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const { ctx, actor } = await requireLiveSession(req);
+  void reply.header('Cache-Control', 'no-store');
+  const { ctx, nonce } = await requireLivePatientRead(req);
 
   // Validate the id at the boundary. A malformed id MUST produce the
   // SAME 404 envelope as a well-formed-but-not-found id — otherwise an
@@ -279,27 +319,17 @@ export async function getMedicationRequestByIdHandler(
     throw err;
   }
 
-  const mr = await medicationRequestRepo.findById(ctx.tenantId, id);
+  const mr = (await readPatientProjection(req, ctx.tenantId, nonce, { id, limit: 1 }))[0];
 
   // Tenant-blind 404 — not-found and cross-tenant (RLS filtered) both
   // emit the same envelope from this branch.
-  if (mr === null) {
+  if (mr === undefined) {
     return reply
       .code(404)
       .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
   }
 
-  // Cross-patient-blind 404. The row exists in the actor's tenant, but
-  // belongs to a different patient. I-025 forbids leaking "exists but
-  // not yours" to a same-tenant attacker; the cross-patient case must
-  // be indistinguishable from not-found.
-  if (mr.patient_account_id !== actor.accountId) {
-    return reply
-      .code(404)
-      .send(makeErrorEnvelope(req.id, 'internal.resource.not_found', NOT_FOUND_MESSAGE));
-  }
-
-  return reply.code(200).send(toPatientMedicationRequestView(mr));
+  return reply.code(200).send(mr);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +340,8 @@ export async function listMedicationRequestsForPatientHandler(
   req: FastifyRequest<{ Params: { patientId: string }; Querystring: ListQuery }>,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const { ctx, actor } = await requireLiveSession(req);
+  void reply.header('Cache-Control', 'no-store');
+  const { ctx, actor, nonce } = await requireLivePatientRead(req);
 
   // Authorization (patient-self-only at v1.0; widens when clinician role
   // lands). Cross-patient → 404 tenant-blind, identical envelope to
@@ -333,13 +364,9 @@ export async function listMedicationRequestsForPatientHandler(
   const options: { status?: MedicationRequestStatus; limit?: number } = {};
   if (parsed.value.status !== undefined) options.status = parsed.value.status;
   if (parsed.value.limit !== undefined) options.limit = parsed.value.limit;
-  const rows = await medicationRequestRepo.listForPatient(
-    ctx.tenantId,
-    req.params.patientId,
-    options,
-  );
+  const rows = await readPatientProjection(req, ctx.tenantId, nonce, options);
 
-  return reply.code(200).send({ prescriptions: rows.map(toPatientMedicationRequestView) });
+  return reply.code(200).send({ prescriptions: rows });
 }
 
 // ---------------------------------------------------------------------------

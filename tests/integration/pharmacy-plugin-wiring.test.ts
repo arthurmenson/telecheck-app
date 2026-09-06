@@ -94,9 +94,8 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     }>();
     expect(body.status).toBe('ok');
     expect(body.module).toBe('pharmacy');
-    // Post-PR-K: slice is fully production-ready. Every clinician
-    // transition from State Machines v1.2 §19 has an HTTP handler.
-    expect(body.phase).toBe('fully_ready_post_tlc055');
+    // The phase describes the implemented capability, not full-slice readiness.
+    expect(body.phase).toBe('patient_read_capability');
     expect(body.schema_ratified).toBe(true);
     expect(body.schema_ratified_at).toBe('2026-05-11');
     expect(body.schema_ratified_by).toBe('P-011');
@@ -122,30 +121,22 @@ describe('pharmacy slice — §1 plugin wiring (post-PR-D: reads + patient-write
     expect(body.clinician_modify_wired).toBe(true);
     expect(body.clinician_modify_wired_by).toBe('TLC-055 PR K');
     expect(body.handlers_wired).toBe(true);
-    expect(body.handlers_wired_by).toBe('TLC-055 PR K — slice complete; /ready flips to 200');
+    expect(body.handlers_wired_by).toBe('TLC-055 PR K');
   });
 
-  it('§1b GET /v0/pharmacy/ready returns 200 (slice fully production-ready post-TLC-055 PR K)', async () => {
-    const r = await app!.inject({
+  it('reports incomplete full-slice readiness without disabling patient reads', async () => {
+    const response = await app!.inject({
       method: 'GET',
       url: '/v0/pharmacy/ready',
       headers: { host: 'localhost' },
     });
-    expect(r.statusCode).toBe(200);
-    const body = r.json<{
-      status: string;
-      module: string;
-      phase: string;
-      ready_at: string;
-      ready_by: string;
-      notes: string;
-    }>();
-    expect(body.status).toBe('ready');
-    expect(body.module).toBe('pharmacy');
-    expect(body.phase).toBe('fully_ready_post_tlc055');
-    expect(body.ready_by).toContain('TLC-055 PR K');
-    expect(body.notes).toContain('fully production-ready');
-    expect(body.notes).toContain('clinician_modify');
-    expect(body.notes).not.toContain('schema not yet ratified');
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      status: 'not_ready',
+      module: 'pharmacy',
+      phase: 'patient_read_capability',
+      production_ready: false,
+      pending: ['restricted_role_write_acceptance', 'refill_and_dispensing', 'provider_acceptance'],
+    });
   });
 });

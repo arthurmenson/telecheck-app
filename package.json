@@ -27,6 +27,7 @@
     "check:migration-bom": "node scripts/check-migration-bom.mjs",
     "migrate:apply": "node scripts/migrate.mjs",
     "verify:identity-runtime": "tsx scripts/verify-identity-runtime.ts",
+    "verify:patient-reads": "tsx scripts/verify-patient-reads.mjs",
     "test:migrations": "node --test scripts/lib/migration-source.test.mjs scripts/migrate.integration.test.mjs",
     "openapi:validate": "echo 'TODO: wire swagger-cli validate against ../telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_OpenAPI_v0_2.md'",
     "migrate:diff": "echo 'TODO: wire prisma migrate diff against current schema'",
