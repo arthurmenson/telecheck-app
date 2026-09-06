@@ -182,6 +182,9 @@ jobs:
       - name: Test (vitest)
         run: npm run test
 
+      - name: Verify atomic migrations and history integrity (PostgreSQL)
+        run: npm run test:migrations
+
       # Coverage report retained as artifact for reviewer inspection.
       # Eventually feeds a coverage gate; for now upload-only.
       - name: Upload coverage report

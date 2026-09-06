@@ -206,7 +206,7 @@ function walkTsFiles(dir: string): string[] {
 
 function isAllowedPath(filePath: string, allowedInPaths?: RegExp[]): boolean {
   if (!allowedInPaths || allowedInPaths.length === 0) return false;
-  const rel = relative(SRC_DIR, filePath);
+  const rel = relative(SRC_DIR, filePath).replaceAll('\\', '/');
   return allowedInPaths.some((pat) => pat.test(rel));
 }
 
@@ -238,7 +238,7 @@ describe('canonical glossary — forbidden alias static analysis (I-014)', () =>
           if (stripped.startsWith('//') || stripped.startsWith('*')) continue;
 
           if (alias.pattern.test(line)) {
-            const rel = relative(SRC_DIR, filePath);
+            const rel = relative(SRC_DIR, filePath).replaceAll('\\', '/');
             violations.push(`  src/${rel}:${i + 1}: ${line.trim()}`);
           }
         }
