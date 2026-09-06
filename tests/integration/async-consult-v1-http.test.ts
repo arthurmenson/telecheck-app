@@ -27,6 +27,7 @@ import { createAccount } from '../../src/modules/identity/internal/repositories/
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { seedBilledConsultFixture } from '../helpers/billed-consult-fixture.ts';
 import { configureBindRole } from '../helpers/configure-bind-role.ts';
+import { seedLiveSession } from '../helpers/live-session-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
 import { getTestClient } from '../setup.ts';
@@ -487,5 +488,131 @@ describe('async-consult v1 — tenant-blind self-scoping (I-025)', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(json<{ rows: unknown[] }>(res).rows).toHaveLength(0);
+  });
+});
+
+describe('async-consult v1 — persisted patient history', () => {
+  async function historySession(accountId: string) {
+    await withTenantContext(T_US, async () => {
+      await getTestClient().query("UPDATE accounts SET status='active' WHERE account_id=$1", [
+        accountId,
+      ]);
+    });
+    return seedLiveSession(
+      {
+        tenantId: T_US,
+        countryOfCare: 'US',
+        displayName: 'Telecheck-US',
+        consumerDba: 'Heros Health',
+        legalEntity: 'Telecheck Health LLC',
+        consumerSubdomain: 'heroshealth.com',
+        kmsKeyAlias: 'alias/telecheck-us-data-key',
+      },
+      accountId,
+    );
+  }
+
+  it('lists only the current patient with bounded stable pages and no cacheable PHI', async () => {
+    const own = await historySession(patient.accountId);
+    const other = await historySession(patientB.accountId);
+    const first = await initiateConsult(own.token);
+    const second = await initiateConsult(own.token);
+    const foreign = await initiateConsult(other.token);
+    const response = await app!.inject({
+      method: 'GET',
+      url: '/v1/async-consults?limit=1',
+      headers: {
+        host: 'localhost',
+        authorization: `Bearer ${own.token}`,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(response.json()).toMatchObject({ limit: 1, offset: 0, has_more: true });
+    const next = await inject({
+      method: 'GET',
+      url: '/v1/async-consults?limit=1&offset=1',
+      token: own.token,
+    });
+    expect(next.statusCode).toBe(200);
+    const nextBody = json<{ rows: { consult_id: string }[]; has_more: boolean }>(next);
+    expect(nextBody.has_more).toBe(false);
+    expect([response.json().rows[0].consult_id, nextBody.rows[0]?.consult_id].sort()).toEqual(
+      [first, second].sort(),
+    );
+    expect(response.body + next.body).not.toContain(foreign);
+    expect(response.body + next.body).not.toContain('patient_id');
+    expect(response.body + next.body).not.toContain('tenant_id');
+    const otherList = await inject({
+      method: 'GET',
+      url: '/v1/async-consults',
+      token: other.token,
+    });
+    expect(
+      json<{ rows: { consult_id: string }[] }>(otherList).rows.map((row) => row.consult_id),
+    ).toEqual([foreign]);
+  });
+
+  it('denies stateless, revoked, deleted and stale-role identities', async () => {
+    const stateless = await inject({
+      method: 'GET',
+      url: '/v1/async-consults',
+      token: patient.token,
+    });
+    expect(stateless.statusCode).toBe(401);
+    const live = await historySession(patient.accountId);
+    await withTenantContext(T_US, async () => {
+      await getTestClient().query(
+        "UPDATE sessions SET revoked_at=NOW(), revoked_reason='patient_logout' WHERE session_id=$1",
+        [live.sessionId],
+      );
+    });
+    expect(
+      (await inject({ method: 'GET', url: '/v1/async-consults', token: live.token })).statusCode,
+    ).toBe(401);
+    const second = await historySession(patient.accountId);
+    await withTenantContext(T_US, async () => {
+      await getTestClient().query('UPDATE accounts SET deleted_at=NOW() WHERE account_id=$1', [
+        patient.accountId,
+      ]);
+    });
+    expect(
+      (await inject({ method: 'GET', url: '/v1/async-consults', token: second.token })).statusCode,
+    ).toBe(401);
+    await withTenantContext(T_US, async () => {
+      await getTestClient().query(
+        "UPDATE accounts SET deleted_at=NULL,account_type='clinician' WHERE account_id=$1",
+        [patient.accountId],
+      );
+    });
+    expect(
+      (await inject({ method: 'GET', url: '/v1/async-consults', token: second.token })).statusCode,
+    ).toBe(401);
+  });
+
+  it('rejects staff, foreign-tenant and caller subject/pagination overrides', async () => {
+    const live = await historySession(patient.accountId);
+    expect(
+      (await inject({ method: 'GET', url: '/v1/async-consults', token: clinician.token }))
+        .statusCode,
+    ).toBe(403);
+    const foreign = await app!.inject({
+      method: 'GET',
+      url: '/v1/async-consults',
+      headers: { host: 'ghana.heroshealth.com', authorization: `Bearer ${live.token}` },
+    });
+    expect(foreign.statusCode).toBe(401);
+    for (const query of [
+      'patient_id=' + patientB.accountId,
+      'limit=101',
+      'offset=10001',
+      'limit=NaN',
+      'offset=-1',
+    ]) {
+      expect(
+        (await inject({ method: 'GET', url: '/v1/async-consults?' + query, token: live.token }))
+          .statusCode,
+      ).toBe(400);
+    }
   });
 });
