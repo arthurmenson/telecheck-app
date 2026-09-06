@@ -4,8 +4,8 @@ import { request as httpRequest } from 'node:http';
 import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
 
-import { withIdempotentExecution } from '../../src/lib/idempotent-handler.ts';
 import { idempotencyPlugin, withIdempotency } from '../../src/lib/idempotency.ts';
+import { withIdempotentExecution } from '../../src/lib/idempotent-handler.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import { TENANT_US, TENANT_GHANA } from '../helpers/tenant-fixtures.ts';
