@@ -156,5 +156,6 @@ module.exports = {
     'vitest.bench.config.ts',
     'vitest.unit.config.ts',
     'vitest.kms.config.ts',
+    'vitest.billing.config.ts',
   ],
 };
