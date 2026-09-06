@@ -179,8 +179,18 @@ jobs:
 
       # Tests run against the Postgres service container.
       # vitest setup applies migrations + seeds two tenants per tests/README.md.
+      - name: Apply and replay the full migration inventory
+        env:
+          MIGRATION_DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: |
+          npm run migrate:apply
+          npm run migrate:apply
+
       - name: Test (vitest)
         run: npm run test
+
+      - name: Verify atomic migrations and history integrity (PostgreSQL)
+        run: npm run test:migrations
 
       # Coverage report retained as artifact for reviewer inspection.
       # Eventually feeds a coverage gate; for now upload-only.
