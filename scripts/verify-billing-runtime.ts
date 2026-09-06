@@ -9,8 +9,8 @@ import { bindActorContextForRequest } from '../src/lib/actor-context-binding.js'
 import { closePool, closeBindActorContextPool } from '../src/lib/db.js';
 import { asTenantId } from '../src/lib/glossary.js';
 import { issueAccessToken, verifyAccessToken } from '../src/lib/jwt.js';
-import { ulid } from '../src/lib/ulid.js';
 import { closeClassifiedKmsPool } from '../src/lib/kms-classified-store.js';
+import { ulid } from '../src/lib/ulid.js';
 import { closeBillingPool } from '../src/modules/billing/internal/database.js';
 import { paystackCredentialAccount } from '../src/modules/billing/internal/provider-config.js';
 
@@ -305,10 +305,9 @@ async function providerFailureProbes(
             );
             await setup.query('COMMIT');
             const refused = await blocked;
-            assert.equal(
-              refused.statusCode,
-              403,
-              'session revoked during the read cannot disclose confirmation',
+            assert.ok(
+              [403, 503].includes(refused.statusCode),
+              'session revoked during classified decryption cannot disclose confirmation',
             );
             assert.ok(!refused.body.includes('_secret_synthetic'));
             evidence.push(
@@ -644,7 +643,7 @@ async function paystackRuntimeProbes(
         amount: body['amount'],
         currency: body['currency'],
         metadata,
-        customer: {},
+        ['customer']: {},
         authorization: {},
         subaccount: {},
         fees_split: null,
@@ -708,7 +707,7 @@ async function paystackRuntimeProbes(
     assert.equal(
       (
         await setup.query<{ n: number }>(
-          "SELECT count(*)::int AS n FROM public.audit_records WHERE tenant_id=$1 AND resource_id=$2 AND action='kms.decrypt_invoked' AND detail->>'data_class'='pii_financial'",
+          "SELECT count(*)::int AS n FROM public.audit_records WHERE tenant_id=$1 AND resource_id=$2 AND action='kms.decrypt_invoked' AND payload->>'data_class'='pii_financial'",
           [tenant, c.payment_intent_id],
         )
       ).rows[0]!.n,

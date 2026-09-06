@@ -7,8 +7,8 @@ import { ulid } from '../../../lib/ulid.js';
 import { asAccountId, findAccountById } from '../../identity/index.js';
 import { resolveCurrencyCode, resolvePaymentProcessor } from '../../tenant-config/index.js';
 
-import { billingTransaction } from './database.js';
 import { mockConfirmation, openConfirmation, sealConfirmation } from './confirmation.js';
+import { billingTransaction } from './database.js';
 import { resolveProviderConfig } from './provider-config.js';
 import {
   assertObservation,

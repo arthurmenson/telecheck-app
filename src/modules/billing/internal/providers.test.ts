@@ -69,7 +69,6 @@ function event(data = stripe()) {
   };
 }
 beforeEach(() => {
-  vi.stubEnv('BILLING_CONFIRMATION_KEY', 'ab'.repeat(32));
   vi.stubEnv('NODE_ENV', 'test');
   vi.stubEnv('BILLING_ALLOW_MOCK', 'true');
 });

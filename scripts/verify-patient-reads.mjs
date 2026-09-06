@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import pg from 'pg';
 import { ulid } from '../src/lib/ulid.ts';
@@ -25,6 +25,7 @@ for (const configured of [
   adminUrl,
   process.env.BIND_ACTOR_CONTEXT_DATABASE_URL,
   process.env.IDENTITY_DATABASE_URL,
+  process.env.BILLING_DATABASE_URL,
 ]) {
   const url = new URL(configured);
   assert.equal(url.hostname, target.hostname);
@@ -45,7 +46,27 @@ assert.deepEqual(role, {
   rolinherit: false,
 });
 await appConnection.end();
+// Explicit synthetic Billing configuration for the paid history-read fixture.
+// No money is charged; the price, quote, intent and consult still use public APIs.
+process.env.BILLING_ALLOW_MOCK = 'true';
+process.env.BILLING_CARE_READ_MOCK_SECRET = randomBytes(32).toString('hex');
+process.env.BILLING_PROVIDERS_JSON = JSON.stringify(
+  Object.fromEntries(
+    ['Telecheck-US', 'Telecheck-Ghana'].map((tenant) => [
+      tenant,
+      {
+        provider: 'mock_local_dev',
+        mode: 'mock_local_dev',
+        account: `synthetic_care_${tenant}`,
+        secret_env: 'BILLING_CARE_READ_MOCK_SECRET',
+        webhook_secret_env: 'BILLING_CARE_READ_MOCK_SECRET',
+        return_url: 'http://localhost/care',
+      },
+    ]),
+  ),
+);
 const { buildApp } = await import('../src/app.ts');
+const { issueAccessToken, verifyAccessToken } = await import('../src/lib/jwt.ts');
 const app = await buildApp({ logger: false });
 const origin = await app.listen({ host: '127.0.0.1', port: 0 });
 async function call(host, method, path, body, token) {
@@ -57,7 +78,7 @@ async function call(host, method, path, body, token) {
         headers: {
           Host: host,
           ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
-          'Idempotency-Key': randomUUID(),
+          'Idempotency-Key': ulid(),
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
       },
@@ -300,16 +321,102 @@ try {
     assert.equal(history.status, 200);
     assert.equal(history.cache, 'no-store');
     assert.deepEqual(history.body, { rows: [], limit: 25, offset: 0, has_more: false });
-    // Metadata-only fixture, deliberately distinct from care/payment acceptance.
-    // A nonempty protected result is needed to detect accidental disclosure.
-    const consultId = ulid();
+    // Synthetic paid fixture through the real price → quote → intent → consult
+    // boundary, so nonempty expiry controls obey the Billing FK and intake gate.
     await control.query(
-      `INSERT INTO public.consult
-       (id,tenant_id,patient_id,consult_type,initiation_source,consult_fee_cents,currency,
-        payment_provider,payment_intent_id,expected_turnaround_at)
-       VALUES ($1,$2,$3,'general','care_tab',0,$4,'mock_local_dev',$5,clock_timestamp()+interval '1 day')`,
-      [consultId, tenant, profile.body.account_id, country === 'US' ? 'USD' : 'GHS', ulid()],
+      `INSERT INTO public.ccr_configs(id,tenant_id,config_key,config_value)
+       VALUES($1,$2,'payment.processor','"mock_local_dev"'::jsonb)
+       ON CONFLICT(tenant_id,config_key) DO UPDATE SET config_value=EXCLUDED.config_value`,
+      [ulid(), tenant],
     );
+    const operatorEmail = `synthetic-care-operator-${randomUUID()}@example.invalid`;
+    const operatorStart = await call(host, 'POST', '/v0/identity/registration/email/start', {
+      email: operatorEmail,
+    });
+    assert.equal(operatorStart.status, 200);
+    const operator = await call(host, 'POST', '/v0/identity/registration/email/verify', {
+      email: operatorEmail,
+      passcode: operatorStart.body.dev_passcode,
+      pin: '583926',
+      first_name: 'Synthetic',
+      last_name: 'CareOperator',
+      date_of_birth: '1990-01-01',
+      gender: 'prefer_not_to_say',
+    });
+    assert.equal(operator.status, 201);
+    const verifiedOperator = verifyAccessToken(
+      operator.body.access_token,
+      process.env.JWT_SIGNING_KEY,
+    );
+    assert(verifiedOperator.ok);
+    const operatorClaims = verifiedOperator.claims;
+    // Explicit synthetic operator provisioning; the nonce resolves this actual live session.
+    await control.query(
+      "UPDATE public.accounts SET account_type='tenant_admin' WHERE tenant_id=$1 AND account_id=$2",
+      [tenant, operatorClaims.sub],
+    );
+    const adminToken = issueAccessToken(
+      {
+        account_id: operatorClaims.sub,
+        tenant_id: tenant,
+        session_id: operatorClaims.session_id,
+        role: 'tenant_admin',
+        admin_tenant_binding: tenant,
+        country_of_care: country,
+      },
+      process.env.JWT_SIGNING_KEY,
+    );
+    const version = Number(
+      (
+        await control.query(
+          'SELECT COALESCE(max(version),0)+1 AS v FROM public.billing_consult_price WHERE tenant_id=$1 AND consult_type=$2',
+          [tenant, 'general'],
+        )
+      ).rows[0].v,
+    );
+    const price = await call(
+      host,
+      'POST',
+      '/v1/billing/consult-prices',
+      {
+        consult_type: 'general',
+        version,
+        amount_minor: 100,
+        turnaround_minutes: 60,
+        quote_ttl_seconds: 600,
+      },
+      adminToken,
+    );
+    assert.equal(price.status, 201, JSON.stringify(price.body.error));
+    const quote = await call(
+      host,
+      'POST',
+      '/v1/billing/consult-quotes',
+      { consult_type: 'general' },
+      token,
+    );
+    assert.equal(quote.status, 201);
+    const initiated = await call(
+      host,
+      'POST',
+      '/v1/async-consults',
+      {
+        consult_type: 'general',
+        initiation_source: 'care_tab',
+        accepted_quote_id: quote.body.quote_id,
+      },
+      token,
+    );
+    assert.equal(initiated.status, 201, JSON.stringify(initiated.body.error));
+    const consultId = initiated.body.consult_id;
+    const paid = await call(
+      host,
+      'POST',
+      `/v1/billing/payment-intents/${initiated.body.payment_intent_id}/mock-confirm`,
+      {},
+      token,
+    );
+    assert.equal(paid.status, 200);
     const populatedHistory = await call(host, 'GET', '/v1/async-consults', undefined, token);
     assert.equal(populatedHistory.status, 200);
     assert.equal(populatedHistory.body.rows.length, 1);
@@ -434,6 +541,7 @@ try {
       shadowObjectsIgnored: true,
       concurrentDeletionAndRevocationDenied: true,
       historyAndMedicationWallClockExpiryDenied: true,
+      syntheticPaidBillingHistoryFixture: true,
       missingMedication: true,
       noStore: true,
       foreignTenantDenied: true,
@@ -445,12 +553,12 @@ try {
       checkedAt: new Date().toISOString(),
       syntheticOnly: true,
       actualHttp: true,
-      actualThreeRoleConnections: true,
+      actualFourRoleConnections: true,
       results,
     }),
   );
   console.log(
-    'PASS: real HTTP, three ordinary login roles, US/GH registration, history, exact medication projections, SQL isolation and concurrent revocation denials. No clinical journey completion claim.',
+    'PASS: real HTTP, four ordinary login roles, US/GH registration, synthetic Billing-paid history fixtures, exact medication projections, SQL isolation and concurrent revocation denials. No clinical journey completion claim.',
   );
 } finally {
   await binder.end();
@@ -459,4 +567,6 @@ try {
   const { closePool, closeBindActorContextPool } = await import('../src/lib/db.ts');
   await closePool();
   await closeBindActorContextPool();
+  const { closeBillingPool } = await import('../src/modules/billing/internal/database.ts');
+  await closeBillingPool();
 }
