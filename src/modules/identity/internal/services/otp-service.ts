@@ -209,7 +209,7 @@ export async function verifyOtp(
   if (timingSafeHashEqual(supplied, otp.code_hash)) {
     // Match — consume + emit audit
     if (externalTx === undefined) {
-      const { withTenantBoundConnection } = await import('../../../../lib/db.js');
+      const { withTenantBoundConnection } = await import('../database.js');
       return withTenantBoundConnection(ctx.tenantId, async (tx) => {
         const consumed = await otpRepo.consumeOtp(ctx.tenantId, otp.otp_id, tx);
         if (consumed !== null) {
@@ -273,7 +273,7 @@ export async function verifyOtp(
 
   // Code mismatch — decrement attempts; if hits 0, emit lockout audit
   if (externalTx === undefined) {
-    const { withTenantBoundConnection } = await import('../../../../lib/db.js');
+    const { withTenantBoundConnection } = await import('../database.js');
     return withTenantBoundConnection(ctx.tenantId, async (tx) => {
       return decrementWithAudit(ctx, actor, otp, tx);
     });

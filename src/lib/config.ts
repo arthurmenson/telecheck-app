@@ -136,6 +136,9 @@ const ConfigSchema = z.object({
   // concern handled via the connection string `sslmode=verify-full`.
   DATABASE_SSL_MODE: z.enum(['disable', 'require']).default('disable'),
 
+  // Credentials and auth response cache are inaccessible to the ordinary app role.
+  IDENTITY_DATABASE_URL: z.string().url().optional(),
+
   // SI-010 dedicated bind-pool URL. Required in production once SI-010
   // authContextPlugin wiring lands; optional in dev/test (the wiring
   // skips binding when undefined, leaving actorContext untrusted for
@@ -396,6 +399,12 @@ function loadConfig() {
     );
   }
 
+  if (parsed.NODE_ENV === 'production' && parsed.IDENTITY_DATABASE_URL === undefined) {
+    throw new Error(
+      'IDENTITY_DATABASE_URL must be set in production to an identity_service_role login.',
+    );
+  }
+
   // Codex PR #210 R2 HIGH closure (2026-05-24): production fail-fast on
   // AI_MODE2_ENABLED=true. The handler only has clinician-role JWT
   // gating + an explicit TODO for clinician-on-care-team / protocol-
@@ -482,6 +491,7 @@ function loadConfig() {
     logLevel: parsed.LOG_LEVEL,
     logRedactPaths: parsed.LOG_REDACT_PATHS ?? [],
     databaseUrl: parsed.DATABASE_URL,
+    identityDatabaseUrl: parsed.IDENTITY_DATABASE_URL,
     dbPoolMax: parsed.DB_POOL_MAX,
     dbSslMode: parsed.DATABASE_SSL_MODE,
     // SI-010 dedicated bind pool (optional). When undefined, the

@@ -238,6 +238,11 @@ export function clearTestPool(): void {
   _pool = null;
 }
 
+/** Explicit integration-harness installation, never inferred from NODE_ENV alone. */
+export function hasTestPool(): boolean {
+  return _testPoolOverride !== null;
+}
+
 // ---------------------------------------------------------------------------
 // Bench-mode pool override (Sprint 17 / TLC-027 closure of Codex r10-B)
 // ---------------------------------------------------------------------------

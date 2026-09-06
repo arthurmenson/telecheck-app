@@ -167,7 +167,7 @@ export async function activateAccount(
     // top by passing a tx-bound runner. Since the repo's API accepts an
     // external tx, we run BOTH the UPDATE and the audit emission inside
     // a freshly-acquired connection by importing withTenantBoundConnection.
-    const { withTenantBoundConnection } = await import('../../../../lib/db.js');
+    const { withTenantBoundConnection } = await import('../database.js');
     return withTenantBoundConnection(ctx.tenantId, async (tx) => {
       const activated = await accountRepo.activateAccount(ctx.tenantId, accountId, tx);
       if (activated === null) return null;

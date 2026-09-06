@@ -3,9 +3,9 @@
  * Spec v1.0 §3.1 (biometric unlock) + §3.4 (multi-device cap).
  *
  *   POST /v0/identity/devices
- *     Body: { account_id, platform, device_label?, device_public_key,
+ *     Body: { account_id?, platform, device_label?, device_public_key,
  *             attestation_format? }
- *     - Register a device for an account
+ *     - Register a device for the active, authenticated account
  *     - Service-layer auto-evicts oldest device with reason=
  *       'max_devices_evicted' when account already has 3 active devices
  *     - Returns the registered AuthDevice (without tenant_id; the
@@ -13,14 +13,12 @@
  *       device pubkey, but tenant_id is stripped to match the platform's
  *       patient-surface discipline)
  *
- *   GET /v0/identity/devices?account_id=<id>
+ *   GET /v0/identity/devices?account_id=<own-id>
  *     - List active devices for an account (oldest-first by last_seen_at)
- *     - account_id supplied as a query param at v1.0 since there's no JWT
- *       yet to resolve actor identity automatically; replaced by JWT-
- *       resolved actor in a follow-up commit
+ *     - account_id is optional; when supplied it must match the JWT actor
  *
  *   DELETE /v0/identity/devices/:deviceId
- *     - Revoke a device with reason='patient_unregistered'
+ *     - Revoke an owned device with reason='patient_unregistered'
  *     - Idempotent: phantom device_id returns 204 too (tenant-blind)
  *
  * Spec references:
@@ -34,11 +32,12 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { DbTransaction } from '../../../../lib/db.js';
-import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
-import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
+import { withIdempotentExecution } from '../database.js';
 import * as deviceService from '../services/auth-device-service.js';
 import { asAccountId, asDeviceId, type AttestationFormat, type DevicePlatform } from '../types.js';
+
+import { requireIdentitySelfContext } from './self-context.js';
 
 // ---------------------------------------------------------------------------
 // Body / param shapes
@@ -101,11 +100,11 @@ export async function registerDeviceHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const ctx = requireTenantContext(req);
+  const { ctx, actor, auditActor } = await requireIdentitySelfContext(req);
   const body = (req.body ?? {}) as RegisterDeviceBody;
 
   if (
-    !isString(body.account_id) ||
+    (body.account_id !== undefined && body.account_id !== actor.accountId) ||
     !isPlatform(body.platform) ||
     !isString(body.device_public_key)
   ) {
@@ -115,12 +114,12 @@ export async function registerDeviceHandler(
         makeErrorEnvelope(
           req.id,
           'internal.request.invalid',
-          'account_id, platform (ios|android|web), and device_public_key required.',
+          'A valid platform and device_public_key are required; account_id must match the caller.',
         ),
       );
   }
 
-  const accountId = asAccountId(body.account_id);
+  const accountId = asAccountId(actor.accountId);
   const deviceId = asDeviceId(ulid());
 
   // Optional attestation_format validation
@@ -135,7 +134,7 @@ export async function registerDeviceHandler(
   return withIdempotentExecution(req, reply, mapServiceError, async (tx: DbTransaction) => {
     const device = await deviceService.registerDevice(
       ctx,
-      { actorId: 'system' },
+      auditActor,
       {
         device_id: deviceId,
         account_id: accountId,
@@ -164,14 +163,14 @@ export async function listDevicesHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const ctx = requireTenantContext(req);
+  const { ctx, actor } = await requireIdentitySelfContext(req);
   const query = (req.query ?? {}) as { account_id?: string };
 
-  if (!isString(query.account_id)) {
+  if (query.account_id !== undefined && query.account_id !== actor.accountId) {
     return reply.code(400).send({
       error: {
         code: 'internal.request.invalid',
-        message: 'account_id query parameter is required.',
+        message: 'account_id must match the caller.',
         request_id: req.id,
       },
     });
@@ -179,7 +178,7 @@ export async function listDevicesHandler(
 
   const devices = await deviceService.listActiveDevicesForAccount(
     ctx,
-    asAccountId(query.account_id),
+    asAccountId(actor.accountId),
   );
 
   // Strip tenant_id from each device row
@@ -200,7 +199,7 @@ export async function revokeDeviceHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const ctx = requireTenantContext(req);
+  const { ctx, actor, auditActor } = await requireIdentitySelfContext(req);
   const params = (req.params ?? {}) as { deviceId?: string };
 
   if (!isString(params.deviceId)) {
@@ -218,15 +217,13 @@ export async function revokeDeviceHandler(
   const deviceId = asDeviceId(params.deviceId);
 
   return withIdempotentExecution(req, reply, mapServiceError, async (tx: DbTransaction) => {
+    const device = await deviceService.findDeviceById(ctx, deviceId, tx);
+    if (device === null || device.account_id !== actor.accountId) {
+      return { status: 204, view: null };
+    }
     // Idempotent: revokeDevice returns null on phantom or already-revoked;
     // we still respond 204 to prevent enumeration (tenant-blind).
-    await deviceService.revokeDevice(
-      ctx,
-      { actorId: 'system' },
-      deviceId,
-      'patient_unregistered',
-      tx,
-    );
+    await deviceService.revokeDevice(ctx, auditActor, deviceId, 'patient_unregistered', tx);
 
     // 204 No Content — body must be null/undefined for the idempotency
     // cache to round-trip cleanly (replay re-sends `null` which Fastify

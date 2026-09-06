@@ -150,6 +150,7 @@ const TENANT_SCOPED_TABLES = [
   'forms_template_admin_review_lifecycle_transition', // migration 040 — Admin Backend slice
   'forms_variant',
   'idempotency_keys',
+  'identity_idempotency_keys', // migration083 — credential-bearing auth replay
   'interaction_engine_evaluation', // migration 047 — Med-Interaction slice
   'interaction_signal', // migration 047 — Med-Interaction slice
   'interaction_signal_lifecycle_transition', // migration 047 — Med-Interaction slice

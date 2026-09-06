@@ -58,9 +58,12 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 
+import { closeIdentityPool, verifyIdentityPool } from './internal/database.js';
 import { registerIdentityRoutes } from './routes.js';
 
 const identityPluginImpl: FastifyPluginAsync = async (app: FastifyInstance): Promise<void> => {
+  app.addHook('onClose', closeIdentityPool);
+  await verifyIdentityPool();
   await app.register(registerIdentityRoutes, { prefix: '/v0/identity' });
 };
 

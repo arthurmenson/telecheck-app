@@ -123,6 +123,7 @@ import { asTenantId } from '../../src/lib/glossary.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
+import { configureBindRole } from '../helpers/configure-bind-role.ts';
 import { grantSliceRolesToTestApp } from '../helpers/grant-slice-roles.ts';
 import { bearerAuthHeader } from '../helpers/jwt-fixtures.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
@@ -193,6 +194,7 @@ async function seedAccount(
         account_type: accountType,
       },
       async () => {},
+      getTestClient(), // beforeAll fixture uses the harness-owned connection
     ),
   );
   return accountId;
@@ -305,9 +307,7 @@ beforeAll(async () => {
   });
   await superuser.connect();
   try {
-    await superuser.query(
-      `ALTER ROLE bind_actor_context_role WITH LOGIN PASSWORD '${BIND_ROLE_TEST_PASSWORD}'`,
-    );
+    await configureBindRole(superuser, BIND_ROLE_TEST_PASSWORD);
   } finally {
     await superuser.end();
   }

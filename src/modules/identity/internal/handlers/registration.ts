@@ -36,9 +36,9 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { DbTransaction } from '../../../../lib/db.js';
-import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
+import { withIdempotentExecution } from '../database.js';
 import * as accountService from '../services/account-service.js';
 import * as otpService from '../services/otp-service.js';
 import { asAccountId, asOtpId, type Account } from '../types.js';
