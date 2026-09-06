@@ -49,12 +49,41 @@ DO $$ BEGIN
         RAISE EXCEPTION 'identity_cache_relocation_requires_migration_rls_bypass';
     END IF;
 END $$;
+-- The old cache stored the raw path. Fastify also accepts percent-encoded
+-- ASCII in route segments, including failed authentication requests whose
+-- response contains no token but whose request hash fingerprints a PIN/OTP.
+-- Decode exactly one layer for classification only; retain the original
+-- endpoint, key, fingerprint and expiry so existing retries keep their scope.
+CREATE FUNCTION pg_temp.identity_legacy_endpoint(p_path TEXT) RETURNS TEXT
+LANGUAGE plpgsql IMMUTABLE STRICT AS $decode$
+DECLARE
+    v_result TEXT := '';
+    v_position INTEGER := 1;
+    v_token TEXT;
+    v_byte INTEGER;
+BEGIN
+    WHILE v_position <= length(p_path) LOOP
+        v_token := substring(p_path FROM v_position FOR 3);
+        IF v_token ~ '^%[0-9a-fA-F]{2}$' THEN
+            v_byte := get_byte(decode(substring(v_token FROM 2), 'hex'), 0);
+            -- Non-ASCII and NUL cannot spell this ASCII route namespace.
+            v_result := v_result || CASE WHEN v_byte BETWEEN 1 AND 127
+                THEN chr(v_byte) ELSE v_token END;
+            v_position := v_position + 3;
+        ELSE
+            v_result := v_result || substring(p_path FROM v_position FOR 1);
+            v_position := v_position + 1;
+        END IF;
+    END LOOP;
+    RETURN lower(v_result);
+END $decode$;
 INSERT INTO public.identity_idempotency_keys
     SELECT * FROM public.idempotency_keys
-     WHERE lower(endpoint) ~ '^/v0/identity(/|$)';
+     WHERE pg_temp.identity_legacy_endpoint(endpoint) ~ '^/v0/identity(/|$)';
 DELETE FROM public.idempotency_keys
- WHERE lower(endpoint) ~ '^/v0/identity(/|$)'
+ WHERE pg_temp.identity_legacy_endpoint(endpoint) ~ '^/v0/identity(/|$)'
     OR response_body ?| ARRAY['access_token','refresh_token','dev_otp','dev_passcode'];
+DROP FUNCTION pg_temp.identity_legacy_endpoint(TEXT);
 
 -- Auth replay contains bearer tokens and low-entropy credential fingerprints.
 -- Restrictive policy composes with tenant RLS and protects reads, deletes,
