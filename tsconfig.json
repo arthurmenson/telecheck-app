@@ -32,6 +32,11 @@
     "incremental": true,
     "tsBuildInfoFile": "./.tsbuildinfo"
   },
-  "include": ["src/**/*", "tests/**/*", "scripts/verify-identity-runtime.ts"],
+  "include": [
+    "src/**/*",
+    "tests/**/*",
+    "scripts/verify-identity-runtime.ts",
+    "scripts/verify-forms-publication.ts"
+  ],
   "exclude": ["node_modules", "dist", ".tsbuildinfo"]
 }

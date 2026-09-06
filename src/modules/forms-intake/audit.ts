@@ -92,6 +92,7 @@ import {
   type AuditEnvelopeInput,
   emitAudit,
 } from '../../lib/audit.js';
+import { emitDomainEvent } from '../../lib/domain-events.js';
 import type { TenantId } from '../../lib/glossary.js';
 
 import type {
@@ -103,6 +104,43 @@ import type {
   PatientId,
   ResumeStateId,
 } from './internal/types.js';
+
+/** No user-authored content enters governance audit/outbox payloads. */
+export async function emitFormsGovernanceEvidence(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    actorRole: 'clinician' | 'operator';
+    countryOfCare: string;
+    resourceId: string;
+    intent: string;
+    detail: Record<string, unknown>;
+  },
+  tx: AuditDbClient,
+): Promise<void> {
+  const audit = await emitAudit(
+    buildEnvelope('config_change_validated', 'B', {
+      tenant_id: args.tenantId,
+      actor_type: args.actorRole,
+      actor_id: args.actorId,
+      actor_tenant_id: args.tenantId,
+      target_patient_id: null,
+      country_of_care: args.countryOfCare,
+      resource_type: 'forms_template',
+      resource_id: args.resourceId,
+      detail: { intent: args.intent, ...args.detail },
+    }),
+    tx,
+  );
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: 'FormTemplate',
+    aggregate_id: args.resourceId,
+    event_type: args.intent,
+    occurred_at: new Date().toISOString(),
+    payload: { ...args.detail, audit_id: audit.audit_id },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // SPEC ISSUE — unratified Forms/Intake audit action IDs (placeholder helper)
@@ -219,7 +257,7 @@ export function formsAuditPlaceholder(id: FormsAuditActionPlaceholder): AuditAct
 
 interface FormsAuditCommon {
   tenant_id: TenantId;
-  actor_type: 'patient' | 'delegate' | 'operator' | 'system';
+  actor_type: 'patient' | 'delegate' | 'operator' | 'system' | 'clinician';
   actor_id: string;
   actor_tenant_id: string | null;
   // Nullable for platform-scope events (e.g., template authoring,

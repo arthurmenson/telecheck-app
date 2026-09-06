@@ -64,6 +64,11 @@ vi.mock('../../../../lib/idempotent-handler.js', () => ({
 vi.mock('../../audit.js', () => ({
   emitTemplateSubmittedForReviewAudit: vi.fn(),
 }));
+vi.mock('../../../forms-intake/index.js', () => ({ assertFormsGovernanceScope: vi.fn() }));
+vi.mock('../../../../lib/db.js', async (original) => ({
+  ...(await original<typeof import('../../../../lib/db.js')>()),
+  withTransaction: vi.fn(),
+}));
 
 // Imports AFTER vi.mock declarations.
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
@@ -71,10 +76,12 @@ import {
   requireSliceRoleMembership,
   resolveActorTenantIdForAudit,
 } from '../../../../lib/auth-context.js';
+import { withTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
+import { assertFormsGovernanceScope } from '../../../forms-intake/index.js';
 import { emitTemplateSubmittedForReviewAudit } from '../../audit.js';
 import { TemplateStateConflictError } from '../errors.js';
 
@@ -111,7 +118,7 @@ function makeFakeTx(): FakeTx {
       if (sql.includes('submit_forms_template_for_admin_review')) {
         return { rows: [{ review_id: RETURNED_REVIEW_ID }], rowCount: 1 };
       }
-      if (sql.includes('forms_template_admin_review_lifecycle_transition')) {
+      if (sql.includes('forms_admin_submission_receipt')) {
         return {
           rows: [{ transition_reason: 'initial_submission' }],
           rowCount: 1,
@@ -168,6 +175,8 @@ function makeReply(): FastifyReply {
  * withDbRole calls through; the audit emitter returns a fake envelope.
  */
 function installDefaultCompositionMocks(tx: FakeTx): void {
+  vi.mocked(withTransaction).mockImplementation(async (fn) => fn(tx as never));
+  vi.mocked(assertFormsGovernanceScope).mockResolvedValue();
   vi.mocked(requireTenantContext).mockReturnValue(
     FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
   );
@@ -236,10 +245,8 @@ describe('postFormsTemplateSubmitHandler §1 — happy path composition (initial
     expect(wrapperCall[1]).toEqual(['Telecheck-US', VALID_TEMPLATE_ID]);
 
     const transitionLookupCall = tx.query.mock.calls[1]!;
-    expect(String(transitionLookupCall[0])).toContain(
-      'forms_template_admin_review_lifecycle_transition',
-    );
-    expect(transitionLookupCall[1]).toEqual(['Telecheck-US', RETURNED_REVIEW_ID]);
+    expect(String(transitionLookupCall[0])).toContain('forms_admin_submission_receipt');
+    expect(transitionLookupCall[1]).toEqual([RETURNED_REVIEW_ID]);
 
     expect(emitTemplateSubmittedForReviewAudit).toHaveBeenCalledTimes(1);
 
@@ -402,21 +409,21 @@ describe('postFormsTemplateSubmitHandler §5 — audit emission payload', () => 
     expect(txArg).toBe(tx);
   });
 
-  it('§5b falls back to x-actor-id header when actorContext is absent (legacy Tier 2 shim)', async () => {
+  it('§5b rejects the legacy actor header without a verified actor context', async () => {
     const tx = makeFakeTx();
     installDefaultCompositionMocks(tx);
 
-    await postFormsTemplateSubmitHandler(
-      makeReq({
-        actorNonce: 'fake-nonce',
-        actorContext: undefined,
-        headers: { 'x-actor-id': 'legacy-header-actor-id' },
-      }),
-      makeReply(),
-    );
-
-    const [auditArgs] = vi.mocked(emitTemplateSubmittedForReviewAudit).mock.calls[0]!;
-    expect(auditArgs.submitterPrincipalId).toBe('legacy-header-actor-id');
+    await expect(
+      postFormsTemplateSubmitHandler(
+        makeReq({
+          actorNonce: 'fake-nonce',
+          actorContext: undefined,
+          headers: { 'x-actor-id': 'legacy-header-actor-id' },
+        }),
+        makeReply(),
+      ),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(emitTemplateSubmittedForReviewAudit).not.toHaveBeenCalled();
   });
 });
 

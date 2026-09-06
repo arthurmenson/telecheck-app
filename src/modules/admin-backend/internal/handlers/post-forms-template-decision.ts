@@ -136,12 +136,16 @@ import {
   resolveActorTenantIdForAudit,
   requireSliceRoleMembership,
 } from '../../../../lib/auth-context.js';
-import type { DbTransaction } from '../../../../lib/db.js';
+import { withTransaction, type DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { PARTICIPANT_BLOCK_MESSAGE, screenInput } from '../../../../lib/pii-screener/index.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
+import {
+  assertFormsGovernanceScope,
+  recordFormsPublicationEvidence,
+} from '../../../forms-intake/index.js';
 import {
   emitTemplatePublishedViaReviewWorkflowAudit,
   emitTemplateReviewDecisionAudit,
@@ -475,6 +479,25 @@ export async function postFormsTemplateDecisionHandler(
   // legacy paths since the role shim already verified tenant binding.
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
+  if (req.actorNonce === undefined || req.actorContext === undefined)
+    throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  try {
+    await withTransaction((tx) =>
+      assertFormsGovernanceScope(
+        tx,
+        {
+          tenantId: ctx.tenantId,
+          accountId: req.actorContext!.accountId,
+          sessionId: req.actorContext!.sessionId,
+          actorNonce: req.actorNonce!,
+        },
+        'forms.admin.decision',
+      ),
+    );
+  } catch {
+    throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  }
+
   return withIdempotentExecution(req, reply, mapServiceError, async (tx, idempotencyCtx) => {
     // tx is the OPEN business transaction from withIdempotentExecution.
     // The wrapper's per-decision idempotency_key parameter receives the
@@ -551,6 +574,16 @@ export async function postFormsTemplateDecisionHandler(
         // (I-003 durability). reject / request_revision do NOT publish, so
         // no publish audit on those paths.
         if (decision === 'approve') {
+          await recordFormsPublicationEvidence(
+            tx,
+            {
+              tenantId: ctx.tenantId,
+              actorId,
+              actorRole: req.actorContext?.role === 'clinician' ? 'clinician' : 'operator',
+              countryOfCare: ctx.countryOfCare,
+            },
+            templateId,
+          );
           await emitTemplatePublishedViaReviewWorkflowAudit(
             {
               tenantId: ctx.tenantId,

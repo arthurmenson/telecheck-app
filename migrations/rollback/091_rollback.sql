@@ -1,0 +1,10 @@
+SET LOCAL search_path=pg_catalog,public,pg_temp;
+DROP FUNCTION IF EXISTS public.forms_read_governance_artifact(UUID);
+DROP FUNCTION IF EXISTS public.forms_review_governance_artifact(UUID,TEXT,TEXT);
+DROP FUNCTION IF EXISTS public.forms_submit_governance_artifact(TEXT,TEXT,JSONB,BOOLEAN);
+DROP FUNCTION IF EXISTS public.forms_resolve_consult_definition(TEXT,TEXT,TEXT,TEXT,TEXT,BOOLEAN);
+DROP FUNCTION IF EXISTS public.forms_retire_consult_deployment(TEXT);
+DROP FUNCTION IF EXISTS public.forms_deploy_consult_template(TEXT,TEXT);
+DROP FUNCTION IF EXISTS public.forms_publish_template(TEXT);
+DROP FUNCTION IF EXISTS public.forms_create_consult_template(TEXT,TEXT,TEXT,JSONB,JSONB,JSONB,JSONB);
+DROP FUNCTION IF EXISTS public.forms_authorize_operation(TEXT,TEXT,TEXT,TEXT);

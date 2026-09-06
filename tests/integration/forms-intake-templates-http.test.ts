@@ -537,7 +537,7 @@ async function injectWithPublishBypass(injectArgs: InjectOptions): Promise<Light
 }
 
 describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — HTTP-level', () => {
-  it('returns 200 + body when publishing a draft template (bypass set)', async () => {
+  it('rejects a signed token without a live actor binding even when the old bypass is set', async () => {
     const { templateId } = await seedTemplate({ status: 'draft' });
 
     const response = await injectWithPublishBypass({
@@ -553,11 +553,10 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
 
     // Publish flow may return 200 on success. Lax 2xx check to tolerate
     // 204 or similar on the empty-body case.
-    expect(response.statusCode).toBeGreaterThanOrEqual(200);
-    expect(response.statusCode).toBeLessThan(300);
+    expect(response.statusCode).toBe(403);
   });
 
-  it('returns 400 when publishing a non-draft (already-published) template', async () => {
+  it('denies an unbound token before looking up a published template', async () => {
     // Pattern A immutability: a published version cannot be re-published.
     const { templateId } = await seedTemplate({ status: 'published' });
 
@@ -572,11 +571,11 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       payload: {},
     });
 
-    expect(response.statusCode).toBe(400);
+    expect(response.statusCode).toBe(403);
     assertNoTenantIdLeakageInError(response);
   });
 
-  it('returns 400 (tenant-blind) for a non-existent template_id', async () => {
+  it('denies an unbound token before looking up a missing template', async () => {
     const response = await injectWithPublishBypass({
       method: 'POST',
       url: `/v0/forms/templates/${ulid()}/versions/${ulid()}/publish`,
@@ -587,7 +586,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
       },
       payload: {},
     });
-    expect(response.statusCode).toBe(400);
+    expect(response.statusCode).toBe(403);
     assertNoTenantIdLeakageInError(response);
   });
 
@@ -614,7 +613,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
   // posture), the publish endpoint MUST return 503 — preserves the
   // safety floor that publish-time governance gates aren't yet
   // implemented and won't accidentally pass through.
-  it('returns 503 when FORMS_PUBLISH_GATES_BYPASS is absent (fail-closed invariant)', async () => {
+  it('denies an unbound token without FORMS_PUBLISH_GATES_BYPASS', async () => {
     const { templateId } = await seedTemplate({ status: 'draft' });
 
     // Save the env state, ensure bypass is unset for THIS test only,
@@ -638,7 +637,7 @@ describe('POST /v0/forms/templates/:templateId/versions/:versionId/publish — H
         process.env['FORMS_PUBLISH_GATES_BYPASS'] = prior;
       }
     }
-    expect(response.statusCode).toBe(503);
+    expect(response.statusCode).toBe(403);
     assertNoTenantIdLeakageInError(response);
   });
 });

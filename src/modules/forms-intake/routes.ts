@@ -18,6 +18,7 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { registerConsultGovernanceRoutes } from './internal/handlers/consult-governance.js';
 import {
   createDeploymentHandler,
   getDeploymentHandler,
@@ -53,6 +54,7 @@ import {
 export const registerFormsIntakeRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
+  registerConsultGovernanceRoutes(app);
   // ---- Templates ----
   app.post('/templates', createTemplateHandler);
   app.get('/templates', listTemplatesHandler);

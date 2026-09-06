@@ -53,6 +53,22 @@ export type {
 // ---------------------------------------------------------------------------
 
 export { formsIntakePlugin } from './plugin.js';
+export {
+  resolveConsultIntakeDefinition,
+  validateConsultIntake,
+  ConsultDefinitionError,
+} from './internal/services/consult-definition.js';
+export type {
+  ConsultIntakeDefinition,
+  ConsultDefinitionContext,
+  ConsultDefinitionSelection,
+  ConsultIntakeAnswers,
+  ConsultIntakeField,
+} from './internal/services/consult-definition.js';
+export {
+  assertFormsGovernanceScope,
+  recordFormsPublicationEvidence,
+} from './internal/services/publication-evidence.js';
 
 // ---------------------------------------------------------------------------
 // Public functions for cross-module consumers

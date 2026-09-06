@@ -63,7 +63,7 @@ jobs:
       # NODE_ENV=test gates the audit emitter's in-memory fallback path
       # (src/lib/audit.ts emitAudit) so tests that exercise the emitter without a
       # transaction handle don't trip the production-only "I-003 violation" guard.
-      NODE_ENV: "test"
+      NODE_ENV: 'test'
       # Per-tenant KMS dev key. src/lib/kms.ts `deriveTenantKey()` requires a
       # >= 32-char master string in test env; without it every kms.encrypt /
       # kms.decrypt call throws (and ANY test that exercises the layer-3
@@ -79,9 +79,9 @@ jobs:
       # at: ...` and silently passes (its early-return on `!specExists()`).
       # Cloning the sibling spec repo and pointing TELECHECK_SPEC_PATH at the
       # bundle directory activates the spec-presence + length assertions.
-      TELECHECK_SPEC_PATH: "${{ github.workspace }}/telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE"
+      TELECHECK_SPEC_PATH: '${{ github.workspace }}/telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE'
       # Force CI mode in tooling (e.g., disables interactive prompts in any future setup script).
-      CI: "true"
+      CI: 'true'
 
     steps:
       - name: Checkout
@@ -112,8 +112,8 @@ jobs:
       - name: Setup Node 22 LTS
         uses: actions/setup-node@v6
         with:
-          node-version: "22"
-          cache: "npm"
+          node-version: '22'
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
@@ -196,10 +196,32 @@ jobs:
           npm run migrate:apply
 
       - name: Test (vitest)
-        run: npm run test
+        run: npm run test -- --no-file-parallelism
 
       - name: Verify atomic migrations and history integrity (PostgreSQL)
         run: npm run test:migrations
+
+      - name: Verify Forms publication with actual application and binder roles
+        env:
+          PGPASSWORD: telecheck_ci
+          NODE_ENV: development
+          FORMS_MIGRATION_DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_test
+          DATABASE_URL: postgres://telecheck_app_role:forms_ci_app@localhost:5432/telecheck_test
+          BIND_ACTOR_CONTEXT_DATABASE_URL: postgres://bind_actor_context_role:forms_ci_bind@localhost:5432/telecheck_test
+          IDENTITY_DATABASE_URL: postgres://identity_service_role:forms_ci_identity@localhost:5432/telecheck_test
+          DATABASE_SSL_MODE: disable
+          JWT_SIGNING_KEY: synthetic-forms-ci-signing-key-32-chars-minimum
+          RESUME_TOKEN_SECRET: synthetic-forms-ci-resume-key-32-chars-minimum
+          TENANT_HOST_OVERRIDES: localhost=Telecheck-US,ghana.localhost=Telecheck-Ghana
+          SMS_PROVIDER: noop
+          EMAIL_PROVIDER: noop
+        run: |
+          psql -h localhost -U telecheck_ci -d telecheck_test -v ON_ERROR_STOP=1 <<'SQL'
+          ALTER ROLE telecheck_app_role LOGIN PASSWORD 'forms_ci_app';
+          ALTER ROLE bind_actor_context_role LOGIN PASSWORD 'forms_ci_bind';
+          ALTER ROLE identity_service_role LOGIN PASSWORD 'forms_ci_identity';
+          SQL
+          npm run verify:forms-publication
 
       # Coverage report retained as artifact for reviewer inspection.
       # Eventually feeds a coverage gate; for now upload-only.

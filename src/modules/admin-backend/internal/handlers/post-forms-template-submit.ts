@@ -114,11 +114,12 @@ import {
   resolveActorTenantIdForAudit,
   requireSliceRoleMembership,
 } from '../../../../lib/auth-context.js';
-import type { DbTransaction } from '../../../../lib/db.js';
+import { withTransaction, type DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
+import { assertFormsGovernanceScope } from '../../../forms-intake/index.js';
 import { emitTemplateSubmittedForReviewAudit } from '../../audit.js';
 import { TemplateStateConflictError } from '../errors.js';
 
@@ -325,6 +326,25 @@ export async function postFormsTemplateSubmitHandler(
   // legacy paths since the role shim already verified tenant binding.
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
+  if (req.actorNonce === undefined || req.actorContext === undefined)
+    throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  try {
+    await withTransaction((tx) =>
+      assertFormsGovernanceScope(
+        tx,
+        {
+          tenantId: ctx.tenantId,
+          accountId: req.actorContext!.accountId,
+          sessionId: req.actorContext!.sessionId,
+          actorNonce: req.actorNonce!,
+        },
+        'forms.governance.submitted',
+      ),
+    );
+  } catch {
+    throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  }
+
   return withIdempotentExecution(req, reply, mapServiceError, async (tx, _idempotencyCtx) => {
     // tx is the OPEN business transaction from withIdempotentExecution.
     // withTransaction inside that helper has already been entered + tenant
@@ -408,12 +428,8 @@ export async function postFormsTemplateSubmitHandler(
         // migration 043 §1 wrapper body).
         const txTyped: DbTransaction = tx;
         const latestTransition = await txTyped.query<LatestTransitionRow>(
-          `SELECT transition_reason
-             FROM forms_template_admin_review_lifecycle_transition
-            WHERE tenant_id = $1 AND review_id = $2
-            ORDER BY transition_at DESC, id DESC
-            LIMIT 1`,
-          [ctx.tenantId, reviewId],
+          'SELECT public.forms_admin_submission_receipt($1) AS transition_reason',
+          [reviewId],
         );
         const transitionReason = latestTransition.rows[0]?.transition_reason;
         // The wrapper always inserts exactly one lifecycle_transition row

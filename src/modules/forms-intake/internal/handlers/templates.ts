@@ -18,6 +18,7 @@
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { requireAdminRole } from '../../../../lib/admin-role.js';
 import { resolveActorTenantIdForAudit } from '../../../../lib/auth-context.js';
 import { withTransaction } from '../../../../lib/db.js';
@@ -30,24 +31,27 @@ import {
   PUBLISH_VERSION_NOT_DRAFT,
   PUBLISH_VERSION_NOT_FOUND,
 } from '../repositories/template-repo.js';
+import { assertFormsGovernanceScope } from '../services/publication-evidence.js';
 import { checkPublishGateBypassAtRuntime } from '../services/publish-gates-killswitch.js';
 import * as templateService from '../services/template-service.js';
-import {
-  PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME,
-  PUBLISH_GATES_NOT_IMPLEMENTED,
-} from '../services/template-service.js';
+import { PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME } from '../services/template-service.js';
 
 /**
- * Module-local service-error mapper for `withIdempotentExecution`. The
- * forms-intake module currently surfaces preconditions as string-sentinel
- * Error objects, which are caught + remapped to Fastify httpErrors INSIDE
- * the body callback (so the surrounding tx rolls back and the reservation
- * is purged). No domain-specific Error classes flow up to this mapper, so
- * it is a deliberate no-op — unmapped errors propagate to Fastify's global
- * error handler. Same shape as async-consult's mapper, just no cases.
+ * Map shared database authorization and publication failures after the
+ * idempotent transaction has rolled back. Preserve tenant-blind messages.
  */
-function mapServiceError(): boolean {
-  return false;
+function mapServiceError(error: unknown, reply: FastifyReply): boolean {
+  const code = (error as { code?: string })?.code;
+  const status =
+    code === '42501' ? 403 : code === '22023' ? 400 : code === '23514' ? 409 : undefined;
+  if (status === undefined) return false;
+  void reply.code(status).send({
+    error: {
+      code: 'forms.operation_unavailable',
+      message: 'The requested form operation is unavailable.',
+    },
+  });
+  return true;
 }
 
 /**
@@ -292,11 +296,8 @@ export async function getTemplateHandler(
 
 /**
  * POST /v0/forms/templates/:templateId/versions/:versionId/publish — flip
- * a draft version to published. Pre-publish governance gates run inside
- * template-service.publishVersion (six-category I-030 static analysis,
- * marketing-copy resolution, Mode 2 contract conformance — currently
- * scaffolded as TODOs in the service; durability + supersession path is
- * implemented end-to-end).
+ * a draft version to published through the shared database publication gates
+ * and same-transaction audit/outbox evidence used by SI-023.
  *
  * Path-param semantics under FORMS_ENGINE v5.2 Pattern A:
  *   `:versionId` IS the operative key — it maps directly to
@@ -408,14 +409,34 @@ export async function publishVersionHandler(
     );
   }
 
+  if (req.actorNonce === undefined || req.actorContext === undefined)
+    throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  try {
+    await withTransaction((tx) =>
+      assertFormsGovernanceScope(
+        tx,
+        {
+          tenantId: ctx.tenantId,
+          accountId: req.actorContext!.accountId,
+          sessionId: req.actorContext!.sessionId,
+          actorNonce: req.actorNonce!,
+        },
+        'forms.publication.checked',
+      ),
+    );
+  } catch {
+    throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  }
   return withIdempotentExecution(req, reply, mapServiceError, async (tx) => {
     try {
-      const published = await templateService.publishVersion(
-        ctx,
-        { actorId, actorTenantId },
-        versionIdParam,
-        parsed.data,
-        tx,
+      const published = await withActorContext(tx, req.actorNonce!, () =>
+        templateService.publishVersion(
+          ctx,
+          { actorId, actorTenantId },
+          versionIdParam,
+          parsed.data,
+          tx,
+        ),
       );
       return { status: 200, view: published };
     } catch (err) {
@@ -431,17 +452,6 @@ export async function publishVersionHandler(
         // idempotency reservation is purged — clean retry possible.
         throw req.server.httpErrors.badRequest(
           'The requested form version cannot be published in its current state.',
-        );
-      }
-      if (message === PUBLISH_GATES_NOT_IMPLEMENTED) {
-        // 503 Service Unavailable — the publish governance gates haven't
-        // been implemented in this deployment, so publish is fail-closed.
-        // This surfaces to operators as "publishing is not yet enabled in
-        // this environment" rather than a 400 (which would suggest a
-        // client-fixable problem). Codex publishVersion-r1 CRITICAL closure
-        // 2026-05-03.
-        throw req.server.httpErrors.serviceUnavailable(
-          'Form template publishing is not yet enabled in this environment.',
         );
       }
       throw err;
