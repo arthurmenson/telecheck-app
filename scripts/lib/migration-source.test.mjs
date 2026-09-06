@@ -33,6 +33,19 @@ test('accepts unwrapped SQL and ignores transaction words in data', () => {
   );
 });
 
+test('rejects transaction escapes hidden by identifier dollars or CR comments', () => {
+  for (const source of [
+    'CREATE TABLE foo$tag$(id int); COMMIT; CREATE TABLE bar$tag$(id int); SELECT 1/0;',
+    'CREATE TABLE cr_leak(id int) -- split\r; COMMIT;\nSELECT 1/0;',
+  ]) {
+    assert.throws(
+      () => transactionalMigrationSource(source),
+      /migration_source_internal_transaction/,
+    );
+  }
+  assert.equal(splitSql('SELECT $é$COMMIT;$é$; SELECT foo$tag$;').length, 2);
+});
+
 test('all checked-in forward migrations can use one runner-owned transaction', async () => {
   const directory = new URL('../../migrations/', import.meta.url);
   const names = (await readdir(directory)).filter((name) => /^\d{3}_.+\.sql$/.test(name)).sort();

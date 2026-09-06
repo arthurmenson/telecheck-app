@@ -52,6 +52,9 @@ export async function applyMigrations(client, directory, report = () => {}) {
       const source = sources.get(name);
       await client.query('BEGIN');
       try {
+        // A prior migration may persist a session setting. Lexing and the
+        // server must agree for every file, not only the first migration.
+        await client.query('SET LOCAL standard_conforming_strings = on');
         await client.query("SET LOCAL lock_timeout = '10s'");
         await client.query("SET LOCAL statement_timeout = '120s'");
         await client.query(source.sql);
