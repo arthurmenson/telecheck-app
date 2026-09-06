@@ -136,6 +136,10 @@ import { runCrisisGate } from '../crisis/gate.js';
 import { CONSERVATIVE_DEFAULT_TEMPLATE } from '../guardrails/conservative-default.js';
 import { resolveClinicalProvider } from '../providers/resolve-clinical-provider.js';
 import { LLMProviderUnavailableError } from '../providers/types.js';
+import {
+  VendorAuditUnavailableError,
+  VendorEgressBlockedError,
+} from '../providers/vendor-boundary.js';
 import { asAIChatSessionId, type Mode1ChatResponseView } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -304,11 +308,21 @@ function pgErrorCode(err: unknown): string | null {
  * propagate to Fastify's global error handler.
  */
 function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): boolean {
-  if (err instanceof Mode1AuditEmissionFailedError) {
+  if (err instanceof VendorEgressBlockedError) {
+    void reply.code(500).send({
+      error: {
+        code: 'ai.provider.egress_blocked',
+        message: 'AI provider request was blocked by the local privacy control.',
+        request_id: reqId,
+      },
+    });
+    return true;
+  }
+  if (err instanceof Mode1AuditEmissionFailedError || err instanceof VendorAuditUnavailableError) {
     void reply.code(503).send({
       error: {
         code: 'ai_chat.audit_emission_unavailable',
-        message: 'AI chat is temporarily unable to record the response audit. Please try again.',
+        message: 'AI chat is temporarily unable to record a required audit. Please try again.',
         request_id: reqId,
       },
     });
@@ -745,7 +759,17 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
       // withDbRole block (above) has already restored the app role, so this
       // resolver's own withDbRole(ai_service_credential_reader) elevation
       // composes cleanly.
-      const provider = await resolveClinicalProvider({ tx });
+      const provider = await resolveClinicalProvider({
+        tx,
+        auditContext: {
+          tenantId: ctx.tenantId,
+          countryOfCare: ctx.countryOfCare,
+          patientId: actor.accountId,
+          conversationId,
+          messageId,
+          idempotency: idempotencyCtx,
+        },
+      });
       try {
         // Build a minimal completion request matching the canonical
         // LLMCompletionRequest shape (snake_case per spec).

@@ -1,16 +1,17 @@
 /**
- * Provider-independent Layer 4 composition. Not yet wired into resolution:
- * the audit-contract prerequisite must be ratified and implemented first.
+ * Provider-independent Layer 4 composition, installed by the clinical resolver.
  */
 import type { LLMCompletionRequest, LLMProvider } from './types.js';
-import { screenVendorRequest } from './vendor-payload-screening.js';
+import { screenVendorRequest, type VendorRequestScope } from './vendor-payload-screening.js';
 
-/** Local decision metadata; not a registered AuditAction or durable event. */
+/** Internal decision metadata. The recorder projects the canonical audit detail. */
 export interface VendorBoundaryDecision {
   readonly action: 'block' | 'redact';
   readonly reason: 'high_confidence_match' | 'low_confidence_redacted' | 'screening_failed';
   readonly patternIds: readonly string[];
   readonly hitCount: number;
+  /** Opaque retry identity; never part of the audit event's detail. */
+  readonly candidateFingerprint: string | null;
 }
 
 export class VendorEgressBlockedError extends Error {
@@ -36,13 +37,14 @@ export class VendorAuditUnavailableError extends Error {
 export function withVendorBoundary(
   provider: LLMProvider,
   recordDecision: (decision: VendorBoundaryDecision) => Promise<void>,
+  scope?: VendorRequestScope,
 ): LLMProvider {
   if (typeof recordDecision !== 'function') throw new VendorAuditUnavailableError();
   return {
     name: provider.name,
     healthcheck: () => provider.healthcheck(),
     async sendCompletion(request: LLMCompletionRequest) {
-      const result = screenVendorRequest(request);
+      const result = screenVendorRequest(request, scope);
       if (result.action !== 'pass') {
         try {
           await recordDecision({
@@ -50,6 +52,7 @@ export function withVendorBoundary(
             reason: result.action === 'block' ? result.reason : 'low_confidence_redacted',
             patternIds: result.patternIds,
             hitCount: result.hitCount,
+            candidateFingerprint: result.candidateFingerprint,
           });
         } catch {
           // The recorder's exception may carry candidate or DB diagnostic

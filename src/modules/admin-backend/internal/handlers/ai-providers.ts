@@ -417,6 +417,9 @@ export async function testAiProviderHandler(
 
   // Minimal live ping. The key is used ONLY inside the adapter; the response
   // never carries it. Any failure returns ok:false with a NON-key reason.
+  // Layer 4 inventory: this fixed literal credential probe accepts no prompt,
+  // patient text, history or tools. It has no patient-bound Mode 1 audit context.
+  // Any future caller-controlled content must use the reviewed clinical boundary.
   const adapter = new AnthropicLLMProvider({ apiKey: plaintextKey, model: config.anthropicModel });
   try {
     await adapter.sendCompletion({

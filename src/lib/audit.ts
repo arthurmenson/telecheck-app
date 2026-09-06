@@ -129,6 +129,9 @@ type CategoryBAction =
   | 'incident_opened'
   | 'incident_resolved'
   | 'signal_enforcement_trigger'
+  // Layer 4 vendor-boundary decisions (AUDIT_EVENTS v5.5 / P-047).
+  | 'pii.screener.egress_block'
+  | 'pii.screener.egress_redact'
   // Research events (added v5.2 per ADR-028)
   | 'research.consent_granted'
   | 'research.consent_revoked'

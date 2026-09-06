@@ -49,6 +49,7 @@ export default defineConfig({
       'src/lib/pii-screener/index.test.ts',
       'src/lib/pii-screener/log-redaction.test.ts',
       'src/modules/ai-service/internal/providers/vendor-payload-screening.test.ts',
+      'src/modules/ai-service/internal/providers/resolve-clinical-provider.test.ts',
     ],
 
     // No `setupFiles`. That omission is the entire point of this config.

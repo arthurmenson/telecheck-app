@@ -1,34 +1,32 @@
 # Sprint 1.2b vendor boundary — implementation status
 
-**Status: DRAFT / NOT ACTIVE.** The local scanner and provider wrapper are implemented and tested. `resolveClinicalProvider` does not yet install the wrapper, so this branch does not claim production Layer 4 enforcement or sprint completion.
+**Status: implemented for the active Mode 1 clinical path; merge requires independent review and green full CI.** The canonical contract is AUDIT_EVENTS v5.5 / P-047 in `arthurmenson/telecheckONE`. The user authorized autonomous completion under counsel recommendations on 2026-09-06; the preserved decision packet records the recommendations and delegated execution authority.
 
-## Implemented components
+## Enforcement
 
-- `vendor-payload-screening.ts` uses only the local regex library. It blocks high-confidence matches and returns a cloned, redacted request for lower-confidence matches. Block results contain no payload or matched values.
-- System messages are checked after the exact `\n\n` concatenation used by the current Anthropic adapter. Non-system turns retain their order. Clean wire bodies are unchanged.
-- Every current regex category is covered, including validation and overlap behavior. Shared regex cursors are not modified.
-- Redaction can expose new regex boundaries. After each replacement pass the scanner checks all resulting prompt fields again, blocking newly exposed high-confidence hits and removing newly exposed low-confidence hits. Only a match-free pass releases the payload; exhaustion of the bounded pass budget fails closed. This closes the independent R1 finding reproduced with `::1MRN 543210` and `::1passport no. AB1234567`.
-- Unknown request/message fields fail closed. Compile-time field coverage requires a screening decision if the provider request interface grows; tool content is currently unsupported and must not pass uninspected.
-- `vendor-boundary.ts` composes with an arbitrary `LLMProvider`. It requires an explicit decision recorder, awaits it before any redacted dispatch, and prevents dispatch for blocked, screening-failed, or recorder-failed requests. The recorder receives metadata only. Candidate-bearing recorder exceptions are not propagated.
-- Tests capture actual serialized Anthropic bodies through a fake transport, verify blocked requests never reach it, and check audit ordering and snapshot isolation during asynchronous recording. The fake recorder is test evidence for callback ordering, not proof of durable audit persistence.
+- `resolveClinicalProvider` installs the boundary on both real credential paths: admin-managed DB key and environment fallback. It requires trusted Mode 1 attribution and the matching pending idempotency reservation, including for clean sends. Unconfigured Null behavior and credential healthchecks retain their existing behavior.
+- `vendor-payload-screening.ts` snapshots supported data properties, rejects unknown/accessor fields and mismatched tenant/workload, and uses the existing local regex library without NER or an external classifier. System messages are scanned after the exact two-newline join used by the serializer; other turns retain their order.
+- High-confidence matches block before transport. Lower-confidence matches are replaced with `[REDACTED:PII]`. Subsequent passes catch identifiers exposed by replacement; only a match-free pass releases the payload. Exhausting the bounded pass budget fails closed. This closes the independent review finding reproduced with `::1MRN 543210` and `::1passport no. AB1234567`.
+- The wrapper requires a durable recorder. A local block returns the tenant-blind `500 ai.provider.egress_blocked`; recording failure returns `503 ai_chat.audit_emission_unavailable`. Neither becomes a provider outage. Genuine upstream failures retain the existing Mode 1 fail-soft response; the crisis gate still runs before Layer 1.
 
-## Prerequisites before resolver wiring and merge
+## Durable evidence
 
-The detailed Layer 4 section in `PII_SCREENING_AND_LOG_REDACTION_SPEC.md` requires `pii.screener.egress_block` and `pii.screener.egress_redact`. They are absent from the verified canonical AUDIT_EVENTS v5.4 catalog and the implementation's `AuditAction` union. The PII spec itself calls for screener-event registration through an SI extension. Event classification, required detail, and durable retry semantics need the contract-owner decision; this branch registers no canonical actions.
+`vendor-audit.ts` records the two unsampled Category B actions through existing tenant-bound append-only audit primitives on the tenant governance chain (`target_patient_id = null`). Its seven-field detail contains only layer, provider, patient ID, message ID, sorted pattern IDs, accepted-match count and closed reason. Screening failure uses an unknown count (`null`). Candidate strings, candidate fingerprints, matched values, credentials and raw diagnostic errors never enter this event.
 
-The detailed high-confidence block rule also conflicts with the PII document's unconditional-send non-goal. The components follow the detailed Layer 4 decision rule, pending explicit resolution of that prose conflict.
+The recorder uses a fresh transaction and commits before a redacted send or local block. A namespaced marker and its audit event commit atomically. Equivalent candidates reuse committed evidence within the original reservation window; retries rescreen, changed raw candidates/rules/model/control values and trusted identities do not reuse evidence, and expired markers are reclaimed without a cleanup job. The reservation is read in the caller's transaction, preserving PostgreSQL microseconds. Pool acquisition and SQL waits are bounded; any failure prevents dispatch. No schema, roles, outbox or audit partition changes are needed.
 
-Required remaining work:
+## Verification
 
-1. Ratify the narrow event registration and durability behavior using the required independent recommendations. Do not infer approval from the draft components.
-2. Implement the approved recorder with trusted tenant/actor context and existing append-only audit primitives. Its promise must resolve only after durable commit, independently of a business transaction that might roll back.
-3. Wire the wrapper centrally around every real provider returned by `resolveClinicalProvider`, including both credential resolution paths. Preserve the Null provider's fail-soft behavior.
-4. Map `VendorEgressBlockedError` to the specified tenant-blind `500 ai.provider.egress_blocked`. Map audit failure through the approved unavailable-audit path. Preserve crisis ordering and unrelated provider errors.
-5. Add DB-backed tests for durable evidence after rollback, provider failures, retry deduplication, cross-tenant isolation, and audit failure. Add resolver/HTTP integration tests proving the active path uses the wrapper.
-6. Obtain independent adversarial approval of the complete diff and green full CI before merge. Append the required Addendum and cockpit revision after merge.
+- DB-free tests cover every regex category across all prompt roles, assembled-system matches, overlap/validation, mutation and accessor rejection, bounded rescanning, fingerprints, both resolver credential paths, scope/context failures, actual Anthropic JSON serialization, and awaited audit-before-send ordering.
+- HTTP tests exercise the real chat handler, resolver and adapter with a fake vendor transport. A selective test-only Layer 1 bypass exposes the defense-in-depth Layer 4 path; separate cases keep Layer 1 and crisis behavior intact. The recorder callback is mocked here, while independent-connection database tests prove durability.
+- PostgreSQL tests use real separate connections and existing non-superuser/RLS behavior. They cover outer rollback, post-audit provider failure, failed INSERT rollback, lost COMMIT acknowledgement, concurrent claims, changed identities, cross-tenant isolation, exact expiry, expiry races, hash-chain integrity, pool saturation and audit-chain lock contention.
 
-## Limits that remain explicit
+Review and full CI results belong to PR #283 and the post-merge Addendum; this file describes implemented behavior, not a deployment authorization.
 
-Regex-only screening cannot identify names or prose addresses. Pilot 1 Day-0 remains blocked on the separately documented NER remedy and other operator gates. No component here performs external classification, changes crisis behavior, changes canonical schema, or authorizes a deployment.
+## Scope and remaining launch gates
 
-The streaming performance prerequisite merged through PR #282 as `bbfbe534bdfb111b824de3aa409a03259fb5756d`. This branch is rebased on that main commit; the Layer 4 PR diff remains separate from the streaming patch.
+Mode 1 is the only currently active clinical provider caller. Mode 2 retains the Null provider. The admin credential probe sends the fixed literal `ping` with no patient-controlled prompt; changing that requires a reviewed boundary and attribution contract.
+
+Regex-only screening does not identify every name or prose address. The separate Pilot 1 Day-0 NER remedy and operator gates remain. Layer 4 completion does not claim zero PHI for arbitrary natural language or authorize deployment.
+
+The streaming performance prerequisite merged through PR #282 as `bbfbe534bdfb111b824de3aa409a03259fb5756d`, preserving all existing security assertions. PR #283 is based on that commit.

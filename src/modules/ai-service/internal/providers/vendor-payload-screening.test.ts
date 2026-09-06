@@ -71,7 +71,13 @@ describe('screenVendorRequest — local regex component (not resolver wiring)', 
       { role: 'user', content: 'What time should I take my medication today?' },
     ]);
     const result = screenVendorRequest(input);
-    expect(result).toEqual({ action: 'pass', patternIds: [], hitCount: 0, request: input });
+    expect(result).toEqual({
+      action: 'pass',
+      patternIds: [],
+      hitCount: 0,
+      candidateFingerprint: expect.any(String),
+      request: input,
+    });
     if (result.action === 'block') throw new Error('expected sendable request');
     expect(result.request).not.toBe(input);
     expect(result.request.messages).not.toBe(input.messages);
@@ -195,6 +201,7 @@ describe('screenVendorRequest — local regex component (not resolver wiring)', 
       reason: 'screening_failed',
       patternIds: [],
       hitCount: 0,
+      candidateFingerprint: null,
     });
   });
 
@@ -213,6 +220,7 @@ describe('screenVendorRequest — local regex component (not resolver wiring)', 
       reason: 'screening_failed',
       patternIds: [],
       hitCount: 0,
+      candidateFingerprint: null,
     });
   });
 
@@ -228,6 +236,84 @@ describe('screenVendorRequest — local regex component (not resolver wiring)', 
     ]);
     expect(screenVendorRequest(input).action).toBe('block');
     expect(getter).not.toHaveBeenCalled();
+  });
+
+  it('fingerprints the original assembled candidate, before redaction', () => {
+    const first = request([{ role: 'user', content: 'Use 192.0.2.1' }]);
+    const second = request([{ role: 'user', content: 'Use 192.0.2.2' }]);
+    const a = screenVendorRequest(first);
+    const b = screenVendorRequest(second);
+    expect(a.action).toBe('redact');
+    expect(b.action).toBe('redact');
+    if (a.action === 'block' || b.action === 'block') throw new Error('expected redaction');
+    expect(a.request).toEqual(b.request);
+    expect(a.candidateFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(a.candidateFingerprint).not.toBe(b.candidateFingerprint);
+    expect(screenVendorRequest(first).candidateFingerprint).toBe(a.candidateFingerprint);
+    expect(
+      screenVendorRequest(
+        request([
+          { role: 'system', content: 'passport' },
+          { role: 'system', content: 'ABCDE1234' },
+        ]),
+      ).candidateFingerprint,
+    ).toBe(
+      screenVendorRequest(request([{ role: 'system', content: 'passport\n\nABCDE1234' }]))
+        .candidateFingerprint,
+    );
+  });
+
+  it('separates changed prompt scaffolding, history, controls, model and validator rules', () => {
+    const input = request([{ role: 'user', content: 'Use 192.0.2.1' }]);
+    const scope = {
+      tenantId: 'Telecheck-US',
+      workloadType: 'conversational_assistant',
+      model: 'model-a',
+    } as const;
+    const fingerprint = screenVendorRequest(input, scope).candidateFingerprint;
+    for (const changed of [
+      {
+        ...input,
+        messages: [{ role: 'system' as const, content: 'New scaffold' }, ...input.messages],
+      },
+      {
+        ...input,
+        messages: [{ role: 'assistant' as const, content: 'Prior reply' }, ...input.messages],
+      },
+      { ...input, max_output_tokens: 512 },
+      { ...input, temperature: 0.5 },
+    ])
+      expect(screenVendorRequest(changed, scope).candidateFingerprint).not.toBe(fingerprint);
+    expect(
+      screenVendorRequest(input, { ...scope, model: 'model-b' }).candidateFingerprint,
+    ).not.toBe(fingerprint);
+    const pattern = PII_PATTERNS.find((p) => p.id === 'credit_card')!;
+    vi.spyOn(pattern, 'validate').mockImplementation(() => false);
+    expect(screenVendorRequest(input, scope).candidateFingerprint).not.toBe(fingerprint);
+  });
+
+  it.each([
+    { tenant_id: 'Telecheck-GH' },
+    { workload_type: 'protocol_execution' },
+    { max_output_tokens: 0 },
+    { max_output_tokens: -1 },
+    { max_output_tokens: 1.5 },
+    { max_output_tokens: Infinity },
+    { temperature: -0.1 },
+    { temperature: 1.1 },
+  ])('fails closed on mismatched scope or invalid controls %#', (overrides) => {
+    expect(
+      screenVendorRequest(
+        { ...request([{ role: 'user', content: 'Hello' }]), ...overrides } as LLMCompletionRequest,
+        { tenantId: 'Telecheck-US', workloadType: 'conversational_assistant' },
+      ),
+    ).toEqual({
+      action: 'block',
+      reason: 'screening_failed',
+      hitCount: 0,
+      patternIds: [],
+      candidateFingerprint: null,
+    });
   });
 });
 
@@ -306,6 +392,7 @@ describe('screened component output through the actual Anthropic serializer', ()
         reason: 'high_confidence_match',
         patternIds: expect.arrayContaining(['ipv6', 'medical_record_number']),
         hitCount: 2,
+        candidateFingerprint: expect.any(String),
       });
     },
   );
@@ -334,6 +421,7 @@ describe('screened component output through the actual Anthropic serializer', ()
         reason: 'low_confidence_redacted',
         patternIds: expect.arrayContaining(['ipv6', 'us_passport']),
         hitCount: 2,
+        candidateFingerprint: expect.any(String),
       });
     },
   );
@@ -354,6 +442,7 @@ describe('screened component output through the actual Anthropic serializer', ()
       reason: 'screening_failed',
       patternIds: [],
       hitCount: 0,
+      candidateFingerprint: null,
     });
   });
 
@@ -426,6 +515,7 @@ describe('screened component output through the actual Anthropic serializer', ()
       reason: 'screening_failed',
       patternIds: [],
       hitCount: 0,
+      candidateFingerprint: null,
     });
     expect(bodies).toEqual([]);
   });

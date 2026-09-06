@@ -1,24 +1,36 @@
 /**
- * Local regex component for PII spec Layer 4. This is not an audit emitter
- * or a provider wrapper: resolver wiring must supply the required durable
- * audit behavior before this component becomes an enforcement boundary.
+ * Local regex component for PII spec Layer 4. The clinical resolver supplies
+ * the required tenant binding and durable decision recorder around this scan.
  *
  * No NER or network imports. Names and prose addresses remain outside the
  * regex library's coverage; this component does not lift the Day-0 NER gate.
  */
-import { PII_PATTERNS } from '../../../../lib/pii-screener/patterns.js';
+import { createHash } from 'node:crypto';
 
-import type { LLMCompletionRequest, LLMMessage } from './types.js';
+import { isLuhnValid, PII_PATTERNS } from '../../../../lib/pii-screener/patterns.js';
+
+import type { ActiveLLMWorkloadType, LLMCompletionRequest, LLMMessage } from './types.js';
 
 export const VENDOR_REDACTION_TOKEN = '[REDACTED:PII]';
 // Replacements can expose a previously hidden word boundary. Bound the work
 // if a future pattern repeatedly matches our own token; exhaustion fails closed.
 const MAX_SCREENING_PASSES = 16;
+// Bump when screening/serialization semantics or validator dependencies change.
+// Current regexes, validators and their Luhn helper are included below too.
+const SCREENING_VERSION = 'layer4-v1';
+
+export interface VendorRequestScope {
+  readonly tenantId: string;
+  readonly workloadType: ActiveLLMWorkloadType;
+  readonly model?: string;
+}
 
 interface ScreeningSummary {
   /** Library identifiers only; never candidate strings or matched values. */
   readonly patternIds: readonly string[];
   readonly hitCount: number;
+  /** Internal retry identity only. Never persist this value in an audit row. */
+  readonly candidateFingerprint: string | null;
 }
 
 export type VendorScreeningResult = ScreeningSummary &
@@ -62,7 +74,10 @@ function fields(value: unknown, expected: object): Record<string, unknown> {
  * blocked results deliberately have no payload, matches, or error messages.
  * The caller still owes durable audit and must honor action before dispatch.
  */
-export function screenVendorRequest(request: LLMCompletionRequest): VendorScreeningResult {
+export function screenVendorRequest(
+  request: LLMCompletionRequest,
+  scope?: VendorRequestScope,
+): VendorScreeningResult {
   try {
     const input = fields(request, REQUEST_FIELDS);
     if (
@@ -70,9 +85,14 @@ export function screenVendorRequest(request: LLMCompletionRequest): VendorScreen
         input.workload_type !== 'protocol_execution') ||
       typeof input.tenant_id !== 'string' ||
       typeof input.max_output_tokens !== 'number' ||
-      !Number.isFinite(input.max_output_tokens) ||
+      !Number.isSafeInteger(input.max_output_tokens) ||
+      input.max_output_tokens <= 0 ||
       typeof input.temperature !== 'number' ||
       !Number.isFinite(input.temperature) ||
+      input.temperature < 0 ||
+      input.temperature > 1 ||
+      (scope !== undefined &&
+        (input.tenant_id !== scope.tenantId || input.workload_type !== scope.workloadType)) ||
       !Array.isArray(input.messages)
     ) {
       throw new Error('invalid shape');
@@ -94,6 +114,32 @@ export function screenVendorRequest(request: LLMCompletionRequest): VendorScreen
     // The adapter joins system messages with two newlines. Checking them
     // individually misses context-bound patterns spanning that separator.
     if (systems.length > 0) messages.unshift({ role: 'system', content: systems.join('\n\n') });
+
+    // Only serialize freshly constructed data from the validated snapshot.
+    // Serializing the raw caller object could invoke getters/toJSON or include
+    // unsupported candidate-bearing fields. The digest remains internal to the
+    // marker key; provider and decision metadata are added by the recorder.
+    const candidateFingerprint = createHash('sha256')
+      .update(
+        JSON.stringify({
+          version: SCREENING_VERSION,
+          luhnValidator: isLuhnValid.toString(),
+          model: scope?.model ?? null,
+          rules: PII_PATTERNS.map((pattern) => [
+            pattern.id,
+            pattern.confidence,
+            pattern.regex.source,
+            pattern.regex.flags,
+            pattern.validate?.toString() ?? null,
+          ]),
+          tenant: input.tenant_id,
+          workload: input.workload_type,
+          maxTokens: input.max_output_tokens,
+          temperature: input.temperature,
+          messages,
+        }),
+      )
+      .digest('hex');
 
     const patternIds = new Set<string>();
     let hitCount = 0;
@@ -137,7 +183,7 @@ export function screenVendorRequest(request: LLMCompletionRequest): VendorScreen
         return { role: message.role, content };
       });
 
-      const summary = { patternIds: [...patternIds], hitCount };
+      const summary = { patternIds: [...patternIds].sort(), hitCount, candidateFingerprint };
       if (highConfidence) return { ...summary, action: 'block', reason: 'high_confidence_match' };
       // Only release content after a complete pass finds no accepted match.
       // For example, replacing ::1 in ::1MRN 543210 exposes a high-confidence
@@ -158,6 +204,12 @@ export function screenVendorRequest(request: LLMCompletionRequest): VendorScreen
     throw new Error('screening did not converge');
   } catch {
     // Never expose a validator/getter/shape failure's candidate-bearing text.
-    return { action: 'block', reason: 'screening_failed', patternIds: [], hitCount: 0 };
+    return {
+      action: 'block',
+      reason: 'screening_failed',
+      patternIds: [],
+      hitCount: 0,
+      candidateFingerprint: null,
+    };
   }
 }
