@@ -267,6 +267,7 @@ describe('with-db-role §5 — allowlist composition', () => {
       // SI-025 table/SECDEF owner identity (migration 079)
       'ai_provider_credential_owner',
       'pharmacy_patient_read_owner',
+      'async_consult_history_read_owner',
       'consult_lifecycle_transition_writer_owner',
       'consult_initiation_wrapper_owner',
       'consult_intake_wrapper_owner',

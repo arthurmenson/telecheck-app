@@ -192,7 +192,9 @@ try {
       'SELECT id FROM public.medication_requests',
       'SELECT nonce FROM public._session_actor_context',
       'SELECT * FROM public.read_patient_medication_requests()',
+      'SELECT * FROM public.async_consult_assert_live_patient()',
       'SET LOCAL ROLE pharmacy_patient_read_owner',
+      'SET LOCAL ROLE async_consult_history_read_owner',
       'SET LOCAL ROLE bind_actor_context_role',
       'SET LOCAL ROLE identity_service_role',
       'SET LOCAL ROLE kms_service_role',
@@ -202,28 +204,33 @@ try {
         (error) => error.code === '42501',
       );
     }
-    for (const isolation of ['REPEATABLE READ', 'SERIALIZABLE']) {
-      await assert.rejects(
-        sqlRead(
-          tenant,
-          nonce,
-          async (client) => {
-            await client.query('SET LOCAL ROLE pharmacy_patient_reader');
-            return client.query('SELECT * FROM public.read_patient_medication_requests()');
-          },
-          isolation,
-        ),
-        (error) => error.code === 'PT503',
-      );
-    }
-    for (const invalidNonce of ['', randomUUID(), 'malformed']) {
-      await assert.rejects(
-        sqlRead(tenant, invalidNonce, async (client) => {
-          await client.query('SET LOCAL ROLE pharmacy_patient_reader');
-          return client.query('SELECT * FROM public.read_patient_medication_requests()');
-        }),
-        (error) => error.code === 'PT401',
-      );
+    for (const [reader, operation] of [
+      ['pharmacy_patient_reader', 'SELECT * FROM public.read_patient_medication_requests()'],
+      ['async_consult_patient_reader', 'SELECT * FROM public.async_consult_assert_live_patient()'],
+    ]) {
+      for (const isolation of ['REPEATABLE READ', 'SERIALIZABLE']) {
+        await assert.rejects(
+          sqlRead(
+            tenant,
+            nonce,
+            async (client) => {
+              await client.query(`SET LOCAL ROLE ${reader}`);
+              return client.query(operation);
+            },
+            isolation,
+          ),
+          (error) => error.code === 'PT503',
+        );
+      }
+      for (const invalidNonce of ['', randomUUID(), 'malformed']) {
+        await assert.rejects(
+          sqlRead(tenant, invalidNonce, async (client) => {
+            await client.query(`SET LOCAL ROLE ${reader}`);
+            return client.query(operation);
+          }),
+          (error) => error.code === 'PT401',
+        );
+      }
     }
     const shadow = await sqlRead(tenant, nonce, async (client) => {
       for (const table of [
@@ -293,6 +300,109 @@ try {
     assert.equal(history.status, 200);
     assert.equal(history.cache, 'no-store');
     assert.deepEqual(history.body, { rows: [], limit: 25, offset: 0, has_more: false });
+    // Metadata-only fixture, deliberately distinct from care/payment acceptance.
+    // A nonempty protected result is needed to detect accidental disclosure.
+    const consultId = ulid();
+    await control.query(
+      `INSERT INTO public.consult
+       (id,tenant_id,patient_id,consult_type,initiation_source,consult_fee_cents,currency,
+        payment_provider,payment_intent_id,expected_turnaround_at)
+       VALUES ($1,$2,$3,'general','care_tab',0,$4,'mock_local_dev',$5,clock_timestamp()+interval '1 day')`,
+      [consultId, tenant, profile.body.account_id, country === 'US' ? 'USD' : 'GHS', ulid()],
+    );
+    const populatedHistory = await call(host, 'GET', '/v1/async-consults', undefined, token);
+    assert.equal(populatedHistory.status, 200);
+    assert.equal(populatedHistory.body.rows.length, 1);
+    assert.equal(populatedHistory.body.rows[0].consult_id, consultId);
+    for (const kind of ['medication', 'history']) {
+      for (const expiration of ['session', 'nonce']) {
+        const blocker = new pg.Client({ connectionString: adminUrl });
+        await blocker.connect();
+        await blocker.query('BEGIN');
+        const relation = kind === 'history' ? 'consult' : 'medication_requests';
+        await blocker.query(`LOCK TABLE public.${relation} IN ACCESS EXCLUSIVE MODE`);
+        // The JWT remains valid; only the owned persisted session is expiring.
+        if (expiration === 'session') {
+          await control.query(
+            "UPDATE public.sessions SET expires_at=clock_timestamp()+interval '1 second' WHERE session_id=$1",
+            [claims.session_id],
+          );
+        }
+        let finished = false;
+        const pending = call(
+          host,
+          'GET',
+          kind === 'history' ? '/v1/async-consults' : medicationsPath,
+          undefined,
+          token,
+        ).finally(() => {
+          finished = true;
+        });
+        try {
+          let blocked = false;
+          for (let attempt = 0; attempt < 100; attempt++) {
+            const waiting = await control.query(
+              "SELECT count(*)::int AS count FROM pg_catalog.pg_stat_activity WHERE datname=$1 AND usename='telecheck_app_role' AND wait_event_type='Lock' AND query LIKE $2",
+              [
+                dbOptions.database,
+                kind === 'history'
+                  ? '%async_consult_patient_summary_v%'
+                  : '%read_patient_medication_requests%',
+              ],
+            );
+            if (waiting.rows[0].count > 0) {
+              blocked = true;
+              break;
+            }
+            if (finished) break;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          assert(
+            blocked,
+            'read must reach the protected relation after successful preauthorization',
+          );
+          if (expiration === 'nonce') {
+            await control.query(
+              "UPDATE public._session_actor_context SET expires_at=clock_timestamp()+interval '0.1 second' WHERE actor_account_id=$1",
+              [profile.body.account_id],
+            );
+          }
+          await new Promise((resolve) =>
+            setTimeout(resolve, expiration === 'session' ? 1100 : 200),
+          );
+          const expired =
+            expiration === 'session'
+              ? await control.query(
+                  'SELECT expires_at <= clock_timestamp() AS expired FROM public.sessions WHERE session_id=$1',
+                  [claims.session_id],
+                )
+              : await control.query(
+                  'SELECT bool_and(expires_at <= clock_timestamp()) AS expired FROM public._session_actor_context WHERE actor_account_id=$1',
+                  [profile.body.account_id],
+                );
+          assert.equal(expired.rows[0].expired, true);
+        } finally {
+          await blocker.query('COMMIT');
+          await blocker.end();
+        }
+        try {
+          const denied = await pending;
+          assert.equal(
+            denied.status,
+            401,
+            `${country} ${kind} ${expiration} expiry must deny disclosure`,
+          );
+          assert.equal(denied.cache, 'no-store');
+          assert.equal(denied.body.rows, undefined);
+          assert.equal(denied.body.prescriptions, undefined);
+        } finally {
+          await control.query(
+            "UPDATE public.sessions SET expires_at=clock_timestamp()+interval '1 hour' WHERE session_id=$1",
+            [claims.session_id],
+          );
+        }
+      }
+    }
     const foreign = await call(
       host === 'localhost' ? 'ghana.heroshealth.com' : 'localhost',
       'GET',
@@ -323,6 +433,7 @@ try {
       malformedNonceDenied: true,
       shadowObjectsIgnored: true,
       concurrentDeletionAndRevocationDenied: true,
+      historyAndMedicationWallClockExpiryDenied: true,
       missingMedication: true,
       noStore: true,
       foreignTenantDenied: true,

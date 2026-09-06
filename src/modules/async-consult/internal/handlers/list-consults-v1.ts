@@ -7,12 +7,6 @@ import { withTransaction, type DbTransaction } from '../../../../lib/db.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
-import {
-  asAccountId,
-  asSessionId,
-  findAccountById,
-  findActiveSessionById,
-} from '../../../identity/index.js';
 
 import { makeErrorEnvelope, pgErrorCode } from './v1-shared.js';
 
@@ -56,19 +50,19 @@ export async function listConsultsV1Handler(req: FastifyRequest, reply: FastifyR
   }
 
   async function requireLivePatient(tx: DbTransaction) {
-    const session = await findActiveSessionById(ctx, asSessionId(actor.sessionId), tx);
-    const account = await findAccountById(ctx, asAccountId(actor.accountId), tx);
-    const tenant = await tx.query(
-      "SELECT id FROM public.tenants WHERE id=$1 AND status='active' AND country_of_care=$2",
-      [ctx.tenantId, ctx.countryOfCare],
-    );
+    const result = await tx.query<{
+      tenant_id: string;
+      account_id: string;
+      session_id: string;
+      country_of_care: string;
+    }>('SELECT * FROM public.async_consult_assert_live_patient()');
+    const live = result.rows[0];
     if (
-      tenant.rows.length !== 1 ||
-      session?.account_id !== actor.accountId ||
-      account?.account_type !== 'patient' ||
-      account.status !== 'active' ||
-      account.deleted_at !== null ||
-      account.country_of_care !== ctx.countryOfCare
+      result.rows.length !== 1 ||
+      live?.tenant_id !== ctx.tenantId ||
+      live.account_id !== actor.accountId ||
+      live.session_id !== actor.sessionId ||
+      live.country_of_care !== ctx.countryOfCare
     )
       throw new UnauthenticatedError();
   }
@@ -84,29 +78,33 @@ export async function listConsultsV1Handler(req: FastifyRequest, reply: FastifyR
         if (isolation.rows[0]?.value !== 'read committed') {
           throw req.server.httpErrors.serviceUnavailable('Consultation history is unavailable.');
         }
-        await requireLivePatient(tx);
-        const result = await withActorContext(tx, nonce, () =>
-          withDbRole(tx, 'async_consult_patient_reader', () =>
-            tx.query<HistoryRow>(
+        return withActorContext(tx, nonce, () =>
+          withDbRole(tx, 'async_consult_patient_reader', async () => {
+            await requireLivePatient(tx);
+            const result = await tx.query<HistoryRow>(
               `SELECT consult_id, consult_type, created_at, current_state, decision_type,
                   follow_up_message_count, last_transition_at
              FROM public.async_consult_patient_summary_v
             WHERE patient_id = $1
             ORDER BY created_at DESC, consult_id DESC LIMIT $2 OFFSET $3`,
               [actor.accountId, limit + 1, offset],
-            ),
-          ),
+            );
+            // Separate READ COMMITTED query, using clock_timestamp(): both
+            // revocation and expiry during a blocked read deny disclosure.
+            await requireLivePatient(tx);
+            return result.rows;
+          }),
         );
-        // Revocation/deletion committed while the read was running still denies
-        // disclosure. Each query uses the normal READ COMMITTED snapshot.
-        await requireLivePatient(tx);
-        return result.rows;
       });
     });
     return reply
       .code(200)
       .send({ rows: rows.slice(0, limit), limit, offset, has_more: rows.length > limit });
   } catch (error) {
+    if (pgErrorCode(error) === 'PT401') throw new UnauthenticatedError();
+    if (pgErrorCode(error) === 'PT503') {
+      throw req.server.httpErrors.serviceUnavailable('Consultation history is unavailable.');
+    }
     if (pgErrorCode(error) === '42501') {
       throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
     }
