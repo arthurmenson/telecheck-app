@@ -49,6 +49,8 @@ export default defineConfig({
       'tests/integration/kms.test.ts',
       'tests/unit/check-log-call-sites.test.ts',
       'src/lib/pii-screener/index.test.ts',
+      'src/lib/pii-screener/ner.test.ts',
+      'src/lib/pii-screener/ner-failure.test.ts',
       'src/lib/pii-screener/log-redaction.test.ts',
       'src/modules/ai-service/internal/providers/vendor-payload-screening.test.ts',
       'src/modules/ai-service/internal/providers/resolve-clinical-provider.test.ts',

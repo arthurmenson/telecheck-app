@@ -64,12 +64,18 @@ vi.mock('../../audit.js', () => ({
   emitTemplatePublishedViaReviewWorkflowAudit: vi.fn(),
 }));
 
+vi.mock('../../../../lib/pii-screener/ner.js', async (original) => {
+  const actual = await original<typeof import('../../../../lib/pii-screener/ner.js')>();
+  return { ...actual, classifyEntities: vi.fn(actual.classifyEntities) };
+});
+
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import {
   requireSliceRoleMembership,
   resolveActorTenantIdForAudit,
 } from '../../../../lib/auth-context.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
+import { classifyEntities } from '../../../../lib/pii-screener/ner.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
@@ -108,6 +114,8 @@ function makeReq(opts?: {
   actorAccountId?: string;
 }): FastifyRequest {
   const httpErrors = {
+    unprocessableEntity: (msg?: string) =>
+      Object.assign(new Error(msg ?? 'Unprocessable'), { statusCode: 422 }),
     forbidden: (msg?: string) => Object.assign(new Error(msg ?? 'Forbidden'), { statusCode: 403 }),
     notFound: (msg?: string) => Object.assign(new Error(msg ?? 'Not Found'), { statusCode: 404 }),
     badRequest: (msg?: string) =>
@@ -122,6 +130,7 @@ function makeReq(opts?: {
       ? { accountId: opts.actorAccountId }
       : { accountId: 'admin-account-fake-id' },
     server: { httpErrors },
+    log: { warn: vi.fn() },
   } as unknown as FastifyRequest;
 }
 
@@ -454,5 +463,39 @@ describe('postFormsTemplateDecisionHandler §8 — publish audit on approve path
       expect(emitTemplateReviewDecisionAudit).toHaveBeenCalledTimes(1);
       expect(emitTemplatePublishedViaReviewWorkflowAudit).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe('admin NER and resource failures before append-only audit', () => {
+  beforeEach(() => vi.resetAllMocks());
+  it.each([
+    { review_notes: 'Patient Ama Serwaa lives in Accra.' },
+    { review_notes: 'x'.repeat(16_001) },
+    { items: Array.from({ length: 65 }, () => 'ok') },
+  ])(
+    'rejects sensitive or unscreenable payload before opening a write',
+    async (decision_payload) => {
+      const tx = makeFakeTx();
+      installDefaultCompositionMocks(tx);
+      await expect(
+        postFormsTemplateDecisionHandler(
+          makeReq({ body: { decision: 'approve', decision_payload } }),
+          makeReply(),
+        ),
+      ).rejects.toMatchObject({ statusCode: 422 });
+      expect(withIdempotentExecution).not.toHaveBeenCalled();
+      expect(tx.query).not.toHaveBeenCalled();
+      expect(emitTemplateReviewDecisionAudit).not.toHaveBeenCalled();
+    },
+  );
+  it('rejects local inference failure before append-only audit', async () => {
+    const tx = makeFakeTx();
+    installDefaultCompositionMocks(tx);
+    vi.mocked(classifyEntities).mockRejectedValueOnce(new Error('private native error'));
+    await expect(postFormsTemplateDecisionHandler(makeReq(), makeReply())).rejects.toMatchObject({
+      statusCode: 422,
+    });
+    expect(emitTemplateReviewDecisionAudit).not.toHaveBeenCalled();
+    expect(withIdempotentExecution).not.toHaveBeenCalled();
   });
 });

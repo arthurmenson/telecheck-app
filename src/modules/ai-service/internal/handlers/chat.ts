@@ -526,7 +526,9 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
     // (high OR low confidence) blocks per the Layer 1 decision matrix.
     // -----------------------------------------------------------------
     if (!crisisDetected) {
-      const screening = screenInput(rawMessageText, 'ai_bound');
+      if (rawMessageText.length > 4_000)
+        throw req.server.httpErrors.badRequest('message_text must contain at most 4000 characters');
+      const screening = await screenInput(rawMessageText, 'ai_bound');
       if (screening.action === 'block') {
         // Log the block WITHOUT the offending text (Layer 3 discipline:
         // the raw candidate never reaches the log stream). Only the
@@ -804,7 +806,7 @@ export async function mode1ChatHandler(req: FastifyRequest, reply: FastifyReply)
         // must not diverge — a reader of the stored turn should see
         // exactly what the participant saw.
         // -------------------------------------------------------------
-        const egress = screenOutput(result.text);
+        const egress = await screenOutput(result.text);
         if (egress.redacted) {
           req.log.warn(
             {

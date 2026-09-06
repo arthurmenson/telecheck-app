@@ -9,12 +9,18 @@
  */
 
 import { buildApp } from './app.js';
+import { initializeNer } from './lib/pii-screener/ner.js';
 
 const port = Number(process.env['PORT'] ?? 3000);
 const host = process.env['HOST'] ?? '0.0.0.0';
 
 async function main(): Promise<void> {
   const app = await buildApp();
+  // Capability degradation must never remove the crisis safety surface.
+  // Liveness/load-balancer checks target /health; NER readiness is /ready/pii.
+  void initializeNer().catch(() => {
+    app.log.error({ capability: 'pii-screening' }, 'local screening unavailable');
+  });
 
   // Graceful shutdown on SIGTERM / SIGINT (per cloud-native discipline)
   const shutdown = async (signal: string): Promise<void> => {

@@ -1,35 +1,6 @@
-/**
- * pii-screener/index.test.ts — Sprint 1.1a regex-core unit + integration tests.
- *
- * Coverage:
- *   - Every pattern in PII_PATTERNS fires on canonical positive samples
- *   - Luhn validator rejects arithmetic false positives on credit-card regex
- *   - AI-bound route: ANY hit → block (high AND low confidence)
- *   - Internal route: high-confidence → block; low-confidence only → redact
- *   - Empty input → pass
- *   - No PII input → pass
- *   - Overlapping hits → deterministic redaction (earlier wins)
- *   - Regex reuse safety (lastIndex reset across calls)
- *   - SAFETY: exercised code path performs no network / process / I/O
- *
- * Adversarial coverage mapping (docs/PILOT_1_COVERAGE_MATRIX.md):
- *   - A1 (real-looking name in chat) — ⚠️ NOT COVERED, see KNOWN GAP below
- *   - A2 (real-looking phone in intake free-text) → covered by us_phone / ghana_phone
- *   - A3 (real-looking SSN in chat) → covered by us_ssn
- *   - A4 (real-looking Ghana Card ID in intake) → covered by ghana_card
- *   - A5 (clinician real patient real name in decision notes) — ⚠️ NOT COVERED
- *   - A6 (subtle PII AI-bound) — ⚠️ NOT COVERED; regex covers structural subset
- *   - A6b (subtle PII internal route) — ⚠️ NOT COVERED
- *
- * ⚠️ KNOWN GAP — the NER classifier is inert. A1 / A5 / A6 / A6b were
- * recorded as "deferred to Sprint 1.1b (NER)" and 1.1b shipped, so they
- * read as closed. They are not. `wink-eng-lite-web-model` has no
- * statistical PERSON / GPE / ORG recogniser, so no layer detects person
- * names or prose addresses. Those four tests plus the Layer 2 PERSON case
- * are marked `it.fails` and explained in the Sprint 1.1b describe block.
- * Remedy pending ratifier decision:
- *   Telecheck_v1_10_PRD_Update/
- *     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
+/** Regex and actual local statistical NER policy regressions.
+ * The five former expected failures are now required passing assertions.
+ * Coverage is a synthetic regression corpus, not universal PII recall.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -104,8 +75,8 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
     ];
 
     for (const { patternId, input, expectMatch } of samples) {
-      it(`fires for ${patternId} on canonical sample`, () => {
-        const result = screenInput(input, 'ai_bound');
+      it(`fires for ${patternId} on canonical sample`, async () => {
+        const result = await screenInput(input, 'ai_bound');
         expect(result.action).toBe('block');
         expect(result.hits.length).toBeGreaterThanOrEqual(1);
         const hit = result.hits.find((h) => h.patternId === patternId);
@@ -125,52 +96,52 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
   });
 
   describe('Codex R1 regression suite (defects surfaced 2026-08-31)', () => {
-    it('Ghana phone matches +233-prefixed international form after whitespace', () => {
+    it('Ghana phone matches +233-prefixed international form after whitespace', async () => {
       // R1 HIGH: prior `\b(?:\+233\d{9}|0\d{9})\b` used `\b` which never
       // matches before `+` (both are non-word). Fix: digit-lookaround.
-      const r = screenInput('my number +233241234567 works too', 'ai_bound');
+      const r = await screenInput('my number +233241234567 works too', 'ai_bound');
       expect(r.action).toBe('block');
       expect(r.hits.some((h) => h.patternId === 'ghana_phone')).toBe(true);
     });
 
-    it('Ghana phone matches +233 form after punctuation and at string start', () => {
-      const r1 = screenInput('reach me (+233241234567) evenings', 'ai_bound');
+    it('Ghana phone matches +233 form after punctuation and at string start', async () => {
+      const r1 = await screenInput('reach me (+233241234567) evenings', 'ai_bound');
       expect(r1.hits.some((h) => h.patternId === 'ghana_phone')).toBe(true);
-      const r2 = screenInput('+233241234567', 'ai_bound');
+      const r2 = await screenInput('+233241234567', 'ai_bound');
       expect(r2.hits.some((h) => h.patternId === 'ghana_phone')).toBe(true);
     });
 
-    it('Ghana phone does not match if embedded in longer digit string', () => {
+    it('Ghana phone does not match if embedded in longer digit string', async () => {
       // Digit lookaround prevents matching inside a 13-digit run that
       // isn't a real Ghana number.
-      const r = screenInput('reference 12332412345678', 'internal');
+      const r = await screenInput('reference 12332412345678', 'internal');
       expect(r.hits.some((h) => h.patternId === 'ghana_phone')).toBe(false);
     });
 
-    it('SSN compact 9-digit form is high-confidence (not passport)', () => {
+    it('SSN compact 9-digit form is high-confidence (not passport)', async () => {
       // R1 HIGH: `123456789` was falling through to low-confidence
       // us_passport → internal-route redact instead of block.
-      const r = screenInput('SSN 123456789 filed', 'internal');
+      const r = await screenInput('SSN 123456789 filed', 'internal');
       expect(r.action).toBe('block'); // MUST block on internal for high-confidence
       const ssnHit = r.hits.find((h) => h.patternId === 'us_ssn');
       expect(ssnHit).toBeDefined();
       expect(ssnHit?.confidence).toBe('high_confidence');
     });
 
-    it('SSN hyphenated form still matches', () => {
-      const r = screenInput('SSN 123-45-6789 filed', 'internal');
+    it('SSN hyphenated form still matches', async () => {
+      const r = await screenInput('SSN 123-45-6789 filed', 'internal');
       const ssnHit = r.hits.find((h) => h.patternId === 'us_ssn');
       expect(ssnHit).toBeDefined();
       expect(ssnHit?.match).toBe('123-45-6789');
     });
 
-    it('SSN does not match inside longer digit run (e.g., card fragment)', () => {
+    it('SSN does not match inside longer digit run (e.g., card fragment)', async () => {
       // 12 digits: not an SSN, not a card (< 13). Should produce zero SSN hits.
-      const r = screenInput('reference 123456789012', 'internal');
+      const r = await screenInput('reference 123456789012', 'internal');
       expect(r.hits.some((h) => h.patternId === 'us_ssn')).toBe(false);
     });
 
-    it('Passport regex requires the "passport" context word', () => {
+    it('Passport regex requires the "passport" context word', async () => {
       // R1 MEDIUM: prior `\b[A-Z0-9]{9}\b` matched any 9-char uppercase
       // word — over-blocked ordinary text. Context-bound fix: must be
       // adjacent to case-insensitive "passport".
@@ -180,7 +151,7 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         'ABCDEFGHI is a nine-character string',
       ];
       for (const input of negatives) {
-        const r = screenInput(input, 'ai_bound');
+        const r = await screenInput(input, 'ai_bound');
         expect(
           r.hits.some((h) => h.patternId === 'us_passport'),
           `false-positive passport hit on: ${input}`,
@@ -188,15 +159,15 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       }
     });
 
-    it('Passport regex matches when passport-context word is present', () => {
-      const r = screenInput('passport AB1234567 expires', 'ai_bound');
+    it('Passport regex matches when passport-context word is present', async () => {
+      const r = await screenInput('passport AB1234567 expires', 'ai_bound');
       expect(r.hits.some((h) => h.patternId === 'us_passport')).toBe(true);
     });
 
-    it('Credit card match excludes trailing separator (boundary correctness)', () => {
+    it('Credit card match excludes trailing separator (boundary correctness)', async () => {
       // R1 MEDIUM: prior `\b(?:\d[ -]?){13,19}\b` greedy-included
       // trailing space when followed by another word.
-      const r = screenInput('card 4111 1111 1111 1111 expires', 'internal');
+      const r = await screenInput('card 4111 1111 1111 1111 expires', 'internal');
       const ccHit = r.hits.find((h) => h.patternId === 'credit_card');
       expect(ccHit).toBeDefined();
       // Match must end on a digit, not a separator.
@@ -205,35 +176,38 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(ccHit?.match).toBe('4111 1111 1111 1111');
     });
 
-    it('IPv6 full form is detected', () => {
+    it('IPv6 full form is detected', async () => {
       // R9 HIGH: spec requires IPv6; prior version shipped IPv4-only.
-      const r = screenInput('client 2001:0db8:85a3:0000:0000:8a2e:0370:7334 connected', 'ai_bound');
+      const r = await screenInput(
+        'client 2001:0db8:85a3:0000:0000:8a2e:0370:7334 connected',
+        'ai_bound',
+      );
       expect(r.action).toBe('block');
       expect(r.hits.some((h) => h.patternId === 'ipv6')).toBe(true);
     });
 
-    it('IPv6 compressed forms detected (::, ::1, fe80::, mid-compress)', () => {
+    it('IPv6 compressed forms detected (::, ::1, fe80::, mid-compress)', async () => {
       const cases: Array<[string, string]> = [
         ['loopback ::1 is local', '::1'],
         ['link-local fe80:: is available', 'fe80::'],
         ['compressed 2001:db8::8a2e:370:7334 example', '2001:db8::8a2e:370:7334'],
       ];
       for (const [input, expected] of cases) {
-        const r = screenInput(input, 'ai_bound');
+        const r = await screenInput(input, 'ai_bound');
         const hit = r.hits.find((h) => h.patternId === 'ipv6');
         expect(hit, `no ipv6 hit for: ${input}`).toBeDefined();
         expect(hit?.match).toBe(expected);
       }
     });
 
-    it('IPv6 IPv4-mapped form detected', () => {
-      const r = screenInput('mapped ::ffff:192.0.2.1 legacy', 'ai_bound');
+    it('IPv6 IPv4-mapped form detected', async () => {
+      const r = await screenInput('mapped ::ffff:192.0.2.1 legacy', 'ai_bound');
       const hit = r.hits.find((h) => h.patternId === 'ipv6');
       expect(hit).toBeDefined();
       expect(hit?.match).toBe('::ffff:192.0.2.1');
     });
 
-    it('IPv6 does not match malformed strings', () => {
+    it('IPv6 does not match malformed strings', async () => {
       // Bad hex, too many groups, non-address text
       const negatives = [
         'not an address: 2001:0dbg:...',
@@ -241,7 +215,7 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         'no colons here 2001db8',
       ];
       for (const input of negatives) {
-        const r = screenInput(input, 'internal');
+        const r = await screenInput(input, 'internal');
         expect(
           r.hits.some((h) => h.patternId === 'ipv6'),
           `false-positive ipv6 hit on: ${input}`,
@@ -249,96 +223,66 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       }
     });
 
-    it('IPv6 blocks on ai_bound (low_confidence still blocks per matrix)', () => {
-      const r = screenInput('the server 2001:db8::1 is up', 'ai_bound');
+    it('IPv6 blocks on ai_bound (low_confidence still blocks per matrix)', async () => {
+      const r = await screenInput('the server 2001:db8::1 is up', 'ai_bound');
       expect(r.action).toBe('block');
     });
 
-    it('IPv6 redacts on internal route (low_confidence)', () => {
-      const r = screenInput('the server 2001:db8::1 is up', 'internal');
+    it('IPv6 redacts on internal route (low_confidence)', async () => {
+      const r = await screenInput('the server 2001:db8::1 is up', 'internal');
       expect(r.action).toBe('redact');
       expect(r.redactedInput).toContain('[REDACTED:IPv6 address]');
     });
   });
 
-  describe('Sprint 1.1b — NER coverage (KNOWN GAP: the classifier is inert)', () => {
-    // ⚠️ EVERY TEST IN THIS BLOCK IS `it.fails`. That is not a suppression.
-    //
-    // `ner.ts` filters `doc.entities()` for PERSON / GPE / ORG, but
-    // `wink-eng-lite-web-model` emits only pattern-based entity types
-    // (DATE, MONEY, TIME, CARDINAL, ORDINAL, PERCENT, EMAIL, URL). It
-    // ships no statistical person/place/organisation recogniser, so the
-    // filter matches nothing and NO layer detects person names or prose
-    // addresses today.
-    //
-    // These assertions describe the behaviour the spec REQUIRES. They are
-    // marked `it.fails` so the gap is loud in every test run instead of
-    // sitting behind a permanently red pipeline that people learn to
-    // scroll past. `it.fails` is a ratchet, not a mute: the moment a
-    // remedy makes the classifier work, these tests FAIL and whoever
-    // fixed it is forced to come back here and remove the marker.
-    //
-    // Do NOT resolve this by deleting the tests or loosening the
-    // assertions. Note that A6b's own history is the cautionary tale —
-    // Codex flagged in Sprint 1.1b that a loose `redact OR pass`
-    // assertion would let a broken NER integration silently pass, and it
-    // was tightened. The tightening never caught anything, because the
-    // suite could not be executed locally at all.
-    //
-    // Remedy is a ratifier decision (four options, three-way consult):
-    //   Telecheck_v1_10_PRD_Update/
-    //     Decision-Request-Layer-1-NER-Capability-Gap-2026-09-01.md
-    it.fails('A1 — real-looking person name in chat blocks on ai_bound (PERSON)', () => {
-      const r = screenInput('Hello, I am John Smith and I have a headache', 'ai_bound');
+  describe('Local statistical NER coverage', () => {
+    // Former expected failures now run against the pinned actual ONNX model.
+    it('A1 — real-looking person name in chat blocks on ai_bound (PERSON)', async () => {
+      const r = await screenInput('Hello, I am John Smith and I have a headache', 'ai_bound');
       expect(r.action).toBe('block');
       expect(r.hits.some((h) => h.patternId === 'ner_person')).toBe(true);
     });
 
-    it.fails('A5 — clinician real patient name in decision notes (internal route blocks)', () => {
+    it('A5 — clinician real patient name in decision notes (internal route blocks)', async () => {
       // Internal route + high-confidence hit → BLOCK per decision matrix.
-      const r = screenInput('Patient Jane Doe reports symptom resolution', 'internal');
+      const r = await screenInput('Patient Jane Doe reports symptom resolution', 'internal');
       expect(r.action).toBe('block');
       const nerHit = r.hits.find((h) => h.patternId === 'ner_person');
       expect(nerHit).toBeDefined();
       expect(nerHit?.confidence).toBe('high_confidence');
     });
 
-    it.fails('A6 — subtle PII (name + condition tied) on AI-bound blocks', () => {
-      const r = screenInput('Michael Johnson has severe hypertension', 'ai_bound');
+    it('A6 — subtle PII (name + condition tied) on AI-bound blocks', async () => {
+      const r = await screenInput('Michael Johnson has severe hypertension', 'ai_bound');
       expect(r.action).toBe('block');
     });
 
-    it.fails(
-      'A6b — subtle PII on internal-only route with GPE (low-confidence) redacts inline',
-      () => {
-        // GPE (country/city name) alone is low-confidence; internal
-        // route → redact. Explicitly free of PERSON entities (which would
-        // be high-confidence block).
-        //
-        // R1 finding: prior version accepted redact OR pass, so a broken
-        // NER integration would silently satisfy this test. Fix — require
-        // deterministic detection: use a well-known GPE fixture ("United
-        // States") that wink-eng-lite-web-model reliably surfaces, and
-        // assert the concrete post-redaction output.
-        const r = screenInput('the clinic is in the United States today', 'internal');
-        expect(r.action).toBe('redact');
-        const gpeHit = r.hits.find((h) => h.patternId === 'ner_gpe');
-        expect(gpeHit).toBeDefined();
-        expect(gpeHit?.confidence).toBe('low_confidence');
-        // Concrete redaction must place the GPE label at the right position.
-        expect(r.redactedInput).toContain(
-          '[REDACTED:Geopolitical entity (country / city / state)]',
-        );
-      },
-    );
+    it('A6b — subtle PII on internal-only route with GPE (low-confidence) redacts inline', async () => {
+      // GPE (country/city name) alone is low-confidence; internal
+      // route → redact. Explicitly free of PERSON entities (which would
+      // be high-confidence block).
+      //
+      // R1 finding: prior version accepted redact OR pass, so a broken
+      // NER integration would silently satisfy this test. Fix — require
+      // deterministic detection: use a well-known GPE fixture ("United
+      // States") and assert both words are covered;
+      // assert the concrete post-redaction output.
+      const r = await screenInput('the clinic is in the United States today', 'internal');
+      expect(r.action).toBe('redact');
+      const gpeHit = r.hits.find((h) => h.patternId === 'ner_gpe');
+      expect(gpeHit).toBeDefined();
+      expect(gpeHit?.confidence).toBe('low_confidence');
+      // Concrete redaction must place the GPE label at the right position.
+      expect(r.redactedInput).toContain('[REDACTED:Geopolitical entity (country / city / state)]');
+    });
 
-    it('synthetic participant handle does NOT trigger PERSON (does not look like a name)', () => {
-      const r = screenInput('I am pilot1-participant-01 and I feel great', 'ai_bound');
+    it('synthetic participant handle does NOT trigger PERSON (does not look like a name)', async () => {
+      const r = await screenInput('I am pilot1-participant-01 and I feel great', 'ai_bound');
       expect(r.hits.some((h) => h.patternId === 'ner_person')).toBe(false);
     });
 
-    it('ordinary medical prose without proper nouns does NOT trigger NER', () => {
-      const r = screenInput(
+    it('ordinary medical prose without proper nouns does NOT trigger NER', async () => {
+      const r = await screenInput(
         'the patient reports chest pain lasting three days with associated fatigue',
         'ai_bound',
       );
@@ -365,25 +309,28 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
       expect(isLuhnValid('12345678901234567890')).toBe(false);
     });
 
-    it('screener does not fire credit_card pattern on Luhn-invalid string', () => {
-      const result = screenInput('reference number 1234567890123456 (not a card)', 'internal');
+    it('screener does not fire credit_card pattern on Luhn-invalid string', async () => {
+      const result = await screenInput(
+        'reference number 1234567890123456 (not a card)',
+        'internal',
+      );
       const ccHit = result.hits.find((h) => h.patternId === 'credit_card');
       expect(ccHit).toBeUndefined();
     });
   });
 
   describe('decision matrix — AI-bound routes', () => {
-    it('BLOCKS on any high-confidence hit', () => {
-      const result = screenInput('my ssn is 123-45-6789', 'ai_bound');
+    it('BLOCKS on any high-confidence hit', async () => {
+      const result = await screenInput('my ssn is 123-45-6789', 'ai_bound');
       expect(result.action).toBe('block');
       expect(result.blockReason).toBe('regex_match_high_confidence');
       expect(result.participantMessage).toBe(PARTICIPANT_BLOCK_MESSAGE);
       expect(result.redactedInput).toBeUndefined();
     });
 
-    it('BLOCKS on any low-confidence hit (never admits to provider)', () => {
+    it('BLOCKS on any low-confidence hit (never admits to provider)', async () => {
       // ipv4 is low-confidence; on ai_bound route should still block.
-      const result = screenInput('the server 192.168.1.100 is running', 'ai_bound');
+      const result = await screenInput('the server 192.168.1.100 is running', 'ai_bound');
       expect(result.action).toBe('block');
       expect(result.blockReason).toBe('regex_match_any_ai_bound');
       expect(result.redactedInput).toBeUndefined();
@@ -391,15 +338,15 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
   });
 
   describe('decision matrix — internal routes', () => {
-    it('BLOCKS on high-confidence hit', () => {
-      const result = screenInput('patient email jane.doe@example.com', 'internal');
+    it('BLOCKS on high-confidence hit', async () => {
+      const result = await screenInput('patient email jane.doe@example.com', 'internal');
       expect(result.action).toBe('block');
       expect(result.blockReason).toBe('regex_match_high_confidence');
       expect(result.redactedInput).toBeUndefined();
     });
 
-    it('REDACTS INLINE on low-confidence-only hit', () => {
-      const result = screenInput('the server 192.168.1.100 is running', 'internal');
+    it('REDACTS INLINE on low-confidence-only hit', async () => {
+      const result = await screenInput('the server 192.168.1.100 is running', 'internal');
       expect(result.action).toBe('redact');
       expect(result.hits.length).toBe(1);
       expect(result.hits[0]?.patternId).toBe('ipv4');
@@ -409,22 +356,22 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
   });
 
   describe('trivial cases', () => {
-    it('PASSES on empty input', () => {
-      const result = screenInput('', 'ai_bound');
+    it('PASSES on empty input', async () => {
+      const result = await screenInput('', 'ai_bound');
       expect(result.action).toBe('pass');
       expect(result.hits).toEqual([]);
     });
 
-    it('PASSES on all-synthetic input', () => {
-      const result = screenInput(
+    it('PASSES on all-synthetic input', async () => {
+      const result = await screenInput(
         'Hello, I am pilot1-participant-01 and my synthetic data is generic',
         'ai_bound',
       );
       expect(result.action).toBe('pass');
     });
 
-    it('PASSES on normal medical-workflow prose (no PII patterns)', () => {
-      const result = screenInput(
+    it('PASSES on normal medical-workflow prose (no PII patterns)', async () => {
+      const result = await screenInput(
         'The patient reports chest pain lasting three days with associated fatigue',
         'ai_bound',
       );
@@ -433,21 +380,24 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
   });
 
   describe('redaction correctness', () => {
-    it('redacts multiple non-overlapping low-confidence hits in order', () => {
-      const result = screenInput('the servers 10.0.0.1 and 10.0.0.2 are both offline', 'internal');
+    it('redacts multiple non-overlapping low-confidence hits in order', async () => {
+      const result = await screenInput(
+        'the servers 10.0.0.1 and 10.0.0.2 are both offline',
+        'internal',
+      );
       expect(result.action).toBe('redact');
       expect(result.redactedInput).toBe(
         'the servers [REDACTED:IPv4 address] and [REDACTED:IPv4 address] are both offline',
       );
     });
 
-    it('handles overlapping hits deterministically (earlier wins)', () => {
+    it('handles overlapping hits deterministically (earlier wins)', async () => {
       // Craft an input where two patterns could overlap. In current
       // pattern set, us_passport (low-confidence 9-alphanumeric) can
       // sit adjacent to other tokens. If we ever add overlapping
       // patterns, this test locks the tie-break rule.
       // For now, verify redaction is well-formed even on adjacent hits.
-      const result = screenInput('server1 10.0.0.1 server2 10.0.0.2', 'internal');
+      const result = await screenInput('server1 10.0.0.1 server2 10.0.0.2', 'internal');
       expect(result.action).toBe('redact');
       expect(result.redactedInput).toBe(
         'server1 [REDACTED:IPv4 address] server2 [REDACTED:IPv4 address]',
@@ -462,11 +412,11 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
   });
 
   describe('regex reuse safety', () => {
-    it('produces the same result across repeated invocations (lastIndex reset)', () => {
+    it('produces the same result across repeated invocations (lastIndex reset)', async () => {
       const input = 'SSN 123-45-6789 and email test@example.com';
-      const r1 = screenInput(input, 'ai_bound');
-      const r2 = screenInput(input, 'ai_bound');
-      const r3 = screenInput(input, 'ai_bound');
+      const r1 = await screenInput(input, 'ai_bound');
+      const r2 = await screenInput(input, 'ai_bound');
+      const r3 = await screenInput(input, 'ai_bound');
       expect(r1.hits.length).toBe(r2.hits.length);
       expect(r2.hits.length).toBe(r3.hits.length);
       expect(r1.hits.length).toBeGreaterThanOrEqual(2);
@@ -476,7 +426,7 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
   });
 
   describe('SAFETY: no external network / process calls (per PII spec §Layer 1 Absolute prohibition)', () => {
-    it('pathological inputs do not throw', () => {
+    it('pathological inputs do not throw', async () => {
       const inputs = [
         '',
         'a'.repeat(10000), // very long input
@@ -485,7 +435,7 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         'SSN\n123-45-6789\nembedded in newlines',
       ];
       for (const input of inputs) {
-        const result: ScreeningResult = screenInput(input, 'ai_bound');
+        const result: ScreeningResult = await screenInput(input, 'ai_bound');
         expect(['block', 'redact', 'pass']).toContain(result.action);
       }
     });
@@ -510,10 +460,10 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
         }) as unknown;
       }
       try {
-        screenInput('subtle name John Smith at 415 555 1212', 'ai_bound');
-        screenInput('SSN 123-45-6789', 'ai_bound');
-        screenInput('the box at 10.0.0.42 is down', 'internal');
-        screenInput('all-synthetic clean prose without PII', 'ai_bound');
+        await screenInput('subtle name John Smith at 415 555 1212', 'ai_bound');
+        await screenInput('SSN 123-45-6789', 'ai_bound');
+        await screenInput('the box at 10.0.0.42 is down', 'internal');
+        await screenInput('all-synthetic clean prose without PII', 'ai_bound');
       } finally {
         for (const name of trapNames) {
           gt[name] = originals[name];
@@ -549,15 +499,22 @@ describe('pii-screener (Sprint 1.1a regex core)', () => {
        * Sprint 1.1b (NER integration) will extend this via its own PR.
        */
       const IMPORT_ALLOWLIST: Record<string, ReadonlySet<string>> = {
-        'index.ts': new Set(['./patterns.js', './ner.js']),
+        'index.ts': new Set(['./patterns.js', './ner.js', './ner-capacity.js']),
         'patterns.ts': new Set([]),
-        // Sprint 1.1b: NER classifier module allowlist. wink-nlp and
-        // wink-eng-lite-web-model are Evans-ratified 2026-08-31 as the
-        // local NER path (chat message "B"). Both are pure JS, no
-        // native bindings, no network. Adding any other specifier to
-        // ner.ts requires Sprint 1.1b Codex re-review because it
-        // could introduce a network reach or a new capability surface.
-        'ner.ts': new Set(['wink-nlp', 'wink-eng-lite-web-model']),
+        // Reviewed local native inference and read-only asset validation. No networking imports.
+        'ner.ts': new Set([
+          'node:crypto',
+          'node:fs/promises',
+          'node:url',
+          'onnxruntime-node',
+          'tokenizers',
+          './ner-manifest.js',
+          './ner-spans.js',
+          './ner-capacity.js',
+        ]),
+        'ner-spans.ts': new Set(['tokenizers', './ner-capacity.js']),
+        'ner-capacity.ts': new Set(['./ner-spans.js']),
+        'ner-manifest.ts': new Set(['./ner-manifest.json']),
       };
 
       const violations: Array<{ file: string; kind: string; detail: string }> = [];
@@ -1052,50 +1009,53 @@ function resolveRootReceiver(expr: import('typescript').Expression, ts: TsModule
 // ---------------------------------------------------------------------------
 
 describe('pii-screener — audit_bound route class (Sprint 1.1d)', () => {
-  it('blocks on a HIGH-confidence hit', () => {
-    const r = screenInput('reviewer note: patient SSN 123-45-6789 on file', 'audit_bound');
+  it('blocks on a HIGH-confidence hit', async () => {
+    const r = await screenInput('reviewer note: patient SSN 123-45-6789 on file', 'audit_bound');
     expect(r.action).toBe('block');
     expect(r.blockReason).toBe('match_any_audit_bound');
   });
 
-  it('blocks on a LOW-confidence hit too (append-only audit is unpurgeable)', () => {
+  it('blocks on a LOW-confidence hit too (append-only audit is unpurgeable)', async () => {
     // IPv4 is low-confidence. On an `internal` route this would redact;
     // on audit_bound it must block, because an audit row cannot later be
     // scrubbed (I-003 append-only) and env-purge PRESERVES audit_records.
-    const r = screenInput('reviewer note: portal at 10.0.0.42 was slow', 'audit_bound');
+    const r = await screenInput('reviewer note: portal at 10.0.0.42 was slow', 'audit_bound');
     expect(r.action).toBe('block');
     expect(r.blockReason).toBe('match_any_audit_bound');
     expect(r.redactedInput).toBeUndefined();
   });
 
-  it('is strictly stricter than internal for the same input', () => {
+  it('is strictly stricter than internal for the same input', async () => {
     const lowConfidenceInput = 'the box at 10.0.0.42 is down';
-    expect(screenInput(lowConfidenceInput, 'internal').action).toBe('redact');
-    expect(screenInput(lowConfidenceInput, 'audit_bound').action).toBe('block');
+    expect((await screenInput(lowConfidenceInput, 'internal')).action).toBe('redact');
+    expect((await screenInput(lowConfidenceInput, 'audit_bound')).action).toBe('block');
   });
 
-  it('passes clean synthetic reviewer prose', () => {
-    const r = screenInput('Template rejected: question 4 wording is ambiguous.', 'audit_bound');
+  it('passes clean synthetic reviewer prose', async () => {
+    const r = await screenInput(
+      'Template rejected: question 4 wording is ambiguous.',
+      'audit_bound',
+    );
     expect(r.action).toBe('pass');
   });
 });
 
 describe('pii-screener — screenOutput (Layer 2 egress, Sprint 1.1d)', () => {
-  it('redacts a high-confidence hit in model-generated output', () => {
-    const r = screenOutput('Sure — you can reach the office at test.user@example.com.');
+  it('redacts a high-confidence hit in model-generated output', async () => {
+    const r = await screenOutput('Sure — you can reach the office at test.user@example.com.');
     expect(r.redacted).toBe(true);
     expect(r.output).toContain('[REDACTED:Email address]');
     expect(r.output).not.toContain('test.user@example.com');
   });
 
-  it('redacts a low-confidence hit too (egress redacts everything it finds)', () => {
-    const r = screenOutput('Try the portal at 10.0.0.42 instead.');
+  it('redacts a low-confidence hit too (egress redacts everything it finds)', async () => {
+    const r = await screenOutput('Try the portal at 10.0.0.42 instead.');
     expect(r.redacted).toBe(true);
     expect(r.output).toContain('[REDACTED:IPv4 address]');
   });
 
-  it('NEVER blocks — there is no block action on egress', () => {
-    const r = screenOutput('SSN 123-45-6789 and email a@b.com and IP 10.0.0.1');
+  it('NEVER blocks — there is no block action on egress', async () => {
+    const r = await screenOutput('SSN 123-45-6789 and email a@b.com and IP 10.0.0.1');
     // The contract exposes no `action` field at all; the only outcomes
     // are redacted-or-not. This test pins that shape.
     expect(r).toHaveProperty('redacted');
@@ -1103,35 +1063,34 @@ describe('pii-screener — screenOutput (Layer 2 egress, Sprint 1.1d)', () => {
     expect(r.output).not.toContain('123-45-6789');
   });
 
-  it('returns clean output verbatim with redacted=false', () => {
+  it('returns clean output verbatim with redacted=false', async () => {
     const clean = 'Take one tablet each morning with food.';
-    const r = screenOutput(clean);
+    const r = await screenOutput(clean);
     expect(r.redacted).toBe(false);
     expect(r.output).toBe(clean);
     expect(r.hits).toEqual([]);
   });
 
-  it('handles empty string', () => {
-    const r = screenOutput('');
+  it('handles empty string', async () => {
+    const r = await screenOutput('');
     expect(r.redacted).toBe(false);
     expect(r.output).toBe('');
   });
 
   // KNOWN GAP — see the Sprint 1.1b block above. Layer 2 inherits the same
-  // inert classifier, so it cannot redact a name the model invents. `it.fails`
-  // keeps this visible and forces a revisit when the classifier works.
-  it.fails('redacts a hallucinated PERSON name (the actual Layer 2 threat model)', () => {
+  // Actual local inference also covers model-generated names.
+  it('redacts a hallucinated PERSON name (the actual Layer 2 threat model)', async () => {
     // Layer 1 already blocked participant-supplied PII at ingress, so
     // the model never saw it. What Layer 2 defends against is the model
     // EMITTING a plausible identity of its own accord.
-    const r = screenOutput('I checked with Dr. Sarah Whitfield about your dosage.');
+    const r = await screenOutput('I checked with Dr. Sarah Whitfield about your dosage.');
     expect(r.redacted).toBe(true);
     expect(r.output).toContain('[REDACTED:Person name]');
   });
 });
 
 describe('date_of_birth is context-bound (replaces the NER DATE entity)', () => {
-  it('matches a date after any DOB label, in numeric and month-name forms', () => {
+  it('matches a date after any DOB label, in numeric and month-name forms', async () => {
     for (const text of [
       'DOB: 01/15/1990',
       'd.o.b 1990-01-15',
@@ -1142,7 +1101,7 @@ describe('date_of_birth is context-bound (replaces the NER DATE entity)', () => 
       'born on 1990-01-15',
       'born 15 January 1990',
     ]) {
-      const hits = screenInput(text, 'internal').hits;
+      const hits = (await screenInput(text, 'internal')).hits;
       expect(
         hits.some((h) => h.patternId === 'date_of_birth'),
         `missed: ${text}`,
@@ -1150,7 +1109,7 @@ describe('date_of_birth is context-bound (replaces the NER DATE entity)', () => 
     }
   });
 
-  it('does NOT fire on ordinary dates — the defect this replaces', () => {
+  it('does NOT fire on ordinary dates — the defect this replaces', async () => {
     // The NER layer's DATE entity fired on ANY date expression, and
     // `ai_bound` blocks on any hit, so the Mode 1 chat route returned 422
     // for 'What time should I take my medication today?'. Blocking every
@@ -1162,11 +1121,11 @@ describe('date_of_birth is context-bound (replaces the NER DATE entity)', () => 
       'I took it at 8am yesterday',
       'refill due 10/15',
     ]) {
-      expect(screenInput(text, 'ai_bound').action, `over-blocked: ${text}`).toBe('pass');
+      expect((await screenInput(text, 'ai_bound')).action, `over-blocked: ${text}`).toBe('pass');
     }
   });
 
-  it('does NOT fire on words merely containing the label', () => {
+  it('does NOT fire on words merely containing the label', async () => {
     // The leading word boundary carries this; the trailing one had to go
     // because "D.O.B." ends in a period, which is not a word boundary.
     for (const text of [
@@ -1174,7 +1133,7 @@ describe('date_of_birth is context-bound (replaces the NER DATE entity)', () => 
       'stubborn 12/31/1985',
       'date of birthday party 1990-01-15',
     ]) {
-      const hits = screenInput(text, 'internal').hits;
+      const hits = (await screenInput(text, 'internal')).hits;
       expect(
         hits.some((h) => h.patternId === 'date_of_birth'),
         `false positive: ${text}`,
@@ -1184,7 +1143,7 @@ describe('date_of_birth is context-bound (replaces the NER DATE entity)', () => 
 });
 
 describe('us_phone matches standalone numbers but never identifier substrings', () => {
-  it('matches the forms humans actually write', () => {
+  it('matches the forms humans actually write', async () => {
     for (const text of [
       'call (415) 555-0123 now',
       'call 415-555-0123 now',
@@ -1194,20 +1153,20 @@ describe('us_phone matches standalone numbers but never identifier substrings', 
       'call 14155550123 now',
       'call 1 (415) 555-0123 now',
     ]) {
-      expect(screenInput(text, 'ai_bound').action, `missed: ${text}`).toBe('block');
+      expect((await screenInput(text, 'ai_bound')).action, `missed: ${text}`).toBe('block');
     }
   });
 
-  it('matches a BARE ten-digit run', () => {
+  it('matches a BARE ten-digit run', async () => {
     // Regression guard. An intermediate fix dropped the bare form to stop
     // it firing inside identifiers; that left a real phone number passing
     // Layer 3 unredacted — exactly the case a last-line defense exists
     // for. The bare form is required.
-    const hits = screenInput('call 3125551212 now', 'internal').hits;
+    const hits = (await screenInput('call 3125551212 now', 'internal')).hits;
     expect(hits.some((h) => h.patternId === 'us_phone')).toBe(true);
   });
 
-  it('leaves UUIDs and large integers intact', () => {
+  it('leaves UUIDs and large integers intact', async () => {
     // The real defect was SUBSTRING matching, not the bare form. An
     // ordinary UUID like 550e8400-e29b-41d4-a716-446655440000 contains
     // 6655440000, and 9007199254740993 contains a candidate too — so the
@@ -1221,7 +1180,7 @@ describe('us_phone matches standalone numbers but never identifier substrings', 
       '123456789012',
       'aaa-446655440000-bbb',
     ]) {
-      const hits = screenInput(text, 'internal').hits;
+      const hits = (await screenInput(text, 'internal')).hits;
       expect(
         hits.some((h) => h.patternId === 'us_phone'),
         `phone matched in: ${text}`,

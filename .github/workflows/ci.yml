@@ -48,6 +48,7 @@ jobs:
           --health-retries 12
 
     env:
+      ONNXRUNTIME_NODE_INSTALL: skip
       # Integration test DSN — points at the service container above.
       # Per tests/README.md: ephemeral DB seeded with two tenants (Telecheck-US, Telecheck-Ghana)
       # for cross-tenant access tests.
@@ -108,14 +109,22 @@ jobs:
           ls "telecheckONE/Telecheck Master Bundle FINAL US REGION BASELINE/Telecheck_OpenAPI_v0_2.md" || \
             echo "::warning::OpenAPI spec file missing from cloned bundle (clone may have partially succeeded)"
 
-      - name: Setup Node 20 LTS
+      - name: Setup Node 22 LTS
         uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Acquire pinned local NER assets
+        run: npm run ner:setup
+
+      - name: Verify native NER in production image without networking
+        run: |
+          docker build -t telecheck-ner-runtime .
+          docker run --rm --network none --read-only telecheck-ner-runtime node scripts/verify-ner-model.mjs
 
       # Migration encoding guard — DB-free file scan that fails if any migration
       # SQL file begins with a UTF-8 BOM. Runs first (fastest, no deps) because a
