@@ -1,18 +1,3 @@
-/**
- * GET /v0/identity/accounts/me — HTTP integration tests.
- *
- * Coverage in this file (1 section, 5 cases):
- *   §1a 200 + PatientAccountView for valid x-account-id
- *   §1b 400 missing header
- *   §1c 404 phantom account_id (tenant-blind)
- *   §1d 404 cross-tenant (account in Ghana, request from US)
- *   §1e response body has no tenant_id substring
- *
- * Spec references:
- *   - src/modules/identity/internal/handlers/accounts.ts (target)
- *   - I-025 (tenant-blind 404)
- */
-
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -22,6 +7,8 @@ import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import * as accountService from '../../src/modules/identity/internal/services/account-service.ts';
 import { asAccountId } from '../../src/modules/identity/internal/types.ts';
+import { mintTestJwt } from '../helpers/jwt-fixtures.ts';
+import { seedLiveSession } from '../helpers/live-session-fixtures.ts';
 import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
 
@@ -60,106 +47,164 @@ afterAll(async () => {
   }
 });
 
-function uniquePhone(prefix: '+1' | '+233' = '+1'): string {
-  const digits = ulid()
-    .slice(-9)
-    .replace(/[^0-9]/g, '0')
-    .padEnd(9, '0');
-  return `${prefix}${digits}`;
+async function seedIdentity(ctx: TenantContext = US_CTX) {
+  const accountId = asAccountId(ulid());
+  await withTenantContext(ctx.tenantId, async () => {
+    await accountService.createAccount(
+      ctx,
+      { actorId: 'op_seed' },
+      {
+        account_id: accountId,
+        email: accountId + '@example.invalid',
+        first_name: 'Synthetic',
+        last_name: 'Identity',
+        date_of_birth: '1990-01-01',
+        gender: 'prefer_not_to_say',
+      },
+      getTestClient(),
+    );
+    await accountService.activateAccount(ctx, { actorId: 'op_seed' }, accountId, getTestClient());
+  });
+  return { accountId, ...(await seedLiveSession(ctx, accountId)) };
 }
 
-describe('GET /v0/identity/accounts/me', () => {
-  it('§1a returns 200 + PatientAccountView for valid x-account-id', async () => {
-    const accountId = asAccountId(ulid());
-    await withTenantContext(T_US, () =>
-      accountService.createAccount(
-        US_CTX,
-        { actorId: 'op_seed' },
-        {
-          account_id: accountId,
-          phone_e164: uniquePhone('+1'),
-          first_name: 'Test',
-          last_name: 'Patient',
-          date_of_birth: '1990-01-01',
-          gender: 'prefer_not_to_say',
-        },
-        getTestClient(),
-      ),
-    );
+const protectedPaths = ['/v0/identity/accounts/me', '/v0/identity/devices'];
 
+for (const url of protectedPaths) {
+  describe(url + ' authorization', () => {
+    it('requires a bearer token even with forged legacy account and role headers', async () => {
+      const { accountId } = await seedIdentity();
+      const response = await app!.inject({
+        method: 'GET',
+        url,
+        headers: {
+          host: 'localhost',
+          'x-account-id': accountId,
+          'x-actor-id': accountId,
+          'x-actor-roles': 'platform_admin',
+        },
+      });
+      expect(response.statusCode).toBe(401);
+      expect(response.body).not.toContain('Telecheck-US');
+    });
+    it('rejects invalid bearer authentication with legacy headers', async () => {
+      const { accountId } = await seedIdentity();
+      const response = await app!.inject({
+        method: 'GET',
+        url,
+        headers: {
+          host: 'localhost',
+          authorization: 'Bearer invalid',
+          'x-account-id': accountId,
+        },
+      });
+      expect(response.statusCode).toBe(401);
+    });
+    it('rejects a valid token from another tenant', async () => {
+      const { token } = await seedIdentity(GH_CTX);
+      const response = await app!.inject({
+        method: 'GET',
+        url,
+        headers: { host: 'localhost', authorization: 'Bearer ' + token },
+      });
+      expect(response.statusCode).toBe(401);
+      expect(response.body).not.toContain('Telecheck-Ghana');
+    });
+    for (const state of [
+      'revoked',
+      'expired',
+      'suspended',
+      'archived',
+      'pending_verification',
+    ] as const) {
+      it('rejects ' + state + ' sessions or accounts', async () => {
+        const identity = await seedIdentity();
+        await withTenantContext(T_US, async () => {
+          if (state === 'revoked') {
+            await getTestClient().query(
+              "UPDATE sessions SET revoked_at=NOW(), revoked_reason='patient_logout' WHERE session_id=$1",
+              [identity.sessionId],
+            );
+          } else if (state === 'expired') {
+            await getTestClient().query(
+              "UPDATE sessions SET expires_at=NOW()-INTERVAL '1 second' WHERE session_id=$1",
+              [identity.sessionId],
+            );
+          } else {
+            await getTestClient().query('UPDATE accounts SET status=$2 WHERE account_id=$1', [
+              identity.accountId,
+              state,
+            ]);
+          }
+        });
+        const response = await app!.inject({
+          method: 'GET',
+          url,
+          headers: { host: 'localhost', authorization: 'Bearer ' + identity.token },
+        });
+        expect(response.statusCode).toBe(401);
+      });
+    }
+    it('rejects a fabricated session and a session owned by another account', async () => {
+      const account = await seedIdentity();
+      const other = await seedIdentity();
+      for (const sessionId of [ulid(), other.sessionId]) {
+        const token = mintTestJwt({
+          accountId: account.accountId,
+          sessionId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          role: 'patient',
+        });
+        const response = await app!.inject({
+          method: 'GET',
+          url,
+          headers: { host: 'localhost', authorization: 'Bearer ' + token },
+        });
+        expect(response.statusCode).toBe(401);
+      }
+    });
+    it('rejects stale role claims and delegated credential access', async () => {
+      const identity = await seedIdentity();
+      for (const claims of [
+        { role: 'clinician' as const },
+        { role: 'patient' as const, delegateId: ulid() },
+      ]) {
+        const token = mintTestJwt({
+          accountId: identity.accountId,
+          sessionId: identity.sessionId,
+          tenantId: T_US,
+          countryOfCare: 'US',
+          ...claims,
+        });
+        const response = await app!.inject({
+          method: 'GET',
+          url,
+          headers: { host: 'localhost', authorization: 'Bearer ' + token },
+        });
+        expect(response.statusCode).toBe(401);
+      }
+    });
+  });
+}
+
+describe('account self read', () => {
+  it('uses the authenticated account, ignores forged account headers, and strips tenant identity', async () => {
+    const own = await seedIdentity();
+    const other = await seedIdentity();
     const response = await app!.inject({
       method: 'GET',
       url: '/v0/identity/accounts/me',
-      headers: { host: 'localhost', 'x-account-id': accountId },
+      headers: {
+        host: 'localhost',
+        authorization: 'Bearer ' + own.token,
+        'x-account-id': other.accountId,
+      },
     });
     expect(response.statusCode).toBe(200);
-    const body = response.json<{ account_id: string; first_name: string }>();
-    expect(body.account_id).toBe(accountId);
-    expect(body.first_name).toBe('Test');
+    expect(response.json().account_id).toBe(own.accountId);
+    expect(response.body).not.toContain(other.accountId);
     expect(response.body).not.toContain('"tenant_id"');
     expect(response.body).not.toContain('Telecheck-US');
-  });
-
-  it('§1b returns 400 when x-account-id missing', async () => {
-    const response = await app!.inject({
-      method: 'GET',
-      url: '/v0/identity/accounts/me',
-      headers: { host: 'localhost' },
-    });
-    expect(response.statusCode).toBe(400);
-    const body = response.json<{ error: { code: string } }>();
-    expect(body.error.code).toBe('internal.request.invalid');
-  });
-
-  it('§1c returns 404 (tenant-blind) for phantom account_id', async () => {
-    const phantom = asAccountId(ulid());
-    const response = await app!.inject({
-      method: 'GET',
-      url: '/v0/identity/accounts/me',
-      headers: { host: 'localhost', 'x-account-id': phantom },
-    });
-    expect(response.statusCode).toBe(404);
-    const body = response.json<{ error: { code: string } }>();
-    expect(body.error.code).toBe('internal.resource.not_found');
-  });
-
-  it('§1d returns 404 for cross-tenant account (RLS-blind)', async () => {
-    // Create account in Ghana, request from US
-    const accountId = asAccountId(ulid());
-    await withTenantContext(T_GH, () =>
-      accountService.createAccount(
-        GH_CTX,
-        { actorId: 'op_seed' },
-        {
-          account_id: accountId,
-          phone_e164: uniquePhone('+233'),
-          first_name: 'A',
-          last_name: 'B',
-          date_of_birth: '1990-01-01',
-          gender: 'prefer_not_to_say',
-        },
-        getTestClient(),
-      ),
-    );
-
-    // Request from US tenant (host=localhost resolves to Telecheck-US)
-    const response = await app!.inject({
-      method: 'GET',
-      url: '/v0/identity/accounts/me',
-      headers: { host: 'localhost', 'x-account-id': accountId },
-    });
-    expect(response.statusCode).toBe(404);
-  });
-
-  it('§1e response body is fully tenant-blind (no Telecheck-* / heros)', async () => {
-    const phantom = asAccountId(ulid());
-    const response = await app!.inject({
-      method: 'GET',
-      url: '/v0/identity/accounts/me',
-      headers: { host: 'localhost', 'x-account-id': phantom },
-    });
-    expect(response.body).not.toContain('Telecheck-US');
-    expect(response.body).not.toContain('Telecheck-Ghana');
-    expect(response.body.toLowerCase()).not.toContain('heros');
   });
 });

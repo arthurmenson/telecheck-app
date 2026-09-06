@@ -123,10 +123,9 @@ export const registerIdentityRoutes: FastifyPluginAsync = async (
    * Account self-read — returns the calling patient's own account.
    *
    *   GET /accounts/me
-   *     Headers: x-account-id (stub at v1.0; replaced by JWT)
+   *     Headers: Authorization: Bearer <access-token>
    *
-   * Tenant-blind 404 if account doesn't exist or is in another tenant
-   * (I-025).
+   * Tenant-blind 401 unless an active account owns the live session (I-025).
    */
   app.get('/accounts/me', getMyAccountHandler);
 };
