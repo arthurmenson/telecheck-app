@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { applyMigrations } from './migrate.mjs';
+import { verifyBillingRollbackRefusal } from './verify-billing-rollback.mjs';
 assert.equal(process.env.NODE_ENV, 'test');
 assert.equal(process.env.BILLING_SYNTHETIC_ACCEPTANCE, 'true');
 const setupUrl = new URL(process.env.MIGRATION_DATABASE_URL);
@@ -25,6 +26,7 @@ try {
   const directory = fileURLToPath(new URL('../migrations/', import.meta.url));
   console.log('Billing full migration apply', await applyMigrations(setup, directory));
   console.log('Billing migration replay', await applyMigrations(setup, directory));
+  await verifyBillingRollbackRefusal(setup);
   for (const role of [
     'telecheck_app_role',
     'identity_service_role',
@@ -80,3 +82,10 @@ Object.assign(process.env, {
   ),
 });
 await import('./verify-billing-runtime.ts');
+const retained = new pg.Client({ connectionString: setupUrl.toString() });
+await retained.connect();
+try {
+  await verifyBillingRollbackRefusal(retained);
+} finally {
+  await retained.end();
+}
