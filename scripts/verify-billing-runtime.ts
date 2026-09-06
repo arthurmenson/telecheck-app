@@ -10,10 +10,18 @@ import { closePool, closeBindActorContextPool } from '../src/lib/db.js';
 import { asTenantId } from '../src/lib/glossary.js';
 import { issueAccessToken, verifyAccessToken } from '../src/lib/jwt.js';
 import { ulid } from '../src/lib/ulid.js';
+import { closeClassifiedKmsPool } from '../src/lib/kms-classified-store.js';
 import { closeBillingPool } from '../src/modules/billing/internal/database.js';
+import { paystackCredentialAccount } from '../src/modules/billing/internal/provider-config.js';
+
+import {
+  installControlledBillingAws,
+  provisionSyntheticBillingKms,
+} from './billing-controlled-aws.js';
 
 assert.equal(process.env['NODE_ENV'], 'development');
 assert.equal(process.env['BILLING_ALLOW_MOCK'], 'true');
+const controlledAws = installControlledBillingAws();
 const setup = new pg.Client({ connectionString: process.env['BILLING_TEST_SETUP_DATABASE_URL'] });
 const ordinary = new pg.Client({ connectionString: process.env['DATABASE_URL'] });
 const binder = new pg.Client({ connectionString: process.env['BIND_ACTOR_CONTEXT_DATABASE_URL'] });
@@ -110,7 +118,13 @@ async function providerFailureProbes(
       ).statusCode,
       201,
     );
-    for (const fault of ['response_lost', 'persistence_failed', 'session_revoked'] as const) {
+    for (const fault of [
+      'missing_binding',
+      'kms_failure',
+      'response_lost',
+      'persistence_failed',
+      'session_revoked',
+    ] as const) {
       const patient = await register(host);
       const quote = await post('/v1/billing/consult-quotes', patient.headers, {
         consult_type: 'general',
@@ -123,6 +137,7 @@ async function providerFailureProbes(
         accepted_quote_id: quoteId,
       };
       const key = ulid();
+      if (fault === 'kms_failure') controlledAws.fail = true;
       const ledger = new Map<string, Record<string, unknown>>();
       let calls = 0;
       globalThis.fetch = async (url, options) => {
@@ -191,12 +206,25 @@ async function providerFailureProbes(
           0,
         );
       } finally {
+        controlledAws.fail = false;
         if (fault === 'persistence_failed') {
           await setup.query(
             'DROP TRIGGER billing_acceptance_persist_fault ON public.billing_payment_intent',
           );
           await setup.query('DROP FUNCTION public.billing_acceptance_persist_fault()');
         }
+      }
+      if (fault === 'missing_binding') {
+        assert.equal(
+          (
+            await setup.query<{ n: number }>(
+              'SELECT count(*)::int AS n FROM public.tenant_kms_bindings WHERE tenant_id=$1',
+              [tenant],
+            )
+          ).rows[0]!.n,
+          0,
+        );
+        await provisionSyntheticBillingKms(setup, tenant);
       }
       const retry = await post('/v1/async-consults', patient.headers, body, key);
       assert.equal(retry.statusCode, fault === 'session_revoked' ? 403 : 201, fault);
@@ -297,11 +325,469 @@ async function providerFailureProbes(
         `Controlled Stripe HTTP / real local roles: ${fault}, durable uncertainty, stable reference, no unauthorized consult or cached secret`,
       );
     }
+    await financialConfirmationProbes(host, tenant);
   } finally {
     globalThis.fetch = originalFetch;
     process.env['BILLING_PROVIDERS_JSON'] = originalRegistry;
     delete process.env['BILLING_ACCEPTANCE_STRIPE_SECRET'];
     delete process.env['BILLING_ACCEPTANCE_STRIPE_WEBHOOK'];
+    await setup.query(
+      "UPDATE public.ccr_configs SET config_value='\"mock_local_dev\"'::jsonb WHERE tenant_id=$1 AND config_key='payment.processor'",
+      [tenant],
+    );
+  }
+}
+async function financialConfirmationProbes(host: string, tenant: string) {
+  // Only the external provider/AWS transports are controlled. Financial class
+  // keys, ciphertext, session checks, SQL roles and audit commits are real.
+  const objects = new Map<string, Record<string, unknown>>();
+  globalThis.fetch = async (url, options) => {
+    assert.equal(url, 'https://api.stripe.com/v1/payment_intents');
+    const fields = new URLSearchParams(options?.body as string);
+    const id = fields.get('metadata[telecheck_payment_id]')!;
+    const value = {
+      id: `pi_${id}`,
+      object: 'payment_intent',
+      livemode: false,
+      status: 'requires_payment_method',
+      amount: Number(fields.get('amount')),
+      currency: fields.get('currency'),
+      client_secret: `pi_${id}_secret_synthetic`,
+      metadata: {
+        telecheck_payment_id: id,
+        telecheck_reference: fields.get('metadata[telecheck_reference]'),
+      },
+    };
+    objects.set(id, value);
+    return new Response(JSON.stringify(value), { status: 200 });
+  };
+  const fixture = async () => {
+    const person = await register(host);
+    const q = await post('/v1/billing/consult-quotes', person.headers, { consult_type: 'general' });
+    assert.equal(q.statusCode, 201);
+    const c = await post('/v1/async-consults', person.headers, {
+      consult_type: 'general',
+      initiation_source: 'care_tab',
+      accepted_quote_id: q.json<{ quote_id: string }>().quote_id,
+    });
+    assert.equal(c.statusCode, 201);
+    return { person, ...c.json<{ payment_intent_id: string; confirmation: { href: string } }>() };
+  };
+  const get = (f: Awaited<ReturnType<typeof fixture>>) =>
+    app.inject({ method: 'GET', url: f.confirmation.href, headers: f.person.headers });
+  const count = async (id: string, action: string) =>
+    (
+      await setup.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM public.audit_records WHERE tenant_id=$1 AND resource_id=$2 AND action=$3',
+        [tenant, id, action],
+      )
+    ).rows[0]!.n;
+  const f = await fixture();
+  const before = await count(f.payment_intent_id, 'kms.decrypt_invoked');
+  const result = await get(f);
+  assert.equal(result.statusCode, 200);
+  assert.ok(result.json<{ client_secret: string }>().client_secret.endsWith('_secret_synthetic'));
+  assert.equal(await count(f.payment_intent_id, 'kms.decrypt_invoked'), before + 1);
+  const stored = (
+    await setup.query<{
+      confirmation_aad: Buffer;
+      confirmation_ciphertext: Buffer;
+      confirmation_data_class: string;
+      confirmation_dek_id: string;
+    }>(
+      'SELECT confirmation_aad,confirmation_ciphertext,confirmation_data_class,confirmation_dek_id FROM public.billing_payment_intent WHERE tenant_id=$1 AND id=$2',
+      [tenant, f.payment_intent_id],
+    )
+  ).rows[0]!;
+  assert.equal(stored.confirmation_data_class, 'pii_financial');
+  assert.equal(stored.confirmation_ciphertext.subarray(0, 8).toString(), 'TCROW002');
+  assert.ok(!stored.confirmation_ciphertext.toString().includes('_secret_synthetic'));
+  const aad = JSON.parse(stored.confirmation_aad.toString()) as unknown[];
+  assert.equal(aad[4], f.person.claims.sub);
+  assert.equal(aad[6], f.payment_intent_id);
+  assert.equal(aad[7], 'payment_confirmation');
+  for (const [index, value] of [
+    [2, 'Telecheck-Ghana'],
+    [3, 'pii_demographic'],
+    [4, ulid()],
+    [6, ulid()],
+    [7, 'wrong_field'],
+  ] as const) {
+    const altered = [...aad];
+    altered[index] = value;
+    await setup.query(
+      'UPDATE public.billing_payment_intent SET confirmation_aad=$3 WHERE tenant_id=$1 AND id=$2',
+      [tenant, f.payment_intent_id, Buffer.from(JSON.stringify(altered))],
+    );
+    const calls = controlledAws.calls;
+    const denied = await get(f);
+    assert.equal(denied.statusCode, 503);
+    assert.ok(!denied.body.includes('_secret_synthetic'));
+    assert.equal(controlledAws.calls, calls);
+  }
+  await setup.query(
+    'UPDATE public.billing_payment_intent SET confirmation_aad=$3 WHERE tenant_id=$1 AND id=$2',
+    [tenant, f.payment_intent_id, stored.confirmation_aad],
+  );
+  assert.ok((await count(f.payment_intent_id, 'kms.decrypt_failed')) >= 5);
+  controlledAws.fail = true;
+  try {
+    const denied = await get(f);
+    assert.equal(denied.statusCode, 503);
+    assert.ok(!denied.body.includes('_secret_synthetic'));
+  } finally {
+    controlledAws.fail = false;
+  }
+  const successBefore = await count(f.payment_intent_id, 'kms.decrypt_invoked');
+  await setup.query(
+    "CREATE FUNCTION public.billing_financial_audit_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic_financial_audit_unavailable'; END $$",
+  );
+  await setup.query(
+    "CREATE TRIGGER billing_financial_audit_fault BEFORE INSERT ON public.audit_records FOR EACH ROW WHEN (NEW.action='kms.decrypt_invoked') EXECUTE FUNCTION public.billing_financial_audit_fault()",
+  );
+  try {
+    const denied = await get(f);
+    assert.equal(denied.statusCode, 503);
+    assert.ok(!denied.body.includes('_secret_synthetic'));
+    assert.equal(await count(f.payment_intent_id, 'kms.decrypt_invoked'), successBefore);
+  } finally {
+    await setup.query('DROP TRIGGER billing_financial_audit_fault ON public.audit_records');
+    await setup.query('DROP FUNCTION public.billing_financial_audit_fault()');
+  }
+  for (const fault of [
+    'crypto_revocation',
+    'crypto_nonce_expiry',
+    'audit_session_expiry',
+  ] as const) {
+    const victim = await fixture();
+    const n = await count(victim.payment_intent_id, 'kms.decrypt_invoked');
+    if (fault !== 'audit_session_expiry') {
+      controlledAws.beforeCrypto = async () => {
+        if (fault === 'crypto_revocation')
+          await setup.query(
+            "UPDATE public.sessions SET revoked_at=clock_timestamp(),revoked_reason='patient_logout' WHERE session_id=$1",
+            [victim.person.claims.session_id],
+          );
+        else {
+          await setup.query(
+            "UPDATE public._session_actor_context SET expires_at=clock_timestamp()+interval '30 milliseconds' WHERE session_id=$1",
+            [victim.person.claims.session_id],
+          );
+          await new Promise((resolve) => setTimeout(resolve, 60));
+        }
+      };
+      const denied = await get(victim);
+      assert.ok([403, 503].includes(denied.statusCode));
+      assert.ok(!denied.body.includes('_secret_synthetic'));
+    } else {
+      await setup.query(
+        'CREATE FUNCTION public.billing_financial_audit_wait() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(9140388); RETURN NEW; END $$',
+      );
+      await setup.query(
+        "CREATE TRIGGER billing_financial_audit_wait BEFORE INSERT ON public.audit_records FOR EACH ROW WHEN (NEW.action='kms.decrypt_invoked') EXECUTE FUNCTION public.billing_financial_audit_wait()",
+      );
+      await setup.query('BEGIN');
+      await setup.query('SELECT pg_advisory_xact_lock(9140388)');
+      const pending = get(victim).then((value) => value);
+      try {
+        let waiting = false;
+        for (let attempt = 0; attempt < 70; attempt++) {
+          await setup.query('SELECT pg_stat_clear_snapshot()');
+          waiting = (
+            await setup.query<{ ok: boolean }>(
+              "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE usename='kms_service_role' AND wait_event_type='Lock') AS ok",
+            )
+          ).rows[0]!.ok;
+          if (waiting) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.ok(waiting, 'financial success audit reached contention');
+        await setup.query(
+          "UPDATE public.sessions SET expires_at=clock_timestamp()+interval '30 milliseconds' WHERE session_id=$1",
+          [victim.person.claims.session_id],
+        );
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        await setup.query('COMMIT');
+        const denied = await pending;
+        assert.ok([403, 503].includes(denied.statusCode));
+        assert.ok(!denied.body.includes('_secret_synthetic'));
+      } finally {
+        await setup.query('ROLLBACK');
+        await pending;
+        await setup.query('DROP TRIGGER billing_financial_audit_wait ON public.audit_records');
+        await setup.query('DROP FUNCTION public.billing_financial_audit_wait()');
+      }
+    }
+    assert.equal(
+      await count(victim.payment_intent_id, 'kms.decrypt_invoked'),
+      n,
+      'no success audit committed after lost authority',
+    );
+  }
+  const webhook = async (type: string, raw: Record<string, unknown>, id: string) => {
+    const bytes = Buffer.from(
+      JSON.stringify({
+        id,
+        type,
+        account: 'acct_synthetic_acceptance',
+        livemode: false,
+        data: { object: raw },
+      }),
+    );
+    const t = Math.floor(Date.now() / 1000).toString();
+    const signature = createHmac('sha256', process.env['BILLING_ACCEPTANCE_STRIPE_WEBHOOK']!)
+      .update(`${t}.`)
+      .update(bytes)
+      .digest('hex');
+    return app.inject({
+      method: 'POST',
+      url: '/v1/billing/webhooks/stripe',
+      headers: {
+        host,
+        'content-type': 'application/json',
+        'stripe-signature': `t=${t},v1=${signature}`,
+      },
+      payload: bytes,
+    });
+  };
+  for (const order of [
+    ['payment_intent.canceled', 'payment_intent.payment_failed'],
+    ['payment_intent.payment_failed', 'payment_intent.canceled'],
+  ]) {
+    const cancelled = await fixture();
+    const raw = objects.get(cancelled.payment_intent_id)!;
+    for (const type of order) {
+      const eventId = `evt_${ulid()}`;
+      const data = {
+        ...raw,
+        status: type === 'payment_intent.canceled' ? 'canceled' : 'requires_payment_method',
+      };
+      assert.equal((await webhook(type, data, eventId)).statusCode, 200);
+      assert.equal((await webhook(type, data, eventId)).statusCode, 200);
+    }
+    const state = (
+      await setup.query<{ status: string }>(
+        'SELECT status FROM public.billing_payment_intent WHERE tenant_id=$1 AND id=$2',
+        [tenant, cancelled.payment_intent_id],
+      )
+    ).rows[0]!.status;
+    assert.equal(state, 'cancelled');
+    assert.equal((await get(cancelled)).statusCode, 409);
+    assert.equal(
+      (
+        await setup.query<{ n: number }>(
+          'SELECT count(*)::int AS n FROM public.billing_provider_event WHERE tenant_id=$1 AND intent_id=$2',
+          [tenant, cancelled.payment_intent_id],
+        )
+      ).rows[0]!.n,
+      2,
+    );
+    await assert.rejects(
+      setup.query(
+        "UPDATE public.billing_payment_intent SET status='requires_payment' WHERE tenant_id=$1 AND id=$2",
+        [tenant, cancelled.payment_intent_id],
+      ),
+      (error: unknown) => (error as { code: string }).code === '23514',
+    );
+  }
+  evidence.push(
+    'Financial class uses tenant KMS and durable successful-decrypt audit; wrong tenant/class/patient/payment/field, KMS failure, audit failure and authority loss during crypto/audit never disclose a secret',
+  );
+  evidence.push(
+    'Both Stripe cancellation/failure delivery orders and duplicate events preserve cancelled, deny confirmation and retain immutable event evidence; SQL regression also denied',
+  );
+}
+async function paystackRuntimeProbes(
+  host: string,
+  tenant: string,
+  adminHeaders: Record<string, string>,
+  version: number,
+) {
+  const originalFetch = globalThis.fetch,
+    originalRegistry = process.env['BILLING_PROVIDERS_JSON']!;
+  const secret = 'sk_test_controlled_paystack_no_real_merchant_account';
+  process.env['BILLING_ACCEPTANCE_PAYSTACK_SECRET'] = secret;
+  const account = paystackCredentialAccount(secret);
+  const registry = JSON.parse(originalRegistry) as Record<string, unknown>;
+  registry[tenant] = {
+    provider: 'paystack',
+    mode: 'sandbox',
+    account,
+    secret_env: 'BILLING_ACCEPTANCE_PAYSTACK_SECRET',
+    webhook_secret_env: 'BILLING_ACCEPTANCE_PAYSTACK_SECRET',
+    return_url: 'https://example.invalid/care',
+  };
+  process.env['BILLING_PROVIDERS_JSON'] = JSON.stringify(registry);
+  await setup.query(
+    "UPDATE public.ccr_configs SET config_value='\"paystack\"'::jsonb WHERE tenant_id=$1 AND config_key='payment.processor'",
+    [tenant],
+  );
+  const ledger = new Map<string, Record<string, unknown>>();
+  let initializeCalls = 0;
+  let loseNext = false;
+  globalThis.fetch = async (target, options) => {
+    assert.equal(new Headers(options?.headers).get('authorization'), `Bearer ${secret}`);
+    const url = String(target);
+    assert.ok(url.startsWith('https://api.paystack.co/transaction/'));
+    if (url.endsWith('/initialize')) {
+      initializeCalls++;
+      const body = JSON.parse(options?.body as string) as Record<string, unknown>;
+      const reference = String(body['reference']);
+      const metadata = JSON.parse(body['metadata'] as string) as Record<string, unknown>;
+      assert.ok(!ledger.has(reference), 'each Paystack reference initializes once');
+      // Official documented verify/event shape: no top-level integration ID.
+      ledger.set(reference, {
+        id: 900000 + initializeCalls,
+        domain: 'test',
+        status: loseNext ? 'success' : 'abandoned',
+        reference,
+        amount: body['amount'],
+        currency: body['currency'],
+        metadata,
+        customer: {},
+        authorization: {},
+        subaccount: {},
+        fees_split: null,
+      });
+      if (loseNext) {
+        loseNext = false;
+        throw new Error('controlled accepted Paystack response lost');
+      }
+      return new Response(
+        JSON.stringify({
+          status: true,
+          data: {
+            reference,
+            authorization_url: `https://checkout.paystack.com/${reference}`,
+            access_code: reference,
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    const reference = decodeURIComponent(url.split('/').at(-1)!);
+    assert.ok(ledger.has(reference));
+    return new Response(JSON.stringify({ status: true, data: ledger.get(reference) }), {
+      status: 200,
+    });
+  };
+  try {
+    await provisionSyntheticBillingKms(setup, tenant);
+    assert.equal(
+      (
+        await post('/v1/billing/consult-prices', adminHeaders, {
+          consult_type: 'general',
+          version,
+          amount_minor: 9900,
+          turnaround_minutes: 60,
+          quote_ttl_seconds: 600,
+        })
+      ).statusCode,
+      201,
+    );
+    const person = await register(host);
+    const quote = await post('/v1/billing/consult-quotes', person.headers, {
+      consult_type: 'general',
+    });
+    assert.equal(quote.statusCode, 201);
+    const body = {
+      consult_type: 'general',
+      initiation_source: 'care_tab',
+      accepted_quote_id: quote.json<{ quote_id: string }>().quote_id,
+    };
+    const initiated = await post('/v1/async-consults', person.headers, body);
+    assert.equal(initiated.statusCode, 201);
+    const c = initiated.json<{ payment_intent_id: string; confirmation: { href: string } }>();
+    const confirmation = await app.inject({
+      method: 'GET',
+      url: c.confirmation.href,
+      headers: person.headers,
+    });
+    assert.equal(confirmation.statusCode, 200);
+    assert.equal(confirmation.json<{ kind: string }>().kind, 'redirect');
+    assert.equal(
+      (
+        await setup.query<{ n: number }>(
+          "SELECT count(*)::int AS n FROM public.audit_records WHERE tenant_id=$1 AND resource_id=$2 AND action='kms.decrypt_invoked' AND detail->>'data_class'='pii_financial'",
+          [tenant, c.payment_intent_id],
+        )
+      ).rows[0]!.n,
+      1,
+    );
+    const calls = initializeCalls;
+    process.env['BILLING_ACCEPTANCE_PAYSTACK_SECRET'] =
+      'sk_test_wrong_integration_secret_000000000';
+    try {
+      const denied = await app.inject({
+        method: 'GET',
+        url: c.confirmation.href,
+        headers: person.headers,
+      });
+      assert.equal(denied.statusCode, 503);
+      assert.equal(initializeCalls, calls);
+    } finally {
+      process.env['BILLING_ACCEPTANCE_PAYSTACK_SECRET'] = secret;
+    }
+    const reference = `tc-${c.payment_intent_id}`;
+    const raw = { ...ledger.get(reference), status: 'success' };
+    const deliver = async (value: Record<string, unknown>, key = secret) => {
+      const bytes = Buffer.from(JSON.stringify({ event: 'charge.success', data: value }));
+      const signature = createHmac('sha512', key).update(bytes).digest('hex');
+      return app.inject({
+        method: 'POST',
+        url: '/v1/billing/webhooks/paystack',
+        headers: { host, 'content-type': 'application/json', 'x-paystack-signature': signature },
+        payload: bytes,
+      });
+    };
+    assert.equal((await deliver(raw, 'sk_test_another_merchant')).statusCode, 400);
+    assert.equal((await deliver({ ...raw, amount: 1 })).statusCode, 400);
+    assert.equal((await deliver({ ...raw, domain: 'live' })).statusCode, 503);
+    assert.equal((await deliver(raw)).statusCode, 200);
+    assert.equal((await deliver(raw)).statusCode, 200);
+    assert.equal(
+      (
+        await app.inject({ method: 'GET', url: c.confirmation.href, headers: person.headers })
+      ).json<{ kind: string }>().kind,
+      'complete',
+    );
+    const nextQuote = await post('/v1/billing/consult-quotes', person.headers, {
+      consult_type: 'general',
+    });
+    assert.equal(nextQuote.statusCode, 201);
+    const nextBody = {
+        ...body,
+        accepted_quote_id: nextQuote.json<{ quote_id: string }>().quote_id,
+      },
+      key = ulid();
+    loseNext = true;
+    assert.equal((await post('/v1/async-consults', person.headers, nextBody, key)).statusCode, 503);
+    const beforeRetry = initializeCalls;
+    const retry = await post('/v1/async-consults', person.headers, nextBody, key);
+    assert.equal(retry.statusCode, 201);
+    assert.equal(
+      initializeCalls,
+      beforeRetry,
+      'ambiguous Paystack creation resumes by authenticated verify only',
+    );
+    const recovered = retry.json<{ confirmation: { href: string } }>();
+    assert.equal(
+      (
+        await app.inject({
+          method: 'GET',
+          url: recovered.confirmation.href,
+          headers: person.headers,
+        })
+      ).json<{ kind: string }>().kind,
+      'complete',
+    );
+    evidence.push(
+      'GH Paystack documented initialize/verify/webhook shape succeeds without data.integration; immutable credential authority, wrong key/mode/money denial, financial decrypt audit, callback dedup and verify-only ambiguous recovery pass under real roles',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.env['BILLING_PROVIDERS_JSON'] = originalRegistry;
+    delete process.env['BILLING_ACCEPTANCE_PAYSTACK_SECRET'];
     await setup.query(
       "UPDATE public.ccr_configs SET config_value='\"mock_local_dev\"'::jsonb WHERE tenant_id=$1 AND config_key='payment.processor'",
       [tenant],
@@ -622,8 +1108,7 @@ try {
         [tenant, c.payment_intent_id],
       )
     ).rows[0]!.confirmation_ciphertext;
-    assert.ok(Buffer.isBuffer(data));
-    assert.ok(!data.toString().includes('Synthetic payment'));
+    assert.equal(data, null, 'mock stores no credential ciphertext or global-key envelope');
     const cache = (
       await setup.query<{ response_body: unknown }>(
         'SELECT response_body FROM public.idempotency_keys WHERE tenant_id=$1 AND key=$2',
@@ -835,6 +1320,7 @@ try {
       await blockedConsultAuthorizationProbes(host, tenant);
       await providerFailureProbes(host, tenant, adminHeaders, version + 2);
     }
+    if (country === 'GH') await paystackRuntimeProbes(host, tenant, adminHeaders, version + 2);
     const logout = await post('/v0/identity/sessions/logout', person.headers, {
       refresh_token: person.refresh_token,
     });
@@ -848,12 +1334,25 @@ try {
       `${country}: actual registration, operator price publication, currency, quote ownership, immutable price, client tamper rejection, durable initiation/replay, SQL unpaid-intake rejection, signed synthetic payment/dedup, private confirmation, signed wrong-money/account/raw-body rejection, outbox rollback/resume, changed/expired quote rejection, terminal-state preservation and revoked replay`,
     );
   }
-  console.log(JSON.stringify({ adapter: 'mock_local_dev', real_money: false, evidence }, null, 2));
+  console.log(
+    JSON.stringify(
+      {
+        adapter: 'mock_local_dev + controlled Stripe/Paystack',
+        aws_transport: 'controlled SDK only; no live AWS policy evidence',
+        real_money: false,
+        evidence,
+      },
+      null,
+      2,
+    ),
+  );
 } finally {
   await app.close();
   await closePool();
   await closeBindActorContextPool();
   await closeBillingPool();
+  await closeClassifiedKmsPool();
+  controlledAws.restore();
   await setup.end();
   await ordinary.end();
   await binder.end();

@@ -1,4 +1,23 @@
+import { createHash } from 'node:crypto';
+
 import { BillingError, type BillingMode, type BillingProvider } from './types.js';
+
+/** Paystack authenticates an integration by its secret, not data.integration.
+ * Freeze that exact authority in the price; do not invent a numeric merchant ID.
+ */
+export function paystackCredentialAccount(secret: string): string {
+  return `paystack_${createHash('sha256').update('telecheck-paystack-credential-v1\0').update(secret).digest('hex')}`;
+}
+export function assertPaystackCredential(config: ProviderConfig): void {
+  if (
+    config.provider !== 'paystack' ||
+    config.account !== paystackCredentialAccount(config.secret) ||
+    config.secret !== config.webhookSecret ||
+    !config.secret.startsWith(config.mode === 'sandbox' ? 'sk_test_' : 'sk_live_') ||
+    config.mode === 'mock_local_dev'
+  )
+    throw new BillingError('billing.provider_account_mismatch');
+}
 
 export interface ProviderConfig {
   tenantId: string;
@@ -53,7 +72,10 @@ export function resolveProviderConfig(tenantId: string, expectedProvider?: strin
     (!account.startsWith('acct_') || !webhookSecret.startsWith('whsec_'))
   )
     throw new BillingError('billing.configuration_unavailable');
-  if (provider === 'paystack' && (!/^\d+$/.test(account) || secret !== webhookSecret))
+  if (
+    provider === 'paystack' &&
+    (account !== paystackCredentialAccount(secret) || secret !== webhookSecret)
+  )
     throw new BillingError('billing.configuration_unavailable');
   const publishableKey = typeof raw['publishable_key'] === 'string' ? raw['publishable_key'] : '';
   if (

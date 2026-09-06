@@ -30,6 +30,7 @@ try {
     'identity_service_role',
     'billing_service_role',
     'bind_actor_context_role',
+    'kms_service_role',
   ]) {
     const password = randomBytes(32).toString('hex');
     await setup.query(`ALTER ROLE ${role} LOGIN PASSWORD '${password}'`);
@@ -46,6 +47,7 @@ Object.assign(process.env, {
   DATABASE_URL: credentials.telecheck_app_role,
   IDENTITY_DATABASE_URL: credentials.identity_service_role,
   BILLING_DATABASE_URL: credentials.billing_service_role,
+  KMS_DATABASE_URL: credentials.kms_service_role,
   BIND_ACTOR_CONTEXT_DATABASE_URL: credentials.bind_actor_context_role,
   BILLING_TEST_SETUP_DATABASE_URL: setupUrl.toString(),
   DATABASE_SSL_MODE: 'disable',
@@ -57,7 +59,6 @@ Object.assign(process.env, {
   SMS_PROVIDER: 'noop',
   EMAIL_PROVIDER: 'noop',
   BILLING_ALLOW_MOCK: 'true',
-  BILLING_CONFIRMATION_KEY: randomBytes(32).toString('hex'),
   BILLING_TEST_MOCK_SECRET: randomBytes(32).toString('hex'),
   BILLING_PROVIDERS_JSON: JSON.stringify(
     Object.fromEntries(

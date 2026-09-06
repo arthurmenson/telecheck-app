@@ -1,13 +1,6 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  createHmac,
-  randomBytes,
-  timingSafeEqual,
-} from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
-import type { ProviderConfig } from './provider-config.js';
+import { assertPaystackCredential, type ProviderConfig } from './provider-config.js';
 import {
   BillingError,
   type Confirmation,
@@ -17,49 +10,6 @@ import {
 
 export const fingerprint = (value: string | Buffer): string =>
   createHash('sha256').update(value).digest('hex');
-function secretKey(): Buffer {
-  const value = process.env['BILLING_CONFIRMATION_KEY'];
-  if (!value || !/^[a-f0-9]{64}$/i.test(value))
-    throw new BillingError('billing.configuration_unavailable');
-  return Buffer.from(value, 'hex');
-}
-export function sealConfirmation(
-  confirmation: Confirmation,
-  tenant: string,
-  payment: string,
-): Buffer {
-  const key = secretKey();
-  try {
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', key, iv);
-    cipher.setAAD(Buffer.from(JSON.stringify(['billing-confirmation-v1', tenant, payment])));
-    return Buffer.concat([
-      Buffer.from([1]),
-      iv,
-      cipher.update(JSON.stringify(confirmation), 'utf8'),
-      cipher.final(),
-      cipher.getAuthTag(),
-    ]);
-  } finally {
-    key.fill(0);
-  }
-}
-export function openConfirmation(bytes: Buffer, tenant: string, payment: string): Confirmation {
-  const key = secretKey();
-  try {
-    if (bytes[0] !== 1 || bytes.length < 30 || bytes.length > 16384) throw new Error();
-    const cipher = createDecipheriv('aes-256-gcm', key, bytes.subarray(1, 13));
-    cipher.setAAD(Buffer.from(JSON.stringify(['billing-confirmation-v1', tenant, payment])));
-    cipher.setAuthTag(bytes.subarray(-16));
-    return JSON.parse(
-      Buffer.concat([cipher.update(bytes.subarray(13, -16)), cipher.final()]).toString('utf8'),
-    ) as Confirmation;
-  } catch {
-    throw new BillingError('billing.confirmation_unavailable');
-  } finally {
-    key.fill(0);
-  }
-}
 type Json = Record<string, unknown>;
 function obj(value: unknown): Json {
   if (!value || typeof value !== 'object' || Array.isArray(value))
@@ -150,10 +100,8 @@ function paystackObject(
   raw: Json,
 ): Omit<ProviderObservation, 'eventId' | 'type'> {
   const metadata = obj(raw['metadata']);
-  if (
-    raw['domain'] !== (config.mode === 'sandbox' ? 'test' : 'live') ||
-    String(raw['integration']) !== config.account
-  )
+  assertPaystackCredential(config);
+  if (raw['domain'] !== (config.mode === 'sandbox' ? 'test' : 'live'))
     throw new BillingError('billing.provider_invalid_response');
   return {
     paymentId: string(metadata['telecheck_payment_id']),
@@ -190,6 +138,7 @@ export async function createProviderIntent(
   intent: PaymentIntent,
   email: string | null,
 ): Promise<Creation> {
+  if (config.provider === 'paystack') assertPaystackCredential(config);
   if (config.provider === 'mock_local_dev')
     return {
       objectId: intent.provider_reference,
@@ -263,7 +212,7 @@ export async function createProviderIntent(
       currency: intent.currency,
       reference: intent.provider_reference,
       callback_url: config.returnUrl,
-      metadata: { telecheck_payment_id: intent.payment_id },
+      metadata: JSON.stringify({ telecheck_payment_id: intent.payment_id }),
     });
     if (response['status'] !== true) throw new BillingError('billing.provider_invalid_response');
     initialized = obj(response['data']);
@@ -314,6 +263,7 @@ export function verifyWebhook(
   headers: Record<string, unknown>,
   now = Date.now(),
 ): ProviderObservation | null {
+  if (config.provider === 'paystack') assertPaystackCredential(config);
   if (bytes.length > 65536) throw new BillingError('billing.webhook_invalid', 400);
   if (config.provider === 'stripe') {
     const header =

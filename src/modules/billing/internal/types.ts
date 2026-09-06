@@ -57,6 +57,13 @@ export interface PaymentIntent extends Price {
   provider_created_at: Date | null;
   verified_at: Date | null;
   confirmation_ciphertext: Buffer | null;
+  confirmation_dek_id: string | null;
+  confirmation_iv: Buffer | null;
+  confirmation_tag: Buffer | null;
+  confirmation_alg: string | null;
+  confirmation_alg_version: string | null;
+  confirmation_aad: Buffer | null;
+  confirmation_encrypted_at: Date | null;
 }
 export type Confirmation =
   | {

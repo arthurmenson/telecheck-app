@@ -8,14 +8,13 @@ import { asAccountId, findAccountById } from '../../identity/index.js';
 import { resolveCurrencyCode, resolvePaymentProcessor } from '../../tenant-config/index.js';
 
 import { billingTransaction } from './database.js';
+import { mockConfirmation, openConfirmation, sealConfirmation } from './confirmation.js';
 import { resolveProviderConfig } from './provider-config.js';
 import {
   assertObservation,
   createProviderIntent,
   fingerprint,
   mockSignedObservation,
-  openConfirmation,
-  sealConfirmation,
   verifyWebhook,
 } from './providers.js';
 import {
@@ -30,7 +29,8 @@ import {
 
 const intentSql = `SELECT p.*, i.id AS payment_id, i.patient_id, i.quote_id, i.request_hash,i.initiation_source,
   i.provider_reference,i.provider_object_id,i.status,i.lease_token,i.lease_expires_at,i.accepted_at,
-  i.provider_created_at,i.verified_at,i.confirmation_ciphertext FROM public.billing_payment_intent i
+  i.provider_created_at,i.verified_at,i.confirmation_ciphertext,i.confirmation_dek_id,i.confirmation_iv,i.confirmation_tag,
+  i.confirmation_alg,i.confirmation_alg_version,i.confirmation_aad,i.confirmation_encrypted_at FROM public.billing_payment_intent i
   JOIN public.billing_consult_price p ON (p.tenant_id,p.id) = (i.tenant_id,i.price_id)`;
 async function audit(
   tx: DbTransaction,
@@ -364,20 +364,33 @@ export async function ensureConsultPayment(
       intent,
       account?.email ?? null,
     );
-    const ciphertext = created.confirmation
-      ? sealConfirmation(created.confirmation, actor.context.tenantId, intent.payment_id)
-      : null;
     return await billingTransaction(
       actor.context.tenantId,
       async (tx) => {
+        // The original real patient still authorizes financial encryption. If
+        // crypto/authority fails after provider acceptance, retain uncertainty.
+        // No fake worker session is created to make this write succeed.
+        const envelope =
+          created.confirmation && intent.provider !== 'mock_local_dev'
+            ? await sealConfirmation(tx, intent, created.confirmation)
+            : null;
         const result = await tx.query(
-          `UPDATE public.billing_payment_intent SET provider_object_id=$4,provider_created_at=COALESCE(provider_created_at,clock_timestamp()),status='requires_payment',confirmation_ciphertext=$5,lease_token=NULL,lease_expires_at=NULL,last_failure_code=NULL WHERE tenant_id=$1 AND id=$2 AND lease_token=$3 AND lease_expires_at>clock_timestamp() AND status IN ('creating','creation_unknown') RETURNING id`,
+          `UPDATE public.billing_payment_intent SET provider_object_id=$4,provider_created_at=COALESCE(provider_created_at,clock_timestamp()),status='requires_payment',confirmation_ciphertext=$5,
+          confirmation_dek_id=$6,confirmation_iv=$7,confirmation_tag=$8,confirmation_alg=$9,confirmation_alg_version=$10,confirmation_aad=$11,confirmation_encrypted_at=$12,
+          lease_token=NULL,lease_expires_at=NULL,last_failure_code=NULL WHERE tenant_id=$1 AND id=$2 AND lease_token=$3 AND lease_expires_at>clock_timestamp() AND status IN ('creating','creation_unknown') RETURNING id`,
           [
             actor.context.tenantId,
             intent.payment_id,
             intent.lease_token,
             created.objectId,
-            ciphertext,
+            envelope?.ciphertext ?? null,
+            envelope?.dekId ?? null,
+            envelope?.iv ?? null,
+            envelope?.tag ?? null,
+            envelope?.alg ?? null,
+            envelope?.algVersion ?? null,
+            envelope?.aad ?? null,
+            envelope?.encryptedAt ?? null,
           ],
         );
         if (!result.rowCount) throw new BillingError('billing.creation_superseded', 409);
@@ -440,7 +453,7 @@ async function applyObservation(
   );
   if (
     observation.type === 'paid' &&
-    !['paid', 'refund_pending', 'refunded'].includes(intent.status)
+    !['paid', 'refund_pending', 'refunded', 'cancelled'].includes(intent.status)
   ) {
     await tx.query(
       "UPDATE public.billing_payment_intent SET status='paid',provider_object_id=COALESCE(provider_object_id,$3),provider_created_at=COALESCE(provider_created_at,clock_timestamp()),verified_at=COALESCE(verified_at,clock_timestamp()),lease_token=NULL,lease_expires_at=NULL WHERE tenant_id=$1 AND id=$2",
@@ -476,7 +489,7 @@ async function applyObservation(
     });
   } else if (
     ['failed', 'cancelled'].includes(observation.type) &&
-    !['paid', 'refund_pending', 'refunded'].includes(intent.status)
+    !['paid', 'refund_pending', 'refunded', 'cancelled'].includes(intent.status)
   ) {
     // A declined Stripe attempt does not destroy its PaymentIntent. The same
     // confirmation may be retried; only an explicit cancellation is terminal.
@@ -540,15 +553,39 @@ export async function paymentConfirmation(actor: BillingActor, id: string): Prom
       ).rows[0];
       if (!intent) throw new BillingError('billing.payment_unavailable', 404);
       assertConfig(intent);
-      await tx.query('SELECT public.billing_apply_verified_payment($1,$2)', [id, ulid()]);
-      if (['paid', 'refund_pending', 'refunded'].includes(intent.status))
+      if (['paid', 'refund_pending', 'refunded'].includes(intent.status)) {
+        await tx.query('SELECT public.billing_apply_verified_payment($1,$2)', [id, ulid()]);
         return {
           kind: 'complete',
           status: intent.status as 'paid' | 'refund_pending' | 'refunded',
         };
-      if (intent.status !== 'requires_payment' || !intent.confirmation_ciphertext)
+      }
+      if (intent.status !== 'requires_payment')
         throw new BillingError('billing.confirmation_unavailable', 409);
-      return openConfirmation(intent.confirmation_ciphertext, actor.context.tenantId, id);
+      // Classified decryption/audit precedes any business advisory lock. After
+      // crypto, serialize with callbacks and re-read terminal state before release.
+      const confirmation =
+        intent.provider === 'mock_local_dev'
+          ? mockConfirmation(intent)
+          : await openConfirmation(tx, intent);
+      await tx.query("SELECT pg_advisory_xact_lock(('x'||substr(md5($1),1,16))::bit(64)::bigint)", [
+        `billing_intent:${actor.context.tenantId}:${id}`,
+      ]);
+      const latest = (
+        await tx.query<{ status: PaymentIntent['status'] }>(
+          'SELECT status FROM public.billing_payment_intent WHERE tenant_id=$1 AND id=$2',
+          [actor.context.tenantId, id],
+        )
+      ).rows[0];
+      if (latest?.status === 'requires_payment') return confirmation;
+      if (latest && ['paid', 'refund_pending', 'refunded'].includes(latest.status)) {
+        await tx.query('SELECT public.billing_apply_verified_payment($1,$2)', [id, ulid()]);
+        return {
+          kind: 'complete',
+          status: latest.status as 'paid' | 'refund_pending' | 'refunded',
+        };
+      }
+      throw new BillingError('billing.confirmation_unavailable', 409);
     },
     actor,
   );

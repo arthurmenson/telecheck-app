@@ -11,6 +11,10 @@ GRANT EXECUTE ON FUNCTION public.set_tenant_context(TEXT), public.clear_tenant_c
 GRANT SELECT (id, country_of_care, status) ON public.tenants TO billing_service_role;
 GRANT SELECT ON public.country_profiles, public.ccr_configs TO billing_service_role;
 GRANT SELECT, INSERT ON public.audit_records, public.domain_events_outbox TO billing_service_role;
+-- The original live patient context authorizes classified financial crypto.
+-- Keyring mutation and decrypt evidence still use the separate KMS login.
+GRANT EXECUTE ON FUNCTION public.kms_current_actor_context(), public.kms_assert_patient_scope(TEXT), public.kms_request_audit_context() TO billing_service_role;
+GRANT SELECT ON public.tenant_kms_bindings TO billing_service_role;
 GRANT SELECT (nonce, actor_account_id, actor_account_tenant_id, actor_role, session_id, expires_at)
   ON public._session_actor_context TO billing_context_owner;
 GRANT SELECT (account_id, tenant_id, account_type, status, deleted_at) ON public.accounts TO billing_context_owner;
@@ -96,6 +100,14 @@ CREATE TABLE public.billing_payment_intent (
   lease_token UUID,
   lease_expires_at TIMESTAMPTZ,
   confirmation_ciphertext BYTEA,
+  confirmation_dek_id VARCHAR(26),
+  confirmation_iv BYTEA,
+  confirmation_tag BYTEA,
+  confirmation_alg TEXT,
+  confirmation_alg_version TEXT,
+  confirmation_aad BYTEA,
+  confirmation_encrypted_at TIMESTAMPTZ,
+  confirmation_data_class TEXT NOT NULL DEFAULT 'pii_financial' CHECK (confirmation_data_class = 'pii_financial'),
   accepted_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   provider_created_at TIMESTAMPTZ,
   verified_at TIMESTAMPTZ,
@@ -108,6 +120,11 @@ CREATE TABLE public.billing_payment_intent (
   UNIQUE (tenant_id, patient_id, operation_key),
   UNIQUE (tenant_id, quote_id),
   UNIQUE (provider_reference),
+  FOREIGN KEY (tenant_id, confirmation_data_class, confirmation_dek_id) REFERENCES public.kms_dek_keyring(tenant_id,data_class,dek_version_id),
+  CHECK ((confirmation_ciphertext IS NULL AND confirmation_dek_id IS NULL AND confirmation_iv IS NULL AND confirmation_tag IS NULL AND confirmation_alg IS NULL AND confirmation_alg_version IS NULL AND confirmation_aad IS NULL AND confirmation_encrypted_at IS NULL)
+    OR (confirmation_ciphertext IS NOT NULL AND confirmation_dek_id IS NOT NULL AND confirmation_iv IS NOT NULL AND octet_length(confirmation_iv)=12
+      AND confirmation_tag IS NOT NULL AND octet_length(confirmation_tag)=16 AND confirmation_alg IS NOT NULL AND confirmation_alg='AES-256-GCM' AND confirmation_alg_version IS NOT NULL AND confirmation_alg_version='2'
+      AND confirmation_aad IS NOT NULL AND confirmation_encrypted_at IS NOT NULL)),
   CHECK ((status NOT IN ('paid', 'refund_pending', 'refunded')) OR verified_at IS NOT NULL)
 );
 CREATE TABLE public.billing_provider_event (
@@ -144,7 +161,7 @@ DO $$ DECLARE t TEXT; BEGIN
     EXECUTE format('GRANT SELECT, INSERT ON public.%I TO billing_service_role', t);
   END LOOP;
 END $$;
-GRANT UPDATE (provider_object_id, status, lease_token, lease_expires_at, confirmation_ciphertext, provider_created_at, verified_at, last_failure_code)
+GRANT UPDATE (provider_object_id, status, lease_token, lease_expires_at, confirmation_ciphertext, confirmation_dek_id, confirmation_iv, confirmation_tag, confirmation_alg, confirmation_alg_version, confirmation_aad, confirmation_encrypted_at, provider_created_at, verified_at, last_failure_code)
   ON public.billing_payment_intent TO billing_service_role;
 GRANT UPDATE (status, provider_refund_id, confirmed_at) ON public.billing_refund_intent TO billing_service_role;
 CREATE FUNCTION public.billing_immutable() RETURNS TRIGGER LANGUAGE plpgsql
@@ -157,15 +174,16 @@ CREATE TRIGGER billing_refund_no_delete BEFORE DELETE ON public.billing_refund_i
 
 CREATE FUNCTION public.billing_intent_identity_immutable() RETURNS TRIGGER LANGUAGE plpgsql
 SET search_path = pg_catalog, public, pg_temp AS $$ BEGIN
-  IF (to_jsonb(NEW) - ARRAY['provider_object_id','status','lease_token','lease_expires_at','confirmation_ciphertext','provider_created_at','verified_at','last_failure_code'])
+  IF (to_jsonb(NEW) - ARRAY['provider_object_id','status','lease_token','lease_expires_at','confirmation_ciphertext','confirmation_dek_id','confirmation_iv','confirmation_tag','confirmation_alg','confirmation_alg_version','confirmation_aad','confirmation_encrypted_at','provider_created_at','verified_at','last_failure_code'])
      IS DISTINCT FROM
-     (to_jsonb(OLD) - ARRAY['provider_object_id','status','lease_token','lease_expires_at','confirmation_ciphertext','provider_created_at','verified_at','last_failure_code'])
+     (to_jsonb(OLD) - ARRAY['provider_object_id','status','lease_token','lease_expires_at','confirmation_ciphertext','confirmation_dek_id','confirmation_iv','confirmation_tag','confirmation_alg','confirmation_alg_version','confirmation_aad','confirmation_encrypted_at','provider_created_at','verified_at','last_failure_code'])
      OR (OLD.verified_at IS NOT NULL AND NEW.verified_at IS DISTINCT FROM OLD.verified_at)
      OR (OLD.provider_object_id IS NOT NULL AND NEW.provider_object_id IS DISTINCT FROM OLD.provider_object_id)
      OR (OLD.provider_created_at IS NOT NULL AND NEW.provider_created_at IS DISTINCT FROM OLD.provider_created_at)
   THEN RAISE EXCEPTION 'billing_intent_identity_immutable' USING ERRCODE = '42501'; END IF;
   IF OLD.status IN ('paid', 'refund_pending', 'refunded') AND NEW.status NOT IN ('paid', 'refund_pending', 'refunded')
      OR OLD.status = 'refunded' AND NEW.status <> 'refunded'
+     OR OLD.status = 'cancelled' AND NEW.status <> 'cancelled'
   THEN RAISE EXCEPTION 'billing_payment_status_regression' USING ERRCODE = '23514'; END IF;
   RETURN NEW;
 END $$;

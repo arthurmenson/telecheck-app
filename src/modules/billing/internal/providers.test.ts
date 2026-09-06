@@ -2,14 +2,12 @@ import { createHmac } from 'node:crypto';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { resolveProviderConfig, type ProviderConfig } from './provider-config.js';
 import {
-  assertObservation,
-  createProviderIntent,
-  openConfirmation,
-  sealConfirmation,
-  verifyWebhook,
-} from './providers.js';
+  paystackCredentialAccount,
+  resolveProviderConfig,
+  type ProviderConfig,
+} from './provider-config.js';
+import { assertObservation, createProviderIntent, verifyWebhook } from './providers.js';
 import type { PaymentIntent } from './types.js';
 
 const config: ProviderConfig = {
@@ -187,7 +185,7 @@ describe('raw provider verification and immutable money binding', () => {
     ...config,
     tenantId: 'Telecheck-Ghana',
     provider: 'paystack' as const,
-    account: '12345',
+    account: paystackCredentialAccount(config.secret),
     webhookSecret: 'sk_test_' + 'a'.repeat(32),
   };
   function paystackEvent(change: Record<string, unknown> = {}) {
@@ -199,7 +197,6 @@ describe('raw provider verification and immutable money binding', () => {
         amount: 4900,
         currency: 'GHS',
         domain: 'test',
-        integration: 12345,
         status: 'success',
         metadata: { telecheck_payment_id: intent.payment_id },
         ...change,
@@ -217,16 +214,16 @@ describe('raw provider verification and immutable money binding', () => {
       },
     };
   }
-  it('verifies Paystack SHA512, integration identity and server reference', () => {
+  it('verifies the documented Paystack shape, credential authority and server reference without data.integration', () => {
     const s = signedPaystack(paystackEvent());
     expect(verifyWebhook(paystack, s.bytes, s.headers)).toMatchObject({
       eventId: 'charge.success:123',
-      account: '12345',
+      account: paystackCredentialAccount(config.secret),
       currency: 'GHS',
       type: 'paid',
     });
   });
-  it.each([{ integration: 987 }, { domain: 'live' }, { status: 'pending' }])(
+  it.each([{ domain: 'live' }, { status: 'pending' }])(
     'rejects signed Paystack mismatch %j',
     (change) => {
       const s = signedPaystack(paystackEvent(change));
@@ -236,6 +233,25 @@ describe('raw provider verification and immutable money binding', () => {
   it('does not accept a Stripe signature on Paystack', () => {
     const s = signed(paystackEvent());
     expect(() => verifyWebhook(paystack, s.bytes, s.headers)).toThrow();
+  });
+  it('does not let an unrelated credential or account label authenticate a Paystack event', () => {
+    const signed = signedPaystack(paystackEvent());
+    expect(() =>
+      verifyWebhook({ ...paystack, account: 'paystack_wrong' }, signed.bytes, signed.headers),
+    ).toThrow('billing.provider_account_mismatch');
+    const wrongSecret = 'sk_test_wrong_integration_secret_000000000';
+    expect(() =>
+      verifyWebhook(
+        {
+          ...paystack,
+          secret: wrongSecret,
+          webhookSecret: wrongSecret,
+          account: paystackCredentialAccount(wrongSecret),
+        },
+        signed.bytes,
+        signed.headers,
+      ),
+    ).toThrow('billing.webhook_invalid');
   });
 });
 describe('durable provider creation protocol', () => {
@@ -351,8 +367,9 @@ describe('durable provider creation protocol', () => {
     const paystack = {
       ...config,
       provider: 'paystack' as const,
+      webhookSecret: config.secret,
       tenantId: 'Telecheck-Ghana',
-      account: '12345',
+      account: paystackCredentialAccount(config.secret),
     };
     const f = vi.fn(
       async () =>
@@ -365,7 +382,6 @@ describe('durable provider creation protocol', () => {
               amount: 4900,
               currency: 'GHS',
               domain: 'test',
-              integration: 12345,
               status: 'success',
               metadata: { telecheck_payment_id: intent.payment_id },
             },
@@ -378,7 +394,7 @@ describe('durable provider creation protocol', () => {
       ...intent,
       provider: 'paystack' as const,
       currency: 'GHS',
-      provider_account: '12345',
+      provider_account: paystackCredentialAccount(config.secret),
       status: 'creation_unknown' as const,
     };
     expect((await createProviderIntent(paystack, p, 'synthetic@example.invalid')).paid?.type).toBe(
@@ -391,7 +407,12 @@ describe('durable provider creation protocol', () => {
     );
   });
   it('does not invent a checkout URL after ambiguous Paystack acceptance', async () => {
-    const paystack = { ...config, provider: 'paystack' as const, account: '12345' };
+    const paystack = {
+      ...config,
+      provider: 'paystack' as const,
+      account: paystackCredentialAccount(config.secret),
+      webhookSecret: config.secret,
+    };
     vi.stubGlobal(
       'fetch',
       vi.fn(
@@ -405,7 +426,6 @@ describe('durable provider creation protocol', () => {
                 amount: 4900,
                 currency: 'GHS',
                 domain: 'test',
-                integration: 12345,
                 status: 'abandoned',
                 metadata: { telecheck_payment_id: intent.payment_id },
               },
@@ -417,35 +437,18 @@ describe('durable provider creation protocol', () => {
     await expect(
       createProviderIntent(
         paystack,
-        { ...intent, currency: 'GHS', provider_account: '12345', status: 'creation_unknown' },
+        {
+          ...intent,
+          currency: 'GHS',
+          provider_account: paystackCredentialAccount(config.secret),
+          status: 'creation_unknown',
+        },
         'synthetic@example.invalid',
       ),
     ).rejects.toThrow('billing.reconciliation_required');
   });
 });
 describe('confirmation secrecy and explicit configuration', () => {
-  it('authenticates tenant and payment identity and ciphertext', () => {
-    const value = {
-      kind: 'stripe' as const,
-      client_secret: 'private_confirmation',
-      publishable_key: 'pk_test',
-      account: 'acct_test',
-      mode: 'sandbox' as const,
-    };
-    const bytes = sealConfirmation(value, 'Telecheck-US', intent.payment_id);
-    expect(bytes.toString()).not.toContain('private_confirmation');
-    expect(openConfirmation(bytes, 'Telecheck-US', intent.payment_id)).toEqual(value);
-    expect(() => openConfirmation(bytes, 'Telecheck-Ghana', intent.payment_id)).toThrow();
-    expect(() => openConfirmation(bytes, 'Telecheck-US', 'other')).toThrow();
-    bytes[15] = bytes[15]! ^ 1;
-    expect(() => openConfirmation(bytes, 'Telecheck-US', intent.payment_id)).toThrow();
-  });
-  it('fails closed without a strong confirmation key', () => {
-    vi.stubEnv('BILLING_CONFIRMATION_KEY', 'weak');
-    expect(() =>
-      sealConfirmation({ kind: 'complete', status: 'paid' }, 'Telecheck-US', intent.payment_id),
-    ).toThrow();
-  });
   function mockConfig() {
     vi.stubEnv('BILLING_MOCK_SECRET', 'a'.repeat(32));
     vi.stubEnv(
