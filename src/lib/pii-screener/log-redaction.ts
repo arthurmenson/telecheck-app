@@ -793,19 +793,26 @@ export function createRedactingStream(dest: NodeJS.WritableStream): Transform {
         // leak (the whole record was redacted together) but it broke
         // the resource invariant the cap exists to hold.
         let out = '';
-        for (;;) {
-          const nl = carry.indexOf('\n');
-          if (nl === -1) break;
-          const record = carry.slice(0, nl + 1);
-          carry = carry.slice(nl + 1);
-          const recordBytes = Buffer.byteLength(record, 'utf8');
-          carryBytes -= recordBytes;
-          if (recordBytes > MAX_CARRY_BYTES) {
-            // Oversized even though terminated — drop it rather than
-            // spend unbounded work redacting it.
-            out += `{"level":50,"msg":"${LOG_OVERSIZED_LINE_SENTINEL}"}\n`;
-          } else {
-            out += redactLogLine(record);
+        // The previous carry has no newline: every complete record was
+        // consumed on the preceding write. Only new text can terminate it.
+        // Searching the growing carry on every tiny chunk repeatedly scans
+        // (and flattens) the entire partial record, making the split-surrogate
+        // regression quadratic even though byte accounting is incremental.
+        if (text.includes('\n')) {
+          for (;;) {
+            const nl = carry.indexOf('\n');
+            if (nl === -1) break;
+            const record = carry.slice(0, nl + 1);
+            carry = carry.slice(nl + 1);
+            const recordBytes = Buffer.byteLength(record, 'utf8');
+            carryBytes -= recordBytes;
+            if (recordBytes > MAX_CARRY_BYTES) {
+              // Oversized even though terminated — drop it rather than
+              // spend unbounded work redacting it.
+              out += `{"level":50,"msg":"${LOG_OVERSIZED_LINE_SENTINEL}"}\n`;
+            } else {
+              out += redactLogLine(record);
+            }
           }
         }
 
