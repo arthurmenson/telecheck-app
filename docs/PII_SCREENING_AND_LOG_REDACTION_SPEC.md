@@ -294,13 +294,19 @@ The  payload walker still fails closed by *rejecting the request*, because it is
 
 ## Layer 4 — AI vendor payload sanitization
 
-**Where:** every call to `src/lib/ai-service/` provider adapters (Anthropic primary; Bedrock + Azure secondary).
+**Where:** real clinical completions resolved by `src/modules/ai-service/internal/providers/resolve-clinical-provider.ts`, for both the admin-managed DB credential and environment fallback. The current caller is Mode 1 chat; Mode 2 still uses the Null provider. The admin credential test sends only the fixed literal `ping` and carries no patient input. New adapters, workloads or prompt-bearing paths must establish their attribution contract and use the boundary before activation.
 
 **How:** the input screener at Layer 1 has already blocked or warned on suspected PHI before the request handler runs. Layer 4 is defense-in-depth on the egress side:
 - Re-run **regex-only** screening (never NER — Layer 1's NER may not have been invoked on system-generated prompt scaffolding that only Layer 4 sees) against the assembled outbound prompt (system prompt + prior turns + current turn + tool inputs)
 - If any high-confidence regex pattern fires in the outbound payload, do NOT send the prompt — return `500 ai.provider.egress_blocked` to the caller with audit event `pii.screener.egress_block`
 - Redact any lower-confidence regex hit with `[REDACTED:PII]` before send and emit `pii.screener.egress_redact` audit event
 - **Absolute:** all screening on outbound payloads happens LOCALLY. Layer 4 never calls the AI provider to determine if content is PHI (see Layer 1 §Local NER-based classifier §Absolute prohibition).
+
+**Canonical registration:** AUDIT_EVENTS v5.5 and Operational Decision Ledger P-047 in `arthurmenson/telecheckONE` define both events as unsampled Category B tenant governance evidence. The detailed block/redact rule above takes precedence over the former unconditional-send non-goal. Screening failure also blocks locally. Audit recording failure returns `503 ai_chat.audit_emission_unavailable` and sends nothing; these local errors do not enter the provider-outage fail-soft path.
+
+The boundary validates and snapshots the complete supported request shape, joins system messages exactly as the Anthropic serializer does, and scans all assembled text. Unsupported fields (including tool extensions) fail closed. Replacements are rescanned until a full pass is match-free; a new high-confidence match blocks, and exhausting the bounded pass budget fails closed. Hit counts include accepted observations across those passes; failed scans record an unknown count (`null`).
+
+The Mode 1 recorder commits through an independent transaction before a redacted send or a local block. Its marker and metadata-only event commit atomically, surviving chat rollback or provider failure. Equivalent decisions reuse evidence within the original reservation window; retries always rescreen, changed candidates/rules/identity remain distinct, and expired markers are reclaimed. The exact reservation expiry is read from the caller's transaction without truncating PostgreSQL timestamp precision. Candidate fingerprints remain inside marker keys and never appear in audit payloads. This records a local decision, not vendor receipt or exactly-once delivery. Clean requests emit no Layer 4 event.
 
 **Rationale:** the AI vendor is a subprocessor NOT authorized for PHI under Ghana law + no BAA. Under no circumstances does real PII cross into Anthropic's / Bedrock's / Azure's data plane during Pilot 1.
 
@@ -517,5 +523,5 @@ Each PR through Codex adversarial review → APPROVE → merge → addendum + co
 ## Known non-goals
 
 - **Layer 1 is NOT clinical-content classification.** Blocking "high blood pressure" (a common phrase) is out of scope. Only PII patterns tied to identifiable persons.
-- **Layer 4 does NOT block AI provider access.** It sanitizes the payload; the AI still receives the (cleaned) turn.
+- **Layer 4 is regex-only.** Clean turns pass, lower-confidence matches are redacted before send, and high-confidence matches or local screening/audit failures prevent send. Names and prose addresses outside the regex library still require the separately gated Layer 1 NER remedy.
 - **These layers do NOT replace Pilot 2's compliant substrate.** They reduce Pilot 1 residual risk; they do not authorize real-PHI processing.

@@ -44,6 +44,12 @@ import { withDbRole } from '../../../../lib/with-db-role.js';
 import { AnthropicLLMProvider } from './anthropic-provider.js';
 import { NullLLMProvider } from './null-provider.js';
 import type { LLMProvider } from './types.js';
+import {
+  recordVendorDecision,
+  validateVendorAuditContext,
+  type VendorAuditContext,
+} from './vendor-audit.js';
+import { VendorAuditUnavailableError, withVendorBoundary } from './vendor-boundary.js';
 
 /** The provider identifiers the credential store recognizes (matches the
  *  ai_provider_credential.provider CHECK). */
@@ -108,6 +114,10 @@ export interface ResolveClinicalProviderDeps {
    *  omitted, resolution skips the DB read and uses only the env fallback
    *  (e.g. a probe path that has no tx). */
   tx?: DbClient;
+  /** Trusted Mode 1 context; required for a real completion, not a healthcheck.
+   * Reservation expiry is read from this caller's transaction, never the child
+   * audit transaction (which cannot see the uncommitted reservation). */
+  auditContext?: Omit<VendorAuditContext, 'reservationExpiresAt'>;
 }
 
 /**
@@ -119,11 +129,20 @@ export interface ResolveClinicalProviderDeps {
 export async function resolveClinicalProvider(
   deps: ResolveClinicalProviderDeps = {},
 ): Promise<LLMProvider> {
+  const tx = deps.tx;
+  // Copy before any await so later caller mutation cannot change attribution.
+  const auditInput =
+    deps.auditContext === undefined
+      ? undefined
+      : {
+          ...deps.auditContext,
+          idempotency: { ...deps.auditContext.idempotency },
+        };
   let apiKey: string | null = null;
 
   // 1. Admin-managed DB credential (takes precedence once configured).
-  if (deps.tx !== undefined) {
-    apiKey = await readActiveProviderKeyPlaintext(deps.tx, 'anthropic');
+  if (tx !== undefined) {
+    apiKey = await readActiveProviderKeyPlaintext(tx, 'anthropic');
   }
 
   // 2. Env fallback (bootstrap; preserves pre-SI-025 behavior).
@@ -139,7 +158,44 @@ export async function resolveClinicalProvider(
     return new NullLLMProvider();
   }
 
-  return new AnthropicLLMProvider({ apiKey, model: config.anthropicModel });
+  const model = config.anthropicModel;
+  const provider = new AnthropicLLMProvider({ apiKey, model });
+  return {
+    name: provider.name,
+    healthcheck: () => provider.healthcheck(),
+    async sendCompletion(request) {
+      let auditContext: VendorAuditContext;
+      try {
+        if (tx === undefined || auditInput === undefined) throw new VendorAuditUnavailableError();
+        const identity = auditInput.idempotency;
+        const reservation = await tx.query<{ expires_at: string }>(
+          `SELECT expires_at::text AS expires_at FROM idempotency_keys
+            WHERE tenant_id = $1 AND key = $2 AND endpoint = $3 AND actor_id = $4
+              AND request_hash = decode($5, 'hex') AND processing_state = 'pending'`,
+          [
+            auditInput.tenantId,
+            identity.idempotencyKey,
+            identity.endpoint,
+            identity.actorId,
+            identity.bodyHash,
+          ],
+        );
+        const expiresAt = reservation.rows[0]?.expires_at;
+        if (typeof expiresAt !== 'string') throw new VendorAuditUnavailableError();
+        auditContext = { ...auditInput, reservationExpiresAt: expiresAt };
+        validateVendorAuditContext(auditContext);
+      } catch {
+        // DB/validation diagnostics may contain candidate values. Keep this
+        // distinct from a provider outage and do not retain the original cause.
+        throw new VendorAuditUnavailableError();
+      }
+      return withVendorBoundary(
+        provider,
+        (decision) => recordVendorDecision(auditContext, provider.name, decision),
+        { tenantId: auditContext.tenantId, workloadType: 'conversational_assistant', model },
+      ).sendCompletion(request);
+    },
+  };
 }
 
 /**
