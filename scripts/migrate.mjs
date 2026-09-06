@@ -52,9 +52,20 @@ export async function applyMigrations(client, directory, report = () => {}) {
       const source = sources.get(name);
       await client.query('BEGIN');
       try {
+        // A prior migration may persist a session setting. Lexing and the
+        // server must agree for every file, not only the first migration.
+        await client.query('SET LOCAL standard_conforming_strings = on');
         await client.query("SET LOCAL lock_timeout = '10s'");
         await client.query("SET LOCAL statement_timeout = '120s'");
-        await client.query(source.sql);
+        // PostgreSQL, not the diagnostic lexer, owns transaction containment.
+        // A SELECT-invoked function cannot end its enclosing transaction, even
+        // through nested DO/CALL or SQL spelling the lexer does not understand.
+        // SECURITY INVOKER preserves the migration principal's existing powers.
+        await client.query(`CREATE OR REPLACE FUNCTION pg_temp.telecheck_apply_migration(body TEXT)
+          RETURNS void LANGUAGE plpgsql SECURITY INVOKER AS $runner$
+          BEGIN EXECUTE body; END $runner$`);
+        await client.query('SELECT pg_temp.telecheck_apply_migration($1)', [source.sql]);
+        await client.query('DROP FUNCTION pg_temp.telecheck_apply_migration(TEXT)');
         await client.query('INSERT INTO schema_migrations(filename, checksum_sha) VALUES ($1,$2)', [
           name,
           source.checksum,

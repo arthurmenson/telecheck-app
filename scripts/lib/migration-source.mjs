@@ -16,7 +16,7 @@ export function splitSql(source) {
     const c = source[i];
     const next = source[i + 1];
     if (lineComment) {
-      if (c === '\n') {
+      if (c === '\n' || c === '\r') {
         lineComment = false;
         code += ' ';
       }
@@ -63,8 +63,12 @@ export function splitSql(source) {
       code += ' quoted_value ';
       continue;
     }
-    if (c === '$') {
-      const match = source.slice(i).match(/^\$(?:[a-zA-Z_][a-zA-Z_0-9]*)?\$/);
+    // PostgreSQL permits dollars inside unquoted identifiers. A dollar quote
+    // starts only at a token boundary; foo$tag$ is an identifier, not a body.
+    if (c === '$' && (i === 0 || !/[A-Za-z0-9_$\u0080-\uFFFF]/.test(source[i - 1]))) {
+      const match = source
+        .slice(i)
+        .match(/^\$(?:[a-zA-Z_\u0080-\uFFFF][a-zA-Z_0-9\u0080-\uFFFF]*)?\$/);
       if (match) {
         dollar = match[0];
         i += dollar.length - 1;

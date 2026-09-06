@@ -12,15 +12,14 @@
  * Why this matters:
  *   `kmsEncrypt`/`kmsDecrypt` are the layer-3 tenant-isolation
  *   boundary per I-023 + ADR-024. Production must FAIL CLOSED until
- *   the AWS KMS adapter is wired (the stub THROWS rather than
- *   silently encrypt with the dev key). The test path uses an AES-
+ *   classified caller context, tenant IAM binding and decrypt audits are
+ *   wired around the AWS envelope primitive. The test path uses an AES-
  *   256-GCM dev cipher with tenant_id mixed into both the key
  *   derivation AND the AAD, modeling AWS KMS's
  *   encryption-context-binding behavior. Tests pin both invariants:
  *
- *     1. Production gate (NODE_ENV !== 'test') THROWS with explicit
- *        I-023 + ADR-024 citations — never silently encrypts with
- *        the dev key.
+ *     1. Production gate (NODE_ENV !== 'test') THROWS a fixed safe error;
+ *        neither credentials nor a local key bypass missing integration.
  *
  *     2. Cross-tenant decrypt FAILS at the auth-tag layer. A stolen
  *        ciphertext from tenant A cannot be decrypted under tenant
@@ -49,10 +48,14 @@
 
 import { Buffer } from 'node:buffer';
 
-import { describe, expect, it } from 'vitest';
+import { KMSClient } from '@aws-sdk/client-kms';
+import { describe, expect, it, vi } from 'vitest';
 
 import { kms, kmsDecrypt, kmsEncrypt } from '../../src/lib/kms.ts';
-import { TENANT_GHANA, TENANT_US } from '../helpers/tenant-fixtures.ts';
+
+// Crypto tests need no database fixtures or global PostgreSQL setup.
+const TENANT_US = 'Telecheck-US';
+const TENANT_GHANA = 'Telecheck-Ghana';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -210,13 +213,13 @@ describe('kmsDecrypt — cross-tenant rejection (AAD encryption-context binding)
 // ---------------------------------------------------------------------------
 
 describe('kms — production gate (fails closed in non-test env)', () => {
-  it('kmsEncrypt THROWS with I-023 + ADR-024 citation when NODE_ENV !== "test"', async () => {
+  it('kmsEncrypt fails closed when mandatory runtime integration is absent', async () => {
     const original = process.env['NODE_ENV'];
     try {
       process.env['NODE_ENV'] = 'production';
       const ctx = tenantCtx(TENANT_US);
       await expect(kmsEncrypt(ctx, Buffer.from('should not encrypt', 'utf8'))).rejects.toThrow(
-        /AWS KMS integration not yet wired/,
+        'Tenant encryption operation is unavailable.',
       );
     } finally {
       process.env['NODE_ENV'] = original;
@@ -231,14 +234,14 @@ describe('kms — production gate (fails closed in non-test env)', () => {
       // The ciphertext content doesn't matter — the gate fires before
       // any decryption is attempted.
       await expect(kmsDecrypt(ctx, Buffer.from('opaque', 'utf8'))).rejects.toThrow(
-        /AWS KMS integration not yet wired/,
+        'Tenant encryption operation is unavailable.',
       );
     } finally {
       process.env['NODE_ENV'] = original;
     }
   });
 
-  it('kmsEncrypt error message cites the offending tenant_id (operator diagnostics)', async () => {
+  it('failure does not expose tenant identity or raw diagnostics', async () => {
     const original = process.env['NODE_ENV'];
     try {
       process.env['NODE_ENV'] = 'staging';
@@ -248,10 +251,9 @@ describe('kms — production gate (fails closed in non-test env)', () => {
         expect.fail('expected throw');
       } catch (err) {
         const message = (err as Error).message;
-        expect(message).toContain(TENANT_US);
-        // Error cites the layer-3 enforcement contract so an operator
-        // grepping logs can find the spec reference quickly.
-        expect(message).toMatch(/I-023 layer-3 enforcement/);
+        expect(message).not.toContain(TENANT_US);
+        expect(message).toBe('Tenant encryption operation is unavailable.');
+        expect((err as Error).cause).toBeUndefined();
       }
     } finally {
       process.env['NODE_ENV'] = original;
@@ -265,11 +267,38 @@ describe('kms — production gate (fails closed in non-test env)', () => {
       for (const env of ['production', 'development', 'staging', '']) {
         process.env['NODE_ENV'] = env;
         await expect(kmsEncrypt(ctx, Buffer.from('x', 'utf8'))).rejects.toThrow(
-          /AWS KMS integration not yet wired/,
+          'Tenant encryption operation is unavailable.',
         );
       }
     } finally {
       process.env['NODE_ENV'] = original;
+    }
+  });
+
+  it('AWS credentials cannot activate the primitive through normal public non-test calls', async () => {
+    const originalEnv = process.env['NODE_ENV'];
+    const originalAccessKey = process.env['AWS_ACCESS_KEY_ID'];
+    const originalSecretKey = process.env['AWS_SECRET_ACCESS_KEY'];
+    const send = vi.spyOn(KMSClient.prototype, 'send');
+    try {
+      process.env['NODE_ENV'] = 'production';
+      process.env['AWS_ACCESS_KEY_ID'] = 'synthetic-test-access-key';
+      process.env['AWS_SECRET_ACCESS_KEY'] = 'synthetic-test-secret-key';
+      await expect(kms.encrypt(tenantCtx(TENANT_US), Buffer.from('private'))).rejects.toThrow(
+        'Tenant encryption operation is unavailable.',
+      );
+      await expect(kms.decrypt(tenantCtx(TENANT_US), Buffer.alloc(100))).rejects.toThrow(
+        'Tenant encryption operation is unavailable.',
+      );
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      if (originalEnv === undefined) delete process.env['NODE_ENV'];
+      else process.env['NODE_ENV'] = originalEnv;
+      if (originalAccessKey === undefined) delete process.env['AWS_ACCESS_KEY_ID'];
+      else process.env['AWS_ACCESS_KEY_ID'] = originalAccessKey;
+      if (originalSecretKey === undefined) delete process.env['AWS_SECRET_ACCESS_KEY'];
+      else process.env['AWS_SECRET_ACCESS_KEY'] = originalSecretKey;
+      send.mockRestore();
     }
   });
 });
