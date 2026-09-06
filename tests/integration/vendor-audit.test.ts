@@ -82,7 +82,7 @@ async function realTransaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promis
           crossExpiryDuringClaim = false;
           await client.query('SELECT pg_sleep(0.1)');
         }
-        if (failAuditInsert && /INSERT INTO audit_records/.test(sql)) {
+        if (failAuditInsert && /INSERT INTO (?:public\.)?audit_records/.test(sql)) {
           failAuditInsert = false;
           // A real SQL error AFTER marker claim aborts the transaction; a
           // JS-only mocked emitter would miss PostgreSQL abort semantics.

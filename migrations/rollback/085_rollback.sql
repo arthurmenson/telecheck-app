@@ -3,5 +3,5 @@ DO $$ BEGIN
     RAISE EXCEPTION 'kms_rollback_requires_verified_data_migration';
   END IF;
 END $$;
-DROP TABLE kms_active_class_keys;
-DROP TABLE kms_dek_keyring;
+DROP TABLE public.kms_active_class_keys;
+DROP TABLE public.kms_dek_keyring;

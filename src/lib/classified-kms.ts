@@ -22,6 +22,7 @@ import {
   type KmsFailureReason,
   type TenantKeyBinding,
 } from './kms-classified-types.js';
+import { signalKmsAuditUnavailable } from './kms-operational-signal.js';
 import { decryptRow, encryptRow, snapshotEnvelope } from './kms-row-envelope.js';
 
 export type {
@@ -182,6 +183,7 @@ export function createClassifiedKms(
         });
       } catch {
         plaintext?.fill(0);
+        classKey?.fill(0);
         if (!actor && descriptor) {
           actor = (await store.auditActor(tx)) ?? undefined;
           failureReason = 'access_denied';
@@ -194,7 +196,7 @@ export function createClassifiedKms(
               failure_reason: failureReason,
               error_code: 'classified_decrypt_unavailable',
             })
-            .catch(() => undefined);
+            .catch(() => signalKmsAuditUnavailable());
         }
         throw new KmsOperationError();
       } finally {

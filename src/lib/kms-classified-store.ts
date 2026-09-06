@@ -15,6 +15,15 @@ import {
   type KmsAuditAction,
   type TenantKeyBinding,
 } from './kms-classified-types.js';
+import {
+  acquireKmsConnection,
+  businessDeadlineClient,
+  deadlineClient,
+  KMS_DB_LIMITS,
+  validateKmsDbLimits,
+  type KmsDbLimits,
+} from './kms-db-deadline.js';
+import { signalKmsAuditUnavailable } from './kms-operational-signal.js';
 import { logger } from './logger.js';
 
 export interface ClassifiedKmsStore {
@@ -52,7 +61,7 @@ interface KeyRow {
   encrypted_dek_blob: Buffer;
 }
 async function readActor(tx: DbTransaction): Promise<KmsActor> {
-  const result = await tx.query<ActorRow>('SELECT * FROM kms_current_actor_context()');
+  const result = await tx.query<ActorRow>('SELECT * FROM public.kms_current_actor_context()');
   const row = result.rows[0];
   if (!row) throw new KmsOperationError();
   return {
@@ -82,38 +91,61 @@ export interface KmsPool {
   connect(): Promise<KmsConnection>;
 }
 
-export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
+export function createClassifiedKmsStore(
+  pool: KmsPool,
+  limits: KmsDbLimits = KMS_DB_LIMITS,
+): ClassifiedKmsStore {
+  validateKmsDbLimits(limits);
+  const auditStarted = new WeakSet<DbTransaction>();
   async function independent<T>(
     actor: KmsActor,
     revalidate: boolean,
     work: (tx: DbTransaction) => Promise<T>,
   ): Promise<T> {
-    const client = await pool.connect();
+    const client = await acquireKmsConnection(() => pool.connect(), limits.acquireMs);
     let broken = false;
+    let released = false;
+    const bounded = deadlineClient(
+      client,
+      () => {
+        released = true;
+        client.release(true);
+      },
+      limits,
+    );
+    const tx = bounded.tx;
     try {
-      const role = await client.query<{ session_user: string }>('SELECT session_user');
+      const role = await tx.query<{ session_user: string }>('SELECT session_user');
       if (role.rows[0]?.session_user !== 'kms_service_role') throw new KmsOperationError();
-      await client.query('BEGIN');
-      await client.query("SET LOCAL lock_timeout = '1s'");
-      await client.query("SET LOCAL statement_timeout = '5s'");
-      await client.query('SELECT set_tenant_context($1)', [actor.tenantId]);
-      await client.query("SELECT set_config('app.request_nonce', $1, true)", [actor.nonce]);
-      if (revalidate && !sameKmsActor(actor, await readActor(client), false))
+      await tx.query('BEGIN');
+      await tx.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
+      await tx.query("SET LOCAL lock_timeout = '1s'");
+      await tx.query("SET LOCAL statement_timeout = '5s'");
+      await tx.query('SELECT public.set_tenant_context($1)', [actor.tenantId]);
+      await tx.query("SELECT pg_catalog.set_config('app.request_nonce', $1, true)", [actor.nonce]);
+      if (revalidate && !sameKmsActor(actor, await readActor(tx), false))
         throw new KmsOperationError();
-      const result = await work(client);
-      if (revalidate && !sameKmsActor(actor, await readActor(client), false))
+      const result = await work(tx);
+      if (revalidate && !sameKmsActor(actor, await readActor(tx), false))
         throw new KmsOperationError();
-      await client.query('COMMIT');
+      await tx.query('COMMIT');
       return result;
     } catch {
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        broken = true;
+      broken = true;
+      if (auditStarted.has(tx)) signalKmsAuditUnavailable();
+      if (!bounded.isDiscarded()) {
+        try {
+          await tx.query('ROLLBACK');
+        } catch {
+          bounded.close();
+        }
       }
       throw new KmsOperationError();
     } finally {
-      client.release(broken);
+      if (!released) {
+        released = true;
+        client.release(broken);
+      }
     }
   }
   async function event(
@@ -125,6 +157,7 @@ export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
     detail: Record<string, unknown>,
   ): Promise<void> {
     const provisioning = action === 'kms.dek_created' || action === 'kms.dek_rotation_started';
+    auditStarted.add(tx);
     await emitAudit(
       {
         timestamp: new Date().toISOString(),
@@ -177,8 +210,8 @@ export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
     return key(
       (
         await tx.query<KeyRow>(
-          `SELECT k.dek_version_id, k.encrypted_dek_blob FROM kms_active_class_keys a
-      JOIN kms_dek_keyring k USING (tenant_id, data_class, dek_version_id)
+          `SELECT k.dek_version_id, k.encrypted_dek_blob FROM public.kms_active_class_keys a
+      JOIN public.kms_dek_keyring k USING (tenant_id, data_class, dek_version_id)
       WHERE a.tenant_id = $1 AND a.data_class = $2`,
           [actor.tenantId, descriptor.dataClass],
         )
@@ -186,29 +219,39 @@ export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
     );
   }
   return {
-    async actor(tx, descriptor) {
+    async actor(rawTx, descriptor) {
+      const bounded = businessDeadlineClient(rawTx, limits);
+      const tx = bounded.tx;
       const savepoint = `kms_actor_${randomUUID().replaceAll('-', '')}`;
       await tx.query(`SAVEPOINT ${savepoint}`);
       try {
         const actor = await readActor(tx);
-        await tx.query('SELECT kms_assert_patient_scope($1)', [descriptor.patientId]);
+        await tx.query('SELECT public.kms_assert_patient_scope($1)', [descriptor.patientId]);
         // Refuse before opening another connection: callers must order crypto
         // before audit/keyring advisory locks, preventing self-deadlock.
         const locks = await tx.query<{ held: boolean }>(`SELECT EXISTS (
-        SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' AND granted
+        SELECT 1 FROM pg_catalog.pg_locks WHERE pid = pg_catalog.pg_backend_pid() AND locktype = 'advisory' AND granted
       ) AS held`);
         if (locks.rows[0]?.held !== false) throw new KmsOperationError();
         await tx.query(`RELEASE SAVEPOINT ${savepoint}`);
         return actor;
       } catch {
-        await tx.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-        await tx.query(`RELEASE SAVEPOINT ${savepoint}`);
+        if (!bounded.isDiscarded()) {
+          try {
+            await tx.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+            await tx.query(`RELEASE SAVEPOINT ${savepoint}`);
+          } catch {
+            bounded.close();
+          }
+        }
         throw new KmsOperationError();
       }
     },
-    async auditActor(tx) {
+    async auditActor(rawTx) {
       try {
-        const row = (await tx.query<ActorRow>('SELECT * FROM kms_request_audit_context()')).rows[0];
+        const tx = businessDeadlineClient(rawTx, limits).tx;
+        const row = (await tx.query<ActorRow>('SELECT * FROM public.kms_request_audit_context()'))
+          .rows[0];
         return row
           ? {
               tenantId: row.tenant_id,
@@ -221,10 +264,12 @@ export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
             }
           : null;
       } catch {
+        signalKmsAuditUnavailable();
         return null;
       }
     },
-    async binding(tx, actor) {
+    async binding(rawTx, actor) {
+      const tx = businessDeadlineClient(rawTx, limits).tx;
       const result = await tx.query<{
         cmk_arn: string;
         service_role_arn: string;
@@ -232,7 +277,7 @@ export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
         residency_policy: TenantKeyBinding['residencyPolicy'];
         replica_arn: string | null;
       }>(
-        'SELECT cmk_arn, service_role_arn, primary_region, residency_policy, replica_arn FROM tenant_kms_bindings WHERE tenant_id = $1',
+        'SELECT cmk_arn, service_role_arn, primary_region, residency_policy, replica_arn FROM public.tenant_kms_bindings WHERE tenant_id = $1',
         [actor.tenantId],
       );
       const row = result.rows[0];
@@ -252,18 +297,18 @@ export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
       independent(actor, true, async (tx) => {
         if (replace && actor.role !== 'tenant_admin') throw new KmsOperationError();
         await tx.query(
-          "SELECT pg_advisory_xact_lock(hashtextextended('kms-key:' || $1 || ':' || $2, 0))",
+          "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('kms-key:' || $1 || ':' || $2, 0))",
           [actor.tenantId, descriptor.dataClass],
         );
         const existing = await active(tx, actor, descriptor);
         if (existing && !replace) return existing;
         if (replace && !existing) throw new KmsOperationError();
         await tx.query(
-          'INSERT INTO kms_dek_keyring (tenant_id, data_class, dek_version_id, encrypted_dek_blob) VALUES ($1, $2, $3, $4)',
+          'INSERT INTO public.kms_dek_keyring (tenant_id, data_class, dek_version_id, encrypted_dek_blob) VALUES ($1, $2, $3, $4)',
           [actor.tenantId, descriptor.dataClass, candidate.dekId, candidate.encryptedDek],
         );
         await tx.query(
-          `INSERT INTO kms_active_class_keys (tenant_id, data_class, dek_version_id) VALUES ($1, $2, $3)
+          `INSERT INTO public.kms_active_class_keys (tenant_id, data_class, dek_version_id) VALUES ($1, $2, $3)
         ON CONFLICT (tenant_id, data_class) DO UPDATE SET dek_version_id = EXCLUDED.dek_version_id`,
           [actor.tenantId, descriptor.dataClass, candidate.dekId],
         );
@@ -287,7 +332,7 @@ export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
         const found = key(
           (
             await tx.query<KeyRow>(
-              'SELECT dek_version_id, encrypted_dek_blob FROM kms_dek_keyring WHERE tenant_id = $1 AND data_class = $2 AND dek_version_id = $3',
+              'SELECT dek_version_id, encrypted_dek_blob FROM public.kms_dek_keyring WHERE tenant_id = $1 AND data_class = $2 AND dek_version_id = $3',
               [actor.tenantId, descriptor.dataClass, dekId],
             )
           ).rows[0],
@@ -314,7 +359,7 @@ export function createClassifiedKmsStore(pool: KmsPool): ClassifiedKmsStore {
         residency_policy: TenantKeyBinding['residencyPolicy'];
         replica_arn: string | null;
       }>(
-        'SELECT cmk_arn, service_role_arn, primary_region, residency_policy, replica_arn FROM tenant_kms_bindings WHERE tenant_id = $1',
+        'SELECT cmk_arn, service_role_arn, primary_region, residency_policy, replica_arn FROM public.tenant_kms_bindings WHERE tenant_id = $1',
         [actor.tenantId],
       )
     ).rows[0];
@@ -338,6 +383,7 @@ export function defaultClassifiedKmsStore(): ClassifiedKmsStore {
       connectionString: config.kmsDatabaseUrl,
       max: 2,
       connectionTimeoutMillis: 2000,
+      query_timeout: KMS_DB_LIMITS.queryMs,
       idleTimeoutMillis: 30_000,
       ssl: config.dbSslMode === 'require' ? { rejectUnauthorized: true } : false,
     });
