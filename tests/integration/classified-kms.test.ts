@@ -18,6 +18,20 @@ const databaseUrl = process.env.KMS_INTEGRATION_DATABASE_URL;
 const enabled = databaseUrl !== undefined;
 const tenant = 'Telecheck-US' as TenantId;
 const cmk = 'arn:aws:kms:us-east-1:123456789012:key/0b1978c6-cb09-4da0-933e-449b5d1e1c24';
+const launchBindings = [
+  {
+    tenantId: tenant,
+    country: 'US',
+    cmkArn: cmk,
+    serviceRoleArn: 'arn:aws:iam::123456789012:role/telecheck-tenant-us',
+  },
+  {
+    tenantId: 'Telecheck-Ghana' as TenantId,
+    country: 'GH',
+    cmkArn: cmk.replace('0b1978c6', '1b1978c6'),
+    serviceRoleArn: 'arn:aws:iam::123456789012:role/telecheck-tenant-ghana',
+  },
+] as const;
 let admin: pg.Pool;
 let auditPool: KmsPool;
 const decryptedKeys: Buffer[] = [];
@@ -39,7 +53,13 @@ const provider: ClassifiedKeyProvider = {
   },
 };
 
-async function asRole(role: 'telecheck_app_role' | 'kms_service_role' | 'bind_actor_context_role') {
+async function asRole(
+  role:
+    | 'telecheck_app_role'
+    | 'kms_service_role'
+    | 'bind_actor_context_role'
+    | 'kms_provisioner_role',
+) {
   const client = await admin.connect();
   try {
     await client.query(`SET SESSION AUTHORIZATION ${role}`);
@@ -70,7 +90,11 @@ async function removeAuthority(
     );
   }
 }
-async function fixture(role: 'patient' | 'clinician' | 'tenant_admin' = 'patient') {
+async function fixture(
+  role: 'patient' | 'clinician' | 'tenant_admin' = 'patient',
+  tenantId: TenantId = tenant,
+) {
+  const country = tenantId === 'Telecheck-Ghana' ? 'GH' : 'US';
   const patientId = ulid(),
     accountId = role === 'patient' ? patientId : ulid(),
     sessionId = ulid();
@@ -85,22 +109,23 @@ async function fixture(role: 'patient' | 'clinician' | 'tenant_admin' = 'patient
       await connection.query(
         `INSERT INTO accounts (account_id, tenant_id, phone_e164, first_name, last_name, date_of_birth,
         gender, country_of_residence, country_of_care, account_type, status, cohort_classification)
-        VALUES ($1,$2,$3,'Synthetic','KMS','1990-01-01','prefer_not_to_say','US','US',$4,'active','baseline')`,
+        VALUES ($1,$2,$3,'Synthetic','KMS','1990-01-01','prefer_not_to_say',$5,$5,$4,'active','baseline')`,
         [
           id,
-          tenant,
-          '+1' +
-            String(BigInt('0x' + randomBytes(6).toString('hex')) % 10_000_000_000n).padStart(
-              10,
-              '0',
-            ),
+          tenantId,
+          (country === 'GH' ? '+233' : '+1') +
+            String(
+              BigInt('0x' + randomBytes(6).toString('hex')) %
+                (country === 'GH' ? 1_000_000_000n : 10_000_000_000n),
+            ).padStart(country === 'GH' ? 9 : 10, '0'),
           type,
+          country,
         ],
       );
     }
     await connection.query(
       "INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash, expires_at) VALUES ($1,$2,$3,$4,clock_timestamp() + INTERVAL '1 hour')",
-      [sessionId, tenant, accountId, randomBytes(32).toString('hex')],
+      [sessionId, tenantId, accountId, randomBytes(32).toString('hex')],
     );
   } finally {
     connection.release();
@@ -111,7 +136,7 @@ async function fixture(role: 'patient' | 'clinician' | 'tenant_admin' = 'patient
     nonce = (
       await bindActorContextForRequest(binder, {
         actorAccountId: accountId,
-        actorAccountTenantId: tenant,
+        actorAccountTenantId: tenantId,
         actorRole: role,
         actorAdminHomeTenantId: null,
         sessionId,
@@ -122,7 +147,7 @@ async function fixture(role: 'patient' | 'clinician' | 'tenant_admin' = 'patient
   }
   const business = await asRole('telecheck_app_role');
   await business.query('BEGIN');
-  await business.query('SELECT set_tenant_context($1)', [tenant]);
+  await business.query('SELECT set_tenant_context($1)', [tenantId]);
   await business.query("SELECT set_config('app.request_nonce', $1, true)", [nonce]);
   const descriptor: ClassifiedResource = {
     dataClass: 'pii_sensitive_clinical',
@@ -140,10 +165,17 @@ describe.skipIf(!enabled)('classified KMS database isolation and durable evidenc
       throw new Error('Use a dedicated classified_kms integration database');
     admin = new pg.Pool({ connectionString: databaseUrl, max: 8, connectionTimeoutMillis: 2000 });
     // Tests do not change cluster roles, disable RLS or suppress audit triggers.
-    await admin.query(
-      "INSERT INTO tenant_kms_bindings (tenant_id, cmk_arn, service_role_arn, residency_policy) VALUES ($1,$2,$3,'us_only') ON CONFLICT DO NOTHING",
-      [tenant, cmk, 'arn:aws:iam::123456789012:role/telecheck-tenant-us'],
-    );
+    const provisioner = await asRole('kms_provisioner_role');
+    try {
+      for (const binding of launchBindings) {
+        await provisioner.query(
+          "INSERT INTO public.tenant_kms_bindings (tenant_id, cmk_arn, service_role_arn, residency_policy) VALUES ($1,$2,$3,'us_only')",
+          [binding.tenantId, binding.cmkArn, binding.serviceRoleArn],
+        );
+      }
+    } finally {
+      await release(provisioner);
+    }
     // Generate fresh class versions per process; an existing DB key cannot be
     // unwrapped by this process's controlled KMS service. Use an untouched DB.
     const count = await admin.query<{ count: string }>('SELECT count(*) FROM kms_dek_keyring');
@@ -797,6 +829,102 @@ describe.skipIf(!enabled)('classified KMS database isolation and durable evidenc
       }
     },
   );
+  it.each(launchBindings)(
+    'provisions and isolates $tenantId keys and durable decrypt evidence',
+    async (expected) => {
+      const f = await fixture('patient', expected.tenantId);
+      try {
+        const store = createClassifiedKmsStore(auditPool);
+        const actor = await store.actor(f.business, f.descriptor);
+        expect(actor.tenantId).toBe(expected.tenantId);
+        expect(actor.countryOfCare).toBe(expected.country);
+        const binding = await store.binding(f.business, actor);
+        expect(binding.cmkArn).toBe(expected.cmkArn);
+        expect(binding.serviceRoleArn).toBe(expected.serviceRoleArn);
+        const visible = await f.business.query(
+          'SELECT tenant_id, cmk_arn FROM public.tenant_kms_bindings',
+        );
+        expect(visible.rows).toEqual([{ tenant_id: expected.tenantId, cmk_arn: expected.cmkArn }]);
+        const observed: ClassifiedKeyProvider = {
+          async generate(current, dataClass) {
+            expect(current).toEqual(binding);
+            return provider.generate(current, dataClass);
+          },
+          async decrypt(current, dataClass, blob) {
+            expect(current).toEqual(binding);
+            return provider.decrypt(current, dataClass, blob);
+          },
+        };
+        const engine = createClassifiedKms(store, observed);
+        const envelope = await engine.encrypt(
+          f.business,
+          f.descriptor,
+          Buffer.from('synthetic tenant answer'),
+        );
+        const plaintext = await engine.decrypt(f.business, f.descriptor, envelope);
+        expect(plaintext.toString()).toBe('synthetic tenant answer');
+        plaintext.fill(0);
+        expect(
+          (
+            await admin.query(
+              "SELECT tenant_id, action FROM public.audit_records WHERE resource_id=$1 AND action='kms.decrypt_invoked'",
+              [f.descriptor.resourceId],
+            )
+          ).rows,
+        ).toEqual([{ tenant_id: expected.tenantId, action: 'kms.decrypt_invoked' }]);
+        expect(decryptedKeys.every((key) => key.equals(Buffer.alloc(32)))).toBe(true);
+      } finally {
+        await release(f.business);
+      }
+    },
+  );
+  it('rejects the invented Ghana alias at the registry foreign key', async () => {
+    const provisioner = await asRole('kms_provisioner_role');
+    try {
+      await expect(
+        provisioner.query(
+          "INSERT INTO public.tenant_kms_bindings (tenant_id, cmk_arn, service_role_arn, residency_policy) VALUES ('Telecheck-GH',$1,$2,'us_only')",
+          [
+            `arn:aws:kms:us-east-1:123456789012:key/${randomUUID()}`,
+            'arn:aws:iam::123456789012:role/telecheck-unregistered',
+          ],
+        ),
+      ).rejects.toMatchObject({ code: '23503' });
+    } finally {
+      await release(provisioner);
+    }
+  });
+  it('rejects a US envelope in a real Ghana session before provider access', async () => {
+    const us = await fixture(),
+      ghana = await fixture('patient', 'Telecheck-Ghana' as TenantId);
+    try {
+      const envelope = await createClassifiedKms(
+        createClassifiedKmsStore(auditPool),
+        provider,
+      ).encrypt(us.business, us.descriptor, Buffer.from('US tenant only'));
+      const observed = { generate: vi.fn(provider.generate), decrypt: vi.fn(provider.decrypt) };
+      await expect(
+        createClassifiedKms(createClassifiedKmsStore(auditPool), observed).decrypt(
+          ghana.business,
+          ghana.descriptor,
+          envelope,
+        ),
+      ).rejects.toThrow(KmsOperationError);
+      expect(observed.generate).not.toHaveBeenCalled();
+      expect(observed.decrypt).not.toHaveBeenCalled();
+      expect(
+        (
+          await admin.query(
+            "SELECT tenant_id, action FROM public.audit_records WHERE resource_id=$1 AND action IN ('kms.decrypt_failed','kms.decrypt_invoked')",
+            [ghana.descriptor.resourceId],
+          )
+        ).rows,
+      ).toEqual([{ tenant_id: 'Telecheck-Ghana', action: 'kms.decrypt_failed' }]);
+    } finally {
+      await release(us.business);
+      await release(ghana.business);
+    }
+  });
   it.each(['role check', 'COMMIT', 'ROLLBACK'] as const)(
     'discards a never-arriving %s reply, erases keys and recovers',
     async (fault) => {
