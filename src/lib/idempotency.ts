@@ -124,6 +124,19 @@ export class IdempotencyBodyMismatchError extends Error {
   }
 }
 
+// Migration083 reserves the impossible-in-practice all-zero SHA-256 value for
+// lossy legacy absolute-form keys. Both caches hold the same nonsecret marker;
+// no old success is inferred and no business operation executes before expiry.
+const LEGACY_UNAVAILABLE_HASH = '0'.repeat(64);
+function legacyUnavailableBody() {
+  return {
+    error: {
+      code: 'internal.idempotency.legacy_result_unavailable',
+      message: 'The legacy operation result is unavailable. Reconcile its status before retrying.',
+    },
+  };
+}
+
 /**
  * Pre-computed idempotency context that the handler passes to
  * `withIdempotency`. The caller computes this BEFORE opening the
@@ -724,6 +737,9 @@ export async function withIdempotency<TBody>(
   }
   const row = lookupResult.rows[0]!;
 
+  if (row.request_hash_hex === LEGACY_UNAVAILABLE_HASH) {
+    throw new IdempotencyReplayError(409, legacyUnavailableBody());
+  }
   if (row.request_hash_hex !== ctx.bodyHash) {
     throw new IdempotencyBodyMismatchError();
   }
@@ -938,6 +954,10 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
     const bodyHash = hashBody(rawBody);
 
     if (existing !== null) {
+      if (existing.bodyHash === LEGACY_UNAVAILABLE_HASH) {
+        await reply.code(409).send(legacyUnavailableBody());
+        return;
+      }
       if (bodyHash !== existing.bodyHash) {
         // Same 4-tuple key, different body → 409 per IDEMPOTENCY v5.1.
         // Body-mismatch fires for completed AND pending records (the
