@@ -22,7 +22,7 @@ import type { TenantId } from '../../src/lib/glossary.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import * as accountService from '../../src/modules/identity/internal/services/account-service.ts';
-import { asAccountId } from '../../src/modules/identity/internal/types.ts';
+import { asAccountId, type AccountType } from '../../src/modules/identity/internal/types.ts';
 import { seedLiveSession } from '../helpers/live-session-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
@@ -69,7 +69,7 @@ function headersFor(accountId: string, key?: string) {
   };
 }
 
-async function seedActiveAccount(): Promise<string> {
+async function seedActiveAccount(accountType: AccountType = 'patient'): Promise<string> {
   const accountId = asAccountId(ulid());
   await withTenantContext(T_US, () =>
     accountService.createAccount(
@@ -77,6 +77,7 @@ async function seedActiveAccount(): Promise<string> {
       { actorId: 'op_seed' },
       {
         account_id: accountId,
+        account_type: accountType,
         phone_e164: uniquePhone(),
         first_name: 'A',
         last_name: 'B',
@@ -89,7 +90,11 @@ async function seedActiveAccount(): Promise<string> {
   await withTenantContext(T_US, () =>
     accountService.activateAccount(US_CTX, { actorId: 'op_seed' }, accountId, getTestClient()),
   );
-  tokens.set(accountId, (await seedLiveSession(US_CTX, accountId)).token);
+  tokens.set(
+    accountId,
+    (await seedLiveSession(US_CTX, accountId, accountType === 'delegate' ? 'patient' : accountType))
+      .token,
+  );
   return accountId;
 }
 
@@ -527,4 +532,51 @@ describe('identity devices HTTP — account authorization', () => {
       expect(response.statusCode).toBe(401);
     }
   });
+});
+
+describe('device HTTP audit attribution', () => {
+  for (const accountType of [
+    'patient',
+    'clinician',
+    'tenant_admin',
+    'platform_admin',
+    'delegate',
+  ] as const) {
+    it('attributes registration, eviction and revocation to ' + accountType, async () => {
+      const accountId = await seedActiveAccount(accountType);
+      const ids: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        const registered = await app!.inject({
+          method: 'POST',
+          url: '/v0/identity/devices',
+          headers: headersFor(accountId, ulid()),
+          payload: { platform: 'web', device_public_key: 'SYNTHETIC-AUDIT-' + i },
+        });
+        expect(registered.statusCode).toBe(201);
+        ids.push(registered.json<{ device_id: string }>().device_id);
+      }
+      const revoked = await app!.inject({
+        method: 'DELETE',
+        url: '/v0/identity/devices/' + ids[3],
+        headers: headersFor(accountId, ulid()),
+      });
+      expect(revoked.statusCode).toBe(204);
+      const audits = await withTenantContext(T_US, () =>
+        getTestClient().query(
+          'SELECT action,actor_id,actor_type,target_patient_id FROM audit_records WHERE resource_type=$1 AND resource_id=ANY($2::text[])',
+          ['auth_device', ids],
+        ),
+      );
+      expect(audits.rows).toHaveLength(6);
+      expect(audits.rows.filter((row) => row.action === 'identity_device_registered')).toHaveLength(
+        4,
+      );
+      expect(audits.rows.filter((row) => row.action === 'identity_device_revoked')).toHaveLength(2);
+      for (const row of audits.rows) {
+        expect(row.actor_id).toBe(accountId);
+        expect(row.actor_type).toBe(accountType === 'tenant_admin' ? 'operator' : accountType);
+        expect(row.target_patient_id).toBe(accountType === 'patient' ? accountId : null);
+      }
+    });
+  }
 });

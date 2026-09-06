@@ -1,6 +1,7 @@
 /** Identity self-service requires a live session owned by an active account. */
 import type { FastifyRequest } from 'fastify';
 
+import type { ActorType } from '../../../../lib/audit.js';
 import { requireActorContext, UnauthenticatedError } from '../../../../lib/auth-context.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import * as accountService from '../services/account-service.js';
@@ -33,5 +34,12 @@ export async function requireIdentitySelfContext(req: FastifyRequest) {
   ) {
     throw new UnauthenticatedError();
   }
-  return { ctx, actor, account };
+  const actorType: ActorType =
+    account.account_type === 'tenant_admin' ? 'operator' : account.account_type;
+  const auditActor = {
+    actorId: actor.accountId,
+    actorType,
+    targetPatientId: account.account_type === 'patient' ? account.account_id : null,
+  };
+  return { ctx, actor, account, auditActor };
 }

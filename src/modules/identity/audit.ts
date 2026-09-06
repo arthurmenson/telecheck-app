@@ -34,6 +34,7 @@
  */
 
 import {
+  type ActorType,
   type AuditAction,
   type AuditDbClient,
   type AuditEnvelope,
@@ -89,7 +90,7 @@ function identityAuditPlaceholder(id: IdentityAuditActionPlaceholder): AuditActi
 
 interface IdentityAuditCommon {
   tenant_id: TenantId;
-  actor_type: 'patient' | 'system' | 'operator';
+  actor_type: ActorType;
   actor_id: string;
   actor_tenant_id: string | null;
   /** Null for pre-account events (registration before account created). */
@@ -380,6 +381,8 @@ export async function emitDeviceRegisteredAudit(
     accountId: AccountId;
     deviceId: DeviceId;
     actorId: string;
+    actorType?: ActorType;
+    targetPatientId?: AccountId | null;
     countryOfCare: string;
     platform: string;
   },
@@ -388,10 +391,10 @@ export async function emitDeviceRegisteredAudit(
   return emitAudit(
     buildEnvelope(identityAuditPlaceholder('identity_device_registered'), 'C', {
       tenant_id: args.tenantId,
-      actor_type: 'system',
+      actor_type: args.actorType ?? 'system',
       actor_id: args.actorId,
       actor_tenant_id: args.tenantId,
-      target_patient_id: args.accountId,
+      target_patient_id: args.targetPatientId === undefined ? args.accountId : args.targetPatientId,
       country_of_care: args.countryOfCare,
       resource_type: 'auth_device',
       resource_id: args.deviceId,
@@ -409,6 +412,8 @@ export async function emitDeviceRevokedAudit(
     accountId: AccountId;
     deviceId: DeviceId;
     actorId: string;
+    actorType?: ActorType;
+    targetPatientId?: AccountId | null;
     countryOfCare: string;
     reason: string;
   },
@@ -417,10 +422,10 @@ export async function emitDeviceRevokedAudit(
   return emitAudit(
     buildEnvelope(identityAuditPlaceholder('identity_device_revoked'), 'C', {
       tenant_id: args.tenantId,
-      actor_type: 'system',
+      actor_type: args.actorType ?? 'system',
       actor_id: args.actorId,
       actor_tenant_id: args.tenantId,
-      target_patient_id: args.accountId,
+      target_patient_id: args.targetPatientId === undefined ? args.accountId : args.targetPatientId,
       country_of_care: args.countryOfCare,
       resource_type: 'auth_device',
       resource_id: args.deviceId,

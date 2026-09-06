@@ -100,7 +100,7 @@ export async function registerDeviceHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const { ctx, actor } = await requireIdentitySelfContext(req);
+  const { ctx, actor, auditActor } = await requireIdentitySelfContext(req);
   const body = (req.body ?? {}) as RegisterDeviceBody;
 
   if (
@@ -134,7 +134,7 @@ export async function registerDeviceHandler(
   return withIdempotentExecution(req, reply, mapServiceError, async (tx: DbTransaction) => {
     const device = await deviceService.registerDevice(
       ctx,
-      { actorId: actor.accountId },
+      auditActor,
       {
         device_id: deviceId,
         account_id: accountId,
@@ -199,7 +199,7 @@ export async function revokeDeviceHandler(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<unknown> {
-  const { ctx, actor } = await requireIdentitySelfContext(req);
+  const { ctx, actor, auditActor } = await requireIdentitySelfContext(req);
   const params = (req.params ?? {}) as { deviceId?: string };
 
   if (!isString(params.deviceId)) {
@@ -223,13 +223,7 @@ export async function revokeDeviceHandler(
     }
     // Idempotent: revokeDevice returns null on phantom or already-revoked;
     // we still respond 204 to prevent enumeration (tenant-blind).
-    await deviceService.revokeDevice(
-      ctx,
-      { actorId: actor.accountId },
-      deviceId,
-      'patient_unregistered',
-      tx,
-    );
+    await deviceService.revokeDevice(ctx, auditActor, deviceId, 'patient_unregistered', tx);
 
     // 204 No Content — body must be null/undefined for the idempotency
     // cache to round-trip cleanly (replay re-sends `null` which Fastify

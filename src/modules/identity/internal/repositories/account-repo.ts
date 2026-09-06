@@ -247,15 +247,19 @@ export async function createAccount(
   externalTx?: DbTransaction,
 ): Promise<Account> {
   const runFn = async (tx: DbClient): Promise<Account> => {
+    // Ordinary registration relies on the database's patient default and
+    // cannot write governed role/cohort fields. Nonpatient provisioning is
+    // deliberately a privileged path requiring INSERT(account_type).
+    const explicitType = input.account_type !== undefined && input.account_type !== 'patient';
     const result = await tx.query<AccountRow>(
       `INSERT INTO accounts (
           account_id, tenant_id, phone_e164, email,
           first_name, last_name, date_of_birth, gender, national_id,
-          country_of_residence, country_of_care, locale, account_type
+          country_of_residence, country_of_care, locale${explicitType ? ', account_type' : ''}
        ) VALUES (
           $1, $2, $3, $4,
           $5, $6, $7::date, $8, $9,
-          $10, $11, $12, $13
+          $10, $11, $12${explicitType ? ', $13' : ''}
        )
        RETURNING ${ACCOUNT_COLUMNS}`,
       [
@@ -271,7 +275,7 @@ export async function createAccount(
         input.country_of_residence,
         input.country_of_care,
         input.locale ?? `en-${input.country_of_care}`,
-        input.account_type ?? 'patient',
+        ...(explicitType ? [input.account_type] : []),
       ],
     );
     const row = result.rows[0];

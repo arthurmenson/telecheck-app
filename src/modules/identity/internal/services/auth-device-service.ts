@@ -7,6 +7,7 @@
  * 'max_devices_evicted' before the new one is inserted.
  */
 
+import type { ActorType } from '../../../../lib/audit.js';
 import type { DbClient, DbTransaction } from '../../../../lib/db.js';
 import { withTenantBoundConnection } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
@@ -28,6 +29,12 @@ import type {
 
 /** Identity Spec §3.4: max 3 concurrent devices per account. */
 const MAX_DEVICES_PER_ACCOUNT = 3;
+
+interface DeviceAuditActor {
+  actorId: string;
+  actorType?: ActorType;
+  targetPatientId?: AccountId | null;
+}
 
 // ---------------------------------------------------------------------------
 // RegisterDeviceInput
@@ -57,7 +64,7 @@ export interface RegisterDeviceInput {
  */
 export async function registerDevice(
   ctx: TenantContext,
-  actor: { actorId: string },
+  actor: DeviceAuditActor,
   input: RegisterDeviceInput,
   externalTx?: DbTransaction,
 ): Promise<AuthDevice> {
@@ -81,6 +88,9 @@ export async function registerDevice(
               accountId: evicted.account_id,
               deviceId: evicted.device_id,
               actorId: actor.actorId,
+              actorType: actor.actorType ?? 'system',
+              targetPatientId:
+                actor.targetPatientId === undefined ? evicted.account_id : actor.targetPatientId,
               countryOfCare: ctx.countryOfCare,
               reason: 'max_devices_evicted',
             },
@@ -119,6 +129,9 @@ export async function registerDevice(
             accountId: persisted.account_id,
             deviceId: persisted.device_id,
             actorId: actor.actorId,
+            actorType: actor.actorType ?? 'system',
+            targetPatientId:
+              actor.targetPatientId === undefined ? persisted.account_id : actor.targetPatientId,
             countryOfCare: ctx.countryOfCare,
             platform: persisted.platform,
           },
@@ -148,7 +161,7 @@ export async function registerDevice(
 
 export async function revokeDevice(
   ctx: TenantContext,
-  actor: { actorId: string },
+  actor: DeviceAuditActor,
   deviceId: DeviceId,
   reason: DeviceRevocationReason,
   externalTx?: DbTransaction,
@@ -162,6 +175,9 @@ export async function revokeDevice(
         accountId: revoked.account_id,
         deviceId: revoked.device_id,
         actorId: actor.actorId,
+        actorType: actor.actorType ?? 'system',
+        targetPatientId:
+          actor.targetPatientId === undefined ? revoked.account_id : actor.targetPatientId,
         countryOfCare: ctx.countryOfCare,
         reason,
       },

@@ -15,7 +15,6 @@ describe('ordinary Identity application role', () => {
       { rolsuper: false, rolbypassrls: false, rolinherit: false, rolcreaterole: false },
     ]);
     for (const table of [
-      'accounts',
       'sessions',
       'auth_devices',
       'otp_challenges',
@@ -23,7 +22,7 @@ describe('ordinary Identity application role', () => {
       'account_pin_credentials',
     ]) {
       const result = await client.query(
-        "SELECT has_table_privilege('telecheck_app_role',$1,'SELECT,INSERT,UPDATE') AS allowed, has_table_privilege('telecheck_app_role',$1,'DELETE') AS can_delete",
+        "SELECT (has_table_privilege('telecheck_app_role',$1,'SELECT') AND has_table_privilege('telecheck_app_role',$1,'INSERT') AND has_table_privilege('telecheck_app_role',$1,'UPDATE')) AS allowed, has_table_privilege('telecheck_app_role',$1,'DELETE') AS can_delete",
         [table],
       );
       expect(result.rows).toEqual([{ allowed: true, can_delete: false }]);
@@ -83,6 +82,50 @@ describe('ordinary Identity application role', () => {
         "SELECT has_table_privilege(current_user,'tenant_brands','UPDATE') AS can_update",
       );
       expect(update.rows).toEqual([{ can_update: false }]);
+    } finally {
+      await client.query('RESET SESSION AUTHORIZATION');
+      await client.query('SET SESSION AUTHORIZATION telecheck_test_app');
+    }
+  });
+});
+
+describe('ordinary account control fields', () => {
+  it('allows registration and activation but forbids privileged role/cohort writes', async () => {
+    const client = getTestClient();
+    await client.query('RESET SESSION AUTHORIZATION');
+    await client.query('SET SESSION AUTHORIZATION telecheck_app_role');
+    try {
+      await client.query('SELECT set_tenant_context($1)', [TENANT_US]);
+      const id = ulid();
+      const registration =
+        "INSERT INTO accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care) VALUES ($1,$2,$3,'Synthetic','Privileges','1990-01-01','prefer_not_to_say','US','US')";
+      await client.query(registration, [id, TENANT_US, id + '@example.invalid']);
+      await client.query(
+        "UPDATE accounts SET status='active', activated_at=NOW() WHERE account_id=$1",
+        [id],
+      );
+      const attempts = [
+        "UPDATE accounts SET account_type='platform_admin' WHERE account_id=$1",
+        "UPDATE accounts SET cohort_classification='baseline' WHERE account_id=$1",
+        "INSERT INTO accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,account_type) VALUES ($1,$2,$3,'Synthetic','Denied','1990-01-01','prefer_not_to_say','US','US','platform_admin')",
+        "INSERT INTO accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,cohort_classification) VALUES ($1,$2,$3,'Synthetic','Denied','1990-01-01','prefer_not_to_say','US','US','baseline')",
+      ];
+      for (const sql of attempts) {
+        await client.query('SAVEPOINT control_field_probe');
+        const params = sql.startsWith('INSERT')
+          ? [ulid(), TENANT_US, ulid() + '@example.invalid']
+          : [id];
+        await expect(client.query(sql, params)).rejects.toMatchObject({ code: '42501' });
+        await client.query('ROLLBACK TO SAVEPOINT control_field_probe');
+        await client.query('RELEASE SAVEPOINT control_field_probe');
+      }
+      const stored = await client.query(
+        'SELECT account_type,cohort_classification,status FROM accounts WHERE account_id=$1',
+        [id],
+      );
+      expect(stored.rows).toEqual([
+        { account_type: 'patient', cohort_classification: 'unclassified', status: 'active' },
+      ]);
     } finally {
       await client.query('RESET SESSION AUTHORIZATION');
       await client.query('SET SESSION AUTHORIZATION telecheck_test_app');
