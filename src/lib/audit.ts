@@ -69,6 +69,10 @@ import type { TenantId } from './glossary.js';
 
 /** Category A — Safety-critical clinical actions */
 type CategoryAAction =
+  | 'kms.dek_created'
+  | 'kms.dek_rotation_started'
+  | 'kms.decrypt_failed'
+  | 'kms.decrypt_invoked'
   | 'prescribing.initiated'
   | 'prescribing.approved'
   | 'prescribing.declined'
@@ -145,6 +149,7 @@ type CategoryBAction =
 
 /** Category C — Operational and engagement actions */
 type CategoryCAction =
+  | 'kms.dek_lookup'
   | 'patient_account_created'
   | 'patient_identity_verified'
   | 'consent_granted'
