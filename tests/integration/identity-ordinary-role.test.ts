@@ -107,6 +107,9 @@ describe('ordinary account control fields', () => {
       const attempts = [
         "UPDATE accounts SET account_type='platform_admin' WHERE account_id=$1",
         "UPDATE accounts SET cohort_classification='baseline' WHERE account_id=$1",
+        "UPDATE accounts SET first_name='Rewritten' WHERE account_id=$1",
+        "UPDATE accounts SET tenant_id='unauthorized-tenant' WHERE account_id=$1",
+        'UPDATE accounts SET deleted_at=NOW() WHERE account_id=$1',
         "INSERT INTO accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,account_type) VALUES ($1,$2,$3,'Synthetic','Denied','1990-01-01','prefer_not_to_say','US','US','platform_admin')",
         "INSERT INTO accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,cohort_classification) VALUES ($1,$2,$3,'Synthetic','Denied','1990-01-01','prefer_not_to_say','US','US','baseline')",
       ];
