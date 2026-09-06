@@ -290,6 +290,73 @@ describe('screened component output through the actual Anthropic serializer', ()
     }
   });
 
+  it.each(['system', 'user', 'assistant'] as const)(
+    'blocks a high-confidence %s identifier exposed by redaction before transport',
+    async (role) => {
+      const { provider, bodies } = capture();
+      const record = vi.fn(async () => undefined);
+      await expect(
+        withVendorBoundary(provider, record).sendCompletion(
+          request([{ role, content: '::1MRN 543210' }]),
+        ),
+      ).rejects.toBeInstanceOf(VendorEgressBlockedError);
+      expect(bodies).toEqual([]);
+      expect(record).toHaveBeenCalledWith({
+        action: 'block',
+        reason: 'high_confidence_match',
+        patternIds: expect.arrayContaining(['ipv6', 'medical_record_number']),
+        hitCount: 2,
+      });
+    },
+  );
+
+  it.each(['system', 'user', 'assistant'] as const)(
+    'removes a low-confidence %s identifier exposed by redaction before transport',
+    async (role) => {
+      const { provider, bodies } = capture();
+      const record = vi.fn(async () => undefined);
+      await withVendorBoundary(provider, record).sendCompletion(
+        request([{ role, content: '::1passport no. AB1234567' }]),
+      );
+      expect(bodies).toHaveLength(1);
+      const body = JSON.parse(bodies[0]!) as { system?: string; messages: LLMMessage[] };
+      const content = role === 'system' ? body.system! : body.messages[0]!.content;
+      expect(content).toBe(VENDOR_REDACTION_TOKEN.repeat(2));
+      expect(bodies[0]).not.toContain('AB1234567');
+      for (const pattern of PII_PATTERNS) {
+        const accepted = [
+          ...content.matchAll(new RegExp(pattern.regex.source, pattern.regex.flags)),
+        ].filter((match) => !pattern.validate || pattern.validate(match[0]));
+        expect(accepted, pattern.id).toEqual([]);
+      }
+      expect(record).toHaveBeenCalledWith({
+        action: 'redact',
+        reason: 'low_confidence_redacted',
+        patternIds: expect.arrayContaining(['ipv6', 'us_passport']),
+        hitCount: 2,
+      });
+    },
+  );
+
+  it('fails closed if a future pattern repeatedly matches the replacement token', async () => {
+    const { provider, bodies } = capture();
+    const pattern = PII_PATTERNS.find((p) => p.id === 'ipv4')!;
+    vi.spyOn(pattern.regex, 'source', 'get').mockReturnValue('x|\\[REDACTED:PII\\]');
+    const record = vi.fn(async () => undefined);
+    await expect(
+      withVendorBoundary(provider, record).sendCompletion(
+        request([{ role: 'user', content: 'x' }]),
+      ),
+    ).rejects.toBeInstanceOf(VendorEgressBlockedError);
+    expect(bodies).toEqual([]);
+    expect(record).toHaveBeenCalledWith({
+      action: 'block',
+      reason: 'screening_failed',
+      patternIds: [],
+      hitCount: 0,
+    });
+  });
+
   it.each(cases.filter((c) => c.action === 'block'))(
     'wrapper prevents $id from reaching the actual transport',
     async ({ text }) => {
