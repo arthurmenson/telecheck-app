@@ -1,0 +1,10 @@
+Telecheck local PII inference model
+Publisher: OpenMed
+Model: OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1-onnx-android
+Immutable revision: 79f7db205869b1be4be23ac4f42aa95bdedc5aee
+Publisher-declared license: Apache-2.0; copy included in LICENSE-2.0.txt.
+Source model: https://huggingface.co/OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1
+ONNX model: https://huggingface.co/OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1-onnx-android
+Base model attribution: intfloat/e5-small-v2, declared MIT.
+Training dataset attribution: NVIDIA Nemotron-PII, declared CC-BY-4.0, https://huggingface.co/datasets/nvidia/Nemotron-PII
+Telecheck uses the pinned INT8 model bytes without modification and applies its own label selection, windowing and span policy. The base model and training dataset are referenced for provenance; neither is separately redistributed.

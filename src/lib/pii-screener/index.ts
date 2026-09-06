@@ -2,8 +2,7 @@
  * pii-screener/index.ts — Layer 1 input screener for Pilot 1 synthetic-only
  * substrate.
  *
- * Sprint 1.1a: regex-only implementation. Local NER (Sprint 1.1b) will
- * plug into the same interface without changing the calling contract.
+ * Regex and local statistical NER run together through a bounded async API.
  *
  * Purpose (per docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Layer 1):
  *   Block or warn on free-text inputs that contain real personal
@@ -17,8 +16,7 @@
  *   This module NEVER calls an external AI provider (Anthropic /
  *   Bedrock / Azure) to classify candidate text. The candidate text
  *   IS the potential real PII we are trying to keep away from those
- *   providers. All classification is local (regex here; Sprint 1.1b
- *   adds local NER).
+ *   providers. All classification is local (regex and pinned ONNX inference).
  *
  * Decision matrix (per PII spec §Layer 1 §Decision):
  *   Route class     | Any hit          | Interpretation
@@ -35,7 +33,8 @@
  *   - docs/PILOT_1_COVERAGE_MATRIX.md scenarios A1-A6, A6b (adversarial coverage)
  */
 
-import { classifyEntities, NerOffsetDerivationError } from './ner.js';
+import { NER_MAX_CHARACTERS } from './ner-capacity.js';
+import { classifyEntities } from './ner.js';
 import { PII_PATTERNS, type PiiPattern } from './patterns.js';
 
 /**
@@ -107,7 +106,8 @@ export interface ScreeningResult {
   readonly blockReason?:
     | 'regex_match_high_confidence'
     | 'regex_match_any_ai_bound'
-    | 'match_any_audit_bound';
+    | 'match_any_audit_bound'
+    | 'screening_unavailable';
   /**
    * When `action === 'block'`, a participant-visible message pointing to
    * the participant kit's synthetic values. Undefined otherwise.
@@ -134,23 +134,31 @@ export const PARTICIPANT_BLOCK_MESSAGE =
  * @returns Decision-neutral ScreeningResult; route handler decides
  *   whether to reject-with-422, redact-and-continue, or pass-through.
  *
- * Runtime characteristics:
- *   - Pure function: no I/O, no network, no logging.
- *   - Deterministic: same input + route class → same result every time.
- *   - Complexity: O(patterns × input length). For Pilot 1 traffic
- *     (10 volunteer participants, short messages) this is trivially
- *     fast. Sprint 1.1b's local NER will change the cost profile.
- *
- * SAFETY: this function is guaranteed by construction to NEVER make an
- * external network call. It uses only synchronous regex operations
- * against the compile-time PII_PATTERNS array. Sprint 1.1b MUST
- * preserve this property when adding the NER layer — see the
- * §Absolute prohibition callout in the module header.
+ * Runtime: bounded async local inference and regex classification. Model assets
+ * are loaded from disk and hash-verified; runtime never downloads or sends text.
+ * Failure blocks ingress and suppresses unverified egress.
  */
-export function screenInput(text: string, routeClass: RouteClass): ScreeningResult {
+export async function screenInput(text: string, routeClass: RouteClass): Promise<ScreeningResult> {
   if (text.length === 0) {
     return { hits: [], action: 'pass' };
   }
+
+  if (text.length > NER_MAX_CHARACTERS)
+    return {
+      hits: [
+        {
+          patternId: 'ner_screening_failure',
+          label: 'Unverified output',
+          confidence: 'high_confidence',
+          match: '',
+          start: 0,
+          end: text.length,
+        },
+      ],
+      action: 'block',
+      blockReason: 'screening_unavailable',
+      participantMessage: 'Text exceeds the local screening budget.',
+    };
 
   const hits: PiiHit[] = [];
   // Layer 1a — regex fast-path.
@@ -176,19 +184,10 @@ export function screenInput(text: string, routeClass: RouteClass): ScreeningResu
     }
   }
 
-  // Layer 1b — local NER classifier (Sprint 1.1b; wink-nlp).
-  // Runs after regex so regex-matched substrings still surface as
-  // regex hits with their own labels; NER surfaces entities the regex
-  // library does not express (real names, addresses, DOBs, orgs).
-  //
-  // Per Codex R5 (Sprint 1.1b): if NER detects an entity but offset
-  // derivation fails, throw NerOffsetDerivationError rather than silently
-  // omit the hit. We catch it here and fail closed with a synthetic
-  // high-confidence hit; the route handler sees the hit + blocks, so
-  // the potentially-real PII cannot slip into the request pipeline
-  // just because we couldn't compute where it is.
+  // Layer 1b: actual local statistical classification. All native/asset/offset/
+  // capacity failures become a static safe result, never a regex-only fallback.
   try {
-    for (const ner of classifyEntities(text)) {
+    for (const ner of await classifyEntities(text)) {
       hits.push({
         patternId: `ner_${ner.entityType.toLowerCase()}`,
         label: nerLabelFor(ner.entityType),
@@ -198,23 +197,24 @@ export function screenInput(text: string, routeClass: RouteClass): ScreeningResu
         end: ner.end,
       });
     }
-  } catch (e) {
-    if (e instanceof NerOffsetDerivationError) {
-      // Fail closed: synthesize a whole-input high-confidence hit so
-      // the decision matrix blocks. The match spans the entire input
-      // because we cannot localize; the participant sees the standard
-      // block message + is prompted to re-enter with synthetic values.
-      hits.push({
-        patternId: 'ner_offset_derivation_failure',
-        label: `Named entity (${e.entityType}) — offset undeterminable`,
-        confidence: 'high_confidence',
-        match: text,
-        start: 0,
-        end: text.length,
-      });
-    } else {
-      throw e;
-    }
+  } catch {
+    // No candidate or native error message is attached to failure diagnostics.
+    return {
+      hits: [
+        {
+          patternId: 'ner_screening_failure',
+          label: 'Unverified output',
+          confidence: 'high_confidence',
+          match: '',
+          start: 0,
+          end: text.length,
+        },
+      ],
+      action: 'block',
+      blockReason: 'screening_unavailable',
+      participantMessage:
+        'Personal information screening is temporarily unavailable. Please retry shortly.',
+    };
   }
 
   if (hits.length === 0) {
@@ -284,22 +284,21 @@ export function screenInput(text: string, routeClass: RouteClass): ScreeningResu
  * start-index-ascending per pattern; we sort here for safety when
  * multiple patterns overlap).
  *
- * When two hits overlap, the earlier one wins (its redaction extends
- * over the later one's range). This is a deterministic tie-break; the
- * participant sees the earlier pattern's label.
+ * Overlapping intervals are unioned; no uncovered suffix can survive.
+ * The participant sees the first interval's label.
  */
-function applyRedactions(text: string, hits: readonly PiiHit[]): string {
-  const sorted = [...hits].sort((a, b) => a.start - b.start);
+export function applyRedactions(text: string, hits: readonly PiiHit[]): string {
+  const sorted = [...hits].sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: Array<{ start: number; end: number; label: string }> = [];
+  for (const hit of sorted) {
+    const previous = merged[merged.length - 1];
+    if (previous && hit.start <= previous.end) previous.end = Math.max(previous.end, hit.end);
+    else merged.push({ start: hit.start, end: hit.end, label: hit.label });
+  }
   const chunks: string[] = [];
   let cursor = 0;
-  for (const hit of sorted) {
-    if (hit.start < cursor) {
-      // Overlap with a previous hit — skip. The previous redaction
-      // already covers this range.
-      continue;
-    }
-    chunks.push(text.slice(cursor, hit.start));
-    chunks.push(`[REDACTED:${hit.label}]`);
+  for (const hit of merged) {
+    chunks.push(text.slice(cursor, hit.start), '[REDACTED:' + hit.label + ']');
     cursor = hit.end;
   }
   chunks.push(text.slice(cursor));
@@ -361,13 +360,13 @@ export interface EgressScreeningResult {
  * provider. The import allowlist enforced by the SAFETY checker in
  * index.test.ts covers this function's dependencies.
  */
-export function screenOutput(text: string): EgressScreeningResult {
+export async function screenOutput(text: string): Promise<EgressScreeningResult> {
   if (text.length === 0) {
     return { hits: [], output: text, redacted: false };
   }
   // Reuse the Layer 1 detection pipeline with `internal` semantics —
   // we only need the hit list here; the action is always redact.
-  const detected = screenInput(text, 'internal');
+  const detected = await screenInput(text, 'internal');
   if (detected.hits.length === 0) {
     return { hits: [], output: text, redacted: false };
   }
@@ -390,8 +389,8 @@ function nerLabelFor(entityType: string): string {
       return 'Geopolitical entity (country / city / state)';
     case 'LOCATION':
       return 'Location';
-    case 'DATE':
-      return 'Date';
+    case 'DOB':
+      return 'Date of birth';
     case 'ORG':
       return 'Organization';
     default:

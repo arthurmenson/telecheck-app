@@ -46,7 +46,7 @@ describe('collectPayloadStrings — exhaustive traversal (Sprint 1.1d)', () => {
     expect(collectPayloadStrings({ review_notes: 'looks good' })).toContain('looks good');
   });
 
-  it('collects every element of required_revisions[]', () => {
+  it('collects every element of required_revisions[]', async () => {
     const strings = collectPayloadStrings({
       required_revisions: ['fix q1', 'fix q2', 'fix q3'],
     });
@@ -62,21 +62,21 @@ describe('collectPayloadStrings — exhaustive traversal (Sprint 1.1d)', () => {
     expect(strings).toContain('john.smith@example.com');
   });
 
-  it('collects keys nested inside arrays of objects', () => {
+  it('collects keys nested inside arrays of objects', async () => {
     const strings = collectPayloadStrings({
       revisions: [{ 'reviewer.email@example.com': 'note' }],
     });
     expect(strings).toContain('reviewer.email@example.com');
   });
 
-  it('collects strings from deeply nested mixed structures', () => {
+  it('collects strings from deeply nested mixed structures', async () => {
     const strings = collectPayloadStrings({
       a: [{ b: { c: ['deep-value'] } }],
     });
     expect(strings).toContain('deep-value');
   });
 
-  it('ignores non-string scalars', () => {
+  it('ignores non-string scalars', async () => {
     const strings = collectPayloadStrings({ n: 42, b: true, z: null });
     // Keys are still collected; the scalar values are not.
     expect(strings).toEqual(expect.arrayContaining(['n', 'b', 'z']));
@@ -104,26 +104,32 @@ describe('collectPayloadStrings — depth exhaustion FAILS CLOSED (Codex R1 bypa
 });
 
 describe('audit_bound screening over collected payload strings (end-to-end)', () => {
-  it('a PII-bearing KEY is caught by the screener once collected', () => {
+  it('a PII-bearing KEY is caught by the screener once collected', async () => {
     const strings = collectPayloadStrings({ 'john.smith@example.com': 'ok' });
-    const blocked = strings.some((s) => screenInput(s, 'audit_bound').action === 'block');
+    let blocked = false;
+    for (const candidate of strings)
+      if ((await screenInput(candidate, 'audit_bound')).action === 'block') blocked = true;
     expect(blocked).toBe(true);
   });
 
-  it('a PII-bearing nested VALUE is caught by the screener once collected', () => {
+  it('a PII-bearing nested VALUE is caught by the screener once collected', async () => {
     const strings = collectPayloadStrings({
       revisions: [{ note: 'reviewer SSN is 123-45-6789' }],
     });
-    const blocked = strings.some((s) => screenInput(s, 'audit_bound').action === 'block');
+    let blocked = false;
+    for (const candidate of strings)
+      if ((await screenInput(candidate, 'audit_bound')).action === 'block') blocked = true;
     expect(blocked).toBe(true);
   });
 
-  it('clean synthetic reviewer payload produces no block', () => {
+  it('clean synthetic reviewer payload produces no block', async () => {
     const strings = collectPayloadStrings({
       review_notes: 'Question 4 wording is ambiguous.',
       required_revisions: ['Clarify question 4.'],
     });
-    const blocked = strings.some((s) => screenInput(s, 'audit_bound').action === 'block');
+    let blocked = false;
+    for (const candidate of strings)
+      if ((await screenInput(candidate, 'audit_bound')).action === 'block') blocked = true;
     expect(blocked).toBe(false);
   });
 });

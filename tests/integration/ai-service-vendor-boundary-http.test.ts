@@ -17,6 +17,7 @@ import { config } from '../../src/lib/config.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import { issueAccessToken } from '../../src/lib/jwt.ts';
 import { screenInput } from '../../src/lib/pii-screener/index.ts';
+import { classifyEntities } from '../../src/lib/pii-screener/ner.ts';
 import { ulid } from '../../src/lib/ulid.ts';
 import { recordVendorDecision } from '../../src/modules/ai-service/internal/providers/vendor-audit.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
@@ -24,6 +25,11 @@ import { asAccountId } from '../../src/modules/identity/internal/types.ts';
 import { grantSliceRolesToTestApp } from '../helpers/grant-slice-roles.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { getTestClient } from '../setup.ts';
+
+vi.mock('../../src/lib/pii-screener/ner.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/lib/pii-screener/ner.ts')>();
+  return { ...actual, classifyEntities: vi.fn(actual.classifyEntities) };
+});
 
 vi.mock('../../src/lib/pii-screener/index.ts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/lib/pii-screener/index.ts')>();
@@ -79,6 +85,7 @@ beforeEach(() => {
   Reflect.set(config, 'anthropicApiKey', 'test-vendor-boundary-key');
   Reflect.set(config, 'anthropicModel', MODEL);
   inputScreener.mockReset();
+  vi.mocked(classifyEntities).mockReset();
   recorder.mockReset();
   recorder.mockResolvedValue(undefined);
   vendorFetch.mockReset();
@@ -189,7 +196,7 @@ interface ChatResponse {
 describe('Mode 1 Layer 4 vendor boundary — HTTP integration', () => {
   it('blocks a high-confidence upstream miss with a local 500 and rolls back the turn/cache', async () => {
     const { accountId, headers, key } = await patientRequest();
-    inputScreener.mockReturnValueOnce({ action: 'pass', hits: [] });
+    inputScreener.mockResolvedValueOnce({ action: 'pass', hits: [] });
 
     const response = await send(headers, HIGH_MESSAGE);
 
@@ -229,7 +236,7 @@ describe('Mode 1 Layer 4 vendor boundary — HTTP integration', () => {
     'fails closed with 503 and zero outbound calls when the decision audit rejects (%s)',
     async (message) => {
       const { accountId, headers, key } = await patientRequest();
-      inputScreener.mockReturnValueOnce({ action: 'pass', hits: [] });
+      inputScreener.mockResolvedValueOnce({ action: 'pass', hits: [] });
       recorder.mockRejectedValueOnce(
         new Error('private database diagnostic test.patient@example.invalid'),
       );
@@ -252,7 +259,7 @@ describe('Mode 1 Layer 4 vendor boundary — HTTP integration', () => {
 
   it('awaits the redaction audit before serializing the sanitized vendor request and keeps Layer 2 output screening', async () => {
     const { accountId, headers, key } = await patientRequest();
-    inputScreener.mockReturnValueOnce({ action: 'pass', hits: [] });
+    inputScreener.mockResolvedValueOnce({ action: 'pass', hits: [] });
     const order: string[] = [];
     let releaseAudit: () => void = () => {};
     let reportAuditStarted: () => void = () => {};
@@ -356,7 +363,7 @@ describe('Mode 1 Layer 4 vendor boundary — HTTP integration', () => {
 
   it('replays a completed redacted turn without screening, audit recording, sending or duplicate persistence', async () => {
     const { accountId, headers } = await patientRequest();
-    inputScreener.mockReturnValueOnce({ action: 'pass', hits: [] });
+    inputScreener.mockResolvedValueOnce({ action: 'pass', hits: [] });
     const first = await send(headers, LOW_MESSAGE);
     expect(first.statusCode).toBe(200);
     expect(inputScreener).toHaveBeenCalledTimes(1);
@@ -432,5 +439,49 @@ describe('Mode 1 Layer 4 vendor boundary — HTTP integration', () => {
     expect(inputScreener).not.toHaveBeenCalled();
     expect(vendorFetch).not.toHaveBeenCalled();
     expect(recorder).not.toHaveBeenCalled();
+  });
+});
+
+describe('NER failure at actual HTTP boundaries', () => {
+  it('rejects unavailable ingress before provider, audit decision or business persistence', async () => {
+    const { accountId, headers, key } = await patientRequest();
+    vi.mocked(classifyEntities).mockRejectedValueOnce(new Error('PRIVATE NATIVE FAILURE'));
+    const response = await send(headers, SAFE_MESSAGE);
+    expect(response.statusCode).toBe(422);
+    expect(response.body).not.toContain('PRIVATE');
+    expect(vendorFetch).not.toHaveBeenCalled();
+    expect(recorder).not.toHaveBeenCalled();
+    await expectNoBusinessRows(accountId, key);
+  });
+
+  it('suppresses unavailable egress and persists exactly the displayed safe replacement', async () => {
+    const { accountId, headers } = await patientRequest();
+    vendorFetch.mockImplementationOnce(async () => {
+      vi.mocked(classifyEntities).mockRejectedValueOnce(new Error('PRIVATE NATIVE FAILURE'));
+      return vendorSuccess('Unverified private provider candidate.');
+    });
+    const response = await send(headers, SAFE_MESSAGE);
+    expect(response.statusCode).toBe(200);
+    const body = response.json<ChatResponse>();
+    expect(body.response_text).toBe('[REDACTED:Unverified output]');
+    expect(response.body).not.toContain('private provider');
+    const stored = await withTenantContext(TENANT, () =>
+      getTestClient().query<{ assistant_message: string }>(
+        'SELECT assistant_message FROM ai_mode1_conversation_turn_result WHERE tenant_id = $1 AND patient_id = $2 AND turn_id = $3',
+        [TENANT, accountId, body.message_id],
+      ),
+    );
+    expect(stored.rows).toEqual([{ assistant_message: body.response_text }]);
+  });
+
+  it('keeps crisis guidance and liveness reachable while classification is unavailable', async () => {
+    const { headers } = await patientRequest();
+    vi.mocked(classifyEntities).mockRejectedValue(new Error('screening unavailable'));
+    const response = await send(headers, 'I am going to kill myself right now.');
+    expect(response.statusCode).toBe(200);
+    expect(response.json<ChatResponse>().crisis_detected).toBe(true);
+    expect(classifyEntities).not.toHaveBeenCalled();
+    expect(vendorFetch).not.toHaveBeenCalled();
+    expect((await app.inject({ method: 'GET', url: '/health' })).statusCode).toBe(200);
   });
 });

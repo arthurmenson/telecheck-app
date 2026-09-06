@@ -231,22 +231,34 @@ export class DecisionPayloadTooDeepError extends Error {
  * Throws `DecisionPayloadTooDeepError` past the depth bound so the
  * handler can reject rather than silently under-screen.
  */
+export class DecisionPayloadTooLargeError extends Error {
+  constructor() {
+    super('decision_payload exceeds screening budget');
+    this.name = 'DecisionPayloadTooLargeError';
+  }
+}
 export function collectPayloadStrings(value: unknown, depth = 0): string[] {
-  if (depth > DECISION_PAYLOAD_MAX_DEPTH) {
-    throw new DecisionPayloadTooDeepError();
+  const strings: string[] = [];
+  let characters = 0;
+  let nodes = 0;
+  function add(text: string): void {
+    characters += text.length;
+    if (characters > 16_000 || strings.length >= 64) throw new DecisionPayloadTooLargeError();
+    strings.push(text);
   }
-  if (typeof value === 'string') return [value];
-  if (Array.isArray(value)) {
-    return value.flatMap((v) => collectPayloadStrings(v, depth + 1));
+  function visit(current: unknown, level: number): void {
+    if (level > DECISION_PAYLOAD_MAX_DEPTH) throw new DecisionPayloadTooDeepError();
+    if (++nodes > 256) throw new DecisionPayloadTooLargeError();
+    if (typeof current === 'string') add(current);
+    else if (Array.isArray(current)) for (const item of current) visit(item, level + 1);
+    else if (current !== null && typeof current === 'object')
+      for (const [key, item] of Object.entries(current)) {
+        add(key);
+        visit(item, level + 1);
+      }
   }
-  if (value !== null && typeof value === 'object') {
-    return Object.entries(value).flatMap(([key, v]) => [
-      // The key itself is caller-controlled — screen it.
-      key,
-      ...collectPayloadStrings(v, depth + 1),
-    ]);
-  }
-  return [];
+  visit(value, depth);
+  return strings;
 }
 
 /**
@@ -412,6 +424,8 @@ export async function postFormsTemplateDecisionHandler(
   try {
     payloadStrings = collectPayloadStrings(decisionPayload);
   } catch (err) {
+    if (err instanceof DecisionPayloadTooLargeError)
+      throw req.server.httpErrors.unprocessableEntity('decision_payload exceeds screening budget');
     if (err instanceof DecisionPayloadTooDeepError) {
       req.log.warn(
         { review_id: paramsParsed.data.review_id },
@@ -427,7 +441,7 @@ export async function postFormsTemplateDecisionHandler(
   }
 
   for (const candidate of payloadStrings) {
-    const screening = screenInput(candidate, 'audit_bound');
+    const screening = await screenInput(candidate, 'audit_bound');
     if (screening.action === 'block') {
       // Log pattern ids + count ONLY — never the offending text.
       req.log.warn(
