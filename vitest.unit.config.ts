@@ -45,6 +45,8 @@ export default defineConfig({
     // Explicit opt-in. Add a file here once it is confirmed to need no
     // database, no Redis, and no Fastify app instance.
     include: [
+      'src/lib/kms-aws.test.ts',
+      'tests/integration/kms.test.ts',
       'tests/unit/check-log-call-sites.test.ts',
       'src/lib/pii-screener/index.test.ts',
       'src/lib/pii-screener/ner.test.ts',
