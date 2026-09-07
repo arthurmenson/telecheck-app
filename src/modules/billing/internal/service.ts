@@ -233,6 +233,84 @@ export interface ConsultPaymentInput extends ConsultSelection {
   accepted_quote_id: string;
   initiation_source: string;
 }
+type PaymentReservation = { intent: PaymentIntent; create: boolean };
+
+export async function listConsultPayments(actor: BillingActor, offset: number) {
+  patient(actor);
+  if (!Number.isInteger(offset) || offset < 0 || offset > 10000)
+    throw new BillingError('billing.page_invalid', 400);
+  return billingTransaction(
+    actor.context.tenantId,
+    async (tx) => {
+      const result = await tx.query<{ page: Record<string, unknown> }>(
+        'SELECT public.billing_patient_consult_payments($1) AS page',
+        [offset],
+      );
+      if (!result.rows[0]?.page) throw new BillingError('billing.persistence_unavailable');
+      return result.rows[0].page;
+    },
+    actor,
+  );
+}
+
+/** Caller holds the original operation's reservation lock. No new price or intent. */
+async function reserveExistingPayment(
+  tx: DbTransaction,
+  actor: BillingActor,
+  prior: PaymentIntent,
+): Promise<PaymentReservation> {
+  assertConfig(prior);
+  if (['requires_payment', 'paid', 'refund_pending', 'refunded'].includes(prior.status))
+    return { intent: prior, create: false };
+  if (prior.status === 'cancelled' || prior.status === 'failed')
+    throw new BillingError('billing.payment_unavailable', 409);
+  if (prior.lease_expires_at && prior.lease_expires_at.getTime() > Date.now())
+    throw new BillingError('billing.creation_in_flight', 409);
+  const lease = randomUUID();
+  await tx.query(
+    "UPDATE public.billing_payment_intent SET status='creation_unknown',lease_token=$3,lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE tenant_id=$1 AND id=$2",
+    [actor.context.tenantId, prior.payment_id, lease],
+  );
+  return { intent: { ...prior, status: 'creation_unknown', lease_token: lease }, create: true };
+}
+
+/** Resume the patient's existing accepted reservation even after a browser reload. */
+export async function resumeConsultPayment(
+  actor: BillingActor,
+  paymentId: string,
+): Promise<PaymentIntent> {
+  patient(actor);
+  const reserved = await billingTransaction(
+    actor.context.tenantId,
+    async (tx) => {
+      const operation = (
+        await tx.query<{ operation_key: string }>(
+          "SELECT operation_key FROM public.billing_payment_intent WHERE tenant_id=$1 AND id=$2 AND patient_id=$3 AND purpose='async_consult'",
+          [actor.context.tenantId, paymentId, actor.accountId],
+        )
+      ).rows[0]?.operation_key;
+      if (!operation) throw new BillingError('billing.payment_unavailable', 404);
+      await tx.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+        `billing_reserve:${actor.context.tenantId}:${actor.accountId}:${operation}`,
+      ]);
+      const prior = (
+        await tx.query<PaymentIntent>(
+          intentSql +
+            " WHERE i.tenant_id=$1 AND i.id=$2 AND i.patient_id=$3 AND i.purpose='async_consult'",
+          [actor.context.tenantId, paymentId, actor.accountId],
+        )
+      ).rows[0];
+      if (!prior || prior.country_of_care !== actor.context.countryOfCare)
+        throw new BillingError('billing.payment_unavailable', 404);
+      if (['failed', 'cancelled', 'refund_pending', 'refunded'].includes(prior.status))
+        throw new BillingError('billing.payment_unavailable', 409);
+      return reserveExistingPayment(tx, actor, prior);
+    },
+    actor,
+  );
+  return completeReservedPayment(actor, reserved);
+}
+
 export async function ensureConsultPayment(
   actor: BillingActor,
   input: ConsultPaymentInput,
@@ -263,22 +341,7 @@ export async function ensureConsultPayment(
       if (prior) {
         if (prior.request_hash !== hash)
           throw new BillingError('billing.idempotency_mismatch', 409);
-        assertConfig(prior);
-        if (['requires_payment', 'paid', 'refund_pending', 'refunded'].includes(prior.status))
-          return { intent: prior, create: false };
-        if (prior.status === 'cancelled' || prior.status === 'failed')
-          throw new BillingError('billing.payment_unavailable', 409);
-        if (prior.lease_expires_at && prior.lease_expires_at.getTime() > Date.now())
-          throw new BillingError('billing.creation_in_flight', 409);
-        const lease = randomUUID();
-        await tx.query(
-          "UPDATE public.billing_payment_intent SET status='creation_unknown',lease_token=$3,lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE tenant_id=$1 AND id=$2",
-          [actor.context.tenantId, prior.payment_id, lease],
-        );
-        return {
-          intent: { ...prior, status: 'creation_unknown' as const, lease_token: lease },
-          create: true,
-        };
+        return reserveExistingPayment(tx, actor, prior);
       }
       const conf = await configured(actor, tx);
       const quote = (
@@ -352,6 +415,13 @@ export async function ensureConsultPayment(
     },
     actor,
   );
+  return completeReservedPayment(actor, reserved);
+}
+
+async function completeReservedPayment(
+  actor: BillingActor,
+  reserved: PaymentReservation,
+): Promise<PaymentIntent> {
   if (!reserved.create) return reserved.intent;
   const intent = reserved.intent;
   try {

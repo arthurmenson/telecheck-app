@@ -5,7 +5,11 @@ import { z } from 'zod';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { withTransaction } from '../../../../lib/db.js';
 import { emitDomainEvent } from '../../../../lib/domain-events.js';
-import { IdempotencyReplayError } from '../../../../lib/idempotency.js';
+import {
+  IdempotencyReplayError,
+  IdempotencyInFlightError,
+  IdempotencyBodyMismatchError,
+} from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { ulid } from '../../../../lib/ulid.js';
@@ -57,6 +61,21 @@ export async function initiateConsultV1Handler(
     // Billing commits its own reservation before provider I/O. A later local
     // rollback resumes the same intent; it never substitutes a new payment key.
     const payment = await ensureConsultPayment(actor, { ...parsed.data, program_id: null }, key);
+    return await completeBilledConsult(req, reply, actor, payment);
+  } catch (error) {
+    if (billingFailure(error, reply, req.id)) return reply;
+    throw error;
+  }
+}
+
+/** Both original initiation and recovered reservations commit this same case boundary. */
+export async function completeBilledConsult(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  actor: ReturnType<typeof billingActor>,
+  payment: Awaited<ReturnType<typeof ensureConsultPayment>>,
+): Promise<unknown> {
+  try {
     return await withIdempotentExecution(
       req,
       reply,
@@ -157,7 +176,12 @@ export async function initiateConsultV1Handler(
           } catch (error) {
             // Cached metadata is still patient data. A blocked cache read must
             // recheck the live session before withIdempotentExecution replays it.
-            if (error instanceof IdempotencyReplayError) await validate();
+            if (
+              error instanceof IdempotencyReplayError ||
+              error instanceof IdempotencyInFlightError ||
+              error instanceof IdempotencyBodyMismatchError
+            )
+              await validate();
             throw error;
           }
         }),
