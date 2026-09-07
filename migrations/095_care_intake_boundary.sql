@@ -183,10 +183,13 @@ BEGIN
     ON e.tenant_id=r.tenant_id AND e.payload->>'audit_id'=r.audit_id::TEXT
     WHERE r.tenant_id=NEW.tenant_id AND r.resource_id=NEW.consult_id AND r.resource_type='consult_care_binding'
       AND r.actor_id=NEW.patient_id AND r.target_patient_id=NEW.patient_id AND r.action='async_consult.intake_definition_bound'
-      AND r.payload->>'schema_hash'=NEW.definition->>'schema_hash'
-      AND r.payload->>'deployment_id'=NEW.definition->>'deployment_id'
-      AND e.aggregate_id=NEW.consult_id AND e.event_type='async_consult.intake_definition_bound.v1'
-      AND e.payload->>'schema_hash'=NEW.definition->>'schema_hash'
+      AND r.payload @> jsonb_build_object('template_id',NEW.definition->'template_id',
+        'template_version',NEW.definition->'template_version','deployment_id',NEW.definition->'deployment_id',
+        'schema_hash',NEW.definition->'schema_hash')
+      AND e.aggregate_type='consult' AND e.aggregate_id=NEW.consult_id AND e.event_type='async_consult.intake_definition_bound.v1'
+      AND e.partition_key=NEW.tenant_id||':'||NEW.consult_id
+      AND e.payload-'occurred_at'=jsonb_build_object('audit_id',r.audit_id::TEXT,
+        'schema_hash',NEW.definition->'schema_hash','deployment_id',NEW.definition->'deployment_id')
       AND public.consent_care_current_write(r.xmin) AND public.consent_care_current_write(e.xmin))
     THEN RAISE EXCEPTION 'care_binding_evidence_required' USING ERRCODE='23514'; END IF;
   IF public.consent_care_live_actor(NULL) IS DISTINCT FROM a
@@ -276,10 +279,15 @@ BEGIN
     ON e.tenant_id=r.tenant_id AND e.payload->>'audit_id'=r.audit_id::TEXT
     WHERE r.tenant_id=NEW.tenant_id AND r.resource_id=NEW.submission_id AND r.resource_type='consult_intake_submission'
       AND r.actor_id=NEW.patient_id AND r.target_patient_id=NEW.patient_id AND r.action='async_consult.intake_submitted'
-      AND r.payload->>'consult_id'=NEW.consult_id AND r.payload->>'template_id'=bound->'definition'->>'template_id'
-      AND r.payload->>'template_version'=bound->'definition'->>'template_version'
-      AND e.aggregate_id=NEW.consult_id AND e.event_type='async_consult.intake_submitted.v1'
-      AND e.payload->>'submission_id'=NEW.submission_id AND e.payload->>'policy_hash'=NEW.admission->>'policy_hash'
+      AND r.payload @> jsonb_build_object('consult_id',NEW.consult_id,
+        'template_id',bound->'definition'->'template_id','template_version',bound->'definition'->>'template_version')
+      AND e.aggregate_type='consult' AND e.aggregate_id=NEW.consult_id AND e.event_type='async_consult.intake_submitted.v1'
+      AND e.partition_key=NEW.tenant_id||':'||NEW.consult_id
+      -- Compare JSON values, never text coercions: omission, JSON null, and a
+      -- string/number posing as the patient's boolean choice all fail closed.
+      AND e.payload-'occurred_at'=jsonb_build_object('submission_id',NEW.submission_id,
+        'audit_id',r.audit_id::TEXT,'publication_id',NEW.admission->'publication_id',
+        'policy_hash',NEW.admission->'policy_hash','ai_interpretation_active',NEW.admission->'ai_interpretation_active')
       AND public.consent_care_current_write(r.xmin) AND public.consent_care_current_write(e.xmin))
     THEN RAISE EXCEPTION 'care_intake_evidence_required' USING ERRCODE='23514'; END IF;
   IF public.consent_care_live_actor(NULL) IS DISTINCT FROM a
