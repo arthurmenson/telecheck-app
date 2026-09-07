@@ -1,57 +1,11 @@
 /**
- * async-consult-v1-http.test.ts — live-PostgreSQL HTTP integration tests
- * for the Sprint-10 /v1/async-consults surface (P-038 canonical entity
- * chain; migrations 055-064).
+ * Downstream async-consult HTTP regressions with real PostgreSQL, binder login,
+ * slice roles, RLS and audit writes. Initiation uses an explicitly synthetic
+ * paid fixture to preserve the existing intake/AI/queue/claim/decision/follow-up
+ * coverage. This suite is not evidence of Billing, real providers, an encrypted
+ * clinical intake journey, or a complete patient-to-clinician workflow.
  *
- * Closes the "Live-PostgreSQL integration tests for the v1 endpoints are
- * pending" hardening item (async-consult README). Unlike the per-handler
- * unit suites (which mock every lib), this file exercises the REAL
- * composition end-to-end: JWT verify → SI-010 bind (real bind pool
- * authenticated as bind_actor_context_role) → tenant context → SET LOCAL
- * ROLE slice role → SECDEF wrappers → RLS → same-tx audit emission.
- *
- * **First suite to exercise the real SI-010 bind path** (per the
- * tests/setup.ts R2/R4 closure, bind wiring is slice-level opt-in): the
- * beforeAll provisions a password for `bind_actor_context_role` (created
- * LOGIN by migration 031; CI's TEST_DATABASE_URL user is superuser),
- * opens a DEDICATED pg.Pool as that role, and installs it via
- * `setBindActorContextTestPool()` BEFORE buildApp — so the app's SI-010
- * boot probe validates the same trust boundary production validates.
- *
- * Coverage (4 groups):
- *
- *   Group A — Full pilot loop over live infrastructure
- *     A1 initiate (patient) → 201 consult_id
- *     A2 intake (patient) → 201 submission_id
- *     A3 ai-preparation (ai_service) → 201 summary_id (submitted →
- *        processing → queued through the migration 059 §3 wrapper under
- *        ai_service_account; migration 064 wiring)
- *     A4 queue (clinician) lists the consult in state 'queued'
- *     A5 claim (clinician) → 201 claim_id
- *     A6 decision (clinician, recommend) → 201 decision_id
- *     A7 patient GET → current_state 'advised', decision_type 'recommend'
- *
- *   Group B — Endpoint #9 + follow-up messages (#10/#11) on a second loop
- *     B1 request-additional-data (clinician) → 201; patient GET shows
- *        'awaiting_data'
- *     B2 patient sends follow-up message → 201
- *     B3 clinician sends follow-up message → 201
- *     B4 patient lists → both messages, envelope round-trips, no tenant leak
- *     B5 clinician lists → both messages
- *
- *   Group C — Caller-class gates on the live surface
- *     C1 ai-preparation with a patient token → 403
- *     C2 ai-preparation with a clinician token → 403
- *     C3 queue with an ai_service token → 403
- *
- *   Group D — Tenant-blind self-scoping (I-025)
- *     D1 a SECOND patient's GET on the first patient's consult → 404
- *     D2 the second patient's follow-up list on that consult → empty rows
- *        (indistinguishable from a message-less consult)
- *
- * Spec references: P-038 §7 endpoints 1-11, migrations 055-064,
- * AUDIT_EVENTS v5.11 async_consult.*, I-003, I-023, I-025, I-026, I-027,
- * docs/SI-010-Session-Actor-Context-DB-Binding.md.
+ * Real isolated Billing HTTP acceptance is scripts/verify-billing-runtime.ts.
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -71,6 +25,7 @@ import { ulid } from '../../src/lib/ulid.ts';
 import { SLICE_ROLES } from '../../src/lib/with-db-role.ts';
 import { createAccount } from '../../src/modules/identity/internal/repositories/account-repo.ts';
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
+import { seedBilledConsultFixture } from '../helpers/billed-consult-fixture.ts';
 import { configureBindRole } from '../helpers/configure-bind-role.ts';
 import { seedLiveSession } from '../helpers/live-session-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
@@ -169,22 +124,9 @@ function json<T>(res: { body: string }): T {
 }
 
 async function initiateConsult(token: string): Promise<string> {
-  const res = await inject({
-    method: 'POST',
-    url: '/v1/async-consults',
-    token,
-    payload: {
-      consult_type: 'general',
-      initiation_source: 'care_tab',
-      consult_fee_cents: 0,
-      currency: 'USD',
-      payment_provider: 'mock_local_dev',
-      payment_intent_id: ulid(),
-      expected_turnaround_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
-    },
-  });
-  expect(res.statusCode).toBe(201);
-  return json<{ consult_id: string }>(res).consult_id;
+  // This legacy suite isolates downstream wrappers using a provisioned paid
+  // fixture. It does not claim real Billing/provider or clinical encryption.
+  return seedBilledConsultFixture(token);
 }
 
 async function submitIntake(token: string, consultId: string): Promise<string> {
@@ -337,7 +279,7 @@ afterAll(async () => {
 // needs and asserts within the same block.
 // ===========================================================================
 
-describe('async-consult v1 — full pilot loop (live SI-010 + SECDEF + RLS)', () => {
+describe('async-consult v1 — downstream wrappers with synthetic paid fixture', () => {
   it('A. initiate → intake → ai-preparation → queue → claim → decision → patient read-back', async () => {
     // Initiate (patient).
     const consultId = await initiateConsult(patient.token);
