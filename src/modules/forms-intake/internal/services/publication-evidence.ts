@@ -100,7 +100,9 @@ export async function recordFormsPublicationEvidence(
     tx,
   );
   // Verify while trusted tenant/actor bindings are still in scope; the context
-  // helpers clear them before the surrounding transaction commits.
+  // helpers clear them before the surrounding transaction commits. The SQL
+  // check also locks the approved content and its current reviewer authority
+  // through commit, protecting any later cache/outbox waits after this flush.
   await tx.query('SET CONSTRAINTS forms_publication_evidence IMMEDIATE');
   await tx.query('SET CONSTRAINTS forms_publication_evidence DEFERRED');
 }

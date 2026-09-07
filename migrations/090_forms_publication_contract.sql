@@ -180,9 +180,125 @@ $$;
 REVOKE ALL ON FUNCTION public.forms_template_hash(public.forms_template) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.forms_template_hash(public.forms_template) TO forms_publication_owner;
 
+-- Row-share locks need UPDATE on a selected column. These grants belong only
+-- to the isolated NOLOGIN owner; no application DML grant is introduced.
+GRANT UPDATE (account_id) ON public.accounts,public.forms_governance_membership TO forms_publication_owner;
+CREATE FUNCTION public.forms_require_approved_artifact(p_tenant TEXT,p_id UUID,p_kind TEXT,p_hash TEXT,p_lock BOOLEAN)
+RETURNS public.forms_governance_artifact
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE r public.forms_governance_artifact; v_capability TEXT; failure TEXT;
+BEGIN
+  v_capability:=CASE p_kind WHEN 'clinical_review' THEN 'clinical_reviewer' WHEN 'marketing_copy' THEN 'marketing_reviewer' WHEN 'mode2_contract' THEN 'mode2_reviewer' END;
+  failure:=CASE p_kind WHEN 'clinical_review' THEN 'forms_independent_clinical_approval_required' WHEN 'marketing_copy' THEN 'forms_approved_marketing_copy_required' ELSE 'forms_mode2_contract_invalid' END;
+  IF p_lock THEN
+    SELECT * INTO r FROM public.forms_governance_artifact WHERE tenant_id=p_tenant AND artifact_id=p_id FOR SHARE;
+  ELSE
+    SELECT * INTO r FROM public.forms_governance_artifact WHERE tenant_id=p_tenant AND artifact_id=p_id;
+  END IF;
+  IF NOT FOUND OR v_capability IS NULL OR r.kind IS DISTINCT FROM p_kind OR r.status IS DISTINCT FROM 'approved'
+    OR r.content_hash IS DISTINCT FROM p_hash OR r.reviewer_id IS NULL OR r.reviewer_id=r.author_id
+  THEN RAISE EXCEPTION USING MESSAGE=failure,ERRCODE='22023'; END IF;
+  IF p_lock THEN
+    -- Read the artifact first so its reviewer identity cannot change while we
+    -- acquire the membership/account locks. Re-evaluate eligibility after waits.
+    PERFORM 1 FROM public.forms_governance_membership m JOIN public.accounts a
+      ON a.tenant_id=m.tenant_id AND a.account_id=m.account_id
+      WHERE m.tenant_id=p_tenant AND m.account_id=r.reviewer_id AND m.capability=v_capability AND m.revoked_at IS NULL
+        AND a.status='active' AND a.deleted_at IS NULL
+        AND ((p_kind='clinical_review' AND a.account_type='clinician') OR (p_kind<>'clinical_review' AND a.account_type IN ('tenant_admin','clinician')))
+      FOR SHARE OF m,a;
+  ELSE
+    PERFORM 1 FROM public.forms_governance_membership m JOIN public.accounts a
+      ON a.tenant_id=m.tenant_id AND a.account_id=m.account_id
+      WHERE m.tenant_id=p_tenant AND m.account_id=r.reviewer_id AND m.capability=v_capability AND m.revoked_at IS NULL
+        AND a.status='active' AND a.deleted_at IS NULL
+        AND ((p_kind='clinical_review' AND a.account_type='clinician') OR (p_kind<>'clinical_review' AND a.account_type IN ('tenant_admin','clinician')));
+  END IF;
+  IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE=failure,ERRCODE='22023'; END IF;
+  RETURN r;
+END $$;
+ALTER FUNCTION public.forms_require_approved_artifact(TEXT,UUID,TEXT,TEXT,BOOLEAN) OWNER TO forms_publication_owner;
+REVOKE ALL ON FUNCTION public.forms_require_approved_artifact(TEXT,UUID,TEXT,TEXT,BOOLEAN) FROM PUBLIC;
+
+CREATE FUNCTION public.forms_assert_publication_contract(t public.forms_template,p_lock BOOLEAN) RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE a JSONB; hash TEXT; g JSONB; el JSONB; artifact public.forms_governance_artifact; l3 JSONB; rule JSONB; field JSONB;
+BEGIN
+  a:=public.forms_live_actor('reviewer');
+  IF a->>'tenant_id' IS DISTINCT FROM t.tenant_id OR a->>'country_of_care' IS DISTINCT FROM t.country_of_care
+  THEN RAISE EXCEPTION 'forms_scope_unavailable' USING ERRCODE='42501'; END IF;
+  -- Every care-affecting construct is either explicitly typed below or rejected.
+  -- All six I-030 categories therefore have no external research-state dependency.
+  IF lower(jsonb_build_array(t.presentation_content,t.branching_logic,t.eligibility_logic,t.approval_governance)::TEXT) ~ 'research[_ .-]*consent|research[_ .-]*status' THEN RAISE EXCEPTION 'forms_research_dependency' USING ERRCODE = '22023'; END IF;
+  PERFORM public.forms_validate_presentation(t.presentation_content,t.country_of_care);
+  IF t.branching_logic NOT IN ('{}'::JSONB,'{"rules":[],"computed_fields":[]}'::JSONB) THEN RAISE EXCEPTION 'forms_unsupported_branching' USING ERRCODE = '22023'; END IF;
+  g := t.approval_governance;
+  PERFORM public.forms_require_keys(g,ARRAY['mode','mode2_contract_id','mode2_contract_hash','development_only'],ARRAY['mode','development_only']);
+  IF jsonb_typeof(g->'development_only') IS DISTINCT FROM 'boolean' OR g->>'mode' NOT IN ('mode1','mode2') THEN RAISE EXCEPTION 'forms_governance_invalid' USING ERRCODE = '22023'; END IF;
+  IF t.presentation_content->>'kind' = 'general_consult' AND (
+    t.eligibility_logic NOT IN ('{}'::JSONB,'{"eligibility_rules":[],"contraindications":[]}'::JSONB)
+    OR g->>'mode' <> 'mode1' OR jsonb_array_length(t.presentation_content->'elements') <> 0
+  ) THEN RAISE EXCEPTION 'forms_general_contract_invalid' USING ERRCODE = '22023'; END IF;
+  hash := public.forms_template_hash(t);
+  IF t.eligibility_logic NOT IN ('{}'::JSONB,'{"eligibility_rules":[],"contraindications":[]}'::JSONB) THEN
+    l3 := t.eligibility_logic;
+    PERFORM public.forms_require_keys(l3,ARRAY['eligibility_rules','contraindications'],ARRAY['eligibility_rules','contraindications']);
+    IF l3->'contraindications' <> '[]'::JSONB OR jsonb_typeof(l3->'eligibility_rules') IS DISTINCT FROM 'array' OR jsonb_array_length(l3->'eligibility_rules') NOT BETWEEN 1 AND 64 THEN RAISE EXCEPTION 'forms_eligibility_invalid' USING ERRCODE = '22023'; END IF;
+    FOR rule IN SELECT * FROM jsonb_array_elements(l3->'eligibility_rules') LOOP
+      PERFORM public.forms_require_keys(rule,ARRAY['field_id','operator','value','outcome'],ARRAY['field_id','operator','value','outcome']);
+      SELECT f INTO field FROM jsonb_array_elements(t.presentation_content->'fields') f WHERE f->>'id' = rule->>'field_id';
+      IF field IS NULL OR rule->>'outcome' IS DISTINCT FROM 'clinical_review_required' OR rule->>'operator' NOT IN ('equals','lt','gt')
+        OR (rule->>'operator' IN ('lt','gt') AND (field->>'type' <> 'number' OR jsonb_typeof(rule->'value') <> 'number'))
+      THEN RAISE EXCEPTION 'forms_eligibility_invalid' USING ERRCODE = '22023'; END IF;
+      IF rule->>'operator'='equals' AND NOT (
+        (field->>'type'='text' AND public.forms_safe_text(rule->'value',(field->>'max_length')::INTEGER)) OR
+        (field->>'type'='boolean' AND jsonb_typeof(rule->'value')='boolean') OR
+        (field->>'type'='number' AND jsonb_typeof(rule->'value')='number') OR
+        (field->>'type'='select' AND EXISTS(SELECT 1 FROM jsonb_array_elements(field->'options') o WHERE o->'value'=rule->'value'))
+      ) THEN RAISE EXCEPTION 'forms_eligibility_invalid' USING ERRCODE='22023'; END IF;
+    END LOOP;
+    SELECT r.* INTO artifact FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='clinical_reviewer' AND m.revoked_at IS NULL
+      JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type='clinician' AND approver.status='active' AND approver.deleted_at IS NULL
+      WHERE r.tenant_id=t.tenant_id AND r.template_id=t.template_id AND r.kind='clinical_review' AND r.status='approved'
+      AND r.content_hash=hash AND r.author_id=t.created_by AND r.reviewer_id<>t.created_by AND r.development_only=(g->>'development_only')::BOOLEAN ORDER BY r.artifact_id LIMIT 1;
+    IF NOT FOUND THEN RAISE EXCEPTION 'forms_independent_clinical_approval_required' USING ERRCODE = '22023'; END IF;
+    artifact:=public.forms_require_approved_artifact(t.tenant_id,artifact.artifact_id,'clinical_review',hash,p_lock);
+    IF artifact.template_id IS DISTINCT FROM t.template_id OR artifact.author_id IS DISTINCT FROM t.created_by
+      OR artifact.development_only IS DISTINCT FROM (g->>'development_only')::BOOLEAN
+    THEN RAISE EXCEPTION 'forms_independent_clinical_approval_required' USING ERRCODE='22023'; END IF;
+  END IF;
+  FOR el IN SELECT * FROM jsonb_array_elements(t.presentation_content->'elements') LOOP
+    IF el->>'copy_classification' = 'molecule_level' THEN
+      SELECT r.* INTO artifact FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='marketing_reviewer' AND m.revoked_at IS NULL
+      JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type IN ('tenant_admin','clinician') AND approver.status='active' AND approver.deleted_at IS NULL
+      WHERE r.tenant_id=t.tenant_id AND r.artifact_id=(el->>'marketing_copy_id')::UUID AND r.kind='marketing_copy' AND r.status='approved' AND r.content_hash=el->>'content_hash' AND r.content->>'country_of_care'=t.country_of_care AND (NOT r.development_only OR (g->>'development_only')::BOOLEAN);
+      IF NOT FOUND THEN RAISE EXCEPTION 'forms_approved_marketing_copy_required' USING ERRCODE = '22023'; END IF;
+      artifact:=public.forms_require_approved_artifact(t.tenant_id,artifact.artifact_id,'marketing_copy',el->>'content_hash',p_lock);
+      IF artifact.content->>'country_of_care' IS DISTINCT FROM t.country_of_care OR (artifact.development_only AND NOT (g->>'development_only')::BOOLEAN)
+      THEN RAISE EXCEPTION 'forms_approved_marketing_copy_required' USING ERRCODE='22023'; END IF;
+    END IF;
+  END LOOP;
+  IF g->>'mode' = 'mode1' THEN
+    IF g ? 'mode2_contract_id' OR g ? 'mode2_contract_hash' THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE = '22023'; END IF;
+  ELSE
+    IF NOT(g ?& ARRAY['mode2_contract_id','mode2_contract_hash']) OR g->>'mode2_contract_id' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR g->>'mode2_contract_hash' !~ '^[a-f0-9]{64}$'
+    THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE='22023'; END IF;
+    SELECT r.* INTO artifact FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='mode2_reviewer' AND m.revoked_at IS NULL
+    JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type IN ('tenant_admin','clinician') AND approver.status='active' AND approver.deleted_at IS NULL
+    WHERE r.tenant_id=t.tenant_id AND r.artifact_id=(g->>'mode2_contract_id')::UUID AND r.kind='mode2_contract' AND r.status='approved' AND r.content_hash=g->>'mode2_contract_hash' AND (NOT r.development_only OR (g->>'development_only')::BOOLEAN);
+    IF NOT FOUND THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE='22023'; END IF;
+    artifact:=public.forms_require_approved_artifact(t.tenant_id,artifact.artifact_id,'mode2_contract',g->>'mode2_contract_hash',p_lock);
+    IF (artifact.development_only AND NOT (g->>'development_only')::BOOLEAN) OR artifact.content->'fields' IS DISTINCT FROM (SELECT jsonb_agg(jsonb_build_object('id',f->'id','type',f->'type','required',f->'required') ORDER BY f->>'id') FROM jsonb_array_elements(t.presentation_content->'fields') f)
+    THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE = '22023'; END IF;
+  END IF;
+  PERFORM public.forms_live_actor('reviewer');
+END $$;
+ALTER FUNCTION public.forms_assert_publication_contract(public.forms_template,BOOLEAN) OWNER TO forms_publication_owner;
+REVOKE ALL ON FUNCTION public.forms_assert_publication_contract(public.forms_template,BOOLEAN) FROM PUBLIC;
+
 CREATE FUNCTION public.forms_enforce_publication() RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
-DECLARE a JSONB; hash TEXT; g JSONB; el JSONB; artifact public.forms_governance_artifact; l3 JSONB; rule JSONB; field JSONB;
+DECLARE a JSONB; hash TEXT; g JSONB;
 BEGIN
   IF OLD.status <> 'draft' AND (
     NEW.presentation_content IS DISTINCT FROM OLD.presentation_content OR NEW.branching_logic IS DISTINCT FROM OLD.branching_logic
@@ -196,65 +312,12 @@ BEGIN
   IF OLD.status <> 'draft' OR OLD.deleted_at IS NOT NULL OR NEW.deleted_at IS NOT NULL THEN RAISE EXCEPTION 'forms_version_not_draft' USING ERRCODE = '22023'; END IF;
   a := public.forms_live_actor('reviewer');
   IF a->>'tenant_id' IS DISTINCT FROM NEW.tenant_id OR a->>'country_of_care' IS DISTINCT FROM NEW.country_of_care THEN RAISE EXCEPTION 'forms_scope_unavailable' USING ERRCODE = '42501'; END IF;
-  -- Every care-affecting construct is either explicitly typed below or rejected.
-  -- All six I-030 categories therefore have no external research-state dependency.
-  IF lower(jsonb_build_array(NEW.presentation_content,NEW.branching_logic,NEW.eligibility_logic,NEW.approval_governance)::TEXT) ~ 'research[_ .-]*consent|research[_ .-]*status' THEN RAISE EXCEPTION 'forms_research_dependency' USING ERRCODE = '22023'; END IF;
-  PERFORM public.forms_validate_presentation(NEW.presentation_content,NEW.country_of_care);
-  IF NEW.branching_logic NOT IN ('{}'::JSONB,'{"rules":[],"computed_fields":[]}'::JSONB) THEN RAISE EXCEPTION 'forms_unsupported_branching' USING ERRCODE = '22023'; END IF;
-  g := NEW.approval_governance;
-  PERFORM public.forms_require_keys(g,ARRAY['mode','mode2_contract_id','mode2_contract_hash','development_only'],ARRAY['mode','development_only']);
-  IF jsonb_typeof(g->'development_only') IS DISTINCT FROM 'boolean' OR g->>'mode' NOT IN ('mode1','mode2') THEN RAISE EXCEPTION 'forms_governance_invalid' USING ERRCODE = '22023'; END IF;
-  IF NEW.presentation_content->>'kind' = 'general_consult' AND (
-    NEW.eligibility_logic NOT IN ('{}'::JSONB,'{"eligibility_rules":[],"contraindications":[]}'::JSONB)
-    OR g->>'mode' <> 'mode1' OR jsonb_array_length(NEW.presentation_content->'elements') <> 0
-  ) THEN RAISE EXCEPTION 'forms_general_contract_invalid' USING ERRCODE = '22023'; END IF;
-  hash := public.forms_template_hash(NEW);
-  IF NEW.eligibility_logic NOT IN ('{}'::JSONB,'{"eligibility_rules":[],"contraindications":[]}'::JSONB) THEN
-    l3 := NEW.eligibility_logic;
-    PERFORM public.forms_require_keys(l3,ARRAY['eligibility_rules','contraindications'],ARRAY['eligibility_rules','contraindications']);
-    IF l3->'contraindications' <> '[]'::JSONB OR jsonb_typeof(l3->'eligibility_rules') IS DISTINCT FROM 'array' OR jsonb_array_length(l3->'eligibility_rules') NOT BETWEEN 1 AND 64 THEN RAISE EXCEPTION 'forms_eligibility_invalid' USING ERRCODE = '22023'; END IF;
-    FOR rule IN SELECT * FROM jsonb_array_elements(l3->'eligibility_rules') LOOP
-      PERFORM public.forms_require_keys(rule,ARRAY['field_id','operator','value','outcome'],ARRAY['field_id','operator','value','outcome']);
-      SELECT f INTO field FROM jsonb_array_elements(NEW.presentation_content->'fields') f WHERE f->>'id' = rule->>'field_id';
-      IF field IS NULL OR rule->>'outcome' IS DISTINCT FROM 'clinical_review_required' OR rule->>'operator' NOT IN ('equals','lt','gt')
-        OR (rule->>'operator' IN ('lt','gt') AND (field->>'type' <> 'number' OR jsonb_typeof(rule->'value') <> 'number'))
-      THEN RAISE EXCEPTION 'forms_eligibility_invalid' USING ERRCODE = '22023'; END IF;
-      IF rule->>'operator'='equals' AND NOT (
-        (field->>'type'='text' AND public.forms_safe_text(rule->'value',(field->>'max_length')::INTEGER)) OR
-        (field->>'type'='boolean' AND jsonb_typeof(rule->'value')='boolean') OR
-        (field->>'type'='number' AND jsonb_typeof(rule->'value')='number') OR
-        (field->>'type'='select' AND EXISTS(SELECT 1 FROM jsonb_array_elements(field->'options') o WHERE o->'value'=rule->'value'))
-      ) THEN RAISE EXCEPTION 'forms_eligibility_invalid' USING ERRCODE='22023'; END IF;
-    END LOOP;
-    IF NOT EXISTS (SELECT 1 FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='clinical_reviewer' AND m.revoked_at IS NULL
-      JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type='clinician' AND approver.status='active' AND approver.deleted_at IS NULL
-      WHERE r.tenant_id=NEW.tenant_id AND r.template_id=NEW.template_id AND r.kind='clinical_review' AND r.status='approved'
-      AND r.content_hash=hash AND r.author_id=NEW.created_by AND r.reviewer_id<>NEW.created_by AND r.development_only=(g->>'development_only')::BOOLEAN)
-    THEN RAISE EXCEPTION 'forms_independent_clinical_approval_required' USING ERRCODE = '22023'; END IF;
-  END IF;
-  FOR el IN SELECT * FROM jsonb_array_elements(NEW.presentation_content->'elements') LOOP
-    IF el->>'copy_classification' = 'molecule_level' THEN
-      SELECT r.* INTO artifact FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='marketing_reviewer' AND m.revoked_at IS NULL
-      JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type IN ('tenant_admin','clinician') AND approver.status='active' AND approver.deleted_at IS NULL
-      WHERE r.tenant_id=NEW.tenant_id AND r.artifact_id=(el->>'marketing_copy_id')::UUID AND r.kind='marketing_copy' AND r.status='approved' AND r.content_hash=el->>'content_hash' AND r.content->>'country_of_care'=NEW.country_of_care AND (NOT r.development_only OR (g->>'development_only')::BOOLEAN);
-      IF NOT FOUND THEN RAISE EXCEPTION 'forms_approved_marketing_copy_required' USING ERRCODE = '22023'; END IF;
-    END IF;
-  END LOOP;
-  IF g->>'mode' = 'mode1' THEN
-    IF g ? 'mode2_contract_id' OR g ? 'mode2_contract_hash' THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE = '22023'; END IF;
-  ELSE
-    IF NOT(g ?& ARRAY['mode2_contract_id','mode2_contract_hash']) OR g->>'mode2_contract_id' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR g->>'mode2_contract_hash' !~ '^[a-f0-9]{64}$'
-    THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE='22023'; END IF;
-    SELECT r.* INTO artifact FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='mode2_reviewer' AND m.revoked_at IS NULL
-    JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type IN ('tenant_admin','clinician') AND approver.status='active' AND approver.deleted_at IS NULL
-    WHERE r.tenant_id=NEW.tenant_id AND r.artifact_id=(g->>'mode2_contract_id')::UUID AND r.kind='mode2_contract' AND r.status='approved' AND r.content_hash=g->>'mode2_contract_hash' AND (NOT r.development_only OR (g->>'development_only')::BOOLEAN);
-    IF NOT FOUND OR artifact.content->'fields' IS DISTINCT FROM (SELECT jsonb_agg(jsonb_build_object('id',f->'id','type',f->'type','required',f->'required') ORDER BY f->>'id') FROM jsonb_array_elements(NEW.presentation_content->'fields') f)
-    THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE = '22023'; END IF;
-  END IF;
-  PERFORM public.forms_live_actor('reviewer');
+  PERFORM public.forms_assert_publication_contract(NEW,false);
+  hash:=public.forms_template_hash(NEW);
+  g:=NEW.approval_governance;
   INSERT INTO public.forms_published_definition(tenant_id,template_id,template_version,schema_hash,presentation,governance,published_by)
     VALUES(NEW.tenant_id,NEW.template_id,NEW.template_version,hash,NEW.presentation_content,g,a->>'account_id');
-  PERFORM public.forms_live_actor('reviewer');
+  PERFORM public.forms_assert_publication_contract(NEW,false);
   NEW.research_consent_static_analysis_status := 'pass';
   NEW.published_at := clock_timestamp();
   RETURN NEW;
