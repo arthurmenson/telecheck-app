@@ -143,6 +143,7 @@ const TENANT_SCOPED_TABLES = [
   'consult_lifecycle_transition', // migration 056 — Async Consult slice
   'consult_review_claim', // migration 056 — Async Consult slice
   'consults',
+  'crisis_care_admission', // migration094 — private patient-owned detection/retry metadata
   'crisis_event', // migration 033 — Crisis Response slice
   'crisis_event_lifecycle_transition', // migration 033 — Crisis Response slice
   'crisis_sweep_execution', // migration 033 — Crisis Response slice

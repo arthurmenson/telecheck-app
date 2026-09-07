@@ -1,6 +1,9 @@
 /** Fresh isolated synthetic consent verification; never a deployment seeder. */
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { copyFile, mkdtemp, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { applyMigrations } from './migrate.mjs';
@@ -25,11 +28,24 @@ try {
   if (!(await setup.query("SELECT 1 FROM pg_roles WHERE rolname='telecheck_app_role'")).rowCount)
     await setup.query('CREATE ROLE telecheck_app_role NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT');
   const directory = fileURLToPath(new URL('../migrations/', import.meta.url));
+  // Exercise destructive empty rollback before dependent migrations exist.
+  // Copy the canonical bytes into a temporary prefix; never alter the source
+  // inventory or run 093 down underneath the current full schema.
+  const prefix = await mkdtemp(join(tmpdir(), 'telecheck-consent-prefix-'));
+  try {
+    for (const name of await readdir(directory)) {
+      if (/^\d{3}_[a-zA-Z0-9_-]+\.sql$/.test(name) && name <= '093_care_consent_publication.sql')
+        await copyFile(join(directory, name), join(prefix, name));
+    }
+    console.log('Consent isolated prefix', await applyMigrations(setup, prefix));
+    await verifyCareConsentRollback(setup, false, prefix);
+  } finally {
+    await rm(prefix, { recursive: true, force: true });
+  }
   console.log('Consent complete chain', await applyMigrations(setup, directory));
   const replay = await applyMigrations(setup, directory);
   assert.equal(replay.applied, 0);
   console.log('Consent replay', replay);
-  await verifyCareConsentRollback(setup, false);
   for (const role of ['telecheck_app_role', 'identity_service_role', 'bind_actor_context_role']) {
     const password = randomBytes(32).toString('hex');
     const statement = await setup.query(
