@@ -113,6 +113,7 @@ type CategoryAAction =
 
 /** Category B — Governance and configuration actions */
 type CategoryBAction =
+  | 'billing.price_published'
   | 'protocol_activated'
   | 'protocol_deactivated'
   | 'guardrail_template_deployed'
@@ -154,6 +155,7 @@ type CategoryCAction =
   | 'patient_identity_verified'
   | 'consent_granted'
   | 'consent_revoked'
+  | 'consent_choice_recorded'
   | 'delegation_setup'
   | 'delegation_revoked'
   | 'message_sent'
@@ -169,6 +171,7 @@ type CategoryCAction =
   | 'community_moderation_action'
   | 'notification_sent'
   | 'payment_processed'
+  | 'billing.payment_intent_reserved'
   | 'payment_failed'
   | 'delivery_status_updated'
   | 'rpm_metric_submitted'

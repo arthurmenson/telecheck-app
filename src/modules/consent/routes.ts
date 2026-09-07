@@ -1,10 +1,9 @@
 /**
  * consent/routes.ts — Fastify route registration for the Consent module.
  *
- * Currently registers only a /health probe; the full route surface
- * (POST /consents, POST /consents/:id/revoke, POST /delegations,
- * POST /delegations/:id/{accept,decline}, etc.) lands in subsequent
- * commits with handler implementations.
+ * Registers published care-policy governance, own-patient consent choices,
+ * bounded history/status and withdrawal. The older client-evidence contract
+ * is explicitly retired. Delegation retains its separate existing surface.
  *
  * Spec references:
  *   - Consent Slice PRD v1.0 (full route surface defined per slice spec)
@@ -13,6 +12,8 @@
 
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
+import { registerCareConsentPatientRoutes } from './internal/handlers/care-consents.js';
+import { registerCarePolicyRoutes } from './internal/handlers/care-policies.js';
 import {
   getMyConsentHistoryHandler,
   grantConsentHandler,
@@ -33,6 +34,8 @@ import {
 export const registerConsentRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
+  registerCarePolicyRoutes(app);
+  registerCareConsentPatientRoutes(app);
   /**
    * Module health probe — module-scoped equivalent of the platform-level
    * /health. Bypasses tenant resolution via the app.ts allowlist entry.

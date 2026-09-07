@@ -54,6 +54,19 @@ export {
 
 export type { GrantConsentInput, RevokeConsentInput } from './internal/services/consent-service.js';
 
+// Published-policy patient operations require a caller-owned transaction with
+// its trusted tenant and live request nonce already bound. They authorize only
+// that patient. They do not grant clinician or background-worker access.
+export {
+  resolveCareConsentInTransaction as resolveCareConsentForPatient,
+  getCareConsentStatus,
+} from './internal/services/care-consent.js';
+export type { CareConsentPatientContext } from './internal/services/care-consent.js';
+export type {
+  CarePolicyProposal,
+  CarePolicyTerm,
+} from './internal/services/care-policy-contract.js';
+
 // ---------------------------------------------------------------------------
 // Delegation service
 // ---------------------------------------------------------------------------

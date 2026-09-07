@@ -882,6 +882,10 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
     const method = request.method.toUpperCase();
     const url = request.url;
 
+    // Provider event IDs/signatures are the webhook idempotency contract.
+    // Matched server route metadata also covers encoded/absolute URL variants.
+    if (request.routeOptions.config.billingBoundary === 'webhook') return;
+
     // Check exemptions
     if (isExempt(method, url)) return;
     const normalizedPath = url.split('?')[0] ?? '';
@@ -905,6 +909,9 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
     // Matched route metadata is server-owned, including encoded URL variants.
     // Identity replays only from its private cache after endpoint authorization.
     if (request.routeOptions.url?.startsWith('/v0/identity/')) return;
+    // Billing authorizes against a live account/session before private durable
+    // reservation or replay. The consult handler owns its safe response cache.
+    if (request.routeOptions.config.billingBoundary === 'patient') return;
 
     // Extract tenant and actor from request context
     const tenantId = request.tenantContext?.tenantId ?? 'unknown';

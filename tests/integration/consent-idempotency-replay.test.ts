@@ -1,36 +1,8 @@
 /**
- * Consent slice — idempotency replay regression for /v0/consent endpoints.
- *
- * The generic idempotency-http.test.ts proves the plugin works against
- * /v0/forms/templates. This file extends that coverage to the consent
- * slice's mutating endpoints — proving same-key-same-body returns the
- * cached response WITHOUT re-running the handler (no second consent row,
- * no duplicate audit emission), and same-key-different-body returns 409
- * `internal.idempotency.body_mismatch`.
- *
- * Discrimination strategy:
- *   The consent table is append-only per Slice PRD §7.1, so a duplicate
- *   handler-run would write a SECOND `granted` row with a different
- *   consent_id but the same (tenant, account, consent_type, version)
- *   tuple. Counting consent rows with that tuple is the canonical "did
- *   the handler run twice" probe — the audit table is parallel evidence
- *   (a duplicate run emits a second `consent_granted` audit record).
- *
- * Coverage in this file (1 section, 3 cases):
- *   §1a POST /consents replay — same key + same body returns cached
- *       response; consent table has exactly 1 row; audit has exactly 1
- *       consent_granted emission for that consent_id
- *   §1b POST /consents body mismatch — same key + different body returns
- *       409 internal.idempotency.body_mismatch with tenant-blind envelope
- *   §1c POST /delegations replay — same key + same body returns cached
- *       delegation_id; delegations table has exactly 1 matching row
- *
- * Spec references:
- *   - IDEMPOTENCY v5.1 (key format, 4-tuple PK, body-hash check)
- *   - I-003 (audit append-only; cached response replay must NOT re-emit)
- *   - I-025 (tenant-blind error envelopes — verified on the 409 body
- *     mismatch path)
- *   - Consent Slice PRD v1.0 §7.1 (append-only consent history)
+ * Retired consent routes cannot create or replay caller-authored grants.
+ * Versioned-policy replay/conflict acceptance is covered with actual HTTP
+ * and restricted database logins in scripts/verify-care-consent.mjs.
+ * Existing delegation replay remains independently verified below.
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -162,123 +134,48 @@ async function createPatient(): Promise<string> {
 // §1 — Idempotency replay regression for /v0/consent
 // ---------------------------------------------------------------------------
 
-describe('consent slice — §1 idempotency replay', () => {
-  it('§1a POST /consents replay returns cached response + no duplicate row + no duplicate audit', async () => {
-    const { accessToken, accountId } = await loginAndGetToken();
-    const versionId = await seedConsentVersion();
-    const idempotencyKey = ulid();
-    const payload = {
-      consent_type: 'platform' as const,
-      consent_version_id: versionId,
-      evidence: { timestamp: new Date().toISOString(), type: 'in_app' as const, device_id: 'd_1a' },
-    };
-
-    // First call — real handler runs, consent row + audit emitted.
-    const first = await app!.inject({
-      method: 'POST',
-      url: '/v0/consent/consents',
-      headers: {
-        host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
-        'idempotency-key': idempotencyKey,
-      },
-      payload,
-    });
-    expect(first.statusCode).toBe(201);
-    const firstBody = first.json<{ consent_id: string }>();
-    expect(firstBody.consent_id).toBeTruthy();
-
-    // Second call with identical key + body — must replay the cached
-    // response without re-running the handler. consent_id must match.
-    const second = await app!.inject({
-      method: 'POST',
-      url: '/v0/consent/consents',
-      headers: {
-        host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
-        'idempotency-key': idempotencyKey,
-      },
-      payload,
-    });
-    expect(second.statusCode).toBe(201);
-    const secondBody = second.json<{ consent_id: string }>();
-    expect(secondBody.consent_id).toBe(firstBody.consent_id);
-
-    // Side-effect probe: exactly ONE consent row for this account+version.
-    // The consent table is append-only (Slice PRD §7.1) — a duplicate
-    // handler-run would write a SECOND `granted` row with a different
-    // consent_id, which this query would catch. Wrapped in withTenantContext
-    // because the test client's tenant binding from earlier
-    // withTenantContext calls in loginAndGetToken may have been rolled back
-    // or expired before reaching this assertion (the binding is stored in
-    // a tx-scoped row in _session_tenant_context per migration 003).
-    const consentCount = await withTenantContext(T_US, async () => {
-      const r = await getTestClient().query<{ c: string }>(
-        `SELECT COUNT(*)::text AS c FROM consent
-           WHERE tenant_id = $1 AND account_id = $2 AND consent_version_id = $3`,
-        [T_US, accountId, versionId],
+describe('consent route retirement and delegation replay', () => {
+  for (const changedBody of [false, true]) {
+    it(`legacy consent requests remain retired with changedBody=${changedBody}`, async () => {
+      const { accessToken, accountId } = await loginAndGetToken();
+      const versionId = await seedConsentVersion();
+      const idempotencyKey = ulid();
+      const payload = {
+        consent_type: 'platform',
+        consent_version_id: versionId,
+        evidence: { timestamp: new Date().toISOString(), type: 'in_app', device_id: 'original' },
+      };
+      for (const retry of [false, true]) {
+        const response = await app!.inject({
+          method: 'POST',
+          url: '/v0/consent/consents',
+          headers: {
+            host: 'localhost',
+            authorization: `Bearer ${accessToken}`,
+            'idempotency-key': idempotencyKey,
+          },
+          payload:
+            retry && changedBody
+              ? { ...payload, evidence: { ...payload.evidence, device_id: 'changed' } }
+              : payload,
+        });
+        expect(response.statusCode).toBe(410);
+        expect(response.json().error.code).toBe('consent.versioned_policy_required');
+        expect(response.headers['cache-control']).toBe('no-store');
+        expect(response.body).not.toContain('Telecheck-US');
+        expect(response.body).not.toContain('Heros Health');
+      }
+      const counts = await withTenantContext(T_US, () =>
+        getTestClient().query<{ grants: number; audits: number }>(
+          `SELECT
+           (SELECT count(*)::int FROM consent WHERE tenant_id=$1 AND account_id=$2 AND consent_version_id=$3) AS grants,
+           (SELECT count(*)::int FROM audit_records WHERE tenant_id=$1 AND actor_id=$2 AND action='consent_granted') AS audits`,
+          [T_US, accountId, versionId],
+        ),
       );
-      return Number.parseInt(r.rows[0]!.c, 10);
+      expect(counts.rows[0]).toEqual({ grants: 0, audits: 0 });
     });
-    expect(consentCount).toBe(1);
-
-    // Parallel audit-side probe: exactly ONE consent_granted audit for
-    // this consent_id. A re-run handler would emit a second audit row.
-    const auditCount = await withTenantContext(T_US, async () => {
-      const r = await getTestClient().query<{ c: string }>(
-        `SELECT COUNT(*)::text AS c FROM audit_records
-           WHERE tenant_id = $1 AND action = 'consent_granted' AND resource_id = $2`,
-        [T_US, firstBody.consent_id],
-      );
-      return Number.parseInt(r.rows[0]!.c, 10);
-    });
-    expect(auditCount).toBe(1);
-  });
-
-  it('§1b POST /consents same key + different body returns 409 tenant-blind', async () => {
-    const { accessToken } = await loginAndGetToken();
-    const versionId = await seedConsentVersion();
-    const idempotencyKey = ulid();
-    const firstPayload = {
-      consent_type: 'platform' as const,
-      consent_version_id: versionId,
-      evidence: { timestamp: new Date().toISOString(), type: 'in_app' as const },
-    };
-
-    const first = await app!.inject({
-      method: 'POST',
-      url: '/v0/consent/consents',
-      headers: {
-        host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
-        'idempotency-key': idempotencyKey,
-      },
-      payload: firstPayload,
-    });
-    expect(first.statusCode).toBe(201);
-
-    // Second call with same key but DIFFERENT evidence.device_id (different
-    // body hash). Must return 409 internal.idempotency.body_mismatch.
-    const second = await app!.inject({
-      method: 'POST',
-      url: '/v0/consent/consents',
-      headers: {
-        host: 'localhost',
-        authorization: `Bearer ${accessToken}`,
-        'idempotency-key': idempotencyKey,
-      },
-      payload: {
-        ...firstPayload,
-        evidence: { ...firstPayload.evidence, device_id: 'different' },
-      },
-    });
-    expect(second.statusCode).toBe(409);
-    const body = second.json<{ error?: { code?: string } }>();
-    expect(body.error?.code).toBe('internal.idempotency.body_mismatch');
-    // I-025 tenant-blindness on the conflict envelope
-    expect(second.body).not.toContain('Telecheck-US');
-    expect(second.body).not.toContain('Heros Health');
-  });
+  }
 
   it('§1c POST /delegations replay returns cached delegation_id + no duplicate row', async () => {
     const { accessToken } = await loginAndGetToken();
