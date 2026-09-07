@@ -129,6 +129,10 @@ const TENANT_SCOPED_TABLES = [
   'billing_refund_intent', // migration 088 — reserved refund ledger; execution not enabled
   'ccr_configs',
   'consent',
+  'consent_care_decision', // migration093 — own-patient affirmative/declined choices
+  'consent_care_membership', // migration093 — explicit publication capabilities
+  'consent_care_policy', // migration093 — immutable reviewed publication
+  'consent_care_policy_term', // migration093 — exact canonical version/scope binding
   'consent_versions',
   'consult', // migration 056 — Async Consult slice (SI-020 / P-038)
   'consult_clinical_summary', // migration 056 — Async Consult slice
