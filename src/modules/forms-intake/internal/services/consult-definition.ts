@@ -9,6 +9,7 @@ import { withTenantContext } from '../../../../lib/rls.js';
 // eslint-disable-next-line no-control-regex
 const forbiddenControls = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u;
 const id = z.string().regex(/^[a-z][a-z0-9_]{0,63}$/);
+// Publication SQL uses the same UTF-16 unit count, including supplementary text.
 const safeText = (max: number) =>
   z
     .string()

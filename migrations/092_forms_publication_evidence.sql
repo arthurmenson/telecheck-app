@@ -24,6 +24,7 @@ BEGIN
   SELECT jsonb_build_object('template_id',template_id,'schema_hash',schema_hash,'template_version',template_version,'governance',governance)
   INTO result FROM public.forms_published_definition WHERE tenant_id=a->>'tenant_id' AND template_id=p_id;
   IF result IS NULL THEN RAISE EXCEPTION 'forms_definition_unavailable' USING ERRCODE='02000'; END IF;
+  PERFORM public.forms_live_actor('reviewer');
   RETURN result;
 END $$;
 ALTER FUNCTION public.forms_publication_receipt(TEXT) OWNER TO forms_publication_owner;
@@ -54,7 +55,7 @@ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.forms_require
 -- Keep its existing audited lifecycle and idempotency sequence, replacing only
 -- the publishing UPDATE and adding live explicit reviewer membership up front.
 DO $$
-DECLARE body TEXT;
+DECLARE body TEXT; marker TEXT;
 BEGIN
   body:=pg_get_functiondef('public.record_forms_template_admin_decision(text,uuid,text,jsonb,text)'::regprocedure);
   body:=replace(body,'SET search_path TO ''pg_catalog'', ''public''','SET search_path TO ''pg_catalog'', ''public'', ''pg_temp''');
@@ -64,6 +65,21 @@ BEGIN
   body:=replace(body,'UPDATE forms_template SET status = ''published'''||chr(10)||'         WHERE tenant_id = p_tenant_id AND template_id = v_review_forms_template_id;',
     'PERFORM public.forms_publish_template(v_review_forms_template_id);');
   IF position('PERFORM public.forms_publish_template(v_review_forms_template_id);' IN body)=0 THEN RAISE EXCEPTION 'forms_admin_wrapper_shape_changed'; END IF;
+  -- Both the explicit replay RETURN and implicit VOID return are SQL boundaries.
+  -- Preserve FOUND consumers; recheck before and after every possible write.
+  FOREACH marker IN ARRAY ARRAY[
+    '    PERFORM pg_advisory_xact_lock(',
+    '    PERFORM 1 FROM forms_template_admin_review',
+    '    -- R2 MED-1 idempotency check (under lock).',
+    '            RETURN;  -- idempotent replay',
+    '    IF v_latest_state IS DISTINCT FROM ''pending_review'' THEN',
+    '    PERFORM record_forms_template_admin_review_transition(',
+    '    IF p_decision = ''approve'' THEN',
+    '    -- admin.template_review_decision Cat A audit emission DEFERRED to'
+  ] LOOP
+    IF position(marker IN body)=0 THEN RAISE EXCEPTION 'forms_decision_wrapper_shape_changed'; END IF;
+    body:=replace(body,marker,'    PERFORM public.forms_live_actor(''reviewer'');'||chr(10)||marker);
+  END LOOP;
   EXECUTE body;
 END $$;
 GRANT EXECUTE ON FUNCTION public.forms_live_actor(TEXT),public.forms_publish_template(TEXT) TO forms_template_admin_review_decision_wrapper_owner;
@@ -82,6 +98,7 @@ BEGIN
   WHERE r.tenant_id=a->>'tenant_id' AND r.review_id=p_review AND r.submitter_principal_id=a->>'account_id'
   ORDER BY l.transition_at DESC,l.id DESC LIMIT 1;
   IF reason IS NULL THEN RAISE EXCEPTION 'forms_review_unavailable' USING ERRCODE='42501'; END IF;
+  PERFORM public.forms_live_actor('operator');
   RETURN reason;
 END $$;
 ALTER FUNCTION public.forms_admin_submission_receipt(UUID) OWNER TO forms_publication_owner;

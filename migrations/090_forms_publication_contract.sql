@@ -68,6 +68,9 @@ BEGIN
   IF current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'forms_auth_unavailable' USING ERRCODE = '42501';
   END IF;
+  -- Take the capability relation lock before resolving identity. Otherwise a
+  -- membership read could block after KMS checked session/nonce expiry.
+  IF p_capability IS NOT NULL THEN LOCK TABLE public.forms_governance_membership IN ACCESS SHARE MODE; END IF;
   BEGIN SELECT * INTO STRICT a FROM public.kms_current_actor_context();
   EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'forms_auth_unavailable' USING ERRCODE = '42501'; END;
   IF p_capability='clinical_reviewer' AND a.actor_role<>'clinician' THEN RAISE EXCEPTION 'forms_scope_unavailable' USING ERRCODE='42501'; END IF;
@@ -75,6 +78,12 @@ BEGIN
     SELECT 1 FROM public.forms_governance_membership m WHERE m.tenant_id = a.tenant_id
     AND m.account_id = a.account_id AND m.capability = p_capability AND m.revoked_at IS NULL
   )) THEN RAISE EXCEPTION 'forms_scope_unavailable' USING ERRCODE = '42501'; END IF;
+  -- The first identity read and membership lookup hold their relation locks.
+  -- Refresh wall-clock identity after the capability read before returning it.
+  IF p_capability IS NOT NULL THEN
+    BEGIN SELECT * INTO STRICT a FROM public.kms_current_actor_context();
+    EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'forms_auth_unavailable' USING ERRCODE = '42501'; END;
+  END IF;
   RETURN jsonb_build_object('tenant_id',a.tenant_id,'account_id',a.account_id,'session_id',a.session_id,'actor_role',a.actor_role,'country_of_care',a.country_of_care);
 END $$;
 ALTER FUNCTION public.forms_live_actor(TEXT) OWNER TO forms_publication_owner;
@@ -93,7 +102,9 @@ GRANT EXECUTE ON FUNCTION public.forms_require_keys(JSONB,TEXT[],TEXT[]) TO form
 
 CREATE FUNCTION public.forms_safe_text(v JSONB, max_length INTEGER) RETURNS BOOLEAN
 LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, public, pg_temp AS $$
-  SELECT jsonb_typeof(v) = 'string' AND length(v #>> '{}') BETWEEN 1 AND max_length
+  -- Match JavaScript/Zod UTF-16 bounds: a supplementary code point uses two units.
+  SELECT jsonb_typeof(v) = 'string'
+    AND length(v #>> '{}') + regexp_count(v #>> '{}', U&'[\+010000-\+10FFFF]') BETWEEN 1 AND max_length
     AND (v #>> '{}') !~ '[<>\x00-\x08\x0B\x0C\x0E-\x1F]'
 $$;
 REVOKE ALL ON FUNCTION public.forms_safe_text(JSONB,INTEGER) FROM PUBLIC;
@@ -182,7 +193,7 @@ BEGIN
     OR NEW.status = 'draft'
   ) THEN RAISE EXCEPTION 'forms_published_immutable' USING ERRCODE = '22023'; END IF;
   IF NEW.status IS NOT DISTINCT FROM OLD.status OR NEW.status <> 'published' THEN RETURN NEW; END IF;
-  IF OLD.status <> 'draft' THEN RAISE EXCEPTION 'forms_version_not_draft' USING ERRCODE = '22023'; END IF;
+  IF OLD.status <> 'draft' OR OLD.deleted_at IS NOT NULL OR NEW.deleted_at IS NOT NULL THEN RAISE EXCEPTION 'forms_version_not_draft' USING ERRCODE = '22023'; END IF;
   a := public.forms_live_actor('reviewer');
   IF a->>'tenant_id' IS DISTINCT FROM NEW.tenant_id OR a->>'country_of_care' IS DISTINCT FROM NEW.country_of_care THEN RAISE EXCEPTION 'forms_scope_unavailable' USING ERRCODE = '42501'; END IF;
   -- Every care-affecting construct is either explicitly typed below or rejected.
@@ -240,8 +251,10 @@ BEGIN
     IF NOT FOUND OR artifact.content->'fields' IS DISTINCT FROM (SELECT jsonb_agg(jsonb_build_object('id',f->'id','type',f->'type','required',f->'required') ORDER BY f->>'id') FROM jsonb_array_elements(NEW.presentation_content->'fields') f)
     THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE = '22023'; END IF;
   END IF;
+  PERFORM public.forms_live_actor('reviewer');
   INSERT INTO public.forms_published_definition(tenant_id,template_id,template_version,schema_hash,presentation,governance,published_by)
     VALUES(NEW.tenant_id,NEW.template_id,NEW.template_version,hash,NEW.presentation_content,g,a->>'account_id');
+  PERFORM public.forms_live_actor('reviewer');
   NEW.research_consent_static_analysis_status := 'pass';
   NEW.published_at := clock_timestamp();
   RETURN NEW;

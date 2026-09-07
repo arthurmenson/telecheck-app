@@ -1,10 +1,24 @@
 import { describe, it, expect } from 'vitest';
 
+import { presentationTextBoundaries } from '../../../../../tests/helpers/forms-presentation-boundaries.js';
+
 import {
   ConsultPresentationSchema,
   validateAnswers,
   type ConsultPresentation,
 } from './consult-definition.js';
+
+describe('presentation Unicode bounds shared with SQL acceptance', () => {
+  for (const country of ['US', 'GH'] as const) {
+    for (const example of presentationTextBoundaries(country)) {
+      it(`${country} ${String(example.name)} accepts exactly ${example.limit} UTF-16 units: ${example.units}`, () => {
+        expect(ConsultPresentationSchema.safeParse(example.presentation).success).toBe(
+          example.valid,
+        );
+      });
+    }
+  }
+});
 
 const presentation: ConsultPresentation = {
   contract_version: 'consult_intake_v1',

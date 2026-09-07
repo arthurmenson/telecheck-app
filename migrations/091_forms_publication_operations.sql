@@ -24,7 +24,8 @@ RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pu
 DECLARE a JSONB; version INTEGER; result public.forms_template;
 BEGIN
   a := public.forms_live_actor('operator');
-  IF p_id !~ '^[0-9A-HJKMNP-TV-Z]{26}$' OR p_program !~ '^[0-9A-HJKMNP-TV-Z]{26}$' OR length(p_name) NOT BETWEEN 1 AND 200
+  IF p_id !~ '^[0-9A-HJKMNP-TV-Z]{26}$' OR p_program !~ '^[0-9A-HJKMNP-TV-Z]{26}$'
+    OR length(p_name)+regexp_count(p_name,U&'[\+010000-\+10FFFF]') NOT BETWEEN 1 AND 200
     OR octet_length(jsonb_build_array(p_presentation,p_branching,p_eligibility,p_governance)::TEXT)>65536
   THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE='22023'; END IF;
   PERFORM public.forms_validate_presentation(p_presentation,a->>'country_of_care');
@@ -33,6 +34,7 @@ BEGIN
   PERFORM public.forms_live_actor('operator');
   INSERT INTO public.forms_template(template_id,tenant_id,program_id,country_of_care,template_version,name,presentation_content,branching_logic,eligibility_logic,approval_governance,created_by)
   VALUES(p_id,a->>'tenant_id',p_program,a->>'country_of_care',version,p_name,p_presentation,p_branching,p_eligibility,p_governance,a->>'account_id') RETURNING * INTO result;
+  PERFORM public.forms_live_actor('operator');
   RETURN jsonb_build_object('template_id',result.template_id,'template_version',result.template_version,'schema_hash',public.forms_template_hash(result),'status',result.status);
 END $$;
 ALTER FUNCTION public.forms_create_consult_template(TEXT,TEXT,TEXT,JSONB,JSONB,JSONB,JSONB) OWNER TO forms_publication_owner;
@@ -46,12 +48,18 @@ BEGIN
   a := public.forms_live_actor('reviewer');
   SELECT * INTO target FROM public.forms_template WHERE tenant_id=a->>'tenant_id' AND template_id=p_id;
   IF NOT FOUND THEN RAISE EXCEPTION 'forms_version_unavailable' USING ERRCODE='02000'; END IF;
+  PERFORM public.forms_live_actor('reviewer');
   PERFORM pg_advisory_xact_lock(hashtextextended('forms-family:' || target.tenant_id || ':' || target.program_id,0));
   SELECT * INTO target FROM public.forms_template WHERE tenant_id=a->>'tenant_id' AND template_id=p_id FOR UPDATE;
-  IF target.status <> 'draft' THEN RAISE EXCEPTION 'forms_version_not_draft' USING ERRCODE='22023'; END IF;
+  IF NOT FOUND THEN RAISE EXCEPTION 'forms_version_unavailable' USING ERRCODE='02000'; END IF;
+  PERFORM public.forms_live_actor('reviewer');
+  IF target.status <> 'draft' OR target.deleted_at IS NOT NULL THEN RAISE EXCEPTION 'forms_version_not_draft' USING ERRCODE='22023'; END IF;
   SELECT template_id INTO prior FROM public.forms_template WHERE tenant_id=target.tenant_id AND program_id=target.program_id AND country_of_care=target.country_of_care AND status='published' ORDER BY template_version DESC LIMIT 1;
+  PERFORM public.forms_live_actor('reviewer');
   UPDATE public.forms_template SET status='superseded',superseded_at=clock_timestamp() WHERE tenant_id=target.tenant_id AND program_id=target.program_id AND country_of_care=target.country_of_care AND status='published';
+  PERFORM public.forms_live_actor('reviewer');
   UPDATE public.forms_template SET status='published' WHERE tenant_id=target.tenant_id AND template_id=target.template_id RETURNING * INTO target;
+  PERFORM public.forms_live_actor('reviewer');
   RETURN jsonb_build_object('published',to_jsonb(target),'prior_template_id',prior);
 END $$;
 ALTER FUNCTION public.forms_publish_template(TEXT) OWNER TO forms_publication_owner;
@@ -75,6 +83,7 @@ BEGIN
   PERFORM public.forms_live_actor('operator');
   INSERT INTO public.forms_deployment(deployment_id,tenant_id,template_id,program_id,deployed_by)
   VALUES(p_deployment,target.tenant_id,target.template_id,target.program_id,a->>'account_id');
+  PERFORM public.forms_live_actor('operator');
   RETURN jsonb_build_object('deployment_id',p_deployment,'template_id',p_id,'template_version',target.template_version);
 END $$;
 ALTER FUNCTION public.forms_deploy_consult_template(TEXT,TEXT) OWNER TO forms_publication_owner;
@@ -90,6 +99,7 @@ BEGIN
   IF NOT FOUND THEN RAISE EXCEPTION 'forms_definition_unavailable' USING ERRCODE='02000'; END IF;
   PERFORM public.forms_live_actor('operator');
   UPDATE public.forms_deployment SET retired_at=COALESCE(retired_at,clock_timestamp()),updated_at=clock_timestamp() WHERE tenant_id=d.tenant_id AND deployment_id=d.deployment_id;
+  PERFORM public.forms_live_actor('operator');
   RETURN jsonb_build_object('deployment_id',d.deployment_id,'template_id',d.template_id,'status','retired');
 END $$;
 ALTER FUNCTION public.forms_retire_consult_deployment(TEXT) OWNER TO forms_publication_owner;
@@ -129,7 +139,8 @@ BEGIN
   IF p_kind NOT IN ('clinical_review','marketing_copy','mode2_contract') OR p_development IS NULL OR octet_length(p_content::TEXT)>32768 THEN RAISE EXCEPTION 'forms_artifact_invalid' USING ERRCODE='22023'; END IF;
   IF p_kind='clinical_review' THEN
     SELECT * INTO t FROM public.forms_template WHERE tenant_id=a->>'tenant_id' AND template_id=p_template FOR SHARE;
-    IF NOT FOUND OR t.status<>'draft' OR t.created_by<>a->>'account_id' OR (t.approval_governance->>'development_only')::BOOLEAN IS DISTINCT FROM p_development THEN RAISE EXCEPTION 'forms_artifact_unavailable' USING ERRCODE='42501'; END IF;
+    IF NOT FOUND OR t.status<>'draft' OR t.deleted_at IS NOT NULL OR t.created_by<>a->>'account_id' OR (t.approval_governance->>'development_only')::BOOLEAN IS DISTINCT FROM p_development THEN RAISE EXCEPTION 'forms_artifact_unavailable' USING ERRCODE='42501'; END IF;
+    PERFORM public.forms_live_actor('operator');
     hash := public.forms_template_hash(t);
     content := jsonb_build_object('template_id',t.template_id,'template_version',t.template_version,'program_id',t.program_id,'country_of_care',t.country_of_care,'schema_hash',hash,'presentation',t.presentation_content,'branching_logic',t.branching_logic,'eligibility_logic',t.eligibility_logic,'approval_governance',t.approval_governance);
   ELSE
@@ -147,6 +158,7 @@ BEGIN
   PERFORM public.forms_live_actor('operator');
   INSERT INTO public.forms_governance_artifact(tenant_id,kind,template_id,content,content_hash,author_id,development_only)
   VALUES(a->>'tenant_id',p_kind,p_template,content,hash,a->>'account_id',p_development) RETURNING artifact_id INTO artifact;
+  PERFORM public.forms_live_actor('operator');
   RETURN jsonb_build_object('artifact_id',artifact,'content_hash',hash,'status','pending','development_only',p_development);
 END $$;
 ALTER FUNCTION public.forms_submit_governance_artifact(TEXT,TEXT,JSONB,BOOLEAN) OWNER TO forms_publication_owner;
@@ -164,10 +176,11 @@ BEGIN
   IF r.author_id=a->>'account_id' OR r.content_hash IS DISTINCT FROM p_hash OR r.status<>'pending' OR p_decision NOT IN ('approved','rejected') THEN RAISE EXCEPTION 'forms_review_invalid' USING ERRCODE='22023'; END IF;
   IF r.kind='clinical_review' THEN
     SELECT * INTO t FROM public.forms_template WHERE tenant_id=r.tenant_id AND template_id=r.template_id FOR SHARE;
-    IF NOT FOUND OR t.status<>'draft' OR public.forms_template_hash(t)<>r.content_hash THEN RAISE EXCEPTION 'forms_review_stale' USING ERRCODE='22023'; END IF;
+    IF NOT FOUND OR t.status<>'draft' OR t.deleted_at IS NOT NULL OR public.forms_template_hash(t)<>r.content_hash THEN RAISE EXCEPTION 'forms_review_stale' USING ERRCODE='22023'; END IF;
   END IF;
   PERFORM public.forms_live_actor(CASE r.kind WHEN 'clinical_review' THEN 'clinical_reviewer' WHEN 'marketing_copy' THEN 'marketing_reviewer' ELSE 'mode2_reviewer' END);
   UPDATE public.forms_governance_artifact SET status=p_decision,reviewer_id=a->>'account_id',reviewed_at=clock_timestamp() WHERE artifact_id=p_id;
+  PERFORM public.forms_live_actor(CASE r.kind WHEN 'clinical_review' THEN 'clinical_reviewer' WHEN 'marketing_copy' THEN 'marketing_reviewer' ELSE 'mode2_reviewer' END);
   RETURN jsonb_build_object('artifact_id',p_id,'content_hash',r.content_hash,'status',p_decision,'development_only',r.development_only);
 END $$;
 ALTER FUNCTION public.forms_review_governance_artifact(UUID,TEXT,TEXT) OWNER TO forms_publication_owner;
