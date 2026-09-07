@@ -1,7 +1,7 @@
 /**
  * Downstream async-consult HTTP regressions with real PostgreSQL, binder login,
  * slice roles, RLS and audit writes. Initiation uses an explicitly synthetic
- * paid fixture to preserve the existing intake/AI/queue/claim/decision/follow-up
+ * paid fixture and private historical intake fixture to preserve AI/queue/claim/decision/follow-up
  * coverage. This suite is not evidence of Billing, real providers, an encrypted
  * clinical intake journey, or a complete patient-to-clinician workflow.
  *
@@ -27,6 +27,7 @@ import { createAccount } from '../../src/modules/identity/internal/repositories/
 import { asAccountId, type AccountId } from '../../src/modules/identity/internal/types.ts';
 import { seedBilledConsultFixture } from '../helpers/billed-consult-fixture.ts';
 import { configureBindRole } from '../helpers/configure-bind-role.ts';
+import { seedLegacyConsultIntakeFixture } from '../helpers/legacy-consult-intake-fixture.ts';
 import { seedLiveSession } from '../helpers/live-session-fixtures.ts';
 import { TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 import { uniquePhone } from '../helpers/unique-phone.ts';
@@ -140,8 +141,10 @@ async function submitIntake(token: string, consultId: string): Promise<string> {
       intake_payload_envelope: makeEnvelope('intake'),
     },
   });
-  expect(res.statusCode).toBe(201);
-  return json<{ submission_id: string }>(res).submission_id;
+  // The protected patient boundary rejects these old caller-supplied envelopes.
+  // Seed the historical row explicitly to isolate the downstream regressions.
+  expect(res.statusCode).toBe(400);
+  return seedLegacyConsultIntakeFixture(token, consultId, templateId);
 }
 
 async function runAiPreparation(consultId: string, patientId: string): Promise<string> {

@@ -14,8 +14,8 @@
  *                                                  record_consult_initiation;
  *                                                  Cat C async_consult.initiated)
  *   POST /v1/async-consults/:consult_id/intake   — intake submission
- *                                                  (record_consult_intake_submission;
- *                                                  pre-encrypted KMS envelope;
+ *                                                  (care_append_intake;
+ *                                                  server-encrypted plaintext;
  *                                                  Cat C async_consult.intake_submitted)
  *   GET  /v1/async-consults/queue                — staff review queue
  *                                                  (async_consult_staff_summary_v;
@@ -77,6 +77,8 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import { aiPreparationV1Handler } from './internal/handlers/ai-preparation-v1.js';
+import { beginIntakeV1Handler } from './internal/handlers/begin-intake-v1.js';
+import { careProgressV1Handler } from './internal/handlers/care-progress-v1.js';
 import { claimConsultV1Handler } from './internal/handlers/claim-consult-v1.js';
 import {
   listFollowUpMessagesV1Handler,
@@ -90,7 +92,10 @@ import {
   recordDecisionV1Handler,
   requestAdditionalDataV1Handler,
 } from './internal/handlers/record-decision-v1.js';
-import { submitIntakeV1Handler } from './internal/handlers/submit-intake-v1.js';
+import {
+  admitCareIntakeV1Request,
+  submitIntakeV1Handler,
+} from './internal/handlers/submit-intake-v1.js';
 
 export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
   app: FastifyInstance,
@@ -103,7 +108,21 @@ export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
   app.post('/', { config: { billingBoundary: 'patient' } }, initiateConsultV1Handler);
   app.get('/', listConsultsV1Handler);
   app.get('/:consult_id', getConsultV1Handler);
-  app.post('/:consult_id/intake', submitIntakeV1Handler);
+  app.get('/:consult_id/care-progress', careProgressV1Handler);
+  app.post(
+    '/:consult_id/intake',
+    {
+      config: { careBoundary: 'patient' },
+      bodyLimit: 1_048_576,
+      preValidation: admitCareIntakeV1Request,
+    },
+    submitIntakeV1Handler,
+  );
+  app.post(
+    '/:consult_id/intake/begin',
+    { config: { careBoundary: 'patient' } },
+    beginIntakeV1Handler,
+  );
   app.post('/:consult_id/ai-preparation', aiPreparationV1Handler);
   app.post('/:consult_id/claim', claimConsultV1Handler);
   app.post('/:consult_id/decision', recordDecisionV1Handler);
@@ -111,3 +130,9 @@ export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
   app.post('/:consult_id/follow-up-messages', sendFollowUpMessageV1Handler);
   app.get('/:consult_id/follow-up-messages', listFollowUpMessagesV1Handler);
 };
+
+declare module 'fastify' {
+  interface FastifyContextConfig {
+    careBoundary?: 'patient';
+  }
+}

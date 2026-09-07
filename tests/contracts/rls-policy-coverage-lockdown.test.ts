@@ -140,6 +140,8 @@ const TENANT_SCOPED_TABLES = [
   'consult_events',
   'consult_follow_up_message', // migration 056 — Async Consult slice
   'consult_intake_submission', // migration 056 — Async Consult slice
+  'consult_care_binding', // migration095 — immutable reviewed definition binding
+  'consult_care_submission', // migration095 — protected submission admission proof
   'consult_lifecycle_transition', // migration 056 — Async Consult slice
   'consult_review_claim', // migration 056 — Async Consult slice
   'consults',

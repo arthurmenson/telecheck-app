@@ -1,0 +1,59 @@
+name: Protected intake isolated runtime
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/modules/async-consult/**'
+      - 'src/modules/crisis-response/**'
+      - 'src/modules/forms-intake/**'
+      - 'src/modules/consent/**'
+      - 'src/modules/billing/**'
+      - 'src/lib/**'
+      - 'migrations/**'
+      - 'scripts/verify-care-intake*.mjs'
+      - '.github/workflows/care-intake-runtime.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/modules/async-consult/**'
+      - 'src/modules/crisis-response/**'
+      - 'src/modules/forms-intake/**'
+      - 'src/modules/consent/**'
+      - 'src/modules/billing/**'
+      - 'src/lib/**'
+      - 'migrations/**'
+      - 'scripts/verify-care-intake*.mjs'
+      - '.github/workflows/care-intake-runtime.yml'
+permissions:
+  contents: read
+jobs:
+  care-intake-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        postgres: ['15-alpine', '16-alpine']
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: care_ci
+          POSTGRES_PASSWORD: synthetic-care-ci
+          POSTGRES_DB: telecheck_care_intake
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U care_ci -d telecheck_care_intake"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      NODE_ENV: test
+      CARE_SYNTHETIC_ACCEPTANCE: 'true'
+      MIGRATION_DATABASE_URL: postgres://care_ci:synthetic-care-ci@localhost:5432/telecheck_care_intake
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify published intake, crisis admission, protected persistence and live authority over real HTTP
+        run: node --import tsx scripts/verify-care-intake-ci.mjs
