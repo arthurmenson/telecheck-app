@@ -337,6 +337,77 @@ async function patientAuthorityWait(tenant, country, phase, fault, choices) {
   }
 }
 
+async function membershipAuthorizationWait(tenant, country, capability, fault) {
+  const who = await staff(tenant, country, [capability]);
+  const bound = await bindActorContextForRequest(binder, {
+    actorAccountId: who.accountId,
+    actorAccountTenantId: tenant,
+    actorRole: who.role,
+    actorAdminHomeTenantId: null,
+    sessionId: who.sessionId,
+  });
+  const blocker = new pg.Client({
+    connectionString: process.env.CONSENT_ACCEPTANCE_ADMIN_DATABASE_URL,
+  });
+  await blocker.connect();
+  await blocker.query('BEGIN');
+  await blocker.query('LOCK TABLE public.consent_care_membership IN ACCESS EXCLUSIVE MODE');
+  await ordinary.query('BEGIN');
+  await ordinary.query('SELECT public.set_tenant_context($1)', [tenant]);
+  await ordinary.query("SELECT set_config('app.request_nonce',$1,true)", [bound.nonce]);
+  await ordinary.query('SET LOCAL ROLE consent_care_operator');
+  const pid = (await ordinary.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+  const pending = ordinary
+    .query('SELECT public.consent_care_live_actor($1) AS actor', [capability])
+    .then(
+      () => 'accepted',
+      (error) => error.code,
+    );
+  try {
+    let waiting = false;
+    for (let i = 0; i < 80; i++) {
+      waiting = (
+        await control.query(
+          "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock') AS waiting",
+          [pid],
+        )
+      ).rows[0].waiting;
+      if (waiting) break;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    assert(waiting, 'authorization helper reached membership wait');
+    if (fault === 'session')
+      await control.query(
+        "UPDATE public.sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND session_id=$2",
+        [tenant, who.sessionId],
+      );
+    else if (fault === 'nonce')
+      await control.query(
+        "UPDATE public._session_actor_context SET expires_at=clock_timestamp()-interval '1 second' WHERE nonce=$1",
+        [bound.nonce],
+      );
+    else
+      await control.query(
+        "UPDATE public.accounts SET status='suspended',suspended_at=clock_timestamp() WHERE tenant_id=$1 AND account_id=$2",
+        [tenant, who.accountId],
+      );
+    await blocker.query('COMMIT');
+    assert.equal(
+      await pending,
+      'PT401',
+      `${country} ${capability} ${fault} lost during membership wait`,
+    );
+    console.log(
+      `PASS ${country} ${capability} helper denies ${fault} invalidation during membership wait`,
+    );
+  } finally {
+    await blocker.query('ROLLBACK').catch(() => {});
+    await pending;
+    await ordinary.query('ROLLBACK');
+    await blocker.end();
+  }
+}
+
 async function programAndVersionAcceptance(author, reviewer, body, generalChoices) {
   const { tenant, country } = author;
   const who = await staff(tenant, country, [], 'patient');
@@ -525,6 +596,9 @@ try {
     const reviewer = await staff(tenant, country, ['policy_reviewer']);
     const patient = await staff(tenant, country, [], 'patient');
     const body = policy(country, version);
+    for (const capability of ['policy_author', 'policy_reviewer'])
+      for (const fault of ['session', 'nonce', 'account'])
+        await membershipAuthorizationWait(tenant, country, capability, fault);
     await expectStatus(
       await call(patient, 'POST', root, body),
       403,
