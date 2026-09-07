@@ -102,11 +102,14 @@ GRANT USAGE ON SEQUENCE public.consent_care_decision_sequence_number_seq TO cons
 
 CREATE FUNCTION public.consent_care_live_actor(p_capability TEXT DEFAULT NULL) RETURNS JSONB
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
-DECLARE a RECORD;
+DECLARE a RECORD; refreshed RECORD;
 BEGIN
   IF current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'consent_authorization_unavailable' USING ERRCODE='PT503';
   END IF;
+  -- Acquire the capability relation before observing live identity. A cached
+  -- plan may otherwise wait here after taking the session/nonce snapshot.
+  IF p_capability IS NOT NULL THEN LOCK TABLE public.consent_care_membership IN ACCESS SHARE MODE; END IF;
   BEGIN SELECT * INTO STRICT a FROM public.kms_current_actor_context();
   EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'consent_unauthenticated' USING ERRCODE='PT401'; END;
   IF NOT EXISTS (SELECT 1 FROM public.accounts p WHERE p.tenant_id=a.tenant_id AND p.account_id=a.account_id AND p.country_of_care=a.country_of_care) THEN
@@ -118,6 +121,11 @@ BEGIN
     IF p_capability NOT IN ('policy_author','policy_reviewer') OR a.actor_role <> 'tenant_admin' OR NOT EXISTS (
       SELECT 1 FROM public.consent_care_membership m WHERE m.tenant_id=a.tenant_id AND m.account_id=a.account_id AND m.capability=p_capability AND m.revoked_at IS NULL
     ) THEN RAISE EXCEPTION 'consent_scope_unavailable' USING ERRCODE='42501'; END IF;
+  END IF;
+  BEGIN SELECT * INTO STRICT refreshed FROM public.kms_current_actor_context();
+  EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'consent_unauthenticated' USING ERRCODE='PT401'; END;
+  IF to_jsonb(refreshed) IS DISTINCT FROM to_jsonb(a) THEN
+    RAISE EXCEPTION 'consent_unauthenticated' USING ERRCODE='PT401';
   END IF;
   RETURN jsonb_build_object('tenant_id',a.tenant_id,'account_id',a.account_id,'session_id',a.session_id,'country_of_care',a.country_of_care,'actor_role',a.actor_role);
 END $$;
