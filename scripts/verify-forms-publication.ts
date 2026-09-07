@@ -13,6 +13,7 @@ import { ulid } from '../src/lib/ulid.js';
 
 import { verifyFormsApproverAuthority } from './verify-forms-approver-authority.js';
 import { verifyFormsBoundaries } from './verify-forms-boundaries.js';
+import { verifyFormsPrimitives } from './verify-forms-primitives.js';
 
 assert.equal(process.env['NODE_ENV'], 'development');
 const admin = new pg.Client({ connectionString: process.env['FORMS_MIGRATION_DATABASE_URL'] });
@@ -993,6 +994,7 @@ try {
     await verifyProtectedSqlSubmission(tenant);
     await verifyFormsBoundaries({ admin, ordinary, binder, app, actor, request }, tenant);
     await verifyFormsApproverAuthority({ admin, ordinary, binder, app, actor, request }, tenant);
+    await verifyFormsPrimitives({ admin, ordinary, binder, app, actor, request }, tenant);
     proofs.push(
       `${tenant}: real-role create/publish/deploy/resolve; operator/reviewer separation; app SQL/owner denial; missing evidence rollback; research gate; independent exact-hash clinical review and stale hash rejection; approved marketing copy and Mode2 contract matching; current staff role required for both content approvals and publication paths; SI023 shared gate; all four handler families deny membership/session/nonce invalidation during blocked cached replay; fresh mutation rolls back after outbox-wait revocation; 12 direct SQL submission cases deny membership/session/nonce invalidation across template/review/initial-transition/revision-transition waits and retain no writes; immutable superseded pin; cross-tenant denial; session/nonce expiry during a blocked read; emergency retirement; revoked session`,
     );
