@@ -109,9 +109,9 @@ export async function findLatestActivePasscode(
           AND email = $2
           AND purpose = $3
           AND consumed_at IS NULL
-          AND expires_at > NOW()
+          AND expires_at > clock_timestamp()
           AND attempts_remaining > 0
-          AND (locked_until IS NULL OR locked_until <= NOW())
+          AND (locked_until IS NULL OR locked_until <= clock_timestamp())
         ORDER BY created_at DESC
         LIMIT 1`,
       [tenantId, email, purpose],
@@ -139,7 +139,7 @@ export async function findActiveLockout(
           AND email = $2
           AND purpose = $3
           AND locked_until IS NOT NULL
-          AND locked_until > NOW()
+          AND locked_until > clock_timestamp()
         ORDER BY locked_until DESC
         LIMIT 1`,
       [tenantId, email, purpose],
@@ -164,7 +164,7 @@ export async function createPasscode(
           passcode_id, tenant_id, account_id, email, purpose,
           code_hash, attempts_remaining, created_at, expires_at
        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $8, NOW(), $7::timestamptz
+          $1, $2, $3, $4, $5, $6, $8, clock_timestamp(), $7::timestamptz
        )
        RETURNING ${PASSCODE_COLUMNS}`,
       [
@@ -200,18 +200,24 @@ export async function consumePasscode(
     : (fn: (c: DbClient) => Promise<EmailPasscode | null>) =>
         withTenantBoundConnection(tenantId, fn);
   return runner(async (client) => {
+    // Obtain the row lock before evaluating wall-clock validity. UPDATE's
+    // initial scan may precede a lock wait even when its WHERE uses clock_timestamp().
+    await client.query(
+      'SELECT passcode_id FROM email_passcodes WHERE tenant_id=$1 AND passcode_id=$2 FOR UPDATE',
+      [tenantId, passcodeId],
+    );
     // Atomic backstop for the lockout-bypass fix in findLatestActivePasscode:
     // even if a locked/exhausted row reached this call, it must not be
     // consumable (Codex round-8 HIGH). The WHERE mirrors the active predicate.
     const result = await client.query<PasscodeRow>(
       `UPDATE email_passcodes
-          SET consumed_at = NOW()
+          SET consumed_at = clock_timestamp()
         WHERE tenant_id = $1
           AND passcode_id = $2
           AND consumed_at IS NULL
-          AND expires_at > NOW()
+          AND expires_at > clock_timestamp()
           AND attempts_remaining > 0
-          AND (locked_until IS NULL OR locked_until <= NOW())
+          AND (locked_until IS NULL OR locked_until <= clock_timestamp())
        RETURNING ${PASSCODE_COLUMNS}`,
       [tenantId, passcodeId],
     );
@@ -230,18 +236,22 @@ export async function decrementAttempts(
     : (fn: (c: DbClient) => Promise<EmailPasscode | null>) =>
         withTenantBoundConnection(tenantId, fn);
   return runner(async (client) => {
+    await client.query(
+      'SELECT passcode_id FROM email_passcodes WHERE tenant_id=$1 AND passcode_id=$2 FOR UPDATE',
+      [tenantId, passcodeId],
+    );
     const result = await client.query<PasscodeRow>(
       `UPDATE email_passcodes
           SET attempts_remaining = attempts_remaining - 1,
               locked_until = CASE
                   WHEN attempts_remaining - 1 <= 0
-                      THEN NOW() + INTERVAL '15 minutes'
+                      THEN clock_timestamp() + INTERVAL '15 minutes'
                   ELSE locked_until
               END
         WHERE tenant_id = $1
           AND passcode_id = $2
           AND consumed_at IS NULL
-          AND expires_at > NOW()
+          AND expires_at > clock_timestamp()
           AND attempts_remaining > 0
        RETURNING ${PASSCODE_COLUMNS}`,
       [tenantId, passcodeId],

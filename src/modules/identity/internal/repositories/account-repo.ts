@@ -218,6 +218,23 @@ export async function findAccountByEmail(
   });
 }
 
+/** Serialize patient PIN checks and resets before either reads a credential. */
+export async function lockPatientAccountByEmail(
+  tenantId: TenantId,
+  email: string,
+  tx: DbTransaction,
+): Promise<Account | null> {
+  const result = await tx.query<AccountRow>(
+    `SELECT ${ACCOUNT_COLUMNS} FROM accounts
+      WHERE tenant_id=$1 AND lower(email)=lower($2) AND deleted_at IS NULL
+        AND status='active' AND account_type IN ('patient','delegate')
+      FOR UPDATE`,
+    [tenantId, email],
+  );
+  const row = result.rows[0];
+  return row === undefined ? null : rowToAccount(row);
+}
+
 // ---------------------------------------------------------------------------
 // createAccount — INSERT a fresh account row (lifecycle = pending_verification)
 // ---------------------------------------------------------------------------

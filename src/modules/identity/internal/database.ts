@@ -4,11 +4,16 @@ import pg from 'pg';
 
 import { config } from '../../../lib/config.js';
 import { getPool, hasTestPool, type DbClient } from '../../../lib/db.js';
-import type { IdempotencyCtx } from '../../../lib/idempotency.js';
+import { IdempotencyReplayError, type IdempotencyCtx } from '../../../lib/idempotency.js';
 import {
   withIdempotentExecution as sharedIdempotentExecution,
   type ServiceErrorMapper,
 } from '../../../lib/idempotent-handler.js';
+
+import {
+  assertPatientPinSessionReceipt,
+  PatientPinSessionUnavailable,
+} from './services/patient-pin-session-receipt.js';
 
 let pool: pg.Pool | null = null;
 
@@ -30,6 +35,10 @@ function identityPool(): pg.Pool {
     // Pool faults are handled by the operation's bounded failure; no credentials
     // or raw database errors are printed by an idle connection callback.
     pool.on('error', () => {});
+    // pg also emits an error directly on a checked-out client when its socket
+    // closes. Its query rejects into rollback/discard; the event must not crash
+    // the process or expose transport details before that safe response runs.
+    pool.on('connect', (client) => client.on('error', () => {}));
   }
   return pool;
 }
@@ -86,13 +95,45 @@ export function withIdempotentExecution<T>(
   reply: FastifyReply,
   mapError: ServiceErrorMapper,
   body: (tx: DbClient, context: IdempotencyCtx) => Promise<{ status: number; view: T }>,
+  afterCommit?: () => void,
 ): Promise<unknown> {
   return sharedIdempotentExecution(
     req,
     reply,
-    mapError,
+    (error, response, requestId) => {
+      if (!(error instanceof PatientPinSessionUnavailable))
+        return mapError(error, response, requestId);
+      void response.code(401).send({
+        error: {
+          code: 'internal.auth.unauthenticated',
+          message: 'Sign in again to continue.',
+          request_id: requestId,
+        },
+      });
+      return true;
+    },
     body,
-    withIdentityTransaction,
+    async (work) => {
+      const result = await withIdentityTransaction(async (tx) => {
+        try {
+          const result = await work(tx);
+          await assertPatientPinSessionReceipt(req, tx, result);
+          return result;
+        } catch (error) {
+          if (error instanceof IdempotencyReplayError) {
+            await assertPatientPinSessionReceipt(req, tx, {
+              status: error.cachedStatus,
+              body: error.cachedBody,
+            });
+          }
+          throw error;
+        }
+      });
+      // Only a successfully acknowledged COMMIT reaches this notification.
+      // Replays and mapped failures leave via the exception path above.
+      afterCommit?.();
+      return result;
+    },
     'identity_idempotency_keys',
   );
 }

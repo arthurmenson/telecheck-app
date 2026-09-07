@@ -360,6 +360,21 @@ export async function revokeSession(
 // Read paths — pure delegates (no audit on reads)
 // ---------------------------------------------------------------------------
 
+/** Revoke every previous session in the caller's account-locked PIN reset transaction. */
+export async function revokeSessionsAfterPinReset(
+  ctx: TenantContext,
+  accountId: AccountId,
+  tx: DbTransaction,
+): Promise<void> {
+  const sessions = await sessionRepo.listActiveSessionsForAccount(ctx.tenantId, accountId, tx);
+  // Deterministic order also bounds interactions with other session revocations.
+  for (const session of sessions.sort((left, right) =>
+    left.session_id.localeCompare(right.session_id),
+  )) {
+    await revokeSession(ctx, { actorId: 'system' }, session.session_id, 'password_changed', tx);
+  }
+}
+
 export async function findSessionById(
   ctx: TenantContext,
   sessionId: SessionId,

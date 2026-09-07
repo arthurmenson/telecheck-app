@@ -104,7 +104,19 @@ function mapServiceError(err: unknown, reply: FastifyReply, reqId: string): bool
       .send(makeErrorEnvelope(reqId, PASSCODE_FAILED, 'Passcode verification failed.'));
     return true;
   }
-  return false;
+  // Credential/audit failures may wrap a database error and lose its SQLSTATE.
+  // Never forward their diagnostic text to this unauthenticated boundary.
+  // Reservation, credential changes, and sessions have all rolled back together.
+  void reply
+    .code(503)
+    .send(
+      makeErrorEnvelope(
+        reqId,
+        'identity.authentication.unavailable',
+        'Authentication is temporarily unavailable. Please try again.',
+      ),
+    );
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +180,7 @@ export async function emailRegistrationStartHandler(
   // Captured inside the tx callback; read AFTER commit to dispatch the email
   // (never on an idempotent replay, where the callback doesn't run).
   let issuedCode: string | null = null;
+  let commitAcknowledged = false;
   const result = await withIdempotentExecution<unknown>(
     req,
     reply,
@@ -212,8 +225,11 @@ export async function emailRegistrationStartHandler(
             : { status: 'ok' },
       };
     },
+    () => {
+      commitAcknowledged = true;
+    },
   );
-  if (issuedCode !== null) {
+  if (commitAcknowledged && issuedCode !== null) {
     dispatchPasscodeEmail(req, {
       to: email,
       code: issuedCode,
@@ -401,7 +417,7 @@ export async function pinLoginHandler(req: FastifyRequest, reply: FastifyReply):
         view: makeErrorEnvelope(req.id, INVALID_CREDENTIALS, 'Invalid email or PIN.'),
       };
 
-      const account = await accountService.findAccountByEmail(ctx, email, tx);
+      const account = await accountService.lockPatientAccountByEmail(ctx, email, tx);
       const cred =
         account !== null && account.status === 'active'
           ? await pinRepo.findByAccountId(ctx.tenantId, account.account_id, tx)
@@ -509,6 +525,7 @@ export async function pinRecoveryStartHandler(
   }
 
   let issuedCode: string | null = null;
+  let commitAcknowledged = false;
   const result = await withIdempotentExecution<unknown>(
     req,
     reply,
@@ -550,10 +567,13 @@ export async function pinRecoveryStartHandler(
             : { status: 'ok' },
       };
     },
+    () => {
+      commitAcknowledged = true;
+    },
   );
   // recovery/start always issues a passcode for every email (existent or not),
   // so this always fires when a code was issued — uniform, no existence oracle.
-  if (issuedCode !== null) {
+  if (commitAcknowledged && issuedCode !== null) {
     dispatchPasscodeEmail(req, {
       to: email,
       code: issuedCode,
@@ -615,13 +635,14 @@ export async function pinRecoveryVerifyHandler(
       // registered email. Skipping it for unknown emails was a state/timing
       // oracle. The combined check below returns the identical PASSCODE_FAILED
       // whether the code was wrong OR the account is missing/inactive.
+      // Take the same account lock as PIN login before reading or changing credentials.
+      const account = await accountService.lockPatientAccountByEmail(ctx, email, tx);
       const verify = await passcodeService.verifyPasscode(
         ctx,
         { actorId: 'system' },
         { email, purpose: 'pin_recovery', code: passcode },
         tx,
       );
-      const account = await accountService.findAccountByEmail(ctx, email, tx);
       if (!verify.ok || account === null || account.status !== 'active') {
         return {
           status: 400,
@@ -650,6 +671,7 @@ export async function pinRecoveryVerifyHandler(
         },
         tx,
       );
+      await sessionService.revokeSessionsAfterPinReset(ctx, account.account_id, tx);
       return { status: 200, view: { status: 'ok' } };
     },
   );
