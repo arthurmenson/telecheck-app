@@ -60,7 +60,9 @@ export type CrisisType =
   | 'violence_threat'
   | 'medical_emergency'
   | 'severe_psychological_distress'
-  | 'protocol_safety_floor_breach';
+  | 'protocol_safety_floor_breach'
+  | 'abuse_disclosure'
+  | 'general_crisis';
 
 export const CRISIS_TYPES: readonly CrisisType[] = [
   'suicidal_ideation',
@@ -69,14 +71,17 @@ export const CRISIS_TYPES: readonly CrisisType[] = [
   'medical_emergency',
   'severe_psychological_distress',
   'protocol_safety_floor_breach',
+  'abuse_disclosure',
+  'general_crisis',
 ] as const;
 
-export type CrisisSeverity = 'non_imminent' | 'imminent' | 'life_threatening';
+export type CrisisSeverity = 'non_imminent' | 'imminent' | 'life_threatening' | 'unassessed';
 
 export const CRISIS_SEVERITIES: readonly CrisisSeverity[] = [
   'non_imminent',
   'imminent',
   'life_threatening',
+  'unassessed',
 ] as const;
 
 // ---------------------------------------------------------------------------

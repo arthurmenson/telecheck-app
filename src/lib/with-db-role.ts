@@ -164,6 +164,7 @@ export const SLICE_ROLES = [
   'ai_service_credential_reader',
   // Patient-own medication projection (migration 087); no raw PHI-table grants.
   'pharmacy_patient_reader',
+  'crisis_care_patient',
 ] as const;
 
 export type SliceRole = (typeof SLICE_ROLES)[number];

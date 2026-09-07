@@ -46,6 +46,12 @@
  */
 
 export { crisisResponsePlugin } from './plugin.js';
+export { admitPatientCareInput } from './internal/patient-care-admission.js';
+export type {
+  PatientCareAdmissionContext,
+  PatientCareAdmissionResult,
+  PatientCrisisResources,
+} from './internal/patient-care-admission.js';
 
 // Branded ID types
 export type {
