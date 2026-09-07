@@ -122,6 +122,11 @@ const TENANT_SCOPED_TABLES = [
   'ai_mode1_conversation_turn_result', // migration 067 — Mode 1 persistence
   'audit_records',
   'auth_devices',
+  'billing_consult_price', // migration 088 — immutable server prices
+  'billing_consult_quote', // migration 088 — subject-owned expiring acceptance
+  'billing_payment_intent', // migration 088 — isolated provider operation
+  'billing_provider_event', // migration 088 — immutable verified event deduplication
+  'billing_refund_intent', // migration 088 — reserved refund ledger; execution not enabled
   'ccr_configs',
   'consent',
   'consent_versions',

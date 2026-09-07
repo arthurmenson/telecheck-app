@@ -234,6 +234,7 @@ jobs:
           DATABASE_URL: postgres://telecheck_app_role:ephemeral-app-read@localhost:5432/telecheck_test
           BIND_ACTOR_CONTEXT_DATABASE_URL: postgres://bind_actor_context_role:ephemeral-bind-read@localhost:5432/telecheck_test
           IDENTITY_DATABASE_URL: postgres://identity_service_role:ephemeral-identity-read@localhost:5432/telecheck_test
+          BILLING_DATABASE_URL: postgres://billing_service_role:ephemeral-billing-read@localhost:5432/telecheck_test
           PATIENT_READ_ACCEPTANCE_ADMIN_DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_test
           JWT_SIGNING_KEY: synthetic-patient-read-jwt-key-for-ci-only
           RESUME_TOKEN_SECRET: synthetic-patient-read-resume-key-for-ci-only
@@ -245,6 +246,7 @@ jobs:
           ALTER ROLE telecheck_app_role LOGIN PASSWORD 'ephemeral-app-read';
           ALTER ROLE bind_actor_context_role LOGIN PASSWORD 'ephemeral-bind-read';
           ALTER ROLE identity_service_role LOGIN PASSWORD 'ephemeral-identity-read';
+          ALTER ROLE billing_service_role LOGIN PASSWORD 'ephemeral-billing-read';
           SQL
           npm run verify:patient-reads
 

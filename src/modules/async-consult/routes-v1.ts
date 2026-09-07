@@ -100,7 +100,7 @@ export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
   // but the ordering keeps intent obvious).
   app.get('/queue', getQueueV1Handler);
 
-  app.post('/', initiateConsultV1Handler);
+  app.post('/', { config: { billingBoundary: 'patient' } }, initiateConsultV1Handler);
   app.get('/', listConsultsV1Handler);
   app.get('/:consult_id', getConsultV1Handler);
   app.post('/:consult_id/intake', submitIntakeV1Handler);

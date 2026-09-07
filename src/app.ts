@@ -33,6 +33,7 @@ import { tenantContextPlugin } from './lib/tenant-context.js';
 import { adminBackendPlugin } from './modules/admin-backend/index.js';
 import { aiServicePlugin } from './modules/ai-service/index.js';
 import { asyncConsultPlugin } from './modules/async-consult/index.js';
+import { billingPlugin } from './modules/billing/index.js';
 import { consentPlugin } from './modules/consent/plugin.js';
 import { crisisResponsePlugin } from './modules/crisis-response/index.js';
 import { formsIntakePlugin } from './modules/forms-intake/index.js';
@@ -335,6 +336,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   // service layer / state machine + initial HTTP handlers; Sprint 10 adds
   // full integration + audit + domain event emitters. See
   // src/modules/async-consult/README.md for the multi-sprint sequencing.
+  await app.register(billingPlugin);
   await app.register(asyncConsultPlugin);
 
   // Crisis Response Slice (SI-022) — routes mounted under /v0/crisis-events.
