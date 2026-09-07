@@ -89,10 +89,25 @@ REVOKE ALL ON FUNCTION public.forms_admin_submission_receipt(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.forms_admin_submission_receipt(UUID) TO telecheck_app_role;
 GRANT EXECUTE ON FUNCTION public.forms_live_actor(TEXT) TO forms_template_admin_review_submit_wrapper_owner;
 DO $$
-DECLARE body TEXT;
+DECLARE body TEXT; marker TEXT;
 BEGIN
   body:=pg_get_functiondef('public.submit_forms_template_for_admin_review(text,text)'::regprocedure);
   body:=replace(body,'SET search_path TO ''pg_catalog'', ''public''','SET search_path TO ''pg_catalog'', ''public'', ''pg_temp''');
   body:=replace(body,'BEGIN'||chr(10),'BEGIN'||chr(10)||'    PERFORM public.forms_live_actor(''operator'');'||chr(10));
+  -- The template/revision locks and either write may block after entry auth.
+  -- Recheck before writes and return, so a lost membership/session/nonce
+  -- aborts all root and lifecycle writes even for a direct SQL caller.
+  -- These anchors follow the baseline's FOUND tests: PERFORM must not clobber
+  -- FOUND before the not-found or already-in-flight guards consume it.
+  FOREACH marker IN ARRAY ARRAY[
+    '    IF v_template_status IS DISTINCT FROM ''draft''',
+    '    IF v_existing_revision_requested_review_id IS NOT NULL THEN',
+    '        -- Insert the new review root.',
+    '        PERFORM record_forms_template_admin_review_transition(',
+    '    RETURN v_review_id;'
+  ] LOOP
+    IF position(marker IN body)=0 THEN RAISE EXCEPTION 'forms_submit_wrapper_shape_changed'; END IF;
+    body:=replace(body,marker,'    PERFORM public.forms_live_actor(''operator'');'||chr(10)||marker);
+  END LOOP;
   EXECUTE body;
 END $$;

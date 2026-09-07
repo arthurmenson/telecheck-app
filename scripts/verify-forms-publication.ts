@@ -225,6 +225,134 @@ const presentation = (country: string) => ({
   elements: [],
 });
 
+async function verifyProtectedSqlSubmission(tenant: Actor['tenant']) {
+  for (const wait of [
+    'initial-template',
+    'revision-review',
+    'initial-transition',
+    'revision-transition',
+  ] as const) {
+    for (const invalidation of ['membership', 'session', 'nonce'] as const) {
+      const who = await actor(tenant, 'tenant_admin', ['operator']);
+      const template = await request(who, 'POST', '/v0/forms/consult-templates', {
+        program_id: ulid(),
+        name: 'Synthetic SQL submission authorization',
+        presentation: presentation(who.country),
+        branching_logic: {},
+        eligibility_logic: {},
+        approval_governance: { mode: 'mode1', development_only: true },
+      });
+      let reviewId: string | undefined;
+      if (wait.startsWith('revision-')) {
+        const review = await request(
+          who,
+          'POST',
+          `/v1/admin/templates/${template.template_id}/submit-for-review`,
+          {},
+        );
+        reviewId = review.review_id;
+        await request(
+          await actor(tenant, 'tenant_admin', ['reviewer']),
+          'POST',
+          `/v1/admin/templates/${template.template_id}/reviews/${reviewId}/decision`,
+          { decision: 'request_revision', decision_payload: {} },
+        );
+      }
+      const persisted = async () => {
+        const roots = await admin.query(
+          'SELECT * FROM public.forms_template_admin_review WHERE tenant_id=$1 AND forms_template_id=$2 ORDER BY review_id',
+          [tenant, template.template_id],
+        );
+        const transitions = await admin.query(
+          `SELECT l.* FROM public.forms_template_admin_review_lifecycle_transition l
+           JOIN public.forms_template_admin_review r ON r.tenant_id=l.tenant_id AND r.review_id=l.review_id
+           WHERE r.tenant_id=$1 AND r.forms_template_id=$2 ORDER BY l.id`,
+          [tenant, template.template_id],
+        );
+        return { roots: roots.rows, transitions: transitions.rows };
+      };
+      const before = await persisted();
+      const bound = await bindActorContextForRequest(binder, {
+        actorAccountId: who.accountId,
+        actorAccountTenantId: tenant,
+        actorRole: who.role,
+        actorAdminHomeTenantId: null,
+        sessionId: who.sessionId,
+      });
+      const pid = (await ordinary.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!
+        .pid;
+      await admin.query('BEGIN');
+      if (wait === 'initial-template')
+        await admin.query('SELECT 1 FROM public.forms_template WHERE template_id=$1 FOR UPDATE', [
+          template.template_id,
+        ]);
+      else if (wait === 'revision-review')
+        await admin.query(
+          'SELECT 1 FROM public.forms_template_admin_review WHERE review_id=$1 FOR UPDATE',
+          [reviewId],
+        );
+      else
+        await admin.query(
+          'LOCK TABLE public.forms_template_admin_review_lifecycle_transition IN SHARE MODE',
+        );
+      await ordinary.query('BEGIN');
+      await ordinary.query('SELECT public.set_tenant_context($1)', [tenant]);
+      await ordinary.query("SELECT set_config('app.request_nonce',$1,true)", [bound.nonce]);
+      await ordinary.query('SET LOCAL ROLE admin_basic_operator');
+      const pending = ordinary
+        .query('SELECT public.submit_forms_template_for_admin_review($1,$2)', [
+          tenant,
+          template.template_id,
+        ])
+        .then(
+          () => 'accepted',
+          (error: unknown) => (error as { code?: string }).code,
+        );
+      try {
+        let blocked = false;
+        for (let attempt = 0; attempt < 200; attempt++) {
+          await admin.query('SELECT pg_stat_clear_snapshot()');
+          blocked =
+            (
+              await admin.query<{ blocked: boolean }>(
+                "SELECT wait_event_type='Lock' AS blocked FROM pg_stat_activity WHERE pid=$1",
+                [pid],
+              )
+            ).rows[0]?.blocked === true;
+          if (blocked) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.equal(blocked, true, `${wait}: submission SQL reached the held lock`);
+        if (invalidation === 'membership')
+          await admin.query(
+            "UPDATE public.forms_governance_membership SET revoked_at=clock_timestamp() WHERE tenant_id=$1 AND account_id=$2 AND capability='operator'",
+            [tenant, who.accountId],
+          );
+        else if (invalidation === 'session')
+          await admin.query(
+            "UPDATE public.sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE session_id=$1",
+            [who.sessionId],
+          );
+        else
+          await admin.query(
+            "UPDATE public._session_actor_context SET expires_at=clock_timestamp()-interval '1 second' WHERE nonce=$1",
+            [bound.nonce],
+          );
+        await admin.query('COMMIT');
+        const result = await pending;
+        const commit = await ordinary.query('COMMIT');
+        assert.equal(result, '42501', `${tenant} ${wait}: ${invalidation} must deny SQL success`);
+        assert.equal(commit.command, 'ROLLBACK', 'SQL denial aborts the submission transaction');
+        assert.deepEqual(await persisted(), before, 'No review root or lifecycle write survives');
+      } finally {
+        await admin.query('ROLLBACK');
+        await pending;
+        await ordinary.query('ROLLBACK');
+      }
+    }
+  }
+}
+
 async function verifyProtectedReplay(tenant: Actor['tenant']) {
   for (const family of [
     'consult-create',
@@ -859,8 +987,9 @@ try {
       403,
     );
     await verifyProtectedReplay(tenant);
+    await verifyProtectedSqlSubmission(tenant);
     proofs.push(
-      `${tenant}: real-role create/publish/deploy/resolve; operator/reviewer separation; app SQL/owner denial; missing evidence rollback; research gate; independent exact-hash clinical review and stale hash rejection; approved marketing copy and Mode2 contract matching; current staff role required for both content approvals and publication paths; SI023 shared gate; all four handler families deny membership/session/nonce invalidation during blocked cached replay; fresh mutation rolls back after outbox-wait revocation; immutable superseded pin; cross-tenant denial; session/nonce expiry during a blocked read; emergency retirement; revoked session`,
+      `${tenant}: real-role create/publish/deploy/resolve; operator/reviewer separation; app SQL/owner denial; missing evidence rollback; research gate; independent exact-hash clinical review and stale hash rejection; approved marketing copy and Mode2 contract matching; current staff role required for both content approvals and publication paths; SI023 shared gate; all four handler families deny membership/session/nonce invalidation during blocked cached replay; fresh mutation rolls back after outbox-wait revocation; 12 direct SQL submission cases deny membership/session/nonce invalidation across template/review/initial-transition/revision-transition waits and retain no writes; immutable superseded pin; cross-tenant denial; session/nonce expiry during a blocked read; emergency retirement; revoked session`,
     );
   }
   console.log(JSON.stringify({ passed: true, proofs }, null, 2));
