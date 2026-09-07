@@ -11,6 +11,7 @@ on:
       - 'src/lib/**'
       - 'migrations/**'
       - 'scripts/verify-care-intake*.mjs'
+      - 'scripts/verify-patient-crisis-history-rollback*.mjs'
       - '.github/workflows/care-intake-runtime.yml'
   push:
     branches: [main]
@@ -23,6 +24,7 @@ on:
       - 'src/lib/**'
       - 'migrations/**'
       - 'scripts/verify-care-intake*.mjs'
+      - 'scripts/verify-patient-crisis-history-rollback*.mjs'
       - '.github/workflows/care-intake-runtime.yml'
 permissions:
   contents: read
@@ -55,5 +57,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Verify rollback acceptance guards
+        run: node --test scripts/verify-patient-crisis-history-rollback.test.mjs
       - name: Verify published intake, crisis admission, protected persistence and live authority over real HTTP
         run: node --import tsx scripts/verify-care-intake-ci.mjs
