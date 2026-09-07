@@ -26,6 +26,9 @@ vi.mock('../../../lib/with-db-role.js', () => ({
 vi.mock('../../../lib/logger.js', () => ({ logger: { error: vi.fn() } }));
 vi.mock('../../../lib/domain-events.js', () => ({ emitDomainEvent: mocks.outbox }));
 vi.mock('../../tenant-config/index.js', () => ({ getTenantCountryProfile: mocks.profile }));
+vi.mock('./patient-care-read.js', () => ({
+  withPatientCareRead: (work: (tx: unknown) => Promise<unknown>) => work({ query: mocks.query }),
+}));
 vi.mock('../audit.js', () => ({ emitCrisisDetectedAudit: mocks.audit }));
 
 import type { TenantContext } from '../../../lib/tenant-context.js';
@@ -165,6 +168,32 @@ describe('patient crisis admission', () => {
       recording_status: 'recorded',
       resources: { status: 'unavailable', emergency_number: null },
     });
+  });
+
+  it('commits before reading resources and checks live authorization after the wait', async () => {
+    mocks.profile.mockImplementation(async () => {
+      expect(mocks.outbox).toHaveBeenCalledOnce();
+      mocks.query.mockRejectedValue(Object.assign(new Error('revoked'), { code: 'PT401' }));
+      return { emergency_number: 'configured-emergency', crisis_helplines: [] };
+    });
+    await expect(admitPatientCareInput(ctx, 'in crisis', 'messaging')).rejects.toMatchObject({
+      code: 'PT401',
+      statusCode: 401,
+    });
+  });
+
+  it('retains known recording status while withholding ID when final authorization is unavailable', async () => {
+    mocks.profile.mockImplementation(async () => {
+      mocks.query.mockRejectedValue(new Error('connection_unavailable'));
+      return { emergency_number: 'configured-emergency', crisis_helplines: [] };
+    });
+    const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    expect(result).toMatchObject({
+      recording_status: 'recorded',
+      escalation_status: 'pending',
+      disclosure_status: 'unavailable',
+    });
+    expect(result).not.toHaveProperty('crisis_event_id');
   });
 
   it('rejects identity mismatch before any write even with a retry key', async () => {

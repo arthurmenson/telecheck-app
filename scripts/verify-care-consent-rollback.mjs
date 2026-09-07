@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
 import { applyMigrations } from './migrate.mjs';
 
 const privateTables = [
@@ -23,7 +22,7 @@ async function fingerprint(db, names) {
   return result;
 }
 /** Run only in the dedicated synthetic acceptance database, using its migration connection. */
-export async function verifyCareConsentRollback(db, populated) {
+export async function verifyCareConsentRollback(db, populated, prefixDirectory) {
   assert.equal(
     (await db.query('SELECT current_database() AS name')).rows[0].name,
     'telecheck_consent',
@@ -60,6 +59,7 @@ export async function verifyCareConsentRollback(db, populated) {
     );
     return;
   }
+  assert.equal(typeof prefixDirectory, 'string', 'An isolated canonical prefix is required.');
   assert.equal(
     (await db.query('SELECT max(filename) AS name FROM schema_migrations')).rows[0].name,
     filename,
@@ -90,9 +90,8 @@ export async function verifyCareConsentRollback(db, populated) {
     await db.query('ROLLBACK');
     throw error;
   }
-  const directory = fileURLToPath(new URL('../migrations/', import.meta.url));
-  assert.equal((await applyMigrations(db, directory)).applied, 1);
-  assert.equal((await applyMigrations(db, directory)).applied, 0);
+  assert.equal((await applyMigrations(db, prefixDirectory)).applied, 1);
+  assert.equal((await applyMigrations(db, prefixDirectory)).applied, 0);
   assert.deepEqual(await fingerprint(db, retainedTables), retainedBefore);
   console.log(
     'PASS committed empty consent rollback and canonical reapplication/replay preserve earlier evidence.',

@@ -11,6 +11,7 @@ import { withDbRole } from '../../../lib/with-db-role.js';
 import { getTenantCountryProfile } from '../../tenant-config/index.js';
 import { emitCrisisDetectedAudit } from '../audit.js';
 
+import { withPatientCareRead } from './patient-care-read.js';
 import { asCrisisEventId, asServerSignalId } from './types.js';
 
 export interface PatientCareAdmissionContext {
@@ -35,6 +36,15 @@ export type PatientCareAdmissionResult =
       detector_version: 'keyword_engineering_v1';
       recording_status: 'recorded';
       crisis_event_id: string;
+      disclosure_status: 'available';
+      escalation_status: 'pending';
+    }
+  | {
+      kind: 'crisis_interruption';
+      resources: PatientCrisisResources;
+      detector_version: 'keyword_engineering_v1';
+      recording_status: 'recorded';
+      disclosure_status: 'unavailable';
       escalation_status: 'pending';
     }
   | {
@@ -154,21 +164,12 @@ export async function admitPatientCareInput(
     crisis_helplines: [],
     status: 'unavailable',
   };
-  // Resolve public market resources independently, before the recording attempt.
-  try {
-    const profile = await getTenantCountryProfile(ctx.tenant);
-    if (profile) {
-      resources.emergency_number = profile.emergency_number;
-      resources.crisis_helplines = profile.crisis_helplines.map((line) => ({ ...line }));
-      resources.status = 'available';
-    } else signalAdmissionUnavailable();
-  } catch {
-    signalAdmissionUnavailable();
-  }
   let commitPossible = false;
   let authenticated = false;
+  let crisisEventId: string | undefined;
+  let recordingStatus: 'recorded' | 'not_recorded' | 'unconfirmed';
   try {
-    const crisisEventId = await patientTransaction(
+    crisisEventId = await patientTransaction(
       ctx,
       async (tx) => {
         authenticated = true;
@@ -230,34 +231,65 @@ export async function admitPatientCareInput(
         commitPossible = true;
       },
     );
-    return {
-      kind: 'crisis_interruption',
-      recording_status: 'recorded',
-      crisis_event_id: crisisEventId,
-      escalation_status: 'pending',
-      detector_version: 'keyword_engineering_v1',
-      resources,
-    };
+    recordingStatus = 'recorded';
   } catch (error) {
     const code = (error as { code?: unknown } | null)?.code;
     if (code === 'PT401') throw error;
     if (code === '42501' && !authenticated)
       throw Object.assign(new Error('crisis_forbidden'), { code: '42501', statusCode: 403 });
     signalAdmissionUnavailable();
-    if (commitPossible)
-      return {
-        kind: 'crisis_interruption',
-        recording_status: 'unconfirmed',
-        escalation_status: 'unconfirmed',
-        detector_version: 'keyword_engineering_v1',
-        resources,
-      };
+    recordingStatus = commitPossible ? 'unconfirmed' : 'not_recorded';
+  }
+
+  // Recording has already settled. Public configuration can neither prevent
+  // that transaction nor change its acknowledged/uncertain outcome.
+  try {
+    const profile = await withPatientCareRead((tx) => getTenantCountryProfile(ctx.tenant, tx));
+    if (profile) {
+      resources.emergency_number = profile.emergency_number;
+      resources.crisis_helplines = profile.crisis_helplines.map((line) => ({ ...line }));
+      resources.status = 'available';
+    } else signalAdmissionUnavailable();
+  } catch {
+    signalAdmissionUnavailable();
+  }
+  const common = {
+    kind: 'crisis_interruption' as const,
+    detector_version: 'keyword_engineering_v1' as const,
+    resources,
+  };
+  if (recordingStatus === 'not_recorded')
+    return { ...common, recording_status: 'not_recorded', escalation_status: 'not_queued' };
+  if (recordingStatus === 'unconfirmed')
+    return { ...common, recording_status: 'unconfirmed', escalation_status: 'unconfirmed' };
+
+  // Revalidate after the resource wait before disclosing an event identifier.
+  // This separate, bounded read cannot undo an acknowledged recording commit.
+  try {
+    await withPatientCareRead((tx) =>
+      withTenantContext(tx, ctx.tenant.tenantId, () =>
+        withActorContext(tx, ctx.actorNonce, () => assertPatient(tx, ctx)),
+      ),
+    );
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code === 'PT401')
+      throw Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401', statusCode: 401 });
+    if (code === '42501')
+      throw Object.assign(new Error('crisis_forbidden'), { code: '42501', statusCode: 403 });
+    signalAdmissionUnavailable();
     return {
-      kind: 'crisis_interruption',
-      recording_status: 'not_recorded',
-      escalation_status: 'not_queued',
-      detector_version: 'keyword_engineering_v1',
-      resources,
+      ...common,
+      recording_status: 'recorded',
+      escalation_status: 'pending',
+      disclosure_status: 'unavailable',
     };
   }
+  return {
+    ...common,
+    recording_status: 'recorded',
+    crisis_event_id: crisisEventId!,
+    escalation_status: 'pending',
+    disclosure_status: 'available',
+  };
 }

@@ -62,7 +62,13 @@ app.post('/__synthetic-crisis-admission', async (req, reply) => {
   );
   reply.header('Cache-Control', 'no-store');
   if (result.kind === 'crisis_interruption')
-    return reply.code(result.recording_status === 'recorded' ? 409 : 503).send(result);
+    return reply
+      .code(
+        result.recording_status === 'recorded' && result.disclosure_status === 'available'
+          ? 409
+          : 503,
+      )
+      .send(result);
   ordinaryValidationCount++;
   return reply.code(400).send({ error: 'synthetic_business_validation_failed' });
 });
@@ -198,6 +204,93 @@ async function delayedAuthorization(who, fault) {
   );
   assert.equal(count.rows[0].n, 0);
 }
+async function blockedCountryResources(who, fault) {
+  const lock = new pg.Client({
+    connectionString: process.env.CRISIS_ACCEPTANCE_ADMIN_DATABASE_URL,
+  });
+  const authLock = new pg.Client({
+    connectionString: process.env.CRISIS_ACCEPTANCE_ADMIN_DATABASE_URL,
+  });
+  await Promise.all([lock.connect(), authLock.connect()]);
+  const started = performance.now();
+  try {
+    await lock.query('BEGIN');
+    await lock.query('LOCK TABLE public.country_profiles IN ACCESS EXCLUSIVE MODE');
+    const request = call(
+      who.host,
+      '/__synthetic-crisis-admission',
+      { unknown: 'in crisis' },
+      who.token,
+    );
+    let waiting = false;
+    for (let i = 0; i < 100; i++) {
+      const result = await control.query(
+        "SELECT 1 FROM pg_stat_activity WHERE application_name='crisis_care_bounded_read' AND wait_event_type='Lock' AND query LIKE '%FROM country_profiles%'",
+      );
+      if (result.rowCount) {
+        waiting = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert(waiting, 'actual ordinary-role resource read reached held country lock');
+    const evidence = await control.query(
+      `SELECT d.crisis_event_id,
+      (SELECT count(*)::int FROM public.crisis_event c WHERE c.id=d.crisis_event_id AND c.tenant_id=d.tenant_id) AS events,
+      (SELECT count(*)::int FROM public.crisis_event_lifecycle_transition l WHERE l.crisis_event_id=d.crisis_event_id AND l.tenant_id=d.tenant_id) AS lifecycle,
+      (SELECT count(*)::int FROM public.audit_records a WHERE a.resource_id=d.crisis_event_id::text AND a.tenant_id=d.tenant_id AND a.action='crisis.detected') AS audits,
+      (SELECT count(*)::int FROM public.domain_events_outbox o WHERE o.aggregate_id=d.crisis_event_id::text AND o.tenant_id=d.tenant_id AND o.payload->>'escalation_status'='pending') AS outbox
+      FROM public.crisis_care_admission d WHERE d.tenant_id=$1 AND d.patient_account_id=$2`,
+      [who.tenant, who.accountId],
+    );
+    assert.equal(evidence.rowCount, 1, 'crisis committed before resource lock was released');
+    assert.deepEqual(Object.values(evidence.rows[0]).slice(1), [1, 1, 1, 1]);
+    if (fault === 'revoked')
+      await control.query(
+        "UPDATE public.sessions SET revoked_at=clock_timestamp(),revoked_reason='patient_logout' WHERE tenant_id=$1 AND session_id=$2",
+        [who.tenant, who.sessionId],
+      );
+    if (fault === 'auth_unavailable') {
+      await authLock.query('BEGIN');
+      await authLock.query('LOCK TABLE public._session_actor_context IN ACCESS EXCLUSIVE MODE');
+    }
+    // Both locks remain held until after the response; an uncancelled resolver
+    // would hang here and cannot pass the bounded deadline assertion.
+    const response = await request;
+    assert(performance.now() - started < 4_500, 'bounded resource and final authorization reads');
+    if (fault === 'revoked') {
+      assert.equal(response.status, 401);
+      assert(!JSON.stringify(response.body).includes(evidence.rows[0].crisis_event_id));
+    } else {
+      assert.equal(response.status, fault === 'auth_unavailable' ? 503 : 409);
+      assert.equal(response.body.recording_status, 'recorded');
+      assert.equal(response.body.escalation_status, 'pending');
+      assert.deepEqual(response.body.resources, {
+        country_of_care: who.country,
+        emergency_number: null,
+        crisis_helplines: [],
+        status: 'unavailable',
+      });
+      assert.equal(
+        response.body.disclosure_status,
+        fault === 'auth_unavailable' ? 'unavailable' : 'available',
+      );
+      if (fault === 'auth_unavailable') assert(!('crisis_event_id' in response.body));
+      else assert.equal(response.body.crisis_event_id, evidence.rows[0].crisis_event_id);
+    }
+    const leftover = await control.query(
+      "SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name='crisis_care_bounded_read' AND state<>'idle' AND wait_event_type='Lock'",
+    );
+    assert.equal(leftover.rows[0].n, 0, 'no uncancelled read remains waiting on either held lock');
+    assertions += 4;
+    console.log(
+      `PASS ${who.country} blocked country resources ${fault}: committed before lookup, bounded response, fresh authorization, no abandoned query`,
+    );
+  } finally {
+    await Promise.all([lock.query('ROLLBACK'), authLock.query('ROLLBACK')]);
+    await Promise.all([lock.end(), authLock.end()]);
+  }
+}
 try {
   for (const [host, tenant, country] of [
     ['localhost', 'Telecheck-US', 'US'],
@@ -207,6 +300,8 @@ try {
       other = await register(host, tenant, country);
     for (const fault of ['nonce_expired', 'session_expired', 'account_suspended'])
       await delayedAuthorization(await register(host, tenant, country), fault);
+    for (const fault of ['available', 'revoked', 'auth_unavailable'])
+      await blockedCountryResources(await register(host, tenant, country), fault);
     const marker = `SYNTHETIC-PRIVATE-${randomUUID()}`;
     const body = {
       wrong_form_id: 'invalid',
