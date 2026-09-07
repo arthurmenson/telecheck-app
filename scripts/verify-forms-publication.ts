@@ -31,20 +31,29 @@ async function actor(
   const accountId = ulid(),
     sessionId = ulid();
   const country = tenant === 'Telecheck-US' ? 'US' : 'GH';
-  await admin.query(
-    `INSERT INTO public.accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,locale,account_type,status)
+  await admin.query('BEGIN');
+  try {
+    await withTenantContext(admin, asTenantId(tenant), async () => {
+      await admin.query(
+        `INSERT INTO public.accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,locale,account_type,status)
     VALUES($1,$2,$3,'Synthetic','Governance','1990-01-01','prefer_not_to_say',$4,$4,$5,$6,'active')`,
-    [accountId, tenant, `${randomUUID()}@example.invalid`, country, `en-${country}`, role],
-  );
-  await admin.query(
-    `INSERT INTO public.sessions(session_id,tenant_id,account_id,refresh_token_hash,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour')`,
-    [sessionId, tenant, accountId, randomBytes(32).toString('hex')],
-  );
-  for (const capability of capabilities)
-    await admin.query(
-      'INSERT INTO public.forms_governance_membership(tenant_id,account_id,capability) VALUES($1,$2,$3)',
-      [tenant, accountId, capability],
-    );
+        [accountId, tenant, `${randomUUID()}@example.invalid`, country, `en-${country}`, role],
+      );
+      await admin.query(
+        `INSERT INTO public.sessions(session_id,tenant_id,account_id,refresh_token_hash,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour')`,
+        [sessionId, tenant, accountId, randomBytes(32).toString('hex')],
+      );
+      for (const capability of capabilities)
+        await admin.query(
+          'INSERT INTO public.forms_governance_membership(tenant_id,account_id,capability) VALUES($1,$2,$3)',
+          [tenant, accountId, capability],
+        );
+    });
+    await admin.query('COMMIT');
+  } catch (error) {
+    await admin.query('ROLLBACK');
+    throw error;
+  }
   const token = issueAccessToken(
     {
       account_id: accountId,
