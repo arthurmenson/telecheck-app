@@ -151,6 +151,9 @@ const TENANT_SCOPED_TABLES = [
   'dispensings', // migration 060 — Pharmacy Refill sub-slice (SI-007 / P-046)
   'domain_events_outbox',
   'forms_deployment',
+  'forms_governance_artifact',
+  'forms_governance_membership',
+  'forms_published_definition',
   'forms_resume_state',
   'forms_snapshot',
   'forms_submission',

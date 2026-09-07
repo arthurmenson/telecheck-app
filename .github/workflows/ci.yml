@@ -199,11 +199,34 @@ jobs:
           npm run migrate:apply
 
       - name: Test (vitest)
-        run: npm run test
+        run: npm run test -- --no-file-parallelism
 
       - name: Verify atomic migrations and history integrity (PostgreSQL)
         run: npm run test:migrations
 
+      - name: Verify Forms publication with actual application and binder roles
+        env:
+          PGPASSWORD: telecheck_ci
+          NODE_ENV: development
+          FORMS_MIGRATION_DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_test
+          FORMS_ROLLBACK_DISPOSABLE_DATABASE: 'true'
+          DATABASE_URL: postgres://telecheck_app_role:forms_ci_app@localhost:5432/telecheck_test
+          BIND_ACTOR_CONTEXT_DATABASE_URL: postgres://bind_actor_context_role:forms_ci_bind@localhost:5432/telecheck_test
+          IDENTITY_DATABASE_URL: postgres://identity_service_role:forms_ci_identity@localhost:5432/telecheck_test
+          DATABASE_SSL_MODE: disable
+          JWT_SIGNING_KEY: synthetic-forms-ci-signing-key-32-chars-minimum
+          RESUME_TOKEN_SECRET: synthetic-forms-ci-resume-key-32-chars-minimum
+          TENANT_HOST_OVERRIDES: localhost=Telecheck-US,ghana.localhost=Telecheck-Ghana
+          SMS_PROVIDER: noop
+          EMAIL_PROVIDER: noop
+        run: |
+          psql -h localhost -U telecheck_ci -d telecheck_test -v ON_ERROR_STOP=1 <<'SQL'
+          ALTER ROLE telecheck_app_role LOGIN PASSWORD 'forms_ci_app';
+          ALTER ROLE bind_actor_context_role LOGIN PASSWORD 'forms_ci_bind';
+          ALTER ROLE identity_service_role LOGIN PASSWORD 'forms_ci_identity';
+          SQL
+          npm run verify:forms-publication
+          npm run verify:forms-rollback
       - name: Verify patient reads over real HTTP and restricted login roles
         env:
           NODE_ENV: development

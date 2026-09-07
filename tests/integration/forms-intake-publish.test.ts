@@ -31,8 +31,11 @@
  *   - migrations/006_forms_intake.sql (forms_template table + RLS policies).
  */
 
+import { randomBytes, randomUUID } from 'node:crypto';
+
 import { describe, expect, it } from 'vitest';
 
+import { withActorContext } from '../../src/lib/actor-context-binding.ts';
 import { asTenantId } from '../../src/lib/glossary.ts';
 import type { TenantContext } from '../../src/lib/tenant-context.ts';
 import { ulid } from '../../src/lib/ulid.ts';
@@ -98,8 +101,8 @@ async function insertDraftTemplate(input: DraftTemplateInput): Promise<string> {
        ) VALUES (
           $1, $2, $3, $4,
           $5, 'draft', $6, $7,
-          '{}'::jsonb, '{}'::jsonb,
-          '{}'::jsonb, '{}'::jsonb,
+          $8::jsonb, '{}'::jsonb,
+          '{}'::jsonb, '{"mode":"mode1","development_only":true}'::jsonb,
           NOW(), NOW()
        )`,
       [
@@ -110,6 +113,16 @@ async function insertDraftTemplate(input: DraftTemplateInput): Promise<string> {
         input.templateVersion,
         name,
         createdBy,
+        JSON.stringify({
+          contract_version: 'consult_intake_v1',
+          kind: 'general_consult',
+          locale: 'en-' + input.ctx.countryOfCare,
+          title: 'Synthetic general consultation',
+          fields: [
+            { id: 'concern', type: 'text', label: 'Concern', required: true, max_length: 4000 },
+          ],
+          elements: [],
+        }),
       ],
     );
   });
@@ -117,39 +130,59 @@ async function insertDraftTemplate(input: DraftTemplateInput): Promise<string> {
 }
 
 /**
- * Run a publishVersion service call with the FORMS_PUBLISH_GATES_BYPASS
- * sentinel set. The bypass MUST be hostile-named so production
- * deployments can't open the gate via routine env config; we set + unset
- * it around each test invocation.
+ * Run a publication with a real session, bound nonce and reviewer membership.
+ * Actual least-privilege HTTP/binder wiring is exercised by the runtime check.
  */
-async function publishWithGatesBypassed(
+async function publishWithLiveReviewer(
   ctx: TenantContext,
   actorId: string,
   versionId: string,
   changeNotes: string | undefined,
 ) {
-  const prior = process.env['FORMS_PUBLISH_GATES_BYPASS'];
-  process.env['FORMS_PUBLISH_GATES_BYPASS'] = 'unsafe-test-only';
+  const tx = getTestClient();
+  const sessionId = ulid(),
+    nonce = randomUUID();
+  await tx.query('SAVEPOINT forms_publish_operation');
   try {
-    // F-4: tests are in-tenant operations (no platform_admin cross-
-    // tenant scenarios here), so actorTenantId === ctx.tenantId.
-    return await templateService.publishVersion(
-      ctx,
-      { actorId, actorTenantId: ctx.tenantId },
-      versionId,
-      { changeNotes },
-      // externalTx: pass the test client so the service's transactional
-      // writes share the savepoint-isolated outer transaction. Without
-      // this, withTransaction would acquire a pool connection that can't
-      // see test-client uncommitted rows (PG transaction isolation).
-      getTestClient(),
+    await tx.query(
+      `INSERT INTO public.accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,locale,account_type,status)
+      VALUES($1,$2,$3,'Synthetic','Reviewer','1990-01-01','prefer_not_to_say',$4,$4,$5,'tenant_admin','active') ON CONFLICT DO NOTHING`,
+      [
+        actorId,
+        ctx.tenantId,
+        randomUUID() + '@example.invalid',
+        ctx.countryOfCare,
+        'en-' + ctx.countryOfCare,
+      ],
     );
-  } finally {
-    if (prior === undefined) {
-      delete process.env['FORMS_PUBLISH_GATES_BYPASS'];
-    } else {
-      process.env['FORMS_PUBLISH_GATES_BYPASS'] = prior;
-    }
+    await tx.query(
+      `INSERT INTO public.sessions(session_id,tenant_id,account_id,refresh_token_hash,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour')`,
+      [sessionId, ctx.tenantId, actorId, randomBytes(32).toString('hex')],
+    );
+    await tx.query(
+      `INSERT INTO public.forms_governance_membership(tenant_id,account_id,capability) VALUES($1,$2,'reviewer') ON CONFLICT DO NOTHING`,
+      [ctx.tenantId, actorId],
+    );
+    // Harness fixture only. The actual-role acceptance script exercises the separate binder.
+    await tx.query(
+      `INSERT INTO public._session_actor_context(nonce,actor_account_id,actor_account_tenant_id,actor_role,session_id,expires_at) VALUES($1,$2,$3,'tenant_admin',$4,clock_timestamp()+interval '5 minutes')`,
+      [nonce, actorId, ctx.tenantId, sessionId],
+    );
+    const result = await withActorContext(tx, nonce, () =>
+      templateService.publishVersion(
+        ctx,
+        { actorId, actorTenantId: ctx.tenantId },
+        versionId,
+        { changeNotes },
+        tx,
+      ),
+    );
+    await tx.query('RELEASE SAVEPOINT forms_publish_operation');
+    return result;
+  } catch (error) {
+    await tx.query('ROLLBACK TO SAVEPOINT forms_publish_operation');
+    await tx.query('RELEASE SAVEPOINT forms_publish_operation');
+    throw error;
   }
 }
 
@@ -167,7 +200,7 @@ describe('forms-intake publishVersion — first-time publish (no prior to supers
     });
 
     const result = await withTenantContext(TENANT_US, () =>
-      publishWithGatesBypassed(US_CTX, 'op_publish_test_1', draftId, 'Initial publish'),
+      publishWithLiveReviewer(US_CTX, 'op_publish_test_1', draftId, 'Initial publish'),
     );
 
     expect(result.template_id).toBe(draftId);
@@ -244,12 +277,12 @@ describe('forms-intake publishVersion — supersession cascade', () => {
 
     // Publish v1 (no prior).
     await withTenantContext(TENANT_US, () =>
-      publishWithGatesBypassed(US_CTX, 'op_super_test', v1Id, undefined),
+      publishWithLiveReviewer(US_CTX, 'op_super_test', v1Id, undefined),
     );
 
     // Publish v2 — supersession cascade should flip v1 to superseded.
     const v2Published = await withTenantContext(TENANT_US, () =>
-      publishWithGatesBypassed(US_CTX, 'op_super_test', v2Id, 'Promoted v2'),
+      publishWithLiveReviewer(US_CTX, 'op_super_test', v2Id, 'Promoted v2'),
     );
     expect(v2Published.status).toBe('published');
 
@@ -305,12 +338,12 @@ describe('forms-intake publishVersion — I-013 immutability', () => {
     });
 
     await withTenantContext(TENANT_US, () =>
-      publishWithGatesBypassed(US_CTX, 'op_imm_test', draftId, undefined),
+      publishWithLiveReviewer(US_CTX, 'op_imm_test', draftId, undefined),
     );
 
     await expect(
       withTenantContext(TENANT_US, () =>
-        publishWithGatesBypassed(US_CTX, 'op_imm_test', draftId, undefined),
+        publishWithLiveReviewer(US_CTX, 'op_imm_test', draftId, undefined),
       ),
     ).rejects.toThrow(templateRepo.PUBLISH_VERSION_NOT_DRAFT);
   });
@@ -330,7 +363,7 @@ describe('forms-intake publishVersion — cross-tenant isolation (I-023)', () =>
 
     await expect(
       withTenantContext(TENANT_GHANA, () =>
-        publishWithGatesBypassed(GH_CTX, 'op_xten_test', draftId, undefined),
+        publishWithLiveReviewer(GH_CTX, 'op_xten_test', draftId, undefined),
       ),
     ).rejects.toThrow(templateRepo.PUBLISH_VERSION_NOT_FOUND);
 
@@ -348,11 +381,11 @@ describe('forms-intake publishVersion — cross-tenant isolation (I-023)', () =>
 });
 
 // ---------------------------------------------------------------------------
-// Scenario 5: Fail-closed gate — publish refused without explicit env bypass
+// Scenario 5: Missing live actor cannot be overridden by legacy environment flags.
 // ---------------------------------------------------------------------------
 
 describe('forms-intake publishVersion — fail-closed governance gate', () => {
-  it('should refuse to publish when FORMS_PUBLISH_GATES_BYPASS is absent', async () => {
+  it('requires live reviewer authorization without FORMS_PUBLISH_GATES_BYPASS', async () => {
     const draftId = await insertDraftTemplate({
       ctx: US_CTX,
       programId: `prog_pub_gate_${ulid().slice(0, 8)}`,
@@ -361,6 +394,7 @@ describe('forms-intake publishVersion — fail-closed governance gate', () => {
 
     const prior = process.env['FORMS_PUBLISH_GATES_BYPASS'];
     delete process.env['FORMS_PUBLISH_GATES_BYPASS'];
+    await getTestClient().query('SAVEPOINT forms_missing_actor');
     try {
       await expect(
         withTenantContext(TENANT_US, () =>
@@ -372,7 +406,9 @@ describe('forms-intake publishVersion — fail-closed governance gate', () => {
             getTestClient(),
           ),
         ),
-      ).rejects.toThrow(templateService.PUBLISH_GATES_NOT_IMPLEMENTED);
+      ).rejects.toThrow('forms_auth_unavailable');
+      await getTestClient().query('ROLLBACK TO SAVEPOINT forms_missing_actor');
+      await getTestClient().query('RELEASE SAVEPOINT forms_missing_actor');
     } finally {
       if (prior !== undefined) {
         process.env['FORMS_PUBLISH_GATES_BYPASS'] = prior;
@@ -391,7 +427,7 @@ describe('forms-intake publishVersion — fail-closed governance gate', () => {
     expect(row!.status).toBe('draft');
   });
 
-  it('should refuse to publish when FORMS_PUBLISH_GATES_BYPASS is set to a non-sentinel value', async () => {
+  it('FORMS_PUBLISH_GATES_BYPASS cannot replace live reviewer authorization', async () => {
     const draftId = await insertDraftTemplate({
       ctx: US_CTX,
       programId: `prog_pub_typo_${ulid().slice(0, 8)}`,
@@ -401,6 +437,7 @@ describe('forms-intake publishVersion — fail-closed governance gate', () => {
     const prior = process.env['FORMS_PUBLISH_GATES_BYPASS'];
     // Common would-be-typo — must NOT open the gate.
     process.env['FORMS_PUBLISH_GATES_BYPASS'] = 'true';
+    await getTestClient().query('SAVEPOINT forms_missing_actor');
     try {
       await expect(
         withTenantContext(TENANT_US, () =>
@@ -412,7 +449,9 @@ describe('forms-intake publishVersion — fail-closed governance gate', () => {
             getTestClient(),
           ),
         ),
-      ).rejects.toThrow(templateService.PUBLISH_GATES_NOT_IMPLEMENTED);
+      ).rejects.toThrow('forms_auth_unavailable');
+      await getTestClient().query('ROLLBACK TO SAVEPOINT forms_missing_actor');
+      await getTestClient().query('RELEASE SAVEPOINT forms_missing_actor');
     } finally {
       if (prior === undefined) {
         delete process.env['FORMS_PUBLISH_GATES_BYPASS'];
