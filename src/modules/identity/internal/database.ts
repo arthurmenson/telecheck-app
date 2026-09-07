@@ -46,7 +46,7 @@ async function assertIdentityConnection(tx: DbClient): Promise<void> {
   if (result.rows[0]?.valid !== true) throw new Error('identity_database_role_invalid');
 }
 
-async function withIdentityTransaction<T>(fn: (tx: DbClient) => Promise<T>): Promise<T> {
+export async function withIdentityTransaction<T>(fn: (tx: DbClient) => Promise<T>): Promise<T> {
   const client = await identityPool().connect();
   let discard = false;
   try {

@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID, randomBytes } from 'node:crypto';
 import http from 'node:http';
+import { verifyStaffEnrollment } from './verify-staff-enrollment-runtime.mjs';
 import pg from 'pg';
 import { buildApp } from '../src/app.ts';
 import { bindActorContextForRequest } from '../src/lib/actor-context-binding.ts';
@@ -216,6 +217,16 @@ try {
       ['policy_reviewer'],
     );
     const patient = await register(host, tenant, country);
+    await verifyStaffEnrollment({
+      admin,
+      ordinary,
+      inject,
+      context,
+      staff,
+      author,
+      reviewer,
+      patient,
+    });
     const form = await request(author, '/v0/forms/consult-templates', {
       program_id: ulid(),
       name: 'Synthetic first-care intake',

@@ -12,6 +12,7 @@ export default defineConfig({
       'src/modules/async-consult/internal/services/clinical-*.test.ts',
       'src/modules/async-consult/internal/handlers/submit-intake-v1.test.ts',
       'src/modules/crisis-response/internal/patient-history.test.ts',
+      'src/modules/identity/internal/services/staff-contract.test.ts',
     ],
     testTimeout: 15000,
   },

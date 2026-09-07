@@ -37,10 +37,12 @@ import {
   registrationStartHandler,
   registrationVerifyHandler,
 } from './internal/handlers/registration.js';
+import { registerStaffEnrollmentRoutes } from './internal/handlers/staff-enrollment.js';
 
 export const registerIdentityRoutes: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
+  registerStaffEnrollmentRoutes(app);
   /**
    * Module health probe — module-scoped equivalent of the platform-level
    * /health endpoint. Lets ops verify the Identity plugin is registered

@@ -166,6 +166,8 @@ const TENANT_SCOPED_TABLES = [
   'forms_variant',
   'idempotency_keys',
   'identity_idempotency_keys', // migration083 — credential-bearing auth replay
+  'identity_staff_enrollment', // migration098 — immutable operator enrollment proof
+  'identity_staff_membership', // migration098 — separately governed enroller capability
   'interaction_engine_evaluation', // migration 047 — Med-Interaction slice
   'interaction_signal', // migration 047 — Med-Interaction slice
   'interaction_signal_lifecycle_transition', // migration 047 — Med-Interaction slice

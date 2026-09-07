@@ -34,10 +34,10 @@ interface AccountRow {
   email: string | null;
   first_name: string;
   last_name: string;
-  date_of_birth: Date | string;
-  gender: string;
+  date_of_birth: Date | string | null;
+  gender: string | null;
   national_id: string | null;
-  country_of_residence: string;
+  country_of_residence: string | null;
   country_of_care: string;
   locale: string;
   account_type: string;
@@ -61,8 +61,8 @@ function rowToAccount(row: AccountRow): Account {
     date_of_birth:
       typeof row.date_of_birth === 'string'
         ? row.date_of_birth
-        : row.date_of_birth.toISOString().slice(0, 10),
-    gender: row.gender as AccountGender,
+        : (row.date_of_birth?.toISOString().slice(0, 10) ?? null),
+    gender: row.gender as AccountGender | null,
     national_id: row.national_id,
     country_of_residence: row.country_of_residence,
     country_of_care: row.country_of_care as 'US' | 'GH',
