@@ -1,0 +1,40 @@
+name: Billing isolated runtime
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  billing-runtime:
+    name: Billing PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        postgres: [15, 16]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: telecheck_ci
+          POSTGRES_PASSWORD: telecheck_ci
+          POSTGRES_DB: telecheck_billing
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U telecheck_ci -d telecheck_billing"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ONNXRUNTIME_NODE_INSTALL: skip
+      NODE_ENV: test
+      BILLING_SYNTHETIC_ACCEPTANCE: 'true'
+      MIGRATION_DATABASE_URL: postgres://telecheck_ci:telecheck_ci@localhost:5432/telecheck_billing
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: node --import tsx scripts/verify-billing-ci.mjs
