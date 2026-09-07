@@ -24,11 +24,13 @@ async function fingerprint(db) {
 /** Committed read removal/reapplication, restricted to disposable local acceptance. */
 export async function verifyPatientCrisisHistoryRollback(db) {
   assert.equal(process.env.CARE_SYNTHETIC_ACCEPTANCE, 'true');
-  const identity = (
-    await db.query('SELECT current_database() AS db,host(inet_server_addr()) AS host')
-  ).rows[0];
+  // Validate the actual client's destination. Docker's published localhost
+  // connection reaches a bridge address inside PostgreSQL; inet_server_addr()
+  // describes that server interface, not whether this is a local test client.
+  assert(['127.0.0.1', 'localhost', '::1'].includes(db.connectionParameters?.host));
+  assert.equal(db.connectionParameters?.database, 'telecheck_care_intake');
+  const identity = (await db.query('SELECT current_database() AS db')).rows[0];
   assert.equal(identity.db, 'telecheck_care_intake');
-  assert(['127.0.0.1', '::1'].includes(identity.host));
   const before = await fingerprint(db);
   const definition = (
     await db.query(
