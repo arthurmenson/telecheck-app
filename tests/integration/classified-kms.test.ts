@@ -100,6 +100,8 @@ async function fixture(
     sessionId = ulid();
   const connection = await admin.connect();
   try {
+    await connection.query('BEGIN');
+    await connection.query('SELECT set_tenant_context($1)', [tenantId]);
     for (const [id, type] of role === 'patient'
       ? [[patientId, 'patient']]
       : [
@@ -127,6 +129,11 @@ async function fixture(
       "INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash, expires_at) VALUES ($1,$2,$3,$4,clock_timestamp() + INTERVAL '1 hour')",
       [sessionId, tenantId, accountId, randomBytes(32).toString('hex')],
     );
+    await connection.query('SELECT clear_tenant_context()');
+    await connection.query('COMMIT');
+  } catch (error) {
+    await connection.query('ROLLBACK');
+    throw error;
   } finally {
     connection.release();
   }

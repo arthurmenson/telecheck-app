@@ -6,6 +6,7 @@ import pg from 'pg';
 import { applyMigrations } from './migrate.mjs';
 import { verifyCareIntakeRollback } from './verify-care-intake-rollback.mjs';
 import { verifyPatientCrisisHistoryRollback } from './verify-patient-crisis-history-rollback.mjs';
+import { verifyStaffEnrollmentRollback } from './verify-staff-enrollment-rollback.mjs';
 
 assert.equal(process.env.NODE_ENV, 'test');
 assert.equal(process.env.CARE_SYNTHETIC_ACCEPTANCE, 'true');
@@ -31,6 +32,7 @@ try {
   assert.equal(replay.applied, 0);
   console.log('Care replay', replay);
   await verifyCareIntakeRollback(setup);
+  await verifyStaffEnrollmentRollback(setup);
   await verifyPatientCrisisHistoryRollback(setup);
   for (const role of [
     'telecheck_app_role',
@@ -96,6 +98,7 @@ const preservation = new pg.Client({ connectionString: setupUrl.href });
 await preservation.connect();
 try {
   await verifyCareIntakeRollback(preservation);
+  await verifyStaffEnrollmentRollback(preservation);
   await verifyPatientCrisisHistoryRollback(preservation);
 } finally {
   await preservation.end();

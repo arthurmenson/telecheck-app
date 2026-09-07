@@ -206,6 +206,16 @@ export async function loginStartHandler(
         };
       }
 
+      if (account.account_type === 'clinician' && account.status === 'pending_verification') {
+        return {
+          status: 403,
+          view: makeErrorEnvelope(
+            req.id,
+            'identity.staff.authentication_required',
+            'Staff authentication setup is required.',
+          ),
+        };
+      }
       if (account.status !== 'active' && account.status !== 'pending_verification') {
         return {
           status: 400,
@@ -292,6 +302,16 @@ export async function loginVerifyHandler(
         };
       }
 
+      if (account.account_type === 'clinician' && account.status === 'pending_verification') {
+        return {
+          status: 403,
+          view: makeErrorEnvelope(
+            req.id,
+            'identity.staff.authentication_required',
+            'Staff authentication setup is required.',
+          ),
+        };
+      }
       // Verify OTP (consume on success in same tx)
       const verify = await otpService.verifyOtp(
         ctx,

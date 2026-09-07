@@ -84,10 +84,10 @@ export interface Account {
   email: string | null;
   first_name: string;
   last_name: string;
-  date_of_birth: string; // ISO date YYYY-MM-DD (Postgres DATE)
-  gender: AccountGender;
+  date_of_birth: string | null; // Required for patients; not collected for staff enrollment.
+  gender: AccountGender | null;
   national_id: string | null;
-  country_of_residence: string; // ISO 3166-1 alpha-2
+  country_of_residence: string | null; // Required for patients; not inferred for staff.
   country_of_care: 'US' | 'GH';
   locale: string; // BCP 47 (e.g., 'en-US')
   account_type: AccountType;

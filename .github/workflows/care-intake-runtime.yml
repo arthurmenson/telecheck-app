@@ -8,10 +8,12 @@ on:
       - 'src/modules/forms-intake/**'
       - 'src/modules/consent/**'
       - 'src/modules/billing/**'
+      - 'src/modules/identity/**'
       - 'src/lib/**'
       - 'migrations/**'
       - 'scripts/verify-care-intake*.mjs'
       - 'scripts/verify-patient-crisis-history-rollback*.mjs'
+      - 'scripts/verify-staff-enrollment*.mjs'
       - '.github/workflows/care-intake-runtime.yml'
   push:
     branches: [main]
@@ -21,10 +23,12 @@ on:
       - 'src/modules/forms-intake/**'
       - 'src/modules/consent/**'
       - 'src/modules/billing/**'
+      - 'src/modules/identity/**'
       - 'src/lib/**'
       - 'migrations/**'
       - 'scripts/verify-care-intake*.mjs'
       - 'scripts/verify-patient-crisis-history-rollback*.mjs'
+      - 'scripts/verify-staff-enrollment*.mjs'
       - '.github/workflows/care-intake-runtime.yml'
 permissions:
   contents: read
