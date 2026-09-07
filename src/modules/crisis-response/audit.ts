@@ -126,9 +126,14 @@ export type CrisisDetectionSourceSurface = 'mode_1_chat' | 'community' | 'forms'
  * `emitCrisisDetectedAudit` envelope construction. The slice-role
  * → ActorType derivation is now centralized at this site.
  */
-export type CrisisInitiatorActorIdentity = 'clinician' | 'on_call_clinician' | 'ai_mode1_service';
+export type CrisisInitiatorActorIdentity =
+  | 'clinician'
+  | 'on_call_clinician'
+  | 'ai_mode1_service'
+  | 'patient';
 
 const CRISIS_INITIATOR_ACTOR_TYPE: Readonly<Record<CrisisInitiatorActorIdentity, ActorType>> = {
+  patient: 'patient',
   clinician: 'clinician',
   on_call_clinician: 'clinician',
   ai_mode1_service: 'ai_workload',
@@ -243,6 +248,7 @@ export async function emitCrisisDetectedAudit(
     severity: CrisisSeverity;
     regulatoryReportingEnabled: boolean;
     sourceSurface: CrisisDetectionSourceSurface;
+    detectorVersion?: 'keyword_engineering_v1';
   },
   tx: AuditDbClient,
 ): Promise<AuditEnvelope> {
@@ -280,6 +286,7 @@ export async function emitCrisisDetectedAudit(
       // incident reconstruction can correlate the audit row to the
       // detecting surface without joining domain-events.
       source_surface: args.sourceSurface,
+      ...(args.detectorVersion ? { detector_version: args.detectorVersion } : {}),
     },
     engine_versions: null,
     // crisis.detected is NOT an I-012 action-class member (I-012
