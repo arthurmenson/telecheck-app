@@ -116,13 +116,15 @@ DECLARE f JSONB; o JSONB; prior JSONB := '{}'::JSONB; source JSONB; opt_values T
 BEGIN
   IF octet_length(p::TEXT) > 65536 THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
   PERFORM public.forms_require_keys(p,ARRAY['contract_version','kind','locale','title','description','fields','elements'],ARRAY['contract_version','kind','locale','title','fields','elements']);
-  IF p->>'contract_version' IS DISTINCT FROM 'consult_intake_v1' OR p->>'kind' NOT IN ('general_consult','program')
-    OR p->>'locale' IS DISTINCT FROM ('en-' || country) OR NOT public.forms_safe_text(p->'title',200)
+  IF jsonb_typeof(p->'contract_version') IS DISTINCT FROM 'string' OR p->>'contract_version' IS DISTINCT FROM 'consult_intake_v1'
+    OR jsonb_typeof(p->'kind') IS DISTINCT FROM 'string' OR p->>'kind' NOT IN ('general_consult','program')
+    OR jsonb_typeof(p->'locale') IS DISTINCT FROM 'string' OR p->>'locale' IS DISTINCT FROM ('en-' || country) OR NOT public.forms_safe_text(p->'title',200)
     OR (p ? 'description' AND NOT public.forms_safe_text(p->'description',1000))
     OR jsonb_typeof(p->'fields') IS DISTINCT FROM 'array' OR jsonb_array_length(p->'fields') NOT BETWEEN 1 AND 64
     OR jsonb_typeof(p->'elements') IS DISTINCT FROM 'array' OR jsonb_array_length(p->'elements') > 16
   THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
   FOR f IN SELECT * FROM jsonb_array_elements(p->'fields') LOOP
+    IF jsonb_typeof(f->'type') IS DISTINCT FROM 'string' THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
     keys := ARRAY['id','type','label','help_text','required','visible_when'];
     IF f->>'type' = 'text' THEN keys := keys || ARRAY['max_length'];
     ELSIF f->>'type' = 'number' THEN keys := keys || ARRAY['min','max'];
@@ -130,7 +132,9 @@ BEGIN
     ELSIF f->>'type' = 'multiselect' THEN keys := keys || ARRAY['options','max_selections'];
     ELSIF f->>'type' IS DISTINCT FROM 'boolean' THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
     PERFORM public.forms_require_keys(f,keys,ARRAY['id','type','label','required']);
-    IF f->>'id' !~ '^[a-z][a-z0-9_]{0,63}$' OR f->>'id' ~* 'research|consent' OR prior ? (f->>'id')
+    -- ->> coerces JSON booleans/numbers to text. Check the JSON type first;
+    -- the immutable snapshot must remain consumable by the strict runtime parser.
+    IF jsonb_typeof(f->'id') IS DISTINCT FROM 'string' OR f->>'id' !~ '^[a-z][a-z0-9_]{0,63}$' OR f->>'id' ~* 'research|consent' OR prior ? (f->>'id')
       OR NOT public.forms_safe_text(f->'label',200) OR (f ? 'help_text' AND NOT public.forms_safe_text(f->'help_text',500))
       OR jsonb_typeof(f->'required') IS DISTINCT FROM 'boolean'
     THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
@@ -143,7 +147,7 @@ BEGIN
       opt_values := ARRAY[]::TEXT[];
       FOR o IN SELECT * FROM jsonb_array_elements(f->'options') LOOP
         PERFORM public.forms_require_keys(o,ARRAY['value','label'],ARRAY['value','label']);
-        IF o->>'value' !~ '^[a-z][a-z0-9_]{0,63}$' OR o->>'value' = ANY(opt_values) OR NOT public.forms_safe_text(o->'label',100)
+        IF jsonb_typeof(o->'value') IS DISTINCT FROM 'string' OR o->>'value' !~ '^[a-z][a-z0-9_]{0,63}$' OR o->>'value' = ANY(opt_values) OR NOT public.forms_safe_text(o->'label',100)
         THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
         opt_values := array_append(opt_values,o->>'value');
       END LOOP;
@@ -152,6 +156,7 @@ BEGIN
     END IF;
     IF f ? 'visible_when' THEN
       PERFORM public.forms_require_keys(f->'visible_when',ARRAY['field_id','equals'],ARRAY['field_id','equals']);
+      IF jsonb_typeof(f->'visible_when'->'field_id') IS DISTINCT FROM 'string' THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
       source := prior->(f->'visible_when'->>'field_id');
       IF source IS NULL OR source ? 'visible_when' OR NOT (
         (source->>'type' = 'boolean' AND jsonb_typeof(f->'visible_when'->'equals') = 'boolean') OR
@@ -161,12 +166,13 @@ BEGIN
     prior := prior || jsonb_build_object(f->>'id',f);
   END LOOP;
   FOR o IN SELECT * FROM jsonb_array_elements(p->'elements') LOOP
+    IF jsonb_typeof(o->'copy_classification') IS DISTINCT FROM 'string' THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
     IF o->>'copy_classification' = 'program_level' THEN
       PERFORM public.forms_require_keys(o,ARRAY['copy_classification','text'],ARRAY['copy_classification','text']);
       IF NOT public.forms_safe_text(o->'text',1000) THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
     ELSIF o->>'copy_classification' = 'molecule_level' THEN
       PERFORM public.forms_require_keys(o,ARRAY['copy_classification','marketing_copy_id','content_hash'],ARRAY['copy_classification','marketing_copy_id','content_hash']);
-      IF o->>'marketing_copy_id' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR o->>'content_hash' !~ '^[a-f0-9]{64}$' THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
+      IF jsonb_typeof(o->'marketing_copy_id') IS DISTINCT FROM 'string' OR o->>'marketing_copy_id' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR jsonb_typeof(o->'content_hash') IS DISTINCT FROM 'string' OR o->>'content_hash' !~ '^[a-f0-9]{64}$' THEN RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
     ELSE RAISE EXCEPTION 'forms_contract_invalid' USING ERRCODE = '22023'; END IF;
   END LOOP;
 END $$;
@@ -234,7 +240,7 @@ BEGIN
   IF t.branching_logic NOT IN ('{}'::JSONB,'{"rules":[],"computed_fields":[]}'::JSONB) THEN RAISE EXCEPTION 'forms_unsupported_branching' USING ERRCODE = '22023'; END IF;
   g := t.approval_governance;
   PERFORM public.forms_require_keys(g,ARRAY['mode','mode2_contract_id','mode2_contract_hash','development_only'],ARRAY['mode','development_only']);
-  IF jsonb_typeof(g->'development_only') IS DISTINCT FROM 'boolean' OR g->>'mode' NOT IN ('mode1','mode2') THEN RAISE EXCEPTION 'forms_governance_invalid' USING ERRCODE = '22023'; END IF;
+  IF jsonb_typeof(g->'development_only') IS DISTINCT FROM 'boolean' OR jsonb_typeof(g->'mode') IS DISTINCT FROM 'string' OR g->>'mode' NOT IN ('mode1','mode2') THEN RAISE EXCEPTION 'forms_governance_invalid' USING ERRCODE = '22023'; END IF;
   IF t.presentation_content->>'kind' = 'general_consult' AND (
     t.eligibility_logic NOT IN ('{}'::JSONB,'{"eligibility_rules":[],"contraindications":[]}'::JSONB)
     OR g->>'mode' <> 'mode1' OR jsonb_array_length(t.presentation_content->'elements') <> 0
@@ -246,6 +252,7 @@ BEGIN
     IF l3->'contraindications' <> '[]'::JSONB OR jsonb_typeof(l3->'eligibility_rules') IS DISTINCT FROM 'array' OR jsonb_array_length(l3->'eligibility_rules') NOT BETWEEN 1 AND 64 THEN RAISE EXCEPTION 'forms_eligibility_invalid' USING ERRCODE = '22023'; END IF;
     FOR rule IN SELECT * FROM jsonb_array_elements(l3->'eligibility_rules') LOOP
       PERFORM public.forms_require_keys(rule,ARRAY['field_id','operator','value','outcome'],ARRAY['field_id','operator','value','outcome']);
+      IF jsonb_typeof(rule->'field_id') IS DISTINCT FROM 'string' OR jsonb_typeof(rule->'operator') IS DISTINCT FROM 'string' OR jsonb_typeof(rule->'outcome') IS DISTINCT FROM 'string' THEN RAISE EXCEPTION 'forms_eligibility_invalid' USING ERRCODE = '22023'; END IF;
       SELECT f INTO field FROM jsonb_array_elements(t.presentation_content->'fields') f WHERE f->>'id' = rule->>'field_id';
       IF field IS NULL OR rule->>'outcome' IS DISTINCT FROM 'clinical_review_required' OR rule->>'operator' NOT IN ('equals','lt','gt')
         OR (rule->>'operator' IN ('lt','gt') AND (field->>'type' <> 'number' OR jsonb_typeof(rule->'value') <> 'number'))
@@ -281,7 +288,7 @@ BEGIN
   IF g->>'mode' = 'mode1' THEN
     IF g ? 'mode2_contract_id' OR g ? 'mode2_contract_hash' THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE = '22023'; END IF;
   ELSE
-    IF NOT(g ?& ARRAY['mode2_contract_id','mode2_contract_hash']) OR g->>'mode2_contract_id' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR g->>'mode2_contract_hash' !~ '^[a-f0-9]{64}$'
+    IF NOT(g ?& ARRAY['mode2_contract_id','mode2_contract_hash']) OR jsonb_typeof(g->'mode2_contract_id') IS DISTINCT FROM 'string' OR g->>'mode2_contract_id' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR jsonb_typeof(g->'mode2_contract_hash') IS DISTINCT FROM 'string' OR g->>'mode2_contract_hash' !~ '^[a-f0-9]{64}$'
     THEN RAISE EXCEPTION 'forms_mode2_contract_invalid' USING ERRCODE='22023'; END IF;
     SELECT r.* INTO artifact FROM public.forms_governance_artifact r JOIN public.forms_governance_membership m ON m.tenant_id=r.tenant_id AND m.account_id=r.reviewer_id AND m.capability='mode2_reviewer' AND m.revoked_at IS NULL
     JOIN public.accounts approver ON approver.tenant_id=r.tenant_id AND approver.account_id=r.reviewer_id AND approver.account_type IN ('tenant_admin','clinician') AND approver.status='active' AND approver.deleted_at IS NULL

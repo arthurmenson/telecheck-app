@@ -133,7 +133,7 @@ GRANT EXECUTE ON FUNCTION public.forms_resolve_consult_definition(TEXT,TEXT,TEXT
 
 CREATE FUNCTION public.forms_submit_governance_artifact(p_kind TEXT,p_template TEXT,p_content JSONB,p_development BOOLEAN) RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
-DECLARE a JSONB; t public.forms_template; content JSONB; hash TEXT; artifact UUID;
+DECLARE a JSONB; t public.forms_template; content JSONB; hash TEXT; artifact UUID; field JSONB; ids TEXT[];
 BEGIN
   a := public.forms_live_actor('operator');
   IF p_kind NOT IN ('clinical_review','marketing_copy','mode2_contract') OR p_development IS NULL OR octet_length(p_content::TEXT)>32768 THEN RAISE EXCEPTION 'forms_artifact_invalid' USING ERRCODE='22023'; END IF;
@@ -148,10 +148,19 @@ BEGIN
     content := p_content;
     IF p_kind='marketing_copy' THEN
       PERFORM public.forms_require_keys(content,ARRAY['text','molecule_id','country_of_care'],ARRAY['text','molecule_id','country_of_care']);
-      IF NOT public.forms_safe_text(content->'text',1000) OR NOT public.forms_safe_text(content->'molecule_id',100) OR content->>'country_of_care' IS DISTINCT FROM a->>'country_of_care' THEN RAISE EXCEPTION 'forms_artifact_invalid' USING ERRCODE='22023'; END IF;
+      IF NOT public.forms_safe_text(content->'text',1000) OR NOT public.forms_safe_text(content->'molecule_id',100) OR jsonb_typeof(content->'country_of_care') IS DISTINCT FROM 'string' OR content->>'country_of_care' IS DISTINCT FROM a->>'country_of_care' THEN RAISE EXCEPTION 'forms_artifact_invalid' USING ERRCODE='22023'; END IF;
     ELSE
       PERFORM public.forms_require_keys(content,ARRAY['fields'],ARRAY['fields']);
       IF jsonb_typeof(content->'fields') IS DISTINCT FROM 'array' OR jsonb_array_length(content->'fields') NOT BETWEEN 1 AND 64 THEN RAISE EXCEPTION 'forms_artifact_invalid' USING ERRCODE='22023'; END IF;
+      ids:=ARRAY[]::TEXT[];
+      FOR field IN SELECT * FROM jsonb_array_elements(content->'fields') LOOP
+        PERFORM public.forms_require_keys(field,ARRAY['id','type','required'],ARRAY['id','type','required']);
+        IF jsonb_typeof(field->'id') IS DISTINCT FROM 'string' OR field->>'id' !~ '^[a-z][a-z0-9_]{0,63}$' OR field->>'id' ~* 'research|consent' OR field->>'id'=ANY(ids)
+          OR jsonb_typeof(field->'type') IS DISTINCT FROM 'string' OR field->>'type' NOT IN ('text','boolean','number','select','multiselect')
+          OR jsonb_typeof(field->'required') IS DISTINCT FROM 'boolean'
+        THEN RAISE EXCEPTION 'forms_artifact_invalid' USING ERRCODE='22023'; END IF;
+        ids:=array_append(ids,field->>'id');
+      END LOOP;
     END IF;
     hash := encode(public.digest(content::TEXT,'sha256'),'hex');
   END IF;

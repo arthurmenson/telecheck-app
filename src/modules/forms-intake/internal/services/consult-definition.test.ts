@@ -1,12 +1,37 @@
 import { describe, it, expect } from 'vitest';
 
 import { presentationTextBoundaries } from '../../../../../tests/helpers/forms-presentation-boundaries.js';
+import {
+  identifierPrimitiveCases,
+  primitivePresentation,
+} from '../../../../../tests/helpers/forms-presentation-primitives.js';
 
 import {
   ConsultPresentationSchema,
   validateAnswers,
   type ConsultPresentation,
 } from './consult-definition.js';
+
+describe('presentation identifier primitives shared with SQL acceptance', () => {
+  for (const country of ['US', 'GH'] as const) {
+    for (const example of identifierPrimitiveCases(country)) {
+      it(`${country} rejects ${example.name}`, () => {
+        expect(ConsultPresentationSchema.safeParse(example.presentation).success).toBe(false);
+      });
+    }
+    it(`${country} retains string true/false and false/zero answers`, () => {
+      const presentation = primitivePresentation(country);
+      expect(ConsultPresentationSchema.safeParse(presentation).success).toBe(true);
+      expect(
+        validateAnswers(
+          presentation,
+          { true: false, count: 0, choice: 'false', many: ['true', 'false'] },
+          'submit',
+        ),
+      ).toEqual({ true: false, count: 0, choice: 'false', many: ['true', 'false'] });
+    });
+  }
+});
 
 describe('presentation Unicode bounds shared with SQL acceptance', () => {
   for (const country of ['US', 'GH'] as const) {
