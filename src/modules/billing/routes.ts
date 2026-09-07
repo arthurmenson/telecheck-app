@@ -10,6 +10,7 @@ import {
   paymentConfirmation,
   publishConsultPrice,
   quoteConsult,
+  listConsultPayments,
   receiveProviderWebhook,
 } from './internal/service.js';
 import { BillingError, type BillingActor } from './internal/types.js';
@@ -67,6 +68,15 @@ export async function registerBillingRoutes(app: FastifyInstance): Promise<void>
   app.addHook('onClose', closeBillingPool);
   app.setErrorHandler((error, req, reply) => {
     if (!billingFailure(error, reply, req.id)) void reply.send(error);
+  });
+  app.get('/consult-payments', async (req, reply) => {
+    void reply.header('Cache-Control', 'no-store');
+    const query = z
+      .object({ offset: z.coerce.number().int().min(0).max(10000).default(0) })
+      .strict()
+      .safeParse(req.query);
+    if (!query.success) throw new BillingError('billing.page_invalid', 400);
+    return listConsultPayments(billingActor(req), query.data.offset);
   });
   app.post('/consult-prices', { config: { billingBoundary: 'patient' } }, async (req, reply) => {
     void reply.header('Cache-Control', 'no-store');

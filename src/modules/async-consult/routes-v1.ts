@@ -92,6 +92,7 @@ import {
   recordDecisionV1Handler,
   requestAdditionalDataV1Handler,
 } from './internal/handlers/record-decision-v1.js';
+import { resumePaidConsultV1Handler } from './internal/handlers/resume-paid-consult-v1.js';
 import {
   admitCareIntakeV1Request,
   submitIntakeV1Handler,
@@ -106,6 +107,11 @@ export const registerAsyncConsultV1Routes: FastifyPluginAsync = async (
   app.get('/queue', getQueueV1Handler);
 
   app.post('/', { config: { billingBoundary: 'patient' } }, initiateConsultV1Handler);
+  app.post(
+    '/payments/:payment_id/resume',
+    { config: { billingBoundary: 'patient' } },
+    resumePaidConsultV1Handler,
+  );
   app.get('/', listConsultsV1Handler);
   app.get('/:consult_id', getConsultV1Handler);
   app.get('/:consult_id/care-progress', careProgressV1Handler);

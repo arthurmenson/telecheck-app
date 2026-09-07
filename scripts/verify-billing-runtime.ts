@@ -226,10 +226,66 @@ async function providerFailureProbes(
         );
         await provisionSyntheticBillingKms(setup, tenant);
       }
-      const retry = await post('/v1/async-consults', patient.headers, body, key);
+      const discovered = await app.inject({
+        method: 'GET',
+        url: '/v1/billing/consult-payments',
+        headers: patient.headers,
+      });
+      assert.equal(discovered.statusCode, fault === 'session_revoked' ? 403 : 200);
+      let retry;
+      if (fault === 'session_revoked') {
+        retry = await post('/v1/async-consults', patient.headers, body, key);
+      } else {
+        const page = discovered.json<{
+          items: Array<{
+            payment_intent_id: string;
+            consult_id: null;
+            payment_status: string;
+            resume_available: boolean;
+          }>;
+          has_unresolved_payment: boolean;
+        }>();
+        assert.equal(page.items.length, 1);
+        assert.equal(page.items[0]!.consult_id, null);
+        assert.equal(page.items[0]!.payment_status, 'creation_unknown');
+        assert.equal(page.items[0]!.resume_available, true);
+        assert.equal(page.has_unresolved_payment, true);
+        const paymentId = page.items[0]!.payment_intent_id;
+        if (fault === 'response_lost') {
+          await setup.query(
+            "UPDATE public.billing_payment_intent SET lease_token=$3,lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE tenant_id=$1 AND id=$2",
+            [tenant, paymentId, randomUUID()],
+          );
+          const leased = await post(
+            `/v1/async-consults/payments/${paymentId}/resume`,
+            patient.headers,
+            {},
+          );
+          assert.equal(leased.statusCode, 409);
+          assert.equal(
+            leased.json<{ error: { code: string } }>().error.code,
+            'billing.creation_in_flight',
+          );
+          assert.equal(calls, 1, 'a live lease cannot create another provider attempt');
+          await setup.query(
+            "UPDATE public.billing_payment_intent SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND id=$2",
+            [tenant, paymentId],
+          );
+        }
+        retry = await post(`/v1/async-consults/payments/${paymentId}/resume`, patient.headers, {});
+      }
       assert.equal(retry.statusCode, fault === 'session_revoked' ? 403 : 201, fault);
       assert.equal(calls, fault === 'session_revoked' ? 1 : 2);
       assert.equal(ledger.size, 1, 'one provider object under the stable reference');
+      if (fault !== 'session_revoked') {
+        const originalRetry = await post('/v1/async-consults', patient.headers, body, key);
+        assert.equal(originalRetry.statusCode, 201);
+        assert.equal(
+          originalRetry.json<{ consult_id: string }>().consult_id,
+          retry.json<{ consult_id: string }>().consult_id,
+        );
+        assert.equal(calls, 2, 'original initiation also resolves the recovered provider intent');
+      }
       if (fault !== 'session_revoked') {
         const result = retry.json<{ payment_intent_id: string; confirmation: { href: string } }>();
         const confirmation = await app.inject({
@@ -793,6 +849,88 @@ async function paystackRuntimeProbes(
     );
   }
 }
+async function blockedRecoveryAuthorizationProbes(host: string, tenant: string) {
+  for (const fault of ['payment_list', 'reservation_lock', 'resume_replay'] as const) {
+    const person = await register(host);
+    const quote = await post('/v1/billing/consult-quotes', person.headers, {
+      consult_type: 'general',
+    });
+    assert.equal(quote.statusCode, 201);
+    const created = await post('/v1/async-consults', person.headers, {
+      consult_type: 'general',
+      initiation_source: 'care_tab',
+      accepted_quote_id: quote.json<{ quote_id: string }>().quote_id,
+    });
+    assert.equal(created.statusCode, 201);
+    const c = created.json<{ payment_intent_id: string; consult_id: string }>();
+    const url = `/v1/async-consults/payments/${c.payment_intent_id}/resume`;
+    const key = ulid();
+    if (fault === 'resume_replay')
+      assert.equal((await post(url, person.headers, {}, key)).statusCode, 201);
+    const operation = (
+      await setup.query<{ operation_key: string }>(
+        'SELECT operation_key FROM public.billing_payment_intent WHERE tenant_id=$1 AND id=$2',
+        [tenant, c.payment_intent_id],
+      )
+    ).rows[0]!.operation_key;
+    await setup.query('BEGIN');
+    if (fault === 'payment_list')
+      await setup.query('LOCK TABLE public.billing_payment_intent IN ACCESS EXCLUSIVE MODE');
+    else if (fault === 'resume_replay')
+      await setup.query('LOCK TABLE public.idempotency_keys IN ACCESS EXCLUSIVE MODE');
+    else
+      await setup.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+        `billing_reserve:${tenant}:${person.claims.sub}:${operation}`,
+      ]);
+    const blocked =
+      fault === 'payment_list'
+        ? app.inject({
+            method: 'GET',
+            url: '/v1/billing/consult-payments',
+            headers: person.headers,
+          })
+        : post(url, person.headers, {}, key);
+    try {
+      let waiting = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        await setup.query('SELECT pg_stat_clear_snapshot()');
+        waiting = (
+          await setup.query<{ waiting: boolean }>(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE usename IN ('billing_service_role','telecheck_app_role') AND wait_event_type='Lock' AND pg_backend_pid()=ANY(pg_blocking_pids(pid))) AS waiting",
+          )
+        ).rows[0]!.waiting;
+        if (waiting) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(waiting, `recovery reached blocked ${fault}`);
+      await setup.query(
+        "UPDATE public.sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND session_id=$2",
+        [tenant, person.claims.session_id],
+      );
+      await setup.query('COMMIT');
+      const denied = await blocked;
+      assert.equal(denied.statusCode, 403, `recovery expired while blocked ${fault}`);
+      assert.ok(!denied.body.includes(c.payment_intent_id));
+      assert.ok(!denied.body.includes(c.consult_id));
+      assert.equal(
+        (
+          await setup.query<{ n: number }>(
+            'SELECT count(*)::int AS n FROM public.consult WHERE tenant_id=$1 AND patient_id=$2',
+            [tenant, person.claims.sub],
+          )
+        ).rows[0]!.n,
+        1,
+      );
+      evidence.push(
+        `${tenant}: ${fault} reauthorizes after actual lock wait; expired session receives no payment/case metadata`,
+      );
+    } catch (error) {
+      await setup.query('ROLLBACK');
+      await blocked;
+      throw error;
+    }
+  }
+}
 async function blockedConsultAuthorizationProbes(host: string, tenant: string) {
   for (const fault of ['outbox_commit', 'cached_replay'] as const) {
     const patient = await register(host);
@@ -1080,6 +1218,16 @@ try {
       {},
     );
     assert.equal(paid.statusCode, 200, `mock confirmation ${paid.statusCode}`);
+    const completedPage = await app.inject({
+      method: 'GET',
+      url: '/v1/billing/consult-payments',
+      headers: person.headers,
+    });
+    assert.equal(completedPage.statusCode, 200);
+    assert.equal(
+      completedPage.json<{ has_unresolved_payment: boolean }>().has_unresolved_payment,
+      false,
+    );
     assert.equal(
       (
         await post(
@@ -1239,8 +1387,147 @@ try {
       );
       await setup.query('DROP FUNCTION public.billing_acceptance_outbox_fault()');
     }
-    const resumed = await post('/v1/async-consults', person.headers, rollbackBody, rollbackKey);
+    // The browser lost its original initiation key. Discover the durable Billing
+    // reservation and resume by its server identifier without accepting new money.
+    const discovered = await app.inject({
+      method: 'GET',
+      url: '/v1/billing/consult-payments',
+      headers: person.headers,
+    });
+    assert.equal(discovered.statusCode, 200);
+    assert.equal(discovered.headers['cache-control'], 'no-store');
+    const page = discovered.json<{
+      items: Array<{
+        payment_intent_id: string;
+        consult_id: string | null;
+        payment_status: string;
+        accepted_at: string;
+        price: Record<string, unknown>;
+        resume_available: boolean;
+      }>;
+      offset: number;
+      limit: number;
+      has_more: boolean;
+      has_unresolved_payment: boolean;
+    }>();
+    assert.deepEqual(
+      Object.keys(page).sort(),
+      ['items', 'offset', 'limit', 'has_more', 'has_unresolved_payment'].sort(),
+    );
+    assert.equal(page.offset, 0);
+    assert.equal(page.limit, 25);
+    assert.equal(page.has_unresolved_payment, true);
+    const orphan = page.items.find((item) => item.consult_id === null)!;
+    assert.ok(orphan);
+    assert.deepEqual(
+      Object.keys(orphan).sort(),
+      [
+        'payment_intent_id',
+        'consult_id',
+        'payment_status',
+        'accepted_at',
+        'price',
+        'resume_available',
+      ].sort(),
+    );
+    assert.equal(orphan.payment_status, 'requires_payment');
+    assert.equal(orphan.resume_available, true);
+    assert.ok(Number.isFinite(Date.parse(orphan.accepted_at)));
+    assert.deepEqual(orphan.price, {
+      amount_minor: price.amount_minor,
+      currency,
+      provider: 'mock_local_dev',
+      mode: 'mock_local_dev',
+    });
+    const offpage = await app.inject({
+      method: 'GET',
+      url: '/v1/billing/consult-payments?offset=25',
+      headers: person.headers,
+    });
+    assert.equal(offpage.statusCode, 200);
+    assert.deepEqual(offpage.json<{ items: unknown[] }>().items, []);
+    assert.equal(offpage.json<{ has_unresolved_payment: boolean }>().has_unresolved_payment, true);
+    const unrelated = await app.inject({
+      method: 'GET',
+      url: '/v1/billing/consult-payments',
+      headers: other.headers,
+    });
+    assert.equal(unrelated.statusCode, 200);
+    assert.deepEqual(unrelated.json<{ items: unknown[] }>().items, []);
+    assert.equal(
+      unrelated.json<{ has_unresolved_payment: boolean }>().has_unresolved_payment,
+      false,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/v1/billing/consult-payments',
+          headers: adminHeaders,
+        })
+      ).statusCode,
+      403,
+    );
+    for (const query of [
+      'offset=-1',
+      'offset=10001',
+      'offset=0.5',
+      'offset=invalid',
+      'patient_id=' + person.claims.sub,
+    ]) {
+      assert.equal(
+        (
+          await app.inject({
+            method: 'GET',
+            url: '/v1/billing/consult-payments?' + query,
+            headers: person.headers,
+          })
+        ).statusCode,
+        400,
+      );
+    }
+    const resumeUrl = `/v1/async-consults/payments/${orphan.payment_intent_id}/resume`;
+    assert.equal((await post(resumeUrl, other.headers, {})).statusCode, 404);
+    assert.equal((await post(resumeUrl, adminHeaders, {})).statusCode, 403);
+    assert.equal((await post(resumeUrl, person.headers, { amount_minor: 1 })).statusCode, 400);
+    assert.equal((await post(resumeUrl + '?amount_minor=1', person.headers, {})).statusCode, 400);
+    const resumeKey = ulid();
+    const resumed = await post(resumeUrl, person.headers, {}, resumeKey);
     assert.equal(resumed.statusCode, 201);
+    assert.equal(
+      resumed.json<{ payment_intent_id: string }>().payment_intent_id,
+      orphan.payment_intent_id,
+    );
+    assert.equal(
+      (await post(resumeUrl, person.headers, {}, resumeKey)).json<{ consult_id: string }>()
+        .consult_id,
+      resumed.json<{ consult_id: string }>().consult_id,
+    );
+    const originalRetry = await post(
+      '/v1/async-consults',
+      person.headers,
+      rollbackBody,
+      rollbackKey,
+    );
+    assert.equal(originalRetry.statusCode, 201);
+    assert.equal(
+      originalRetry.json<{ consult_id: string }>().consult_id,
+      resumed.json<{ consult_id: string }>().consult_id,
+    );
+    const parallelResumes = await Promise.all([
+      post(resumeUrl, person.headers, {}),
+      post(resumeUrl, person.headers, {}),
+    ]);
+    for (const response of parallelResumes) {
+      assert.equal(response.statusCode, 201);
+      assert.equal(
+        response.json<{ consult_id: string }>().consult_id,
+        resumed.json<{ consult_id: string }>().consult_id,
+      );
+    }
+    evidence.push(
+      `${country}: discover orphan accepted payment after local rollback; metadata-only own list and off-page unresolved flag; new-key, original-key and concurrent resume retain the single payment and case`,
+    );
     assert.equal(
       (
         await setup.query<{ n: number }>(
@@ -1314,6 +1601,7 @@ try {
       'expired',
     );
 
+    await blockedRecoveryAuthorizationProbes(host, tenant);
     if (country === 'US') {
       const originalDsn = process.env['BILLING_DATABASE_URL']!;
       await closeBillingPool();
