@@ -4,6 +4,75 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { ulid } from '../src/lib/ulid.ts';
 
+export async function verifyStaffMembershipShape(admin, author, reviewer) {
+  const insert = `INSERT INTO public.identity_staff_membership(tenant_id,account_id,capability,
+    granted_at,granted_by,evidence_sha256,provisioning_reference,revoked_at,revocation_reference)
+    VALUES($1,$2,'clinician_enroller',clock_timestamp()-interval '1 hour',$3,$4,
+      'synthetic-membership-shape',$5::timestamptz,$6)`;
+  const now = new Date();
+  const beforeGrant = new Date(now.getTime() - 2 * 3600_000);
+  const cases = [
+    { time: null, reference: null, valid: true },
+    { time: now, reference: 'synthetic-valid-revocation', valid: true },
+    { time: now, reference: null, valid: false },
+    { time: null, reference: 'synthetic-partial-revocation', valid: false },
+    { time: now, reference: '', valid: false },
+    { time: now, reference: 'x'.repeat(161), valid: false },
+    { time: beforeGrant, reference: 'synthetic-invalid-order', valid: false },
+  ];
+  const params = [author.tenant, author.account, reviewer.account, 'a'.repeat(64)];
+  for (const entry of cases) {
+    await admin.query('BEGIN');
+    try {
+      await admin.query('SELECT set_tenant_context($1)', [author.tenant]);
+      if (entry.valid) await admin.query(insert, [...params, entry.time, entry.reference]);
+      else
+        await assert.rejects(admin.query(insert, [...params, entry.time, entry.reference]), {
+          code: '23514',
+        });
+    } finally {
+      await admin.query('ROLLBACK');
+    }
+  }
+  for (const reference of [null, '', 'x'.repeat(161)]) {
+    await admin.query('BEGIN');
+    try {
+      await admin.query('SELECT set_tenant_context($1)', [author.tenant]);
+      await admin.query(insert, [...params, null, null]);
+      await assert.rejects(
+        admin.query(
+          'UPDATE identity_staff_membership SET revoked_at=clock_timestamp(),revocation_reference=$3 WHERE tenant_id=$1 AND account_id=$2',
+          [author.tenant, author.account, reference],
+        ),
+        { code: '23514' },
+      );
+    } finally {
+      await admin.query('ROLLBACK');
+    }
+  }
+  await admin.query('BEGIN');
+  try {
+    await admin.query('SELECT set_tenant_context($1)', [author.tenant]);
+    await admin.query(insert, [...params, null, null]);
+    await admin.query(
+      "UPDATE identity_staff_membership SET revoked_at=clock_timestamp(),revocation_reference='synthetic-revoke' WHERE tenant_id=$1 AND account_id=$2",
+      [author.tenant, author.account],
+    );
+    await assert.rejects(
+      admin.query(
+        'UPDATE identity_staff_membership SET revoked_at=NULL,revocation_reference=NULL WHERE tenant_id=$1 AND account_id=$2',
+        [author.tenant, author.account],
+      ),
+      { code: '23514' },
+    );
+  } finally {
+    await admin.query('ROLLBACK');
+  }
+  console.log(
+    `${author.country}: 11 membership shape/revocation cases passed without retained fixture changes`,
+  );
+}
+
 export async function verifyStaffEnrollment({
   admin,
   ordinary,
@@ -31,6 +100,7 @@ export async function verifyStaffEnrollment({
     inject({ method: 'POST', url: path, headers: headers(who, key), payload });
   assert.equal((await call(author)).statusCode, 403, 'role alone cannot enroll');
   assert.equal((await call(patient)).statusCode, 403, 'patient cannot enroll');
+  await verifyStaffMembershipShape(admin, author, reviewer);
   await admin.query(
     `INSERT INTO public.identity_staff_membership(tenant_id,account_id,capability,granted_by,evidence_sha256,provisioning_reference)
     VALUES($1,$2,'clinician_enroller',$3,$4,'synthetic-isolated-acceptance-only')`,
