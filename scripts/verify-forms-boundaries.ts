@@ -25,7 +25,7 @@ type Receipt = {
   content_hash: string;
   review_id: string;
 };
-type Context = {
+export type FormsAcceptanceContext = {
   admin: pg.Client;
   ordinary: pg.Client;
   binder: pg.Client;
@@ -40,7 +40,7 @@ type Context = {
   ) => Promise<Receipt>;
 };
 
-export async function verifyFormsBoundaries(ctx: Context, tenant: Actor['tenant']) {
+export async function verifyFormsBoundaries(ctx: FormsAcceptanceContext, tenant: Actor['tenant']) {
   const { admin, ordinary, binder, app, actor, request } = ctx;
   const country = tenant === 'Telecheck-US' ? 'US' : 'GH';
   const body = (program = ulid()) => ({

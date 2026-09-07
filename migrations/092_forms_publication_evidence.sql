@@ -33,6 +33,7 @@ GRANT EXECUTE ON FUNCTION public.forms_publication_receipt(TEXT) TO telecheck_ap
 
 CREATE FUNCTION public.forms_require_publication_evidence() RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE target public.forms_template;
 BEGIN
   -- A raw SQL status change still needs same-transaction durable evidence.
   IF NOT EXISTS(SELECT 1 FROM public.audit_records a WHERE a.tenant_id=NEW.tenant_id
@@ -43,6 +44,15 @@ BEGIN
       AND e.aggregate_id=NEW.template_id AND e.event_type='forms.publication.checked'
       AND e.payload->>'schema_hash'=NEW.schema_hash AND public.forms_current_transaction_write(e.xmin))
   THEN RAISE EXCEPTION 'forms_publication_evidence_required' USING ERRCODE='23514'; END IF;
+  SELECT * INTO target FROM public.forms_template WHERE tenant_id=NEW.tenant_id AND template_id=NEW.template_id;
+  IF NOT FOUND OR target.status NOT IN ('published','superseded') OR target.deleted_at IS NOT NULL
+    OR public.forms_template_hash(target) IS DISTINCT FROM NEW.schema_hash
+    OR target.presentation_content IS DISTINCT FROM NEW.presentation OR target.approval_governance IS DISTINCT FROM NEW.governance
+  THEN RAISE EXCEPTION 'forms_publication_contract_changed' USING ERRCODE='22023'; END IF;
+  -- Re-run every gate after the evidence writes. Lock the selected approval,
+  -- membership and qualified account through commit, including when the HTTP
+  -- layer flushes this constraint before later cache/outbox work.
+  PERFORM public.forms_assert_publication_contract(target,true);
   PERFORM public.forms_live_actor('reviewer');
   RETURN NULL;
 END $$;

@@ -3,6 +3,8 @@ DROP TRIGGER IF EXISTS forms_publication_boundary ON public.forms_template;
 DROP TRIGGER IF EXISTS forms_definition_immutable ON public.forms_published_definition;
 DROP FUNCTION IF EXISTS public.forms_published_definition_immutable();
 DROP FUNCTION IF EXISTS public.forms_enforce_publication();
+DROP FUNCTION IF EXISTS public.forms_assert_publication_contract(public.forms_template,BOOLEAN);
+DROP FUNCTION IF EXISTS public.forms_require_approved_artifact(TEXT,UUID,TEXT,TEXT,BOOLEAN);
 DROP FUNCTION IF EXISTS public.forms_template_hash(public.forms_template);
 DROP FUNCTION IF EXISTS public.forms_validate_presentation(JSONB,TEXT);
 DROP FUNCTION IF EXISTS public.forms_safe_text(JSONB,INTEGER);
