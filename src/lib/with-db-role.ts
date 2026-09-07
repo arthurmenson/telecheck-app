@@ -108,6 +108,8 @@ import type { DbClient } from './db.js';
 // ---------------------------------------------------------------------------
 
 export const SLICE_ROLES = [
+  'consent_care_patient',
+  'consent_care_operator',
   // Crisis Response (SI-022; 7 roles)
   'crisis_initiator',
   'crisis_acknowledger',

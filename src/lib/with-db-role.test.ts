@@ -223,8 +223,10 @@ describe('with-db-role §4 — callback throw propagation + restore-on-throw', (
 });
 
 describe('with-db-role §5 — allowlist composition', () => {
-  it('SLICE_ROLES contains 7 Crisis + 2 Admin + 4 Med-Interaction + 5 Async-Consult + 2 AI-Service + 4 Subscription + 2 AI-Provider-Credentials + 1 Pharmacy = 27 roles', () => {
-    expect(SLICE_ROLES).toHaveLength(27);
+  it('SLICE_ROLES contains the existing 27 roles plus two care-consent callers', () => {
+    expect(SLICE_ROLES).toHaveLength(29);
+    expect(SLICE_ROLES).toContain('consent_care_patient');
+    expect(SLICE_ROLES).toContain('consent_care_operator');
     // Spot-check one from each slice
     expect(SLICE_ROLES).toContain('crisis_initiator');
     expect(SLICE_ROLES).toContain('admin_basic_operator');
@@ -255,6 +257,7 @@ describe('with-db-role §5 — allowlist composition', () => {
   it('SLICE_ROLES does NOT contain wrapper-owner / view-owner / writer-owner roles', () => {
     // These are internal SECDEF identities, never SET-ROLEd into by handlers.
     const forbidden = [
+      'consent_care_owner',
       'crisis_initiation_wrapper_owner',
       'crisis_event_current_state_view_owner',
       'crisis_event_lifecycle_transition_writer_owner',

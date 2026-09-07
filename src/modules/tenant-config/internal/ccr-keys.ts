@@ -24,6 +24,8 @@
  * domain for readability.
  */
 export const CCR_KEYS = {
+  // Reviewed publication bindings; no implicit country fallback.
+  CONSENT_CARE_POLICY_PUBLICATIONS: 'consent.care_policy_publications',
   // Notification domain
   NOTIFICATION_SMS_PROVIDER: 'notification.sms_provider',
   NOTIFICATION_QUIET_HOURS_OVERRIDE: 'notification.quiet_hours_override',

@@ -171,7 +171,7 @@ describe('consent HTTP — §1 I-025 error envelope tenant-blindness', () => {
     assertTenantBlind(response.body);
   });
 
-  it('§1b 400 envelope on invalid consent_type is tenant-blind', async () => {
+  it('§1b retired grant envelope is tenant-blind even for an invalid type', async () => {
     const { accessToken } = await loginAndGetToken();
     const versionId = await seedConsentVersion();
     const response = await app!.inject({
@@ -188,11 +188,11 @@ describe('consent HTTP — §1 I-025 error envelope tenant-blindness', () => {
         evidence: { timestamp: new Date().toISOString() },
       },
     });
-    expect(response.statusCode).toBe(400);
+    expect(response.statusCode).toBe(410);
     assertTenantBlind(response.body);
   });
 
-  it('§1c 404 envelope on revoke-with-no-prior-grant is tenant-blind', async () => {
+  it('§1c retired revoke envelope is tenant-blind', async () => {
     const { accessToken } = await loginAndGetToken();
     const versionId = await seedConsentVersion();
     const response = await app!.inject({
@@ -210,7 +210,7 @@ describe('consent HTTP — §1 I-025 error envelope tenant-blindness', () => {
         evidence: { timestamp: new Date().toISOString() },
       },
     });
-    expect(response.statusCode).toBe(404);
+    expect(response.statusCode).toBe(410);
     assertTenantBlind(response.body);
   });
 

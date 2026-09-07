@@ -1,0 +1,51 @@
+name: Consent isolated runtime
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/modules/consent/**'
+      - 'src/lib/**'
+      - 'migrations/**'
+      - 'scripts/verify-care-consent*.mjs'
+      - '.github/workflows/consent-runtime.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/modules/consent/**'
+      - 'src/lib/**'
+      - 'migrations/**'
+      - 'scripts/verify-care-consent*.mjs'
+      - '.github/workflows/consent-runtime.yml'
+permissions:
+  contents: read
+jobs:
+  consent-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        postgres: ['15-alpine', '16-alpine']
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: consent_ci
+          POSTGRES_PASSWORD: synthetic-consent-ci
+          POSTGRES_DB: telecheck_consent
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U consent_ci -d telecheck_consent"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      NODE_ENV: test
+      CONSENT_SYNTHETIC_ACCEPTANCE: 'true'
+      MIGRATION_DATABASE_URL: postgres://consent_ci:synthetic-consent-ci@localhost:5432/telecheck_consent
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify published terms, patient choices and live authority over real HTTP
+        run: node --import tsx scripts/verify-care-consent-ci.mjs
