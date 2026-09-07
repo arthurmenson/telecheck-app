@@ -277,7 +277,7 @@ describe('identity login HTTP — §4 sessions/{refresh,logout}', () => {
     expect(refreshBody.session.session_id).toBeTruthy();
   });
 
-  it('§4b sessions/refresh with phantom token → 400 invalid_or_expired', async () => {
+  it('§4b sessions/refresh rejects a malformed token before credential lookup', async () => {
     const response = await app!.inject({
       method: 'POST',
       url: '/v0/identity/sessions/refresh',
@@ -286,7 +286,20 @@ describe('identity login HTTP — §4 sessions/{refresh,logout}', () => {
     });
     expect(response.statusCode).toBe(400);
     const body = response.json<{ error: { code: string } }>();
-    expect(body.error.code).toBe('identity.session.invalid_or_expired');
+    expect(body.error.code).toBe('internal.request.invalid');
+  });
+
+  it('§4b sessions/refresh with a canonical unknown token → 401 invalid_or_expired', async () => {
+    const response = await app!.inject({
+      method: 'POST',
+      url: '/v0/identity/sessions/refresh',
+      headers: { host: 'localhost', 'idempotency-key': ulid() },
+      payload: { refresh_token: 'A'.repeat(43) },
+    });
+    expect(response.statusCode).toBe(401);
+    expect(response.json<{ error: { code: string } }>().error.code).toBe(
+      'identity.session.invalid_or_expired',
+    );
   });
 
   it('§4c sessions/logout with active token → 204; subsequent refresh fails', async () => {
@@ -328,7 +341,10 @@ describe('identity login HTTP — §4 sessions/{refresh,logout}', () => {
       headers: { host: 'localhost', 'idempotency-key': ulid() },
       payload: { refresh_token: refreshToken },
     });
-    expect(afterRefresh.statusCode).toBe(400);
+    expect(afterRefresh.statusCode).toBe(401);
+    expect(afterRefresh.json<{ error: { code: string } }>().error.code).toBe(
+      'identity.session.invalid_or_expired',
+    );
   });
 
   it('§4d sessions/logout with phantom token → 204 (idempotent, tenant-blind)', async () => {

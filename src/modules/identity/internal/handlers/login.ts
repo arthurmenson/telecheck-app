@@ -23,16 +23,12 @@
  *
  *   POST /sessions/refresh
  *     Body: { refresh_token }
- *     - Resolve session by hash; if active+unexpired → return new
- *       PatientSessionView
- *     - Currently a NO-OP rotation (returns the existing session view).
- *       NOT migrated to the SI-006 idempotency helper at this commit
- *       because it is read-only at v1.0 — no state mutation, no audit.
- *       When real refresh-token rotation lands (new plaintext + hash +
- *       revoke previous), migrate this handler to withIdempotentExecution.
+ *     - Rotate the current patient/delegate credential and issue a new JWT.
+ *     - Require an exact-key retry; replay is limited to the current live
+ *       rotation within the private 900-second credential cache.
  *
  *   POST /sessions/logout
- *     Body: { refresh_token }
+ *     Body: { refresh_token, refresh_idempotency_key? }
  *     - Resolve session by refresh-token plaintext
  *     - Revoke with reason='patient_logout'
  *     - Return 204 (idempotent: phantom token also returns 204 to
@@ -68,6 +64,8 @@ import { ulid } from '../../../../lib/ulid.js';
 import { withIdempotentExecution } from '../database.js';
 import * as accountService from '../services/account-service.js';
 import * as otpService from '../services/otp-service.js';
+import { patientRefreshKeySchema } from '../services/patient-refresh-contract.js';
+import { logoutPatientSession } from '../services/patient-refresh-service.js';
 import * as sessionService from '../services/session-service.js';
 import { asOtpId, asSessionId } from '../types.js';
 
@@ -119,12 +117,9 @@ interface LoginVerifyBody {
   code?: string;
 }
 
-interface SessionRefreshBody {
-  refresh_token?: string;
-}
-
 interface SessionLogoutBody {
   refresh_token?: string;
+  refresh_idempotency_key?: string;
 }
 
 function isString(v: unknown): v is string {
@@ -366,70 +361,7 @@ export async function loginVerifyHandler(
 // POST /sessions/refresh
 // ---------------------------------------------------------------------------
 
-/**
- * NOT migrated to withIdempotentExecution at this commit — the v1.0
- * implementation is a pure read (no state mutation, no audit emission;
- * "no-op rotation" returns the existing session view).
- *
- * SECURITY (Sprint 33 / SI-006 PR-F3 r4 — Codex 2026-05-07 MEDIUM
- * closure): the response is NOT actually invariant. After a successful
- * refresh, a logout/revoke can change the session state, so caching a
- * 200 response would risk replaying an active-session view post-
- * revocation for the cache TTL. The pre-r4 comment claimed "the
- * response is invariant for the same refresh_token (it's a read)";
- * that was wrong because session state is mutable.
- *
- * Defense-in-depth: this endpoint is listed in `EXEMPT_PATHS` in
- * `src/lib/idempotency.ts` so the preHandler bypasses idempotency
- * lookup entirely. Every request runs `findActiveSessionByRefreshToken`
- * live, so a revoked session is detected on every retry. No cached
- * response can replay an active-looking view post-revocation. The
- * legacy onSend cache-write hook that necessitated a per-handler opt-
- * out flag was removed in Sprint 33 PR-E; Sprint 34 cleanup-sweep
- * removed the no-op `markIdempotencyManagedByHandler` helper itself.
- *
- * When real refresh-token rotation lands (issue new plaintext + hash;
- * revoke previous; emit identity_session_rotated audit), migrate this
- * handler to the same pattern as loginVerifyHandler — the rotation
- * path WILL want idempotency-cache replay so a network-blip retry
- * returns the SAME rotated tokens (not a fresh rotation that orphans
- * the original).
- */
-export async function sessionRefreshHandler(
-  req: FastifyRequest,
-  reply: FastifyReply,
-): Promise<unknown> {
-  const ctx = requireTenantContext(req);
-  const body = (req.body ?? {}) as SessionRefreshBody;
-
-  if (!isString(body.refresh_token)) {
-    return reply.code(400).send({
-      error: {
-        code: 'internal.request.invalid',
-        message: 'refresh_token is required.',
-        request_id: req.id,
-      },
-    });
-  }
-
-  const session = await sessionService.findActiveSessionByRefreshToken(ctx, body.refresh_token);
-  if (session === null) {
-    return reply.code(400).send({
-      error: {
-        code: 'identity.session.invalid_or_expired',
-        message: 'Refresh token is invalid or expired.',
-        request_id: req.id,
-      },
-    });
-  }
-
-  // No-op rotation at v1.0 — return the existing session view. True
-  // refresh-token rotation (new plaintext + hash + revoke previous)
-  // lands in a follow-up commit.
-  return reply.code(200).send({
-    session: sessionService.toPatientSessionView(session),
-  });
-}
+export { patientRefreshHandler as sessionRefreshHandler } from './patient-refresh.js';
 
 // ---------------------------------------------------------------------------
 // POST /sessions/logout
@@ -451,11 +383,27 @@ export async function sessionLogoutHandler(
   }
 
   const refreshToken = body.refresh_token;
+  if (
+    body.refresh_idempotency_key !== undefined &&
+    !patientRefreshKeySchema.safeParse(body.refresh_idempotency_key).success
+  )
+    return reply.code(204).send();
 
   return withIdempotentExecution<null>(
     req,
     reply,
-    () => false,
+    () => {
+      void reply
+        .code(503)
+        .send(
+          makeErrorEnvelope(
+            req.id,
+            'identity.authentication.unavailable',
+            'Authentication is temporarily unavailable. Please try again.',
+          ),
+        );
+      return true;
+    },
     async (tx: DbTransaction) => {
       // Lookup session inside the tx so the revoke + audit + domain event
       // emissions are atomic with respect to it.
@@ -465,18 +413,7 @@ export async function sessionLogoutHandler(
       //
       // Use the variant that returns null on phantom; reply 204 in that
       // case (tenant-blind).
-      const session = await sessionService.findActiveSessionByRefreshToken(ctx, refreshToken, tx);
-      if (session === null) {
-        return { status: 204, view: null };
-      }
-
-      await sessionService.revokeSession(
-        ctx,
-        { actorId: 'system' },
-        session.session_id,
-        'patient_logout',
-        tx,
-      );
+      await logoutPatientSession(ctx, refreshToken, body.refresh_idempotency_key, tx);
 
       return { status: 204, view: null };
     },

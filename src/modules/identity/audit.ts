@@ -55,6 +55,7 @@ type IdentityAuditActionPlaceholder =
   | 'identity_account_activated'
   | 'identity_session_issued'
   | 'identity_session_revoked'
+  | 'identity_session_rotated'
   | 'identity_otp_issued'
   | 'identity_otp_consumed'
   | 'identity_otp_lockout_triggered'
@@ -271,6 +272,32 @@ export async function emitSessionRevokedAudit(
       detail: {
         revoked_reason: args.reason,
       },
+    }),
+    tx,
+  );
+}
+
+export async function emitSessionRotatedAudit(
+  args: {
+    tenantId: TenantId;
+    accountId: AccountId;
+    sessionId: SessionId;
+    countryOfCare: string;
+    expiresAt: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildEnvelope(identityAuditPlaceholder('identity_session_rotated'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'patient',
+      actor_id: args.accountId,
+      actor_tenant_id: args.tenantId,
+      target_patient_id: args.accountId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'session',
+      resource_id: args.sessionId,
+      detail: { expires_at: args.expiresAt },
     }),
     tx,
   );

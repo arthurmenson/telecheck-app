@@ -33,6 +33,7 @@ import {
   sessionLogoutHandler,
   sessionRefreshHandler,
 } from './internal/handlers/login.js';
+import { patientRefreshNoStore } from './internal/handlers/patient-refresh.js';
 import {
   registrationStartHandler,
   registrationVerifyHandler,
@@ -104,8 +105,8 @@ export const registerIdentityRoutes: FastifyPluginAsync = async (
    */
   app.post('/login/start', loginStartHandler);
   app.post('/login/verify', loginVerifyHandler);
-  app.post('/sessions/refresh', sessionRefreshHandler);
-  app.post('/sessions/logout', sessionLogoutHandler);
+  app.post('/sessions/refresh', { onRequest: patientRefreshNoStore }, sessionRefreshHandler);
+  app.post('/sessions/logout', { onRequest: patientRefreshNoStore }, sessionLogoutHandler);
 
   /**
    * Device management per Identity Spec v1.0 §3.1 (biometric unlock) +

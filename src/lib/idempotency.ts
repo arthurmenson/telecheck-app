@@ -422,7 +422,9 @@ const ENDPOINT_TTL_OVERRIDES: ReadonlyMap<string, number> = new Map([
   // to DEFAULT_TTL_SECONDS = 24h, a 96x dwell-time regression). recovery/verify
   // is deliberately absent — it resets the PIN and returns no tokens.
   ['/v0/identity/registration/email/verify', 900], // plaintext access_token + refresh_token
-  ['/v0/identity/login/pin', 900], // plaintext access_token + refresh_token
+  ['/v0/identity/login/pin', 900],
+  ['/v0/identity/sessions/refresh', 900], // recover only the exact current rotation
+  // plaintext access_token + refresh_token
 ]);
 
 const DEFAULT_TTL_SECONDS = 86400; // 24h per IDEMPOTENCY v5.1
@@ -841,16 +843,6 @@ const EXEMPT_PATHS = new Set([
   '/patients/:id/locale',
   '/patients/:id/notification-preferences',
   '/health',
-  // Sprint 33 / SI-006 PR-F3 r5 (Codex 2026-05-07 MEDIUM closure):
-  // /v0/identity/sessions/refresh is a session-state read whose
-  // response is NOT invariant — a logout/revoke between requests
-  // changes the session validity. Caching ANY response at this
-  // endpoint risks replaying an active-session view post-revocation
-  // for the cache TTL. Adding the path here bypasses preHandler
-  // lookup so any pre-existing cache rows (e.g., upgrade from a deploy
-  // that cached refresh responses on the legacy onSend path that was
-  // removed in Sprint 33 PR-E) are not replayed. Defense in depth.
-  '/v0/identity/sessions/refresh',
 ]);
 
 function isExempt(method: string, url: string): boolean {
