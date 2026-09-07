@@ -404,6 +404,15 @@ try {
     await request(other, progressPath, undefined, 404, 'GET');
     await request(author, progressPath, undefined, 403, 'GET');
     await request(patient, `${progressPath}?patient_id=${other.account}`, undefined, 400, 'GET');
+    const otherCountry = country === 'US' ? 'GH' : 'US';
+    const crossTenant = await register(
+      otherCountry === 'US' ? 'localhost' : 'ghana.localhost',
+      otherCountry === 'US' ? 'Telecheck-US' : 'Telecheck-Ghana',
+      otherCountry,
+    );
+    await request(crossTenant, progressPath, undefined, 404, 'GET');
+    await request(crossTenant, `/v1/async-consults/${consult.consult_id}/intake/begin`, {}, 404);
+    await request(crossTenant, `/v1/async-consults/${consult.consult_id}/intake`, input, 404);
     await request(other, `/v1/async-consults/${consult.consult_id}/intake/begin`, {}, 404);
     await ordinary.query('BEGIN');
     try {
