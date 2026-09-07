@@ -47,6 +47,11 @@
 
 export { crisisResponsePlugin } from './plugin.js';
 export { admitPatientCareInput } from './internal/patient-care-admission.js';
+export { getPatientCrisisHistory } from './internal/patient-history.js';
+export type {
+  PatientCrisisHistory,
+  PatientCrisisHistoryEvent,
+} from './internal/patient-history.js';
 export type {
   PatientCareAdmissionContext,
   PatientCareAdmissionResult,

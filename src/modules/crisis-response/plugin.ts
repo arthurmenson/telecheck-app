@@ -19,12 +19,14 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 
+import { registerPatientCrisisHistory } from './routes-v1.js';
 import { registerCrisisResponseRoutes } from './routes.js';
 
 const crisisResponsePluginImpl: FastifyPluginAsync = async (
   app: FastifyInstance,
 ): Promise<void> => {
   await app.register(registerCrisisResponseRoutes, { prefix: '/v0/crisis-events' });
+  await app.register(registerPatientCrisisHistory, { prefix: '/v1/crisis' });
 };
 
 export const crisisResponsePlugin = fp(crisisResponsePluginImpl, {

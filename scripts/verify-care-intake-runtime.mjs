@@ -734,6 +734,114 @@ try {
     );
     for (const response of repeated) assert.equal(response.statusCode, 202, response.body);
     assert.equal(new Set(repeated.map((response) => response.json().crisis_event_id)).size, 1);
+    const eventId = repeated[0].json().crisis_event_id;
+    const history = await request(patient, '/v1/crisis/mine', undefined, 200, 'GET');
+    assert.deepEqual(
+      Object.keys(history).sort(),
+      ['items', 'active_event', 'offset', 'limit', 'has_more', 'resources'].sort(),
+    );
+    assert.equal(history.active_event.crisis_event_id, eventId);
+    assert.equal(history.active_event.current_state, 'detected');
+    assert.deepEqual(
+      Object.keys(history.active_event).sort(),
+      ['crisis_event_id', 'detected_at', 'current_state', 'state_changed_at'].sort(),
+    );
+    assert.equal(history.resources.country_of_care, country);
+    assert.equal(history.resources.status, 'available');
+    assert(history.items.some((item) => item.crisis_event_id === eventId));
+    for (const unrelated of [other, crossTenant]) {
+      const empty = await request(unrelated, '/v1/crisis/mine', undefined, 200, 'GET');
+      assert.deepEqual(empty.items, []);
+      assert.equal(empty.active_event, null);
+    }
+    await request(author, '/v1/crisis/mine', undefined, 403, 'GET');
+    for (const invalidQuery of [
+      'patient_id=' + patient.account,
+      'offset=-1',
+      'offset=10001',
+      'offset=0.5',
+      'offset=invalid',
+    ])
+      await request(patient, '/v1/crisis/mine?' + invalidQuery, undefined, 400, 'GET');
+    // Actual admission creates enough immutable events to prove pagination and
+    // durable safety state independent of the requested history page.
+    const createdEvents = [eventId];
+    for (let i = 0; i < 26; i++) {
+      const interrupted = await request(
+        patient,
+        '/v1/async-consults/not-a-valid-case/intake',
+        { unknown: 'I want to hurt myself' },
+        202,
+      );
+      createdEvents.push(interrupted.crisis_event_id);
+    }
+    const firstPage = await request(patient, '/v1/crisis/mine', undefined, 200, 'GET');
+    const secondPage = await request(patient, '/v1/crisis/mine?offset=25', undefined, 200, 'GET');
+    assert.equal(firstPage.items.length, 25);
+    assert.equal(firstPage.has_more, true);
+    assert.equal(firstPage.active_event.crisis_event_id, createdEvents.at(-1));
+    assert.equal(secondPage.active_event.crisis_event_id, firstPage.active_event.crisis_event_id);
+    assert(
+      !secondPage.items.some(
+        (item) => item.crisis_event_id === firstPage.active_event.crisis_event_id,
+      ),
+    );
+    assert.equal(
+      new Set([...firstPage.items, ...secondPage.items].map((item) => item.crisis_event_id)).size,
+      firstPage.items.length + secondPage.items.length,
+    );
+    const emptyPage = await request(patient, '/v1/crisis/mine?offset=10000', undefined, 200, 'GET');
+    assert.deepEqual(emptyPage.items, []);
+    assert.equal(emptyPage.has_more, false);
+    assert.equal(emptyPage.active_event.crisis_event_id, firstPage.active_event.crisis_event_id);
+    for (const table of ['crisis_event', 'crisis_event_lifecycle_transition', 'country_profiles']) {
+      const victim = await register(host, tenant, country);
+      const recorded = await request(
+        victim,
+        '/v1/async-consults/not-a-valid-case/intake',
+        { unknown: 'I want to hurt myself' },
+        202,
+      );
+      await admin.query('BEGIN');
+      await admin.query('LOCK TABLE public.' + table + ' IN ACCESS EXCLUSIVE MODE');
+      const blocked = inject({
+        method: 'GET',
+        url: '/v1/crisis/mine',
+        headers: {
+          host,
+          authorization: `Bearer ${victim.token}`,
+        },
+      });
+      try {
+        let waiting = false;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          await admin.query('SELECT pg_stat_clear_snapshot()');
+          waiting = (
+            await admin.query(
+              "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='crisis_care_bounded_read' AND wait_event_type='Lock' AND pg_backend_pid()=ANY(pg_blocking_pids(pid))) AS waiting",
+            )
+          ).rows[0].waiting;
+          if (waiting) break;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        assert(waiting, `history reached ${table} read wait`);
+        await admin.query(
+          "UPDATE public.sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND session_id=$2",
+          [tenant, victim.session],
+        );
+        await admin.query('COMMIT');
+        const denied = await blocked;
+        assert.equal(denied.statusCode, 401, denied.body);
+        assert(!denied.body.includes(recorded.crisis_event_id));
+      } catch (error) {
+        await admin.query('ROLLBACK');
+        await blocked;
+        throw error;
+      }
+    }
+    console.log(
+      `${country}: real crisis history/reload projection,30+ durable events,paging/global active event,otherpatient/country/admin/query denials,three blocked read expiry denials PASS`,
+    );
     await noSubmission(invalid.c);
     console.log(
       `${country}: actual normal intake HTTP, legacy-envelope rejection, persisted crisis before invalid case/body/retry key, three concurrent safety retries PASS`,
