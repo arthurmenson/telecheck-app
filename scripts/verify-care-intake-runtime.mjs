@@ -343,6 +343,52 @@ try {
       {},
       200,
     );
+    for (const [field, value] of [
+      ['deployment_id', ulid()],
+      ['deployment_id', undefined],
+      ['deployment_id', null],
+      ['deployment_id', 17],
+      ['schema_hash', null],
+      ['schema_hash', undefined],
+      ['audit_id', 0],
+      ['audit_id', null],
+    ]) {
+      await assert.rejects(
+        careIntakeTransaction(ctx)((tx) =>
+          beginCareIntake(
+            {
+              ...tx,
+              query: (sql, params) => {
+                if (/INSERT INTO domain_events_outbox/u.test(sql)) {
+                  const next = [...params];
+                  const payload = JSON.parse(next[6]);
+                  if (value === undefined) delete payload[field];
+                  else payload[field] = value;
+                  next[6] = JSON.stringify(payload);
+                  return tx.query(sql, next);
+                }
+                return tx.query(sql, params);
+              },
+            },
+            ctx,
+            consult.consult_id,
+          ),
+        ),
+        (error) => error.code === '23514',
+      );
+      assert.equal(
+        Number(
+          (
+            await admin.query(
+              'SELECT count(*) AS n FROM public.consult_care_binding WHERE tenant_id=$1 AND consult_id=$2',
+              [tenant, consult.consult_id],
+            )
+          ).rows[0].n,
+        ),
+        0,
+      );
+    }
+    console.log(`${country}: 8 mismatched binding-evidence attempts roll back PASS`);
     const bound = await request(
       patient,
       `/v1/async-consults/${consult.consult_id}/intake/begin`,
@@ -703,6 +749,59 @@ try {
       (error) => error.code === '23514',
     );
     await noSubmission(missing.c);
+    // Only the evidence adapter changes. Actual own-patient authorization,
+    // classified encryption and ordinary-role transaction remain production code.
+    const alteredEvidence = [
+      ['publication_id', ulid()],
+      ['publication_id', undefined],
+      ['publication_id', null],
+      ['publication_id', 17],
+      ['ai_interpretation_active', true],
+      ['ai_interpretation_active', undefined],
+      ['ai_interpretation_active', null],
+      ['ai_interpretation_active', 'false'],
+      ['ai_interpretation_active', 0],
+      ['policy_hash', null],
+      ['submission_id', undefined],
+      ['audit_id', 0],
+    ];
+    for (const [field, value] of alteredEvidence) {
+      const repository = careIntakeRepository(ctx);
+      const mismatched = createCareIntakeService({
+        repository: {
+          ...repository,
+          evidence: (tx, record) =>
+            repository.evidence(
+              {
+                ...tx,
+                query: (sql, params) => {
+                  if (/INSERT INTO domain_events_outbox/u.test(sql)) {
+                    const next = [...params];
+                    const payload = JSON.parse(next[6]);
+                    if (value === undefined) delete payload[field];
+                    else payload[field] = value;
+                    next[6] = JSON.stringify(payload);
+                    return tx.query(sql, next);
+                  }
+                  return tx.query(sql, params);
+                },
+              },
+              record,
+            ),
+        },
+      });
+      await assert.rejects(
+        careIntakeTransaction(ctx)((tx) =>
+          mismatched(tx, ctx, missing.c.consult_id, missing.input),
+        ),
+        (error) => error.code === '23514',
+        `mismatched ${field} / ${String(value)} must roll back`,
+      );
+      await noSubmission(missing.c);
+    }
+    console.log(
+      `${country}: 12 contradictory/missing/null/wrong-type event-evidence attempts roll back PASS`,
+    );
     const withdrawn = await nextCase();
     aws.beforeCrypto = async () => {
       await request(patient, '/v0/consent/care/choices', {
