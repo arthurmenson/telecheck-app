@@ -236,3 +236,12 @@ export async function findAccountByEmail(
 ): Promise<Account | null> {
   return accountRepo.findAccountByEmail(ctx.tenantId, email, externalTx);
 }
+
+/** Caller retains the transaction until PIN verification/reset and session work finish. */
+export async function lockPatientAccountByEmail(
+  ctx: TenantContext,
+  email: string,
+  tx: DbTransaction,
+): Promise<Account | null> {
+  return accountRepo.lockPatientAccountByEmail(ctx.tenantId, email, tx);
+}

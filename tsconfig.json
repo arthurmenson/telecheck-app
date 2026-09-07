@@ -36,6 +36,7 @@
     "src/**/*",
     "tests/**/*",
     "vitest.care.config.ts",
+    "vitest.pin-recovery.config.ts",
     "scripts/verify-identity-runtime.ts",
     "scripts/verify-forms-publication.ts",
     "scripts/verify-forms-rollback.ts",
