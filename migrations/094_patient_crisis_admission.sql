@@ -47,12 +47,12 @@ DECLARE a RECORD; refreshed RECORD;
 BEGIN
   IF current_setting('transaction_isolation') <> 'read committed' THEN RAISE EXCEPTION 'crisis_unavailable' USING ERRCODE='PT503'; END IF;
   BEGIN SELECT * INTO STRICT a FROM public.kms_current_actor_context();
-  EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'crisis_unauthenticated' USING ERRCODE='PT401'; END;
+  EXCEPTION WHEN raise_exception OR no_data_found OR invalid_text_representation THEN RAISE EXCEPTION 'crisis_unauthenticated' USING ERRCODE='PT401'; END;
   IF a.actor_role <> 'patient' THEN RAISE EXCEPTION 'crisis_forbidden' USING ERRCODE='42501'; END IF;
   IF NOT EXISTS(SELECT 1 FROM public.accounts p WHERE p.tenant_id=a.tenant_id AND p.account_id=a.account_id AND p.country_of_care=a.country_of_care) THEN
     RAISE EXCEPTION 'crisis_unauthenticated' USING ERRCODE='PT401'; END IF;
   BEGIN SELECT * INTO STRICT refreshed FROM public.kms_current_actor_context();
-  EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'crisis_unauthenticated' USING ERRCODE='PT401'; END;
+  EXCEPTION WHEN raise_exception OR no_data_found OR invalid_text_representation THEN RAISE EXCEPTION 'crisis_unauthenticated' USING ERRCODE='PT401'; END;
   IF to_jsonb(a) IS DISTINCT FROM to_jsonb(refreshed) THEN RAISE EXCEPTION 'crisis_unauthenticated' USING ERRCODE='PT401'; END IF;
   RETURN jsonb_build_object('tenant_id',a.tenant_id,'account_id',a.account_id,'session_id',a.session_id,'country_of_care',a.country_of_care);
 END $$;
