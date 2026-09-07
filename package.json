@@ -27,6 +27,8 @@
     "check:migration-bom": "node scripts/check-migration-bom.mjs",
     "migrate:apply": "node scripts/migrate.mjs",
     "verify:identity-runtime": "tsx scripts/verify-identity-runtime.ts",
+    "verify:forms-publication": "tsx scripts/verify-forms-publication.ts",
+    "verify:forms-rollback": "tsx scripts/verify-forms-rollback.ts",
     "verify:patient-reads": "tsx scripts/verify-patient-reads.mjs",
     "verify:care-consent": "tsx scripts/verify-care-consent.mjs",
     "test:migrations": "node --test scripts/lib/migration-source.test.mjs scripts/migrate.integration.test.mjs",

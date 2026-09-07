@@ -63,6 +63,15 @@ vi.mock('../../audit.js', () => ({
   emitTemplateReviewDecisionAudit: vi.fn(),
   emitTemplatePublishedViaReviewWorkflowAudit: vi.fn(),
 }));
+vi.mock('../../../forms-intake/index.js', () => ({
+  assertFormsGovernanceScope: vi.fn(),
+  formsGovernanceTransaction: vi.fn(() => vi.fn()),
+  recordFormsPublicationEvidence: vi.fn(),
+}));
+vi.mock('../../../../lib/db.js', async (original) => ({
+  ...(await original<typeof import('../../../../lib/db.js')>()),
+  withTransaction: vi.fn(),
+}));
 
 vi.mock('../../../../lib/pii-screener/ner.js', async (original) => {
   const actual = await original<typeof import('../../../../lib/pii-screener/ner.js')>();
@@ -74,11 +83,16 @@ import {
   requireSliceRoleMembership,
   resolveActorTenantIdForAudit,
 } from '../../../../lib/auth-context.js';
+import { withTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { classifyEntities } from '../../../../lib/pii-screener/ner.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
+import {
+  assertFormsGovernanceScope,
+  recordFormsPublicationEvidence,
+} from '../../../forms-intake/index.js';
 import {
   emitTemplatePublishedViaReviewWorkflowAudit,
   emitTemplateReviewDecisionAudit,
@@ -144,6 +158,9 @@ function makeReply(): FastifyReply {
 }
 
 function installDefaultCompositionMocks(tx: FakeTx): void {
+  vi.mocked(withTransaction).mockImplementation(async (fn) => fn(tx as never));
+  vi.mocked(assertFormsGovernanceScope).mockResolvedValue();
+  vi.mocked(recordFormsPublicationEvidence).mockResolvedValue();
   vi.mocked(requireTenantContext).mockReturnValue(
     FAKE_TENANT_CTX as unknown as ReturnType<typeof requireTenantContext>,
   );

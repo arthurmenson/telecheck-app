@@ -136,12 +136,17 @@ import {
   resolveActorTenantIdForAudit,
   requireSliceRoleMembership,
 } from '../../../../lib/auth-context.js';
-import type { DbTransaction } from '../../../../lib/db.js';
+import { withTransaction, type DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { PARTICIPANT_BLOCK_MESSAGE, screenInput } from '../../../../lib/pii-screener/index.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
+import {
+  assertFormsGovernanceScope,
+  formsGovernanceTransaction,
+  recordFormsPublicationEvidence,
+} from '../../../forms-intake/index.js';
 import {
   emitTemplatePublishedViaReviewWorkflowAudit,
   emitTemplateReviewDecisionAudit,
@@ -475,83 +480,82 @@ export async function postFormsTemplateDecisionHandler(
   // legacy paths since the role shim already verified tenant binding.
   const actorTenantId = resolveActorTenantIdForAudit(req, ctx.tenantId);
 
-  return withIdempotentExecution(req, reply, mapServiceError, async (tx, idempotencyCtx) => {
-    // tx is the OPEN business transaction from withIdempotentExecution.
-    // The wrapper's per-decision idempotency_key parameter receives the
-    // SAME key that withIdempotentExecution resolved from the
-    // Idempotency-Key header — both sides agree on the canonical key.
-    const wrapperIdempotencyKey = idempotencyCtx.idempotencyKey;
+  if (req.actorNonce === undefined || req.actorContext === undefined)
+    throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  try {
+    await withTransaction((tx) =>
+      assertFormsGovernanceScope(
+        tx,
+        {
+          tenantId: ctx.tenantId,
+          accountId: req.actorContext!.accountId,
+          sessionId: req.actorContext!.sessionId,
+          actorNonce: req.actorNonce!,
+        },
+        'forms.admin.decision',
+      ),
+    );
+  } catch {
+    throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  }
 
-    return withTenantContext(tx, ctx.tenantId, async () => {
-      const run = async (): Promise<{
-        status: number;
-        view: { review_id: string; decision: TemplateReviewDecision };
-      }> => {
-        // R2 MED-1 closure parity (mirrors get-crisis-operational-health.ts +
-        // post-forms-template-submit.ts): the 42501 catch MUST wrap the
-        // ENTIRE withDbRole call, not just the inner SELECT. withDbRole
-        // issues SET LOCAL ROLE BEFORE invoking its callback; a role-
-        // membership gap would raise 42501 at that pre-callback boundary,
-        // escaping a catch inside the callback. Wrapping the
-        // withDbRole(...) Promise covers BOTH paths (privilege acquisition
-        // + SECDEF wrapper LAYER C tenant-scope guard).
-        try {
-          await withDbRole(tx, sliceRole, async () => {
-            // Call the SECDEF wrapper. RETURNS VOID. The wrapper inserts
-            // the lifecycle_transition row + optionally publishes the
-            // template (approve-path) atomically per migration 043 §3.
-            await tx.query(
-              'SELECT record_forms_template_admin_decision($1, $2, $3, $4::jsonb, $5)',
-              [
-                ctx.tenantId,
-                reviewId,
-                decision,
-                JSON.stringify(decisionPayload),
-                wrapperIdempotencyKey,
-              ],
-            );
-          });
-        } catch (err) {
-          if (
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err &&
-            (err as { code?: unknown }).code === '42501'
-          ) {
-            throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+  return withIdempotentExecution(
+    req,
+    reply,
+    mapServiceError,
+    async (tx, idempotencyCtx) => {
+      // tx is the OPEN business transaction from withIdempotentExecution.
+      // The wrapper's per-decision idempotency_key parameter receives the
+      // SAME key that withIdempotentExecution resolved from the
+      // Idempotency-Key header — both sides agree on the canonical key.
+      const wrapperIdempotencyKey = idempotencyCtx.idempotencyKey;
+
+      return withTenantContext(tx, ctx.tenantId, async () => {
+        const run = async (): Promise<{
+          status: number;
+          view: { review_id: string; decision: TemplateReviewDecision };
+        }> => {
+          // R2 MED-1 closure parity (mirrors get-crisis-operational-health.ts +
+          // post-forms-template-submit.ts): the 42501 catch MUST wrap the
+          // ENTIRE withDbRole call, not just the inner SELECT. withDbRole
+          // issues SET LOCAL ROLE BEFORE invoking its callback; a role-
+          // membership gap would raise 42501 at that pre-callback boundary,
+          // escaping a catch inside the callback. Wrapping the
+          // withDbRole(...) Promise covers BOTH paths (privilege acquisition
+          // + SECDEF wrapper LAYER C tenant-scope guard).
+          try {
+            await withDbRole(tx, sliceRole, async () => {
+              // Call the SECDEF wrapper. RETURNS VOID. The wrapper inserts
+              // the lifecycle_transition row + optionally publishes the
+              // template (approve-path) atomically per migration 043 §3.
+              await tx.query(
+                'SELECT record_forms_template_admin_decision($1, $2, $3, $4::jsonb, $5)',
+                [
+                  ctx.tenantId,
+                  reviewId,
+                  decision,
+                  JSON.stringify(decisionPayload),
+                  wrapperIdempotencyKey,
+                ],
+              );
+            });
+          } catch (err) {
+            if (
+              typeof err === 'object' &&
+              err !== null &&
+              'code' in err &&
+              (err as { code?: unknown }).code === '42501'
+            ) {
+              throw req.server.httpErrors.forbidden('Insufficient scope for this request.');
+            }
+            throw err;
           }
-          throw err;
-        }
 
-        // Same-transaction Cat A audit emission (I-003 durability). Runs
-        // AFTER withDbRole's finally-block restores telecheck_app_role; the
-        // app role holds the audit_records INSERT grant.
-        const txTyped: DbTransaction = tx;
-        await emitTemplateReviewDecisionAudit(
-          {
-            tenantId: ctx.tenantId,
-            reviewId,
-            formsTemplateId: templateId,
-            deciderPrincipalId: actorId,
-            deciderActorTenantId: actorTenantId,
-            countryOfCare: ctx.countryOfCare,
-            decision,
-            decisionPayload,
-          },
-          txTyped,
-        );
-
-        // Sprint 4 — approve-path publish audit (SI-023 §3 row 4). The
-        // wrapper atomically UPDATEs forms_template.status → published on
-        // decision='approve' (transition triple #2, the canonical publish
-        // path per SI-023 §6). The `admin.template_published_via_review_workflow`
-        // Cat A audit fires IFF the decision was approve — deterministic
-        // from the decision value (no separate DB read needed). Same tx as
-        // the wrapper INSERT + decision audit, under the restored app role
-        // (I-003 durability). reject / request_revision do NOT publish, so
-        // no publish audit on those paths.
-        if (decision === 'approve') {
-          await emitTemplatePublishedViaReviewWorkflowAudit(
+          // Same-transaction Cat A audit emission (I-003 durability). Runs
+          // AFTER withDbRole's finally-block restores telecheck_app_role; the
+          // app role holds the audit_records INSERT grant.
+          const txTyped: DbTransaction = tx;
+          await emitTemplateReviewDecisionAudit(
             {
               tenantId: ctx.tenantId,
               reviewId,
@@ -559,26 +563,70 @@ export async function postFormsTemplateDecisionHandler(
               deciderPrincipalId: actorId,
               deciderActorTenantId: actorTenantId,
               countryOfCare: ctx.countryOfCare,
+              decision,
+              decisionPayload,
             },
             txTyped,
           );
-        }
 
-        return {
-          status: 201,
-          view: { review_id: reviewId, decision },
+          // Sprint 4 — approve-path publish audit (SI-023 §3 row 4). The
+          // wrapper atomically UPDATEs forms_template.status → published on
+          // decision='approve' (transition triple #2, the canonical publish
+          // path per SI-023 §6). The `admin.template_published_via_review_workflow`
+          // Cat A audit fires IFF the decision was approve — deterministic
+          // from the decision value (no separate DB read needed). Same tx as
+          // the wrapper INSERT + decision audit, under the restored app role
+          // (I-003 durability). reject / request_revision do NOT publish, so
+          // no publish audit on those paths.
+          if (decision === 'approve') {
+            await recordFormsPublicationEvidence(
+              tx,
+              {
+                tenantId: ctx.tenantId,
+                actorId,
+                actorRole: req.actorContext?.role === 'clinician' ? 'clinician' : 'operator',
+                countryOfCare: ctx.countryOfCare,
+              },
+              templateId,
+            );
+            await emitTemplatePublishedViaReviewWorkflowAudit(
+              {
+                tenantId: ctx.tenantId,
+                reviewId,
+                formsTemplateId: templateId,
+                deciderPrincipalId: actorId,
+                deciderActorTenantId: actorTenantId,
+                countryOfCare: ctx.countryOfCare,
+              },
+              txTyped,
+            );
+          }
+
+          return {
+            status: 201,
+            view: { review_id: reviewId, decision },
+          };
         };
-      };
 
-      // Compose withActorContext when the SI-010 nonce is present (the
-      // wrapper's LAYER C check + internal actor binding depends on it).
-      // Without a nonce the wrapper itself fail-closes with 42501 ("no
-      // actor account bound") — mapped by the outer try/catch to a
-      // tenant-blind 403 per I-025.
-      if (req.actorNonce !== undefined) {
-        return withActorContext(tx, req.actorNonce, run);
-      }
-      return run();
-    });
-  });
+        // Compose withActorContext when the SI-010 nonce is present (the
+        // wrapper's LAYER C check + internal actor binding depends on it).
+        // Without a nonce the wrapper itself fail-closes with 42501 ("no
+        // actor account bound") — mapped by the outer try/catch to a
+        // tenant-blind 403 per I-025.
+        if (req.actorNonce !== undefined) {
+          return withActorContext(tx, req.actorNonce, run);
+        }
+        return run();
+      });
+    },
+    formsGovernanceTransaction(
+      {
+        tenantId: ctx.tenantId,
+        accountId: req.actorContext.accountId,
+        sessionId: req.actorContext.sessionId,
+        actorNonce: req.actorNonce,
+      },
+      'forms.admin.decision',
+    ),
+  );
 }

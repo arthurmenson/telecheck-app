@@ -59,6 +59,7 @@ import type {
   FormVariantId,
 } from '../types.js';
 
+import { recordFormsPublicationEvidence } from './publication-evidence.js';
 import { checkPublishGateBypassAtRuntime } from './publish-gates-killswitch.js';
 
 /**
@@ -150,21 +151,6 @@ export async function createDraftTemplate(
 }
 
 /**
- * Sentinel error code thrown by `publishVersion` when the four governance
- * pre-publish gates aren't implemented yet AND the deployment hasn't
- * explicitly opted into the gate-bypass via the env flag.
- *
- * Per Codex publishVersion-r1 CRITICAL closure 2026-05-03: the gates
- * (I-030 static analysis, MarketingCopy resolution, Mode 2 contract,
- * L3 dual-control) ARE the safety floor for publishing. Until they're
- * implemented, the publish path MUST fail closed in production —
- * shipping the durability + supersession plumbing without the gates
- * was a "draft becomes published with no governance" hazard. Tests +
- * local dev opt in via `FORMS_PUBLISH_GATES_BYPASS = 'unsafe-test-only'`.
- */
-export const PUBLISH_GATES_NOT_IMPLEMENTED = 'forms.publish.gates_not_implemented';
-
-/**
  * Sentinel error code thrown by `publishVersion` when the runtime
  * defense-in-depth check (SI-011 kill-switch layer 2) detects a
  * forbidden FORMS_PUBLISH_GATES_BYPASS or FORMS_PUBLISH_GATES_TEST_OVERRIDE_*
@@ -184,61 +170,9 @@ export const PUBLISH_GATES_NOT_IMPLEMENTED = 'forms.publish.gates_not_implemente
 export const PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME =
   'forms.publish.bypass_attempt_in_production';
 
-/**
- * Publish a draft version. Pre-publish gates:
- *
- *   1. Tenant Clinical Lead approval recorded for any L3 (eligibility) edits
- *      per I-015 dual-control.
- *   2. Six-category I-030 static analysis against `research_data_use_consent_block`
- *      elements per FORMS_ENGINE v5.2 + Slice PRD §25.3 — reject publish
- *      if ANY of: branching, visibility, validation, eligibility/triage,
- *      pricing/commerce, outcome messaging depends on `research_consent_status`.
- *   3. L4 governance verification that any molecule-level L1 element resolves
- *      to a `MarketingCopy` entity in `approved` status per Slice PRD §25.1.
- *   4. Mode 2 input contract conformance per Slice PRD §10.
- *
- * On success: cascades prior published version → superseded; flips target
- * version → published; emits the corresponding governance audit + domain
- * event inside the same transaction.
- *
- * **Pre-publish gate scaffolding (fail-closed at this commit):**
- * The four governance gates arrive with the v1.10 governance work (I-030
- * static analyzer, MarketingCopy resolver, Mode 2 contract validator, L3
- * dual-control). At this commit, the publish path FAILS CLOSED in
- * production — without the gates, a draft with prohibited
- * `research_consent_status` dependencies, unapproved marketing copy, or
- * malformed Mode 2 contract could promote to published. The durability +
- * supersession + audit-emission pattern is implemented end-to-end so the
- * gates can slot in front without restructuring the write path.
- *
- * Bypass for local dev / integration tests:
- *   `FORMS_PUBLISH_GATES_BYPASS='unsafe-test-only'`
- * The literal string is intentionally hostile so production deployments
- * can't accidentally set it via routine env config (no `'true'` /
- * `'enabled'` typo path).
- *
- * **Sentinel-throw error contract (mirrors createDeployment):**
- *   - `forms.publish.version_not_found` — version doesn't exist in this
- *     tenant. Maps to a tenant-blind 400 (NOT 404) so we don't leak
- *     cross-tenant existence per I-025.
- *   - `forms.publish.version_not_draft` — version exists but its status
- *     is not `draft` (already published, superseded, or archived).
- *     I-013 immutability enforcement; maps to 400.
- *
- * @param ctx — tenant context resolved from the request.
- * @param actorId — operator authoring the publish action; flows into
- *                  audit envelope `actor_id` + domain-event payload.
- * @param versionId — Pattern A: each row of forms_template IS a version,
- *                    so the URL's `:versionId` segment maps directly to
- *                    `forms_template.template_id`. The handler also
- *                    receives `:templateId` from the path for REST
- *                    symmetry; it's currently unused at the service
- *                    layer (no separate template-family identity exists
- *                    in the data model yet — see SPEC ISSUE in routes.ts).
- * @param input — PublishVersionRequest body (just optional change notes
- *                at scaffold; the Tenant Clinical Lead sign-off arrives
- *                via the consent module + the audit chain, not this body).
- */
+/** Publish only through the shared database contract. Four-layer validation,
+ * live membership, independent content approval and same-transaction evidence
+ * apply equally to this endpoint and the SI-023 decision workflow. */
 export async function publishVersion(
   ctx: TenantContext,
   actor: FormsIntakeActor,
@@ -274,48 +208,21 @@ export async function publishVersion(
     );
   }
 
-  // FAIL-CLOSED gate per Codex publishVersion-r1 CRITICAL closure
-  // (2026-05-03). Until the four governance gates below are implemented,
-  // publishing in production is unsafe — a draft with prohibited
-  // research_consent_status dependencies, unapproved marketing copy, or
-  // malformed Mode 2 contract could promote to published.
-  //
-  // The bypass env value is intentionally a hostile sentinel string
-  // ('unsafe-test-only') so a routine env config typo can't accidentally
-  // open the gate in production. Even with NODE_ENV=test, the bypass
-  // must be explicit.
-  //
-  // Note: the kill-switch check above already throws if the bypass var
-  // is present in NODE_ENV !== 'test'. This second check fires when
-  // NODE_ENV === 'test' and the bypass var is unset OR set to a
-  // non-canonical value — the canonical test/dev opt-in.
-  const gateBypass = process.env['FORMS_PUBLISH_GATES_BYPASS'];
-  if (gateBypass !== 'unsafe-test-only') {
-    throw new Error(PUBLISH_GATES_NOT_IMPLEMENTED);
-  }
-
-  // TODO (deferred — v1.10 governance work):
-  //   1. Run six-category I-030 static analyzer over presentation_content +
-  //      branching_logic + eligibility_logic + approval_governance for any
-  //      reference to research_consent_status. Reject publish on any hit.
-  //   2. Walk presentation_content for molecule-level L1 references; for each
-  //      MarketingCopy id, verify the entity exists in `approved` status.
-  //      Reject publish on any unapproved reference.
-  //   3. Walk approval_governance for Mode 2 contract assertions; reject if
-  //      contract validator flags any field.
-  //   4. Verify L3 dual-control: the calling actor MUST NOT be the same
-  //      operator who authored any pending eligibility-logic change. Cross-
-  //      check against the audit chain.
-  // All four gates land here — before the repo delegate — so a gate
-  // failure aborts before any DB write. When they land, the FAIL-CLOSED
-  // env check above can be removed (the gates themselves become the
-  // safety floor); until then it's the only thing keeping publish from
-  // shipping unsafe drafts.
-
+  // The database enforces all four gates for every publication path, including SI-023.
   return templateRepo.publishVersion(
     ctx.tenantId,
     versionId,
     async (tx, published, supersededVersionId) => {
+      await recordFormsPublicationEvidence(
+        tx,
+        {
+          tenantId: ctx.tenantId,
+          actorId: actor.actorId,
+          actorRole: 'operator',
+          countryOfCare: ctx.countryOfCare,
+        },
+        published.template_id,
+      );
       // Capture the audit envelope so we can thread its audit_id into the
       // domain event — without that correlation a subscriber can't prove
       // the wire-side event corresponds to the immutable Category B audit
