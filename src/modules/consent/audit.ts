@@ -30,6 +30,7 @@ import {
   type AuditEnvelopeInput,
   emitAudit,
 } from '../../lib/audit.js';
+import { emitDomainEvent } from '../../lib/domain-events.js';
 import type { TenantId } from '../../lib/glossary.js';
 import type { AccountId } from '../identity/internal/types.js';
 
@@ -111,6 +112,119 @@ function buildEnvelope(
     country_of_care: common.country_of_care,
     break_glass: null,
   };
+}
+
+export async function emitCarePolicyEvidence(
+  args: {
+    tenantId: TenantId;
+    actorId: string;
+    countryOfCare: string;
+    policyId: string;
+    contentHash: string;
+    status: 'draft' | 'published' | 'superseded' | 'withdrawn';
+  },
+  tx: AuditDbClient,
+): Promise<void> {
+  const intent = `consent.policy.${args.status === 'draft' ? 'drafted' : args.status}`;
+  const detail = {
+    intent,
+    policy_id: args.policyId,
+    content_hash: args.contentHash,
+    status: args.status,
+  };
+  const audit = await emitAudit(
+    buildEnvelope('config_change_validated', 'B', {
+      tenant_id: args.tenantId,
+      actor_type: 'operator',
+      actor_id: args.actorId,
+      actor_tenant_id: args.tenantId,
+      target_patient_id: null,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consent_care_policy',
+      resource_id: args.policyId,
+      detail,
+    }),
+    tx,
+  );
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: 'ConsentCarePolicy',
+    aggregate_id: args.policyId,
+    event_type: intent,
+    occurred_at: new Date().toISOString(),
+    payload: { ...detail, audit_id: audit.audit_id },
+  });
+}
+
+export async function emitCareChoiceEvidence(
+  args: {
+    tenantId: TenantId;
+    accountId: string;
+    countryOfCare: string;
+    publicationId: string;
+    policyHash: string;
+    decision: {
+      decision_id: string;
+      consent_id: string | null;
+      term_key: string;
+      consent_type: string;
+      scope_id: string | null;
+      consent_version_id: string;
+      accepted: boolean;
+      status: 'granted' | 'revoked' | 'declined';
+    };
+  },
+  tx: AuditDbClient,
+): Promise<void> {
+  const decision = args.decision;
+  const detail = {
+    publication_id: args.publicationId,
+    policy_hash: args.policyHash,
+    ...decision,
+  };
+  const emit = async (
+    action: AuditAction,
+    resourceType: string,
+    resourceId: string,
+    eventType: string,
+  ) => {
+    const audit = await emitAudit(
+      buildEnvelope(action, 'C', {
+        tenant_id: args.tenantId,
+        actor_type: 'patient',
+        actor_id: args.accountId,
+        actor_tenant_id: args.tenantId,
+        target_patient_id: args.accountId,
+        country_of_care: args.countryOfCare,
+        resource_type: resourceType,
+        resource_id: resourceId,
+        detail,
+      }),
+      tx,
+    );
+    await emitDomainEvent(tx, {
+      tenant_id: args.tenantId,
+      aggregate_type: resourceType,
+      aggregate_id: resourceId,
+      event_type: eventType,
+      occurred_at: audit.timestamp,
+      payload: { ...detail, account_id: args.accountId, audit_id: audit.audit_id },
+    });
+  };
+  await emit(
+    'consent_choice_recorded',
+    'consent_care_decision',
+    decision.decision_id,
+    'consent.choice_recorded',
+  );
+  if (decision.consent_id !== null) {
+    await emit(
+      decision.accepted ? 'consent_granted' : 'consent_revoked',
+      'consent',
+      decision.consent_id,
+      decision.accepted ? 'consent.granted' : 'consent.revoked',
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,9 @@
 /**
  * Consent slice — HTTP integration test.
  *
- * Exercises POST /v0/consent/consents (grant) + revoke + GET /me
- * end-to-end via Fastify inject() with Bearer JWT auth.
+ * Verifies retirement of client-authored evidence and unbounded history.
+ * The replacement published-policy flow is exercised with actual restricted
+ * database logins by scripts/verify-care-consent.mjs.
  *
  * Coverage in this file (3 sections, 7 cases).
  *
@@ -124,7 +125,7 @@ async function seedConsentVersion(): Promise<ConsentVersionId> {
 // ---------------------------------------------------------------------------
 
 describe('consent HTTP — §1 POST /consents grant', () => {
-  it('§1a happy path: grant returns 201 + PatientConsentView (no tenant_id)', async () => {
+  it('§1a legacy grants cannot create consent using client-authored evidence', async () => {
     const { accessToken } = await loginAndGetToken();
     const versionId = await seedConsentVersion();
 
@@ -147,10 +148,13 @@ describe('consent HTTP — §1 POST /consents grant', () => {
       },
     });
 
-    expect(response.statusCode).toBe(201);
-    const body = response.json<{ consent_id: string; status: string }>();
-    expect(body.consent_id).toBeTruthy();
-    expect(body.status).toBe('granted');
+    expect(response.statusCode).toBe(410);
+    expect(response.json().error.code).toBe('consent.versioned_policy_required');
+    expect(response.headers['cache-control']).toBe('no-store');
+    const rows = await withTenantContext(T_US, () =>
+      getTestClient().query('SELECT count(*)::int AS count FROM consent'),
+    );
+    expect(rows.rows[0]?.count).toBe(0);
     expect(response.body).not.toContain('"tenant_id"');
     expect(response.body).not.toContain('Telecheck-US');
   });
@@ -170,7 +174,7 @@ describe('consent HTTP — §1 POST /consents grant', () => {
     expect(response.statusCode).toBe(401);
   });
 
-  it('§1c 400 invalid consent_type', async () => {
+  it('§1c legacy invalid consent types remain unavailable', async () => {
     const { accessToken } = await loginAndGetToken();
     const versionId = await seedConsentVersion();
     const response = await app!.inject({
@@ -187,10 +191,10 @@ describe('consent HTTP — §1 POST /consents grant', () => {
         evidence: { timestamp: new Date().toISOString() },
       },
     });
-    expect(response.statusCode).toBe(400);
+    expect(response.statusCode).toBe(410);
   });
 
-  it('§1d 400 evidence missing timestamp key', async () => {
+  it('§1d legacy evidence does not bypass retirement', async () => {
     const { accessToken } = await loginAndGetToken();
     const versionId = await seedConsentVersion();
     const response = await app!.inject({
@@ -207,7 +211,7 @@ describe('consent HTTP — §1 POST /consents grant', () => {
         evidence: { type: 'in_app' }, // no timestamp
       },
     });
-    expect(response.statusCode).toBe(400);
+    expect(response.statusCode).toBe(410);
   });
 });
 
@@ -216,7 +220,7 @@ describe('consent HTTP — §1 POST /consents grant', () => {
 // ---------------------------------------------------------------------------
 
 describe('consent HTTP — §2 POST /consents/revoke', () => {
-  it('§2a happy path: grant then revoke', async () => {
+  it('§2a the old platform-revoke route cannot avoid account closure', async () => {
     const { accessToken } = await loginAndGetToken();
     const versionId = await seedConsentVersion();
 
@@ -252,13 +256,15 @@ describe('consent HTTP — §2 POST /consents/revoke', () => {
         evidence: { timestamp: new Date().toISOString() },
       },
     });
-    expect(response.statusCode).toBe(200);
-    const body = response.json<{ status: string; revocation_reason: string }>();
-    expect(body.status).toBe('revoked');
-    expect(body.revocation_reason).toBe('patient_initiated');
+    expect(response.statusCode).toBe(410);
+    expect(response.json().error.code).toBe('consent.versioned_policy_required');
+    const rows = await withTenantContext(T_US, () =>
+      getTestClient().query('SELECT count(*)::int AS count FROM consent'),
+    );
+    expect(rows.rows[0]?.count).toBe(0);
   });
 
-  it('§2b 404 when no active consent to revoke', async () => {
+  it('§2b legacy revoke is unavailable even without a prior grant', async () => {
     const { accessToken } = await loginAndGetToken();
     const versionId = await seedConsentVersion();
 
@@ -277,7 +283,7 @@ describe('consent HTTP — §2 POST /consents/revoke', () => {
         evidence: { timestamp: new Date().toISOString() },
       },
     });
-    expect(response.statusCode).toBe(404);
+    expect(response.statusCode).toBe(410);
   });
 });
 
@@ -286,7 +292,7 @@ describe('consent HTTP — §2 POST /consents/revoke', () => {
 // ---------------------------------------------------------------------------
 
 describe('consent HTTP — §3 GET /consents/me', () => {
-  it('§3a returns consent history (granted + revoked rows)', async () => {
+  it('§3a the old unbounded history route discloses no evidence', async () => {
     const { accessToken } = await loginAndGetToken();
     const versionId = await seedConsentVersion();
 
@@ -326,9 +332,9 @@ describe('consent HTTP — §3 GET /consents/me', () => {
       url: '/v0/consent/consents/me',
       headers: { host: 'localhost', authorization: `Bearer ${accessToken}` },
     });
-    expect(response.statusCode).toBe(200);
-    const body = response.json<{ consents: Array<{ status: string }> }>();
-    expect(body.consents.length).toBeGreaterThanOrEqual(2);
+    expect(response.statusCode).toBe(410);
+    expect(response.json().consents).toBeUndefined();
+    expect(response.headers['cache-control']).toBe('no-store');
     expect(response.body).not.toContain('"tenant_id"');
     expect(response.body).not.toContain('Telecheck-US');
   });

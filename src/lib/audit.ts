@@ -154,6 +154,7 @@ type CategoryCAction =
   | 'patient_identity_verified'
   | 'consent_granted'
   | 'consent_revoked'
+  | 'consent_choice_recorded'
   | 'delegation_setup'
   | 'delegation_revoked'
   | 'message_sent'
