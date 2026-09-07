@@ -2,7 +2,9 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
+import { readFile } from 'node:fs/promises';
 import pg from 'pg';
+import { transactionalMigrationSource } from './lib/migration-source.mjs';
 import { bindActorContextForRequest } from '../src/lib/actor-context-binding.ts';
 import { requirePatientActorContext } from '../src/lib/auth-context.ts';
 import { closePool, closeBindActorContextPool } from '../src/lib/db.ts';
@@ -363,7 +365,31 @@ try {
       400,
     );
     ordinaryValidationCount = 0;
-    assertions += 24;
+    assertions += 27;
+  }
+  // Matched rollback disables admission but preserves all clinical evidence.
+  const countsSql = `SELECT (SELECT count(*) FROM public.crisis_event)::INT AS events,
+    (SELECT count(*) FROM public.crisis_event_lifecycle_transition)::INT AS lifecycle,
+    (SELECT count(*) FROM public.crisis_care_admission)::INT AS admissions,
+    (SELECT count(*) FROM public.audit_records)::INT AS audits,
+    (SELECT count(*) FROM public.domain_events_outbox)::INT AS outbox`;
+  const beforeRollback = (await control.query(countsSql)).rows[0];
+  await control.query('BEGIN');
+  try {
+    await control.query(
+      transactionalMigrationSource(
+        await readFile(new URL('../migrations/rollback/094_rollback.sql', import.meta.url), 'utf8'),
+      ),
+    );
+    assert.deepEqual((await control.query(countsSql)).rows[0], beforeRollback);
+    const disabled = (
+      await control.query(
+        "SELECT pg_has_role('telecheck_app_role','crisis_care_patient','MEMBER') AS member,has_function_privilege('crisis_care_patient','public.crisis_care_record(TEXT,TEXT,TEXT)','EXECUTE') AS callable",
+      )
+    ).rows[0];
+    assert.deepEqual(disabled, { member: false, callable: false });
+  } finally {
+    await control.query('ROLLBACK');
   }
   console.log(
     JSON.stringify({
