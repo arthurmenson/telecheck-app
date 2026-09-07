@@ -31,7 +31,8 @@ CREATE TABLE public.identity_staff_membership (
   FOREIGN KEY(tenant_id,account_id) REFERENCES public.accounts(tenant_id,account_id),
   FOREIGN KEY(tenant_id,granted_by) REFERENCES public.accounts(tenant_id,account_id),
   CHECK((revoked_at IS NULL AND revocation_reference IS NULL) OR
-    (revoked_at>=granted_at AND length(revocation_reference) BETWEEN 1 AND 160))
+    (revoked_at IS NOT NULL AND revocation_reference IS NOT NULL
+      AND revoked_at>=granted_at AND length(revocation_reference) BETWEEN 1 AND 160))
 );
 CREATE TABLE public.identity_staff_enrollment (
   tenant_id TEXT NOT NULL REFERENCES public.tenants(id),

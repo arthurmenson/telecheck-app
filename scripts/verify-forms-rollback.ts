@@ -88,19 +88,28 @@ try {
     const account = ulid(),
       session = ulid();
     const country = tenant === 'Telecheck-US' ? 'US' : 'GH';
-    await admin.query(
-      `INSERT INTO public.accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,locale,account_type,status)
+    await admin.query('BEGIN');
+    try {
+      await withTenantContext(admin, asTenantId(tenant), async () => {
+        await admin.query(
+          `INSERT INTO public.accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,locale,account_type,status)
       VALUES($1,$2,$3,'Synthetic','Rollback','1990-01-01','prefer_not_to_say',$4,$4,$5,'tenant_admin','active')`,
-      [account, tenant, `${randomUUID()}@example.invalid`, country, `en-${country}`],
-    );
-    await admin.query(
-      "INSERT INTO public.sessions(session_id,tenant_id,account_id,refresh_token_hash,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour')",
-      [session, tenant, account, randomBytes(32).toString('hex')],
-    );
-    await admin.query(
-      "INSERT INTO public.forms_governance_membership(tenant_id,account_id,capability) VALUES($1,$2,'operator')",
-      [tenant, account],
-    );
+          [account, tenant, `${randomUUID()}@example.invalid`, country, `en-${country}`],
+        );
+        await admin.query(
+          "INSERT INTO public.sessions(session_id,tenant_id,account_id,refresh_token_hash,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour')",
+          [session, tenant, account, randomBytes(32).toString('hex')],
+        );
+        await admin.query(
+          "INSERT INTO public.forms_governance_membership(tenant_id,account_id,capability) VALUES($1,$2,'operator')",
+          [tenant, account],
+        );
+      });
+      await admin.query('COMMIT');
+    } catch (error) {
+      await admin.query('ROLLBACK');
+      throw error;
+    }
     for (const state of ['published', 'superseded', 'archived', 'deleted_draft', 'draft']) {
       const template = ulid();
       // Fixture-only rows isolate the submission guard from new publication gates.
