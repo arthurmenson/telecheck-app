@@ -223,8 +223,9 @@ describe('with-db-role §4 — callback throw propagation + restore-on-throw', (
 });
 
 describe('with-db-role §5 — allowlist composition', () => {
-  it('SLICE_ROLES contains the existing 27 roles plus two care-consent callers', () => {
-    expect(SLICE_ROLES).toHaveLength(29);
+  it('SLICE_ROLES contains the existing roles plus care-consent and patient crisis callers', () => {
+    expect(SLICE_ROLES).toHaveLength(30);
+    expect(SLICE_ROLES).toContain('crisis_care_patient');
     expect(SLICE_ROLES).toContain('consent_care_patient');
     expect(SLICE_ROLES).toContain('consent_care_operator');
     // Spot-check one from each slice
