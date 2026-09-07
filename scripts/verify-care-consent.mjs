@@ -6,6 +6,7 @@ import pg from 'pg';
 import { bindActorContextForRequest } from '../src/lib/actor-context-binding.ts';
 import { closeBindActorContextPool, closePool } from '../src/lib/db.ts';
 import { asTenantId } from '../src/lib/glossary.ts';
+import { withTenantContext } from '../src/lib/rls.ts';
 import { issueAccessToken } from '../src/lib/jwt.ts';
 import { ulid } from '../src/lib/ulid.ts';
 import { hashCarePolicy } from '../src/modules/consent/internal/services/care-policy-contract.ts';
@@ -51,34 +52,51 @@ if (process.env.CONSENT_ACCEPTANCE_DIAGNOSTICS === 'true')
 const origin = await app.listen({ host: '127.0.0.1', port: 0 });
 
 async function staff(tenant, country, capabilities, accountRole = 'tenant_admin') {
-  const accountId = ulid(),
-    sessionId = ulid();
-  await control.query(
-    `INSERT INTO public.accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,locale,account_type,status)
+  await control.query('BEGIN');
+  try {
+    const result = await withTenantContext(control, asTenantId(tenant), async () => {
+      const accountId = ulid(),
+        sessionId = ulid();
+      await control.query(
+        `INSERT INTO public.accounts(account_id,tenant_id,email,first_name,last_name,date_of_birth,gender,country_of_residence,country_of_care,locale,account_type,status)
     VALUES($1,$2,$3,'Synthetic','Consent','1990-01-01','prefer_not_to_say',$4,$4,$5,$6,'active')`,
-    [accountId, tenant, `${randomUUID()}@example.invalid`, country, `en-${country}`, accountRole],
-  );
-  await control.query(
-    `INSERT INTO public.sessions(session_id,tenant_id,account_id,refresh_token_hash,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour')`,
-    [sessionId, tenant, accountId, randomBytes(32).toString('hex')],
-  );
-  for (const capability of capabilities)
-    await control.query(
-      'INSERT INTO public.consent_care_membership(tenant_id,account_id,capability) VALUES($1,$2,$3)',
-      [tenant, accountId, capability],
-    );
-  const token = issueAccessToken(
-    {
-      account_id: accountId,
-      tenant_id: asTenantId(tenant),
-      session_id: sessionId,
-      role: accountRole,
-      country_of_care: country,
-      ...(accountRole === 'tenant_admin' ? { admin_tenant_binding: tenant } : {}),
-    },
-    process.env.JWT_SIGNING_KEY,
-  );
-  return { accountId, sessionId, tenant, country, role: accountRole, token };
+        [
+          accountId,
+          tenant,
+          `${randomUUID()}@example.invalid`,
+          country,
+          `en-${country}`,
+          accountRole,
+        ],
+      );
+      await control.query(
+        `INSERT INTO public.sessions(session_id,tenant_id,account_id,refresh_token_hash,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour')`,
+        [sessionId, tenant, accountId, randomBytes(32).toString('hex')],
+      );
+      for (const capability of capabilities)
+        await control.query(
+          'INSERT INTO public.consent_care_membership(tenant_id,account_id,capability) VALUES($1,$2,$3)',
+          [tenant, accountId, capability],
+        );
+      const token = issueAccessToken(
+        {
+          account_id: accountId,
+          tenant_id: asTenantId(tenant),
+          session_id: sessionId,
+          role: accountRole,
+          country_of_care: country,
+          ...(accountRole === 'tenant_admin' ? { admin_tenant_binding: tenant } : {}),
+        },
+        process.env.JWT_SIGNING_KEY,
+      );
+      return { accountId, sessionId, tenant, country, role: accountRole, token };
+    });
+    await control.query('COMMIT');
+    return result;
+  } catch (error) {
+    await control.query('ROLLBACK');
+    throw error;
+  }
 }
 async function call(who, method, path, body, key = randomUUID()) {
   return new Promise((resolve, reject) => {
