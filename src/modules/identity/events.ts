@@ -135,6 +135,26 @@ export async function emitSessionRevokedDomainEvent(
   });
 }
 
+export async function emitSessionRotatedDomainEvent(
+  tx: DbTransaction,
+  args: {
+    tenantId: TenantId;
+    accountId: AccountId;
+    sessionId: SessionId;
+    occurredAt: string;
+    expiresAt: string;
+  },
+): Promise<void> {
+  await emitDomainEvent(tx, {
+    tenant_id: args.tenantId,
+    aggregate_type: SESSION_AGGREGATE,
+    aggregate_id: args.sessionId,
+    event_type: 'identity.session.rotated',
+    payload: { account_id: args.accountId, session_id: args.sessionId, expires_at: args.expiresAt },
+    occurred_at: args.occurredAt,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // OTP lifecycle events
 // ---------------------------------------------------------------------------

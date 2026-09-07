@@ -71,6 +71,88 @@ const SESSION_COLUMNS = `
   revoked_at, revoked_reason
 `;
 
+/**
+ * Revoke-only locking for a session already proved by an opaque credential or
+ * a verified rotation receipt. Account status/type cannot prevent signout.
+ * This helper must never authorize renewal or return replacement credentials.
+ */
+export async function lockSessionForRevocation(
+  tenantId: TenantId,
+  accountId: string,
+  sessionId: string,
+  tx: DbTransaction,
+): Promise<Session | null> {
+  const account = await tx.query(
+    'SELECT account_id FROM accounts WHERE tenant_id=$1 AND account_id=$2 FOR UPDATE',
+    [tenantId, accountId],
+  );
+  if (account.rowCount !== 1) return null;
+  await tx.query(
+    'SELECT session_id FROM sessions WHERE tenant_id=$1 AND account_id=$2 AND session_id=$3 FOR UPDATE',
+    [tenantId, accountId, sessionId],
+  );
+  const result = await tx.query<SessionRow>(
+    `SELECT ${SESSION_COLUMNS} FROM sessions WHERE tenant_id=$1 AND account_id=$2 AND session_id=$3
+      AND revoked_at IS NULL AND expires_at>clock_timestamp()`,
+    [tenantId, accountId, sessionId],
+  );
+  return result.rows[0] ? rowToSession(result.rows[0]) : null;
+}
+
+/** Account then session matches PIN reset; evaluate time only after both waits. */
+export async function lockCurrentPatientSession(
+  tenantId: TenantId,
+  accountId: string,
+  sessionId: string,
+  tx: DbTransaction,
+): Promise<Session | null> {
+  const account = await tx.query(
+    `SELECT account_id FROM accounts WHERE tenant_id=$1 AND account_id=$2
+      AND account_type IN ('patient','delegate') AND status='active' AND deleted_at IS NULL FOR UPDATE`,
+    [tenantId, accountId],
+  );
+  if (account.rowCount !== 1) return null;
+  await tx.query(
+    'SELECT session_id FROM sessions WHERE tenant_id=$1 AND account_id=$2 AND session_id=$3 FOR UPDATE',
+    [tenantId, accountId, sessionId],
+  );
+  const result = await tx.query<SessionRow>(
+    `SELECT ${SESSION_COLUMNS} FROM sessions WHERE tenant_id=$1 AND account_id=$2 AND session_id=$3
+      AND revoked_at IS NULL AND expires_at>clock_timestamp()`,
+    [tenantId, accountId, sessionId],
+  );
+  return result.rows[0] ? rowToSession(result.rows[0]) : null;
+}
+
+/** Replace a current credential once; never extend the original session deadline. */
+export async function rotatePatientRefreshToken(
+  tenantId: TenantId,
+  previousHash: string,
+  nextHash: string,
+  tx: DbTransaction,
+): Promise<Session | null> {
+  const candidate = await tx.query<{ account_id: string; session_id: string }>(
+    'SELECT account_id,session_id FROM sessions WHERE tenant_id=$1 AND refresh_token_hash=$2',
+    [tenantId, previousHash],
+  );
+  const original = candidate.rows[0];
+  if (candidate.rowCount !== 1 || !original) return null;
+  const live = await lockCurrentPatientSession(
+    tenantId,
+    original.account_id,
+    original.session_id,
+    tx,
+  );
+  if (!live || live.refresh_token_hash !== previousHash) return null;
+  const rotated = await tx.query<SessionRow>(
+    `UPDATE sessions SET refresh_token_hash=$4,last_active_at=clock_timestamp()
+      WHERE tenant_id=$1 AND session_id=$2 AND refresh_token_hash=$3
+      AND revoked_at IS NULL AND expires_at>clock_timestamp() RETURNING ${SESSION_COLUMNS}`,
+    [tenantId, original.session_id, previousHash, nextHash],
+  );
+  return rotated.rows[0] ? rowToSession(rotated.rows[0]) : null;
+}
+
 // ---------------------------------------------------------------------------
 // CreateSessionInput
 // ---------------------------------------------------------------------------
