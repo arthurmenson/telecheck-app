@@ -144,6 +144,24 @@ export async function verifyStaffEnrollment({
       [author.tenant, receipt.account_id],
       '42501',
     );
+    // An intermediate suspended/archived status cannot bypass staff setup.
+    await identity.query('BEGIN');
+    try {
+      await identity.query('SELECT public.set_tenant_context($1)', [author.tenant]);
+      await identity.query(
+        "UPDATE public.accounts SET status='suspended' WHERE tenant_id=$1 AND account_id=$2",
+        [author.tenant, receipt.account_id],
+      );
+      await assert.rejects(
+        identity.query(
+          "UPDATE public.accounts SET status='active' WHERE tenant_id=$1 AND account_id=$2",
+          [author.tenant, receipt.account_id],
+        ),
+        (e) => e.code === '42501',
+      );
+    } finally {
+      await identity.query('ROLLBACK');
+    }
     await denied(
       "INSERT INTO public.sessions(session_id,tenant_id,account_id,refresh_token_hash,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour')",
       [ulid(), author.tenant, receipt.account_id, randomBytes(32).toString('hex')],

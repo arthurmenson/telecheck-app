@@ -135,7 +135,7 @@ GRANT EXECUTE ON FUNCTION public.identity_enroll_clinician(TEXT,TEXT,TEXT,TEXT,T
 CREATE FUNCTION public.identity_staff_activation_guard() RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 BEGIN
-  IF OLD.status='pending_verification' AND NEW.status='active' AND EXISTS(
+  IF NEW.status='active' AND EXISTS(
     SELECT 1 FROM public.identity_staff_enrollment e WHERE e.tenant_id=OLD.tenant_id AND e.account_id=OLD.account_id) THEN
     RAISE EXCEPTION 'staff_authentication_required' USING ERRCODE='42501';
   END IF;
