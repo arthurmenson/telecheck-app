@@ -9,7 +9,9 @@ import type pg from 'pg';
 const fixtureKey = createHash('sha256')
   .update('synthetic-billing-AWS-transport-only-not-an-AWS-key')
   .digest();
-export function installControlledBillingAws() {
+export function installControlledBillingAws(
+  expectedDataClass: 'pii_financial' | 'pii_sensitive_clinical' = 'pii_financial',
+) {
   assert.equal(process.env['BILLING_SYNTHETIC_ACCEPTANCE'], 'true');
   assert.equal(process.env['NODE_ENV'], 'development');
   const originalKms = Object.getOwnPropertyDescriptor(KMSClient.prototype, 'send');
@@ -45,7 +47,7 @@ export function installControlledBillingAws() {
       state.calls++;
       assert.ok(command instanceof GenerateDataKeyCommand || command instanceof DecryptCommand);
       const input = command.input;
-      assert.equal(input.EncryptionContext?.['data_class'], 'pii_financial');
+      assert.equal(input.EncryptionContext?.['data_class'], expectedDataClass);
       assert.deepEqual(Object.keys(input.EncryptionContext ?? {}).sort(), [
         'data_class',
         'tenant_id',

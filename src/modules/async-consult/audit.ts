@@ -291,6 +291,7 @@ export async function emitConsultExpiredAudit(
 
 type AsyncConsultV1AuditActionPlaceholder =
   | 'async_consult.initiated'
+  | 'async_consult.intake_definition_bound'
   | 'async_consult.intake_submitted'
   | 'async_consult.ai_preparation_started'
   | 'async_consult.ai_preparation_completed'
@@ -454,6 +455,40 @@ export async function emitAsyncConsultIntakeSubmittedAudit(
         template_version: args.templateVersion,
         // The intake payload itself is a KMS envelope (I-026) — never
         // echoed into audit detail.
+      },
+    }),
+    tx,
+  );
+}
+
+export async function emitAsyncConsultIntakeDefinitionBoundAudit(
+  args: {
+    tenantId: TenantId;
+    consultId: string;
+    patientId: string;
+    countryOfCare: string;
+    templateId: string;
+    templateVersion: number;
+    deploymentId: string;
+    schemaHash: string;
+  },
+  tx: AuditDbClient,
+): Promise<AuditEnvelope> {
+  return emitAudit(
+    buildV1Envelope(asyncConsultV1AuditPlaceholder('async_consult.intake_definition_bound'), 'C', {
+      tenant_id: args.tenantId,
+      actor_type: 'patient',
+      actor_id: args.patientId,
+      actor_tenant_id: args.tenantId,
+      target_patient_id: args.patientId,
+      country_of_care: args.countryOfCare,
+      resource_type: 'consult_care_binding',
+      resource_id: args.consultId,
+      detail: {
+        template_id: args.templateId,
+        template_version: args.templateVersion,
+        deployment_id: args.deploymentId,
+        schema_hash: args.schemaHash,
       },
     }),
     tx,

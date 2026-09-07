@@ -1,361 +1,327 @@
-/**
- * submit-intake-v1.test.ts — unit tests for
- * POST /v1/async-consults/:consult_id/intake.
- *
- * Verifies: guard precedence (401/403/delegate 403/400 including partial
- * KMS envelope), canonical composition, 18-param wrapper call with
- * decoded envelope Buffers, same-tx Cat C async_consult.intake_submitted
- * emission, 42501 → 403, and the mapServiceError contract for the
- * 23514 state guard (asserted via the mapper the handler passes to
- * withIdempotentExecution).
- */
+import sensible from '@fastify/sensible';
+import Fastify, { type FastifyInstance } from 'fastify';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { FastifyReply, FastifyRequest } from 'fastify';
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { idempotencyPlugin } from '../../../../lib/idempotency.js';
 
-import { submitIntakeV1Handler } from './submit-intake-v1.js';
+import { admitCareIntakeV1Request, submitIntakeV1Handler } from './submit-intake-v1.js';
 
-// ---------------------------------------------------------------------------
-// Mocks
-// ---------------------------------------------------------------------------
+const h = vi.hoisted(() => ({
+  admit: vi.fn(),
+  submit: vi.fn(),
+  transaction: vi.fn(),
+  cacheLookup: vi.fn(),
+  actor: undefined as Record<string, unknown> | undefined,
+  nonce: 'unit-nonce' as string | undefined,
+  order: [] as string[],
+}));
+const tenant = { tenantId: 'Telecheck-US', countryOfCare: 'US' };
+const caseId = '01K00000000000000000000001';
+const key = '01K00000000000000000000002';
+vi.mock('../../../crisis-response/index.js', () => ({ admitPatientCareInput: h.admit }));
+vi.mock('../../../../lib/db.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../../lib/db.js')>()),
+  withTenantBoundConnection: async (_tenant: string, work: (client: unknown) => Promise<unknown>) =>
+    work({ query: h.cacheLookup }),
+}));
+vi.mock('../../../../lib/tenant-context.js', () => ({
+  requireTenantContext: () => ({ tenantId: 'Telecheck-US', countryOfCare: 'US' }),
+}));
+vi.mock('../../../../lib/auth-context.js', () => ({
+  requirePatientActorContext: () => {
+    if (!h.actor) throw Object.assign(new Error('Authentication required'), { statusCode: 401 });
+    if (h.actor['role'] !== 'patient')
+      throw Object.assign(new Error('Patient required'), { statusCode: 403 });
+    return h.actor;
+  },
+}));
+vi.mock('../../../forms-intake/index.js', () => ({
+  ConsultDefinitionError: class extends Error {},
+}));
+vi.mock('../services/clinical-intake-repository.js', () => ({
+  careIntakeRepository: () => ({}),
+  careIntakeTransaction: () => h.transaction,
+  beginCareIntake: vi.fn(),
+}));
+vi.mock('../services/clinical-intake.js', () => ({
+  createCareIntakeService: () => h.submit,
+  CareIntakeError: class extends Error {},
+}));
+vi.mock('../../../../lib/idempotent-handler.js', () => ({
+  withIdempotentExecution: async (
+    req: { id: string },
+    reply: { code: (value: number) => { send: (value: unknown) => unknown } },
+    map: (error: unknown, reply: unknown, id: string) => boolean,
+    body: (tx: unknown) => Promise<{ status: number; view: unknown }>,
+    run: (work: (tx: unknown) => Promise<unknown>) => Promise<unknown>,
+  ) => {
+    try {
+      const result = (await run(body)) as { status: number; view: unknown };
+      return reply.code(result.status).send(result.view);
+    } catch (error) {
+      if (map(error, reply, req.id)) return reply;
+      throw error;
+    }
+  },
+}));
 
-const wrapperCalls: string[] = [];
-const recordedQueries: { sql: string; params: unknown[] | undefined }[] = [];
-const auditCalls: { fn: string; args: unknown }[] = [];
-/** The mapServiceError fn the handler passed to withIdempotentExecution. */
-let capturedMapServiceError:
-  | ((err: unknown, reply: FastifyReply, reqId: string) => boolean)
-  | null = null;
-
-let queryResponder: (
-  sql: string,
-  params?: unknown[],
-) => Promise<{ rows: unknown[]; rowCount: number | null }> = async () => ({
-  rows: [],
-  rowCount: 1,
-});
-
-const mockTx = {
-  query: vi.fn(async (sql: string, params?: unknown[]) => {
-    recordedQueries.push({ sql, params });
-    return queryResponder(sql, params);
-  }),
+let app: FastifyInstance;
+const resources = {
+  country_of_care: 'US',
+  emergency_number: '911',
+  crisis_helplines: [],
+  status: 'available',
+};
+const interrupted = {
+  kind: 'crisis_interruption',
+  recording_status: 'recorded',
+  disclosure_status: 'available',
+  crisis_event_id: caseId,
+  escalation_status: 'pending',
+  detector_version: 'keyword_engineering_v1',
+  resources,
+};
+const input = {
+  definition: {
+    deployment_id: caseId,
+    template_id: key,
+    template_version: 1,
+    schema_hash: 'a'.repeat(64),
+  },
+  answers: { reason: 'Synthetic ordinary care question' },
 };
 
-vi.mock('../../../../lib/idempotent-handler.js', () => ({
-  withIdempotentExecution: vi.fn(
-    async (
-      _req: unknown,
-      reply: { code: (n: number) => { send: (b: unknown) => unknown } },
-      mapServiceError: (err: unknown, reply: FastifyReply, reqId: string) => boolean,
-      body: (tx: unknown, ctx: unknown) => Promise<{ status: number; view: unknown }>,
-    ) => {
-      capturedMapServiceError = mapServiceError;
-      wrapperCalls.push('withIdempotentExecution:start');
-      const result = await body(mockTx, { tenantId: 'Telecheck-US' });
-      wrapperCalls.push('withIdempotentExecution:end');
-      return reply.code(result.status).send(result.view);
-    },
-  ),
-}));
-
-vi.mock('../../../../lib/rls.js', () => ({
-  withTenantContext: vi.fn(async (_tx: unknown, tenantId: string, fn: () => Promise<unknown>) => {
-    wrapperCalls.push(`withTenantContext:${tenantId}`);
-    return fn();
-  }),
-}));
-
-vi.mock('../../../../lib/actor-context-binding.js', () => ({
-  withActorContext: vi.fn(async (_tx: unknown, nonce: string, fn: () => Promise<unknown>) => {
-    wrapperCalls.push(`withActorContext:${nonce}`);
-    return fn();
-  }),
-}));
-
-vi.mock('../../../../lib/with-db-role.js', () => ({
-  withDbRole: vi.fn(async (_tx: unknown, role: string, fn: () => Promise<unknown>) => {
-    wrapperCalls.push(`withDbRole:${role}`);
-    return fn();
-  }),
-}));
-
-vi.mock('../../../../lib/tenant-context.js', () => ({
-  requireTenantContext: vi.fn(() => ({
-    tenantId: 'Telecheck-US',
-    countryOfCare: 'US' as const,
-  })),
-}));
-
-vi.mock('../../../../lib/auth-context.js', () => ({
-  requirePatientActorContext: vi.fn((req: { actorContext?: { role?: string } }) => {
-    const actor = req.actorContext;
-    if (actor === undefined) {
-      const e = new Error('Authentication is required.') as Error & { statusCode: number };
-      e.statusCode = 401;
-      throw e;
-    }
-    if (actor.role !== 'patient') {
-      const e = new Error('This endpoint requires role=patient.') as Error & {
-        statusCode: number;
-      };
-      e.statusCode = 403;
-      throw e;
-    }
-    return actor;
-  }),
-  resolveActorTenantIdForAudit: vi.fn(() => 'Telecheck-US'),
-}));
-
-let ulidCounter = 0;
-vi.mock('../../../../lib/ulid.js', () => ({
-  ulid: vi.fn(() => `01HFG6Z3Q8B7H9P2W4V5K6N7T${(ulidCounter++ % 10).toString()}`),
-}));
-
-vi.mock('../../audit.js', () => ({
-  emitAsyncConsultIntakeSubmittedAudit: vi.fn(async (args: unknown, _tx: unknown) => {
-    auditCalls.push({ fn: 'emitAsyncConsultIntakeSubmittedAudit', args });
-    return { audit_id: 'aud_test' };
-  }),
-}));
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
-const PATIENT_ULID = '01HFG6Z3Q8B7H9P2W4V5K6N7TB';
-const CONSULT_ULID = '01HFG6Z3Q8B7H9P2W4V5K6N7TD';
-const TEMPLATE_ULID = '01HFG6Z3Q8B7H9P2W4V5K6N7TE';
-const DEK_ULID = '01HFG6Z3Q8B7H9P2W4V5K6N7TF';
-
-function makeEnvelope(): Record<string, unknown> {
-  return {
-    ciphertext_b64: Buffer.from('sealed-intake-payload').toString('base64'),
-    dek_id: DEK_ULID,
-    iv_b64: Buffer.from('0123456789ab').toString('base64'),
-    tag_b64: Buffer.from('0123456789abcdef').toString('base64'),
-    alg: 'AES-256-GCM',
-    alg_version: '1',
-    aad_b64: Buffer.from('tenant:Telecheck-US').toString('base64'),
-    encrypted_at: '2026-07-06T00:00:00.000Z',
+beforeEach(async () => {
+  vi.clearAllMocks();
+  h.order.length = 0;
+  h.nonce = 'unit-nonce';
+  h.actor = {
+    accountId: '01K00000000000000000000003',
+    sessionId: key,
+    role: 'patient',
+    tenantId: tenant.tenantId,
+    delegateId: null,
   };
-}
-
-function makeValidBody(): Record<string, unknown> {
-  return {
-    template_id: TEMPLATE_ULID,
-    template_version: '3',
-    intake_payload_envelope: makeEnvelope(),
-  };
-}
-
-function makeReq(opts?: {
-  body?: unknown;
-  consultId?: string;
-  actor?: { role: string; delegateId?: string | null } | null;
-  actorNonce?: string;
-}): FastifyRequest {
-  const actorSpec = opts?.actor === undefined ? { role: 'patient', delegateId: null } : opts.actor;
-  return {
-    id: 'req_test',
-    body: opts?.body ?? makeValidBody(),
-    params: { consult_id: opts?.consultId ?? CONSULT_ULID },
-    headers: {},
-    actorContext:
-      actorSpec === null
-        ? undefined
-        : {
-            accountId: PATIENT_ULID,
-            sessionId: 'sess_test',
-            tenantId: 'Telecheck-US',
-            role: actorSpec.role,
-            countryOfCare: 'US',
-            delegateId: actorSpec.delegateId ?? null,
-            adminTenantBinding: null,
-            adminHomeTenantId: null,
-          },
-    actorNonce: opts?.actorNonce,
-    server: {
-      httpErrors: {
-        forbidden: (msg: string) => {
-          const e = new Error(msg) as Error & { statusCode: number };
-          e.statusCode = 403;
-          return e;
-        },
-      },
+  h.admit.mockImplementation(async () => {
+    h.order.push('admission');
+    return { kind: 'no_detection' };
+  });
+  h.cacheLookup.mockImplementation(async () => {
+    h.order.push('cache');
+    return { rows: [] };
+  });
+  h.transaction.mockImplementation(async (work) => {
+    h.order.push('business');
+    return work({});
+  });
+  h.submit.mockResolvedValue({ submission_id: caseId, status: 'submitted' });
+  app = Fastify({ logger: false });
+  await app.register(sensible);
+  app.addHook('onRequest', async (req) => {
+    Object.assign(req, { actorContext: h.actor, actorNonce: h.nonce, tenantContext: tenant });
+  });
+  await app.register(idempotencyPlugin);
+  app.post(
+    '/v1/async-consults/:consult_id/intake',
+    {
+      config: { careBoundary: 'patient' },
+      bodyLimit: 1_048_576,
+      preValidation: admitCareIntakeV1Request,
     },
-  } as unknown as FastifyRequest;
+    submitIntakeV1Handler,
+  );
+  app.post('/unit-without-admission/:consult_id', submitIntakeV1Handler);
+  await app.ready();
+});
+afterEach(async () => {
+  await app.close();
+});
+function request(
+  body: unknown = input,
+  headers: Record<string, string> = { 'idempotency-key': key },
+  url = `/v1/async-consults/${caseId}/intake`,
+) {
+  return app.inject({ method: 'POST', url, headers, payload: JSON.stringify(body) });
 }
-
-function makeReply(): { reply: FastifyReply; sent: { code?: number; body?: unknown } } {
-  const sent: { code?: number; body?: unknown } = {};
-  const reply = {
-    code: (n: number) => {
-      sent.code = n;
-      return reply;
-    },
-    send: (body: unknown) => {
-      sent.body = body;
-      return reply;
-    },
-  } as unknown as FastifyReply;
-  return { reply, sent };
-}
-
-beforeEach(() => {
-  wrapperCalls.length = 0;
-  recordedQueries.length = 0;
-  auditCalls.length = 0;
-  ulidCounter = 0;
-  capturedMapServiceError = null;
-  queryResponder = async () => ({ rows: [], rowCount: 1 });
-});
-
-// ===========================================================================
-// §1 — Guard precedence + envelope validation
-// ===========================================================================
-
-describe('submitIntakeV1Handler §1 — guards + validation', () => {
-  it('rejects 401 when unauthenticated', async () => {
-    const req = makeReq({ actor: null });
-    const { reply } = makeReply();
-    await expect(submitIntakeV1Handler(req, reply)).rejects.toMatchObject({ statusCode: 401 });
-  });
-
-  it('rejects 403 for a clinician actor', async () => {
-    const req = makeReq({ actor: { role: 'clinician' } });
-    const { reply } = makeReply();
-    await expect(submitIntakeV1Handler(req, reply)).rejects.toMatchObject({ statusCode: 403 });
-  });
-
-  it('rejects 403 when the patient actor carries delegate context', async () => {
-    const req = makeReq({ actor: { role: 'patient', delegateId: TEMPLATE_ULID } });
-    const { reply } = makeReply();
-    await expect(submitIntakeV1Handler(req, reply)).rejects.toMatchObject({ statusCode: 403 });
-  });
-
-  it('rejects 400 on a malformed consult_id path param', async () => {
-    const req = makeReq({ consultId: 'not-a-ulid' });
-    const { reply, sent } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-    expect(sent.code).toBe(400);
-  });
-
-  it('rejects 400 when the KMS envelope is missing a field (partial envelope)', async () => {
-    const envelope = makeEnvelope();
-    delete envelope['tag_b64'];
-    const req = makeReq({ body: { ...makeValidBody(), intake_payload_envelope: envelope } });
-    const { reply, sent } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-    expect(sent.code).toBe(400);
-  });
-
-  it('rejects 400 when a BYTEA envelope field is not valid base64', async () => {
-    const envelope = { ...makeEnvelope(), ciphertext_b64: '%%%not-base64%%%' };
-    const req = makeReq({ body: { ...makeValidBody(), intake_payload_envelope: envelope } });
-    const { reply, sent } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-    expect(sent.code).toBe(400);
-  });
-});
-
-// ===========================================================================
-// §2 — Composition + wrapper call + audit
-// ===========================================================================
-
-describe('submitIntakeV1Handler §2 — composition + wrapper + audit', () => {
-  it('threads the canonical composition with withDbRole(async_consult_patient_initiator)', async () => {
-    const req = makeReq({ actorNonce: 'nonce-1' });
-    const { reply } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-    expect(wrapperCalls).toEqual([
-      'withIdempotentExecution:start',
-      'withTenantContext:Telecheck-US',
-      'withActorContext:nonce-1',
-      'withDbRole:async_consult_patient_initiator',
-      'withIdempotentExecution:end',
-    ]);
-  });
-
-  it('calls record_consult_intake_submission with 18 params + decoded Buffers', async () => {
-    const req = makeReq();
-    const { reply } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-
-    expect(recordedQueries).toHaveLength(1);
-    const { sql, params } = recordedQueries[0]!;
-    expect(sql).toContain('record_consult_intake_submission');
-    expect(params).toHaveLength(18);
-    expect(params?.[1]).toBe('Telecheck-US');
-    expect(params?.[2]).toBe(CONSULT_ULID);
-    expect(params?.[3]).toBe(PATIENT_ULID); // trust-anchor patient
-    expect(Buffer.isBuffer(params?.[6])).toBe(true); // ciphertext
-    expect((params?.[6] as Buffer).toString('utf8')).toBe('sealed-intake-payload');
-    expect(params?.[7]).toBe(DEK_ULID);
-    expect(params?.[17]).toBe('patient'); // p_actor_role
-  });
-
-  it('emits EXACTLY ONE audit event: async_consult.intake_submitted', async () => {
-    const req = makeReq();
-    const { reply } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-    expect(auditCalls.map((c) => c.fn)).toEqual(['emitAsyncConsultIntakeSubmittedAudit']);
-    const args = auditCalls[0]!.args as Record<string, unknown>;
-    expect(args['consultId']).toBe(CONSULT_ULID);
-    expect(args['templateId']).toBe(TEMPLATE_ULID);
-  });
-
-  it('returns 201 with { submission_id }', async () => {
-    const req = makeReq();
-    const { reply, sent } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-    expect(sent.code).toBe(201);
-    expect(typeof (sent.body as Record<string, unknown>)['submission_id']).toBe('string');
-  });
-});
-
-// ===========================================================================
-// §3 — Error mapping
-// ===========================================================================
-
-describe('submitIntakeV1Handler §3 — error mapping', () => {
-  it('maps 42501 to a tenant-blind 403', async () => {
-    queryResponder = async () => {
-      const err = new Error('tenant scope mismatch') as Error & { code: string };
-      err.code = '42501';
-      throw err;
-    };
-    const req = makeReq();
-    const { reply } = makeReply();
-    await expect(submitIntakeV1Handler(req, reply)).rejects.toMatchObject({
-      statusCode: 403,
-      message: 'Insufficient scope for this request.',
+// This unit harness uses the real Fastify lifecycle and idempotency preHandler;
+// actual Identity, PostgreSQL, crisis persistence and KMS are runtime acceptance.
+describe('plaintext intake admission boundary', () => {
+  it('submits after crisis admission and idempotency checks, with a private response', async () => {
+    const response = await request(input, {
+      'idempotency-key': key,
+      'content-type': 'application/json',
     });
+    expect(response.statusCode).toBe(201);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(h.order).toEqual(['admission', 'business']);
+    expect(h.admit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: h.actor!['accountId'],
+        actorNonce: h.nonce,
+        idempotencyKey: key,
+      }),
+      input,
+      'form_response',
+    );
+    expect(h.submit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ accountId: h.actor!['accountId'] }),
+      caseId,
+      input,
+    );
+    expect(response.json()).toEqual({ submission_id: caseId, status: 'submitted' });
   });
-
-  it('mapServiceError maps the 23514 state guard to a tenant-blind 409', async () => {
-    const req = makeReq();
-    const { reply } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-    expect(capturedMapServiceError).not.toBeNull();
-
-    const { reply: mapReply, sent } = makeReply();
-    const err = new Error('consult not in an intake-capable state') as Error & { code: string };
-    err.code = '23514';
-    const mapped = capturedMapServiceError!(err, mapReply, 'req_test');
-    expect(mapped).toBe(true);
-    expect(sent.code).toBe(409);
-    const body = sent.body as { error: { message: string } };
-    expect(body.error.message).toBe('Consult is not in an intake-capable state.');
+  it.each([{}, { 'idempotency-key': 'invalid' }, { 'idempotency-key': key }])(
+    'interrupts before idempotency validation for headers %j',
+    async (headers) => {
+      h.admit.mockResolvedValue(interrupted);
+      const body = { unrelated_unknown_field: 'Synthetic trigger text', answers: false };
+      const response = await request(body, { ...headers, 'content-type': 'application/json' });
+      expect(response.statusCode).toBe(202);
+      expect(response.json()).toEqual(interrupted);
+      expect(h.admit.mock.calls[0]?.[1]).toEqual(body);
+      expect(h.cacheLookup).not.toHaveBeenCalled();
+      expect(h.transaction).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['not_recorded', 'unconfirmed'])(
+    'blocks ordinary care with resources when recording is %s',
+    async (recording) => {
+      const result = {
+        kind: 'crisis_interruption',
+        recording_status: recording,
+        escalation_status: recording === 'unconfirmed' ? 'unconfirmed' : 'not_queued',
+        resources,
+        detector_version: 'keyword_engineering_v1',
+      };
+      h.admit.mockResolvedValue(result);
+      const response = await request({}, { 'content-type': 'application/json' });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual(result);
+      expect(response.json()).not.toHaveProperty('crisis_event_id');
+      expect(h.submit).not.toHaveBeenCalled();
+    },
+  );
+  it('returns a truthful unavailable receipt when recording succeeded but disclosure is unavailable', async () => {
+    const { crisis_event_id: _event, ...recorded } = interrupted;
+    h.admit.mockResolvedValue({ ...recorded, disclosure_status: 'unavailable' });
+    const response = await request(input, { 'content-type': 'application/json' });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      recording_status: 'recorded',
+      escalation_status: 'pending',
+      disclosure_status: 'unavailable',
+    });
+    expect(response.json()).not.toHaveProperty('crisis_event_id');
+    expect(h.submit).not.toHaveBeenCalled();
+    expect(h.cacheLookup).not.toHaveBeenCalled();
   });
-
-  it('mapServiceError leaves unknown SQLSTATEs unmapped (propagate to global envelope)', async () => {
-    const req = makeReq();
-    const { reply } = makeReply();
-    await submitIntakeV1Handler(req, reply);
-    const { reply: mapReply } = makeReply();
-    const err = new Error('deadlock detected') as Error & { code: string };
-    err.code = '40P01';
-    expect(capturedMapServiceError!(err, mapReply, 'req_test')).toBe(false);
+  it('scans an invalid case path and query before business rejection', async () => {
+    h.admit.mockResolvedValue(interrupted);
+    const response = await request(
+      input,
+      { 'content-type': 'application/json' },
+      '/v1/async-consults/invalid/intake?unknown=yes',
+    );
+    expect(response.statusCode).toBe(202);
+    expect(h.transaction).not.toHaveBeenCalled();
+  });
+  it.each(['missing', 'invalid'])(
+    'rejects %s ordinary retry keys only after admission',
+    async (kind) => {
+      const response = await request(input, {
+        'content-type': 'application/json',
+        ...(kind === 'invalid' ? { 'idempotency-key': 'invalid' } : {}),
+      });
+      expect(response.statusCode).toBe(400);
+      expect(h.admit).toHaveBeenCalledOnce();
+      expect(h.submit).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['clinician', 'tenant_admin', 'platform_admin'])(
+    'rejects %s before patient crisis admission',
+    async (role) => {
+      h.actor!['role'] = role;
+      const response = await request(input, {
+        'idempotency-key': key,
+        'content-type': 'application/json',
+      });
+      expect(response.statusCode).toBe(403);
+      expect(h.admit).not.toHaveBeenCalled();
+    },
+  );
+  it('requires authentication before crisis admission', async () => {
+    h.actor = undefined;
+    const response = await request(input, { 'content-type': 'application/json' });
+    expect(response.statusCode).toBe(401);
+    expect(h.admit).not.toHaveBeenCalled();
+  });
+  it.each(['delegate', 'nonce', 'tenant'])(
+    'rejects unavailable %s scope before admission',
+    async (scope) => {
+      if (scope === 'delegate') h.actor!['delegateId'] = key;
+      if (scope === 'nonce') h.nonce = undefined;
+      if (scope === 'tenant') h.actor!['tenantId'] = 'Telecheck-Ghana';
+      const response = await request(input, { 'content-type': 'application/json' });
+      expect(response.statusCode).toBe(403);
+      expect(h.admit).not.toHaveBeenCalled();
+    },
+  );
+  it('rejects an expired admission session with no ordinary transaction', async () => {
+    h.admit.mockRejectedValue(
+      Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' }),
+    );
+    const response = await request(input, {
+      'idempotency-key': key,
+      'content-type': 'application/json',
+    });
+    expect(response.statusCode).toBe(401);
+    expect(h.submit).not.toHaveBeenCalled();
+    expect(response.body).not.toContain('crisis_unauthenticated');
+  });
+  it('cannot call the handler through a route missing admission', async () => {
+    const response = await request(
+      input,
+      { 'idempotency-key': key, 'content-type': 'application/json' },
+      `/unit-without-admission/${caseId}`,
+    );
+    expect(response.statusCode).toBe(503);
+    expect(h.submit).not.toHaveBeenCalled();
+  });
+  it('maps consent withdrawal during work to a safe actionable conflict', async () => {
+    h.submit.mockRejectedValue(
+      Object.assign(new Error('care_consent_required'), { code: 'PT409' }),
+    );
+    const response = await request(input, {
+      'idempotency-key': key,
+      'content-type': 'application/json',
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe('care.consent_required');
+  });
+  it.each([
+    ['billing_actor_unavailable', '42501', 401],
+    ['unrelated_permission_failure', '42501', 403],
+    ['billing_actor_unavailable', '55P03', 503],
+  ])(
+    'maps only a confirmed Billing identity denial to session expiry (%s/%s)',
+    async (message, code, status) => {
+      h.submit.mockRejectedValue(Object.assign(new Error(message), { code }));
+      const response = await request(input, {
+        'idempotency-key': key,
+        'content-type': 'application/json',
+      });
+      expect(response.statusCode).toBe(status);
+      expect(response.body).not.toContain(message);
+    },
+  );
+  it('enforces the parser admission limit without running business work', async () => {
+    const response = await request(
+      { text: 'a'.repeat(1_048_577) },
+      { 'content-type': 'application/json' },
+    );
+    expect(response.statusCode).toBe(413);
+    expect(h.admit).not.toHaveBeenCalled();
+    expect(h.submit).not.toHaveBeenCalled();
   });
 });

@@ -1036,9 +1036,31 @@ try {
           'patient',
         ],
       ),
-      (error: unknown) => (error as { code: string }).code === '23514',
+      (error: unknown) => (error as { code: string }).code === '42501',
     );
     await ordinary.query('ROLLBACK');
+    // The old caller-supplied envelope capability is retired. Prove the payment
+    // guard through the actual replacement SQL capability and HTTP ingress too.
+    await ordinary.query('BEGIN');
+    await ordinary.query('SELECT public.set_tenant_context($1)', [tenant]);
+    await ordinary.query("SELECT set_config('app.request_nonce',$1,true)", [nonce.nonce]);
+    await assert.rejects(
+      ordinary.query('SELECT public.care_bind_intake($1)', [c.consult_id]),
+      (error: unknown) =>
+        (error as { code: string; message: string }).code === 'PT409' &&
+        (error as { message: string }).message === 'care_payment_required',
+    );
+    await ordinary.query('ROLLBACK');
+    const unpaidIntake = await post(
+      `/v1/async-consults/${c.consult_id}/intake/begin`,
+      person.headers,
+      {},
+    );
+    assert.equal(unpaidIntake.statusCode, 409);
+    assert.equal(
+      unpaidIntake.json<{ error: { code: string } }>().error.code,
+      'care.payment_required',
+    );
     const confirm = await app.inject({
       method: 'GET',
       url: c.confirmation.href,

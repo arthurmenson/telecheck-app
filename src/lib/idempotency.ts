@@ -912,6 +912,9 @@ const idempotencyPluginImpl: FastifyPluginAsync<IdempotencyPluginOptions> = asyn
     // Billing authorizes against a live account/session before private durable
     // reservation or replay. The consult handler owns its safe response cache.
     if (request.routeOptions.config.billingBoundary === 'patient') return;
+    // Protected care resolves both replay and mismatch after live authorization
+    // inside the owning transaction, including any cache lock wait.
+    if (request.routeOptions.config.careBoundary === 'patient') return;
 
     // Extract tenant and actor from request context
     const tenantId = request.tenantContext?.tenantId ?? 'unknown';
