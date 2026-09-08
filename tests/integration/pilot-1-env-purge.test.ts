@@ -83,11 +83,23 @@ function cloneSchema(fromDsn: string, toDsn: string) {
     opts,
   );
   if (schema.status !== 0) throw new Error(`pg_dump --schema-only failed: ${schema.stderr}`);
-  const restore = spawnSync('psql', [`--dbname=${toDsn}`, '-X', '-q', '-v', 'ON_ERROR_STOP=1'], {
-    ...opts,
-    input: schema.stdout,
-  });
-  if (restore.status !== 0) throw new Error(`schema restore failed: ${restore.stderr}`);
+  // `-f -` makes psql label errors with the dump line (psql:<stdin>:N), so a
+  // restore failure can quote the offending statement instead of a bare
+  // ERROR line.
+  const restore = spawnSync(
+    'psql',
+    [`--dbname=${toDsn}`, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-f', '-'],
+    { ...opts, input: schema.stdout },
+  );
+  if (restore.status !== 0) {
+    const m = /<stdin>:(\d+):/.exec(restore.stderr);
+    const lines = schema.stdout.split('\n');
+    const at = m ? Number(m[1]) : 0;
+    const region = at ? lines.slice(Math.max(0, at - 25), at).join('\n') : '(no line reported)';
+    throw new Error(
+      `schema restore failed: ${restore.stderr}\n--- dump lines ${Math.max(1, at - 24)}..${at} ---\n${region}`,
+    );
+  }
   const data = spawnSync(
     'pg_dump',
     [
