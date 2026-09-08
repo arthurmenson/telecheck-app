@@ -1,12 +1,16 @@
-import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { withTransaction, type DbTransaction } from '../../../../lib/db.js';
+import {
+  getPool,
+  type DbClient,
+  type DbTransaction,
+  type withTransaction,
+} from '../../../../lib/db.js';
 import { emitDomainEvent } from '../../../../lib/domain-events.js';
 import {
   IdempotencyReplayError,
   IdempotencyBodyMismatchError,
   IdempotencyInFlightError,
 } from '../../../../lib/idempotency.js';
-import { withTenantContext } from '../../../../lib/rls.js';
+import { logger } from '../../../../lib/logger.js';
 import { ulid } from '../../../../lib/ulid.js';
 import type { CareConsentPatientContext } from '../../../consent/index.js';
 import { resolveConsultIntakeDefinition } from '../../../forms-intake/index.js';
@@ -55,32 +59,191 @@ async function actor(tx: DbTransaction, ctx: CareConsentPatientContext) {
 }
 
 /** Encloses reservation/replay, writes, audit/outbox and deferred proof checks. */
-export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof withTransaction {
-  return (work) =>
-    withTransaction((tx) =>
-      withTenantContext(tx, ctx.tenant.tenantId, () =>
-        withActorContext(tx, ctx.actorNonce, async () => {
-          await tx.query("SET LOCAL statement_timeout='10s'");
-          await tx.query("SET LOCAL lock_timeout='3s'");
-          await actor(tx, ctx);
-          try {
-            const result = await work(tx);
-            await actor(tx, ctx);
-            await tx.query('SET CONSTRAINTS care_intake_evidence,care_binding_evidence IMMEDIATE');
-            await actor(tx, ctx);
-            return result;
-          } catch (error) {
-            if (
-              error instanceof IdempotencyReplayError ||
-              error instanceof IdempotencyBodyMismatchError ||
-              error instanceof IdempotencyInFlightError
-            )
-              await actor(tx, ctx);
-            throw error;
-          }
-        }),
-      ),
+/**
+ * Wall-clock bound on the COMMIT statement only. PostgreSQL disables
+ * `statement_timeout` before running deferred constraint triggers inside
+ * COMMIT, so once the evidence triggers fire there their audit/outbox scans
+ * are unbounded server-side; this is the client-side bound. Deliberately
+ * below the transaction's 10 s statement_timeout.
+ */
+const COMMIT_DEADLINE_MS = 4_000;
+
+/** Bound on post-COMMIT ROLLBACK/cleanup, which run outside SET LOCAL timeouts. */
+const CLEANUP_DEADLINE_MS = 2_000;
+
+/** A pool client this module may return or DISCARD. */
+interface RecordingClient extends DbClient {
+  release?: (destroy?: boolean) => void;
+}
+
+/** Transaction outcome, captured the instant COMMIT resolves or rejects. */
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+let nextDiscardSignalAt = -Infinity;
+function signalRecordingClientDiscarded(): void {
+  if (performance.now() < nextDiscardSignalAt) return;
+  nextDiscardSignalAt = performance.now() + 60_000;
+  try {
+    logger.error(
+      { event: 'care_intake.recording_connection.discarded' },
+      'Care intake recording connection discarded: cleanup did not complete within its bound',
     );
+  } catch {
+    // Never let a logger failure replace the care response.
+  }
+}
+
+/**
+ * Consumed background work after the outcome has been published: roll back
+ * a failed transaction, clear the tenant binding, return the client — or
+ * discard it if that cannot finish inside its bound. I-023 holds either
+ * way: the binding is cleared, or the backend that held it is destroyed.
+ */
+function finalizeRecordingClient(
+  client: RecordingClient,
+  run: Promise<unknown>,
+  rollback: boolean,
+): void {
+  const settledRun = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  const rolledBack = rollback
+    ? settledRun
+        .then(() => client.query('ROLLBACK'))
+        .then(
+          () => undefined,
+          () => undefined,
+        )
+    : settledRun;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const bound = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('cleanup_deadline')), CLEANUP_DEADLINE_MS);
+  });
+  void Promise.race([rolledBack.then(() => client.query('SELECT clear_tenant_context()')), bound])
+    .then(
+      () => client.release?.(),
+      () => {
+        client.release?.(true);
+        signalRecordingClientDiscarded();
+      },
+    )
+    .finally(() => {
+      if (timer !== null) clearTimeout(timer);
+    });
+}
+
+/**
+ * Runs `work` in a transaction whose COMMIT is itself authority-checked.
+ *
+ * The previous shape — `withTransaction(() => withTenantContext(() =>
+ * withActorContext(work)))` followed by `SET CONSTRAINTS
+ * care_intake_evidence,care_binding_evidence IMMEDIATE` — is the defect
+ * class fixed for the crisis path in PR #302. `withTenantContext` DELETES
+ * the per-backend tenant binding in its cleanup, before the outer COMMIT;
+ * `kms_current_actor_context()` needs `current_tenant_id()`, so at COMMIT
+ * nothing could re-validate authority, and forcing the triggers IMMEDIATE
+ * consumed their events — the real COMMIT ran with no authority check and
+ * an actor nonce expiring in that window was committed under expired
+ * authority (`kms_current_actor_context()` compares against
+ * `clock_timestamp()`).
+ *
+ * Now this module owns the client: it sets the tenant binding, runs
+ * BEGIN…COMMIT with both bindings live, and lets the deferred triggers —
+ * which call `consent_care_live_actor()` first and last — fire AT COMMIT as
+ * a genuine authority gate. The outcome is published the instant COMMIT
+ * settles; ROLLBACK and cleanup are bounded background work; a stalled
+ * COMMIT is bounded client-side and reported as PT503, with this module's
+ * own socket destroyed rather than any backend signalled by pid.
+ *
+ * Keeps `typeof withTransaction` so `withIdempotentExecution` can consume
+ * it unchanged.
+ */
+export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof withTransaction {
+  return async <T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> => {
+    const client = (await getPool().connect()) as unknown as RecordingClient;
+    try {
+      await client.query('SELECT set_tenant_context($1)', [ctx.tenant.tenantId]);
+    } catch (error) {
+      client.release?.(true);
+      throw error;
+    }
+
+    let settled: Settled<T> | null = null;
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    let armDeadline: () => void = () => undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      armDeadline = () => {
+        deadlineTimer = setTimeout(() => {
+          reject(Object.assign(new Error('care_commit_unconfirmed'), { code: 'COMMIT_DEADLINE' }));
+        }, COMMIT_DEADLINE_MS);
+      };
+    });
+
+    const run = (async () => {
+      await client.query('BEGIN');
+      try {
+        await client.query("SET LOCAL statement_timeout='10s'");
+        await client.query("SET LOCAL lock_timeout='3s'");
+        await actor(client, ctx);
+        let result: T;
+        try {
+          result = await work(client);
+          await actor(client, ctx);
+        } catch (error) {
+          // An idempotency replay/mismatch/in-flight outcome is still only
+          // disclosed to a live, authorised actor.
+          if (
+            error instanceof IdempotencyReplayError ||
+            error instanceof IdempotencyBodyMismatchError ||
+            error instanceof IdempotencyInFlightError
+          )
+            await actor(client, ctx);
+          throw error;
+        }
+        armDeadline();
+        // The deferred care_intake_evidence / care_binding_evidence triggers
+        // fire HERE, with tenant and actor bindings both still in scope.
+        await client.query('COMMIT');
+        settled = { ok: true, value: result };
+        return result;
+      } catch (error) {
+        settled = { ok: false, error };
+        throw error;
+      } finally {
+        if (deadlineTimer !== null) clearTimeout(deadlineTimer);
+      }
+    })();
+
+    try {
+      const value = await Promise.race([run, deadline]);
+      finalizeRecordingClient(client, run, false);
+      const outcome = settled as Settled<T> | null;
+      return outcome?.ok ? outcome.value : value;
+    } catch (error) {
+      const outcome = settled as Settled<T> | null;
+      if (outcome?.ok) {
+        finalizeRecordingClient(client, run, false);
+        return outcome.value;
+      }
+      if (outcome && !outcome.ok) {
+        // A known outcome always wins over the deadline.
+        finalizeRecordingClient(client, run, true);
+        throw outcome.error;
+      }
+      if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') {
+        // COMMIT still in flight: destroy THIS socket so it can never be
+        // re-borrowed mid-COMMIT; never signal a backend by pid. The
+        // outcome is unknown — surface as PT503 (503), never as a success
+        // or a definite failure.
+        run.catch(() => undefined);
+        client.release?.(true);
+        throw Object.assign(new Error('care_commit_unconfirmed'), { code: 'PT503' });
+      }
+      finalizeRecordingClient(client, run, true);
+      throw error;
+    }
+  };
 }
 
 export function careIntakeRepository(ctx: CareConsentPatientContext): CareIntakeRepository {
