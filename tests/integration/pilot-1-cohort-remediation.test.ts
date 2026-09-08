@@ -411,12 +411,16 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
 
     // An unrelated unclassified account must be left exactly as it is: a seed
     // never classifies existing rows (Codex R6).
-    const canary = ulid();
-    await rawInsert(TARGET_TENANT, canary, 'patient');
-    const canaryUs = ulid();
-    await rawInsert(TENANT_US, canaryUs, 'patient');
-    const canaryGh = ulid();
-    await rawInsert('Telecheck-Ghana', canaryGh, 'patient');
+    // Patient AND delegate canaries in every tenant (a delegate-only
+    // mutation must be caught too — Codex R8).
+    const canaries: string[] = [];
+    for (const tenant of [TARGET_TENANT, TENANT_US, 'Telecheck-Ghana']) {
+      for (const type of ['patient', 'delegate']) {
+        const id = ulid();
+        await rawInsert(tenant, id, type);
+        canaries.push(id);
+      }
+    }
     const before = await allAccountIds();
     const ok = psqlFile('seed-staging-accounts.sql');
     expect(ok.status, ok.stderr).toBe(0);
@@ -428,7 +432,7 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
       [newIds],
     );
     for (const row of rows.rows) expect(row.c).toBe('baseline');
-    for (const c of [canary, canaryUs, canaryGh]) {
+    for (const c of canaries) {
       expect(await classificationOf(c)).toBe('unclassified');
       await deleteAccount(c);
     }
@@ -437,12 +441,16 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
   it('the baseline seed is idempotent, every row it creates is baseline, and every seeded id is a canonical ULID', async () => {
     // An unrelated unclassified account must be left exactly as it is: a seed
     // never classifies existing rows (Codex R6).
-    const canary = ulid();
-    await rawInsert(TARGET_TENANT, canary, 'patient');
-    const canaryUs = ulid();
-    await rawInsert(TENANT_US, canaryUs, 'patient');
-    const canaryGh = ulid();
-    await rawInsert('Telecheck-Ghana', canaryGh, 'patient');
+    // Patient AND delegate canaries in every tenant (a delegate-only
+    // mutation must be caught too — Codex R8).
+    const canaries: string[] = [];
+    for (const tenant of [TARGET_TENANT, TENANT_US, 'Telecheck-Ghana']) {
+      for (const type of ['patient', 'delegate']) {
+        const id = ulid();
+        await rawInsert(tenant, id, type);
+        canaries.push(id);
+      }
+    }
     const before = await allAccountIds();
     const first = psqlFile('pilot-1-baseline-seed.sql');
     expect(first.status, first.stderr).toBe(0);
@@ -458,7 +466,7 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     );
     expect(rows.rowCount).toBe(SEED_IDS.length);
     for (const row of rows.rows) expect(row.c).toBe('baseline');
-    for (const c of [canary, canaryUs, canaryGh]) {
+    for (const c of canaries) {
       expect(await classificationOf(c)).toBe('unclassified');
       await deleteAccount(c);
     }

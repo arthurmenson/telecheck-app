@@ -223,13 +223,17 @@ test('remediation: a refusal raised inside the transaction maps to exit 1; any o
 // ---------------------------------------------------------------------------
 
 export function splitSqlStatements(sql) {
+  // PostgreSQL ends a line comment at CR as well as LF; a CR could therefore
+  // hide executable SQL inside what this scanner sees as a comment. Seeds
+  // are LF-only, so the character is rejected outright (Codex R8).
+  if (sql.includes('\r')) throw new Error('carriage returns are not supported in a seed');
   const statements = [];
   let cur = '';
   let i = 0;
   while (i < sql.length) {
     const ch = sql[i];
     if (ch === '-' && sql[i + 1] === '-') {
-      while (i < sql.length && sql[i] !== '\n') i++;
+      while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i++;
       continue;
     }
     if (ch === '\\' && cur.trim() === '') {
@@ -293,6 +297,11 @@ export function splitSqlStatements(sql) {
     }
     if (ch === '$') {
       const m = sql.slice(i).match(/^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/);
+      if (!m) {
+        // Only ASCII-tagged dollar quotes are modelled; anything else
+        // (a non-ASCII tag PostgreSQL would accept) fails closed.
+        throw new Error('unsupported dollar-quote tag in a seed');
+      }
       if (m) {
         const tag = m[0];
         const end = sql.indexOf(tag, i + tag.length);
@@ -397,12 +406,13 @@ const DO_ALLOWED_BEFORE_PAREN = new Set([
 
 /** Removes comments (nested block + line), string literals and quoted identifiers, in encounter order. */
 export function stripSqlNoise(text) {
+  if (text.includes('\r')) throw new Error('carriage returns are not supported in a seed');
   let out = '';
   let i = 0;
   while (i < text.length) {
     const ch = text[i];
     if (ch === '-' && text[i + 1] === '-') {
-      while (i < text.length && text[i] !== '\n') i++;
+      while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
       out += ' ';
       continue;
     }
@@ -449,10 +459,11 @@ export function stripSqlNoise(text) {
       continue;
     }
     if (ch === '"') throw new Error('quoted identifiers are not supported in a seed');
-    if (ch === '$' && /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.test(text.slice(i))) {
-      // A nested dollar-quoted literal would let its apostrophes hide
-      // executable SQL from the scanner (Codex R7); guards never need one.
-      throw new Error('dollar-quoted literals inside a DO body are not supported in a seed');
+    if (ch === '$') {
+      // A nested dollar-quoted literal — with ANY tag, ASCII or not — would
+      // let its apostrophes hide executable SQL from the scanner (Codex R7 /
+      // R8); guards never need a dollar sign at all.
+      throw new Error('a dollar sign inside a DO body is not supported in a seed');
     }
     out += ch;
     i++;
@@ -851,6 +862,38 @@ test('seeds: the static check rejects DEFAULT, unclassified, missing column, a s
     ],
   ]) {
     assert.notEqual(mutated, source, `${name}: mutation did not apply`);
+    assert.equal(seedWritesOnlyBaseline(mutated), false, `${name} slipped through`);
+  }
+  // Codex R8 reproductions.
+  for (const [name, mutated] of [
+    [
+      'non-ASCII dollar tag hiding an UPDATE in a DO body',
+      baseline.replace(
+        /\nCOMMIT;/,
+        "\nDO $$ BEGIN RAISE NOTICE $é$'$é$; UPDATE accounts SET cohort_classification='baseline' WHERE account_type='delegate' AND cohort_classification='unclassified'; RAISE NOTICE $é$'$é$; END $$;\nCOMMIT;",
+      ),
+    ],
+    [
+      'CR-terminated comment hiding an UPDATE inside a DO body',
+      baseline.replace(
+        /\nCOMMIT;/,
+        "\nDO $$ BEGIN -- guard\rUPDATE accounts SET cohort_classification='baseline' WHERE account_type='delegate' AND cohort_classification='unclassified';\n END $$;\nCOMMIT;",
+      ),
+    ],
+    [
+      'CR-terminated comment hiding a top-level UPDATE',
+      baseline.replace(
+        /\nCOMMIT;/,
+        "\n-- guard\rUPDATE accounts SET cohort_classification='baseline';\nCOMMIT;",
+      ),
+    ],
+    [
+      'a bare dollar sign in a DO body',
+      baseline.replace(/\nCOMMIT;/, '\nDO $$ BEGIN RAISE NOTICE $x$; END $$;\nCOMMIT;'),
+    ],
+    ['a non-ASCII top-level dollar quote', baseline + '\nSELECT $é$x$é$;\n'],
+  ]) {
+    assert.notEqual(mutated, baseline, `${name}: mutation did not apply`);
     assert.equal(seedWritesOnlyBaseline(mutated), false, `${name} slipped through`);
   }
   // The real guards are accepted as read-only.
