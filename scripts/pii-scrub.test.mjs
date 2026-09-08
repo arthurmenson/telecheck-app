@@ -372,3 +372,21 @@ test('backup mode: COPY header whitespace, byte-level E-string escapes, budget b
   assert.equal(e.code, 4);
   assert.match(e.stderr, /exceeds/);
 });
+
+test('backup mode: COPY at the token boundary and complete code points after a backslash (Codex R11)', async () => {
+  const a = await run(
+    ['--mode', 'backup'],
+    'COPY"t" (body) FROM stdin;\ntest.user@example.com\n\\.\n',
+  );
+  assert.equal(a.code, 0, a.stderr);
+  assert.ok(!a.stdout.includes('test.user@example.com'));
+  assert.match(a.stderr, /copyRows=1/);
+  const b = await run(['--mode', 'backup'], 'copy public.t (\n');
+  assert.equal(b.code, 4);
+  assert.match(b.stderr, /unterminated COPY/);
+  const c = await run(['--mode', 'backup'], "SELECT E'\\😀 test.user@example.com';\n");
+  assert.equal(c.code, 0, c.stderr);
+  assert.ok(c.stdout.includes('😀'));
+  assert.ok(!c.stdout.includes('\uFFFD'));
+  assert.ok(!c.stdout.includes('test.user@example.com'));
+});

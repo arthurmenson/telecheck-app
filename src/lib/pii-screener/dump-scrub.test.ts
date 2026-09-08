@@ -516,3 +516,47 @@ describe('Codex R10 in-scope closures — header whitespace, byte-level E-string
     );
   });
 });
+
+describe('Codex R11 in-scope closures — COPY token boundary, complete code points after a backslash', () => {
+  for (const [name, header] of [
+    ['a quoted identifier adjacent to COPY', 'COPY"t" (body) FROM stdin;'],
+    ['no whitespace before FROM', 'COPY public.t(body)FROM stdin;'],
+    ['lowercase and adjacent', 'copy"t"(body)from stdin;'],
+  ] as const) {
+    it(`recognises a COPY header with ${name}`, () => {
+      const s = createDumpScrubber();
+      const out =
+        s.push(`${header}\n`) +
+        s.push('reach me at test.user@example.com\n') +
+        s.push('\\.\n') +
+        s.end();
+      expect(out).not.toContain('test.user@example.com');
+      expect(s.stats.copyRows).toBe(1);
+    });
+  }
+  it('an unsupported COPY form adjacent to a quoted identifier fails closed', () => {
+    expect(() => scrubText('COPY"t" (body) TO stdout;\nx\n')).toThrow(/unsupported COPY/);
+  });
+  it('a lowercase / adjacent unterminated COPY statement at EOF fails closed', () => {
+    for (const partial of ['copy public.t (\n', 'COPY"t" (\n']) {
+      const s = createDumpScrubber();
+      s.push(partial);
+      expect(() => s.end()).toThrow(/unterminated COPY/);
+    }
+  });
+  it('a statement that merely starts with the letters COPY is not a COPY statement', () => {
+    const sql = "SELECT 'my SSN is 123-45-6789' AS copyx;\nCOPYX;\n";
+    const out = scrubText(sql);
+    expect(out).not.toContain('123-45-6789');
+    expect(out.endsWith('COPYX;\n')).toBe(true);
+  });
+  it('an escaped supplementary character beside a redaction is preserved whole', () => {
+    const out = scrubText("SELECT E'\\😀 test.user@example.com';\n");
+    expect(out).toContain('😀');
+    expect(out).not.toContain('\uFFFD');
+    expect(out).not.toContain('test.user@example.com');
+  });
+  it('a lone surrogate after a backslash fails closed rather than being replaced', () => {
+    expect(() => scrubText("SELECT E'\\\uD83D x';\n")).toThrow(/invalid UTF-8/);
+  });
+});

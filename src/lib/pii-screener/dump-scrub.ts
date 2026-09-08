@@ -44,10 +44,18 @@
 import { redactForBackup } from './backup-redaction.js';
 import { redactLogLine } from './log-redaction.js';
 
-/** COPY header, tested on the complete statement once it closes in code mode. */
-const COPY_START_MULTILINE = /^COPY\s[\s\S]*?\sFROM\s+stdin\s*;\s*$/i;
-/** Any COPY statement at all — one that is not the header above is unsupported. */
-const COPY_ANY = /^COPY\s/i;
+/**
+ * COPY is a keyword: it ends at the first non-identifier character, so
+ * `COPY"t"` and `COPY t(a)FROM stdin;` are COPY statements too (Codex R11).
+ * One classifier serves statement end and EOF; case-insensitive.
+ */
+const COPY_ANY = /^COPY(?![A-Za-z0-9_$])/i;
+/** The one COPY form pg_dump plain format emits; anything else fails closed. */
+const COPY_START_MULTILINE =
+  /^COPY(?![A-Za-z0-9_$])[\s\S]*?(?<![A-Za-z0-9_$])FROM\s+stdin\s*;\s*$/i;
+function isCopyStatement(stmt: string): boolean {
+  return COPY_ANY.test(stmt.trim());
+}
 const COPY_END = /^\\\.\s*$/;
 const NUMERIC = /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 const DOLLAR_TAG = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/;
@@ -265,6 +273,9 @@ function decodeEscapeLiteral(content: string): string {
   // and corrupted multibyte text around a redaction (Codex R10).
   const bytes: number[] = [];
   const pushText = (text: string) => {
+    // A lone surrogate would be silently replaced by Buffer.from before the
+    // fatal decoder ever ran — reject it here instead (Codex R11).
+    if (!WELL_FORMED.test(text)) throw invalidEscapeSequence();
     for (const b of Buffer.from(text, 'utf8')) bytes.push(b);
   };
   let i = 0;
@@ -344,7 +355,17 @@ function decodeEscapeLiteral(content: string): string {
         if (oct) {
           bytes.push(parseInt(oct, 8) & 0xff);
           i += oct.length - 1;
-        } else pushText(next); // `\\`, `\'`, and any other char stands for itself
+        } else {
+          // `\\`, `\'`, and any other character stands for itself — as a
+          // COMPLETE code point: `next` is one UTF-16 unit, so a supplementary
+          // character (an emoji) must take its low half with it.
+          let literal = next;
+          if (/[\uD800-\uDBFF]/.test(next) && /[\uDC00-\uDFFF]/.test(content[i] ?? '')) {
+            literal += content[i]!;
+            i += 1;
+          }
+          pushText(literal);
+        }
       }
     }
   }
@@ -356,6 +377,8 @@ function decodeEscapeLiteral(content: string): string {
     throw invalidEscapeSequence();
   }
 }
+
+const WELL_FORMED = /^(?:[^\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])*$/;
 
 function invalidEscapeSequence(): Error {
   const err = new Error(
@@ -678,7 +701,7 @@ export function createDumpScrubber(): DumpScrubber {
     // the header line — it would otherwise be mis-lexed as the first row.
     if (activateCopy) afterCopyHeader = true;
     else if (COPY_START_MULTILINE.test(stmt.trim())) activateCopy = true;
-    else if (COPY_ANY.test(stmt.trim())) {
+    else if (isCopyStatement(stmt)) {
       // `COPY ... TO stdout`, `COPY ... FROM '/file'`, WITH options: pg_dump
       // plain format never emits them; the rows that might follow would be
       // lexed as SQL, so fail closed instead (Codex R10).
@@ -740,7 +763,7 @@ export function createDumpScrubber(): DumpScrubber {
       return out;
     },
     end(): string {
-      if (/^\s*COPY\s/.test(sql.stmt)) {
+      if (isCopyStatement(sql.stmt)) {
         const err = new Error('dump-scrub: unterminated COPY statement at end of input');
         (err as { exitCode?: number }).exitCode = 4;
         throw err;
