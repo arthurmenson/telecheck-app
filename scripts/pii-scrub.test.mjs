@@ -269,3 +269,11 @@ test('backup mode: a header whose identifiers close and open on different lines 
   assert.equal(code, 0);
   assert.ok(!stdout.includes('test.user@example.com'));
 });
+
+test('backup mode: a string-literal continuation across a newline (Codex R6) fails closed (exit 4)', async () => {
+  const input = "SELECT E'\"'\n'\\u0062@\\u0063.\\u0063\\u006f\"'::json;\n";
+  const { code, stdout, stderr } = await run(['--mode', 'backup'], input);
+  assert.equal(code, 4);
+  assert.match(stderr, /continuation/);
+  assert.ok(!stdout.includes('b@c.co'));
+});

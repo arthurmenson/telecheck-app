@@ -320,3 +320,20 @@ describe('value-level accounting', () => {
     expect(s.stats.redactedValues).toBe(3);
   });
 });
+
+describe('Codex R6 in-scope closure — literal continuation across a newline', () => {
+  it('rejects a continued E-literal (PostgreSQL would join the fragments) instead of decoding half of it', () => {
+    const sql = "SELECT E'\"'\n'\\u0062@\\u0063.\\u0063\\u006f\"'::json;\n";
+    expect(() => scrubText(sql)).toThrow(/continuation/);
+  });
+  it('rejects a continued plain literal too', () => {
+    expect(() => scrubText("INSERT INTO t VALUES ('abc'\n  'def');\n")).toThrow(/continuation/);
+  });
+  it('a literal followed by code on the same line, then a literal on the next line, is NOT a continuation', () => {
+    const sql =
+      "INSERT INTO t VALUES ('a', 1);\nINSERT INTO t VALUES ('b my SSN is 123-45-6789', 2);\n";
+    const out = scrubText(sql);
+    expect(out).not.toContain('123-45-6789');
+    expect(out.startsWith("INSERT INTO t VALUES ('a', 1);\n")).toBe(true);
+  });
+});

@@ -349,6 +349,13 @@ interface SqlState {
   /** Raw text of an open quoted identifier, held until it closes. */
   identifier: string;
   stats?: DumpScrubStats;
+  /**
+   * True when the last literal closed and only whitespace followed it on its
+   * line. PostgreSQL joins a following literal that starts on the next line
+   * into the same literal (E-mode carried over); that continuation is not
+   * supported here and fails closed. (Codex R6.)
+   */
+  literalClosedAtLineEnd: boolean;
 }
 
 function scrubLiteral(content: string, escapeLiteral: boolean, stats?: DumpScrubStats): string {
@@ -419,6 +426,9 @@ function scrubSqlText(text: string, st: SqlState): string {
         st.mode = 'code';
         st.literal = '';
         i++;
+        // A literal that closes with only whitespace after it on this line may
+        // be continued by a literal on the next line (PostgreSQL joins them).
+        st.literalClosedAtLineEnd = /^[ \t\r]*\n?$/.test(text.slice(i));
         continue;
       }
       st.literal += ch;
@@ -519,6 +529,7 @@ export function createDumpScrubber(): DumpScrubber {
     dollarTag: '',
     identifier: '',
     stats,
+    literalClosedAtLineEnd: false,
   };
   // Physical lines of the statement in progress while a quoted identifier,
   // literal or dollar block is open. A COPY header is recognised ONLY when
@@ -547,6 +558,18 @@ export function createDumpScrubber(): DumpScrubber {
           return line;
         }
         return scrubCopyRow(line, stats);
+      }
+      if (sql.literalClosedAtLineEnd) {
+        sql.literalClosedAtLineEnd = false;
+        if (/^[ \t]*'/.test(line)) {
+          // `'a'<newline>'b'` is ONE literal to PostgreSQL. pg_dump never
+          // writes it; a hand-edited dump might. Not supported — fail closed.
+          const err = new Error(
+            'dump-scrub: unsupported string-literal continuation across a newline; aborting',
+          );
+          (err as { exitCode?: number }).exitCode = 4;
+          throw err;
+        }
       }
       const startsStatement = sql.mode === 'code' && !pendingCopyActive;
       const out = scrubSqlText(line, sql);
