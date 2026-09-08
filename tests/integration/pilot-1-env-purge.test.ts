@@ -391,7 +391,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     // bound tenant context, so bind it for this backend first.
     await admin.query('SELECT set_tenant_context($1)', [TENANT]);
     await admin.query(
-      `INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash, expires_at) VALUES ($1, $2, $3, repeat('a', 64), NOW() + INTERVAL '1 hour')`,
+      `INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash, expires_at) VALUES ($1, $2, $3, encode(sha256($1::bytea), 'hex'), NOW() + INTERVAL '1 hour')`,
       [sessionCanary, TENANT, ids.participantPatient],
     );
     expect(await count('sessions', 'WHERE session_id = $1', [sessionCanary])).toBe(1);
