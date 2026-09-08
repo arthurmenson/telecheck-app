@@ -4,17 +4,21 @@
  *
  *   pg_dump ... | node --import tsx scripts/pii-scrub.mjs --mode backup | age -R recipients
  *
- * Reads stdin, redacts line by line, writes stdout. FAIL CLOSED:
- *   - a line longer than --max-line-bytes (default 64 MiB) aborts the run
- *     with exit 3 — never dropped, never partially emitted (a dropped row
- *     would make a backup look valid while silently missing data);
+ * Reads stdin, writes stdout. FAIL CLOSED:
+ *   - a line longer than --max-line-bytes (default 64 MiB), complete or
+ *     unterminated, aborts the run with exit 3 — never dropped, never
+ *     partially emitted (a dropped row would make a backup look valid while
+ *     silently missing data);
  *   - any redaction error aborts with exit 4;
  *   - usage error exits 2.
- * Only complete newline-terminated lines are redacted and emitted; a
+ * Only complete newline-terminated lines are processed and emitted; a
  * trailing partial line is held until its newline or end of input, so a
  * value split across two chunks is never seen in halves.
  *
- * --mode backup  whole library (Layer 5, default)
+ * --mode backup  dump-aware, whole library (Layer 5, default): scrubs only
+ *                inside decoded values — COPY fields and SQL string literals —
+ *                never syntax, delimiters, identifiers or bare numbers
+ *                (see src/lib/pii-screener/dump-scrub.ts)
  * --mode log     Layer 3's JSON-aware log-line pass (incident capture reuse)
  *
  * NER is deliberately not on this path (Layer 3 is ratified regex-only; the
@@ -22,7 +26,7 @@
  */
 import process from 'node:process';
 
-import { redactForBackup } from '../src/lib/pii-screener/backup-redaction.ts';
+import { createDumpScrubber } from '../src/lib/pii-screener/dump-scrub.ts';
 import { redactLogLine } from '../src/lib/pii-screener/log-redaction.ts';
 
 const DEFAULT_MAX_LINE_BYTES = 64 * 1024 * 1024;
@@ -52,8 +56,17 @@ function parseArgs(argv) {
   return opts;
 }
 
+function oversized(max) {
+  const err = new Error(
+    `pii-scrub: line exceeds --max-line-bytes (${max}); aborting so no row is silently dropped`,
+  );
+  err.exitCode = 3;
+  return err;
+}
+
 export async function scrubStream(input, output, opts) {
-  const redact = opts.mode === 'log' ? redactLogLine : redactForBackup;
+  const dump = opts.mode === 'backup' ? createDumpScrubber() : null;
+  const redact = dump ? (line) => dump.push(line) : redactLogLine;
   let carry = '';
   let carryBytes = 0;
   let lines = 0;
@@ -65,6 +78,11 @@ export async function scrubStream(input, output, opts) {
     if (out !== line) redactedLines += 1;
     return out;
   };
+  const write = async (text) => {
+    if (text.length > 0 && !output.write(text)) {
+      await new Promise((resolve) => output.once('drain', resolve));
+    }
+  };
 
   input.setEncoding('utf8');
   for await (const chunk of input) {
@@ -75,34 +93,20 @@ export async function scrubStream(input, output, opts) {
     while ((nl = carry.indexOf('\n')) !== -1) {
       const line = carry.slice(0, nl + 1);
       const lineBytes = Buffer.byteLength(line, 'utf8');
-      if (lineBytes > opts.maxLineBytes) {
-        // A complete line over the cap is as fatal as an unterminated one:
-        // fail before anything from this chunk is emitted.
-        const err = new Error(
-          `pii-scrub: line exceeds --max-line-bytes (${opts.maxLineBytes}); aborting so no row is silently dropped`,
-        );
-        err.exitCode = 3;
-        throw err;
-      }
+      // A complete line over the cap is as fatal as an unterminated one:
+      // fail before anything from this chunk is emitted.
+      if (lineBytes > opts.maxLineBytes) throw oversized(opts.maxLineBytes);
       carry = carry.slice(nl + 1);
       carryBytes -= lineBytes;
       out += emit(line);
     }
-    if (carryBytes > opts.maxLineBytes) {
-      const err = new Error(
-        `pii-scrub: line exceeds --max-line-bytes (${opts.maxLineBytes}); aborting so no row is silently dropped`,
-      );
-      err.exitCode = 3;
-      throw err;
-    }
-    if (out.length > 0 && !output.write(out)) {
-      await new Promise((resolve) => output.once('drain', resolve));
-    }
+    if (carryBytes > opts.maxLineBytes) throw oversized(opts.maxLineBytes);
+    await write(out);
   }
-  if (carry.length > 0) {
-    const out = emit(carry);
-    if (!output.write(out)) await new Promise((resolve) => output.once('drain', resolve));
-  }
+  let tail = '';
+  if (carry.length > 0) tail += emit(carry);
+  if (dump) tail += dump.end();
+  await write(tail);
   return { lines, redactedLines };
 }
 

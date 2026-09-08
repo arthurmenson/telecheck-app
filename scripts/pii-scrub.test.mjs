@@ -84,6 +84,49 @@ test('backup mode: 100% recall against the whole library on an adversarial dump,
   assert.match(stderr, /lines=\d+ redactedLines=\d+/);
 });
 
+test('backup mode: PII hidden behind COPY / JSON / bytea encodings is caught after DECODING, and DDL is untouched', async () => {
+  const hexEmail = Buffer.from('reach me at test.user@example.com', 'utf8').toString('hex');
+  const input = [
+    "SET client_encoding = 'UTF8';",
+    'CREATE TABLE public.t (',
+    '    id integer NOT NULL,',
+    "    meta jsonb DEFAULT '{}'::jsonb NOT NULL",
+    ');',
+    'COPY public.t (id, note, phone, meta, blob) FROM stdin;',
+    '1\tMRN\\n1234567\t(415)\\t555-0123\t{"email":"te\\\\u0073t.user@example.com","n":3125551212}\t\\\\x' + hexEmail,
+    '2\t3125551212\t\\N\t{"k":2}\t\\N',
+    '\\.',
+    "INSERT INTO public.free_text (id, body) VALUES (1, E'line\\nmy SSN is 123-45-6789');",
+    'ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id);',
+    '',
+  ].join('\n');
+  const { code, stdout, stderr } = await run(['--mode', 'backup'], input);
+  assert.equal(code, 0, stderr);
+  const lines = stdout.split('\n');
+  // DDL byte-identical (the ::jsonb cast is not an IPv6 address).
+  assert.equal(lines[1], 'CREATE TABLE public.t (');
+  assert.equal(lines[3], "    meta jsonb DEFAULT '{}'::jsonb NOT NULL");
+  assert.equal(lines[10], 'ALTER TABLE ONLY public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id);');
+  // COPY row 1: decode every field and check recall + framing.
+  const row1 = lines[6].split('\t');
+  assert.equal(row1.length, 5, 'field count preserved');
+  const dec = (f) => f.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\\\/g, '\\');
+  assert.ok(!dec(row1[1]).includes('1234567'), 'COPY-escaped MRN leaked');
+  assert.ok(!dec(row1[2]).includes('555-0123'), 'COPY-escaped phone leaked');
+  const meta = JSON.parse(dec(row1[3]));
+  assert.equal(meta.n, 0, 'matching JSON number becomes 0, still a number');
+  assert.equal(typeof meta.n, 'number');
+  assert.ok(!meta.email.includes('test.user@example.com'), 'JSON-escaped email leaked');
+  const blob = dec(row1[4]);
+  assert.ok(blob.startsWith('\\x'));
+  assert.ok(!Buffer.from(blob.slice(2), 'hex').toString('utf8').includes('test.user@example.com'), 'bytea email leaked');
+  // COPY row 2: matching numeric field becomes 0 in place, \N kept, field count kept.
+  assert.equal(lines[7], '2\t0\t\\N\t{"k":2}\t\\N');
+  // INSERT E-literal: decoded SSN gone, statement still well-formed.
+  assert.ok(!lines[9].includes('123-45-6789'));
+  assert.match(lines[9], /^INSERT INTO public\.free_text \(id, body\) VALUES \(1, E'line\\n[^']*'\);$/);
+});
+
 test('values split across chunk boundaries are still caught (1-byte and 7-byte chunks)', async () => {
   const input = fixture();
   for (const chunk of [1, 7]) {
@@ -93,11 +136,15 @@ test('values split across chunk boundaries are still caught (1-byte and 7-byte c
   }
 });
 
-test('a trailing line without a newline is redacted at end of input, not lost', async () => {
-  const { code, stdout } = await run(['--mode', 'backup'], 'tail row 123-45-6789 no newline');
+test('a trailing COPY row without a newline is redacted at end of input, not lost', async () => {
+  // Prose OUTSIDE a COPY block or a literal is code and passes through by
+  // design; the value under test is a COPY field, terminated by end of input.
+  const input = 'COPY public.t (id, body) FROM stdin;\n1\tmy SSN is 123-45-6789 no newline';
+  const { code, stdout } = await run(['--mode', 'backup'], input);
   assert.equal(code, 0);
   assert.ok(!stdout.includes('123-45-6789'));
-  assert.ok(stdout.startsWith('tail row '));
+  assert.ok(stdout.startsWith('COPY public.t (id, body) FROM stdin;\n1\t'));
+  assert.ok(!stdout.endsWith('\n'), 'no newline is invented');
 });
 
 test('an oversized line FAILS the run (exit 3) — never dropped, its PII never emitted', async () => {
