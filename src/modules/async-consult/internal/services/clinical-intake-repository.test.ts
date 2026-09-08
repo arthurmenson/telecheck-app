@@ -100,7 +100,11 @@ describe('careIntakeTransaction — authority is enforced at the actual COMMIT',
   it('rejects with the COMMIT-time PT401 immediately even when ROLLBACK hangs', async () => {
     vi.useFakeTimers();
     try {
-      mocks.commitError = Object.assign(new Error('care_unauthenticated'), { code: 'PT401' });
+      // pg server errors carry `severity`; that is what marks a real raise.
+      mocks.commitError = Object.assign(new Error('care_unauthenticated'), {
+        code: 'PT401',
+        severity: 'ERROR',
+      });
       mocks.rollbackHang = true;
       const pending = careIntakeTransaction(ctx)(async () => 'x');
       const rejection = expect(pending).rejects.toMatchObject({ code: 'PT401' });
@@ -117,6 +121,7 @@ describe('careIntakeTransaction — authority is enforced at the actual COMMIT',
   it('surfaces a constraint violation raised at COMMIT as itself (a known rollback)', async () => {
     mocks.commitError = Object.assign(new Error('care_intake_evidence_required'), {
       code: '23514',
+      severity: 'ERROR',
     });
     await expect(careIntakeTransaction(ctx)(async () => 'x')).rejects.toMatchObject({
       code: '23514',
@@ -218,6 +223,18 @@ describe('careIntakeTransaction — authority is enforced at the actual COMMIT',
       });
       expect(mocks.release).toHaveBeenCalledWith(true);
     }
+  });
+
+  it('treats EPIPE on an issued COMMIT as indeterminate — a SQLSTATE shape is not a server raise', async () => {
+    // Codex round 2 on PR #303: EPIPE is five uppercase characters, so a
+    // shape-only SQLSTATE test read a socket error as a server raise and it
+    // fell through as a 500. pg server errors carry `severity`; transport
+    // errors never do — that is the discriminator.
+    mocks.commitError = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).rejects.toMatchObject({
+      code: 'PT503',
+    });
+    expect(mocks.release).toHaveBeenCalledWith(true);
   });
 
   it('does NOT treat a pre-COMMIT connection failure as indeterminate', async () => {

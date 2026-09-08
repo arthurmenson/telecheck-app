@@ -256,8 +256,18 @@ export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof wi
         // indeterminate — the submission and its idempotency record may have
         // committed — and must not be rethrown as if it were a known failure.
         // (Codex review of PR #303.)
-        const code = (outcome.error as { code?: unknown } | null)?.code;
-        const sqlState = typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null;
+        // A SQLSTATE shape alone does not prove the server raised: EPIPE is
+        // five uppercase characters too. pg's server errors always carry
+        // `severity`; transport errors (EPIPE, ECONNRESET, ETIMEDOUT) never do.
+        // (Codex round 2 on PR #303.)
+        const failure = outcome.error as { code?: unknown; severity?: unknown } | null;
+        const code = failure?.code;
+        const sqlState =
+          typeof code === 'string' &&
+          /^[0-9A-Z]{5}$/.test(code) &&
+          typeof failure?.severity === 'string'
+            ? code
+            : null;
         const indeterminate = commitIssued && (sqlState === null || sqlState.startsWith('08'));
         if (indeterminate) throw unconfirmed();
         // A known outcome always wins over the deadline.
