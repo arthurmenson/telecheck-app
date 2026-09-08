@@ -449,6 +449,11 @@ export function stripSqlNoise(text) {
       continue;
     }
     if (ch === '"') throw new Error('quoted identifiers are not supported in a seed');
+    if (ch === '$' && /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.test(text.slice(i))) {
+      // A nested dollar-quoted literal would let its apostrophes hide
+      // executable SQL from the scanner (Codex R7); guards never need one.
+      throw new Error('dollar-quoted literals inside a DO body are not supported in a seed');
+    }
     out += ch;
     i++;
   }
@@ -471,12 +476,13 @@ export function assertReadOnlyDoBody(stmt) {
   }
 }
 
-const ACCOUNTS_INSERT =
-  /^INSERT\s+INTO\s+(?:public\.)?accounts\s*\(([^)]*)\)\s*VALUES\s*([\s\S]*)$/i;
+const SEED_INSERT = /^INSERT\s+INTO\s+(?:public\.)?([a-z_]+)\s*\(([^)]*)\)\s*VALUES\s*([\s\S]*)$/i;
+/** Tables a seed may insert into; every other INSERT fails the check. */
+const SEED_TABLES = new Set(['accounts', 'forms_template']);
 /** A VALUES cell may only be a plain literal, DATE literal, NOW(), number, NULL or boolean — never a call. */
 const ALLOWED_VALUE =
   /^(?:'(?:[^']|'')*'|DATE\s+'[^']*'|NOW\(\)|-?\d+(?:\.\d+)?|NULL|TRUE|FALSE)$/i;
-const DO_NOTHING_SUFFIX = /^ON\s+CONFLICT\s*\(\s*account_id\s*\)\s*DO\s+NOTHING$/i;
+const DO_NOTHING_SUFFIX = /^ON\s+CONFLICT\s*\(\s*[a-z_]+\s*\)\s*DO\s+NOTHING$/i;
 
 /**
  * Consumes the complete VALUES expression: `( ... )` tuples separated by
@@ -559,22 +565,33 @@ export function seedAccountInserts(sql) {
     if (!/^INSERT\b/i.test(stmt)) {
       throw new Error(`unrecognised statement in a seed: ${stmt.slice(0, 80)}`);
     }
-    if (!/\baccounts\b/i.test(stmt)) continue; // other tables (forms_template, ...)
-    const m = stmt.match(ACCOUNTS_INSERT);
-    if (!m) throw new Error(`unrecognised statement touching accounts: ${stmt.slice(0, 80)}`);
-    const columns = m[1].split(',').map((c) => c.trim().toLowerCase());
-    const tuples = parseValuesStrict(m[2]);
+    // Every INSERT — not only the accounts one — must match the strict seed
+    // shape: an allowlisted table, a column list, tuples of matching arity,
+    // literal-only VALUES cells and at most the exact DO NOTHING suffix
+    // (Codex R7: an unchecked forms_template INSERT could carry
+    // set_config(...) in a TEXT column).
+    const m = stmt.match(SEED_INSERT);
+    if (!m) throw new Error(`unrecognised INSERT in a seed: ${stmt.slice(0, 80)}`);
+    const table = m[1].toLowerCase();
+    if (!SEED_TABLES.has(table)) {
+      throw new Error(`INSERT into a table a seed may not touch: ${table}`);
+    }
+    const columns = m[2].split(',').map((c) => c.trim().toLowerCase());
+    const tuples = parseValuesStrict(m[3]);
+    if (tuples.length === 0) throw new Error(`${table} INSERT without VALUES tuples`);
     for (const tuple of tuples) {
+      if (tuple.length !== columns.length) {
+        throw new Error(`${table}: tuple arity ${tuple.length} != ${columns.length} columns`);
+      }
       for (const cell of tuple) {
         if (!ALLOWED_VALUE.test(cell)) {
           throw new Error(
-            `unsupported VALUES expression in an accounts INSERT: ${cell.slice(0, 40)}`,
+            `unsupported VALUES expression in a ${table} INSERT: ${cell.slice(0, 40)}`,
           );
         }
       }
     }
-    if (tuples.length === 0) throw new Error('accounts INSERT without VALUES tuples');
-    found.push({ columns, tuples });
+    if (table === 'accounts') found.push({ columns, tuples });
   }
   return found;
 }
@@ -797,6 +814,43 @@ test('seeds: the static check rejects DEFAULT, unclassified, missing column, a s
     ],
   ]) {
     assert.notEqual(mutated, baseline, `${name}: mutation did not apply`);
+    assert.equal(seedWritesOnlyBaseline(mutated), false, `${name} slipped through`);
+  }
+  // Codex R7 reproductions.
+  const staging = fs.readFileSync(path.join(here, 'seed-staging-accounts.sql'), 'utf8');
+  assert.equal(seedWritesOnlyBaseline(staging), true);
+  for (const [name, source, mutated] of [
+    [
+      'nested dollar quote hiding an UPDATE in a DO body',
+      baseline,
+      baseline.replace(
+        /\nCOMMIT;/,
+        "\nDO $$ BEGIN RAISE NOTICE $q$'$q$; UPDATE accounts SET cohort_classification='baseline' WHERE tenant_id='Telecheck-US' AND cohort_classification='unclassified'; RAISE NOTICE $q$'$q$; END $$;\nCOMMIT;",
+      ),
+    ],
+    [
+      'set_config in a forms_template TEXT column',
+      staging,
+      staging.replace(
+        /'Staging E2E synthetic intake template',/,
+        "set_config('standard_conforming_strings', 'off', true),",
+      ),
+    ],
+    [
+      'INSERT into a table a seed may not touch',
+      staging,
+      staging + "\nINSERT INTO consent_versions (id) VALUES ('x');\n",
+    ],
+    [
+      'forms_template DO UPDATE',
+      staging,
+      staging.replace(
+        /ON CONFLICT \(template_id\) DO NOTHING;/,
+        "ON CONFLICT (template_id) DO UPDATE SET name = 'x';",
+      ),
+    ],
+  ]) {
+    assert.notEqual(mutated, source, `${name}: mutation did not apply`);
     assert.equal(seedWritesOnlyBaseline(mutated), false, `${name} slipped through`);
   }
   // The real guards are accepted as read-only.
