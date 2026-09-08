@@ -100,6 +100,55 @@ function ownClientErrors(client: RecordingClient): () => void {
   return () => client.off?.('error', listener);
 }
 
+type CheckoutCallback = (error: Error | null | undefined, client?: unknown) => void;
+interface CheckoutPool {
+  connect: (callback?: CheckoutCallback) => unknown;
+}
+
+/**
+ * Check a client out of the pool with the error listener attached BEFORE the
+ * acquisition promise resolves.
+ *
+ * `await pool.connect()` is not good enough: pg-pool removes its idle
+ * 'error' listener before resolving, and the listener attached after the
+ * `await` resumes only runs a microtask later. If one socket read carries
+ * the startup ReadyForQuery together with a FATAL (57P01, backend shutdown —
+ * PostgreSQL may terminate asynchronously), pg parses both synchronously and
+ * emits 'error' inside that gap with zero listeners: the process exits.
+ * Reproduced by Codex with the installed parser (round 4 on PR #303).
+ *
+ * The callback form of pg-pool's connect() invokes the callback
+ * synchronously with the client, so the listener is attached before anyone
+ * else can run. The test harness's pool wrapper is promise-only and ignores
+ * a callback; that path has no socket, so resolving through the promise is
+ * fine there.
+ */
+function checkoutRecordingClient(): Promise<{ client: RecordingClient; disown: () => void }> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const handOver: CheckoutCallback = (error, raw) => {
+      if (settled) return;
+      settled = true;
+      if (error) {
+        reject(error);
+        return;
+      }
+      const client = raw as RecordingClient;
+      const disown = ownClientErrors(client);
+      resolve({ client, disown });
+    };
+    const pool = getPool() as unknown as CheckoutPool;
+    const returned = pool.connect(handOver);
+    const thenable = returned as { then?: unknown } | null | undefined;
+    if (thenable && typeof thenable.then === 'function') {
+      (returned as Promise<unknown>).then(
+        (raw) => handOver(null, raw),
+        (error: unknown) => handOver(error instanceof Error ? error : new Error(String(error))),
+      );
+    }
+  });
+}
+
 /** Transaction outcome, captured the instant COMMIT resolves or rejects. */
 type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
@@ -199,8 +248,7 @@ function finalizeRecordingClient(
  */
 export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof withTransaction {
   return async <T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> => {
-    const client = (await getPool().connect()) as unknown as RecordingClient;
-    const disown = ownClientErrors(client);
+    const { client, disown } = await checkoutRecordingClient();
     let previousTenantId: string | null = null;
     let commitIssued = false;
 

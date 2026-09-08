@@ -14,19 +14,32 @@ const mocks = vi.hoisted(() => ({
   /** Emit a client 'error' event alongside the COMMIT rejection (pg does both). */
   commitEmitsError: false,
   client: null as unknown,
+  /** Emit a client 'error' synchronously the instant checkout hands over. */
+  emitOnCheckout: null as Error | null,
+  /** Exercise the harness-style promise-only connect(). */
+  promiseOnlyConnect: false,
 }));
 // A real EventEmitter, like pg.Client: an 'error' event with no listener
 // THROWS out of emit(), which is exactly the process-exit path the module
 // must prevent by owning the listener while it owns the client.
 vi.mock('../../../../lib/db.js', () => ({
   getPool: () => ({
-    connect: async () => {
+    // Mirrors pg-pool: with a callback, hand the client over synchronously
+    // (returning undefined); without one, return a promise. The harness
+    // wrapper is promise-only and ignores the callback.
+    connect: (callback?: (error: Error | null, client?: unknown) => void) => {
       const client = Object.assign(new EventEmitter(), {
         query: mocks.query,
         release: mocks.release,
       });
       mocks.client = client;
-      return client;
+      if (mocks.promiseOnlyConnect || !callback) return Promise.resolve(client);
+      callback(null, client);
+      // pg-pool has already dropped its own idle listener by now; a
+      // coalesced ReadyForQuery + FATAL read emits here, before any await
+      // in the caller can resume.
+      if (mocks.emitOnCheckout) client.emit('error', mocks.emitOnCheckout);
+      return undefined;
     },
   }),
 }));
@@ -65,6 +78,8 @@ beforeEach(() => {
   mocks.previousTenantId = null;
   mocks.commitEmitsError = false;
   mocks.client = null;
+  mocks.emitOnCheckout = null;
+  mocks.promiseOnlyConnect = false;
   mocks.query.mockImplementation(async (sql: string) => {
     if (sql === 'COMMIT') {
       if (mocks.commitHang) return new Promise<never>(() => undefined);
@@ -280,6 +295,28 @@ describe('careIntakeTransaction — authority is enforced at the actual COMMIT',
     // idle listener when a client is RETURNED. Detaching here is exactly
     // what let the scheduled emit above throw unlistened.
     expect((mocks.client as EventEmitter).listenerCount('error')).toBe(1);
+  });
+
+  it('is already listening when pool checkout hands the client over — no microtask gap', async () => {
+    // Codex round 4 on PR #303: pg-pool drops its idle listener before
+    // resolving connect(); a listener attached after `await` resumes is one
+    // microtask too late for a coalesced startup ReadyForQuery + FATAL
+    // 57P01, which pg parses synchronously. With no listener that emit
+    // throws and Node exits. Attaching inside the checkout callback closes
+    // the gap; this emit fires synchronously right after handover.
+    mocks.emitOnCheckout = Object.assign(new Error('terminating connection'), {
+      code: '57P01',
+      severity: 'FATAL',
+    });
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).resolves.toBe('x');
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBeGreaterThanOrEqual(0);
+  });
+
+  it('still works with a promise-only pool (the test harness wrapper)', async () => {
+    mocks.promiseOnlyConnect = true;
+    await expect(careIntakeTransaction(ctx)(async () => 'y')).resolves.toBe('y');
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
   });
 
   it('listens for client errors for the whole ownership window, then lets go at release', async () => {
