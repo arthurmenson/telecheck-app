@@ -114,6 +114,28 @@ function regularFileInside(realBase, p) {
   return { st, real };
 }
 
+/**
+ * Reads a manifest ONLY after lstat proved it a regular file inside the real
+ * directory, through a descriptor opened with O_NOFOLLOW (where available) and
+ * re-checked with fstat — a FIFO or a symlink swapped in can neither be
+ * followed nor block the shared lifecycle (Codex R5).
+ */
+function readRegularNoFollow(realBase, p) {
+  const { st } = regularFileInside(realBase, p);
+  if (!st) return null;
+  let flags = fs.constants.O_RDONLY;
+  if (typeof fs.constants.O_NOFOLLOW === 'number') flags |= fs.constants.O_NOFOLLOW;
+  if (typeof fs.constants.O_NONBLOCK === 'number') flags |= fs.constants.O_NONBLOCK;
+  const fd = fs.openSync(p, flags);
+  try {
+    const fst = fs.fstatSync(fd);
+    if (!fst.isFile()) throw new Error(`entry is not a regular file: ${path.basename(p)}`);
+    return fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 const isIso = (v) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
 
 /**
@@ -165,11 +187,11 @@ export function readManifest(dir, id) {
   assertId(id);
   const base = realDir(dir);
   const file = path.join(base, `${id}.manifest.json`);
-  const { st } = regularFileInside(base, file);
-  if (!st) return { missing: true, file };
+  const raw = readRegularNoFollow(base, file);
+  if (raw === null) return { missing: true, file };
   let value;
   try {
-    value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    value = JSON.parse(raw);
   } catch {
     return { malformed: true, file };
   }
@@ -327,13 +349,34 @@ export function gcPlan(dir, { nowMs = Date.now(), minAgeDays = DEFAULT_GC_MIN_AG
     skipped: [],
     lock: lock.present ? (lock.valid ? lock.incidentId : lock.why) : null,
   };
-  // Artifact ownership across EVERY manifest that parses (Codex R4): an
-  // artifact claimed by more than one manifest — or claimed by any manifest
-  // that is not itself eligible — is never deleted on the strength of one of
-  // them. Unparseable manifests cannot vouch for anything, so their presence
-  // is recorded separately and blocks nothing beyond their own file.
-  const claimedBy = new Map();
+  // Ownership (Codex R4 / R5): an artifact `<X>-*.age` may belong to ANY
+  // incident X whose manifest exists by NAME (readable or not — a truncated or
+  // FAILED manifest still owns its evidence) or whose id the active lock
+  // names. Inventoried claims from every parseable manifest are indexed too.
+  // An artifact that could belong to more than one incident is never deleted.
   const manifests = listManifests(base);
+  const possibleOwners = new Set(manifests.map((f) => f.slice(0, -'.manifest.json'.length)));
+  if (lock.present && lock.valid) possibleOwners.add(lock.incidentId);
+  const claimedBy = new Map();
+  for (const file of manifests) {
+    const id = file.slice(0, -'.manifest.json'.length);
+    let value;
+    try {
+      const raw = readRegularNoFollow(base, path.join(base, file));
+      value = raw === null ? null : JSON.parse(raw);
+    } catch {
+      continue; // unreadable / non-regular / malformed: owns by name only
+    }
+    const arts = Array.isArray(value?.artifacts) ? value.artifacts : [];
+    for (const a of arts) {
+      if (!a || typeof a.path !== 'string') continue;
+      const name = path.basename(a.path);
+      if (!claimedBy.has(name)) claimedBy.set(name, new Set());
+      claimedBy.get(name).add(id);
+    }
+  }
+  const otherPossibleOwners = (name, id) =>
+    [...possibleOwners].filter((o) => o !== id && name.startsWith(`${o}-`)).sort();
   for (const file of manifests) {
     const id = file.slice(0, -'.manifest.json'.length);
     let value;
@@ -354,15 +397,17 @@ export function gcPlan(dir, { nowMs = Date.now(), minAgeDays = DEFAULT_GC_MIN_AG
     const id = file.slice(0, -'.manifest.json'.length);
     const p = path.join(base, file);
     let st;
+    let raw;
     try {
       ({ st } = regularFileInside(base, p));
+      raw = readRegularNoFollow(base, p);
     } catch (error) {
       plan.skipped.push({ file, reason: error.message });
       continue;
     }
     let value;
     try {
-      value = JSON.parse(fs.readFileSync(p, 'utf8'));
+      value = JSON.parse(raw);
     } catch {
       plan.skipped.push({ file, reason: 'malformed manifest' });
       continue;
@@ -410,6 +455,15 @@ export function gcPlan(dir, { nowMs = Date.now(), minAgeDays = DEFAULT_GC_MIN_AG
       plan.skipped.push({
         file,
         reason: `conflicting inventory: ${conflicts.join(', ')} also claimed by ${others.join(', ')}`,
+      });
+      continue;
+    }
+    const ambiguous = artifacts.filter((a) => otherPossibleOwners(a, id).length > 0);
+    if (ambiguous.length) {
+      const owners = [...new Set(ambiguous.flatMap((a) => otherPossibleOwners(a, id)))].sort();
+      plan.skipped.push({
+        file,
+        reason: `ambiguous ownership: ${ambiguous.join(', ')} may belong to ${owners.join(', ')} (manifest present or lock active)`,
       });
       continue;
     }
@@ -475,7 +529,7 @@ export function closeWipeBlockers(dir) {
       const id = f.slice(0, -'.manifest.json'.length);
       let value;
       try {
-        value = JSON.parse(fs.readFileSync(p, 'utf8'));
+        value = JSON.parse(readRegularNoFollow(base, p));
       } catch {
         blockers.push(`unreadable manifest ${f}`);
         continue;

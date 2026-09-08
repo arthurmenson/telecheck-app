@@ -511,6 +511,114 @@ test('writers (Codex R4): an artifact claimed by two manifests is never deleted 
   );
 });
 
+test('writers (Codex R5): ownership is inferred from every manifest NAME and the active lock — a truncated or FAILED (artifact-less) locked incident still protects its evidence', () => {
+  for (const variant of ['truncated', 'failed-no-artifacts', 'lock-only']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+    mkIncidentDir({ into: dir, id: 'inc', lock: false, consumed: true, ageDays: 40, artifacts: 1 });
+    // the aged manifest lists inc-2's artifact; inc-2's own manifest cannot vouch for it
+    const victim = path.join(dir, 'inc-2-art0.age');
+    fs.writeFileSync(
+      victim,
+      Buffer.concat([Buffer.from(AGE_HEADER, 'latin1'), Buffer.alloc(40, 7)]),
+    );
+    const mf = path.join(dir, 'inc.manifest.json');
+    const man = JSON.parse(fs.readFileSync(mf, 'utf8'));
+    man.artifacts.push({
+      path: victim,
+      plaintextBytes: 10,
+      ciphertextBytes: AGE_HEADER.length + 40,
+    });
+    fs.writeFileSync(mf, JSON.stringify(man));
+    const t = new Date(Date.now() - 40 * DAY);
+    fs.utimesSync(mf, t, t);
+    if (variant === 'truncated')
+      fs.writeFileSync(
+        path.join(dir, 'inc-2.manifest.json'),
+        '{"incidentId": "inc-2", "status": "SUCC',
+      );
+    if (variant === 'failed-no-artifacts')
+      fs.writeFileSync(
+        path.join(dir, 'inc-2.manifest.json'),
+        JSON.stringify({
+          incidentId: 'inc-2',
+          status: 'FAILED',
+          capturedAt: new Date().toISOString(),
+          consumed: false,
+        }),
+      );
+    fs.writeFileSync(
+      path.join(dir, '.incident.lock'),
+      JSON.stringify({ incidentId: 'inc-2', openedAt: 'x', openedBy: 't' }),
+    );
+    const before = snapshot(dir);
+    const plan = gcPlan(dir, { minAgeDays: 30 });
+    assert.deepEqual(plan.deletions, [], variant);
+    const reason = Object.fromEntries(plan.skipped.map((x) => [x.file, x.reason]))[
+      'inc.manifest.json'
+    ];
+    assert.match(reason, /ambiguous ownership: inc-2-art0\.age may belong to inc-2/, variant);
+    assert.deepEqual(gcExecute(dir, plan), [], variant);
+    assert.deepEqual(snapshot(dir), before, `${variant}: the directory changed`);
+    assert.ok(fs.existsSync(victim), `${variant}: the active incident's evidence survived`);
+  }
+  // an unrelated aged manifest whose artifacts share no other id prefix is still collected
+  const ok = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  mkIncidentDir({ into: ok, id: 'solo', lock: false, consumed: true, ageDays: 40, artifacts: 2 });
+  fs.writeFileSync(
+    path.join(ok, '.incident.lock'),
+    JSON.stringify({ incidentId: 'other', openedAt: 'x', openedBy: 't' }),
+  );
+  assert.deepEqual(
+    gcPlan(ok, { minAgeDays: 30 }).deletions.map((d) => d.id),
+    ['solo'],
+  );
+});
+
+test(
+  'writers (Codex R5): a manifest entry that is a FIFO or a symlink is never opened for reading — GC and close-wipe report it and the lifecycle cannot hang',
+  { skip: process.platform === 'win32' },
+  () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+    mkIncidentDir({ into: dir, id: 'aged', lock: false, consumed: true, ageDays: 40 });
+    const fifo = spawnSync('mkfifo', [path.join(dir, 'pipe.manifest.json')], { encoding: 'utf8' });
+    assert.equal(fifo.status, 0, fifo.stderr);
+    const outside = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'p1out-')), 'x.json');
+    fs.writeFileSync(
+      outside,
+      JSON.stringify({
+        incidentId: 'linked',
+        status: 'SUCCESS',
+        capturedAt: new Date().toISOString(),
+        artifacts: [],
+        consumed: true,
+        disposition: 'RESOLVED',
+        clearedAt: new Date().toISOString(),
+      }),
+    );
+    fs.symlinkSync(outside, path.join(dir, 'linked.manifest.json'));
+    const started = Date.now();
+    const plan = gcPlan(dir, { minAgeDays: 30 });
+    assert.ok(Date.now() - started < 5000, 'the plan must not block on the FIFO');
+    const reasons = Object.fromEntries(plan.skipped.map((x) => [x.file, x.reason]));
+    assert.match(reasons['pipe.manifest.json'], /not a regular file/);
+    assert.match(reasons['linked.manifest.json'], /symbolic link/);
+    assert.deepEqual(
+      plan.deletions.map((d) => d.id),
+      ['aged'],
+      'the regular aged manifest is still eligible',
+    );
+    const blockers = closeWipeBlockers(dir);
+    assert.match(
+      blockers.join(';'),
+      /unexpected entry \(not a regular file\): pipe\.manifest\.json/,
+    );
+    assert.match(
+      blockers.join(';'),
+      /unexpected entry \(not a regular file\): linked\.manifest\.json/,
+    );
+  },
+);
+
 test('writers (Codex R3): a literal `symlink/..` path is refused before any normalization — the lexical and physical destinations may differ', () => {
   // /safe/alias -> /real/sub ; configured "/safe/alias/../incident-logs" names
   // /real/incident-logs physically but /safe/incident-logs lexically
