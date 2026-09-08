@@ -541,6 +541,30 @@ describe('patient crisis admission', () => {
     expect(mocks.release).toHaveBeenCalledWith();
   });
 
+  it('keeps a FATAL/PANIC termination after an issued COMMIT classified as uncertain — never not_recorded', async () => {
+    // Codex R1 on the consolidation refactor: the copied classifier treated
+    // any SQLSTATE-with-severity rejection as a definite rollback, but the
+    // installed pg driver rejects COMMIT when CommandComplete(COMMIT) is
+    // followed by FATAL 57P01/57P02 or PANIC XX000 — the admission and its
+    // escalation may have committed. Reporting not_recorded there invites a
+    // retry under another key and a duplicate. The shared primitive routes
+    // these through PT503; the caller must report unconfirmed.
+    for (const [code, severity] of [
+      ['57P01', 'FATAL'],
+      ['57P02', 'FATAL'],
+      ['XX000', 'PANIC'],
+    ] as const) {
+      vi.clearAllMocks();
+      mocks.commitError = Object.assign(new Error('terminating connection'), { code, severity });
+      const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+      expect(result, `${code} ${severity}`).toMatchObject({
+        recording_status: 'unconfirmed',
+        escalation_status: 'unconfirmed',
+      });
+      expect(mocks.release, `${code} ${severity}`).toHaveBeenCalledWith(true);
+    }
+  });
+
   it('keeps a class-08 connection exception at COMMIT classified as uncertain', async () => {
     // Codex verification round on PR #302: a five-char SQLSTATE was being
     // read as "the server raised, so it rolled back". Class 08 is the
