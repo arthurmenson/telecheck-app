@@ -231,6 +231,15 @@ export function scrubCopyRow(line: string, stats?: DumpScrubStats): string {
   const body = newline ? line.slice(0, -1) : line;
   const cr = body.endsWith('\r') ? '\r' : '';
   const row = cr ? body.slice(0, -1) : body;
+  if (row.includes('\r')) {
+    // pg_dump escapes a CR inside a value as \r; a bare one is not a valid
+    // text-format row and would be a newline to PostgreSQL. Fail closed.
+    const err = new Error(
+      'dump-scrub: unsupported bare carriage return inside a COPY row; aborting',
+    );
+    (err as { exitCode?: number }).exitCode = 4;
+    throw err;
+  }
   if (stats) stats.copyRows += 1;
   return (
     row
@@ -356,6 +365,15 @@ interface SqlState {
    * supported here and fails closed. (Codex R6.)
    */
   literalClosedAtLineEnd: boolean;
+  /**
+   * Comment-free, literal-masked text of the statement in progress (code
+   * characters and identifiers verbatim; a literal contributes '' and a
+   * dollar block $$). COPY-header recognition and statement termination
+   * are decided on THIS, never on raw lines. (Codex R8.)
+   */
+  stmt: string;
+  /** A real statement-terminating `;` was seen in code mode. */
+  stmtEnded: boolean;
 }
 
 function scrubLiteral(content: string, escapeLiteral: boolean, stats?: DumpScrubStats): string {
@@ -404,6 +422,7 @@ function scrubSqlText(text: string, st: SqlState): string {
         return out;
       }
       out += st.identifier + text.slice(i, j + 1);
+      st.stmt += st.identifier + text.slice(i, j + 1);
       st.identifier = '';
       i = j + 1;
       st.mode = 'code';
@@ -423,6 +442,7 @@ function scrubSqlText(text: string, st: SqlState): string {
           continue;
         }
         out += scrubLiteral(st.literal, st.escapeLiteral, st.stats) + "'";
+        st.stmt += "''";
         st.mode = 'code';
         st.literal = '';
         i++;
@@ -438,20 +458,38 @@ function scrubSqlText(text: string, st: SqlState): string {
     }
     // code
     if (ch === '-' && text[i + 1] === '-') {
-      const nl = text.indexOf('\n', i);
-      if (nl === -1) {
+      // A line comment ends at LF or CR (PostgreSQL treats both as
+      // newlines); it contributes nothing to the statement text.
+      const lf = text.indexOf('\n', i);
+      const cr = text.indexOf('\r', i);
+      const end = lf === -1 ? cr : cr === -1 ? lf : Math.min(lf, cr);
+      if (end === -1) {
         out += text.slice(i);
         return out;
       }
-      out += text.slice(i, nl + 1);
-      i = nl + 1;
+      out += text.slice(i, end);
+      i = end;
       continue;
+    }
+    if (ch === '\r') {
+      if (text[i + 1] === '\n') {
+        // CRLF line ending: pass through; the LF below is the newline.
+        out += ch;
+        i++;
+        continue;
+      }
+      // A bare CR is a newline to PostgreSQL but not to this line-oriented
+      // scanner: reject rather than mis-lex what follows it. (Codex R8.)
+      const err = new Error('dump-scrub: unsupported bare carriage return in SQL text; aborting');
+      (err as { exitCode?: number }).exitCode = 4;
+      throw err;
     }
     if (ch === '$') {
       const tag = text.slice(i).match(DOLLAR_TAG)?.[0];
       if (tag) {
         st.mode = 'dollar';
         st.dollarTag = tag;
+        st.stmt += '$$';
         out += tag;
         i += tag.length;
         continue;
@@ -479,6 +517,7 @@ function scrubSqlText(text: string, st: SqlState): string {
         return out;
       }
       out += text.slice(i, j + 1);
+      st.stmt += text.slice(i, j + 1);
       i = j + 1;
       continue;
     }
@@ -495,6 +534,8 @@ function scrubSqlText(text: string, st: SqlState): string {
       continue;
     }
     out += ch;
+    st.stmt += ch;
+    if (ch === ';') st.stmtEnded = true;
     i++;
   }
   return out;
@@ -531,6 +572,8 @@ export function createDumpScrubber(): DumpScrubber {
     identifier: '',
     stats,
     literalClosedAtLineEnd: false,
+    stmt: '',
+    stmtEnded: false,
   };
   // Physical lines of the statement in progress while a quoted identifier,
   // literal or dollar block is open. A COPY header is recognised ONLY when
@@ -539,17 +582,9 @@ export function createDumpScrubber(): DumpScrubber {
   // (Codex R4: a table named public."a FROM stdin;<newline>\\.<newline>b"
   // activated COPY early, its embedded terminator ended it, and the real
   // rows bypassed scrubbing).
-  // Pending COPY statement: from a line that begins `COPY` in code mode
-  // until a line ENDS in code mode with `;`. The whole statement is then
-  // tested for the header. Quote state is scanned first, so an identifier
-  // containing `FROM stdin;` or a terminator line cannot activate COPY
-  // early (Codex R4), an identifier that closes on one line while the next
-  // opens on a later line is still assembled (Codex R5 follow-through), and
-  // beyond the cap the run FAILS CLOSED rather than falling back to SQL
-  // passthrough (Codex R5).
-  let pendingCopy = '';
-  let pendingCopyActive = false;
-  const HEAD_CAP = 1024 * 1024;
+  // Beyond the cap a pending statement FAILS CLOSED — never a fallback to
+  // SQL passthrough (Codex R5).
+  const STMT_CAP = 1024 * 1024;
   return {
     stats,
     push(line: string): string {
@@ -566,44 +601,33 @@ export function createDumpScrubber(): DumpScrubber {
         // open across them. It is settled only by a real token — a quote
         // (rejected) or anything else (cleared). (Codex R7.)
         if (/^\s*'/.test(line)) {
-          // `'a'<whitespace/comments/newlines>'b'` is ONE literal to
-          // PostgreSQL. pg_dump never writes it; a hand-edited dump might.
-          // Not supported — fail closed.
           const err = new Error(
             'dump-scrub: unsupported string-literal continuation across a newline; aborting',
           );
           (err as { exitCode?: number }).exitCode = 4;
           throw err;
         }
-        // Lines arrive with their trailing newline; a comment runs to it.
-        if (!/^\s*(?:--[^\n]*)?\s*$/.test(line)) sql.literalClosedAtLineEnd = false;
+        if (!/^\s*(?:--[^\n\r]*)?\s*$/.test(line)) sql.literalClosedAtLineEnd = false;
       }
-      const startsStatement = sql.mode === 'code' && !pendingCopyActive;
       const out = scrubSqlText(line, sql);
-      if (startsStatement && /^COPY\s/.test(line)) {
-        pendingCopyActive = true;
-        pendingCopy = '';
-      }
-      if (!pendingCopyActive) return out;
-      pendingCopy += line;
-      if (pendingCopy.length > HEAD_CAP) {
+      if (sql.stmt.length > STMT_CAP) {
         const err = new Error(
-          `dump-scrub: pending COPY statement exceeds ${HEAD_CAP} bytes before closing; aborting so no row is passed through unscreened`,
+          `dump-scrub: pending statement exceeds ${STMT_CAP} bytes before closing; aborting so no row is passed through unscreened`,
         );
         (err as { exitCode?: number }).exitCode = 4;
         throw err;
       }
-      if (sql.mode === 'code' && /;\s*$/.test(line)) {
-        // Statement closed in code mode: decide now.
-        const statement = pendingCopy;
-        pendingCopy = '';
-        pendingCopyActive = false;
-        if (COPY_START_MULTILINE.test(statement)) inCopy = true;
+      if (sql.stmtEnded && sql.mode === 'code') {
+        // A REAL terminating semicolon (outside quotes and comments) closed
+        // the statement: decide on the comment-free, literal-masked text.
+        if (COPY_START_MULTILINE.test(sql.stmt.trim())) inCopy = true;
+        sql.stmt = '';
+        sql.stmtEnded = false;
       }
       return out;
     },
     end(): string {
-      if (pendingCopyActive) {
+      if (/^\s*COPY\s/.test(sql.stmt)) {
         const err = new Error('dump-scrub: unterminated COPY statement at end of input');
         (err as { exitCode?: number }).exitCode = 4;
         throw err;

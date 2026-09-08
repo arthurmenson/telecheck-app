@@ -358,3 +358,42 @@ describe('Codex R7 in-scope closure — continuation across whitespace and comme
     expect(out).not.toContain('123-45-6789');
   });
 });
+
+describe('Codex R8 in-scope closures — lexer-driven termination and CR handling', () => {
+  it('a comment containing ";" inside a COPY header does not discard the header', () => {
+    const dump =
+      'COPY public.t (id,\n-- ;\nbody) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+    const out = scrubText(dump);
+    expect(out).not.toContain('test.user@example.com');
+    expect(out).toContain('COPY public.t (id,\n');
+  });
+  it('a comment containing "FROM stdin;" does not activate COPY early', () => {
+    const dump =
+      "INSERT INTO t VALUES (1); -- FROM stdin;\nINSERT INTO t VALUES ('my SSN is 123-45-6789');\n";
+    const out = scrubText(dump);
+    expect(out).not.toContain('123-45-6789');
+    expect(out.startsWith('INSERT INTO t VALUES (1); -- FROM stdin;\n')).toBe(true);
+  });
+  it('a trailing comment on the COPY header line is fine', () => {
+    const dump =
+      'COPY public.t (id, body) FROM stdin; -- data follows\n1\tmy SSN is 123-45-6789\n\\.\n';
+    expect(scrubText(dump)).not.toContain('123-45-6789');
+  });
+  it('a bare CR ending a comment before a continued literal is rejected', () => {
+    expect(() => scrubText("SELECT 'test.user@'\n-- c\r'example.com';\n")).toThrow(
+      /carriage return|continuation/,
+    );
+  });
+  it('a bare CR directly between fragments is rejected', () => {
+    expect(() => scrubText("SELECT 'test.user@'\r'example.com';\n")).toThrow(/carriage return/);
+  });
+  it('CRLF line endings pass through SQL and COPY rows', () => {
+    const dump = 'COPY public.t (id, body) FROM stdin;\r\n1\tmy SSN is 123-45-6789\r\n\\.\r\n';
+    const out = scrubText(dump);
+    expect(out).not.toContain('123-45-6789');
+    expect(out.split('\r\n')).toHaveLength(4);
+  });
+  it('a bare CR inside a COPY row is rejected', () => {
+    expect(() => scrubCopyRow('1\ta\rb\n')).toThrow(/carriage return/);
+  });
+});

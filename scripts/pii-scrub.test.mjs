@@ -289,3 +289,30 @@ test('backup mode: continuations separated by blank / comment lines (Codex R7) f
     assert.ok(!stdout.includes('example.com'));
   }
 });
+
+test('backup mode: comment semicolons and FROM stdin inside comments (Codex R8) do not fool the lexer', async () => {
+  const a = await run(
+    ['--mode', 'backup'],
+    'COPY public.t (id,\n-- ;\nbody) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n',
+  );
+  assert.equal(a.code, 0, a.stderr);
+  assert.ok(!a.stdout.includes('test.user@example.com'));
+  assert.match(a.stderr, /copyRows=1/);
+  const b = await run(
+    ['--mode', 'backup'],
+    "INSERT INTO t VALUES (1); -- FROM stdin;\nINSERT INTO t VALUES ('my SSN is 123-45-6789');\n",
+  );
+  assert.equal(b.code, 0, b.stderr);
+  assert.ok(!b.stdout.includes('123-45-6789'));
+});
+
+test('backup mode: a bare CR between literal fragments (Codex R8) fails closed', async () => {
+  for (const input of [
+    "SELECT 'test.user@'\n-- c\r'example.com';\n",
+    "SELECT 'test.user@'\r'example.com';\n",
+  ]) {
+    const { code, stdout } = await run(['--mode', 'backup'], input);
+    assert.equal(code, 4);
+    assert.ok(!stdout.includes('example.com'));
+  }
+});
