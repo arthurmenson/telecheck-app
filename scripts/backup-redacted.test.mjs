@@ -85,7 +85,7 @@ test('wrapper: refuses without a readable recipients file', () => {
 test('wrapper: pg_dump options that bypass the pipe are refused before execution', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'l5-'));
   const stubs = mkStubs(dir);
-  for (const args of [['--file=/tmp/raw.sql'], ['-f', '/tmp/raw.sql'], ['-Fc'], ['--format=custom'], ['-Z', '9'], ['--jobs=4'], ['-E', 'LATIN1']]) {
+  for (const args of [['--file=/tmp/raw.sql'], ['-f', '/tmp/raw.sql'], ['-Fc'], ['--format=custom'], ['-Z', '9'], ['--jobs=4'], ['-E', 'LATIN1'], ['-vf/tmp/raw.sql'], ['-vFc'], ['-vZ9'], ['--inserts'], ['--column-inserts'], ['--rows-per-insert=100'], ['/tmp/raw.sql']]) {
     const outDir = path.join(dir, 'out-' + args.join('').replace(/[^a-z0-9]/gi, ''));
     const r = runWrapper(dir, stubs, outDir, args);
     assert.equal(r.status, 2, `${args.join(' ')}: ${r.stderr}`);
@@ -124,5 +124,12 @@ test('wrapper: forces plain UTF-8 format on the pg_dump stage', () => {
   const args = fs.readFileSync(argLog, 'utf8').split('\n');
   assert.ok(args.includes('--format=plain'));
   assert.ok(args.includes('--encoding=UTF8'));
+});
+
+test('wrapper: allowlisted options (including value-taking ones) still pass', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'l5-'));
+  const stubs = mkStubs(dir);
+  const r = runWrapper(dir, stubs, path.join(dir, 'out'), ['-v', '--table', 'public.t', '--no-comments']);
+  assert.equal(r.status, 0, r.stderr);
 });
 

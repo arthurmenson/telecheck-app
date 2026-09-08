@@ -33,15 +33,31 @@ PG_DUMP_BIN="${PG_DUMP_BIN:-pg_dump}"
 AGE_BIN="${AGE_BIN:-age}"
 MAX_LINE="${PII_SCRUB_MAX_LINE_BYTES:-67108864}"
 
-# Reject pg_dump options that bypass the pipe or change the stream format.
+# pg_dump options: explicit ALLOWLIST, parsed token by token. Bundled short
+# options (-vf/path, -vFc, -vZ9) are refused outright — PostgreSQL parses
+# bundles, so a prefix check is not a guard. Everything that redirects
+# output, changes format/compression/encoding, or changes data serialisation
+# (INSERT forms are not type-aware-screened) is refused before execution.
+ALLOWED_LONG='^--(data-only|schema-only|no-comments|no-publications|no-subscriptions|no-security-labels|no-tablespaces|no-unlogged-table-data|no-sync|strict-names|if-exists|clean|create|serializable-deferrable|verbose|table|exclude-table|exclude-table-data|schema|exclude-schema|extension|lock-wait-timeout|snapshot)(=.*)?$'
+ALLOWED_SHORT='^-(a|s|c|C|v|t|T|n|N|e)$'
+prev_takes_value=0
 for arg in "$@"; do
+  if [ "$prev_takes_value" = "1" ]; then prev_takes_value=0; continue; fi
   case "$arg" in
-    -f|-f*|--file|--file=*) echo "backup-redacted: refusing '$arg' — output must flow through the pipe" >&2; exit 2 ;;
-    -F|-F*|--format|--format=*) echo "backup-redacted: refusing '$arg' — format is forced to plain" >&2; exit 2 ;;
-    -Z|-Z*|--compress|--compress=*) echo "backup-redacted: refusing '$arg' — compression would defeat scrubbing" >&2; exit 2 ;;
-    -j|-j*|--jobs|--jobs=*) echo "backup-redacted: refusing '$arg' — parallel dumps require directory format" >&2; exit 2 ;;
-    -E|-E*|--encoding|--encoding=*) echo "backup-redacted: refusing '$arg' — encoding is forced to UTF8" >&2; exit 2 ;;
+    --inserts|--column-inserts|--attribute-inserts|--rows-per-insert|--rows-per-insert=*)
+      echo "backup-redacted: refusing '$arg' — INSERT-serialised values are not type-aware-screened" >&2; exit 2 ;;
   esac
+  if [[ "$arg" == --* ]]; then
+    [[ "$arg" =~ $ALLOWED_LONG ]] || { echo "backup-redacted: refusing '$arg' — not on the allowlist" >&2; exit 2; }
+    case "$arg" in --table|--exclude-table|--exclude-table-data|--schema|--exclude-schema|--extension|--lock-wait-timeout|--snapshot) prev_takes_value=1 ;; esac
+    continue
+  fi
+  if [[ "$arg" == -* ]]; then
+    [[ "$arg" =~ $ALLOWED_SHORT ]] || { echo "backup-redacted: refusing '$arg' — bundled or unlisted short option" >&2; exit 2; }
+    case "$arg" in -t|-T|-n|-N|-e) prev_takes_value=1 ;; esac
+    continue
+  fi
+  echo "backup-redacted: refusing positional argument '$arg' — the DSN comes from BACKUP_DATABASE_URL" >&2; exit 2
 done
 
 [ -r "$AGE_RECIPIENTS_FILE" ] || { echo "backup-redacted: recipients file not readable: $AGE_RECIPIENTS_FILE" >&2; exit 2; }

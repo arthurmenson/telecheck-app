@@ -174,3 +174,17 @@ test('log mode delegates to the Layer 3 JSON-aware pass', async () => {
   assert.ok(!stdout.includes('test.user@example.com'));
   assert.doesNotThrow(() => JSON.parse(stdout));
 });
+
+test('backup mode: quoted identifier with an apostrophe before a COPY block (Codex R2) is scrubbed', async () => {
+  const input = 'CREATE TABLE public."o\'neil" (id integer, body text);\nCOPY public."o\'neil" (id, body) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+  const { code, stdout } = await run(['--mode', 'backup'], input);
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes('test.user@example.com'));
+});
+
+test('backup mode: an unterminated literal at end of input fails closed (exit 4)', async () => {
+  const { code, stderr } = await run(['--mode', 'backup'], "INSERT INTO t VALUES ('open\n");
+  assert.equal(code, 4);
+  assert.match(stderr, /unterminated literal/);
+});
+

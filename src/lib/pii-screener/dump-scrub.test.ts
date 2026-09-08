@@ -140,3 +140,47 @@ describe('SQL text — only literal contents are scrubbed', () => {
     expect(out).toBe(dump.replace('1\t3125551212\t', '1\t0\t'));
   });
 });
+
+describe('Codex R2 in-scope closures', () => {
+  it('a quoted identifier with an apostrophe does not open a literal, and the following COPY block is scrubbed', () => {
+    const dump =
+      'CREATE TABLE public."o\'neil" (id integer, body text);\n' +
+      'COPY public."o\'neil" (id, body) FROM stdin;\n' +
+      '1\treach me at test.user@example.com\n' +
+      '\\.\n';
+    const out = scrubText(dump);
+    expect(out).not.toContain('test.user@example.com');
+    expect(out.startsWith('CREATE TABLE public."o\'neil" (id integer, body text);\n')).toBe(true);
+  });
+  it('a doubled quote inside an E-literal does not end escape handling', () => {
+    const sql = "INSERT INTO public.t VALUES (E'it''s (415)\\t555-0123');\n";
+    const out = scrubText(sql);
+    expect(out).not.toContain('555-0123');
+    // The re-encoder may write the escaped quote as \' (valid in an E-string)
+    // or keep ''; both are a single quote inside the literal.
+    expect(out).toMatch(/^INSERT INTO public\.t VALUES \(E'it(''|\\')s /);
+    expect(out.endsWith("');\n")).toBe(true);
+  });
+  it('JSON scalar strings are decoded, scrubbed and re-encoded (fully and partly escaped)', () => {
+    const full = JSON.stringify('test.user@example.com').replace(
+      /[a-z]/g,
+      (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'),
+    );
+    const out1 = scrubValue(full);
+    expect(JSON.parse(out1)).not.toContain('test.user@example.com');
+    const out2 = scrubValue('"te\\u0073t.user@example.com"');
+    expect(JSON.parse(out2)).not.toContain('test.user@example.com');
+  });
+  it('backup JSON does not inherit Layer 3 numeric exemptions', () => {
+    const out = JSON.parse(
+      scrubValue('{"time":1700000000004,"n":1700000000004,"responseTime":0.3125551212}'),
+    ) as Record<string, number>;
+    expect(out['time']).toBe(out['n']);
+    expect(out['responseTime']).toBe(0);
+  });
+  it('an unterminated literal at end of input fails closed', () => {
+    const s = createDumpScrubber();
+    s.push("INSERT INTO t VALUES ('open\n");
+    expect(() => s.end()).toThrow(/unterminated literal/);
+  });
+});

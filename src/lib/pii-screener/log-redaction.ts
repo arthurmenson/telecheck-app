@@ -358,6 +358,7 @@ export function redactLogLine(
   line: string,
   redactor: (value: string) => string = redactString,
   numberRedactor: (rawNumber: string) => string = redactNumericLexeme,
+  options: { preserveNumbers?: boolean } = {},
 ): string {
   const trimmed = line.trimEnd();
   const newline = line.slice(trimmed.length);
@@ -382,7 +383,12 @@ export function redactLogLine(
       valid = false;
     }
     if (valid) {
-      const scanned = redactJsonStringTokens(trimmed, redactor, numberRedactor);
+      const scanned = redactJsonStringTokens(
+        trimmed,
+        redactor,
+        numberRedactor,
+        options.preserveNumbers ?? true,
+      );
       if (scanned !== null) return scanned + newline;
     }
     // Not valid JSON — fall through to the whole-line pass.
@@ -401,6 +407,7 @@ function redactJsonStringTokens(
   text: string,
   redactor: (value: string) => string,
   numberRedactor: (rawNumber: string) => string,
+  preserveNumbers: boolean,
 ): string | null {
   let out = '';
   let i = 0;
@@ -549,7 +556,10 @@ function redactJsonStringTokens(
         // (`logger.info({ time: 3125551212 }, 'x')`).
         // Every allowlisted field sits at a fixed position in the record,
         // so requiring the position costs nothing.
-        out += shouldPreserveNumber(keyStack, num.raw) ? num.raw : numberRedactor(num.raw);
+        out +=
+          preserveNumbers && shouldPreserveNumber(keyStack, num.raw)
+            ? num.raw
+            : numberRedactor(num.raw);
         i = num.next;
         continue;
       }

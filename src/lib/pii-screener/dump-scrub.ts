@@ -65,6 +65,21 @@ export function zeroFillIfMatching(rawNumber: string): string {
 export function scrubValue(value: string): string {
   if (value.length === 0) return value;
   const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    // A valid JSON scalar string (possibly fully or partly \u-escaped):
+    // decode, scrub the decoded text, re-encode — never scrub the escaped
+    // form (that either misses the value or breaks the escape).
+    try {
+      const decoded = JSON.parse(trimmed) as unknown;
+      if (typeof decoded === 'string') {
+        const leading = value.slice(0, value.length - value.trimStart().length);
+        const trailing = value.slice(value.trimEnd().length);
+        return leading + JSON.stringify(redactForBackup(decoded)) + trailing;
+      }
+    } catch {
+      // not a JSON string — fall through to prose
+    }
+  }
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     try {
       JSON.parse(trimmed);
@@ -72,7 +87,11 @@ export function scrubValue(value: string): string {
       // whole library via the redactor parameter.
       const leading = value.slice(0, value.length - value.trimStart().length);
       const trailing = value.slice(value.trimEnd().length);
-      return leading + redactLogLine(trimmed, redactForBackup, zeroFillIfMatching) + trailing;
+      return (
+        leading +
+        redactLogLine(trimmed, redactForBackup, zeroFillIfMatching, { preserveNumbers: false }) +
+        trailing
+      );
     } catch {
       // not JSON — fall through
     }
@@ -293,14 +312,16 @@ function encodeEscapeLiteral(value: string): string {
 }
 
 interface SqlState {
-  mode: 'code' | 'literal' | 'dollar';
+  mode: 'code' | 'literal' | 'dollar' | 'identifier';
   escapeLiteral: boolean;
   literal: string;
   dollarTag: string;
 }
 
 function scrubLiteral(content: string, escapeLiteral: boolean): string {
-  const decoded = escapeLiteral ? decodeEscapeLiteral(content) : content.replace(/''/g, "'");
+  const decoded = escapeLiteral
+    ? decodeEscapeLiteral(content.replace(/''/g, "\\'"))
+    : content.replace(/''/g, "'");
   const scrubbed = scrubValue(decoded);
   if (scrubbed === decoded) return content;
   return escapeLiteral ? encodeEscapeLiteral(scrubbed) : scrubbed.replace(/'/g, "''");
@@ -322,6 +343,28 @@ function scrubSqlText(text: string, st: SqlState): string {
       st.mode = 'code';
       continue;
     }
+    if (st.mode === 'identifier') {
+      // Continuation of a quoted identifier that spanned a line boundary.
+      let j = i;
+      while (j < text.length) {
+        if (text[j] === '"') {
+          if (text[j + 1] === '"') {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      if (j >= text.length) {
+        out += text.slice(i);
+        return out;
+      }
+      out += text.slice(i, j + 1);
+      i = j + 1;
+      st.mode = 'code';
+      continue;
+    }
     if (st.mode === 'literal') {
       if (st.escapeLiteral && ch === '\\') {
         st.literal += ch + (text[i + 1] ?? '');
@@ -329,7 +372,8 @@ function scrubSqlText(text: string, st: SqlState): string {
         continue;
       }
       if (ch === "'") {
-        if (!st.escapeLiteral && text[i + 1] === "'") {
+        // A doubled quote is an escaped quote in BOTH literal kinds.
+        if (text[i + 1] === "'") {
           st.literal += "''";
           i += 2;
           continue;
@@ -364,6 +408,30 @@ function scrubSqlText(text: string, st: SqlState): string {
         i += tag.length;
         continue;
       }
+    }
+    if (ch === '"') {
+      // Quoted identifier: pass through verbatim up to the closing quote
+      // (a doubled quote is an escaped quote). Its content is a NAME, and
+      // an apostrophe inside it must not open a literal.
+      let j = i + 1;
+      while (j < text.length) {
+        if (text[j] === '"') {
+          if (text[j + 1] === '"') {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      if (j >= text.length) {
+        st.mode = 'identifier';
+        out += text.slice(i);
+        return out;
+      }
+      out += text.slice(i, j + 1);
+      i = j + 1;
+      continue;
     }
     if (ch === "'") {
       const prev = text[i - 1];
@@ -413,13 +481,12 @@ export function createDumpScrubber(): DumpScrubber {
       return scrubSqlText(line, sql);
     },
     end(): string {
-      if (sql.mode === 'literal') {
-        // Unterminated literal at end of input: emit what we hold, scrubbed
-        // as a value, so nothing buffered is lost or leaked.
-        const held = scrubLiteral(sql.literal, sql.escapeLiteral);
-        sql.literal = '';
-        sql.mode = 'code';
-        return held;
+      if (sql.mode === 'literal' || sql.mode === 'dollar' || sql.mode === 'identifier') {
+        // An unterminated literal / dollar block / identifier at end of
+        // input is not a valid dump: fail closed rather than guess.
+        const err = new Error(`dump-scrub: unterminated ${sql.mode} at end of input`);
+        (err as { exitCode?: number }).exitCode = 4;
+        throw err;
       }
       return '';
     },
