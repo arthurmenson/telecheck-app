@@ -370,6 +370,118 @@ function parseTuples(body) {
   return tuples;
 }
 
+/**
+ * A DO block in a seed is a GUARD: it may read and RAISE, nothing else. The
+ * dollar-quoted body is stripped of comments, string literals and quoted
+ * identifiers, then rejected if it contains any mutation / execution keyword
+ * in ANY spelling, or any function call outside a small read-only allowlist
+ * (so `PERFORM classify(...)`, `EXECUTE '...'`, `SELECT fn(...)` all fail).
+ */
+const DO_FORBIDDEN =
+  /\b(UPDATE|INSERT|DELETE|TRUNCATE|MERGE|PERFORM|EXECUTE|CALL|CREATE|ALTER|DROP|GRANT|REVOKE|COPY|LOCK|SET|IMPORT|REFRESH|CLUSTER|VACUUM|ANALYZE|REINDEX)\b/;
+const DO_ALLOWED_BEFORE_PAREN = new Set([
+  // read-only functions used by the guards
+  'COUNT',
+  'STRING_AGG',
+  'ARRAY_AGG',
+  'COALESCE',
+  'NULLIF',
+  'LENGTH',
+  'LOWER',
+  'UPPER',
+  'BTRIM',
+  'NOW',
+  // keywords that precede a parenthesis
+  'IN',
+  'NOT',
+  'EXISTS',
+  'AND',
+  'OR',
+  'IF',
+  'ELSIF',
+  'WHEN',
+  'WHILE',
+  'THEN',
+  'WHERE',
+  'ON',
+  'SELECT',
+  'FROM',
+  'VALUES',
+  'RETURN',
+]);
+
+/** Removes comments (nested block + line), string literals and quoted identifiers, in encounter order. */
+export function stripSqlNoise(text) {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '-' && text[i + 1] === '-') {
+      while (i < text.length && text[i] !== '\n') i++;
+      out += ' ';
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      let depth = 1;
+      i += 2;
+      while (i < text.length && depth > 0) {
+        if (text.startsWith('/*', i)) {
+          depth++;
+          i += 2;
+        } else if (text.startsWith('*/', i)) {
+          depth--;
+          i += 2;
+        } else i++;
+      }
+      out += ' ';
+      continue;
+    }
+    if (ch === "'") {
+      let j = i + 1;
+      for (;;) {
+        if (j >= text.length) throw new Error('unterminated string literal in DO body');
+        if (text[j] === "'") {
+          if (text[j + 1] === "'") {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      out += " '' ";
+      i = j + 1;
+      continue;
+    }
+    if (ch === '"') {
+      const j = text.indexOf('"', i + 1);
+      if (j < 0) throw new Error('unterminated identifier in DO body');
+      out += ' ';
+      i = j + 1;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+export function assertReadOnlyDoBody(stmt) {
+  const m = stmt.match(/^DO\s+(\$[A-Za-z_0-9]*\$)([\s\S]*)\1\s*(?:LANGUAGE\s+plpgsql)?$/i);
+  if (!m) throw new Error(`unrecognised DO form: ${stmt.slice(0, 80)}`);
+  // One pass, in encounter order: a literal containing `--` (the staging
+  // guard's remediation hint) must not be mistaken for a comment, and a
+  // comment containing a quote must not open a literal.
+  const upper = stripSqlNoise(m[2]).toUpperCase();
+  const forbidden = upper.match(DO_FORBIDDEN);
+  if (forbidden) throw new Error(`DO body is not read-only: ${forbidden[1]}`);
+  for (const call of upper.matchAll(/\b([A-Z_][A-Z0-9_]*)\s*\(/g)) {
+    if (!DO_ALLOWED_BEFORE_PAREN.has(call[1])) {
+      throw new Error(`DO body calls a function outside the read-only allowlist: ${call[1]}`);
+    }
+  }
+}
+
 const ACCOUNTS_INSERT =
   /^INSERT\s+INTO\s+(?:public\.)?accounts\s*\(([^)]*)\)\s*VALUES\s*([\s\S]*?)(?:\s+ON\s+CONFLICT\s*\(\s*account_id\s*\)\s*DO\s+NOTHING)?$/i;
 
@@ -389,12 +501,15 @@ export function seedAccountInserts(sql) {
       throw new Error(`unrecognised SELECT touching accounts: ${stmt.slice(0, 80)}`);
     }
     if (/^DO\b/i.test(stmt)) {
-      // Guards may read accounts; a DO block that mutates accounts is exactly
-      // the unaudited post-insert classification this check exists to
-      // reject (Codex R3).
-      if (/\b(UPDATE|INSERT\s+INTO|DELETE\s+FROM|TRUNCATE)\s+(?:public\.)?accounts\b/i.test(stmt))
-        throw new Error(`account mutation inside a DO block: ${stmt.slice(0, 80)}`);
+      // Fail closed: a DO body may only contain the verified read-only guard
+      // forms (Codex R3 / R4 — regex spellings of "UPDATE accounts" are not a
+      // gate; comments, ONLY, quoted identifiers, EXECUTE and function calls
+      // all evade them).
+      assertReadOnlyDoBody(stmt);
       continue;
+    }
+    if (!/^INSERT\b/i.test(stmt)) {
+      throw new Error(`unrecognised statement in a seed: ${stmt.slice(0, 80)}`);
     }
     if (!/\baccounts\b/i.test(stmt)) continue; // other tables (forms_template, ...)
     const m = stmt.match(ACCOUNTS_INSERT);
@@ -508,6 +623,55 @@ test('seeds: the static check rejects DEFAULT, unclassified, missing column, a s
   );
   const fnSelect = base + "\nSELECT pilot_1_classify_account('x', 'baseline', 'seed');\n";
   assert.equal(seedWritesOnlyBaseline(fnSelect), false, 'an unrecognised SELECT slipped through');
+  // Codex R4 reproductions: spellings that evade a keyword regex.
+  for (const [name, mutation] of [
+    [
+      'comment-split UPDATE',
+      "DO $$ BEGIN UPDATE /* fixtures */ accounts SET cohort_classification='baseline' WHERE cohort_classification='unclassified'; END $$;",
+    ],
+    [
+      'UPDATE ONLY',
+      "DO $$ BEGIN UPDATE ONLY accounts SET cohort_classification='baseline'; END $$;",
+    ],
+    [
+      'quoted identifier',
+      'DO $$ BEGIN UPDATE "accounts" SET cohort_classification=\'baseline\'; END $$;',
+    ],
+    ['TRUNCATE TABLE', 'DO $$ BEGIN TRUNCATE TABLE accounts; END $$;'],
+    [
+      'PERFORM function',
+      "DO $$ BEGIN PERFORM pilot_1_classify_account('x', 'baseline', 'seed'); END $$;",
+    ],
+    [
+      'EXECUTE literal',
+      "DO $$ BEGIN EXECUTE 'UPDATE accounts SET cohort_classification = ''baseline'''; END $$;",
+    ],
+    [
+      'SELECT function inside DO',
+      'DO $$ DECLARE r INTEGER; BEGIN SELECT classify_all() INTO r; END $$;',
+    ],
+    [
+      'nested comment hiding a keyword',
+      "DO $$ BEGIN /* a /* b */ UPDATE accounts SET cohort_classification='baseline'; */ END $$; DO $$ BEGIN UPDATE accounts SET cohort_classification='baseline'; END $$;",
+    ],
+    ['top-level CALL', 'CALL classify_everything();'],
+    ['top-level UPDATE ONLY', "UPDATE ONLY accounts SET cohort_classification = 'baseline';"],
+    [
+      'INSERT into a quoted table with DEFAULT',
+      'INSERT INTO "accounts" (account_id, cohort_classification) VALUES (\'x\', DEFAULT);',
+    ],
+  ]) {
+    assert.equal(
+      seedWritesOnlyBaseline(base + '\n' + mutation + '\n'),
+      false,
+      `${name} slipped through`,
+    );
+  }
+  // The real guards are accepted as read-only.
+  for (const file of ['pilot-1-baseline-seed.sql', 'seed-staging-accounts.sql']) {
+    const sql = fs.readFileSync(path.join(here, file), 'utf8');
+    for (const stmt of splitSqlStatements(sql)) if (/^DO\b/i.test(stmt)) assertReadOnlyDoBody(stmt);
+  }
   const literalSemicolon =
     "SELECT 'a;b'; INSERT INTO accounts (account_id, cohort_classification) VALUES ('x', 'baseline');";
   assert.equal(splitSqlStatements(literalSemicolon).length, 2);
