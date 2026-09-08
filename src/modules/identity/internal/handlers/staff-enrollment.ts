@@ -5,6 +5,7 @@ import { requireActorContext } from '../../../../lib/auth-context.js';
 import {
   commitAuthorityTransaction,
   type CheckoutPool,
+  type CommitAuthority,
 } from '../../../../lib/commit-authority-transaction.js';
 import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
@@ -33,7 +34,9 @@ function context(req: FastifyRequest, reply: FastifyReply) {
   return { tenant, actor, nonce: req.actorNonce };
 }
 type Context = ReturnType<typeof context>;
-export async function assertStaffOperator(tx: DbTransaction, ctx: Context, lock: boolean) {
+/** Operator context the staff writes are authorised against (tenant, actor, request nonce). */
+export type StaffContext = Context;
+export async function assertStaffOperator(tx: DbTransaction, ctx: StaffContext, lock: boolean) {
   const result = await tx.query<{ actor: Record<string, unknown> }>(
     'SELECT public.identity_staff_operator($1) AS actor',
     [lock],
@@ -67,17 +70,22 @@ export async function assertStaffOperator(tx: DbTransaction, ctx: Context, lock:
  * staffFailure already maps to 503. Genuine SQL failures pass through
  * without another query into an aborted transaction.
  */
-export function staffTransaction(ctx: Context) {
+/** The exact authority the staff-enrollment writes run under. Exported for the real-Postgres COMMIT-authority regression. */
+export function staffAuthority(ctx: StaffContext): CommitAuthority {
+  return {
+    tenantId: ctx.tenant.tenantId,
+    nonce: ctx.nonce,
+    afterBegin: (tx) => assertIdentityConnection(tx),
+    assertLive: (tx) => assertStaffOperator(tx, ctx, true),
+    unconfirmed: () =>
+      Object.assign(new Error('identity.staff.commit_unconfirmed'), { code: 'PT503' }),
+    discardEvent: 'identity.staff.recording_connection.discarded',
+  };
+}
+
+export function staffTransaction(ctx: StaffContext) {
   return commitAuthorityTransaction(
-    {
-      tenantId: ctx.tenant.tenantId,
-      nonce: ctx.nonce,
-      afterBegin: (tx) => assertIdentityConnection(tx),
-      assertLive: (tx) => assertStaffOperator(tx, ctx, true),
-      unconfirmed: () =>
-        Object.assign(new Error('identity.staff.commit_unconfirmed'), { code: 'PT503' }),
-      discardEvent: 'identity.staff.recording_connection.discarded',
-    },
+    staffAuthority(ctx),
     () => identityPool() as unknown as CheckoutPool,
   );
 }
