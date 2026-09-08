@@ -44,8 +44,15 @@ if [ -L "${LOCK_FILE}" ]; then echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) mus
 # Containment is checked against the REAL incident directory; when it does
 # not exist (yet) there is nothing to be inside of — the later "not found"
 # refusal handles that case instead of a false containment match.
-INC_REAL="$(cd "${INCIDENT_DIR}" 2>/dev/null && pwd -P || true)"
-LOCK_DIR_REAL="$(cd "$(dirname "${LOCK_FILE}")" 2>/dev/null && pwd -P || true)"
+# Configured paths may not contain `..` segments: shells and normalizers
+# collapse them lexically while the kernel resolves them physically through a
+# preceding symlink (Codex R3). Refused up front, before any resolution.
+no_dotdot() { case "/$2/" in */../*|*\\..\\*|*\\../*|*/..\\*) echo "ERROR: $1 must not contain '..' segments: $2" >&2; exit 2 ;; esac; }
+no_dotdot PILOT_1_INCIDENT_LOGS_DIR "${INCIDENT_DIR}"
+no_dotdot PILOT_1_LOCK_FILE "${LOCK_FILE}"
+# Physical resolution (`cd -P`): symlinks are resolved BEFORE `..` is processed.
+INC_REAL="$(cd -P -- "${INCIDENT_DIR}" 2>/dev/null && pwd -P || true)"
+LOCK_DIR_REAL="$(cd -P -- "$(dirname -- "${LOCK_FILE}")" 2>/dev/null && pwd -P || true)"
 if [ -n "${INC_REAL}" ] && [ -n "${LOCK_DIR_REAL}" ]; then
     case "${LOCK_DIR_REAL}/" in
         "${INC_REAL}/"*) echo "ERROR: PILOT_1_LOCK_FILE must not be inside the incident directory" >&2; exit 2 ;;

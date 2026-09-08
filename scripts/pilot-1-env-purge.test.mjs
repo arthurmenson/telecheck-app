@@ -649,12 +649,29 @@ test('env-purge: containment: real filesystem locations — a `..`-prefixed chil
       { PILOT_1_LOCK_FILE: path.join(alias, 'new', 'deeper', 'lifecycle.lock') },
     ],
     ['TMPDIR two missing components beneath alias', { TMPDIR: path.join(alias, 'new', 'tmp') }],
+    // literal symlink/.. (built by concatenation; never normalized by the fixture) — Codex R3 on the lifecycle package
+    [
+      'state dir via literal alias/..',
+      { PILOT_1_RUNTIME_STATE_DIR: `${alias}${path.sep}..${path.sep}state` },
+    ],
+    [
+      'lock via literal alias/..',
+      { PILOT_1_LOCK_FILE: `${alias}${path.sep}..${path.sep}lifecycle.lock` },
+    ],
+    // MSYS rewrites TMPDIR (and collapses `..`) before bash sees it, so this case is Linux-only
+    ...(process.platform === 'win32'
+      ? []
+      : [['TMPDIR via literal alias/..', { TMPDIR: `${alias}${path.sep}..${path.sep}tmp` }]]),
+    [
+      'incident dir via literal ..',
+      { PILOT_1_INCIDENT_LOGS_DIR: `${inc}${path.sep}..${path.sep}${path.basename(inc)}` },
+    ],
   ]) {
     const r = run(dir, stubs, ['--routine-reset'], { PILOT_1_INCIDENT_LOGS_DIR: inc, ...env });
     assert.equal(r.status, 2, `${name}: ${r.stderr}`);
     assert.match(
       r.stderr,
-      /resolves inside the incident directory|must not be a symbolic link/,
+      /resolves inside the incident directory|must not be a symbolic link|must not contain '\.\.' segments/,
       name,
     );
   }

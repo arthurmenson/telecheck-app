@@ -64,11 +64,33 @@ function lstatOrNull(p) {
   }
 }
 
+/** A configured path may not contain `..` segments: they are collapsed lexically
+ * by every normalizer while the kernel resolves them PHYSICALLY through a
+ * preceding symlink, so `/safe/alias/../incident-logs` would be validated as
+ * one directory and operated on as another (Codex R3). */
+export function assertNoDotDot(p, what) {
+  const segments = String(p).split(/[\\/]+/);
+  if (segments.some((seg) => seg === '..')) {
+    throw new Error(`${what} must not contain '..' segments: ${p}`);
+  }
+}
+
 function realDir(dir) {
+  assertNoDotDot(dir, 'incident directory');
   // path.resolve strips trailing separators (lstat('link/') would follow the
-  // link — Codex R2); the resolved path must then be its own real path, i.e.
-  // no component anywhere in it may be a symbolic link.
+  // link — Codex R2); then EVERY component of the resolved path is inspected
+  // with lstat — no component may be a symbolic link — and the resolved path
+  // must equal its own real path.
   const resolved = path.resolve(dir);
+  const root = path.parse(resolved).root;
+  let cur = root;
+  for (const seg of resolved.slice(root.length).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, seg);
+    const cst = lstatOrNull(cur);
+    if (!cst) throw new Error(`incident directory not found: ${resolved}`);
+    if (cst.isSymbolicLink())
+      throw new Error(`incident directory path contains a symbolic link: ${cur}`);
+  }
   const st = lstatOrNull(resolved);
   if (!st) throw new Error(`incident directory not found: ${resolved}`);
   if (st.isSymbolicLink()) throw new Error(`incident directory is a symbolic link: ${resolved}`);

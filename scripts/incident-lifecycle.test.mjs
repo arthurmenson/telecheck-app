@@ -21,6 +21,7 @@ import {
   gcPlan,
   readManifest,
   removeLock,
+  assertNoDotDot,
   validateLifecycleManifest,
   writeAll,
 } from './lib/incident-writers.mjs';
@@ -458,6 +459,45 @@ test('writers (Codex R2): a symlinked incident directory is refused even with a 
   assert.match(closeWipeBlockers(nested).join(';'), /symbolic link/);
   assert.throws(() => closeWipe(nested), /symbolic link/);
   assert.throws(() => gcPlan(nested, { minAgeDays: 30 }), /symbolic link/);
+});
+
+test('writers (Codex R3): a literal `symlink/..` path is refused before any normalization — the lexical and physical destinations may differ', () => {
+  // /safe/alias -> /real/sub ; configured "/safe/alias/../incident-logs" names
+  // /real/incident-logs physically but /safe/incident-logs lexically
+  const safe = fs.mkdtempSync(path.join(os.tmpdir(), 'p1safe-'));
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), 'p1real-'));
+  fs.mkdirSync(path.join(real, 'sub'));
+  fs.symlinkSync(path.join(real, 'sub'), path.join(safe, 'alias'), 'junction');
+  const lexical = path.join(safe, 'incident-logs');
+  const physical = path.join(real, 'incident-logs');
+  fs.mkdirSync(lexical);
+  fs.mkdirSync(physical);
+  mkIncidentDir({ into: lexical, lock: false, consumed: true }); // no blockers lexically
+  mkIncidentDir({ into: physical, id: 'live', lock: true }); // an ACTIVE incident physically
+  const configured = `${safe}${path.sep}alias${path.sep}..${path.sep}incident-logs`;
+  const beforeL = snapshot(lexical);
+  const beforeP = snapshot(physical);
+  assert.throws(() => assertNoDotDot(configured, 'x'), /'\.\.' segments/);
+  assert.throws(() => closeWipe(configured), /'\.\.' segments/);
+  assert.match(closeWipeBlockers(configured).join(';'), /'\.\.' segments/);
+  assert.throws(() => gcPlan(configured, { minAgeDays: 30 }), /'\.\.' segments/);
+  assert.throws(
+    () => consume(configured, 'live', { disposition: 'RESOLVED', clearedBy: 'x' }),
+    /'\.\.' segments/,
+  );
+  assert.throws(() => removeLock(configured, 'live'), /'\.\.' segments/);
+  assert.deepEqual(snapshot(lexical), beforeL, 'lexical destination changed');
+  assert.deepEqual(snapshot(physical), beforeP, 'physical destination changed');
+  assert.ok(
+    fs.existsSync(path.join(physical, '.incident.lock')),
+    'the active incident lock survived',
+  );
+  // a `..` anywhere, including a trailing one and a Windows-style separator, is refused
+  for (const bad of ['..', `${lexical}${path.sep}..`, `..${path.sep}x`, 'a/../b', 'a\\..\\b']) {
+    assert.throws(() => assertNoDotDot(bad, 'p'), /'\.\.' segments/, bad);
+  }
+  assertNoDotDot(lexical, 'p'); // plain paths pass
+  assertNoDotDot(path.join(lexical, 'x..y', '..z', 'z..'), 'p'); // dots inside names are not segments
 });
 
 test('writers (Codex R2): a FAILED capture (no artifact list) can be ABANDONED, collected by GC and does not block close-wipe; residual files are reported, never deleted by GC', () => {
@@ -990,6 +1030,79 @@ test('incident-log-gc: dry run lists without deleting; execution deletes exactly
     PILOT_1_INCIDENT_LOGS_DIR: inc,
   });
   assert.match(human.stdout, /DRY RUN: incident-log-gc/);
+  // Codex R3: literal `symlink/..` paths — built by string concatenation, never
+  // normalized by the fixture — are usage errors for every configured path
+  {
+    const safe = fs.mkdtempSync(path.join(os.tmpdir(), 'p1safe-'));
+    const real = fs.mkdtempSync(path.join(os.tmpdir(), 'p1real-'));
+    fs.mkdirSync(path.join(real, 'sub'));
+    fs.symlinkSync(path.join(real, 'sub'), path.join(safe, 'alias'), 'junction');
+    const viaAlias = `${safe}${path.sep}alias${path.sep}..${path.sep}incident-logs`;
+    fs.mkdirSync(path.join(real, 'incident-logs'));
+    fs.mkdirSync(path.join(safe, 'incident-logs'));
+    const beforeR = snapshot(path.join(real, 'incident-logs'));
+    for (const [script, args, env] of [
+      ['incident-log-gc.sh', ['--dry-run'], { PILOT_1_INCIDENT_LOGS_DIR: viaAlias }],
+      [
+        'incident-log-gc.sh',
+        ['--dry-run'],
+        {
+          PILOT_1_INCIDENT_LOGS_DIR: inc,
+          PILOT_1_LOCK_FILE: `${viaAlias}${path.sep}lifecycle.lock`,
+        },
+      ],
+      ['pilot-1-close-wipe.sh', ['--confirm'], { PILOT_1_INCIDENT_LOGS_DIR: viaAlias }],
+      [
+        'pilot-1-close-wipe.sh',
+        ['--confirm'],
+        {
+          PILOT_1_INCIDENT_LOGS_DIR: inc,
+          PILOT_1_LOCK_FILE: `${viaAlias}${path.sep}lifecycle.lock`,
+        },
+      ],
+      [
+        'incident-clear.sh',
+        ['--incident-id', ID, '--disposition', 'RESOLVED'],
+        { PILOT_1_INCIDENT_LOGS_DIR: viaAlias },
+      ],
+      [
+        'incident-clear.sh',
+        ['--incident-id', ID, '--disposition', 'RESOLVED'],
+        {
+          PILOT_1_INCIDENT_LOGS_DIR: inc,
+          PILOT_1_LOCK_FILE: `${viaAlias}${path.sep}lifecycle.lock`,
+        },
+      ],
+      // MSYS rewrites TMPDIR (and collapses `..`) before bash sees it, so this case is Linux-only
+      ...(process.platform === 'win32'
+        ? []
+        : [
+            [
+              'incident-clear.sh',
+              ['--incident-id', ID, '--disposition', 'RESOLVED'],
+              { PILOT_1_INCIDENT_LOGS_DIR: inc, TMPDIR: viaAlias },
+            ],
+          ]),
+    ]) {
+      const bad = run(script, dir, stubs, args, env);
+      assert.equal(bad.status, 2, `${script} ${JSON.stringify(env)}: ${bad.stderr}`);
+      assert.match(bad.stderr, /must not contain '\.\.' segments/, script);
+    }
+    assert.deepEqual(
+      snapshot(path.join(real, 'incident-logs')),
+      beforeR,
+      'the physical directory changed',
+    );
+    assert.deepEqual(
+      fs.readdirSync(path.join(safe, 'incident-logs')),
+      [],
+      'the lexical directory changed',
+    );
+    assert.ok(
+      !fs.existsSync(path.join(real, 'incident-logs', 'lifecycle.lock')),
+      'a lock file was created through the alias',
+    );
+  }
   // the lifecycle lock may not live inside the incident directory (Codex R2):
   // neither an inventoried artifact nor an absent .incident.lock may be opened
   for (const lockPath of [
