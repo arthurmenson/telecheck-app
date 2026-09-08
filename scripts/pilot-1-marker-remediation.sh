@@ -140,6 +140,14 @@ if [ "${CURRENT}" != "unclassified" ]; then
     echo "         Reclassification requires a separate audit-logged decision; this script does not reclassify." >&2
     exit 1
 fi
+# The ratified three-state model restricts `participant` to patients and
+# delegates; a staff identity classified as participant would become eligible
+# for the purge DELETE predicate (Codex R2). Decided here and re-checked
+# under the row lock below.
+if [ "${CLASSIFY_AS}" = "participant" ] && [ "${ACCOUNT_TYPE}" != "patient" ] && [ "${ACCOUNT_TYPE}" != "delegate" ]; then
+    echo "REFUSED: account ${ACCOUNT_ID} is a ${ACCOUNT_TYPE}; only patient/delegate accounts can be classified as 'participant' (nothing written)" >&2
+    exit 1
+fi
 
 # --- step 2: ONE transaction — classify + attest, or nothing ---
 # Values reach the DO block through transaction-local settings (psql does
@@ -187,6 +195,9 @@ BEGIN
     END IF;
     IF v_row.cohort_classification <> 'unclassified' THEN
         RAISE EXCEPTION 'REMEDIATION_REFUSED: account % is already classified as %', v_id, v_row.cohort_classification;
+    END IF;
+    IF v_cls = 'participant' AND v_row.account_type NOT IN ('patient', 'delegate') THEN
+        RAISE EXCEPTION 'REMEDIATION_REFUSED: account % is a %; only patient/delegate accounts can be participants', v_id, v_row.account_type;
     END IF;
 
     UPDATE accounts

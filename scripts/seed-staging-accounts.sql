@@ -98,6 +98,7 @@ ON CONFLICT (template_id) DO NOTHING;
 DO $$
 DECLARE
     v_count INTEGER;
+    v_drift TEXT;
 BEGIN
     SELECT COUNT(*) INTO v_count
       FROM accounts
@@ -109,6 +110,23 @@ BEGIN
        AND status = 'active';
     IF v_count <> 5 THEN
         RAISE EXCEPTION 'seed-staging-accounts: expected 5 active seed accounts, found %', v_count;
+    END IF;
+    -- Upgrade case: rows that pre-date the classification column (migration
+    -- 080 backfilled them 'unclassified') are untouched by ON CONFLICT DO
+    -- NOTHING and would still block Day-0 and purge. Fail loudly with the
+    -- offending ids; classification is an audited operator decision
+    -- (scripts/pilot-1-marker-remediation.sh), never a silent seed update.
+    SELECT string_agg(account_id || '=' || cohort_classification, ', ' ORDER BY account_id)
+      INTO v_drift
+      FROM accounts
+     WHERE account_id IN (
+               '01JZZZ00000000000000000P01', '01JZZZ00000000000000000C01',
+               '01JZZZ00000000000000000A02',
+               '01JZZZ00000000000000000P02', '01JZZZ00000000000000000C02'
+           )
+       AND cohort_classification <> 'baseline';
+    IF v_drift IS NOT NULL THEN
+        RAISE EXCEPTION 'seed-staging-accounts: seed fixture(s) are not baseline — % — classify each with scripts/pilot-1-marker-remediation.sh --classify-as baseline (audited) and re-run', v_drift;
     END IF;
     RAISE NOTICE 'seed-staging-accounts: 5 active synthetic accounts present (US patient/clinician/platform_admin + Ghana patient/clinician)';
 END $$;

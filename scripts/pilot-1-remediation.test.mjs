@@ -59,6 +59,7 @@ function run(dir, stub, args, extraEnv = {}) {
 }
 
 const good = ['--account-id', ULID, '--classify-as', 'baseline', '--reason', 'seed fixture'];
+const asParticipant = ['--account-id', ULID, '--classify-as', 'participant', '--reason', 'pilot'];
 
 test('remediation: usage errors exit 2 before psql is ever invoked', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
@@ -104,7 +105,7 @@ test('remediation: the state lookup goes through stdin with psql variables, neve
   assert.match(calls[0], /-v aid=01JZZZ00000000000000000R01/);
 });
 
-test('remediation: unknown actor tenant exits 2; unknown / already-classified accounts are refused (exit 1) with no transaction', () => {
+test('remediation: unknown actor tenant exits 2; unknown / already-classified / staff-as-participant are refused (exit 1) with no transaction', () => {
   const badTenant = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
   const rt = run(
     badTenant,
@@ -114,20 +115,36 @@ test('remediation: unknown actor tenant exits 2; unknown / already-classified ac
   assert.equal(rt.status, 2, rt.stderr);
   assert.match(rt.stderr, /actor tenant 'Telecheck-US' does not exist/);
   assert.ok(!fs.existsSync(path.join(badTenant, 'tx.sql')));
-  for (const [state, expect] of [
-    ['t|\n', /not found/],
-    ['t|Telecheck-US|patient|US|baseline\n', /already classified as 'baseline'/],
-    ['t|Telecheck-US|patient|US|participant\n', /already classified as 'participant'/],
+  for (const [state, args, expect] of [
+    ['t|\n', good, /not found/],
+    ['t|Telecheck-US|patient|US|baseline\n', good, /already classified as 'baseline'/],
+    ['t|Telecheck-US|patient|US|participant\n', good, /already classified as 'participant'/],
+    [
+      't|Telecheck-US|clinician|US|unclassified\n',
+      asParticipant,
+      /only patient\/delegate accounts can be classified as 'participant'/,
+    ],
+    ['t|Telecheck-US|tenant_admin|US|unclassified\n', asParticipant, /only patient\/delegate/],
+    ['t|Telecheck-US|platform_admin|US|unclassified\n', asParticipant, /only patient\/delegate/],
   ]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
     const stub = mkStub(dir, { state });
-    const r = run(dir, stub, good);
+    const r = run(dir, stub, args);
     assert.equal(r.status, 1, r.stderr);
     assert.match(r.stderr, expect);
     assert.ok(
       !fs.existsSync(path.join(dir, 'tx.sql')),
       'a transaction was started for a refused account',
     );
+  }
+  // Staff CAN be classified baseline; a delegate CAN be a participant.
+  for (const [state, args] of [
+    ['t|Telecheck-US|clinician|US|unclassified\n', good],
+    ['t|Telecheck-Ghana|delegate|GH|unclassified\n', asParticipant],
+  ]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
+    const r = run(dir, mkStub(dir, { state }), args);
+    assert.equal(r.status, 0, r.stderr);
   }
 });
 
@@ -153,6 +170,7 @@ test('remediation: success path binds the TARGET tenant, records the ACTOR tenan
   assert.match(sql, /set_tenant_context\(:'tenant'\)/);
   assert.match(sql, /FOR UPDATE/);
   assert.match(sql, /cohort_classification = 'unclassified'/);
+  assert.match(sql, /NOT IN \('patient', 'delegate'\)/);
   assert.match(sql, /'pilot_1\.cohort_classification'/);
   assert.match(sql, /INSERT INTO audit_records/);
   assert.match(sql, /v_actor_tenant/);
@@ -192,16 +210,99 @@ test('remediation: a refusal raised inside the transaction maps to exit 1; any o
   assert.match(r2.stderr, /rolled back; nothing written/);
 });
 
-/**
- * Static seed check — SQL-aware enough for the seed files' shape: strips
- * line AND block comments, accepts `INSERT INTO [public.]accounts`, locates
- * the cohort_classification column, and checks the VALUE in every tuple
- * (so `DEFAULT` — which migration 080 resolves to 'unclassified' — is a
- * failure, not a pass). The real seeds are also executed against
- * PostgreSQL in the integration test.
- */
-function stripSqlComments(sql) {
-  return sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, '');
+// ---------------------------------------------------------------------------
+// Static seed check — a small SQL tokenizer (line + nested block comments,
+// single-quoted literals with '' escapes, dollar quotes, double-quoted
+// identifiers) splits the file into COMPLETE statements before any account
+// insert is inspected, so a `;` inside a literal cannot end a statement early
+// (Codex R2). Every statement that touches `accounts` must be a recognised
+// INSERT of the exact seed shape whose every tuple writes 'baseline';
+// anything else (UPDATE, COPY, an unrecognised INSERT) fails the check. The
+// real seeds are also executed against PostgreSQL in the integration test,
+// which verifies every row they actually create.
+// ---------------------------------------------------------------------------
+
+export function splitSqlStatements(sql) {
+  const statements = [];
+  let cur = '';
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === '-' && sql[i + 1] === '-') {
+      while (i < sql.length && sql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '\\' && cur.trim() === '') {
+      // psql meta-command (`\set`, `\.`): a whole line, terminated by the
+      // newline rather than a `;`.
+      let j = i;
+      while (j < sql.length && sql[j] !== '\n') j++;
+      statements.push(sql.slice(i, j).trim());
+      i = j;
+      continue;
+    }
+    if (ch === '/' && sql[i + 1] === '*') {
+      let depth = 1;
+      i += 2;
+      while (i < sql.length && depth > 0) {
+        if (sql.startsWith('/*', i)) {
+          depth++;
+          i += 2;
+        } else if (sql.startsWith('*/', i)) {
+          depth--;
+          i += 2;
+        } else i++;
+      }
+      if (depth > 0) throw new Error('unterminated block comment');
+      cur += ' ';
+      continue;
+    }
+    if (ch === "'") {
+      let j = i + 1;
+      for (;;) {
+        if (j >= sql.length) throw new Error('unterminated string literal');
+        if (sql[j] === "'") {
+          if (sql[j + 1] === "'") {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      cur += sql.slice(i, j + 1);
+      i = j + 1;
+      continue;
+    }
+    if (ch === '$') {
+      const m = sql.slice(i).match(/^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/);
+      if (m) {
+        const tag = m[0];
+        const end = sql.indexOf(tag, i + tag.length);
+        if (end < 0) throw new Error('unterminated dollar quote');
+        cur += sql.slice(i, end + tag.length);
+        i = end + tag.length;
+        continue;
+      }
+    }
+    if (ch === '"') {
+      const j = sql.indexOf('"', i + 1);
+      if (j < 0) throw new Error('unterminated identifier');
+      cur += sql.slice(i, j + 1);
+      i = j + 1;
+      continue;
+    }
+    if (ch === ';') {
+      if (cur.trim()) statements.push(cur.trim());
+      cur = '';
+      i++;
+      continue;
+    }
+    cur += ch;
+    i++;
+  }
+  if (cur.trim()) statements.push(cur.trim());
+  return statements;
 }
 
 function splitTopLevel(text) {
@@ -239,115 +340,141 @@ function splitTopLevel(text) {
   return parts;
 }
 
-export function seedAccountInserts(sql) {
-  const clean = stripSqlComments(sql);
-  const re =
-    /INSERT\s+INTO\s+(?:public\.)?accounts\s*\(([^)]*)\)\s*VALUES\s*([\s\S]*?)(?:ON\s+CONFLICT|;)/gi;
-  const found = [];
-  for (const m of clean.matchAll(re)) {
-    const columns = m[1].split(',').map((c) => c.trim().toLowerCase());
-    const tuples = [];
-    let depth = 0;
-    let start = -1;
-    let quote = false;
-    const body = m[2];
-    for (let i = 0; i < body.length; i++) {
-      const ch = body[i];
-      if (quote) {
-        if (ch === "'" && body[i + 1] !== "'") quote = false;
-        else if (ch === "'") i++;
-        continue;
+function parseTuples(body) {
+  const tuples = [];
+  let depth = 0;
+  let start = -1;
+  let quote = false;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === "'") {
+        if (body[i + 1] === "'") i++;
+        else quote = false;
       }
-      if (ch === "'") quote = true;
-      else if (ch === '(') {
-        if (depth === 0) start = i + 1;
-        depth++;
-      } else if (ch === ')') {
-        depth--;
-        if (depth === 0 && start >= 0) {
-          tuples.push(splitTopLevel(body.slice(start, i)));
-          start = -1;
-        }
+      continue;
+    }
+    if (ch === "'") quote = true;
+    else if (ch === '(') {
+      if (depth === 0) start = i + 1;
+      depth++;
+    } else if (ch === ')') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        tuples.push(splitTopLevel(body.slice(start, i)));
+        start = -1;
       }
     }
+  }
+  if (depth !== 0) throw new Error('unbalanced VALUES tuple');
+  return tuples;
+}
+
+const ACCOUNTS_INSERT =
+  /^INSERT\s+INTO\s+(?:public\.)?accounts\s*\(([^)]*)\)\s*VALUES\s*([\s\S]*?)(?:\s+ON\s+CONFLICT\s*\(\s*account_id\s*\)\s*DO\s+NOTHING)?$/i;
+
+/**
+ * Returns the parsed account inserts of a seed. Throws on any statement that
+ * touches `accounts` without being a recognised seed INSERT.
+ */
+export function seedAccountInserts(sql) {
+  const found = [];
+  for (const stmt of splitSqlStatements(sql)) {
+    if (!/\baccounts\b/i.test(stmt)) continue;
+    if (/^(SELECT|DO)\b/i.test(stmt) || stmt.startsWith('\\')) continue; // guards, context calls, psql meta-commands
+    const m = stmt.match(ACCOUNTS_INSERT);
+    if (!m) throw new Error(`unrecognised statement touching accounts: ${stmt.slice(0, 80)}`);
+    const columns = m[1].split(',').map((c) => c.trim().toLowerCase());
+    const tuples = parseTuples(m[2]);
+    if (tuples.length === 0) throw new Error('accounts INSERT without VALUES tuples');
     found.push({ columns, tuples });
   }
   return found;
 }
 
-test('seeds: every INSERT INTO accounts in a Pilot 1 seed names cohort_classification and every tuple writes baseline (PII spec CI test 4, SQL paths)', () => {
+/** True only if every account insert names the column and every tuple writes 'baseline'. */
+export function seedWritesOnlyBaseline(sql) {
+  let inserts;
+  try {
+    inserts = seedAccountInserts(sql);
+  } catch {
+    return false;
+  }
+  if (inserts.length < 1) return false;
+  for (const { columns, tuples } of inserts) {
+    const idx = columns.indexOf('cohort_classification');
+    if (idx < 0) return false;
+    for (const t of tuples) {
+      if (t.length !== columns.length) return false;
+      if (t[idx] !== "'baseline'") return false;
+    }
+  }
+  return true;
+}
+
+test('seeds: every accounts INSERT in a Pilot 1 seed names cohort_classification and every tuple writes baseline (PII spec CI test 4, SQL paths)', () => {
   for (const file of ['pilot-1-baseline-seed.sql', 'seed-staging-accounts.sql']) {
     const sql = fs.readFileSync(path.join(here, file), 'utf8');
     const inserts = seedAccountInserts(sql);
     assert.ok(inserts.length >= 1, `${file}: no INSERT INTO accounts found`);
-    for (const { columns, tuples } of inserts) {
-      const idx = columns.indexOf('cohort_classification');
-      assert.ok(
-        idx >= 0,
-        `${file}: an INSERT INTO accounts omits cohort_classification (columns: ${columns.join(', ')})`,
-      );
-      assert.ok(tuples.length >= 1, `${file}: no VALUES tuples parsed`);
-      for (const tuple of tuples) {
-        assert.equal(
-          tuple.length,
-          columns.length,
-          `${file}: tuple arity ${tuple.length} != ${columns.length} columns`,
-        );
-        assert.equal(
-          tuple[idx],
-          "'baseline'",
-          `${file}: a seed tuple writes ${tuple[idx]} for cohort_classification`,
-        );
-      }
-    }
+    assert.equal(
+      seedWritesOnlyBaseline(sql),
+      true,
+      `${file}: a seed tuple does not write 'baseline'`,
+    );
   }
 });
 
-test('seeds: the static check rejects DEFAULT, missing column, unclassified, qualified-table and commented-out variants', () => {
+test('seeds: the static check rejects DEFAULT, unclassified, missing column, a sixth tuple hidden behind a `;` in a literal, UPDATEs, and commented-out inserts', () => {
   const base = fs.readFileSync(path.join(here, 'seed-staging-accounts.sql'), 'utf8');
-  const check = (sql) => {
-    const inserts = seedAccountInserts(sql);
-    if (inserts.length < 1) return false;
-    for (const { columns, tuples } of inserts) {
-      const idx = columns.indexOf('cohort_classification');
-      if (idx < 0) return false;
-      for (const t of tuples) if (t[idx] !== "'baseline'") return false;
-    }
-    return true;
-  };
-  assert.equal(check(base), true);
+  const tuple = /NOW\(\), 'baseline'/;
+  assert.equal(seedWritesOnlyBaseline(base), true);
   assert.equal(
-    check(base.replace(/NOW\(\), 'baseline'/, 'NOW(), DEFAULT')),
+    seedWritesOnlyBaseline(base.replace(tuple, 'NOW(), DEFAULT')),
     false,
     'DEFAULT slipped through',
   );
   assert.equal(
-    check(base.replace(/NOW\(\), 'baseline'/, "NOW(), 'unclassified'")),
+    seedWritesOnlyBaseline(base.replace(tuple, "NOW(), 'unclassified'")),
     false,
     "'unclassified' slipped through",
   );
   assert.equal(
-    check(
+    seedWritesOnlyBaseline(
       base.replace(/, cohort_classification\n\) VALUES/, '\n) VALUES').replace(/, 'baseline'/g, ''),
     ),
     false,
     'omitted column slipped through',
   );
   assert.equal(
-    check(base.replace(/INSERT INTO accounts/, 'INSERT INTO public.accounts')),
+    seedWritesOnlyBaseline(base.replace(/INSERT INTO accounts/, 'INSERT INTO public.accounts')),
     true,
     'qualified table not recognised',
   );
-  assert.equal(
-    check(
-      base
-        .replace(/INSERT INTO accounts/, 'INSERT INTO public.accounts')
-        .replace(/NOW\(\), 'baseline'/, 'NOW(), DEFAULT'),
-    ),
-    false,
+  // Codex R2 reproduction: a sixth tuple whose first_name contains `;` and
+  // whose classification is DEFAULT, appended after the fifth tuple.
+  const extra = base.replace(
+    /'clinician', 'active', NOW\(\), 'baseline'\n\s*\)\nON CONFLICT/,
+    "'clinician', 'active', NOW(), 'baseline'\n    ),\n    ('01JZZZ00000000000000000X06', 'Telecheck-US', '+15550100009', 'x@example.invalid', 'Extra; Fixture', 'Six', DATE '1990-01-01', 'prefer_not_to_say', 'US', 'US', 'en-US', 'patient', 'active', NOW(), DEFAULT)\nON CONFLICT",
   );
+  assert.notEqual(extra, base, 'the extra-tuple mutation did not apply');
+  assert.equal(
+    seedWritesOnlyBaseline(extra),
+    false,
+    'a tuple hidden behind a ; in a literal slipped through',
+  );
+  const update =
+    base + "\nUPDATE accounts SET cohort_classification = 'baseline' WHERE account_id = 'x';\n";
+  assert.equal(seedWritesOnlyBaseline(update), false, 'an UPDATE of accounts slipped through');
   const commented =
     `/* INSERT INTO accounts (account_id, cohort_classification) VALUES ('x', 'baseline'); */\n` +
-    base.replace(/NOW\(\), 'baseline'/, 'NOW(), DEFAULT');
-  assert.equal(check(commented), false, 'a block-commented INSERT masked a real defect');
+    base.replace(tuple, 'NOW(), DEFAULT');
+  assert.equal(
+    seedWritesOnlyBaseline(commented),
+    false,
+    'a block-commented INSERT masked a real defect',
+  );
+  const literalSemicolon =
+    "SELECT 'a;b'; INSERT INTO accounts (account_id, cohort_classification) VALUES ('x', 'baseline');";
+  assert.equal(splitSqlStatements(literalSemicolon).length, 2);
 });
