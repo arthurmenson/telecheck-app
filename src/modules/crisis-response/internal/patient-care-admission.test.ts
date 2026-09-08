@@ -9,36 +9,19 @@ const mocks = vi.hoisted(() => ({
   commitError: null as unknown,
   cleanupError: null as unknown,
   commitHang: false,
+  cleanupHang: false,
+  release: vi.fn(),
 }));
-// The seam is now `withTenantBoundConnection` with BEGIN/COMMIT issued
-// INSIDE the tenant scope, so COMMIT failure is simulated where it really
-// happens: on the `COMMIT` statement itself, via `mocks.query`.
-// Mirrors the real wrapper's shape: run `work`, then run tenant cleanup, and
-// if cleanup throws, surface that failure — wrapped with the callback error
-// in an AggregateError when both failed — exactly as src/lib/db.ts does.
+// The module now OWNS its recording client: it takes a raw pool client,
+// sets the tenant binding itself, runs BEGIN/COMMIT, and decides whether to
+// return or DISCARD the client. So the seam is `getPool().connect()`, and
+// COMMIT/cleanup failures are simulated where they really happen — on the
+// `COMMIT` and `clear_tenant_context()` statements via `mocks.query` — and
+// disposal is observed via `mocks.release`.
 vi.mock('../../../lib/db.js', () => ({
-  withConnection: async (work: (client: unknown) => Promise<unknown>) =>
-    work({ query: mocks.query }),
-  withTenantBoundConnection: async (
-    _tenantId: string,
-    work: (client: unknown) => Promise<unknown>,
-  ) => {
-    let result: unknown;
-    let cbError: unknown;
-    let failed = false;
-    try {
-      result = await work({ query: mocks.query });
-    } catch (error) {
-      cbError = error;
-      failed = true;
-    }
-    if (mocks.cleanupError !== null) {
-      if (failed) throw new AggregateError([cbError, mocks.cleanupError], 'cleanup failed');
-      throw new Error('withTenantBoundConnection: clear_tenant_context failed');
-    }
-    if (failed) throw cbError;
-    return result;
-  },
+  getPool: () => ({
+    connect: async () => ({ query: mocks.query, release: mocks.release }),
+  }),
 }));
 vi.mock('../../../lib/rls.js', () => ({
   withTenantContext: (_tx: unknown, _tenant: string, work: () => Promise<unknown>) => work(),
@@ -68,12 +51,15 @@ const ctx = {
   actorNonce: '123e4567-e89b-42d3-a456-426614174000',
   idempotencyKey: 'synthetic-request',
 };
+/** Let consumed background cleanup run (real timers). */
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.commitFailure = false;
   mocks.commitError = null;
   mocks.cleanupError = null;
   mocks.commitHang = false;
+  mocks.cleanupHang = false;
   mocks.profile.mockResolvedValue({
     emergency_number: 'configured-emergency',
     crisis_helplines: [],
@@ -81,6 +67,12 @@ beforeEach(() => {
   mocks.audit.mockResolvedValue({ audit_id: '123e4567-e89b-42d3-a456-426614174001' });
   mocks.outbox.mockResolvedValue(undefined);
   mocks.query.mockImplementation(async (sql: string) => {
+    if (sql.includes('clear_tenant_context')) {
+      // Post-COMMIT cleanup runs outside the transaction and its timeouts.
+      if (mocks.cleanupHang) return new Promise<never>(() => undefined);
+      if (mocks.cleanupError !== null) throw mocks.cleanupError;
+      return { rows: [] };
+    }
     if (sql === 'COMMIT') {
       // A COMMIT that never acknowledges: deferred-trigger work the server's
       // statement_timeout does not bound.
@@ -91,7 +83,6 @@ beforeEach(() => {
       if (mocks.commitError !== null) throw mocks.commitError;
       return { rows: [] };
     }
-    if (sql.includes('pg_backend_pid')) return { rows: [{ pid: 4242 }] };
     if (sql.includes('crisis_care_live_patient'))
       return {
         rows: [
@@ -255,6 +246,10 @@ describe('patient crisis admission', () => {
       escalation_status: 'pending',
       crisis_event_id: '123e4567-e89b-42d3-a456-426614174002',
     });
+    // Cleanup is consumed background work; a client whose tenant binding
+    // could not be cleared is DISCARDED, never returned (I-023).
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith(true);
   });
 
   it('keeps a PT401 raised by COMMIT as a 401 even when cleanup also fails', async () => {
@@ -267,6 +262,8 @@ describe('patient crisis admission', () => {
       code: 'PT401',
       statusCode: 401,
     });
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith(true);
   });
 
   it('bounds a stalled COMMIT with a client-side deadline and reports uncertainty', async () => {
@@ -293,14 +290,15 @@ describe('patient crisis admission', () => {
         escalation_status: 'unconfirmed',
       });
       expect(result).not.toHaveProperty('crisis_event_id');
-      // The recording backend's pid was captured at BEGIN and cancelled
-      // best-effort so the stuck connection frees without waiting on it.
+      // The stalled client is DESTROYED so it can never be handed to another
+      // request mid-COMMIT. No backend is signalled by pid: under pool
+      // saturation a delayed pg_cancel_backend can land after this client
+      // was released and re-borrowed, aborting another tenant's transaction
+      // (Codex round 4 on PR #302).
+      expect(mocks.release).toHaveBeenCalledWith(true);
       const sqls = mocks.query.mock.calls.map(([sql]) => String(sql));
-      expect(sqls.some((q) => q.includes('pg_backend_pid'))).toBe(true);
-      const cancel = mocks.query.mock.calls.find(([sql]) =>
-        String(sql).includes('pg_cancel_backend'),
-      );
-      expect(cancel?.[1]).toEqual([4242]);
+      expect(sqls.some((q) => q.includes('pg_cancel_backend'))).toBe(false);
+      expect(sqls.some((q) => q.includes('pg_backend_pid'))).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -318,8 +316,35 @@ describe('patient crisis admission', () => {
         recording_status: 'not_recorded',
         escalation_status: 'not_queued',
       });
-      const sqls = mocks.query.mock.calls.map(([sql]) => String(sql));
-      expect(sqls.some((q) => q.includes('pg_cancel_backend'))).toBe(false);
+      await vi.advanceTimersByTimeAsync(0);
+      // Rolled back and cleaned up: the client is RETURNED, not discarded.
+      expect(mocks.release).toHaveBeenCalledWith();
+      expect(mocks.release).not.toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns an acknowledged COMMIT immediately even when cleanup hangs, then discards the client', async () => {
+    // Codex round 4 on PR #302: with the timer cleared on successful COMMIT,
+    // a hanging clear_tenant_context() DELETE — outside the transaction and
+    // its SET LOCAL timeouts — withheld the safety resources despite an
+    // acknowledged commit. Cleanup is now consumed background work with its
+    // own 2 s bound; the response never waits on it.
+    vi.useFakeTimers();
+    try {
+      mocks.cleanupHang = true;
+      const pending = admitPatientCareInput(ctx, 'in crisis', 'messaging');
+      await vi.advanceTimersByTimeAsync(0);
+      const result = await pending;
+      expect(result).toMatchObject({
+        recording_status: 'recorded',
+        escalation_status: 'pending',
+        crisis_event_id: '123e4567-e89b-42d3-a456-426614174002',
+      });
+      expect(mocks.release).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(mocks.release).toHaveBeenCalledWith(true);
     } finally {
       vi.useRealTimers();
     }

@@ -2,12 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { withActorContext } from '../../../lib/actor-context-binding.js';
 import { crisisDetector } from '../../../lib/crisis-detection.js';
-import {
-  withConnection,
-  withTenantBoundConnection,
-  type DbClient,
-  type DbTransaction,
-} from '../../../lib/db.js';
+import { getPool, type DbClient, type DbTransaction } from '../../../lib/db.js';
 import { emitDomainEvent } from '../../../lib/domain-events.js';
 import { logger } from '../../../lib/logger.js';
 import { withTenantContext } from '../../../lib/rls.js';
@@ -33,9 +28,10 @@ export interface PatientCareAdmissionContext {
    * client that translates BEGIN/COMMIT into savepoints, and a deferred
    * constraint trigger fires only at a real COMMIT — so COMMIT-time
    * authority enforcement is invisible there. Integration tests pass their
-   * own connection here to observe it. Forwarded to
-   * `withTenantBoundConnection` as its caller-owned `externalTx`, which
-   * means the caller also owns the tenant binding. Refused outside test.
+   * own connection here to observe it. It is used in place of a pool
+   * client: the caller sets the tenant binding beforehand and owns disposal
+   * — this module never returns or destroys a caller-owned connection.
+   * Refused outside test.
    */
   connection?: DbClient;
 }
@@ -146,58 +142,126 @@ async function assertPatient(tx: DbTransaction, ctx: PatientCareAdmissionContext
 const COMMIT_DEADLINE_MS = 4_000;
 
 /**
- * Runs `work` in a transaction whose COMMIT is itself authority-checked.
- *
- * ## Why the nesting is tenant-scope OUTSIDE, BEGIN/COMMIT INSIDE
- *
- * The earlier shape was `withTransaction(() => withTenantContext(() =>
- * withActorContext(work)))`. That looks right and is subtly wrong:
- * `withTenantContext` DELETES the per-backend tenant binding in its
- * cleanup, which runs when the callback returns — i.e. BEFORE the outer
- * `withTransaction` issues COMMIT. The actor nonce (`set_config(...,
- * true)`) is transaction-local and survives to COMMIT, but
- * `kms_current_actor_context()` requires `current_tenant_id()` too, so at
- * COMMIT time nothing could re-validate authority.
- *
- * The code worked around that by forcing the DEFERRABLE evidence trigger
- * `crisis_care_evidence` IMMEDIATE while the bindings were still in scope.
- * That drains the trigger queue, so the actual COMMIT ran with NO authority
- * check at all. Between the last `assertPatient` and COMMIT the nonce can
- * expire — `kms_current_actor_context()` compares against
- * `clock_timestamp()`, not the frozen `NOW()` — and the admission was
- * committed under expired authority. Reproduced by the clinical v1 review.
- *
- * Inverting the nesting fixes the root cause instead of the symptom: the
- * tenant binding is set on the connection, BEGIN…COMMIT run inside that
- * scope, and cleanup follows COMMIT. Both bindings are live when the
- * deferred trigger fires, so `crisis_care_require_evidence()` —
- * which calls `crisis_care_live_patient()` first and last — becomes a
- * genuine COMMIT-time authority gate. An expired nonce now raises PT401
- * from the COMMIT statement and the transaction rolls back.
- *
- * The IMMEDIATE forcing is therefore removed on purpose. Re-adding it
- * would reopen the window. The two app-side `assertPatient` calls stay
- * for fail-fast; they are no longer the last word.
+ * Bound on the post-COMMIT `clear_tenant_context()` DELETE, which runs
+ * outside the transaction and therefore outside its `SET LOCAL` timeouts.
+ * A concurrent lock on `_session_tenant_context` could otherwise hold the
+ * connection indefinitely after an acknowledged commit. (Codex round 4.)
  */
-function patientTransaction<T>(
+const CLEANUP_DEADLINE_MS = 2_000;
+
+/**
+ * A connection this module may dispose of. Pool clients expose `release`;
+ * the test-only caller-owned connection may not, in which case the caller
+ * owns disposal too.
+ */
+interface RecordingClient extends DbClient {
+  release?: (destroy?: boolean) => void;
+}
+
+/** Transaction outcome, captured the instant COMMIT resolves or rejects. */
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+let nextDiscardSignalAt = -Infinity;
+function signalRecordingClientDiscarded(): void {
+  if (performance.now() < nextDiscardSignalAt) return;
+  nextDiscardSignalAt = performance.now() + 60_000;
+  try {
+    logger.error(
+      { event: 'crisis.recording_connection.discarded' },
+      'Crisis recording connection discarded: tenant cleanup did not complete within its bound',
+    );
+  } catch {
+    // Never let a logger failure replace the patient safety response.
+  }
+}
+
+/**
+ * Acquire the connection the admission will record on.
+ *
+ * Owned path: a raw pool client with the tenant binding set here, so this
+ * module — not a shared wrapper — controls when it is returned or
+ * DISCARDED. That ownership is the point: on a stalled COMMIT the only safe
+ * remedy is to destroy this exact socket. Signalling the backend by pid
+ * from another connection was rejected in review because, under pool
+ * saturation, the cancel can be delayed until after this client has been
+ * released and re-borrowed by an unrelated request — same role, so
+ * `pg_cancel_backend` would abort another tenant's transaction.
+ *
+ * Caller-owned path (test-only): the caller sets the tenant binding and
+ * owns disposal; refused outside test.
+ */
+async function acquireRecordingClient(
+  ctx: PatientCareAdmissionContext,
+): Promise<{ client: RecordingClient; owned: boolean }> {
+  if (ctx.connection !== undefined) {
+    if (process.env['NODE_ENV'] !== 'test') {
+      throw new Error('patientTransaction: a caller-owned connection is test-only');
+    }
+    return { client: ctx.connection, owned: false };
+  }
+  const client = (await getPool().connect()) as unknown as RecordingClient;
+  try {
+    await client.query('SELECT set_tenant_context($1)', [ctx.tenant.tenantId]);
+  } catch (error) {
+    // I-023: never return a client to the pool in an unknown binding state.
+    client.release?.(true);
+    throw error;
+  }
+  return { client, owned: true };
+}
+
+/**
+ * Consumed background work: clear the tenant binding, then return the
+ * client — or discard it if the clear cannot finish inside its bound.
+ * Never awaited by the caller, so cleanup can never delay the patient
+ * response. I-023 is preserved either way: the binding is cleared, or the
+ * backend that held it is destroyed.
+ */
+function finalizeRecordingClient(
+  client: RecordingClient,
+  owned: boolean,
+  run: Promise<unknown>,
+): void {
+  const settledRun = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  if (!owned) return;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const bound = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('cleanup_deadline')), CLEANUP_DEADLINE_MS);
+  });
+  void Promise.race([settledRun.then(() => client.query('SELECT clear_tenant_context()')), bound])
+    .then(
+      () => client.release?.(),
+      () => {
+        client.release?.(true);
+        signalRecordingClientDiscarded();
+      },
+    )
+    .finally(() => {
+      if (timer !== null) clearTimeout(timer);
+    });
+}
+
+function mapUnauthenticated(error: unknown): unknown {
+  if ((error as { code?: unknown } | null)?.code === 'PT401')
+    return Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401', statusCode: 401 });
+  return error;
+}
+
+async function patientTransaction<T>(
   ctx: PatientCareAdmissionContext,
   work: (tx: DbTransaction) => Promise<T>,
   beforeCommit: () => void = () => undefined,
 ): Promise<T> {
-  if (ctx.connection !== undefined && process.env['NODE_ENV'] !== 'test') {
-    throw new Error('patientTransaction: a caller-owned connection is test-only');
-  }
+  const { client, owned } = await acquireRecordingClient(ctx);
+
   // The transaction's outcome is SETTLED the moment COMMIT resolves or
-  // rejects. Everything that happens afterwards on the connection — the
-  // wrapper's clear_tenant_context cleanup, pool release — is bookkeeping
-  // and must not be allowed to rewrite that outcome. Without this capture,
-  // a cleanup failure after a successful COMMIT surfaced as a generic error
-  // with no SQLSTATE, so an acknowledged admission was reported
-  // `unconfirmed`; and a PT401 raised by COMMIT followed by a cleanup
-  // failure became an AggregateError with no code, replacing the required
-  // 401. (Codex review of PR #302, reproduced by fault injection.)
-  let settled: { ok: true; value: T } | { ok: false; error: unknown } | null = null;
-  let backendPid: number | null = null;
+  // rejects. Everything afterwards — tenant cleanup, pool release — is
+  // bookkeeping and must not be allowed to rewrite that outcome or delay
+  // its delivery. (Codex rounds 2 and 4 on PR #302.)
+  let settled: Settled<T> | null = null;
 
   // Armed only when COMMIT is issued, so it bounds nothing else.
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
@@ -210,78 +274,59 @@ function patientTransaction<T>(
     };
   });
 
-  const transaction = withTenantBoundConnection(
-    ctx.tenant.tenantId,
-    async (client) => {
-      await client.query('BEGIN');
-      try {
-        // Captured so a stalled COMMIT can be cancelled from another
-        // connection; DbClient exposes no way to destroy this socket.
-        const pidRow = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
-        backendPid = pidRow.rows[0]?.pid ?? null;
-        const result = await withActorContext(client, ctx.actorNonce, async () => {
-          await client.query("SET LOCAL statement_timeout='5s'");
-          await client.query("SET LOCAL lock_timeout='2s'");
-          await assertPatient(client, ctx);
-          const result = await work(client);
-          await assertPatient(client, ctx);
-          return result;
-        });
-        beforeCommit();
-        armDeadline();
-        // The deferred `crisis_care_evidence` trigger fires HERE, with the
-        // tenant and actor bindings both still in scope.
-        await client.query('COMMIT');
-        settled = { ok: true, value: result };
+  const run = (async () => {
+    await client.query('BEGIN');
+    try {
+      const result = await withActorContext(client, ctx.actorNonce, async () => {
+        await client.query("SET LOCAL statement_timeout='5s'");
+        await client.query("SET LOCAL lock_timeout='2s'");
+        await assertPatient(client, ctx);
+        const result = await work(client);
+        await assertPatient(client, ctx);
         return result;
-      } catch (error) {
-        settled = { ok: false, error };
-        await client.query('ROLLBACK').catch(() => undefined);
-        throw error;
-      } finally {
-        if (deadlineTimer !== null) clearTimeout(deadlineTimer);
-      }
-    },
-    ctx.connection,
-  );
-
-  return Promise.race([transaction, deadline])
-    .then(
-      (value) => (settled?.ok ? settled.value : value),
-      async (error: unknown) => {
-        // Prefer the settled transaction outcome over whatever the wrapper
-        // threw during cleanup. If COMMIT succeeded, the admission stands.
-        if (settled?.ok) return settled.value;
-        if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') {
-          // The COMMIT is still in flight on the recording connection. Do
-          // NOT wait for it — the patient's safety-resource response must
-          // not depend on server-side COMMIT work that statement_timeout
-          // cannot bound. Let the wrapper finish in the background (it
-          // will return or discard the connection), and cancel the backend
-          // best-effort so the connection frees promptly. The outcome is
-          // genuinely unknown at this moment, which the caller reports as
-          // `unconfirmed`; the cancel may land before or after the commit
-          // record, so it must never be read as evidence either way.
-          transaction.catch(() => undefined);
-          if (backendPid !== null) {
-            const pid = backendPid;
-            await withConnection((c) => c.query('SELECT pg_cancel_backend($1)', [pid])).catch(
-              () => undefined,
-            );
-          }
-          throw error;
-        }
-        throw settled && !settled.ok ? settled.error : error;
-      },
-    )
-    .catch((error: unknown) => {
-      if ((error as { code?: unknown } | null)?.code === 'PT401')
-        throw Object.assign(new Error('crisis_unauthenticated'), {
-          code: 'PT401',
-          statusCode: 401,
-        });
+      });
+      beforeCommit();
+      armDeadline();
+      // The deferred `crisis_care_evidence` trigger fires HERE, with the
+      // tenant and actor bindings both still in scope.
+      await client.query('COMMIT');
+      settled = { ok: true, value: result };
+      return result;
+    } catch (error) {
+      settled = { ok: false, error };
+      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
-    });
+    } finally {
+      if (deadlineTimer !== null) clearTimeout(deadlineTimer);
+    }
+  })();
+
+  try {
+    const value = await Promise.race([run, deadline]);
+    finalizeRecordingClient(client, owned, run);
+    // `settled` is assigned inside the closure above; read it through a
+    // widened alias so control-flow narrowing does not freeze it at null.
+    const outcome = settled as Settled<T> | null;
+    return outcome?.ok ? outcome.value : value;
+  } catch (error) {
+    const outcome = settled as Settled<T> | null;
+    if (outcome?.ok) {
+      finalizeRecordingClient(client, owned, run);
+      return outcome.value;
+    }
+    if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') {
+      // The COMMIT is still in flight. Do not wait for it, and do not
+      // signal any backend: destroy THIS socket so it can never be handed
+      // to another request mid-COMMIT, and let the server resolve the
+      // transaction on disconnect. The outcome is genuinely unknown at this
+      // moment — the caller reports `unconfirmed`, never `not_recorded`.
+      run.catch(() => undefined);
+      if (owned) client.release?.(true);
+      throw error;
+    }
+    finalizeRecordingClient(client, owned, run);
+    throw mapUnauthenticated(outcome && !outcome.ok ? outcome.error : error);
+  }
 }
 
 /**

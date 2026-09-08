@@ -298,11 +298,12 @@ describe('crisis admission — authority is enforced at the actual COMMIT', () =
  * that sleeps 8 s on `crisis_care_admission`, so the COMMIT genuinely stalls
  * inside the server — the exact scenario, not a simulation.
  *
- * The recording connection here is the superuser pool, which the app pool's
- * role is not permitted to `pg_cancel_backend`. The best-effort cancel is
- * therefore denied and swallowed, the server finishes the sleep, and the
- * COMMIT lands. That is precisely why the app must report `unconfirmed` and
- * never `not_recorded`: the admission DID persist after the response.
+ * On deadline the app disposes of ITS OWN connection; it never signals a
+ * backend by pid (a delayed cancel could hit a re-borrowed client). The
+ * connection here is caller-owned by the test, whose `release` is a no-op,
+ * so the server finishes the sleep and the COMMIT lands. That is precisely
+ * why the app must report `unconfirmed` and never `not_recorded`: the
+ * admission DID persist after the response.
  */
 describe('crisis admission — a slow deferred trigger cannot stall the patient response', () => {
   const SLOW_TRIGGER = 'zz_test_slow_deferred_commit';
