@@ -138,7 +138,7 @@ import { PII_PATTERNS } from './patterns.js';
  * carries the pattern label so an operator reading the log knows WHAT
  * was scrubbed without seeing the value.
  */
-function redactionToken(label: string): string {
+export function redactionToken(label: string): string {
   return `[REDACTED:${label}]`;
 }
 

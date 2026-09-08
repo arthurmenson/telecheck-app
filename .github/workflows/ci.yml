@@ -204,6 +204,9 @@ jobs:
       - name: Verify atomic migrations and history integrity (PostgreSQL)
         run: npm run test:migrations
 
+      - name: Layer 5 backup redaction (pii-scrub CLI + wrapper, stubbed pg_dump/age)
+        run: npm run test:scripts
+
       - name: Verify Forms publication with actual application and binder roles
         env:
           PGPASSWORD: telecheck_ci

@@ -38,7 +38,10 @@
     "migrate:diff": "echo 'TODO: wire prisma migrate diff against current schema'",
     "prepare": "echo 'TODO: husky install once first slice begins'",
     "ner:setup": "node scripts/setup-ner-model.mjs",
-    "ner:verify": "node scripts/verify-ner-model.mjs"
+    "ner:verify": "node scripts/verify-ner-model.mjs",
+    "pii:scrub": "node --import tsx scripts/pii-scrub.mjs",
+    "backup:redacted": "bash scripts/backup-redacted.sh",
+    "test:scripts": "node --test scripts/pii-scrub.test.mjs scripts/backup-redacted.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-kms": "3.1127.0",
