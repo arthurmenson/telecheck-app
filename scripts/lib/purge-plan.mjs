@@ -61,6 +61,21 @@ export function validateClassification(map) {
       }
     }
   }
+  // Stored derived relations: every materialized view must be classified too;
+  // an allowlist view is REFRESHed inside the purge transaction (Codex R3).
+  const mvs = map.materializedViews ?? {};
+  for (const name of Object.keys(mvs)) {
+    if (!IDENT.test(name))
+      throw new Error(`classification: invalid materialized view name ${JSON.stringify(name)}`);
+    const entry = mvs[name];
+    if (!entry || !['allowlist', 'preserved'].includes(entry.class)) {
+      throw new Error(`classification: materialized view ${name} must be allowlist or preserved`);
+    }
+    if (map.tables[name])
+      throw new Error(
+        `classification: ${name} is listed both as a table and as a materialized view`,
+      );
+  }
   // Mixed-baseline safeguard (spec step 5): accounts is NEVER allowlist.
   const accounts = map.tables.accounts;
   if (!accounts || accounts.class !== 'scoped-delete') {
@@ -83,6 +98,13 @@ export function validateClassification(map) {
     if (map.tables[t]?.class !== 'preserved')
       throw new Error(`classification: ${t} MUST be preserved`);
   }
+}
+
+export function matviewsOfClass(map, cls) {
+  const mvs = map.materializedViews ?? {};
+  return Object.keys(mvs)
+    .filter((v) => mvs[v].class === cls)
+    .sort();
 }
 
 export function tablesOfClass(map, cls) {
@@ -133,6 +155,10 @@ export function renderPlan(map, { failAfter = null } = {}) {
     sql += `DELETE FROM public.${t} WHERE ${map.tables[t].predicate};\n`;
   }
   if (failAfter === 'delete') sql += injectedFailure('delete');
+  // Stored projections are refreshed AFTER their sources are purged, inside
+  // the same transaction, so no participant state survives in them.
+  for (const v of matviewsOfClass(map, 'allowlist'))
+    sql += `REFRESH MATERIALIZED VIEW public.${v};\n`;
   // Post-checks: abort (and therefore roll back the attestation too) if any
   // allowlist table still has rows or any scoped predicate still matches.
   sql += 'DO $$\nDECLARE v_n BIGINT;\nBEGIN\n';
@@ -141,6 +167,9 @@ export function renderPlan(map, { failAfter = null } = {}) {
   }
   for (const t of scoped) {
     sql += `  SELECT COUNT(*) INTO v_n FROM public.${t} WHERE ${map.tables[t].predicate};\n  IF v_n <> 0 THEN RAISE EXCEPTION 'pilot-1-env-purge: % ${t} rows still match the scoped predicate', v_n; END IF;\n`;
+  }
+  for (const v of matviewsOfClass(map, 'allowlist')) {
+    sql += `  SELECT COUNT(*) INTO v_n FROM public.${v};\n  IF v_n <> 0 THEN RAISE EXCEPTION 'pilot-1-env-purge: % rows survived in materialized view ${v}', v_n; END IF;\n`;
   }
   for (const t of guarded) {
     sql += `  SELECT COUNT(*) INTO v_n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = '${t}' AND NOT tg.tgisinternal AND tg.tgenabled = 'D';\n  IF v_n <> 0 THEN RAISE EXCEPTION 'pilot-1-env-purge: % user trigger(s) on ${t} still disabled', v_n; END IF;\n`;

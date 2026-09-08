@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "spec": "docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Purge table classification policy — every table in public MUST be classified; new migrations that add tables MUST add their classification here in the same PR (CI schema-drift test).",
   "classes": {
     "allowlist": "participant-only — TRUNCATE (never CASCADE)",
@@ -355,6 +355,12 @@
     "tenants": {
       "class": "preserved",
       "why": "tenant baseline"
+    }
+  },
+  "materializedViews": {
+    "interaction_signal_current_state_mv": {
+      "class": "allowlist",
+      "why": "stored projection of interaction_signal + lifecycle transitions (migration 048): participant state survives a TRUNCATE of its sources until the view is refreshed, so the plan refreshes it inside the attestation transaction and post-checks it is empty (Codex R3)"
     }
   }
 }

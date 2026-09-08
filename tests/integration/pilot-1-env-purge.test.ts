@@ -49,6 +49,7 @@ const AGE_HEADER = 'age-encryption.org/v1';
 
 type Classification = {
   version: number;
+  materializedViews?: Record<string, { class: 'allowlist' | 'preserved' }>;
   tables: Record<
     string,
     { class: 'allowlist' | 'preserved' | 'scoped-delete'; predicate?: string }
@@ -166,7 +167,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
       PILOT_1_ACTOR: 'ci-operator@test',
       PILOT_1_ACTOR_TENANT: TENANT,
       PILOT_1_SKIP_RUNTIME_STEPS: '1',
-      PILOT_1_LOCK_DIR: path.join(lockRoot, 'lifecycle.lock'),
+      PILOT_1_LOCK_FILE: path.join(lockRoot, 'lifecycle.lock'),
       PILOT_1_INCIDENT_LOGS_DIR:
         extraEnv['PILOT_1_INCIDENT_LOGS_DIR'] ?? fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-')),
       ...extraEnv,
@@ -333,6 +334,9 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     cloneSchema(SHARED_DSN, DSN);
     admin = new Client({ connectionString: DSN });
     await admin.connect();
+    // The schema-only clone leaves materialized views unpopulated; populate
+    // the stored projection so the purge's REFRESH + post-check are exercised.
+    await admin.query('REFRESH MATERIALIZED VIEW public.interaction_signal_current_state_mv');
     await admin.query(
       `INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain, country_of_care, kms_key_alias, status, activated_at)
        VALUES ($1, $1, $2, $3, $4, 'US', $5, 'active', NOW()) ON CONFLICT (id) DO NOTHING`,
@@ -359,6 +363,12 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     const live = r.rows.map((x) => x.table_name).sort();
     expect(live.filter((t) => !MAP.tables[t])).toEqual([]);
     expect(Object.keys(MAP.tables).filter((t) => !live.includes(t))).toEqual([]);
+    const mv = await admin.query<{ matviewname: string }>(
+      `SELECT matviewname FROM pg_matviews WHERE schemaname = 'public' ORDER BY matviewname`,
+    );
+    const liveViews = mv.rows.map((x) => x.matviewname).sort();
+    const mappedViews = Object.keys(MAP.materializedViews ?? {}).sort();
+    expect(liveViews).toEqual(mappedViews);
   });
 
   it('FK edges: no preserved table references an allowlist table; preserved → scoped-delete edges only target accounts', async () => {
@@ -485,6 +495,11 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
       expect(await count('accounts', 'WHERE account_id = $1', [id]), id).toBe(1);
     expect(snapshotDir(inc)).toEqual(dirBefore);
     expect(await guardedTriggersDisabled()).toBe(0);
+    const mvState = await admin.query<{ ispopulated: boolean }>(
+      `SELECT ispopulated FROM pg_matviews WHERE schemaname = 'public' AND matviewname = 'interaction_signal_current_state_mv'`,
+    );
+    expect(mvState.rows[0]!.ispopulated).toBe(true);
+    expect(await count('interaction_signal_current_state_mv')).toBe(0);
     const gate = spawnSync(
       bash,
       [...bashArgs, path.join(ROOT, 'scripts', 'verify-pilot-1-baseline.sh')],
@@ -512,7 +527,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     expect(statuses, `${a.stderr}\n${b.stderr}`).toEqual([0, 1]);
     const winner = a.status === 0 ? a : b;
     const loser = a.status === 0 ? b : a;
-    expect(loser.stderr).toMatch(/already attested|another purge lifecycle/);
+    expect(loser.stderr).toMatch(/already attested|another purge lifecycle holds/);
     const won = JSON.parse(winner.stdout) as Record<string, unknown>;
     expect(won).toMatchObject({ mode: 'incident', incidentId: id, artifacts: 1 });
     expect(await count('accounts', 'WHERE account_id = $1', [c.participantPatient])).toBe(0);

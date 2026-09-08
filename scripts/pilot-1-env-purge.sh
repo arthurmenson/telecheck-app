@@ -20,13 +20,15 @@
 #                         recovery ONLY, after exit 4 / 5: re-run the re-seed
 #                         (idempotent) and the runtime steps for a purge whose
 #                         attestation for <uuid> is COMMITTED, provided the
-#                         incident state still matches that attestation. No
-#                         database purge, no new attestation.
+#                         incident state still permits it (an incident
+#                         attestation needs the matching lock; a routine one
+#                         needs the same clean state --routine-reset needs).
 #
-# Every mode holds the LIFECYCLE LOCK (a host-level lock directory) from
-# before the app is stopped until the runtime steps are done, so two
-# invocations can never interleave: the second refuses immediately. A stale
-# lock (its recorded pid is dead) is taken over and reported.
+# Every mode holds the LIFECYCLE LOCK — a kernel lock (flock) on a file that
+# is never unlinked and must lie outside the incident tree — from before the
+# app is stopped until the runtime steps are done, so two invocations can
+# never interleave: the second refuses immediately. The lock dies with the
+# process, so there is no stale-lock recovery and nothing to delete.
 #
 # Purge modes:
 #   1. verify-pilot-1-baseline.sh must be green (no `unclassified` account).
@@ -34,19 +36,22 @@
 #      `env.purge.executed` attestation row PER TENANT (resource tenant =
 #      each purged tenant, actor_tenant_id = the operator's home tenant, all
 #      correlated by an operation id, PLATFORM partition) → the FK-aware plan
-#      rendered from scripts/pilot-1-purge-classification.json → COMMIT. Any
-#      error rolls back everything — including the attestation. If psql fails
-#      WITHOUT a refusal, the outcome is RECONCILED: a fresh session takes the
-#      same advisory lock (so an in-flight COMMIT finishes first; bounded by
+#      rendered from scripts/pilot-1-purge-classification.json (user triggers
+#      disabled only around the TRUNCATE on the two care-intake tables; one
+#      TRUNCATE ... RESTRICT; scoped DELETEs with accounts last; stored
+#      projections REFRESHed; post-checks) → COMMIT. Any error rolls back
+#      everything — including the attestation. If psql fails WITHOUT a
+#      refusal, the outcome is RECONCILED: a fresh session takes the same
+#      advisory lock (so an in-flight COMMIT finishes first; bounded by
 #      lock_timeout) and looks the operation id up: found → committed, the
 #      run continues; absent → rolled back (exit 3); lookup impossible →
 #      exit 5 with the app left stopped (outcome unknown).
 #   3. Re-seed the synthetic baseline (scripts/pilot-1-baseline-seed.sql) in a
 #      separate transaction, then the runtime steps: Redis FLUSHALL, Caddy
-#      access-log truncate (configured paths only — the checked-in Caddyfile
-#      writes none), app container REMOVED and RECREATED (its Docker-retained
-#      stdout log goes with it — the app logs to stdout), and a health check
-#      that requires exactly HTTP 200 from every configured URL.
+#      access-log truncate (configured paths only), app container REMOVED and
+#      RECREATED (the app logs to stdout; the Docker-retained log goes with
+#      it), and a health check requiring exactly HTTP 200 from every
+#      configured URL.
 #
 # This script READS the incident directory and never writes, modifies or
 # deletes anything under it (single-writer discipline; CI asserts byte-for-
@@ -66,21 +71,20 @@
 # Environment:
 #   PILOT_1_DATABASE_URL         operator DSN (defaults to $DATABASE_URL); a
 #                                cross-tenant role with BYPASSRLS / superuser
-#   PILOT_1_PSQL / PILOT_1_NODE / PILOT_1_CURL   binaries (psql / node / curl)
+#   PILOT_1_PSQL / PILOT_1_NODE / PILOT_1_CURL / PILOT_1_FLOCK   binaries
 #   PILOT_1_ACTOR                actor id ([A-Za-z0-9._@+-]{1,120}; default <user>@<host>)
 #   PILOT_1_ACTOR_TENANT         operator's home tenant (required for purge modes)
 #   PILOT_1_INCIDENT_LOGS_DIR    default /home/deploy/incident-logs
-#   PILOT_1_LOCK_DIR             lifecycle lock directory (default /var/tmp/pilot-1-env-purge.lock)
+#   PILOT_1_LOCK_FILE            lifecycle lock file (default /var/tmp/pilot-1-env-purge.lock;
+#                                must not be inside the incident directory)
 #   PILOT_1_COMPOSE              compose command (default "docker compose")
-#   PILOT_1_CADDY_LOG_PATHS      space-separated in-container Caddy log files to
-#                                truncate (default: none)
+#   PILOT_1_CADDY_LOG_PATHS      space-separated in-container Caddy log files to truncate
 #   PILOT_1_HEALTH_URLS          space-separated URLs that must return exactly
 #                                HTTP 200 after the restart — REQUIRED unless
 #                                runtime steps are skipped
 #   PILOT_1_SKIP_RUNTIME_STEPS   =1 skips every docker-compose step and the
 #                                health check (CI / tests)
-#   PILOT_1_TEST_FAIL_AFTER      TEST HOOK: audit-insert|audit|truncate|delete —
-#                                injects a failure inside the purge transaction
+#   PILOT_1_TEST_FAIL_AFTER      TEST HOOK: audit-insert|audit|truncate|delete
 #
 # Options: --routine-reset | --incident-id <id> | --finish-runtime --operation-id <uuid> ; --json ; --help
 
@@ -91,10 +95,11 @@ DSN="${PILOT_1_DATABASE_URL:-${DATABASE_URL:-}}"
 PSQL="${PILOT_1_PSQL:-psql}"
 NODE="${PILOT_1_NODE:-node}"
 CURL="${PILOT_1_CURL:-curl}"
+FLOCK="${PILOT_1_FLOCK:-flock}"
 ACTOR="${PILOT_1_ACTOR:-}"
 ACTOR_TENANT="${PILOT_1_ACTOR_TENANT:-}"
 INCIDENT_DIR="${PILOT_1_INCIDENT_LOGS_DIR:-/home/deploy/incident-logs}"
-LOCK_DIR="${PILOT_1_LOCK_DIR:-/var/tmp/pilot-1-env-purge.lock}"
+LOCK_FILE="${PILOT_1_LOCK_FILE:-/var/tmp/pilot-1-env-purge.lock}"
 COMPOSE="${PILOT_1_COMPOSE:-docker compose}"
 CADDY_LOGS="${PILOT_1_CADDY_LOG_PATHS:-}"
 HEALTH_URLS="${PILOT_1_HEALTH_URLS:-}"
@@ -105,7 +110,6 @@ INCIDENT_ID=""
 OP_ID=""
 FORMAT="human"
 APP_STOPPED=0
-LOCK_OWNED=0
 
 usage() { sed -n '2,90p' "$0" | sed 's/^# \{0,1\}//'; }
 set_mode() { [ -z "${MODE}" ] || { echo "ERROR: --routine-reset, --incident-id and --finish-runtime are mutually exclusive" >&2; exit 2; }; MODE="$1"; }
@@ -149,34 +153,28 @@ fi
 for f in "${HERE}/lib/purge-plan.mjs" "${HERE}/lib/incident-manifest.mjs" "${HERE}/verify-pilot-1-baseline.sh" "${HERE}/pilot-1-baseline-seed.sql" "${HERE}/pilot-1-purge-classification.json"; do
     [ -r "$f" ] || { echo "ERROR: required file missing: $f" >&2; exit 2; }
 done
+command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is required for the lifecycle lock (PILOT_1_FLOCK='${FLOCK}' not found)" >&2; exit 2; }
+# The lock file is a WRITE; it must never be inside the incident tree
+# (single-writer discipline) and must not be the incident directory itself.
+if ! "${NODE}" -e '
+const p = require("node:path");
+const [lock, inc] = process.argv.slice(1).map((x) => p.resolve(x));
+const rel = p.relative(inc, lock);
+const inside = lock === inc || (rel !== "" && !rel.startsWith("..") && !p.isAbsolute(rel));
+process.exit(inside ? 1 : 0);
+' "${LOCK_FILE}" "${INCIDENT_DIR}"; then
+    echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) must not be inside the incident directory (${INCIDENT_DIR})" >&2; exit 2
+fi
 
 TMP="$(mktemp -d)"
-cleanup() {
-    rm -rf "${TMP}"
-    if [ "${LOCK_OWNED}" = "1" ]; then rm -rf "${LOCK_DIR}"; fi
-}
-trap cleanup EXIT
+trap 'rm -rf "${TMP}"' EXIT
 
-# --- lifecycle lock: from before the app is stopped until the runtime steps end
-take_lifecycle_lock() {
-    if mkdir "${LOCK_DIR}" 2>/dev/null; then
-        echo "$$" > "${LOCK_DIR}/pid"; LOCK_OWNED=1; return 0
-    fi
-    local pid
-    pid="$(cat "${LOCK_DIR}/pid" 2>/dev/null || echo '')"
-    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-        echo "REFUSED: another purge lifecycle (pid ${pid}) holds ${LOCK_DIR}; wait for it to finish (nothing written)" >&2
-        exit 1
-    fi
-    echo "WARNING: stale lifecycle lock at ${LOCK_DIR} (pid '${pid}' is not running) — taking it over" >&2
-    rm -rf "${LOCK_DIR}"
-    if mkdir "${LOCK_DIR}" 2>/dev/null; then
-        echo "$$" > "${LOCK_DIR}/pid"; LOCK_OWNED=1; return 0
-    fi
-    echo "REFUSED: could not take the lifecycle lock at ${LOCK_DIR} (nothing written)" >&2
+# --- lifecycle lock: kernel-managed, held on fd 9 until the process exits -----
+exec 9>>"${LOCK_FILE}" || { echo "ERROR: cannot open the lifecycle lock file ${LOCK_FILE}" >&2; exit 2; }
+if ! "${FLOCK}" -n 9; then
+    echo "REFUSED: another purge lifecycle holds ${LOCK_FILE}; wait for it to finish (nothing written)" >&2
     exit 1
-}
-take_lifecycle_lock
+fi
 
 runtime_post_steps() {
     # Runs after a COMMITTED purge (or in --finish-runtime). Any failure exits 4:
@@ -215,9 +213,9 @@ restart_app_if_stopped() {
     [ "${APP_STOPPED}" = "1" ] && [ "${SKIP_RUNTIME}" != "1" ] && ${COMPOSE} start app >/dev/null 2>&1 || true
 }
 
-# --- recovery mode: bound to a COMMITTED attestation + consistent incident state
+# --- recovery mode: bound to a COMMITTED attestation + permitted incident state
 if [ "${MODE}" = "finish-runtime" ]; then
-    ATT="$("${PSQL}" --dbname="${DSN}" -X -A -t -v ON_ERROR_STOP=1 -v op="${OP_ID}" <<'SQL'
+    ATT="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v op="${OP_ID}" <<'SQL'
 SELECT payload->>'mode' || '|' || COALESCE(payload->>'incidentId', '')
   FROM audit_records WHERE action = 'env.purge.executed' AND payload->>'operationId' = :'op'
  ORDER BY recorded_at LIMIT 1;
@@ -226,13 +224,18 @@ SQL
     [ -n "${ATT}" ] || { echo "REFUSED: no committed env.purge.executed attestation for operation ${OP_ID}; recovery only completes a purge that committed (nothing written)" >&2; exit 1; }
     IFS='|' read -r ATT_MODE ATT_INCIDENT <<< "${ATT}"
     [ -d "${INCIDENT_DIR}" ] || { echo "REFUSED: incident-logs directory not found or not a directory: ${INCIDENT_DIR}" >&2; exit 1; }
-    LOCKSTATE="$("${NODE}" "${HERE}/lib/incident-manifest.mjs" lock-state --dir "${INCIDENT_DIR}")" || { echo "REFUSED: incident lock cannot be inspected: ${LOCKSTATE}" >&2; exit 1; }
-    LOCK_PRESENT="$(printf '%s' "${LOCKSTATE}" | sed -n 's/.*"present":\(true\|false\).*/\1/p')"
-    LOCK_INCIDENT="$(printf '%s' "${LOCKSTATE}" | sed -n 's/.*"incidentId":"\([^"]*\)".*/\1/p')"
     if [ "${ATT_MODE}" = "incident" ]; then
+        LOCKSTATE="$("${NODE}" "${HERE}/lib/incident-manifest.mjs" lock-state --dir "${INCIDENT_DIR}")" || { echo "REFUSED: incident lock cannot be inspected: ${LOCKSTATE}" >&2; exit 1; }
+        LOCK_PRESENT="$(printf '%s' "${LOCKSTATE}" | sed -n 's/.*"present":\(true\|false\).*/\1/p')"
+        LOCK_INCIDENT="$(printf '%s' "${LOCKSTATE}" | sed -n 's/.*"incidentId":"\([^"]*\)".*/\1/p')"
         [ "${LOCK_PRESENT}" = "true" ] && [ "${LOCK_INCIDENT}" = "${ATT_INCIDENT}" ] || { echo "REFUSED: operation ${OP_ID} purged incident ${ATT_INCIDENT} but the current incident lock is $( [ "${LOCK_PRESENT}" = "true" ] && echo "for '${LOCK_INCIDENT}'" || echo "absent" ); the incident state no longer matches (nothing written)" >&2; exit 1; }
     else
-        [ "${LOCK_PRESENT}" != "true" ] || { echo "REFUSED: operation ${OP_ID} was a routine-reset but an incident lock (${LOCK_INCIDENT}) is now present; dispose of the incident first (nothing written)" >&2; exit 1; }
+        # A routine attestation may only be completed in the state a routine
+        # reset itself requires: no lock, no unconsumed manifest, directory
+        # inspectable (Codex R3).
+        if ! BLOCK="$("${NODE}" "${HERE}/lib/incident-manifest.mjs" routine-blockers --dir "${INCIDENT_DIR}")"; then
+            echo "REFUSED: operation ${OP_ID} was a routine-reset but incident state now blocks routine work under ${INCIDENT_DIR}: ${BLOCK} (nothing written)" >&2; exit 1
+        fi
     fi
     reseed
     runtime_post_steps
@@ -245,7 +248,7 @@ SQL
 fi
 
 # --- step A: operator capability + actor tenant (read-only) -------------------
-CAP="$("${PSQL}" --dbname="${DSN}" -X -A -t -v ON_ERROR_STOP=1 -v actor_tenant="${ACTOR_TENANT}" <<'SQL'
+CAP="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v actor_tenant="${ACTOR_TENANT}" <<'SQL'
 SELECT (SELECT CASE WHEN rolsuper OR rolbypassrls THEN 't' ELSE 'f' END FROM pg_roles WHERE rolname = current_user)
        || '|' || (SELECT CASE WHEN EXISTS (SELECT 1 FROM tenants WHERE id = :'actor_tenant') THEN 't' ELSE 'f' END)
        || '|' || (SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = 'cohort_classification');
@@ -286,7 +289,7 @@ fi
 
 # --- step D: single-use attestation (incident mode; re-checked under the lock) --
 if [ "${MODE}" = "incident" ]; then
-    PRIOR="$("${PSQL}" --dbname="${DSN}" -X -A -t -v ON_ERROR_STOP=1 -v iid="${INCIDENT_ID}" <<'SQL'
+    PRIOR="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v iid="${INCIDENT_ID}" <<'SQL'
 SELECT COUNT(*) FROM audit_records WHERE action = 'env.purge.executed' AND payload->>'incidentId' = :'iid';
 SQL
 )" || { echo "ERROR: could not read prior attestations" >&2; exit 3; }
@@ -426,19 +429,21 @@ if [ "${STATUS}" -ne 0 ]; then
     # Not a refusal: rollback OR a lost COMMIT acknowledgement. Reconcile
     # under the SAME advisory lock — a still-running COMMIT holds it, so the
     # lookup waits for it (bounded by lock_timeout) and then reads a settled
-    # state (Codex R2). If the lock cannot be taken, the outcome stays UNKNOWN.
+    # state (Codex R2). -q suppresses command tags so only the count is read
+    # (Codex R3); anything non-numeric leaves the outcome UNKNOWN.
     set +e
-    FOUND="$("${PSQL}" --dbname="${DSN}" -X -A -t -v ON_ERROR_STOP=1 -v op="${OP_ID}" <<'SQL' | tail -1
+    RECON_OUT="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v op="${OP_ID}" <<'SQL'
 SET lock_timeout = '60s';
 BEGIN;
 SELECT pg_advisory_xact_lock(hashtext('pilot-1-env-purge'));
-SELECT COUNT(*) FROM audit_records WHERE action = 'env.purge.executed' AND payload->>'operationId' = :'op';
+SELECT 'ATTESTED=' || COUNT(*) FROM audit_records WHERE action = 'env.purge.executed' AND payload->>'operationId' = :'op';
 COMMIT;
 SQL
 )"
     RSTATUS=$?
     set -e
-    if [ "${RSTATUS}" -ne 0 ] || ! [[ "${FOUND}" =~ ^[0-9]+$ ]]; then
+    FOUND="$(printf '%s\n' "${RECON_OUT}" | sed -n 's/^ATTESTED=\([0-9][0-9]*\)$/\1/p' | tail -1)"
+    if [ "${RSTATUS}" -ne 0 ] || [ -z "${FOUND}" ]; then
         echo "ERROR: outcome UNKNOWN — the purge transaction failed and its result could not be reconciled under the purge lock for operation ${OP_ID}:" >&2
         sed 's/^/    /' "${ERR}" >&2
         echo "       The app is left STOPPED. Inspect audit_records for payload->>'operationId' = '${OP_ID}'; if attested, run --finish-runtime --operation-id ${OP_ID}; otherwise re-run the purge." >&2
