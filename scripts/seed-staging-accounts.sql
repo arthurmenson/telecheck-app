@@ -17,6 +17,11 @@
 --   01JZZZ00000000000000000P02  patient    (Staging Patient GH)
 --   01JZZZ00000000000000000C02  clinician  (Staging Clinician GH)
 --
+-- Every account row names cohort_classification = 'baseline' explicitly:
+-- these are E2E smoke fixtures, not Pilot 1 participants, so env-purge must
+-- preserve them (PII spec §Three-state cohort classification; CI test 4
+-- requires the classification in the same INSERT — scripts/pilot-1-remediation.test.mjs).
+--
 -- ULIDs use only Crockford base32 characters (no I, L, O, U) and are 26
 -- chars, matching the platform VARCHAR(26) identity shape.
 
@@ -24,42 +29,42 @@ INSERT INTO accounts (
     account_id, tenant_id, phone_e164, email,
     first_name, last_name, date_of_birth, gender,
     country_of_residence, country_of_care, locale,
-    account_type, status, activated_at
+    account_type, status, activated_at, cohort_classification
 ) VALUES
     (
         '01JZZZ00000000000000000P01', 'Telecheck-US', '+15550100001',
         'staging-patient@example.invalid',
         'Staging', 'Patient', DATE '1990-01-01', 'prefer_not_to_say',
         'US', 'US', 'en-US',
-        'patient', 'active', NOW()
+        'patient', 'active', NOW(), 'baseline'
     ),
     (
         '01JZZZ00000000000000000C01', 'Telecheck-US', '+15550100002',
         'staging-clinician@example.invalid',
         'Staging', 'Clinician', DATE '1985-01-01', 'prefer_not_to_say',
         'US', 'US', 'en-US',
-        'clinician', 'active', NOW()
+        'clinician', 'active', NOW(), 'baseline'
     ),
     (
         '01JZZZ00000000000000000A02', 'Telecheck-US', '+15550100003',
         'staging-platform-admin@example.invalid',
         'Staging', 'Platform Admin', DATE '1980-01-01', 'prefer_not_to_say',
         'US', 'US', 'en-US',
-        'platform_admin', 'active', NOW()
+        'platform_admin', 'active', NOW(), 'baseline'
     ),
     (
         '01JZZZ00000000000000000P02', 'Telecheck-Ghana', '+233550100001',
         'staging-patient-gh@example.invalid',
         'Staging', 'Patient GH', DATE '1990-01-01', 'prefer_not_to_say',
         'GH', 'GH', 'en-GH',
-        'patient', 'active', NOW()
+        'patient', 'active', NOW(), 'baseline'
     ),
     (
         '01JZZZ00000000000000000C02', 'Telecheck-Ghana', '+233550100002',
         'staging-clinician-gh@example.invalid',
         'Staging', 'Clinician GH', DATE '1985-01-01', 'prefer_not_to_say',
         'GH', 'GH', 'en-GH',
-        'clinician', 'active', NOW()
+        'clinician', 'active', NOW(), 'baseline'
     )
 ON CONFLICT (account_id) DO NOTHING;
 
