@@ -91,7 +91,7 @@ test('remediation: usage errors exit 2 before psql is ever invoked', () => {
 
 test('remediation: the state lookup goes through stdin with psql variables, never -c', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
-  const stub = mkStub(dir, { state: 't|Telecheck-US|patient|US|unclassified\n' });
+  const stub = mkStub(dir, { state: 't|t|Telecheck-US|patient|US|unclassified|active\n' });
   const r = run(dir, stub, good);
   assert.equal(r.status, 0, r.stderr);
   const lookup = fs.readFileSync(path.join(dir, 'lookup.sql'), 'utf8');
@@ -109,23 +109,35 @@ test('remediation: unknown actor tenant exits 2; unknown / already-classified / 
   const badTenant = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
   const rt = run(
     badTenant,
-    mkStub(badTenant, { state: 'f|Telecheck-US|patient|US|unclassified\n' }),
+    mkStub(badTenant, { state: 'f|t|Telecheck-US|patient|US|unclassified|active\n' }),
     good,
   );
   assert.equal(rt.status, 2, rt.stderr);
   assert.match(rt.stderr, /actor tenant 'Telecheck-US' does not exist/);
   assert.ok(!fs.existsSync(path.join(badTenant, 'tx.sql')));
   for (const [state, args, expect] of [
-    ['t|\n', good, /not found/],
-    ['t|Telecheck-US|patient|US|baseline\n', good, /already classified as 'baseline'/],
-    ['t|Telecheck-US|patient|US|participant\n', good, /already classified as 'participant'/],
+    ['t|t|\n', good, /not found/],
+    ['t|t|Telecheck-US|patient|US|baseline|active\n', good, /already classified as 'baseline'/],
     [
-      't|Telecheck-US|clinician|US|unclassified\n',
+      't|t|Telecheck-US|patient|US|participant|active\n',
+      good,
+      /already classified as 'participant'/,
+    ],
+    [
+      't|t|Telecheck-US|clinician|US|unclassified|active\n',
       asParticipant,
       /only patient\/delegate accounts can be classified as 'participant'/,
     ],
-    ['t|Telecheck-US|tenant_admin|US|unclassified\n', asParticipant, /only patient\/delegate/],
-    ['t|Telecheck-US|platform_admin|US|unclassified\n', asParticipant, /only patient\/delegate/],
+    [
+      't|t|Telecheck-US|tenant_admin|US|unclassified|active\n',
+      asParticipant,
+      /only patient\/delegate/,
+    ],
+    [
+      't|t|Telecheck-US|platform_admin|US|unclassified|active\n',
+      asParticipant,
+      /only patient\/delegate/,
+    ],
   ]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
     const stub = mkStub(dir, { state });
@@ -139,8 +151,8 @@ test('remediation: unknown actor tenant exits 2; unknown / already-classified / 
   }
   // Staff CAN be classified baseline; a delegate CAN be a participant.
   for (const [state, args] of [
-    ['t|Telecheck-US|clinician|US|unclassified\n', good],
-    ['t|Telecheck-Ghana|delegate|GH|unclassified\n', asParticipant],
+    ['t|t|Telecheck-US|clinician|US|unclassified|active\n', good],
+    ['t|t|Telecheck-Ghana|delegate|GH|unclassified|active\n', asParticipant],
   ]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
     const r = run(dir, mkStub(dir, { state }), args);
@@ -150,7 +162,7 @@ test('remediation: unknown actor tenant exits 2; unknown / already-classified / 
 
 test('remediation: success path binds the TARGET tenant, records the ACTOR tenant, classifies once, attests in the same transaction, prints only JSON', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
-  const stub = mkStub(dir, { state: 't|Telecheck-Ghana|delegate|GH|unclassified\n' });
+  const stub = mkStub(dir, { state: 't|t|Telecheck-Ghana|delegate|GH|unclassified|active\n' });
   const r = run(dir, stub, [...good, '--json']);
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout.trim().split('\n').length, 1, 'stdout must be exactly one JSON line');
@@ -158,6 +170,7 @@ test('remediation: success path binds the TARGET tenant, records the ACTOR tenan
   assert.deepEqual(out, {
     accountId: ULID,
     tenantId: 'Telecheck-Ghana',
+    tenantStatus: 'active',
     accountType: 'delegate',
     classifiedAs: 'baseline',
     actor: 'evans@test-host',
@@ -166,6 +179,7 @@ test('remediation: success path binds the TARGET tenant, records the ACTOR tenan
     auditAction: 'pilot_1.cohort_classification',
   });
   const sql = fs.readFileSync(path.join(dir, 'tx.sql'), 'utf8');
+  const calls = fs.readFileSync(path.join(dir, 'calls.log'), 'utf8');
   assert.match(sql, /^BEGIN;/m);
   assert.match(sql, /set_tenant_context\(:'tenant'\)/);
   assert.match(sql, /FOR UPDATE/);
@@ -174,13 +188,43 @@ test('remediation: success path binds the TARGET tenant, records the ACTOR tenan
   assert.match(sql, /'pilot_1\.cohort_classification'/);
   assert.match(sql, /INSERT INTO audit_records/);
   assert.match(sql, /v_actor_tenant/);
+  assert.match(sql, /CASE WHEN :'bind_context' = 't' THEN set_tenant_context\(:'tenant'\) END/);
+  assert.match(calls, /-v bind_context=t/);
+  assert.match(calls, /-v tenant_status=active/);
   assert.match(sql, /COMMIT;\s*$/);
   assert.ok(sql.indexOf('UPDATE accounts') < sql.indexOf('INSERT INTO audit_records'));
-  const calls = fs.readFileSync(path.join(dir, 'calls.log'), 'utf8');
   assert.match(calls, /-v tenant=Telecheck-Ghana/);
   assert.match(calls, /-v actor_tenant=Telecheck-US/);
   assert.match(calls, /-v cls=baseline/);
   assert.match(calls, /-v actor=evans@test-host/);
+});
+
+test('remediation: an inactive tenant is remediated without binding context when the role bypasses RLS, and refused otherwise', () => {
+  for (const status of ['suspended', 'archived']) {
+    const ok = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
+    const r = run(
+      ok,
+      mkStub(ok, { state: `t|t|Telecheck-Ghana|patient|GH|unclassified|${status}\n` }),
+      [...good, '--json'],
+    );
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).tenantStatus, status);
+    const calls = fs.readFileSync(path.join(ok, 'calls.log'), 'utf8');
+    assert.match(calls, /-v bind_context=f/);
+    assert.match(calls, new RegExp(`-v tenant_status=${status}`));
+    const noBypass = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
+    const refused = run(
+      noBypass,
+      mkStub(noBypass, { state: `t|f|Telecheck-Ghana|patient|GH|unclassified|${status}\n` }),
+      good,
+    );
+    assert.equal(refused.status, 1, refused.stderr);
+    assert.match(refused.stderr, /BYPASSRLS/);
+    assert.ok(
+      !fs.existsSync(path.join(noBypass, 'tx.sql')),
+      'a transaction was started without RLS bypass',
+    );
+  }
 });
 
 test('remediation: a refusal raised inside the transaction maps to exit 1; any other failure to exit 3', () => {
@@ -188,7 +232,7 @@ test('remediation: a refusal raised inside the transaction maps to exit 1; any o
   const r1 = run(
     refused,
     mkStub(refused, {
-      state: 't|Telecheck-US|patient|US|unclassified\n',
+      state: 't|t|Telecheck-US|patient|US|unclassified|active\n',
       txExit: 3,
       txStderr: 'ERROR:  REMEDIATION_REFUSED: account X is already classified as participant\n',
     }),
@@ -200,7 +244,7 @@ test('remediation: a refusal raised inside the transaction maps to exit 1; any o
   const r2 = run(
     failed,
     mkStub(failed, {
-      state: 't|Telecheck-US|patient|US|unclassified\n',
+      state: 't|t|Telecheck-US|patient|US|unclassified|active\n',
       txExit: 3,
       txStderr: 'ERROR:  new row for relation "audit_records" violates check constraint\n',
     }),

@@ -123,12 +123,13 @@ fi
 STATE="$("${PSQL}" "${DSN}" -X -A -t -v ON_ERROR_STOP=1 \
     -v aid="${ACCOUNT_ID}" -v actor_tenant="${ACTOR_TENANT}" <<'SQL'
 SELECT (SELECT CASE WHEN EXISTS (SELECT 1 FROM tenants WHERE id = :'actor_tenant') THEN 't' ELSE 'f' END)
-       || '|' || COALESCE((SELECT tenant_id || '|' || account_type || '|' || country_of_care || '|' || cohort_classification
-                           FROM accounts WHERE account_id = :'aid'), '');
+       || '|' || (SELECT CASE WHEN rolsuper OR rolbypassrls THEN 't' ELSE 'f' END FROM pg_roles WHERE rolname = current_user)
+       || '|' || COALESCE((SELECT a.tenant_id || '|' || a.account_type || '|' || a.country_of_care || '|' || a.cohort_classification || '|' || t.status
+                           FROM accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.account_id = :'aid'), '');
 SQL
 )" || { echo "ERROR: could not read account state" >&2; exit 3; }
 
-IFS='|' read -r ACTOR_TENANT_EXISTS TENANT_ID ACCOUNT_TYPE COUNTRY CURRENT <<< "${STATE}"
+IFS='|' read -r ACTOR_TENANT_EXISTS OPERATOR_BYPASS TENANT_ID ACCOUNT_TYPE COUNTRY CURRENT TENANT_STATUS <<< "${STATE}"
 if [ "${ACTOR_TENANT_EXISTS}" != "t" ]; then
     echo "ERROR: actor tenant '${ACTOR_TENANT}' does not exist (nothing written)" >&2; exit 2
 fi
@@ -139,6 +140,20 @@ if [ "${CURRENT}" != "unclassified" ]; then
     echo "REFUSED: account ${ACCOUNT_ID} is already classified as '${CURRENT}'." >&2
     echo "         Reclassification requires a separate audit-logged decision; this script does not reclassify." >&2
     exit 1
+fi
+# A suspended / archived tenant cannot be bound via set_tenant_context
+# (migration 003 requires status = 'active'), yet verify-pilot-1-baseline.sh
+# counts its unclassified accounts. Remediation there runs WITHOUT binding a
+# tenant context, relying on the operator role's RLS bypass, with explicit
+# tenant predicates on every write and the tenant status on the audit row
+# (Codex R9). Without bypass the gate cannot be cleared this way — refuse.
+BIND_CONTEXT="t"
+if [ "${TENANT_STATUS}" != "active" ]; then
+    BIND_CONTEXT="f"
+    if [ "${OPERATOR_BYPASS}" != "t" ]; then
+        echo "REFUSED: account ${ACCOUNT_ID} belongs to tenant ${TENANT_ID} (status '${TENANT_STATUS}'); remediation there requires an operator role with BYPASSRLS / superuser (current role has neither), or reactivating the tenant (nothing written)" >&2
+        exit 1
+    fi
 fi
 # The ratified three-state model restricts `participant` to patients and
 # delegates; a staff identity classified as participant would become eligible
@@ -158,15 +173,21 @@ trap 'rm -f "${ERR}"' EXIT
 set +e
 "${PSQL}" "${DSN}" -X -q -v ON_ERROR_STOP=1 \
     -v aid="${ACCOUNT_ID}" -v cls="${CLASSIFY_AS}" -v reason="${REASON}" \
-    -v actor="${ACTOR}" -v actor_tenant="${ACTOR_TENANT}" -v tenant="${TENANT_ID}" <<'SQL' >/dev/null 2>"${ERR}"
+    -v actor="${ACTOR}" -v actor_tenant="${ACTOR_TENANT}" -v tenant="${TENANT_ID}" \
+    -v bind_context="${BIND_CONTEXT}" -v tenant_status="${TENANT_STATUS}" <<'SQL' >/dev/null 2>"${ERR}"
 BEGIN;
-SELECT set_tenant_context(:'tenant');
-SELECT set_config('pilot1.account_id',   :'aid',          true),
-       set_config('pilot1.classify_as',  :'cls',          true),
-       set_config('pilot1.reason',       :'reason',       true),
-       set_config('pilot1.actor',        :'actor',        true),
-       set_config('pilot1.actor_tenant', :'actor_tenant', true),
-       set_config('pilot1.tenant',       :'tenant',       true);
+-- Bind the tenant context only for an active tenant (a CASE evaluates only
+-- the taken branch); an inactive tenant is written under RLS bypass with
+-- explicit tenant predicates.
+SELECT CASE WHEN :'bind_context' = 't' THEN set_tenant_context(:'tenant') END;
+SELECT set_config('pilot1.account_id',    :'aid',           true),
+       set_config('pilot1.classify_as',   :'cls',           true),
+       set_config('pilot1.reason',        :'reason',        true),
+       set_config('pilot1.actor',         :'actor',         true),
+       set_config('pilot1.actor_tenant',  :'actor_tenant',  true),
+       set_config('pilot1.tenant',        :'tenant',        true),
+       set_config('pilot1.tenant_status', :'tenant_status', true),
+       set_config('pilot1.bind_context',  :'bind_context',  true);
 DO $$
 DECLARE
     v_id           TEXT := current_setting('pilot1.account_id');
@@ -175,9 +196,20 @@ DECLARE
     v_actor        TEXT := current_setting('pilot1.actor');
     v_actor_tenant TEXT := current_setting('pilot1.actor_tenant');
     v_tenant       TEXT := current_setting('pilot1.tenant');
+    v_tenant_status TEXT := current_setting('pilot1.tenant_status');
+    v_bind         TEXT := current_setting('pilot1.bind_context');
     v_row          RECORD;
     v_n            INTEGER;
 BEGIN
+    -- Re-verify the tenant status under the lock of this transaction and,
+    -- for an inactive tenant, that the role really bypasses RLS (otherwise
+    -- the UPDATE below would silently affect zero rows and be refused).
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tenant AND status = v_tenant_status) THEN
+        RAISE EXCEPTION 'REMEDIATION_REFUSED: tenant % status changed since lookup', v_tenant;
+    END IF;
+    IF v_bind <> 't' AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND (rolsuper OR rolbypassrls)) THEN
+        RAISE EXCEPTION 'REMEDIATION_REFUSED: tenant % is % and the current role cannot bypass RLS', v_tenant, v_tenant_status;
+    END IF;
     IF v_cls NOT IN ('participant', 'baseline') THEN
         RAISE EXCEPTION 'REMEDIATION_REFUSED: invalid classification %', v_cls;
     END IF;
@@ -232,6 +264,8 @@ BEGIN
             'reason', v_reason,
             'previousClassification', 'unclassified',
             'accountType', v_row.account_type,
+            'tenantStatus', v_tenant_status,
+            'tenantContextBound', (v_bind = 't'),
             'script', 'scripts/pilot-1-marker-remediation.sh'
         )
     );
@@ -257,10 +291,10 @@ if [ "${FORMAT}" = "json" ]; then
     # account_type CHECK, classification enum, actor charset) — no escaping
     # is needed for the output to be valid JSON. The reason is deliberately
     # NOT echoed; it lives on the audit row.
-    printf '{"accountId":"%s","tenantId":"%s","accountType":"%s","classifiedAs":"%s","actor":"%s","actorTenantId":"%s","status":"classified","auditAction":"pilot_1.cohort_classification"}\n' \
-        "${ACCOUNT_ID}" "${TENANT_ID}" "${ACCOUNT_TYPE}" "${CLASSIFY_AS}" "${ACTOR}" "${ACTOR_TENANT}"
+    printf '{"accountId":"%s","tenantId":"%s","tenantStatus":"%s","accountType":"%s","classifiedAs":"%s","actor":"%s","actorTenantId":"%s","status":"classified","auditAction":"pilot_1.cohort_classification"}\n' \
+        "${ACCOUNT_ID}" "${TENANT_ID}" "${TENANT_STATUS}" "${ACCOUNT_TYPE}" "${CLASSIFY_AS}" "${ACTOR}" "${ACTOR_TENANT}"
 else
-    echo "OK: account ${ACCOUNT_ID} (${ACCOUNT_TYPE}, ${TENANT_ID}) classified as '${CLASSIFY_AS}'."
+    echo "OK: account ${ACCOUNT_ID} (${ACCOUNT_TYPE}, ${TENANT_ID} [${TENANT_STATUS}]) classified as '${CLASSIFY_AS}'."
     echo "    Audit event pilot_1.cohort_classification committed in the same transaction (actor: ${ACTOR}, actor tenant: ${ACTOR_TENANT})."
     echo "    Re-run scripts/verify-pilot-1-baseline.sh to confirm the gate is green."
 fi

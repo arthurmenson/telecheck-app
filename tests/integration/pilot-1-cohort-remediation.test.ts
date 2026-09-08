@@ -106,12 +106,14 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
   const suffix = Array.from(randomBytes(4), (b) => LETTERS[b % 26]).join('');
   const OPERATOR_TENANT = `Telecheck-TR${suffix}A`;
   const TARGET_TENANT = `Telecheck-TR${suffix}B`;
+  const SUSPENDED_TENANT = `Telecheck-TR${suffix}S`;
+  const ARCHIVED_TENANT = `Telecheck-TR${suffix}X`;
 
-  async function createTenant(id: string, country: 'US' | 'GH') {
+  async function createTenant(id: string, country: 'US' | 'GH', status = 'active') {
     await admin.query(
       `INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain,
           country_of_care, kms_key_alias, status, activated_at)
-       VALUES ($1, $1, $2, $3, $4, $5, $6, 'active', NOW())
+       VALUES ($1, $1, $2, $3, $4, $5, $6, $7, NOW())
        ON CONFLICT (id) DO NOTHING`,
       [
         id,
@@ -120,6 +122,7 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
         `${id.toLowerCase()}.heroshealth.com`,
         country,
         `alias/telecheck-test-${id.toLowerCase()}-data-key`,
+        status,
       ],
     );
   }
@@ -130,11 +133,20 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     type: string,
     classification?: string,
     active = false,
+    bindContext = true,
   ) {
     await admin.query('BEGIN');
     try {
-      await admin.query('SELECT set_tenant_context($1)', [tenant]);
-      const country = tenant === TARGET_TENANT || tenant === 'Telecheck-Ghana' ? 'GH' : 'US';
+      // An inactive tenant cannot be bound (migration 003); the superuser
+      // admin client writes it under RLS bypass instead.
+      if (bindContext) await admin.query('SELECT set_tenant_context($1)', [tenant]);
+      const country =
+        tenant === TARGET_TENANT ||
+        tenant === SUSPENDED_TENANT ||
+        tenant === ARCHIVED_TENANT ||
+        tenant === 'Telecheck-Ghana'
+          ? 'GH'
+          : 'US';
       const phone = `+1555${String(Math.floor(Math.random() * 1e7)).padStart(7, '0')}`;
       const columns = [
         'account_id',
@@ -213,6 +225,8 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     await admin.connect();
     await createTenant(OPERATOR_TENANT, 'US');
     await createTenant(TARGET_TENANT, 'GH');
+    await createTenant(SUSPENDED_TENANT, 'GH', 'suspended');
+    await createTenant(ARCHIVED_TENANT, 'GH', 'archived');
   });
 
   afterAll(async () => {
@@ -349,6 +363,50 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
       expect(ok.status, ok.stderr).toBe(0);
       expect(await classificationOf(id)).toBe('baseline');
       expect(await auditCountFor(id)).toBe(1);
+    }
+  });
+
+  it('an unclassified account in a suspended or archived tenant is remediated under RLS bypass with the tenant status on the audit row', async () => {
+    for (const [tenant, status] of [
+      [SUSPENDED_TENANT, 'suspended'],
+      [ARCHIVED_TENANT, 'archived'],
+    ] as const) {
+      const id = ulid();
+      await rawInsert(tenant, id, 'patient', undefined, false, false);
+      expect(await classificationOf(id)).toBe('unclassified');
+      const gate = runScript('verify-pilot-1-baseline.sh', ['--json'], OPERATOR_TENANT);
+      expect(gate.status).toBe(1);
+      const r = runScript(
+        'pilot-1-marker-remediation.sh',
+        [
+          '--account-id',
+          id,
+          '--classify-as',
+          'baseline',
+          '--reason',
+          `CI: ${status} tenant`,
+          '--json',
+        ],
+        OPERATOR_TENANT,
+      );
+      expect(r.status, r.stderr).toBe(0);
+      expect(JSON.parse(r.stdout)).toMatchObject({
+        accountId: id,
+        tenantId: tenant,
+        tenantStatus: status,
+      });
+      expect(await classificationOf(id)).toBe('baseline');
+      const audit = await admin.query<{ payload: Record<string, unknown>; tenant_id: string }>(
+        `SELECT payload, tenant_id FROM audit_records WHERE action = 'pilot_1.cohort_classification' AND resource_id = $1`,
+        [id],
+      );
+      expect(audit.rowCount).toBe(1);
+      expect(audit.rows[0]!.tenant_id).toBe(tenant);
+      expect(audit.rows[0]!.payload).toMatchObject({
+        tenantStatus: status,
+        tenantContextBound: false,
+      });
+      await deleteAccount(id);
     }
   });
 
