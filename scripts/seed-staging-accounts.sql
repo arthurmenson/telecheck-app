@@ -25,6 +25,9 @@
 -- ULIDs use only Crockford base32 characters (no I, L, O, U) and are 26
 -- chars, matching the platform VARCHAR(26) identity shape.
 
+-- One transaction: if any guard below refuses, nothing is left behind.
+BEGIN;
+
 INSERT INTO accounts (
     account_id, tenant_id, phone_e164, email,
     first_name, last_name, date_of_birth, gender,
@@ -130,3 +133,5 @@ BEGIN
     END IF;
     RAISE NOTICE 'seed-staging-accounts: 5 active synthetic accounts present (US patient/clinician/platform_admin + Ghana patient/clinician)';
 END $$;
+
+COMMIT;

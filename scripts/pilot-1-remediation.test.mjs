@@ -380,8 +380,23 @@ const ACCOUNTS_INSERT =
 export function seedAccountInserts(sql) {
   const found = [];
   for (const stmt of splitSqlStatements(sql)) {
-    if (!/\baccounts\b/i.test(stmt)) continue;
-    if (/^(SELECT|DO)\b/i.test(stmt) || stmt.startsWith('\\')) continue; // guards, context calls, psql meta-commands
+    if (stmt.startsWith('\\') || /^(BEGIN|COMMIT)\b/i.test(stmt)) continue;
+    if (/^SELECT\b/i.test(stmt)) {
+      // Only the two context helpers are recognised; any other SELECT that
+      // names accounts (a function call could mutate) fails the check.
+      if (/^SELECT\s+(set_tenant_context\('[A-Za-z-]+'\)|clear_tenant_context\(\))$/i.test(stmt))
+        continue;
+      throw new Error(`unrecognised SELECT touching accounts: ${stmt.slice(0, 80)}`);
+    }
+    if (/^DO\b/i.test(stmt)) {
+      // Guards may read accounts; a DO block that mutates accounts is exactly
+      // the unaudited post-insert classification this check exists to
+      // reject (Codex R3).
+      if (/\b(UPDATE|INSERT\s+INTO|DELETE\s+FROM|TRUNCATE)\s+(?:public\.)?accounts\b/i.test(stmt))
+        throw new Error(`account mutation inside a DO block: ${stmt.slice(0, 80)}`);
+      continue;
+    }
+    if (!/\baccounts\b/i.test(stmt)) continue; // other tables (forms_template, ...)
     const m = stmt.match(ACCOUNTS_INSERT);
     if (!m) throw new Error(`unrecognised statement touching accounts: ${stmt.slice(0, 80)}`);
     const columns = m[1].split(',').map((c) => c.trim().toLowerCase());
@@ -474,6 +489,25 @@ test('seeds: the static check rejects DEFAULT, unclassified, missing column, a s
     false,
     'a block-commented INSERT masked a real defect',
   );
+  // Codex R3 reproduction: an unaudited post-insert classification hidden
+  // in a DO block (the checker used to skip every DO statement).
+  const doUpdate =
+    base +
+    "\nDO $$ BEGIN UPDATE accounts SET cohort_classification = 'baseline' WHERE cohort_classification = 'unclassified'; END $$;\n";
+  assert.equal(
+    seedWritesOnlyBaseline(doUpdate),
+    false,
+    'an UPDATE inside a DO block slipped through',
+  );
+  const doDelete =
+    base + "\nDO $$ BEGIN DELETE FROM public.accounts WHERE account_type = 'patient'; END $$;\n";
+  assert.equal(
+    seedWritesOnlyBaseline(doDelete),
+    false,
+    'a DELETE inside a DO block slipped through',
+  );
+  const fnSelect = base + "\nSELECT pilot_1_classify_account('x', 'baseline', 'seed');\n";
+  assert.equal(seedWritesOnlyBaseline(fnSelect), false, 'an unrecognised SELECT slipped through');
   const literalSemicolon =
     "SELECT 'a;b'; INSERT INTO accounts (account_id, cohort_classification) VALUES ('x', 'baseline');";
   assert.equal(splitSqlStatements(literalSemicolon).length, 2);

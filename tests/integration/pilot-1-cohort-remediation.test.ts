@@ -100,7 +100,10 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
   const admin = new Client({ connectionString: DSN });
   const created: string[] = [];
   // Disposable tenants: the operator's home tenant and the target tenant.
-  const suffix = randomBytes(2).toString('hex').toUpperCase();
+  // Migration 001 requires tenant ids to match ^Telecheck-[A-Z][A-Za-z]+$ —
+  // letters only, so a hex suffix would fail the CHECK (Codex R3).
+  const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const suffix = Array.from(randomBytes(4), (b) => LETTERS[b % 26]).join('');
   const OPERATOR_TENANT = `Telecheck-TR${suffix}A`;
   const TARGET_TENANT = `Telecheck-TR${suffix}B`;
 
@@ -121,21 +124,57 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     );
   }
 
-  async function rawInsert(tenant: string, id: string, type: string, classification?: string) {
+  async function rawInsert(
+    tenant: string,
+    id: string,
+    type: string,
+    classification?: string,
+    active = false,
+  ) {
     await admin.query('BEGIN');
     try {
       await admin.query('SELECT set_tenant_context($1)', [tenant]);
       const country = tenant === TARGET_TENANT || tenant === 'Telecheck-Ghana' ? 'GH' : 'US';
       const phone = `+1555${String(Math.floor(Math.random() * 1e7)).padStart(7, '0')}`;
+      const columns = [
+        'account_id',
+        'tenant_id',
+        'phone_e164',
+        'first_name',
+        'last_name',
+        'date_of_birth',
+        'gender',
+        'country_of_residence',
+        'country_of_care',
+        'locale',
+        'account_type',
+      ];
+      const values = [
+        '$1',
+        '$2',
+        '$3',
+        "'Synthetic'",
+        "'Fixture'",
+        "'1990-01-01'",
+        "'prefer_not_to_say'",
+        '$4',
+        '$4',
+        "'en-US'",
+        '$5',
+      ];
+      const params: unknown[] = [id, tenant, phone, country, type];
+      if (classification !== undefined) {
+        columns.push('cohort_classification');
+        params.push(classification);
+        values.push(`$${params.length}`);
+      }
+      if (active) {
+        columns.push('status', 'activated_at');
+        values.push("'active'", 'NOW()');
+      }
       await admin.query(
-        `INSERT INTO accounts (account_id, tenant_id, phone_e164, first_name, last_name, date_of_birth,
-            gender, country_of_residence, country_of_care, locale, account_type
-            ${classification === undefined ? '' : ', cohort_classification'})
-         VALUES ($1, $2, $3, 'Synthetic', 'Fixture', '1990-01-01', 'prefer_not_to_say', $4, $4, 'en-US', $5
-            ${classification === undefined ? '' : ', $6'})`,
-        classification === undefined
-          ? [id, tenant, phone, country, type]
-          : [id, tenant, phone, country, type, classification],
+        `INSERT INTO accounts (${columns.join(', ')}) VALUES (${values.join(', ')})`,
+        params,
       );
       await admin.query('COMMIT');
       created.push(id);
@@ -356,11 +395,18 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     // Upgrade case (Codex R2): the fixture pre-exists as 'unclassified'.
     const drifted = STAGING_SEED_IDS[0]!;
     await deleteAccount(drifted);
-    await rawInsert(TENANT_US, drifted, 'patient');
+    // Active (as a real pre-080 fixture would be) but unclassified.
+    await rawInsert(TENANT_US, drifted, 'patient', undefined, true);
     const refused = psqlFile('seed-staging-accounts.sql');
     expect(refused.status).not.toBe(0);
     expect(refused.stderr).toContain(drifted);
     expect(refused.stderr).toMatch(/pilot-1-marker-remediation/);
+    // The seed is one transaction: a refused run leaves NOTHING behind.
+    const leftover = await admin.query<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM accounts WHERE account_id = ANY($1) AND account_id <> $2`,
+      [STAGING_SEED_IDS, drifted],
+    );
+    expect(leftover.rows[0]!.n).toBe(0);
     await deleteAccount(drifted);
 
     const before = await allAccountIds();
