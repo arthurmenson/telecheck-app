@@ -17,7 +17,7 @@ import {
 
 let pool: pg.Pool | null = null;
 
-function identityPool(): pg.Pool {
+export function identityPool(): pg.Pool {
   if (!config.identityDatabaseUrl) {
     if (config.nodeEnv === 'test' && hasTestPool()) return getPool();
     throw new Error('identity_database_unavailable');
@@ -43,7 +43,7 @@ function identityPool(): pg.Pool {
   return pool;
 }
 
-async function assertIdentityConnection(tx: DbClient): Promise<void> {
+export async function assertIdentityConnection(tx: DbClient): Promise<void> {
   if (!config.identityDatabaseUrl && config.nodeEnv === 'test' && hasTestPool()) return;
   const result = await tx.query<{ valid: boolean }>(`
     SELECT session_user = 'identity_service_role'
