@@ -327,7 +327,30 @@ export function gcPlan(dir, { nowMs = Date.now(), minAgeDays = DEFAULT_GC_MIN_AG
     skipped: [],
     lock: lock.present ? (lock.valid ? lock.incidentId : lock.why) : null,
   };
-  for (const file of listManifests(base)) {
+  // Artifact ownership across EVERY manifest that parses (Codex R4): an
+  // artifact claimed by more than one manifest — or claimed by any manifest
+  // that is not itself eligible — is never deleted on the strength of one of
+  // them. Unparseable manifests cannot vouch for anything, so their presence
+  // is recorded separately and blocks nothing beyond their own file.
+  const claimedBy = new Map();
+  const manifests = listManifests(base);
+  for (const file of manifests) {
+    const id = file.slice(0, -'.manifest.json'.length);
+    let value;
+    try {
+      value = JSON.parse(fs.readFileSync(path.join(base, file), 'utf8'));
+    } catch {
+      continue;
+    }
+    const arts = Array.isArray(value?.artifacts) ? value.artifacts : [];
+    for (const a of arts) {
+      if (!a || typeof a.path !== 'string') continue;
+      const name = path.basename(a.path);
+      if (!claimedBy.has(name)) claimedBy.set(name, new Set());
+      claimedBy.get(name).add(id);
+    }
+  }
+  for (const file of manifests) {
     const id = file.slice(0, -'.manifest.json'.length);
     const p = path.join(base, file);
     let st;
@@ -377,6 +400,17 @@ export function gcPlan(dir, { nowMs = Date.now(), minAgeDays = DEFAULT_GC_MIN_AG
       artifacts = inventoriedArtifacts(base, id, value);
     } catch (error) {
       plan.skipped.push({ file, reason: `inventory refused: ${error.message}` });
+      continue;
+    }
+    const conflicts = artifacts.filter((a) => (claimedBy.get(a)?.size ?? 0) > 1);
+    if (conflicts.length) {
+      const others = [
+        ...new Set(conflicts.flatMap((a) => [...claimedBy.get(a)].filter((o) => o !== id))),
+      ].sort();
+      plan.skipped.push({
+        file,
+        reason: `conflicting inventory: ${conflicts.join(', ')} also claimed by ${others.join(', ')}`,
+      });
       continue;
     }
     // residual `<id>-*.age` files that the inventory does not name (e.g. a

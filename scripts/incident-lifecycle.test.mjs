@@ -461,6 +461,56 @@ test('writers (Codex R2): a symlinked incident directory is refused even with a 
   assert.throws(() => gcPlan(nested, { minAgeDays: 30 }), /symbolic link/);
 });
 
+test('writers (Codex R4): an artifact claimed by two manifests is never deleted on the strength of one of them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  mkIncidentDir({ into: dir, id: 'inc', lock: false, consumed: true, ageDays: 40, artifacts: 1 });
+  mkIncidentDir({ into: dir, id: 'inc-2', lock: true, consumed: false, ageDays: 1, artifacts: 1 }); // active, locked
+  // the aged manifest ALSO lists inc-2's artifact
+  const mf = path.join(dir, 'inc.manifest.json');
+  const man = JSON.parse(fs.readFileSync(mf, 'utf8'));
+  man.artifacts.push({
+    path: path.join(dir, 'inc-2-art0.age'),
+    plaintextBytes: 10,
+    ciphertextBytes: AGE_HEADER.length + 40,
+  });
+  fs.writeFileSync(mf, JSON.stringify(man));
+  const t = new Date(Date.now() - 40 * DAY);
+  fs.utimesSync(mf, t, t);
+  const before = snapshot(dir);
+  const plan = gcPlan(dir, { minAgeDays: 30 });
+  assert.deepEqual(plan.deletions, [], 'nothing may be deleted while the inventory conflicts');
+  const reasons = Object.fromEntries(plan.skipped.map((x) => [x.file, x.reason]));
+  assert.match(
+    reasons['inc.manifest.json'],
+    /conflicting inventory: inc-2-art0\.age also claimed by inc-2/,
+  );
+  assert.match(reasons['inc-2.manifest.json'], /not consumed/);
+  assert.deepEqual(gcExecute(dir, plan), []);
+  assert.deepEqual(snapshot(dir), before, 'the directory changed');
+  assert.ok(
+    fs.existsSync(path.join(dir, 'inc-2-art0.age')),
+    "the active incident's evidence survived",
+  );
+  // the same artifact claimed by a consumed-but-young manifest still blocks
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  mkIncidentDir({ into: dir2, id: 'a', lock: false, consumed: true, ageDays: 40, artifacts: 1 });
+  mkIncidentDir({ into: dir2, id: 'b', lock: false, consumed: true, ageDays: 1, artifacts: 0 });
+  const mb = path.join(dir2, 'b.manifest.json');
+  const manB = JSON.parse(fs.readFileSync(mb, 'utf8'));
+  manB.artifacts.push({
+    path: path.join(dir2, 'a-art0.age'),
+    plaintextBytes: 10,
+    ciphertextBytes: AGE_HEADER.length + 40,
+  });
+  fs.writeFileSync(mb, JSON.stringify(manB));
+  const plan2 = gcPlan(dir2, { minAgeDays: 30 });
+  assert.deepEqual(plan2.deletions, []);
+  assert.match(
+    Object.fromEntries(plan2.skipped.map((x) => [x.file, x.reason]))['a.manifest.json'],
+    /conflicting inventory/,
+  );
+});
+
 test('writers (Codex R3): a literal `symlink/..` path is refused before any normalization — the lexical and physical destinations may differ', () => {
   // /safe/alias -> /real/sub ; configured "/safe/alias/../incident-logs" names
   // /real/incident-logs physically but /safe/incident-logs lexically
