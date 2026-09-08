@@ -25,7 +25,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { ulid } from '../../src/lib/ulid.ts';
 import { assertAuditChainIntact } from '../helpers/audit-assertions.ts';
-import { TENANT_GHANA, TENANT_US } from '../helpers/tenant-fixtures.ts';
+import { TENANT_GHANA, TENANT_US, withTenantContext } from '../helpers/tenant-fixtures.ts';
 
 const ROOT = path.resolve(import.meta.dirname ?? __dirname, '../..');
 const DSN = process.env['TEST_DATABASE_URL'] ?? '';
@@ -36,7 +36,12 @@ function runScript(script: string, args: string[]) {
   return spawnSync(bash, [...bashArgs, path.join(ROOT, 'scripts', script), ...args], {
     cwd: ROOT,
     encoding: 'utf8',
-    env: { ...process.env, PILOT_1_DATABASE_URL: DSN, PILOT_1_ACTOR: 'ci-operator@test' },
+    env: {
+      ...process.env,
+      PILOT_1_DATABASE_URL: DSN,
+      PILOT_1_ACTOR: 'ci-operator@test',
+      PILOT_1_ACTOR_TENANT: TENANT_US,
+    },
   });
 }
 
@@ -51,14 +56,23 @@ function psqlFile(file: string) {
   );
 }
 
+const STAGING_SEED_IDS = [
+  '01JZZZ00000000000000000P01',
+  '01JZZZ00000000000000000C01',
+  '01JZZZ00000000000000000A02',
+  '01JZZZ00000000000000000P02',
+  '01JZZZ00000000000000000C02',
+];
+const STAGING_TEMPLATE_IDS = ['01JZZZ0000000000000000TP01', '01JZZZ0000000000000000TP02'];
+
 const SEED_IDS = [
-  '01JZZZ000000000000PILOT0C1',
-  '01JZZZ000000000000PILOT0A1',
-  '01JZZZ000000000000PILOT0P1',
-  '01JZZZ000000000000PILOT0C2',
-  '01JZZZ000000000000PILOT0A2',
-  '01JZZZ000000000000PILOT0P2',
-  '01JZZZ000000000000PILOTPA1',
+  '01JZZZ000000000000000P1C01',
+  '01JZZZ000000000000000P1A01',
+  '01JZZZ000000000000000P1F01',
+  '01JZZZ000000000000000P1C02',
+  '01JZZZ000000000000000P1A02',
+  '01JZZZ000000000000000P1F02',
+  '01JZZZ000000000000000P1PA1',
 ];
 
 describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgres)', () => {
@@ -102,7 +116,12 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
   });
 
   afterAll(async () => {
-    for (const id of [...created, ...SEED_IDS]) {
+    for (const templateId of STAGING_TEMPLATE_IDS) {
+      await admin
+        .query('DELETE FROM forms_template WHERE template_id = $1', [templateId])
+        .catch(() => undefined);
+    }
+    for (const id of [...created, ...SEED_IDS, ...STAGING_SEED_IDS]) {
       await admin.query('DELETE FROM accounts WHERE account_id = $1', [id]).catch(() => undefined);
     }
     await admin.end();
@@ -148,6 +167,7 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
       accountType: 'delegate',
       classifiedAs: 'participant',
       actor: 'ci-operator@test',
+      actorTenantId: TENANT_US,
       status: 'classified',
     });
     expect(await classificationOf(id)).toBe('participant');
@@ -168,17 +188,23 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     const row = audit.rows[0]!;
     expect(row.category).toBe('B');
     expect(row.actor_type).toBe('platform_admin');
-    expect(row.actor_tenant_id).toBe(TENANT_GHANA);
+    // A US-home platform admin remediating a Ghana account: actor_tenant_id is
+    // the ACTOR's home tenant (migration 029), the row lives in the target's
+    // partition (Codex R1).
+    expect(row.actor_tenant_id).toBe(TENANT_US);
     expect(row.target_patient_id).toBe(id);
     expect(row.payload).toMatchObject({
       accountId: id,
       classifiedAs: 'participant',
       actor: 'ci-operator@test',
+      actorTenantId: TENANT_US,
       reason: 'CI: pilot participant',
       previousClassification: 'unclassified',
       accountType: 'delegate',
     });
-    await assertAuditChainIntact(TENANT_GHANA);
+    // The shared test client runs under the app role with FORCE RLS: the
+    // chain walk must run under a bound tenant context (Codex R1).
+    await withTenantContext(TENANT_GHANA, () => assertAuditChainIntact(TENANT_GHANA));
 
     const second = runScript('pilot-1-marker-remediation.sh', [
       '--account-id',
@@ -246,6 +272,17 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     expect(r.stderr).toMatch(/not found/);
   });
 
+  it('the staging seed also writes only baseline rows when executed against PostgreSQL', async () => {
+    const r = psqlFile('seed-staging-accounts.sql');
+    expect(r.status, r.stderr).toBe(0);
+    const rows = await admin.query<{ c: string }>(
+      `SELECT cohort_classification AS c FROM accounts WHERE account_id = ANY($1)`,
+      [STAGING_SEED_IDS],
+    );
+    expect(rows.rowCount).toBe(STAGING_SEED_IDS.length);
+    for (const row of rows.rows) expect(row.c).toBe('baseline');
+  });
+
   it('the baseline seed is idempotent and writes only baseline rows', async () => {
     const first = psqlFile('pilot-1-baseline-seed.sql');
     expect(first.status, first.stderr).toBe(0);
@@ -257,6 +294,7 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     );
     expect(rows.rowCount).toBe(SEED_IDS.length);
     for (const row of rows.rows) expect(row.c).toBe('baseline');
+    for (const id of SEED_IDS) expect(id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
     expect(rows.rows.map((r) => r.t).sort()).toEqual([
       'clinician',
       'clinician',

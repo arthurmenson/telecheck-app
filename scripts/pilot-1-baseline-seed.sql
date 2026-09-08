@@ -21,16 +21,18 @@
 --     verify-pilot-1-baseline.sh); accounts has FORCE RLS, so each tenant's
 --     rows are written under that tenant's context.
 --
--- Identities (fixed ULIDs; Crockford base32, 26 chars, no I/L/O/U):
+-- Identities (fixed ULIDs; Crockford base32, 26 chars, no I/L/O/U — the
+-- application's ULID schema rejects anything else, so a seeded patient must
+-- satisfy it to refresh a session; Codex R1):
 --   Telecheck-US
---     01JZZZ000000000000PILOT0C1  clinician      (Pilot Clinician US)
---     01JZZZ000000000000PILOT0A1  tenant_admin   (Pilot Tenant Admin US)
---     01JZZZ000000000000PILOT0P1  patient        (Pilot Baseline Fixture US) — baseline test fixture
---     01JZZZ000000000000PILOTPA1  platform_admin (Pilot Platform Admin) — global scope, home tenant US
+--     01JZZZ000000000000000P1C01  clinician      (Pilot Clinician US)
+--     01JZZZ000000000000000P1A01  tenant_admin   (Pilot Tenant Admin US)
+--     01JZZZ000000000000000P1F01  patient        (Pilot Baseline Fixture US) — baseline test fixture
+--     01JZZZ000000000000000P1PA1  platform_admin (Pilot Platform Admin) — global scope, home tenant US
 --   Telecheck-Ghana
---     01JZZZ000000000000PILOT0C2  clinician      (Pilot Clinician GH)
---     01JZZZ000000000000PILOT0A2  tenant_admin   (Pilot Tenant Admin GH)
---     01JZZZ000000000000PILOT0P2  patient        (Pilot Baseline Fixture GH) — baseline test fixture
+--     01JZZZ000000000000000P1C02  clinician      (Pilot Clinician GH)
+--     01JZZZ000000000000000P1A02  tenant_admin   (Pilot Tenant Admin GH)
+--     01JZZZ000000000000000P1F02  patient        (Pilot Baseline Fixture GH) — baseline test fixture
 --
 -- Synthetic contact data only (+1555 / +233555 test ranges, example.invalid).
 
@@ -52,16 +54,16 @@ INSERT INTO accounts (
     country_of_residence, country_of_care, locale,
     account_type, status, activated_at, cohort_classification
 ) VALUES
-    ('01JZZZ000000000000PILOT0C1', 'Telecheck-US', '+15550200001', 'pilot-clinician-us@example.invalid',
+    ('01JZZZ000000000000000P1C01', 'Telecheck-US', '+15550200001', 'pilot-clinician-us@example.invalid',
      'Pilot', 'Clinician US', DATE '1985-01-01', 'prefer_not_to_say',
      'US', 'US', 'en-US', 'clinician', 'active', NOW(), 'baseline'),
-    ('01JZZZ000000000000PILOT0A1', 'Telecheck-US', '+15550200002', 'pilot-tenant-admin-us@example.invalid',
+    ('01JZZZ000000000000000P1A01', 'Telecheck-US', '+15550200002', 'pilot-tenant-admin-us@example.invalid',
      'Pilot', 'Tenant Admin US', DATE '1980-01-01', 'prefer_not_to_say',
      'US', 'US', 'en-US', 'tenant_admin', 'active', NOW(), 'baseline'),
-    ('01JZZZ000000000000PILOT0P1', 'Telecheck-US', '+15550200003', 'pilot-baseline-fixture-us@example.invalid',
+    ('01JZZZ000000000000000P1F01', 'Telecheck-US', '+15550200003', 'pilot-baseline-fixture-us@example.invalid',
      'Pilot', 'Baseline Fixture US', DATE '1990-01-01', 'prefer_not_to_say',
      'US', 'US', 'en-US', 'patient', 'active', NOW(), 'baseline'),
-    ('01JZZZ000000000000PILOTPA1', 'Telecheck-US', '+15550200004', 'pilot-platform-admin@example.invalid',
+    ('01JZZZ000000000000000P1PA1', 'Telecheck-US', '+15550200004', 'pilot-platform-admin@example.invalid',
      'Pilot', 'Platform Admin', DATE '1980-01-01', 'prefer_not_to_say',
      'US', 'US', 'en-US', 'platform_admin', 'active', NOW(), 'baseline')
 ON CONFLICT (account_id) DO NOTHING;
@@ -73,13 +75,13 @@ INSERT INTO accounts (
     country_of_residence, country_of_care, locale,
     account_type, status, activated_at, cohort_classification
 ) VALUES
-    ('01JZZZ000000000000PILOT0C2', 'Telecheck-Ghana', '+233550200001', 'pilot-clinician-gh@example.invalid',
+    ('01JZZZ000000000000000P1C02', 'Telecheck-Ghana', '+233550200001', 'pilot-clinician-gh@example.invalid',
      'Pilot', 'Clinician GH', DATE '1985-01-01', 'prefer_not_to_say',
      'GH', 'GH', 'en-GH', 'clinician', 'active', NOW(), 'baseline'),
-    ('01JZZZ000000000000PILOT0A2', 'Telecheck-Ghana', '+233550200002', 'pilot-tenant-admin-gh@example.invalid',
+    ('01JZZZ000000000000000P1A02', 'Telecheck-Ghana', '+233550200002', 'pilot-tenant-admin-gh@example.invalid',
      'Pilot', 'Tenant Admin GH', DATE '1980-01-01', 'prefer_not_to_say',
      'GH', 'GH', 'en-GH', 'tenant_admin', 'active', NOW(), 'baseline'),
-    ('01JZZZ000000000000PILOT0P2', 'Telecheck-Ghana', '+233550200003', 'pilot-baseline-fixture-gh@example.invalid',
+    ('01JZZZ000000000000000P1F02', 'Telecheck-Ghana', '+233550200003', 'pilot-baseline-fixture-gh@example.invalid',
      'Pilot', 'Baseline Fixture GH', DATE '1990-01-01', 'prefer_not_to_say',
      'GH', 'GH', 'en-GH', 'patient', 'active', NOW(), 'baseline')
 ON CONFLICT (account_id) DO NOTHING;
@@ -95,12 +97,12 @@ DECLARE
     v_all INTEGER;
 BEGIN
     SELECT COUNT(*) INTO v_all FROM accounts
-     WHERE account_id LIKE '01JZZZ000000000000PILOT%';
+     WHERE account_id LIKE '01JZZZ000000000000000P1%';
     IF v_all <> 7 THEN
         RAISE EXCEPTION 'pilot-1-baseline-seed: expected 7 seed accounts, found %', v_all;
     END IF;
     SELECT COUNT(*) INTO v_bad FROM accounts
-     WHERE account_id LIKE '01JZZZ000000000000PILOT%'
+     WHERE account_id LIKE '01JZZZ000000000000000P1%'
        AND (cohort_classification <> 'baseline' OR status <> 'active');
     IF v_bad <> 0 THEN
         RAISE EXCEPTION 'pilot-1-baseline-seed: % seed account(s) are not active baseline rows; aborting', v_bad;

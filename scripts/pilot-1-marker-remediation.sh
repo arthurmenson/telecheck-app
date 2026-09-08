@@ -27,28 +27,35 @@
 #   3  database error (transaction rolled back; nothing written)
 #
 # Environment:
-#   PILOT_1_DATABASE_URL — operator DSN (defaults to $DATABASE_URL). Must be
-#                          the cross-tenant operator role used by
-#                          verify-pilot-1-baseline.sh (RLS is forced on
-#                          accounts: the script binds the account's tenant
-#                          via set_tenant_context before writing).
-#   PILOT_1_PSQL         — psql binary (default: `psql` on PATH)
-#   PILOT_1_ACTOR        — actor id recorded on the audit row
-#                          (default: <user>@<hostname>)
+#   PILOT_1_DATABASE_URL  — operator DSN (defaults to $DATABASE_URL). Must be
+#                           the cross-tenant operator role used by
+#                           verify-pilot-1-baseline.sh (RLS is forced on
+#                           accounts: the script binds the account's tenant
+#                           via set_tenant_context before writing).
+#   PILOT_1_PSQL          — psql binary (default: `psql` on PATH)
+#   PILOT_1_ACTOR         — actor id recorded on the audit row
+#                           (default: <user>@<hostname>; [A-Za-z0-9._@+-]{1,120})
+#   PILOT_1_ACTOR_TENANT  — the OPERATOR's home tenant (audit_records.
+#                           actor_tenant_id per migration 029 — the actor's
+#                           tenant, NOT the target account's tenant, which
+#                           may differ for a cross-tenant platform admin).
+#                           Required unless --actor-tenant is given; must be
+#                           an existing tenant id.
 #
 # Options:
-#   --account-id <id>     26-character Crockford ULID
-#   --classify-as <c>     participant | baseline
-#   --reason "<text>"     required, 1–500 characters; recorded verbatim on the
-#                         audit row (do NOT put PII in it — it is durable)
-#   --actor <id>          overrides PILOT_1_ACTOR
-#   --json                machine-readable output
+#   --account-id <id>      26-character Crockford ULID
+#   --classify-as <c>      participant | baseline
+#   --reason "<text>"      required, 1–500 characters; recorded verbatim on
+#                          the audit row (do NOT put PII in it — it is durable)
+#   --actor <id>           overrides PILOT_1_ACTOR
+#   --actor-tenant <id>    overrides PILOT_1_ACTOR_TENANT
+#   --json                 machine-readable output
 #
 # Spec references:
 #   - docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Remediation contract
 #   - migrations/080_pilot_1_cohort_classification.sql (schema + column comment)
 #   - migrations/002_audit_chain.sql / 029 / 030 (audit envelope, hash chain,
-#     actor_tenant_id CHECK for human actors)
+#     actor_tenant_id = actor's home tenant, CHECK for human actors)
 #   - scripts/verify-pilot-1-baseline.sh (the gate this script unblocks)
 
 set -euo pipefail
@@ -56,12 +63,13 @@ set -euo pipefail
 DSN="${PILOT_1_DATABASE_URL:-${DATABASE_URL:-}}"
 PSQL="${PILOT_1_PSQL:-psql}"
 ACTOR="${PILOT_1_ACTOR:-}"
+ACTOR_TENANT="${PILOT_1_ACTOR_TENANT:-}"
 ACCOUNT_ID=""
 CLASSIFY_AS=""
 REASON=""
 FORMAT="human"
 
-usage() { sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -69,6 +77,7 @@ while [ $# -gt 0 ]; do
         --classify-as)  [ $# -ge 2 ] || { echo "ERROR: --classify-as requires a value" >&2; exit 2; }; CLASSIFY_AS="$2"; shift 2 ;;
         --reason)       [ $# -ge 2 ] || { echo "ERROR: --reason requires a value" >&2; exit 2; }; REASON="$2"; shift 2 ;;
         --actor)        [ $# -ge 2 ] || { echo "ERROR: --actor requires a value" >&2; exit 2; }; ACTOR="$2"; shift 2 ;;
+        --actor-tenant) [ $# -ge 2 ] || { echo "ERROR: --actor-tenant requires a value" >&2; exit 2; }; ACTOR_TENANT="$2"; shift 2 ;;
         --json)         FORMAT="json"; shift ;;
         --help|-h)      usage; exit 0 ;;
         *)              echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
@@ -92,18 +101,40 @@ fi
 if [ -z "${ACTOR}" ]; then
     ACTOR="$(id -un 2>/dev/null || echo operator)@$(hostname 2>/dev/null || echo unknown-host)"
 fi
+# The actor id is emitted verbatim in the --json output; a closed charset
+# keeps that output valid JSON without an encoder on the host.
+if ! [[ "${ACTOR}" =~ ^[A-Za-z0-9._@+-]{1,120}$ ]]; then
+    echo "ERROR: actor id must match [A-Za-z0-9._@+-]{1,120} (got '${ACTOR}')" >&2; exit 2
+fi
+if [ -z "${ACTOR_TENANT}" ]; then
+    echo "ERROR: the operator's home tenant is required — set PILOT_1_ACTOR_TENANT or pass --actor-tenant" >&2
+    echo "       (audit_records.actor_tenant_id is the ACTOR's tenant per migration 029, not the target account's)" >&2
+    exit 2
+fi
+if ! [[ "${ACTOR_TENANT}" =~ ^[A-Za-z0-9-]{1,64}$ ]]; then
+    echo "ERROR: --actor-tenant must be a tenant id (got '${ACTOR_TENANT}')" >&2; exit 2
+fi
 
 # --- step 1: read current state (cross-tenant operator read; no writes) ---
+# The SQL is supplied on stdin so psql interpolates :'aid' / :'actor_tenant'
+# (variables are NOT interpolated inside -c commands — Codex R1).
 # A refusal is decided here on committed state; the transaction below
 # re-checks under FOR UPDATE so a concurrent classification cannot race.
-STATE="$("${PSQL}" "${DSN}" -X -A -t -v ON_ERROR_STOP=1 -v aid="${ACCOUNT_ID}" -c \
-    "SELECT tenant_id || '|' || account_type || '|' || country_of_care || '|' || cohort_classification
-       FROM accounts WHERE account_id = :'aid'")" || { echo "ERROR: could not read account state" >&2; exit 3; }
+STATE="$("${PSQL}" "${DSN}" -X -A -t -v ON_ERROR_STOP=1 \
+    -v aid="${ACCOUNT_ID}" -v actor_tenant="${ACTOR_TENANT}" <<'SQL'
+SELECT (SELECT CASE WHEN EXISTS (SELECT 1 FROM tenants WHERE id = :'actor_tenant') THEN 't' ELSE 'f' END)
+       || '|' || COALESCE((SELECT tenant_id || '|' || account_type || '|' || country_of_care || '|' || cohort_classification
+                           FROM accounts WHERE account_id = :'aid'), '');
+SQL
+)" || { echo "ERROR: could not read account state" >&2; exit 3; }
 
-if [ -z "${STATE}" ]; then
+IFS='|' read -r ACTOR_TENANT_EXISTS TENANT_ID ACCOUNT_TYPE COUNTRY CURRENT <<< "${STATE}"
+if [ "${ACTOR_TENANT_EXISTS}" != "t" ]; then
+    echo "ERROR: actor tenant '${ACTOR_TENANT}' does not exist (nothing written)" >&2; exit 2
+fi
+if [ -z "${TENANT_ID}" ]; then
     echo "REFUSED: account ${ACCOUNT_ID} not found (nothing written)" >&2; exit 1
 fi
-IFS='|' read -r TENANT_ID ACCOUNT_TYPE COUNTRY CURRENT <<< "${STATE}"
 if [ "${CURRENT}" != "unclassified" ]; then
     echo "REFUSED: account ${ACCOUNT_ID} is already classified as '${CURRENT}'." >&2
     echo "         Reclassification requires a separate audit-logged decision; this script does not reclassify." >&2
@@ -112,32 +143,38 @@ fi
 
 # --- step 2: ONE transaction — classify + attest, or nothing ---
 # Values reach the DO block through transaction-local settings (psql does
-# not interpolate :'var' inside dollar-quoted bodies).
+# not interpolate :'var' inside dollar-quoted bodies). Query output goes to
+# /dev/null so nothing but the final line reaches stdout.
 ERR="$(mktemp)"
 trap 'rm -f "${ERR}"' EXIT
 set +e
 "${PSQL}" "${DSN}" -X -q -v ON_ERROR_STOP=1 \
     -v aid="${ACCOUNT_ID}" -v cls="${CLASSIFY_AS}" -v reason="${REASON}" \
-    -v actor="${ACTOR}" -v tenant="${TENANT_ID}" <<'SQL' 2>"${ERR}"
+    -v actor="${ACTOR}" -v actor_tenant="${ACTOR_TENANT}" -v tenant="${TENANT_ID}" <<'SQL' >/dev/null 2>"${ERR}"
 BEGIN;
 SELECT set_tenant_context(:'tenant');
-SELECT set_config('pilot1.account_id', :'aid',   true),
-       set_config('pilot1.classify_as', :'cls',  true),
-       set_config('pilot1.reason',      :'reason', true),
-       set_config('pilot1.actor',       :'actor', true),
-       set_config('pilot1.tenant',      :'tenant', true);
+SELECT set_config('pilot1.account_id',   :'aid',          true),
+       set_config('pilot1.classify_as',  :'cls',          true),
+       set_config('pilot1.reason',       :'reason',       true),
+       set_config('pilot1.actor',        :'actor',        true),
+       set_config('pilot1.actor_tenant', :'actor_tenant', true),
+       set_config('pilot1.tenant',       :'tenant',       true);
 DO $$
 DECLARE
-    v_id      TEXT := current_setting('pilot1.account_id');
-    v_cls     TEXT := current_setting('pilot1.classify_as');
-    v_reason  TEXT := current_setting('pilot1.reason');
-    v_actor   TEXT := current_setting('pilot1.actor');
-    v_tenant  TEXT := current_setting('pilot1.tenant');
-    v_row     RECORD;
-    v_n       INTEGER;
+    v_id           TEXT := current_setting('pilot1.account_id');
+    v_cls          TEXT := current_setting('pilot1.classify_as');
+    v_reason       TEXT := current_setting('pilot1.reason');
+    v_actor        TEXT := current_setting('pilot1.actor');
+    v_actor_tenant TEXT := current_setting('pilot1.actor_tenant');
+    v_tenant       TEXT := current_setting('pilot1.tenant');
+    v_row          RECORD;
+    v_n            INTEGER;
 BEGIN
     IF v_cls NOT IN ('participant', 'baseline') THEN
         RAISE EXCEPTION 'REMEDIATION_REFUSED: invalid classification %', v_cls;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_actor_tenant) THEN
+        RAISE EXCEPTION 'REMEDIATION_REFUSED: actor tenant % does not exist', v_actor_tenant;
     END IF;
 
     SELECT account_type, country_of_care, cohort_classification
@@ -162,9 +199,10 @@ BEGIN
     END IF;
 
     -- Attestation in the SAME transaction (I-003 / I-027). Category B
-    -- (governance decision by a human operator); actor_tenant_id is
-    -- required for human actors by migration 030's CHECK; the patient
-    -- partition is used for patient/delegate accounts, PLATFORM otherwise.
+    -- (governance decision by a human operator). actor_tenant_id is the
+    -- OPERATOR's home tenant (migration 029), required non-null for human
+    -- actors (migration 030); the row lives in the TARGET tenant's
+    -- partition (tenant_id), patient partition for patient/delegate.
     INSERT INTO audit_records (
         tenant_id, category, audit_sensitivity_level, action,
         actor_type, actor_id, actor_tenant_id,
@@ -172,13 +210,14 @@ BEGIN
         payload
     ) VALUES (
         v_tenant, 'B', 'standard', 'pilot_1.cohort_classification',
-        'platform_admin', v_actor, v_tenant,
+        'platform_admin', v_actor, v_actor_tenant,
         CASE WHEN v_row.account_type IN ('patient', 'delegate') THEN v_id END,
         'account', v_id, v_row.country_of_care,
         jsonb_build_object(
             'accountId', v_id,
             'classifiedAs', v_cls,
             'actor', v_actor,
+            'actorTenantId', v_actor_tenant,
             'reason', v_reason,
             'previousClassification', 'unclassified',
             'accountType', v_row.account_type,
@@ -203,11 +242,15 @@ if [ "${STATUS}" -ne 0 ]; then
 fi
 
 if [ "${FORMAT}" = "json" ]; then
-    printf '{"accountId":"%s","tenantId":"%s","accountType":"%s","classifiedAs":"%s","actor":"%s","status":"classified","auditAction":"pilot_1.cohort_classification"}\n' \
-        "${ACCOUNT_ID}" "${TENANT_ID}" "${ACCOUNT_TYPE}" "${CLASSIFY_AS}" "${ACTOR}"
+    # Every value below is from a validated closed charset (ULID, tenant id,
+    # account_type CHECK, classification enum, actor charset) — no escaping
+    # is needed for the output to be valid JSON. The reason is deliberately
+    # NOT echoed; it lives on the audit row.
+    printf '{"accountId":"%s","tenantId":"%s","accountType":"%s","classifiedAs":"%s","actor":"%s","actorTenantId":"%s","status":"classified","auditAction":"pilot_1.cohort_classification"}\n' \
+        "${ACCOUNT_ID}" "${TENANT_ID}" "${ACCOUNT_TYPE}" "${CLASSIFY_AS}" "${ACTOR}" "${ACTOR_TENANT}"
 else
     echo "OK: account ${ACCOUNT_ID} (${ACCOUNT_TYPE}, ${TENANT_ID}) classified as '${CLASSIFY_AS}'."
-    echo "    Audit event pilot_1.cohort_classification committed in the same transaction (actor: ${ACTOR})."
+    echo "    Audit event pilot_1.cohort_classification committed in the same transaction (actor: ${ACTOR}, actor tenant: ${ACTOR_TENANT})."
     echo "    Re-run scripts/verify-pilot-1-baseline.sh to confirm the gate is green."
 fi
 exit 0
