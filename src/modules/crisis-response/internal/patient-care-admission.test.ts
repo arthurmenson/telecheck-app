@@ -261,6 +261,24 @@ describe('patient crisis admission', () => {
     });
   });
 
+  it('keeps a class-08 connection exception at COMMIT classified as uncertain', async () => {
+    // Codex verification round on PR #302: a five-char SQLSTATE was being
+    // read as "the server raised, so it rolled back". Class 08 is the
+    // opposite — the CLIENT reporting it does not know what the server
+    // did. 08007 is literally transaction_resolution_unknown; the
+    // admission may already be committed, so claiming `not_recorded`
+    // would invite a duplicating retry under a fresh key.
+    for (const code of ['08007', '08006', '08003', '08000']) {
+      mocks.commitError = Object.assign(new Error('connection exception'), { code });
+      const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+      expect(result, `SQLSTATE ${code} must stay uncertain`).toMatchObject({
+        recording_status: 'unconfirmed',
+        escalation_status: 'unconfirmed',
+      });
+      expect(result).not.toHaveProperty('crisis_event_id');
+    }
+  });
+
   it('keeps a driver-level failure code (not a SQLSTATE) classified as uncertain', async () => {
     // pg surfaces socket errors with codes like ECONNRESET. Those are not
     // five-char SQLSTATEs and must not be mistaken for a server raise.

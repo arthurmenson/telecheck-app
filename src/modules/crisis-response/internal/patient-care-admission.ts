@@ -321,15 +321,25 @@ export async function admitPatientCareInput(
     if (code === '42501' && !authenticated)
       throw Object.assign(new Error('crisis_forbidden'), { code: '42501', statusCode: 403 });
     signalAdmissionUnavailable();
-    // `unconfirmed` is reserved for a genuinely unknowable outcome — the
-    // acknowledgement was lost. An error that carries a SQLSTATE was RAISED
-    // by the server, and a raise during COMMIT is a guaranteed rollback,
-    // not an uncertainty. Now that the evidence trigger fires at COMMIT
-    // rather than being forced early, its `crisis_evidence_required`
-    // (23514) can arrive on the COMMIT statement and must still classify
-    // as `not_recorded`. SQLSTATE is exactly five alphanumerics; driver
-    // codes such as `ECONNRESET` do not match and stay uncertain.
-    const definiteRollback = typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code);
+    // `unconfirmed` is reserved for a genuinely unknowable outcome. An error
+    // the SERVER raised while processing the transaction — including one
+    // raised by the COMMIT statement itself, now that the evidence trigger
+    // fires there — means the transaction was aborted: a known rollback,
+    // so `crisis_evidence_required` (23514) at COMMIT classifies as
+    // `not_recorded`.
+    //
+    // The exception is SQLSTATE class 08 (connection exception). Those are
+    // not the server reporting a rollback; they are the client reporting
+    // that it does not know what the server did. 08007 is literally
+    // `transaction_resolution_unknown`. Treating class 08 as definite
+    // turned explicit uncertainty into a false absence claim: the
+    // admission may already be committed, and a retry under another key
+    // would duplicate it. (Codex verification round on PR #302.)
+    //
+    // Driver-level codes such as `ECONNRESET` are not five-char SQLSTATEs
+    // and stay uncertain for the same reason.
+    const sqlState = typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null;
+    const definiteRollback = sqlState !== null && !sqlState.startsWith('08');
     recordingStatus = commitPossible && !definiteRollback ? 'unconfirmed' : 'not_recorded';
   }
 
