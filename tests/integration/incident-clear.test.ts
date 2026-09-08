@@ -22,6 +22,8 @@ import path from 'node:path';
 import { Client } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { assertAuditChainIntact } from '../helpers/audit-assertions.ts';
+
 import { cloneSchema, withDatabase } from './helpers/disposable-db.ts';
 
 const ROOT = path.resolve(import.meta.dirname ?? __dirname, '../..');
@@ -236,16 +238,11 @@ describe('Sprint 1.3 phase B part 3a — incident-clear (real Postgres, disposab
         abandonReason: 'RCA: capture was a false positive',
       });
       expect(fs.existsSync(path.join(inc, '.incident.lock'))).toBe(false);
-      // chain integrity of the appended rows: hashes computed by the DB trigger, none null
-      const chain = await admin
-        .query<{
-          n: string;
-        }>(
-          `SELECT COUNT(*)::text AS n FROM audit_records WHERE action = 'env.incident.abandoned' AND payload->>'incidentId' = $1 AND (record_hash IS NULL OR record_hash = '')`,
-          [id],
-        )
-        .catch(() => ({ rows: [{ n: '0' }] }));
-      expect(chain.rows[0]!.n).toBe('0');
+      // chain integrity of every affected tenant partition: the I-003 walker
+      // recomputes each canonical hash, checks every prev_hash link and the
+      // genesis seed — it throws on the first defect (no success fallback)
+      const tenants = await admin.query<{ id: string }>('SELECT id FROM tenants ORDER BY id');
+      for (const t of tenants.rows) await assertAuditChainIntact(t.id, admin);
       // repeat: no lock → refused
       const again = runClear(
         ['--incident-id', id, '--disposition', 'ABANDONED', '--force-abandoned', 'x'],

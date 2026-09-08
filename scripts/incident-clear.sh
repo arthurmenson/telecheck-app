@@ -88,6 +88,15 @@ case "$(cd "$(dirname "${LOCK_FILE}")" 2>/dev/null && pwd -P)/" in
     "$(cd "${INCIDENT_DIR}" 2>/dev/null && pwd -P)/"*) echo "ERROR: PILOT_1_LOCK_FILE must not be inside the incident directory" >&2; exit 2 ;;
 esac
 
+# Scratch files (psql stderr) live in a private mktemp directory — never a
+# predictable path a pre-planted symlink could redirect onto evidence (Codex R1).
+SCRATCH_PARENT="${TMPDIR:-/tmp}"
+case "$(cd "${SCRATCH_PARENT}" 2>/dev/null && pwd -P)/" in
+    "$(cd "${INCIDENT_DIR}" 2>/dev/null && pwd -P)/"*) echo "ERROR: TMPDIR must not be inside the incident directory" >&2; exit 2 ;;
+esac
+SCRATCH="$(mktemp -d)" || { echo "ERROR: cannot create a scratch directory under ${SCRATCH_PARENT}" >&2; exit 2; }
+trap 'rm -rf "${SCRATCH}"' EXIT
+
 # --- lifecycle lock (shared with env-purge) ------------------------------------
 exec 9>>"${LOCK_FILE}" || { echo "ERROR: cannot open the lifecycle lock file ${LOCK_FILE}" >&2; exit 2; }
 if [ -L "${LOCK_FILE}" ] || [ ! -f "${LOCK_FILE}" ]; then echo "ERROR: lifecycle lock file ${LOCK_FILE} is not a regular file" >&2; exit 2; fi
@@ -135,12 +144,31 @@ fi
 
 CLEARED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EMITTED=false
+REPLAYED=false
+if [ "${DISPOSITION}" = "ABANDONED" ] && [ "${ABANDON_ROWS}" != "0" ]; then
+    # The abandonment is already committed (an earlier run was interrupted after
+    # COMMIT): the manifest must record THAT attestation's reason / actor /
+    # time, not this retry's arguments (Codex R1). Conflicting arguments are
+    # reported, never written.
+    COMMITTED="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v iid="${INCIDENT_ID}" <<'SQL'
+SELECT payload->>'clearedAt' || E'\t' || payload->>'actor' || E'\t' || payload->>'reason'
+  FROM audit_records WHERE action = 'env.incident.abandoned' AND payload->>'incidentId' = :'iid'
+ ORDER BY recorded_at LIMIT 1;
+SQL
+)" || { echo "ERROR: could not read the committed abandonment for ${INCIDENT_ID}" >&2; exit 3; }
+    IFS=$'\t' read -r C_AT C_ACTOR C_REASON <<< "${COMMITTED}"
+    [ -n "${C_AT}" ] && [ -n "${C_ACTOR}" ] || { echo "ERROR: the committed abandonment for ${INCIDENT_ID} has no clearedAt / actor payload" >&2; exit 3; }
+    if [ "${C_REASON}" != "${REASON}" ]; then
+        echo "NOTE: the abandonment for ${INCIDENT_ID} was already committed with reason '${C_REASON}' by ${C_ACTOR} at ${C_AT}; completing the clearance with the COMMITTED values (this retry's reason is not recorded)." >&2
+    fi
+    CLEARED_AT="${C_AT}"; ACTOR="${C_ACTOR}"; REASON="${C_REASON}"; REPLAYED=true
+fi
 if [ "${DISPOSITION}" = "ABANDONED" ] && [ "${ABANDON_ROWS}" = "0" ]; then
     # Audit FIRST (I-003 / I-027): one row per tenant, correlated by incidentId,
     # under the purge advisory lock; a concurrent purge cannot interleave.
     if ! "${PSQL}" --dbname="${DSN}" -X -q -v ON_ERROR_STOP=1 \
         -v iid="${INCIDENT_ID}" -v reason="${REASON}" -v actor="${ACTOR}" -v actor_tenant="${ACTOR_TENANT}" \
-        -v purge_attested="${PURGE_ATTESTED}" -v cleared_at="${CLEARED_AT}" <<'SQL' >/dev/null 2>"${TMPDIR:-/tmp}/incident-clear.$$.err"
+        -v purge_attested="${PURGE_ATTESTED}" -v cleared_at="${CLEARED_AT}" <<'SQL' >/dev/null 2>"${SCRATCH}/abandon.err"
 BEGIN;
 SELECT pg_advisory_xact_lock(hashtext('pilot-1-env-purge'));
 SELECT set_config('pilot1.iid', :'iid', true), set_config('pilot1.reason', :'reason', true),
@@ -169,24 +197,23 @@ $$;
 COMMIT;
 SQL
     then
-        ERRF="${TMPDIR:-/tmp}/incident-clear.$$.err"
-        if grep -q CLEAR_REFUSED "${ERRF}"; then echo "REFUSED: $(grep -o 'CLEAR_REFUSED:[^"]*' "${ERRF}" | head -1 | sed 's/CLEAR_REFUSED: //') (nothing changed)" >&2; rm -f "${ERRF}"; exit 1; fi
-        echo "ERROR: could not record env.incident.abandoned for ${INCIDENT_ID} (transaction rolled back; nothing changed):" >&2; sed 's/^/    /' "${ERRF}" >&2; rm -f "${ERRF}"; exit 3
+        ERRF="${SCRATCH}/abandon.err"
+        if grep -q CLEAR_REFUSED "${ERRF}"; then echo "REFUSED: $(grep -o 'CLEAR_REFUSED:[^"]*' "${ERRF}" | head -1 | sed 's/CLEAR_REFUSED: //') (nothing changed)" >&2; exit 1; fi
+        echo "ERROR: could not record env.incident.abandoned for ${INCIDENT_ID} (transaction rolled back; nothing changed):" >&2; sed 's/^/    /' "${ERRF}" >&2; exit 3
     fi
-    rm -f "${TMPDIR:-/tmp}/incident-clear.$$.err"
     EMITTED=true
 fi
 
 # --- consume the manifest, then remove the lock (both no-follow, atomic) --------------
-CONSUME_ARGS=(consume --dir "${INCIDENT_DIR}" --incident-id "${INCIDENT_ID}" --disposition "${DISPOSITION}" --cleared-by "${ACTOR}" --purge-attested "${PURGE_ATTESTED}")
+CONSUME_ARGS=(consume --dir "${INCIDENT_DIR}" --incident-id "${INCIDENT_ID}" --disposition "${DISPOSITION}" --cleared-by "${ACTOR}" --cleared-at "${CLEARED_AT}" --purge-attested "${PURGE_ATTESTED}")
 [ "${DISPOSITION}" = "ABANDONED" ] && CONSUME_ARGS+=(--reason "${REASON}")
 CONSUMED="$("${NODE}" "${HERE}/lib/incident-writers.mjs" "${CONSUME_ARGS[@]}")" || { echo "ERROR: could not consume the manifest for ${INCIDENT_ID}: ${CONSUMED}$([ "${EMITTED}" = "true" ] && echo ' (the env.incident.abandoned attestation is committed; re-run to complete)')" >&2; exit 3; }
 ALREADY="$(printf '%s' "${CONSUMED}" | sed -n 's/.*"alreadyConsumed":\(true\|false\).*/\1/p')"
 REMOVED="$("${NODE}" "${HERE}/lib/incident-writers.mjs" remove-lock --dir "${INCIDENT_DIR}" --incident-id "${INCIDENT_ID}")" || { echo "ERROR: manifest consumed but the incident lock could not be removed: ${REMOVED} — re-run with the same disposition to complete" >&2; exit 3; }
 
 if [ "${FORMAT}" = "json" ]; then
-    printf '{"incidentId":"%s","disposition":"%s","purgeAttested":%s,"abandonedAttestationEmitted":%s,"completedInterruptedClearance":%s,"clearedAt":"%s","clearedBy":"%s","status":"cleared"}\n' \
-        "${INCIDENT_ID}" "${DISPOSITION}" "${PURGE_ATTESTED}" "${EMITTED}" "${ALREADY:-false}" "${CLEARED_AT}" "${ACTOR}"
+    printf '{"incidentId":"%s","disposition":"%s","purgeAttested":%s,"abandonedAttestationEmitted":%s,"abandonmentReplayedFromAudit":%s,"completedInterruptedClearance":%s,"clearedAt":"%s","clearedBy":"%s","status":"cleared"}\n' \
+        "${INCIDENT_ID}" "${DISPOSITION}" "${PURGE_ATTESTED}" "${EMITTED}" "${REPLAYED}" "${ALREADY:-false}" "${CLEARED_AT}" "${ACTOR}"
 else
     echo "OK: incident ${INCIDENT_ID} cleared (${DISPOSITION}); manifest consumed, incident lock removed$([ "${ALREADY}" = "true" ] && echo ' (completed an interrupted clearance)')."
 fi

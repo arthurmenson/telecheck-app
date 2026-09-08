@@ -21,6 +21,8 @@ import {
   gcPlan,
   readManifest,
   removeLock,
+  validateLifecycleManifest,
+  writeAll,
 } from './lib/incident-writers.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -30,6 +32,7 @@ const ID = '2026-09-08T15-45Z-cat1-01';
 const DAY = 24 * 60 * 60 * 1000;
 
 function mkIncidentDir({
+  into,
   id = ID,
   consumed = false,
   lock = true,
@@ -39,7 +42,7 @@ function mkIncidentDir({
   artifacts = 1,
   status = 'SUCCESS',
 } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  const dir = into ?? fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
   const capturedAt = new Date(Date.now() - ageDays * DAY).toISOString();
   const list = [];
   for (let i = 0; i < artifacts; i++) {
@@ -49,6 +52,8 @@ function mkIncidentDir({
   }
   const manifest = { incidentId: id, status, capturedAt, artifacts: list, consumed };
   if (disposition) manifest.disposition = disposition;
+  else if (consumed) manifest.disposition = 'RESOLVED';
+  if (consumed) manifest.clearedAt = capturedAt;
   const mf = path.join(dir, `${id}.manifest.json`);
   fs.writeFileSync(mf, JSON.stringify(manifest));
   if (ageDays) {
@@ -192,12 +197,7 @@ test('writers: removeLock unlinks only a regular lock naming the id; absent is r
 test('writers: gc plan deletes only consumed, unlocked, aged manifests + their artifacts; never the lock, never unconsumed / malformed / young ones; both ages must pass', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
   const add = (id, opts) => {
-    const src = mkIncidentDir({ id, lock: false, ...opts });
-    for (const f of fs.readdirSync(src)) {
-      fs.copyFileSync(path.join(src, f), path.join(dir, f));
-      const st = fs.statSync(path.join(src, f));
-      fs.utimesSync(path.join(dir, f), st.atime, st.mtime);
-    }
+    mkIncidentDir({ id, lock: false, ...opts, into: dir });
   };
   add('old-consumed', { consumed: true, ageDays: 40, artifacts: 2 });
   add('old-open', { consumed: false, ageDays: 40 });
@@ -221,6 +221,8 @@ test('writers: gc plan deletes only consumed, unlocked, aged manifests + their a
     path.join(dir, '.incident.lock'),
     JSON.stringify({ incidentId: 'locked-consumed', openedAt: 'x', openedBy: 't' }),
   );
+  assert.throws(() => gcPlan(dir, { minAgeDays: 29 }), />= 30/);
+  assert.throws(() => gcPlan(dir, { minAgeDays: 1 }), />= 30/);
   const plan = gcPlan(dir, { minAgeDays: 30 });
   assert.deepEqual(
     plan.deletions.map((d) => d.id),
@@ -252,16 +254,11 @@ test('writers: gc plan deletes only consumed, unlocked, aged manifests + their a
   );
   // an uninspectable lock blocks EVERY deletion
   const blocked = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
-  const src = mkIncidentDir({ id: 'aged', lock: false, consumed: true, ageDays: 40 });
-  for (const f of fs.readdirSync(src)) {
-    fs.copyFileSync(path.join(src, f), path.join(blocked, f));
-    const st = fs.statSync(path.join(src, f));
-    fs.utimesSync(path.join(blocked, f), st.atime, st.mtime);
-  }
+  mkIncidentDir({ id: 'aged', lock: false, consumed: true, ageDays: 40, into: blocked });
   fs.mkdirSync(path.join(blocked, '.incident.lock'));
   const p2 = gcPlan(blocked, { minAgeDays: 30 });
   assert.deepEqual(p2.deletions, []);
-  assert.match(p2.skipped[0].reason, /uninspectable/);
+  assert.match(p2.skipped[0].reason, /cannot be inspected/);
 });
 
 test('writers: close-wipe blockers (lock, unconsumed, unreadable, non-regular entries) and the wipe itself', () => {
@@ -288,6 +285,206 @@ test('writers: close-wipe blockers (lock, unconsumed, unreadable, non-regular en
   assert.match(closeWipeBlockers(missing).join(';'), /not found/);
 });
 
+test("writers (Codex R1): artifacts come from the validated inventory only — a prefix collision never claims another incident's evidence; unlisted files are left alone", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  const copy = (id, opts) => {
+    mkIncidentDir({ id, lock: false, ...opts, into: dir });
+  };
+  copy('inc', { consumed: true, ageDays: 40, artifacts: 2 });
+  copy('inc-2', { consumed: false, ageDays: 1, artifacts: 1 }); // young, unconsumed, and locked below
+  fs.writeFileSync(path.join(dir, 'inc-unlisted.age'), 'x'); // shares the prefix, not inventoried
+  fs.writeFileSync(
+    path.join(dir, '.incident.lock'),
+    JSON.stringify({ incidentId: 'inc-2', openedAt: 'x', openedBy: 't' }),
+  );
+  const plan = gcPlan(dir, { minAgeDays: 30 });
+  assert.deepEqual(
+    plan.deletions.map((d) => d.id),
+    ['inc'],
+  );
+  assert.deepEqual(plan.deletions[0].artifacts, ['inc-art0.age', 'inc-art1.age']);
+  const deleted = gcExecute(dir, plan);
+  assert.deepEqual(deleted.sort(), ['inc-art0.age', 'inc-art1.age', 'inc.manifest.json']);
+  assert.ok(fs.existsSync(path.join(dir, 'inc-2-art0.age')), 'inc-2 evidence must survive');
+  assert.ok(fs.existsSync(path.join(dir, 'inc-2.manifest.json')));
+  assert.ok(fs.existsSync(path.join(dir, 'inc-unlisted.age')), 'unlisted files are never claimed');
+  assert.ok(fs.existsSync(path.join(dir, '.incident.lock')));
+  // an inventory that lists a file outside the directory or of another name refuses the whole manifest
+  const bad = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  mkIncidentDir({ id: 'aged', lock: false, consumed: true, ageDays: 40, into: bad });
+  const mf = path.join(bad, 'aged.manifest.json');
+  const man = JSON.parse(fs.readFileSync(mf, 'utf8'));
+  man.artifacts.push({
+    path: path.join(bad, 'other-victim.age'),
+    plaintextBytes: 1,
+    ciphertextBytes: 1,
+  });
+  fs.writeFileSync(mf, JSON.stringify(man));
+  const t = new Date(Date.now() - 40 * DAY);
+  fs.utimesSync(mf, t, t);
+  fs.writeFileSync(path.join(bad, 'other-victim.age'), 'x');
+  const p2 = gcPlan(bad, { minAgeDays: 30 });
+  assert.deepEqual(p2.deletions, []);
+  assert.match(p2.skipped[0].reason, /inventory refused/);
+  // gcExecute refuses a tampered plan naming another incident's file
+  assert.throws(
+    () =>
+      gcExecute(bad, {
+        deletions: [
+          { id: 'aged', manifest: 'aged.manifest.json', artifacts: ['other-victim.age'] },
+        ],
+      }),
+    /not an artifact of aged/,
+  );
+  assert.ok(fs.existsSync(path.join(bad, 'other-victim.age')));
+});
+
+test('writers (Codex R1): a present lock without a valid identity blocks every GC deletion and close-wipe; incomplete lifecycle manifests are never eligible', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  mkIncidentDir({ id: 'aged', lock: false, consumed: true, ageDays: 40, into: dir });
+  for (const lockBody of [
+    '{}',
+    '{"incidentId": 12}',
+    '{"incidentId": "../x"}',
+    '{"incidentId": null}',
+  ]) {
+    fs.writeFileSync(path.join(dir, '.incident.lock'), lockBody);
+    const plan = gcPlan(dir, { minAgeDays: 30 });
+    assert.deepEqual(plan.deletions, [], lockBody);
+    assert.match(plan.skipped[0].reason, /blocks every deletion/, lockBody);
+    assert.match(closeWipeBlockers(dir).join(';'), /incident lock present/, lockBody);
+    assert.match(
+      routineResetBlockers(dir).join(';'),
+      /incident lock present \(malformed\)/,
+      lockBody,
+    );
+  }
+  fs.rmSync(path.join(dir, '.incident.lock'));
+  assert.equal(
+    gcPlan(dir, { minAgeDays: 30 }).deletions.length,
+    1,
+    'a valid state is eligible again',
+  );
+  // incomplete manifests: validator + GC + close-wipe agree
+  const t = new Date(Date.now() - 40 * DAY);
+  const cases = [
+    ['{"consumed": true, "capturedAt": "not-a-date"}', /capturedAt|incidentId/],
+    [
+      JSON.stringify({
+        incidentId: 'aged',
+        status: 'SUCCESS',
+        capturedAt: t.toISOString(),
+        artifacts: [],
+        consumed: true,
+      }),
+      /disposition/,
+    ],
+    [
+      JSON.stringify({
+        incidentId: 'aged',
+        status: 'SUCCESS',
+        capturedAt: t.toISOString(),
+        artifacts: [],
+        consumed: true,
+        disposition: 'RESOLVED',
+      }),
+      /clearedAt/,
+    ],
+    [
+      JSON.stringify({
+        incidentId: 'aged',
+        status: 'SUCCESS',
+        capturedAt: t.toISOString(),
+        artifacts: [{}],
+        consumed: true,
+        disposition: 'RESOLVED',
+        clearedAt: t.toISOString(),
+      }),
+      /artifact entry without a path/,
+    ],
+    [
+      JSON.stringify({
+        incidentId: 'other',
+        status: 'SUCCESS',
+        capturedAt: t.toISOString(),
+        artifacts: [],
+        consumed: true,
+        disposition: 'RESOLVED',
+        clearedAt: t.toISOString(),
+      }),
+      /does not match/,
+    ],
+    [
+      JSON.stringify({
+        incidentId: 'aged',
+        status: 'SUCCESS',
+        capturedAt: t.toISOString(),
+        artifacts: [],
+        consumed: 'yes',
+      }),
+      /consumed is not a boolean/,
+    ],
+  ];
+  for (const [body, expect] of cases) {
+    const mf = path.join(dir, 'aged.manifest.json');
+    fs.writeFileSync(mf, body);
+    fs.utimesSync(mf, t, t);
+    assert.match(String(validateLifecycleManifest(JSON.parse(body), 'aged')), expect, body);
+    const plan = gcPlan(dir, { minAgeDays: 30 });
+    assert.deepEqual(plan.deletions, [], body);
+    assert.match(plan.skipped[0].reason, /incomplete lifecycle manifest/, body);
+    assert.match(closeWipeBlockers(dir).join(';'), /incomplete lifecycle manifest/, body);
+  }
+});
+
+test('writers (Codex R1): manifest rewrites write every byte — a short write never publishes a truncated manifest', () => {
+  const dir = mkIncidentDir();
+  const before = fs.readFileSync(path.join(dir, `${ID}.manifest.json`), 'utf8');
+  const origWrite = fs.writeSync;
+  // (a) chunked writes (1 byte per call) still land the complete document
+  fs.writeSync = (fd, buf, off, len) => origWrite(fd, buf, off, Math.min(1, len));
+  try {
+    consume(dir, ID, {
+      disposition: 'RESOLVED',
+      clearedBy: 'x',
+      clearedAt: '2026-09-08T16:00:00Z',
+    });
+  } finally {
+    fs.writeSync = origWrite;
+  }
+  const m = manifestOf(dir);
+  assert.equal(m.consumed, true);
+  assert.equal(m.clearedBy, 'x');
+  // (b) a zero-length write (disk full) aborts before the rename; the original stays intact
+  const dir2 = mkIncidentDir();
+  const before2 = fs.readFileSync(path.join(dir2, `${ID}.manifest.json`), 'utf8');
+  fs.writeSync = () => 0;
+  try {
+    assert.throws(
+      () => consume(dir2, ID, { disposition: 'RESOLVED', clearedBy: 'x' }),
+      /short write/,
+    );
+  } finally {
+    fs.writeSync = origWrite;
+  }
+  assert.equal(fs.readFileSync(path.join(dir2, `${ID}.manifest.json`), 'utf8'), before2);
+  assert.deepEqual(
+    fs.readdirSync(dir2).filter((f) => f.includes('.tmp-')),
+    [],
+    'no temp file left behind',
+  );
+  assert.notEqual(before, before2 + 'x'); // keep `before` referenced
+  // writeAll itself
+  const tmpf = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'p1w-')), 'f');
+  const fd = fs.openSync(tmpf, 'w');
+  try {
+    assert.equal(writeAll(fd, Buffer.from('hello')), 5);
+  } finally {
+    fs.closeSync(fd);
+  }
+  assert.equal(fs.readFileSync(tmpf, 'utf8'), 'hello');
+});
+
 // ---------------------------------------------------------------------------
 // scripts (stub psql + flock)
 // ---------------------------------------------------------------------------
@@ -305,6 +502,7 @@ printf '%s' "$sql" > "${d}/call-$n.sql"
 case "$sql" in
   *"env.incident.abandoned"*"INSERT INTO audit_records"*) printf '%s' "$sql" > "${d}/tx.sql"; [ -n "\${PSQL_TX_STDERR:-}" ] && echo "\${PSQL_TX_STDERR}" >&2; exit "\${PSQL_TX_EXIT:-0}" ;;
   *"env.purge.executed"*"env.incident.abandoned"*) printf '%s|%s\\n' "\${PSQL_PURGE_ROWS:-0}" "\${PSQL_ABANDON_ROWS:-0}"; exit 0 ;;
+  *"payload->>'clearedAt'"*"env.incident.abandoned"*) printf '%s\\n' "\${PSQL_COMMITTED_ABANDON:-2026-09-08T15:00:00Z	prior@host	committed reason}"; exit 0 ;;
   *) echo "stub psql: unexpected SQL" >&2; exit 9 ;;
 esac
 `,
@@ -375,6 +573,16 @@ test('incident-clear: usage errors exit 2 before anything runs', () => {
   });
   assert.equal(r.status, 2, r.stderr);
   assert.match(r.stderr, /must not be inside the incident directory/);
+  assert.equal(psqlCalls(dir), 0);
+  r = run(
+    'incident-clear.sh',
+    dir,
+    stubs,
+    ['--incident-id', ID, '--disposition', 'ABANDONED', '--force-abandoned', 'r'],
+    { PILOT_1_INCIDENT_LOGS_DIR: inc, TMPDIR: inc },
+  );
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /TMPDIR must not be inside the incident directory/);
   assert.equal(psqlCalls(dir), 0);
   assert.deepEqual(snapshot(inc), before);
 });
@@ -600,6 +808,35 @@ test('incident-clear ABANDONED: audit rows first (per tenant, under the advisory
   const out4 = JSON.parse(r4.stdout);
   assert.equal(out4.completedInterruptedClearance, true);
   assert.equal(out4.abandonedAttestationEmitted, false, 'no second attestation');
+  assert.equal(out4.abandonmentReplayedFromAudit, true);
+  assert.equal(out4.clearedBy, 'prior@host', 'the COMMITTED actor, not the retry');
+  assert.equal(out4.clearedAt, '2026-09-08T15:00:00Z');
+  assert.match(r4.stderr, /already committed with reason 'committed reason'/);
+  // interrupted AFTER commit but BEFORE consume: the manifest gets the committed reason, never the retry's
+  const inc5 = mkIncidentDir();
+  const dir5 = fs.mkdtempSync(path.join(os.tmpdir(), 'p1c-'));
+  const r5 = run(
+    'incident-clear.sh',
+    dir5,
+    mkStubs(dir5),
+    [
+      '--incident-id',
+      ID,
+      '--disposition',
+      'ABANDONED',
+      '--force-abandoned',
+      'DIFFERENT retry reason',
+      '--json',
+    ],
+    { PILOT_1_INCIDENT_LOGS_DIR: inc5, PSQL_ABANDON_ROWS: '2' },
+  );
+  assert.equal(r5.status, 0, r5.stderr);
+  assert.ok(!fs.existsSync(path.join(dir5, 'tx.sql')), 'no second attestation');
+  const m5 = manifestOf(inc5);
+  assert.equal(m5.abandonReason, 'committed reason');
+  assert.equal(m5.clearedBy, 'prior@host');
+  assert.equal(m5.clearedAt, '2026-09-08T15:00:00Z');
+  assert.ok(!fs.existsSync(path.join(inc5, '.incident.lock')));
   assert.ok(!fs.existsSync(path.join(dir4, 'tx.sql')));
   assert.ok(!fs.existsSync(path.join(inc4, '.incident.lock')));
 });
@@ -613,12 +850,7 @@ test('incident-log-gc: dry run lists without deleting; execution deletes exactly
     ['old-open', { consumed: false, ageDays: 40 }],
     ['young', { consumed: true, ageDays: 2 }],
   ]) {
-    const src = mkIncidentDir({ id, lock: false, ...opts });
-    for (const f of fs.readdirSync(src)) {
-      fs.copyFileSync(path.join(src, f), path.join(inc, f));
-      const st = fs.statSync(path.join(src, f));
-      fs.utimesSync(path.join(inc, f), st.atime, st.mtime);
-    }
+    mkIncidentDir({ id, lock: false, ...opts, into: inc });
   }
   fs.writeFileSync(
     path.join(inc, '.incident.lock'),
@@ -644,16 +876,15 @@ test('incident-log-gc: dry run lists without deleting; execution deletes exactly
   assert.ok(fs.existsSync(path.join(inc, '.incident.lock')));
   assert.ok(fs.existsSync(path.join(inc, 'old-open.manifest.json')));
   assert.ok(fs.existsSync(path.join(inc, 'young.manifest.json')));
-  r = run('incident-log-gc.sh', dir, stubs, ['--min-age-days', '1', '--dry-run', '--json'], {
-    PILOT_1_INCIDENT_LOGS_DIR: inc,
-  });
-  assert.equal(JSON.parse(r.stdout).deletions.length, 0, 'the lock still protects young');
-  assert.equal(
-    run('incident-log-gc.sh', dir, stubs, ['--min-age-days', '0'], {
+  // the ratified 30-day floor cannot be lowered (Codex R1)
+  for (const days of ['0', '1', '29']) {
+    const low = run('incident-log-gc.sh', dir, stubs, ['--min-age-days', days, '--dry-run'], {
       PILOT_1_INCIDENT_LOGS_DIR: inc,
-    }).status,
-    2,
-  );
+    });
+    assert.equal(low.status, 2, `--min-age-days ${days}: ${low.stderr}`);
+    assert.match(low.stderr, />= 30/);
+  }
+  assert.ok(fs.existsSync(path.join(inc, 'young.manifest.json')), 'young survives every attempt');
   assert.equal(
     run('incident-log-gc.sh', dir, stubs, [], { PILOT_1_INCIDENT_LOGS_DIR: inc, FLOCK_BUSY: '1' })
       .status,

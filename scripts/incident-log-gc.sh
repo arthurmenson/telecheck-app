@@ -6,7 +6,7 @@
 # for each `<id>.manifest.json`, delete the manifest AND its `<id>-*.age`
 # artifacts ONLY if manifest.consumed = true AND no incident lock references
 # that id (an uninspectable or malformed lock blocks every deletion) AND the
-# manifest is at least --min-age-days (default 30) old by BOTH its file mtime
+# manifest is at least --min-age-days (default and MINIMUM 30) old by BOTH its file mtime
 # and its capturedAt. Never touches `.incident.lock`. Never deletes an
 # unconsumed, malformed or unreadable manifest. Runs weekly from cron.
 #
@@ -37,7 +37,7 @@ while [ $# -gt 0 ]; do
         *)               echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
-[[ "${MIN_AGE_DAYS}" =~ ^[1-9][0-9]{0,3}$ ]] || { echo "ERROR: --min-age-days must be a positive integer" >&2; exit 2; }
+[[ "${MIN_AGE_DAYS}" =~ ^[1-9][0-9]{0,3}$ ]] && [ "${MIN_AGE_DAYS}" -ge 30 ] || { echo "ERROR: --min-age-days must be an integer >= 30 (the ratified retention floor cannot be lowered)" >&2; exit 2; }
 [ -r "${HERE}/lib/incident-writers.mjs" ] || { echo "ERROR: required file missing: ${HERE}/lib/incident-writers.mjs" >&2; exit 2; }
 command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is required for the lifecycle lock" >&2; exit 2; }
 if [ -L "${LOCK_FILE}" ]; then echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) must not be a symbolic link" >&2; exit 2; fi

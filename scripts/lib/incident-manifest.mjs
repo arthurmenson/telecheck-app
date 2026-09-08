@@ -62,10 +62,12 @@ export function readLock(dir) {
   if (error === 'missing') return { present: false };
   if (error === 'unreadable') return { present: true, unreadable: true, code };
   if (error) return { present: true, malformed: true };
-  return {
-    present: true,
-    incidentId: typeof value.incidentId === 'string' ? value.incidentId : null,
-  };
+  // A lock that does not name a valid incident id is malformed: it blocks
+  // routine work and every deletion but cannot authorize anything (Codex R1).
+  if (typeof value.incidentId !== 'string' || !INCIDENT_ID.test(value.incidentId)) {
+    return { present: true, malformed: true };
+  }
+  return { present: true, incidentId: value.incidentId };
 }
 
 export function listManifests(dir) {
