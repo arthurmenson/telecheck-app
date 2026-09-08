@@ -45,8 +45,18 @@ import { PUBLISH_GATES_BYPASS_DETECTED_AT_RUNTIME } from '../services/template-s
  */
 function mapServiceError(error: unknown, reply: FastifyReply): boolean {
   const code = (error as { code?: string })?.code;
+  // PT503: the COMMIT's fate is unknown (formsGovernanceTransaction) — tell
+  // the caller to check status before retrying, never a 500.
   const status =
-    code === '42501' ? 403 : code === '22023' ? 400 : code === '23514' ? 409 : undefined;
+    code === '42501'
+      ? 403
+      : code === '22023'
+        ? 400
+        : code === '23514'
+          ? 409
+          : code === 'PT503'
+            ? 503
+            : undefined;
   if (status === undefined) return false;
   void reply.code(status).send({
     error: {

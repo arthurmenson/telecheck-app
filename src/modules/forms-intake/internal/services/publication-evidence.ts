@@ -1,7 +1,7 @@
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { withTransaction, type DbClient, type DbTransaction } from '../../../../lib/db.js';
+import { commitAuthorityTransaction } from '../../../../lib/commit-authority-transaction.js';
+import { type DbClient, type withTransaction } from '../../../../lib/db.js';
 import type { TenantId } from '../../../../lib/glossary.js';
-import { IdempotencyReplayError } from '../../../../lib/idempotency.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { emitFormsGovernanceEvidence } from '../../audit.js';
 
@@ -12,30 +12,42 @@ type FormsGovernanceContext = {
   actorNonce: string;
 };
 
-/** Authorize both sides of the entire idempotency transaction, including cache
- * waits, outbox writes, cache completion and replay (which skips the body).
- * SQL failures may have aborted the transaction: preserve them without issuing
- * another query. A replay is a JavaScript control-flow exception with a live
- * transaction, so its final authorization must run before it reaches HTTP. */
+/**
+ * Authorize both sides of the entire idempotency transaction, including cache
+ * waits, outbox writes, cache completion and replay (which skips the body) —
+ * and AT COMMIT.
+ *
+ * The previous shape ran under `withTransaction` while the body nested
+ * `withTenantContext` / `withActorContext`, and `recordFormsPublicationEvidence`
+ * forced the deferred `forms_publication_evidence` trigger IMMEDIATE (then
+ * re-DEFERRED it, which does not re-queue a consumed event). That is the
+ * deferred-authority-trigger defect class fixed in PRs #302/#303/#304 and
+ * consent: at the real COMMIT the tenant binding had been cleared and the
+ * trigger event consumed, so `forms_live_actor('reviewer')` never ran at
+ * COMMIT and an actor nonce expiring in that window was committed under
+ * expired authority.
+ *
+ * Now the shared primitive owns the client, holds tenant + actor bindings
+ * live through COMMIT, and lets the deferred trigger fire there as a genuine
+ * authority gate. The live-scope check runs before the body, after it, and
+ * before disclosing an idempotency replay/mismatch/in-flight outcome. An
+ * unconfirmed COMMIT (stalled, or transport/class-08 failure after COMMIT was
+ * issued) surfaces as PT503 -> 503 so the caller checks status before
+ * retrying. SQL failures may have aborted the transaction: they are preserved
+ * without issuing another query.
+ */
 export function formsGovernanceTransaction(
   context: FormsGovernanceContext,
   operation: string,
   resourceId: string | null = null,
 ): typeof withTransaction {
-  return <T>(body: (tx: DbTransaction) => Promise<T>, externalTx?: DbTransaction) =>
-    withTransaction(async (tx) => {
-      await assertFormsGovernanceScope(tx, context, operation, resourceId);
-      let result: T;
-      try {
-        result = await body(tx);
-      } catch (error) {
-        if (error instanceof IdempotencyReplayError)
-          await assertFormsGovernanceScope(tx, context, operation, resourceId);
-        throw error;
-      }
-      await assertFormsGovernanceScope(tx, context, operation, resourceId);
-      return result;
-    }, externalTx);
+  return commitAuthorityTransaction({
+    tenantId: context.tenantId,
+    nonce: context.actorNonce,
+    assertLive: (tx) => assertFormsGovernanceScope(tx, context, operation, resourceId),
+    unconfirmed: () => Object.assign(new Error('forms.commit_unconfirmed'), { code: 'PT503' }),
+    discardEvent: 'forms.recording_connection.discarded',
+  });
 }
 
 export async function assertFormsGovernanceScope(
@@ -99,10 +111,9 @@ export async function recordFormsPublicationEvidence(
     },
     tx,
   );
-  // Verify while trusted tenant/actor bindings are still in scope; the context
-  // helpers clear them before the surrounding transaction commits. The SQL
-  // check also locks the approved content and its current reviewer authority
-  // through commit, protecting any later cache/outbox waits after this flush.
-  await tx.query('SET CONSTRAINTS forms_publication_evidence IMMEDIATE');
-  await tx.query('SET CONSTRAINTS forms_publication_evidence DEFERRED');
+  // The deferred `forms_publication_evidence` trigger fires AT COMMIT, with
+  // the tenant and actor bindings held live by formsGovernanceTransaction.
+  // It must NOT be forced IMMEDIATE here: that consumes the trigger event
+  // (re-DEFERRING does not re-queue it), and the real COMMIT would then run
+  // with no `forms_live_actor('reviewer')` re-validation.
 }

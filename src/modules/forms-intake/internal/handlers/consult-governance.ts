@@ -53,6 +53,8 @@ function readInput<T>(schema: z.ZodType<T>, value: unknown, req: FastifyRequest)
 
 function mapError(error: unknown, reply: FastifyReply): boolean {
   const code = (error as { code?: string })?.code;
+  // PT503: the COMMIT's fate is unknown (formsGovernanceTransaction) — tell
+  // the caller to check status before retrying, never a 500.
   const status =
     code === '42501'
       ? 403
@@ -62,7 +64,9 @@ function mapError(error: unknown, reply: FastifyReply): boolean {
           ? 400
           : code === '23514'
             ? 409
-            : undefined;
+            : code === 'PT503'
+              ? 503
+              : undefined;
   if (status === undefined) return false;
   void reply.code(status).send({
     error: {
