@@ -390,3 +390,15 @@ test('backup mode: COPY at the token boundary and complete code points after a b
   assert.ok(!c.stdout.includes('\uFFFD'));
   assert.ok(!c.stdout.includes('test.user@example.com'));
 });
+
+test('backup mode: a leading U+FEFF in an E-literal survives redaction (Codex R12)', async () => {
+  for (const encoded of ['\uFEFF', '\\uFEFF', '\\357\\273\\277', '\\xEF\\xBB\\xBF']) {
+    const { code, stdout, stderr } = await run(
+      ['--mode', 'backup'],
+      `SELECT E'${encoded} test.user@example.com';\n`,
+    );
+    assert.equal(code, 0, stderr);
+    assert.ok(stdout.includes('\uFEFF'), `lost U+FEFF for ${JSON.stringify(encoded)}`);
+    assert.ok(!stdout.includes('test.user@example.com'));
+  }
+});

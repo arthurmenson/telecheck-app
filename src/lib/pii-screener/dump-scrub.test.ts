@@ -560,3 +560,18 @@ describe('Codex R11 in-scope closures — COPY token boundary, complete code poi
     expect(() => scrubText("SELECT E'\\\uD83D x';\n")).toThrow(/invalid UTF-8/);
   });
 });
+
+describe('Codex R12 in-scope closure — a leading U+FEFF in an E-literal is value, not a BOM', () => {
+  for (const [name, encoded] of [
+    ['literal', '\uFEFF'],
+    ['unicode escape', '\\uFEFF'],
+    ['octal bytes', '\\357\\273\\277'],
+    ['hex bytes', '\\xEF\\xBB\\xBF'],
+  ] as const) {
+    it(`preserves a leading U+FEFF encoded as ${name} beside a redaction`, () => {
+      const out = scrubText(`SELECT E'${encoded} test.user@example.com';\n`);
+      expect(out).toContain('\uFEFF');
+      expect(out).not.toContain('test.user@example.com');
+    });
+  }
+});

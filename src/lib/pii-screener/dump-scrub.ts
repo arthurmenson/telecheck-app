@@ -370,7 +370,11 @@ function decodeEscapeLiteral(content: string): string {
     }
   }
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
+    // ignoreBOM: a leading U+FEFF inside a literal is VALUE, not a transport
+    // BOM — the default would silently delete it on re-encode (Codex R12).
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+      Uint8Array.from(bytes),
+    );
   } catch {
     // PostgreSQL would have rejected this literal on a UTF8 database; a
     // lossy decode here would corrupt the value on re-encode.
