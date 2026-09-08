@@ -88,6 +88,12 @@ done
 if [ -z "${DSN}" ]; then
     echo "ERROR: PILOT_1_DATABASE_URL (or DATABASE_URL) is not set" >&2; exit 2
 fi
+# The DSN is always passed as --dbname=… so psql can never read it as an
+# option (a value such as --command=… would otherwise execute SQL during the
+# read-only lookup — Codex R10); a leading dash is refused outright.
+case "${DSN}" in
+    -*) echo "ERROR: the DSN must not begin with '-' (got '${DSN:0:24}…')" >&2; exit 2 ;;
+esac
 if ! [[ "${ACCOUNT_ID}" =~ ^[0-9A-HJKMNP-TV-Z]{26}$ ]]; then
     echo "ERROR: --account-id must be a 26-character Crockford-base32 ULID (got '${ACCOUNT_ID}')" >&2; exit 2
 fi
@@ -120,7 +126,7 @@ fi
 # (variables are NOT interpolated inside -c commands — Codex R1).
 # A refusal is decided here on committed state; the transaction below
 # re-checks under FOR UPDATE so a concurrent classification cannot race.
-STATE="$("${PSQL}" "${DSN}" -X -A -t -v ON_ERROR_STOP=1 \
+STATE="$("${PSQL}" --dbname="${DSN}" -X -A -t -v ON_ERROR_STOP=1 \
     -v aid="${ACCOUNT_ID}" -v actor_tenant="${ACTOR_TENANT}" <<'SQL'
 SELECT (SELECT CASE WHEN EXISTS (SELECT 1 FROM tenants WHERE id = :'actor_tenant') THEN 't' ELSE 'f' END)
        || '|' || (SELECT CASE WHEN rolsuper OR rolbypassrls THEN 't' ELSE 'f' END FROM pg_roles WHERE rolname = current_user)
@@ -171,7 +177,7 @@ fi
 ERR="$(mktemp)"
 trap 'rm -f "${ERR}"' EXIT
 set +e
-"${PSQL}" "${DSN}" -X -q -v ON_ERROR_STOP=1 \
+"${PSQL}" --dbname="${DSN}" -X -q -v ON_ERROR_STOP=1 \
     -v aid="${ACCOUNT_ID}" -v cls="${CLASSIFY_AS}" -v reason="${REASON}" \
     -v actor="${ACTOR}" -v actor_tenant="${ACTOR_TENANT}" -v tenant="${TENANT_ID}" \
     -v bind_context="${BIND_CONTEXT}" -v tenant_status="${TENANT_STATUS}" <<'SQL' >/dev/null 2>"${ERR}"

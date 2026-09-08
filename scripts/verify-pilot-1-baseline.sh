@@ -60,12 +60,17 @@ if [ -z "${DSN}" ]; then
     echo "ERROR: PILOT_1_DATABASE_URL (or DATABASE_URL) is not set" >&2
     exit 2
 fi
+# Passed as --dbname=… so psql never reads the DSN as an option (Codex R10 on
+# the remediation script; same shape here).
+case "${DSN}" in
+    -*) echo "ERROR: the DSN must not begin with '-'" >&2; exit 2 ;;
+esac
 
 # Verify the column exists — protects against running this script against
 # a database on which migration 080 has not yet been applied. Fail-closed
 # so a purge preflight cannot accidentally proceed on a schema that
 # lacks the classification column entirely.
-COLUMN_EXISTS=$("${PSQL}" "${DSN}" -X -A -t -c \
+COLUMN_EXISTS=$("${PSQL}" --dbname="${DSN}" -X -A -t -c \
     "SELECT COUNT(*) FROM information_schema.columns
      WHERE table_name='accounts' AND column_name='cohort_classification'")
 if [ "${COLUMN_EXISTS}" != "1" ]; then
@@ -81,7 +86,7 @@ fi
 # Run the integrity query — one row per unclassified account. LIMIT is
 # generous (a real pilot-1 substrate should have zero rows here; the
 # limit protects against runaway output on a badly-drifted DB).
-UNCLASSIFIED_JSON=$("${PSQL}" "${DSN}" -X -A -t -c \
+UNCLASSIFIED_JSON=$("${PSQL}" --dbname="${DSN}" -X -A -t -c \
     "SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (
         SELECT account_id, tenant_id, account_type,
                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at_utc
@@ -91,7 +96,7 @@ UNCLASSIFIED_JSON=$("${PSQL}" "${DSN}" -X -A -t -c \
         LIMIT 1000
     ) t")
 
-COUNT=$("${PSQL}" "${DSN}" -X -A -t -c \
+COUNT=$("${PSQL}" --dbname="${DSN}" -X -A -t -c \
     "SELECT COUNT(*) FROM accounts WHERE cohort_classification = 'unclassified'")
 
 if [ "${FORMAT}" = "json" ]; then

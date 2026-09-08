@@ -89,6 +89,25 @@ test('remediation: usage errors exit 2 before psql is ever invoked', () => {
   assert.ok(!fs.existsSync(path.join(dir, 'calls.log')), 'psql was invoked on a usage error');
 });
 
+test('remediation: the DSN is passed as --dbname and a leading-option DSN never reaches psql', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
+  const stub = mkStub(dir, { state: 't|t|Telecheck-US|patient|US|unclassified|active\n' });
+  const injected = run(dir, stub, good, {
+    PILOT_1_DATABASE_URL: "--command=UPDATE accounts SET cohort_classification='baseline'",
+  });
+  assert.equal(injected.status, 2, injected.stderr);
+  assert.match(injected.stderr, /must not begin with '-'/);
+  assert.ok(
+    !fs.existsSync(path.join(dir, 'calls.log')),
+    'psql was invoked with an option-shaped DSN',
+  );
+  const ok = run(dir, stub, good);
+  assert.equal(ok.status, 0, ok.stderr);
+  const calls = fs.readFileSync(path.join(dir, 'calls.log'), 'utf8').split('\n').filter(Boolean);
+  assert.equal(calls.length, 2);
+  for (const c of calls) assert.match(c, /(^| )--dbname=postgres:\/\/synthetic( |$)/);
+});
+
 test('remediation: the state lookup goes through stdin with psql variables, never -c', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1r-'));
   const stub = mkStub(dir, { state: 't|t|Telecheck-US|patient|US|unclassified|active\n' });
