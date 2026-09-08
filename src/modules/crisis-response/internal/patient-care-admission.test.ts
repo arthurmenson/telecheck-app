@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   cleanupError: null as unknown,
   commitHang: false,
   cleanupHang: false,
+  rollbackHang: false,
   release: vi.fn(),
 }));
 // The module now OWNS its recording client: it takes a raw pool client,
@@ -60,6 +61,7 @@ beforeEach(() => {
   mocks.cleanupError = null;
   mocks.commitHang = false;
   mocks.cleanupHang = false;
+  mocks.rollbackHang = false;
   mocks.profile.mockResolvedValue({
     emergency_number: 'configured-emergency',
     crisis_helplines: [],
@@ -67,6 +69,11 @@ beforeEach(() => {
   mocks.audit.mockResolvedValue({ audit_id: '123e4567-e89b-42d3-a456-426614174001' });
   mocks.outbox.mockResolvedValue(undefined);
   mocks.query.mockImplementation(async (sql: string) => {
+    if (sql === 'ROLLBACK') {
+      // A wedged connection after a rejected COMMIT: ROLLBACK never returns.
+      if (mocks.rollbackHang) return new Promise<never>(() => undefined);
+      return { rows: [] };
+    }
     if (sql.includes('clear_tenant_context')) {
       // Post-COMMIT cleanup runs outside the transaction and its timeouts.
       if (mocks.cleanupHang) return new Promise<never>(() => undefined);
@@ -341,6 +348,50 @@ describe('patient crisis admission', () => {
         recording_status: 'recorded',
         escalation_status: 'pending',
         crisis_event_id: '123e4567-e89b-42d3-a456-426614174002',
+      });
+      expect(mocks.release).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(mocks.release).toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns a PT401 raised by COMMIT immediately even when ROLLBACK hangs', async () => {
+    // Codex round 5 on PR #302: after COMMIT rejected, the run still awaited
+    // ROLLBACK with the deadline armed, so a wedged connection let the
+    // deadline fire and overwrite a KNOWN 401 with `unconfirmed` (503). The
+    // outcome is published the instant COMMIT settles; ROLLBACK is bounded
+    // background work and the wedged client is discarded.
+    vi.useFakeTimers();
+    try {
+      mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' });
+      mocks.rollbackHang = true;
+      const pending = admitPatientCareInput(ctx, 'in crisis', 'messaging');
+      // Attach the expectation BEFORE advancing the clock: the rejection
+      // lands in that tick, and an unhandled rejection is a vitest error
+      // even when a handler arrives one microtask later.
+      const rejection = expect(pending).rejects.toMatchObject({ code: 'PT401', statusCode: 401 });
+      await vi.advanceTimersByTimeAsync(0);
+      await rejection;
+      expect(mocks.release).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(mocks.release).toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns a 23514 raised by COMMIT as not_recorded immediately even when ROLLBACK hangs', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.commitError = Object.assign(new Error('crisis_evidence_required'), { code: '23514' });
+      mocks.rollbackHang = true;
+      const pending = admitPatientCareInput(ctx, 'in crisis', 'messaging');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await pending).toMatchObject({
+        recording_status: 'not_recorded',
+        escalation_status: 'not_queued',
       });
       expect(mocks.release).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(2_100);

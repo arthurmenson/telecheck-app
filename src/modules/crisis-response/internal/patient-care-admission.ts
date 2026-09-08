@@ -211,27 +211,50 @@ async function acquireRecordingClient(
 }
 
 /**
- * Consumed background work: clear the tenant binding, then return the
- * client — or discard it if the clear cannot finish inside its bound.
- * Never awaited by the caller, so cleanup can never delay the patient
- * response. I-023 is preserved either way: the binding is cleared, or the
- * backend that held it is destroyed.
+ * Consumed background work: roll back a failed transaction, clear the
+ * tenant binding, then return the client — or discard it if that cannot
+ * finish inside its bound. Never awaited by the caller, so neither ROLLBACK
+ * nor cleanup can delay the patient response. I-023 is preserved either
+ * way: the binding is cleared, or the backend that held it is destroyed.
+ *
+ * ROLLBACK lives here, not on the response path, because the outcome is
+ * already known the instant COMMIT rejects: the server has aborted the
+ * transaction. Awaiting ROLLBACK before publishing that outcome let a
+ * stalled connection run into the still-armed deadline and overwrite a
+ * known PT401 (401) or 23514 (not_recorded) with `unconfirmed`. (Codex
+ * round 5 on PR #302.)
+ *
+ * On a caller-owned connection the ROLLBACK is still issued — leaving the
+ * transaction aborted would break the caller's next statement — but the
+ * connection is never returned or destroyed by this module.
  */
 function finalizeRecordingClient(
   client: RecordingClient,
   owned: boolean,
   run: Promise<unknown>,
+  rollback: boolean,
 ): void {
   const settledRun = run.then(
     () => undefined,
     () => undefined,
   );
-  if (!owned) return;
+  const rolledBack = rollback
+    ? settledRun
+        .then(() => client.query('ROLLBACK'))
+        .then(
+          () => undefined,
+          () => undefined,
+        )
+    : settledRun;
+  if (!owned) {
+    void rolledBack;
+    return;
+  }
   let timer: ReturnType<typeof setTimeout> | null = null;
   const bound = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error('cleanup_deadline')), CLEANUP_DEADLINE_MS);
   });
-  void Promise.race([settledRun.then(() => client.query('SELECT clear_tenant_context()')), bound])
+  void Promise.race([rolledBack.then(() => client.query('SELECT clear_tenant_context()')), bound])
     .then(
       () => client.release?.(),
       () => {
@@ -293,8 +316,9 @@ async function patientTransaction<T>(
       settled = { ok: true, value: result };
       return result;
     } catch (error) {
+      // Publish immediately. ROLLBACK is bounded background work — see
+      // finalizeRecordingClient — never something the response waits on.
       settled = { ok: false, error };
-      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
       if (deadlineTimer !== null) clearTimeout(deadlineTimer);
@@ -303,7 +327,7 @@ async function patientTransaction<T>(
 
   try {
     const value = await Promise.race([run, deadline]);
-    finalizeRecordingClient(client, owned, run);
+    finalizeRecordingClient(client, owned, run, false);
     // `settled` is assigned inside the closure above; read it through a
     // widened alias so control-flow narrowing does not freeze it at null.
     const outcome = settled as Settled<T> | null;
@@ -311,8 +335,15 @@ async function patientTransaction<T>(
   } catch (error) {
     const outcome = settled as Settled<T> | null;
     if (outcome?.ok) {
-      finalizeRecordingClient(client, owned, run);
+      finalizeRecordingClient(client, owned, run, false);
       return outcome.value;
+    }
+    if (outcome && !outcome.ok) {
+      // A KNOWN outcome always wins, even if the deadline also fired while
+      // ROLLBACK was pending: the server has already aborted the
+      // transaction, so this is a 401 / not_recorded, never `unconfirmed`.
+      finalizeRecordingClient(client, owned, run, true);
+      throw mapUnauthenticated(outcome.error);
     }
     if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') {
       // The COMMIT is still in flight. Do not wait for it, and do not
@@ -324,8 +355,8 @@ async function patientTransaction<T>(
       if (owned) client.release?.(true);
       throw error;
     }
-    finalizeRecordingClient(client, owned, run);
-    throw mapUnauthenticated(outcome && !outcome.ok ? outcome.error : error);
+    finalizeRecordingClient(client, owned, run, true);
+    throw mapUnauthenticated(error);
   }
 }
 
