@@ -575,3 +575,25 @@ describe('Codex R12 in-scope closure — a leading U+FEFF in an E-literal is val
     });
   }
 });
+
+describe('Codex R13 in-scope closure — either Unicode-escape width for either surrogate half', () => {
+  for (const [name, pair] of [
+    ['u + u', '\\uD83D\\uDE00'],
+    ['u + U', '\\uD83D\\U0000DE00'],
+    ['U + u', '\\U0000D83D\\uDE00'],
+    ['U + U', '\\U0000D83D\\U0000DE00'],
+  ] as const) {
+    it(`decodes a ${name} surrogate pair and preserves it beside a redaction`, () => {
+      const out = scrubText(`SELECT E'${pair} test.user@example.com';\n`);
+      expect(out).toContain('😀');
+      expect(out).not.toContain('test.user@example.com');
+      const untouched = `SELECT E'${pair} plain';\n`;
+      expect(scrubText(untouched)).toBe(untouched);
+    });
+  }
+  it('lone halves in either width still fail closed', () => {
+    for (const lone of ['\\uD83D', '\\U0000D83D', '\\uDE00', '\\U0000DE00', '\\uD83D\\U0000DE0']) {
+      expect(() => scrubText(`SELECT E'${lone} x';\n`)).toThrow(/invalid UTF-8/);
+    }
+  });
+});

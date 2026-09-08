@@ -402,3 +402,22 @@ test('backup mode: a leading U+FEFF in an E-literal survives redaction (Codex R1
     assert.ok(!stdout.includes('test.user@example.com'));
   }
 });
+
+test('backup mode: surrogate pairs in either escape width (Codex R13)', async () => {
+  for (const pair of [
+    '\\uD83D\\uDE00',
+    '\\uD83D\\U0000DE00',
+    '\\U0000D83D\\uDE00',
+    '\\U0000D83D\\U0000DE00',
+  ]) {
+    const { code, stdout, stderr } = await run(
+      ['--mode', 'backup'],
+      `SELECT E'${pair} test.user@example.com';\n`,
+    );
+    assert.equal(code, 0, `${pair}: ${stderr}`);
+    assert.ok(stdout.includes('😀'), `lost the pair for ${pair}`);
+    assert.ok(!stdout.includes('test.user@example.com'));
+  }
+  const lone = await run(['--mode', 'backup'], "SELECT E'\\U0000D83D x';\n");
+  assert.equal(lone.code, 4);
+});

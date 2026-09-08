@@ -335,10 +335,14 @@ function decodeEscapeLiteral(content: string): string {
             // PostgreSQL accepts a high surrogate only when the very next
             // escape is its low half; a lone half is an error there and a
             // silent U+FFFD here — so fail closed instead.
-            const low = content.slice(i, i + 6).match(/^\\u([Dd][C-Fc-f][0-9A-Fa-f]{2})/);
+            const low = content
+              .slice(i, i + 10)
+              .match(/^\\(?:u([Dd][C-Fc-f][0-9A-Fa-f]{2})|U(0000[Dd][C-Fc-f][0-9A-Fa-f]{2}))/);
             if (!low) throw invalidEscapeSequence();
-            code = 0x10000 + ((code - 0xd800) << 10) + (parseInt(low[1]!, 16) - 0xdc00);
-            i += 6;
+            // Either escape width is accepted for either half (Codex R13).
+            const lowHex = low[1] ?? low[2]!;
+            code = 0x10000 + ((code - 0xd800) << 10) + (parseInt(lowHex, 16) - 0xdc00);
+            i += low[0].length;
           } else if (code >= 0xdc00 && code <= 0xdfff) throw invalidEscapeSequence();
           let cp: string;
           try {
