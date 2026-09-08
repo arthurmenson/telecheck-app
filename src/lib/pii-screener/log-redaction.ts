@@ -138,7 +138,7 @@ import { PII_PATTERNS } from './patterns.js';
  * carries the pattern label so an operator reading the log knows WHAT
  * was scrubbed without seeing the value.
  */
-function redactionToken(label: string): string {
+export function redactionToken(label: string): string {
   return `[REDACTED:${label}]`;
 }
 
@@ -354,7 +354,12 @@ export function redactString(value: string): string {
  * FAILS SAFE — an unparseable line is still scrubbed, it just loses the
  * identifier carve-out.
  */
-export function redactLogLine(line: string): string {
+export function redactLogLine(
+  line: string,
+  redactor: (value: string) => string = redactString,
+  numberRedactor: (rawNumber: string) => string = redactNumericLexeme,
+  options: { preserveNumbers?: boolean } = {},
+): string {
   const trimmed = line.trimEnd();
   const newline = line.slice(trimmed.length);
   if (trimmed.length === 0) return line;
@@ -378,12 +383,17 @@ export function redactLogLine(line: string): string {
       valid = false;
     }
     if (valid) {
-      const scanned = redactJsonStringTokens(trimmed);
+      const scanned = redactJsonStringTokens(
+        trimmed,
+        redactor,
+        numberRedactor,
+        options.preserveNumbers ?? true,
+      );
       if (scanned !== null) return scanned + newline;
     }
     // Not valid JSON — fall through to the whole-line pass.
   }
-  return redactString(trimmed) + newline;
+  return redactor(trimmed) + newline;
 }
 
 /**
@@ -393,7 +403,12 @@ export function redactLogLine(line: string): string {
  * @returns the rewritten JSON text, or `null` if the input is not
  *   well-formed enough to scan (caller falls back to a whole-line pass).
  */
-function redactJsonStringTokens(text: string): string | null {
+function redactJsonStringTokens(
+  text: string,
+  redactor: (value: string) => string,
+  numberRedactor: (rawNumber: string) => string,
+  preserveNumbers: boolean,
+): string | null {
   let out = '';
   let i = 0;
   // Enclosing key per nesting level. An array pushes its own enclosing
@@ -427,7 +442,7 @@ function redactJsonStringTokens(text: string): string | null {
         // Redacting keys is safe for the identifier keys we care about:
         // `consult_id`, `tenant_id`, `route` and friends match no
         // high-confidence pattern, so they pass through unchanged.
-        const redactedKey = redactString(decoded);
+        const redactedKey = redactor(decoded);
         out += redactedKey === decoded ? raw : JSON.stringify(redactedKey);
       } else {
         // EVERY string value is screened. There is no carve-out.
@@ -457,7 +472,7 @@ function redactJsonStringTokens(text: string): string | null {
         // Losing correlation on one identifier occasionally is a better
         // trade than a standing rule that emits caller-influenced values
         // unscreened.
-        out += JSON.stringify(redactString(decoded));
+        out += JSON.stringify(redactor(decoded));
       }
       i = next;
       continue;
@@ -541,7 +556,10 @@ function redactJsonStringTokens(text: string): string | null {
         // (`logger.info({ time: 3125551212 }, 'x')`).
         // Every allowlisted field sits at a fixed position in the record,
         // so requiring the position costs nothing.
-        out += shouldPreserveNumber(keyStack, num.raw) ? num.raw : redactNumericLexeme(num.raw);
+        out +=
+          preserveNumbers && shouldPreserveNumber(keyStack, num.raw)
+            ? num.raw
+            : numberRedactor(num.raw);
         i = num.next;
         continue;
       }

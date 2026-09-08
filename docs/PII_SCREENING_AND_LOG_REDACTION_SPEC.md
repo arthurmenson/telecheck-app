@@ -11,12 +11,14 @@
 ## Threat model
 
 **Threat:** a Pilot 1 volunteer, despite signing the synthetic-participant consent, enters real personal or clinical information into the system. Vectors:
+
 - Chat free-text field (AI Mode 1)
 - Intake form free-text fields
 - Consult decision notes (clinician side)
 - Any free-text response
 
 **Impact if unmitigated:** real PHI enters the substrate that was declared synthetic-only. Data flows to:
+
 - PostgreSQL (persistent) → backups → durable storage
 - AI vendor payloads (Anthropic API + telemetry)
 - Pino logs → stdout → `docker logs` → potentially external log aggregation
@@ -36,18 +38,19 @@
 
 The original enumeration in this spec assumed four screenable routes. Implementation (Sprint 1.1c, 2026-08-31) established that **only one route in the current codebase exposes plaintext free-text to the server**:
 
-| Route | Free-text posture | Layer 1 screenable? |
-|---|---|---|
-| `POST /v0/ai/chat` (Mode 1) | **Plaintext** `message_text` in request body | ✅ **YES — wired Sprint 1.1c** |
-| `POST /v1/async-consults/:id/intake` | Pre-encrypted 8-field KMS envelope (`intake_payload_envelope`) per I-026 | ❌ NO — server never sees plaintext |
-| `POST /v1/async-consults/:id/decision` | Pre-encrypted 8-field KMS envelope (`decision_rationale_envelope`) per I-026 | ❌ NO — server never sees plaintext |
-| `POST /v1/async-consults/:id/follow-up-messages` | Pre-encrypted 8-field KMS envelope (`message_envelope`) per I-026 | ❌ NO — server never sees plaintext |
+| Route                                            | Free-text posture                                                            | Layer 1 screenable?                 |
+| ------------------------------------------------ | ---------------------------------------------------------------------------- | ----------------------------------- |
+| `POST /v0/ai/chat` (Mode 1)                      | **Plaintext** `message_text` in request body                                 | ✅ **YES — wired Sprint 1.1c**      |
+| `POST /v1/async-consults/:id/intake`             | Pre-encrypted 8-field KMS envelope (`intake_payload_envelope`) per I-026     | ❌ NO — server never sees plaintext |
+| `POST /v1/async-consults/:id/decision`           | Pre-encrypted 8-field KMS envelope (`decision_rationale_envelope`) per I-026 | ❌ NO — server never sees plaintext |
+| `POST /v1/async-consults/:id/follow-up-messages` | Pre-encrypted 8-field KMS envelope (`message_envelope`) per I-026            | ❌ NO — server never sees plaintext |
 
 The async-consult family encrypts client-side per I-026 (KMS envelope posture; `v1-shared.ts`). The backend receives ciphertext + DEK id + IV + tag and stores it verbatim. There is no plaintext for a server-side screener to inspect — this is not a wiring gap, it is the architecture working as designed.
 
 ### Consequence — client-side screening gap (Pilot 1 open item)
 
 Layer 1 as implemented protects the Mode 1 chat route ONLY. For the async-consult routes, PII screening must run **client-side, before encryption**, in:
+
 - `telecheck-patient-app` (Expo/React Native) — intake form + follow-up message composer
 - `telecheck-clinician-console` (Vite/React) — decision-rationale composer
 
@@ -60,8 +63,9 @@ That is **Track 4 work**, not backend work. It is a **Pilot 1 startup-authorizat
 - `POST /v0/ai/chat` — `message_text` field. **Route class: `ai_bound`** (reaches Anthropic / Bedrock / Azure on the non-crisis path), so ANY hit blocks per the decision matrix.
 
 **Ordering invariant (Sprint 1.1c, non-negotiable):** the screener runs **AFTER** the I-019 crisis gate and **BEFORE** Stage-2 validation / persistence / the LLM call.
-- *After the crisis gate* because I-019 / FLOOR-013 is platform-floor: crisis detection must run on raw text and must not be suppressible. A distressed participant who also typed real PII still gets the crisis sentinel + Category A audit. The crisis path makes no LLM call (AI_LAYERING §6 crisis-write exception), so no PII crosses the provider boundary on it.
-- *Before persistence + LLM call* on the non-crisis path, so a blocked turn never persists and the provider never sees the text.
+
+- _After the crisis gate_ because I-019 / FLOOR-013 is platform-floor: crisis detection must run on raw text and must not be suppressible. A distressed participant who also typed real PII still gets the crisis sentinel + Category A audit. The crisis path makes no LLM call (AI_LAYERING §6 crisis-write exception), so no PII crosses the provider boundary on it.
+- _Before persistence + LLM call_ on the non-crisis path, so a blocked turn never persists and the provider never sees the text.
 
 **Accepted residual risk (documented, not hidden):** a crisis-positive turn that ALSO contains real PII persists the raw `user_message` into `ai_mode1_conversation_turn_admission`. The crisis floor outranks the PII block by design. Mitigations: Layer 3 log redaction, Layer 5 backup redaction, and the IR runbook Category 1 CRITICAL path (capture → purge). Test `PII-6` in `tests/integration/ai-service-mode-1-chat-http.test.ts` pins this ordering invariant.
 
@@ -84,7 +88,7 @@ That is **Track 4 work**, not backend work. It is a **Pilot 1 startup-authorizat
    - **Adversarial test required:** integration test proving raw candidate text never egresses to any external provider from within the Layer 1 code path
 
 3. **Decision (routes that eventually reach an external AI provider — `POST /v1/ai/mode1/turns` and any other AI-bound endpoint):**
-   - Regex hit OR ANY local-NER hit (high OR low confidence) → **BLOCK** with 422 + machine-readable reason + participant-visible message: *"This looks like real personal information. Pilot 1 uses synthetic data only. Please re-enter with synthetic values (see participant kit)."*
+   - Regex hit OR ANY local-NER hit (high OR low confidence) → **BLOCK** with 422 + machine-readable reason + participant-visible message: _"This looks like real personal information. Pilot 1 uses synthetic data only. Please re-enter with synthetic values (see participant kit)."_
    - No hit → pass through
 
    **Invariant:** on AI-bound routes, low-confidence NER hits are NEVER admitted to the request handler. Prose-form real names and addresses trigger NER but not regex; if they were admitted with only a warn, they could reach Layer 4 (which is regex-only) and cross into the provider payload. Blocking on any NER hit for AI-bound routes closes that path.
@@ -97,6 +101,7 @@ That is **Track 4 work**, not backend work. It is a **Pilot 1 startup-authorizat
 **Sprint 1 phasing note:** if a production-quality local NER classifier is not available in the first shipped PR (Sprint 1.1a-b), the initial implementation uses **regex-only** with a conservative pattern set + explicit gate that Pilot 1 Day-0 dry run does NOT authorize until the local NER classifier ships. The regex-only interim is safe because it fail-closes (it does not send candidate text anywhere) — it may under-catch prose-form PII but never leaks candidate content to a provider. **The provider boundary is only opened for participants after the local NER classifier ships.**
 
 **Response contract:**
+
 ```json
 {
   "error": "pii.screener.block",
@@ -116,12 +121,12 @@ That is **Track 4 work**, not backend work. It is a **Pilot 1 startup-authorizat
 
 As with the Layer 1 ingress sweep, the assumed surface was wider than the real one. Actual response-side plaintext:
 
-| Egress surface | Content | Screenable? |
-|---|---|---|
-| Mode 1 `response_text` | **model-generated prose** | ✅ **YES — wired Sprint 1.1d** |
-| async-consult reads (consult / follow-up / decision) | pre-encrypted KMS envelopes (I-026) | ❌ ciphertext |
-| Admin dashboards (`consult-queue-health`, `crisis-operational-health`, `mode1-volume-health`) | aggregate counts | ❌ no free-text echo |
-| Mode 1 crisis sentinel | fixed server-side constant `CRISIS_RESPONSE_TEXT` | ❌ not user-derived |
+| Egress surface                                                                                | Content                                           | Screenable?                    |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------ |
+| Mode 1 `response_text`                                                                        | **model-generated prose**                         | ✅ **YES — wired Sprint 1.1d** |
+| async-consult reads (consult / follow-up / decision)                                          | pre-encrypted KMS envelopes (I-026)               | ❌ ciphertext                  |
+| Admin dashboards (`consult-queue-health`, `crisis-operational-health`, `mode1-volume-health`) | aggregate counts                                  | ❌ no free-text echo           |
+| Mode 1 crisis sentinel                                                                        | fixed server-side constant `CRISIS_RESPONSE_TEXT` | ❌ not user-derived            |
 
 ### Threat model — what Layer 2 actually defends against
 
@@ -135,7 +140,7 @@ By the time content reaches egress the work is already done — the LLM has been
 
 **Contract:** `screenOutput(text) → { hits, output, redacted }`. There is deliberately **no `action` field** — the only outcomes are redacted-or-not. Pinned by test.
 
-**Both surfaces receive the redacted text.** The Mode 1 handler assigns `egress.output` to *both* `responseText` (what the participant sees) and `persistedAssistantMessage` (what lands in `turn_result`). They must not diverge — a later reader of the stored turn should see exactly what the participant saw.
+**Both surfaces receive the redacted text.** The Mode 1 handler assigns `egress.output` to _both_ `responseText` (what the participant sees) and `persistedAssistantMessage` (what lands in `turn_result`). They must not diverge — a later reader of the stored turn should see exactly what the participant saw.
 
 **How:** same regex + **local NER** stack as Layer 1, with the identical prohibition on external-provider classification.
 
@@ -159,14 +164,15 @@ Therefore `audit_bound` **blocks on ANY hit, high or low confidence**, before th
 
 ### Decision matrix (complete, all three classes)
 
-| Route class | Any hit | Rationale |
-|---|---|---|
-| `ai_bound` | **BLOCK** | Content reaches an external provider with no BAA |
-| `audit_bound` | **BLOCK** | Content reaches append-only, purge-exempt storage |
-| `internal` + high-confidence | **BLOCK** | Persists to DB, but purgeable |
-| `internal` + low-confidence only | **REDACT INLINE** | Preserves workflow; purgeable |
+| Route class                      | Any hit           | Rationale                                         |
+| -------------------------------- | ----------------- | ------------------------------------------------- |
+| `ai_bound`                       | **BLOCK**         | Content reaches an external provider with no BAA  |
+| `audit_bound`                    | **BLOCK**         | Content reaches append-only, purge-exempt storage |
+| `internal` + high-confidence     | **BLOCK**         | Persists to DB, but purgeable                     |
+| `internal` + low-confidence only | **REDACT INLINE** | Preserves workflow; purgeable                     |
 
 **Decision:**
+
 - Regex or high-confidence LLM hit → **REDACT** the specific token with `[REDACTED:PII]`
 - Log the redaction as `pii.screener.egress_redact` audit event
 - Never expose real PII to the clinician console even if it slipped past Layer 1
@@ -198,7 +204,7 @@ Both are structural, so the mitigation is structural.
 
 `hooks.logMethod` is the obvious seam and it is the wrong one. Two reasons, both surfaced by Codex review of the first implementation:
 
-- **It runs BEFORE pino's serializers.** Fastify's `req`/`res` serializers turn request objects into log records *after* the hook has run — so anything a serializer produces is never seen. That includes **the request URL with its query string**, which is entirely client-controlled. `/?email=real.person@example.com` was a live leak vector under the hook design.
+- **It runs BEFORE pino's serializers.** Fastify's `req`/`res` serializers turn request objects into log records _after_ the hook has run — so anything a serializer produces is never seen. That includes **the request URL with its query string**, which is entirely client-controlled. `/?email=real.person@example.com` was a live leak vector under the hook design.
 - **Rebuilding objects there corrupts them.** Fastify request properties (`method`, `url`, `headers`, `host`, `ip`) are prototype getters. `Object.entries()` does not copy prototype getters, so cloning the request into a plain object hands the downstream serializer a structurally damaged input, producing empty or incomplete request records — deleting exactly the diagnostics an incident needs.
 
 Redacting at the destination stream avoids both: the line is already fully serialized (serializer output, child bindings, and message all present), and no live object is ever touched.
@@ -207,13 +213,13 @@ Redacting at the destination stream avoids both: the line is already fully seria
 
 Each line is scanned as text and **only its string tokens are rewritten**. Every number, boolean, null and structural character is copied byte-for-byte.
 
-The obvious implementation — `JSON.parse` → walk → `JSON.stringify` — is **lossy, and silently so**: parse coerces every JSON number to an IEEE-754 double, so any integer beyond `Number.MAX_SAFE_INTEGER` (a 64-bit id, a nanosecond timestamp, a BigInt-backed counter) is rounded on the way out. Parsing succeeds, so no failure sentinel fires — the value is just quietly wrong. Corrupting an identifier *inside the redaction layer* would destroy exactly the correlation evidence an incident depends on.
+The obvious implementation — `JSON.parse` → walk → `JSON.stringify` — is **lossy, and silently so**: parse coerces every JSON number to an IEEE-754 double, so any integer beyond `Number.MAX_SAFE_INTEGER` (a 64-bit id, a nanosecond timestamp, a BigInt-backed counter) is rounded on the way out. Parsing succeeds, so no failure sentinel fires — the value is just quietly wrong. Corrupting an identifier _inside the redaction layer_ would destroy exactly the correlation evidence an incident depends on.
 
 The scanner tracks the enclosing key path for each value. That path is used **only** for the numeric allowlist below; string values and property names are screened unconditionally regardless of where they sit.
 
 It is a single O(n) pass with an explicit stack, so the depth bound an earlier recursive implementation needed is gone entirely rather than merely tuned.
 
-`JSON.parse` runs first purely as a **validity gate** and its result is discarded. Without it, JSON-*like* but invalid text (`{email:real.person@example.com}`) reached the token scanner, which found no quoted token to rewrite and copied the line through verbatim.
+`JSON.parse` runs first purely as a **validity gate** and its result is discarded. Without it, JSON-_like_ but invalid text (`{email:real.person@example.com}`) reached the token scanner, which found no quoted token to rewrite and copied the line through verbatim.
 
 Non-JSON lines (a pretty-print transport, a non-JSON warning) fall back to a whole-line regex scrub — **fail safe**: everything is scrubbed, including values the numeric allowlist would have preserved in a well-formed record. Batched multi-line chunks are handled per line, preserving framing.
 
@@ -223,7 +229,7 @@ Layers 1 and 2 run regex + local NER. Layer 3 runs regex only:
 
 - **Cost.** NER is model inference. Logs are high-volume and on the hot path.
 - **Precision.** NER's PERSON/GPE/ORG classes would fire on the operational vocabulary logs are made of — role names, tenant identifiers, provider names, module names. Redacting those destroys debuggability while protecting nothing.
-- **Value.** What actually shows up in a leaked log line is *structured* identifiers — SSN, email, phone, card. Regex's strength.
+- **Value.** What actually shows up in a leaked log line is _structured_ identifiers — SSN, email, phone, card. Regex's strength.
 
 ### Pattern selection is its own axis — `redactInLogs`, not `confidence`
 
@@ -242,11 +248,11 @@ Set `redactInLogs: false` only when a match is more likely to be an operational 
 
 Three successive designs were tried and each was found bypassable:
 
-| Design | Bypass |
-|---|---|
+| Design                                          | Bypass                                                                                                                                                                                    |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Key name only (`*_id` suffix + an explicit set) | `{"request_id":"person@example.com"}` — the value is caller-shaped even when the key is not. `url` in the same set was a live leak, since its query string is entirely client-controlled. |
-| Key name **and** UUID/ULID value shape | A ULID is 26 chars of Crockford base32, so one containing a nine-digit SSN substring is still syntactically valid and was emitted verbatim. |
-| Either, applied inside containers | Array frames inherited the enclosing key, and nested arrays re-inherited it, so `{"request_id":[["person@example.com"]]}` preserved the email. |
+| Key name **and** UUID/ULID value shape          | A ULID is 26 chars of Crockford base32, so one containing a nine-digit SSN substring is still syntactically valid and was emitted verbatim.                                               |
+| Either, applied inside containers               | Array frames inherited the enclosing key, and nested arrays re-inherited it, so `{"request_id":[["person@example.com"]]}` preserved the email.                                            |
 
 The pattern is the lesson: inferring trust from a key name or a value shape is the wrong instinct for a layer whose entire premise is that Layers 1 and 2 already failed. Each carve-out was one more thing to get right, and each was gotten wrong.
 
@@ -262,13 +268,13 @@ Numeric lexemes are screened **as text and never parsed**, so a non-matching num
 
 The exemption is a small, closed, explicit allowlist requiring **both** an exact root-relative path (case-sensitive) **and** a value inside that field's real domain:
 
-| Path | Written by | Accepted domain |
-|---|---|---|
-| `time` | pino, per record | integer ms epoch, 2010-01-01 … 2100-01-01 |
-| `pid` | pino, per record | integer 1 … 4,194,304 (Linux PID max) |
-| `level` | pino, per record | integer 0 … 100 |
-| `responseTime` | Fastify | finite, 0 … 24h in ms |
-| `statusCode`, `res.statusCode` | Fastify | integer 100 … 599 |
+| Path                           | Written by       | Accepted domain                           |
+| ------------------------------ | ---------------- | ----------------------------------------- |
+| `time`                         | pino, per record | integer ms epoch, 2010-01-01 … 2100-01-01 |
+| `pid`                          | pino, per record | integer 1 … 4,194,304 (Linux PID max)     |
+| `level`                        | pino, per record | integer 0 … 100                           |
+| `responseTime`                 | Fastify          | finite, 0 … 24h in ms                     |
+| `statusCode`, `res.statusCode` | Fastify          | integer 100 … 599                         |
 
 Three properties matter, and each closes a bypass found in review:
 
@@ -276,9 +282,9 @@ Three properties matter, and each closes a bypass found in review:
 - **Not depth-blind.** A bare key set let a caller-shaped subtree shadow a trusted name — `{"payload":{"time":3125551212}}` emitted a phone number because the inner key spelled `time`. An array frame has no key, so nothing inside one can resolve to an allowlisted path.
 - **Position is not provenance.** Path alone still trusts location over origin. The scanner sees serialized bytes and cannot tell whether pino wrote a root field or an application merge object collided with the name — `logger.info({ time: 3125551212 }, 'x')` puts a phone number at root `time`. The domain test is what actually closes this, and it is available precisely because these fields are machine-written with narrow ranges. Nothing matching `us_ssn` (9 digits) or `us_phone` (10 digits) fits any domain above.
 
-`time` deliberately does **not** accept an epoch in *seconds*: a 10-digit seconds epoch is indistinguishable from a bare phone number, and admitting that range would reopen the hole. If pino is ever reconfigured to seconds, timestamps get redacted — loud, safe, and immediately noticeable.
+`time` deliberately does **not** accept an epoch in _seconds_: a 10-digit seconds epoch is indistinguishable from a bare phone number, and admitting that range would reopen the hole. If pino is ever reconfigured to seconds, timestamps get redacted — loud, safe, and immediately noticeable.
 
-**Known residual, and why it is the floor.** A 13-digit Luhn-valid integer inside the epoch window is preserved at `time`. This is not closable: a legitimate ms epoch *is* a 13-digit integer in that window, and about one in ten is Luhn-valid by chance. Distinguishing it from a 13-digit card number is impossible from the value alone, and screening it is what mangled `time` on ~10% of lines in the first place. Every other field's domain excludes every high-confidence pattern outright.
+**Known residual, and why it is the floor.** A 13-digit Luhn-valid integer inside the epoch window is preserved at `time`. This is not closable: a legitimate ms epoch _is_ a 13-digit integer in that window, and about one in ten is Luhn-valid by chance. Distinguishing it from a 13-digit card number is impossible from the value alone, and screening it is what mangled `time` on ~10% of lines in the first place. Every other field's domain excludes every high-confidence pattern outright.
 
 ### Chunk boundaries and oversized records
 
@@ -290,13 +296,14 @@ On a record exceeding the per-record cap, the stream **drops the record and emit
 
 An earlier implementation walked the parsed record recursively and needed a depth bound; at the bound it returned the raw subtree, which let 33 nested containers followed by an email deterministically bypass Layer 3. The token scanner removed the need for a bound at all — it is iterative with an explicit stack, so arbitrarily nested input is handled in a single linear pass with no recursion to guard.
 
-The  payload walker still fails closed by *rejecting the request*, because it is genuinely recursive over caller-supplied JSON and rejecting an over-deep audit payload costs only one API call.
+The payload walker still fails closed by _rejecting the request_, because it is genuinely recursive over caller-supplied JSON and rejecting an over-deep audit payload costs only one API call.
 
 ## Layer 4 — AI vendor payload sanitization
 
 **Where:** real clinical completions resolved by `src/modules/ai-service/internal/providers/resolve-clinical-provider.ts`, for both the admin-managed DB credential and environment fallback. The current caller is Mode 1 chat; Mode 2 still uses the Null provider. The admin credential test sends only the fixed literal `ping` and carries no patient input. New adapters, workloads or prompt-bearing paths must establish their attribution contract and use the boundary before activation.
 
 **How:** the input screener at Layer 1 has already blocked or warned on suspected PHI before the request handler runs. Layer 4 is defense-in-depth on the egress side:
+
 - Re-run **regex-only** screening (never NER — Layer 1's NER may not have been invoked on system-generated prompt scaffolding that only Layer 4 sees) against the assembled outbound prompt (system prompt + prior turns + current turn + tool inputs)
 - If any high-confidence regex pattern fires in the outbound payload, do NOT send the prompt — return `500 ai.provider.egress_blocked` to the caller with audit event `pii.screener.egress_block`
 - Redact any lower-confidence regex hit with `[REDACTED:PII]` before send and emit `pii.screener.egress_redact` audit event
@@ -322,6 +329,10 @@ The Mode 1 recorder commits through an independent transaction before a redacted
 
 **Nuance:** this layer degrades Pilot 1 backup fidelity slightly (redactions in the dump), which is acceptable because Pilot 1 has no PHI worth preserving faithfully anyway.
 
+**Implementation (Sprint 1.2c, dump-aware after Codex R1):** the scrub is NOT a regex pass over serialized dump text — that both misses PII hidden behind COPY/JSON/bytea escaping and corrupts syntax (`'{}'::jsonb` matches the IPv6 pattern). `src/lib/pii-screener/dump-scrub.ts` scrubs only inside **decoded values**: COPY fields (text-format escapes decoded and re-encoded; `\N` kept; JSON fields through the JSON-aware scanner with the whole library — strings and property names scrubbed, non-matching numbers verbatim, a matching number replaced by 0 so it stays a number, output stays valid JSON; a bare numeric field that matches a pattern is replaced by 0 so the column stays typed; bytea hex that decodes to printable UTF-8 is scrubbed as text and re-hexed, other bytea passes through) and SQL string literals (`''` and `E'...'` escapes decoded/re-encoded, literals may span lines); dollar-quoted function bodies, comments, identifiers, casts and bare numbers are never touched. A real `pg_dump → pii-scrub → psql` round-trip test restores a scrubbed dump into a scratch database and asserts schema, counts, types and zero survival of seeded PII in text/JSON/bytea columns. The wrapper refuses `pg_dump` options that bypass the pipe (`-f/--file`, non-plain `-F/--format`, `-Z/--compress`, `-j/--jobs`, `-E/--encoding`), forces `--format=plain --encoding=UTF8`, refuses an empty dump, and stages artifact + manifest so a failure after publication started withdraws this run's files.
+
+**Implementation (Sprint 1.2c):** `scripts/backup-redacted.sh <out-dir>` = `pg_dump | node --import tsx scripts/pii-scrub.mjs --mode backup | age -R $AGE_RECIPIENTS_FILE`, structurally verified (non-empty, canonical `age-encryption.org/v1` header, ciphertext ≥ plaintext bytes) before the artifact and its manifest are finalized; any stage failure removes the partial artifact and exits non-zero. The scrub runs the **whole** regex library (`src/lib/pii-screener/backup-redaction.ts`, `redactForBackup`) — not Layer 3's `redactInLogs` subset, so IP addresses are redacted here — with the same `validate` hook and token, and it **fails closed** on an oversized line (default cap 64 MiB, `--max-line-bytes`) rather than dropping it. Regex-only: NER is not on this path (Layer 3 is ratified regex-only; the local NER decision is unratified). Tests: `backup-redaction.test.ts` (library completeness — a new pattern must add a sample), `scripts/pii-scrub.test.mjs` (adversarial pg_dump fixture, 100% recall, chunk boundaries, oversized-line failure), `scripts/backup-redacted.test.mjs` (wrapper with stubbed `pg_dump`/`age`). `--mode log` exposes Layer 3's JSON-aware pass for Sprint 1.3's incident capture.
+
 ---
 
 ## Environment purge/reset procedure
@@ -345,6 +356,7 @@ The Mode 1 recorder commits through an independent transaction before a redacted
 - **Incident-mode:** `bash scripts/pilot-1-env-purge.sh --incident-id <id>` — READS `/home/deploy/incident-logs/` to verify preconditions (manifest existence/status/freshness/identity/inventory/consumed=false; lock's incidentId matches). Executes purge. Emits **an append-only DB audit event `env.purge.executed`** with `{incidentId, purgedAt, actor}` into `audit_records` (which is I-003 append-only + preserved across purge by design). **Env-purge writes zero files, zero modifications, zero deletions under `/home/deploy/incident-logs/`.** The audit event is the sole attestation that this incident's purge ran; `incident-clear.sh` verifies it. Mismatched lock → refuse (protects against invoking purge with wrong incident id while a different incident is open).
 
 **Incident-mode preconditions checked at script start (fail-closed):**
+
 - **Manifest existence:** `/home/deploy/incident-logs/<id>.manifest.json` must exist. Missing manifest → refuse.
 - **Manifest status:** must contain `"status": "SUCCESS"`. Any other value (including missing / FAILED / IN_PROGRESS / null) → refuse.
 - **Manifest freshness:** manifest's `capturedAt` timestamp must be within 30 minutes of the purge invocation. Stale manifest → refuse. (Rationale: an old incident's manifest cannot authorize purge for a new incident.)
@@ -360,6 +372,7 @@ The purge script itself performs NO raw evidence capture. Any forensic artifact 
 **Purge table classification policy (spec = policy; Sprint 1.3 implementation PR = FK-graph resolution):**
 
 This specification defines POLICY:
+
 - Participant-data tables are removed to reset the environment
 - Schema fixtures, tenant baseline, and immutable evidence (`audit_records`, `audit_dedupe_markers`, `domain_events_outbox`) are preserved
 - No blanket truncation — every table must be classified explicitly as one of: **`allowlist`** (participant-only; TRUNCATE), **`preserved`** (never touched), or **`scoped-delete`** (mixed baseline + participant; DELETE with WHERE preserving baseline rows)
@@ -367,6 +380,7 @@ This specification defines POLICY:
 - The complete FK-aware purge plan (all TRUNCATEs + all scoped DELETEs) executes in a SINGLE transaction with the attestation — failure of any step rolls back all mutations AND the attestation atomically
 
 The **FK-graph resolution** (what SQL operation on which tables in which order) is the responsibility of the Sprint 1.3 implementation PR, which:
+
 1. Enumerates every table in migrations 000–HEAD
 2. Classifies each as one of the three: **`allowlist`** (participant-only; TRUNCATE) / **`preserved`** (never touched) / **`scoped-delete`** (mixed baseline + participant; DELETE WHERE clause preserves baseline rows)
 3. Models the FK edges between classifications
@@ -376,6 +390,7 @@ The **FK-graph resolution** (what SQL operation on which tables in which order) 
 **Three-state cohort classification (canonical data model for Pilot 1 accounts):**
 
 Every row in `accounts` MUST be in exactly one of three states:
+
 - **`participant`** — a Pilot-1 participant (patient or delegate) whose data is purged by env-purge
 - **`baseline`** — a legitimate baseline account (a `clinician`, `tenant_admin`, `platform_admin`, service account, OR a `patient`/`delegate` seeded for baseline test purposes — e.g., a synthetic patient identity used to seed a fixture that other participants reference). Preserved by env-purge.
 - **`unclassified`** — a row that has neither classification. Any `unclassified` row is a data-model defect: either provisioning failed to assign a classification, or a manual database write bypassed the provisioning path.
@@ -388,17 +403,18 @@ Every row in `accounts` MUST be in exactly one of three states:
 
 **Purge predicate:** `DELETE FROM accounts WHERE cohort_classification = 'participant'`. Never touches `baseline` or `unclassified`. (If `unclassified` exists, the verifier preflight has already refused the purge with an actionable message.)
 
-**Remediation contract:** `scripts/pilot-1-marker-remediation.sh --account-id <id> --classify-as {participant|baseline} --reason "..."` — the ONLY authorized route for classifying an `unclassified` account. Each invocation is audit-logged as `pilot_1.cohort_classification{accountId, classifiedAs, actor, reason}`. Once classified, the account joins its class permanently. Reclassification requires a separate audit-logged decision.
-6. Produces the CI test suite that verifies (a) schema-drift classification completeness, (b) canary purge behavior across all three classifications, (c) no FK edge crosses from preserved-scope evidence into truncated-scope data (or, if intentional, is documented + tested for correct scoped-DELETE handling), (d) mixed-baseline-table safeguard: known mixed-baseline tables (`accounts` at minimum) MUST be classified `scoped-delete`; CI test rejects any classification of `accounts` as `allowlist`.
+**Remediation contract:** `scripts/pilot-1-marker-remediation.sh --account-id <id> --classify-as {participant|baseline} --reason "..."` — the ONLY authorized route for classifying an `unclassified` account. Each invocation is audit-logged as `pilot_1.cohort_classification{accountId, classifiedAs, actor, reason}`. Once classified, the account joins its class permanently. Reclassification requires a separate audit-logged decision. 6. Produces the CI test suite that verifies (a) schema-drift classification completeness, (b) canary purge behavior across all three classifications, (c) no FK edge crosses from preserved-scope evidence into truncated-scope data (or, if intentional, is documented + tested for correct scoped-DELETE handling), (d) mixed-baseline-table safeguard: known mixed-baseline tables (`accounts` at minimum) MUST be classified `scoped-delete`; CI test rejects any classification of `accounts` as `allowlist`.
 
 Illustrative classification below reflects a first-pass reading of migrations 000–079. Sprint 1.3 PR revises it against actual FK graph and adds the operational plan (TRUNCATE vs scoped DELETE) per table.
 
 **Illustrative classification (verified against migrations 000–079 as of 2026-08-30; Sprint 1.3 PR must re-verify against migrations at merge time):**
 
 **Classification `scoped-delete` (mixed baseline + participant — DELETE WHERE preserves baseline):**
+
 - `accounts` — DELETE WHERE `cohort_classification = 'participant'`. Preserves `baseline` rows (all clinician/admin/service + any patient/delegate seeded as baseline test fixture). `unclassified` rows are impossible at purge time because verifier preflight refuses purge when they exist. Sprint 1.3 adds the `cohort_classification` column via migration with NOT NULL + CHECK constraints + operator-reviewed backfill.
 
 **Classification `allowlist` (participant-only — TRUNCATE):**
+
 - **Identity + auth (participant-only child tables):** `sessions`, `otp_challenges`, `auth_devices`, `account_pin_credentials`, `email_passcodes` — these have FK to `accounts`; dependency order: TRUNCATE these BEFORE the `accounts` scoped-DELETE (or handle via DELETE-then-DELETE with correct ordering)
 - **Consent (participant records only; schema `consent_versions` preserved):** `consent`, `delegations`, `delegation_scopes`
 - **Forms + intake:** `forms_submission`, `forms_resume_state`, `consult_intake_submission`
@@ -412,6 +428,7 @@ Illustrative classification below reflects a first-pass reading of migrations 00
 - **Redis:** FLUSHALL (Redis is cache/queues; nothing there is source of truth)
 
 **Explicitly PRESERVED (never truncated by env-purge):**
+
 - `audit_records` — I-003 append-only; vehicle for `env.purge.executed` attestation + `env.incident.abandoned` and all other audit events. Truncating would break the manifest-clear flow AND violate I-003.
 - `audit_dedupe_markers` — companion to audit_records (dedup discipline requires preservation across purge)
 - `tenants`, `tenant_brands`, `tenant_users`, `country_profiles`, `ccr_configs`, `adapter_configs` — tenant baseline
@@ -438,10 +455,10 @@ Illustrative classification below reflects a first-pass reading of migrations 00
 
    Run env-purge (both modes: routine-reset from clean; incident-mode with manifest); verify (a) every `allowlist`-canary is GONE, (b) every `preserved`-canary is INTACT, (c) every `scoped-delete`-canary matches expectation per above enumeration, (d) `audit_records` contains the `env.purge.executed` event with matching incidentId (incident-mode only), (e) no orphaned FK rows across the entire schema post-purge, (f) no baseline account of ANY type deleted under any code path.
 
-5. **Cohort-classification integrity test:** every account-creation path in Pilot-1 baseline-seed + participant-provisioning flows MUST atomically write `cohort_classification` as part of the same INSERT. CI test enumerates every code path that inserts into `accounts` under Pilot-1 seed/provisioning; asserts each writes the classification in the same statement. Additionally, CI test attempts a raw INSERT omitting the classification column — the NOT NULL schema constraint MUST reject it. FAIL if either path allows an `unclassified` account to be created.
+4. **Cohort-classification integrity test:** every account-creation path in Pilot-1 baseline-seed + participant-provisioning flows MUST atomically write `cohort_classification` as part of the same INSERT. CI test enumerates every code path that inserts into `accounts` under Pilot-1 seed/provisioning; asserts each writes the classification in the same statement. Additionally, CI test attempts a raw INSERT omitting the classification column — the NOT NULL schema constraint MUST reject it. FAIL if either path allows an `unclassified` account to be created.
 
-6. **Day-0 + runtime classification-integrity gate:** the Pilot-1 startup authorization checklist (see `PATH_A_PILOT_COMPLETION_RUNBOOK.md` §Pilot 1 startup authorization checklist) has a required check: at Day-0 dry-run start, script `scripts/verify-pilot-1-baseline.sh` runs `SELECT COUNT(*), array_agg(id) FROM accounts WHERE cohort_classification = 'unclassified'` — count MUST be 0; any offending account IDs are surfaced. Same script runs as env-purge preflight (both modes) and as post-provisioning verifier — any nonzero count refuses purge / rolls back provisioning with actionable message pointing to `scripts/pilot-1-marker-remediation.sh`.
-4. **Attestation-transaction test:** verify FK-aware atomic purge rollback across BOTH operation kinds:
+5. **Day-0 + runtime classification-integrity gate:** the Pilot-1 startup authorization checklist (see `PATH_A_PILOT_COMPLETION_RUNBOOK.md` §Pilot 1 startup authorization checklist) has a required check: at Day-0 dry-run start, script `scripts/verify-pilot-1-baseline.sh` runs `SELECT COUNT(*), array_agg(id) FROM accounts WHERE cohort_classification = 'unclassified'` — count MUST be 0; any offending account IDs are surfaced. Same script runs as env-purge preflight (both modes) and as post-provisioning verifier — any nonzero count refuses purge / rolls back provisioning with actionable message pointing to `scripts/pilot-1-marker-remediation.sh`.
+6. **Attestation-transaction test:** verify FK-aware atomic purge rollback across BOTH operation kinds:
    - Inject a failure AFTER at least one successful `TRUNCATE` on an `allowlist` table but before COMMIT — verify the entire transaction rolls back: audit event GONE + truncated table's rows RESTORED + purge exits non-zero
    - Inject a failure AFTER at least one successful scoped `DELETE` on a `scoped-delete` table but before COMMIT — verify the same: audit event GONE + deleted rows RESTORED + purge exits non-zero
    - Inject a failure INSIDE the audit event INSERT — verify no participant mutation occurred + purge exits non-zero
@@ -451,6 +468,7 @@ Illustrative classification below reflects a first-pass reading of migrations 00
 **Attestation transaction (FK-aware):** the `env.purge.executed` audit event is inserted BEFORE any participant-data mutation, in the same transaction as the complete FK-aware purge plan. Order: BEGIN → INSERT `env.purge.executed` audit event → execute the complete purge plan (all `TRUNCATE` operations for `allowlist` tables in FK dependency order + all `DELETE ... WHERE` operations for `scoped-delete` tables per their scoping predicate) → COMMIT. Any error at any step rolls back the entire transaction including the attestation — no false attestation, no partial participant deletion. Second stage (reseed) is a separate transaction executed only after successful COMMIT.
 
 **Steps:**
+
 1. `docker compose exec app pkill -TERM node` (graceful app shutdown)
 2. `docker compose stop app` (freeze app container)
 3. `docker compose exec db psql -U telecheck telecheck` — single atomic transaction: BEGIN → INSERT `env.purge.executed` audit event → execute complete FK-aware purge plan (all TRUNCATEs + all scoped DELETEs per the Sprint 1.3 classification map) → COMMIT. On any error, transaction rolls back completely (audit event + any partial deletion); env-purge exits non-zero; Redis + app logs are NOT touched (steps 4-6 are gated on step 3 success).
@@ -500,12 +518,14 @@ Refers to the canonical **three-state cohort classification** (participant / bas
 - **Remediation path (safe recovery):** `scripts/pilot-1-marker-remediation.sh` is the ONLY authorized route for classifying an `unclassified` account. Each invocation is logged as an audit event (`pilot_1.cohort_classification{accountId, classifiedAs, actor, reason}`). This ensures an incident purge is never blocked forever — the operator can always classify + proceed — while requiring an explicit audited decision for any drift.
 
 **CI test additions covering fail-closed behavior (three-state):**
+
 - Classification-omitted raw INSERT: schema NOT NULL constraint rejects with error; no row inserted; provisioning helper's atomic-insert design is verified.
 - Invalid-classification raw INSERT: schema CHECK constraint rejects with error.
 - Provisioning-then-verifier-fail simulation: inject a verifier failure post-INSERT within the transaction; verify rollback; verify no account created; verify audit event of provisioning-failure.
 - Purge-with-unclassified-account: seed an `unclassified` account (via test-only DDL relaxation bypassing constraints in a controlled fixture); run purge; verify purge REFUSES with actionable message naming the account ID.
 - Remediation script `--classify-as participant`: run; verify `pilot_1.cohort_classification` audit event with `classifiedAs: participant`; verify purge now proceeds and account is DELETED.
 - Remediation script `--classify-as baseline`: run against a different unclassified account; verify `pilot_1.cohort_classification` audit event with `classifiedAs: baseline`; verify purge now proceeds and account is INTACT.
+
 9. **PR 1.4 — Adversarial test suite** (attempts to bypass each layer; verifies each layer catches independently; explicit test that NO layer sends candidate text to any external AI provider under any code path).
 
 Each PR through Codex adversarial review → APPROVE → merge → addendum + cockpit bump.
