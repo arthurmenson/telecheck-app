@@ -68,7 +68,8 @@
 #      (scripts/pilot-1-baseline-seed.sql) in a separate transaction, Redis
 #      FLUSHALL (reply must be OK), Caddy access-log truncate (configured
 #      paths only), app container REMOVED and RECREATED (the app logs to
-#      stdout; the Docker-retained log goes with it), and a health check
+#      stdout; the Docker-retained log goes with it; the start is
+#      `up -d --no-recreate` so an existing container is never replaced), and a health check
 #      requiring exactly HTTP 200 from every configured URL.
 #
 # This script READS the incident directory and never writes, modifies or
@@ -303,7 +304,10 @@ run_stages() {
         mark_stage removed
     fi
     if ! stage_done recreated; then
-        ${COMPOSE} up -d app || { echo "ERROR: purge COMMITTED; app did not start — $(recover_hint)" >&2; exit 4; }
+        # --no-recreate: create the container only if none exists; an existing
+        # replacement (started before a crash recorded `recreated`) is kept
+        # even when the image or configuration changed since (Codex R11).
+        ${COMPOSE} up -d --no-recreate app || { echo "ERROR: purge COMMITTED; app did not start — $(recover_hint)" >&2; exit 4; }
         mark_stage recreated
     fi
     # Health check: retried as a health check ONLY when everything above is done.

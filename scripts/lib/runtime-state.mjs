@@ -46,8 +46,30 @@ export function ensureStateDir(dir) {
     st = fs.lstatSync(abs);
   } catch (error) {
     if (error && error.code === 'ENOENT') {
-      fs.mkdirSync(abs, { recursive: true, mode: 0o700 });
-      fsyncDir(path.dirname(abs));
+      // Create every missing ancestor INDIVIDUALLY and fsync its parent — a
+      // recursive mkdir would leave the upper entries unsynced (Codex R11).
+      const missing = [];
+      let cur = abs;
+      for (;;) {
+        try {
+          const cst = fs.lstatSync(cur);
+          if (cst.isSymbolicLink())
+            throw new Error(`state directory ancestor is a symbolic link: ${cur}`);
+          if (!cst.isDirectory())
+            throw new Error(`state directory ancestor is not a directory: ${cur}`);
+          break;
+        } catch (e) {
+          if (!(e && e.code === 'ENOENT')) throw e;
+        }
+        missing.push(cur);
+        const parent = path.dirname(cur);
+        if (parent === cur) throw new Error(`state directory has no existing ancestor: ${abs}`);
+        cur = parent;
+      }
+      for (const dir of missing.reverse()) {
+        fs.mkdirSync(dir, { mode: 0o700 });
+        fsyncDir(path.dirname(dir));
+      }
       st = fs.lstatSync(abs);
     } else {
       throw new Error(`state directory cannot be inspected (${error && error.code}): ${abs}`);

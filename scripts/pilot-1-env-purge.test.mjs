@@ -807,6 +807,34 @@ test(
     assert.ok(tmpIdx >= 0, 'temp file not fsynced');
     assert.ok(dirIdx > tmpIdx, 'marker rename not persisted after the temp-file fsync');
     assert.ok(fs.existsSync(path.join(opDir, 'removed')));
+
+    // multiple missing ancestors: each is created individually and its parent
+    // fsynced, so the whole journal survives a crash (Codex R11)
+    const deep = path.join(root, 'new-parent', 'mid', 'state2');
+    const opened2 = new Map();
+    const synced2 = [];
+    fs.openSync = (p, ...rest) => {
+      const fd = origOpen(p, ...rest);
+      opened2.set(fd, path.resolve(String(p)));
+      return fd;
+    };
+    fs.fsyncSync = (fd) => {
+      synced2.push(opened2.get(fd));
+      return origFsync(fd);
+    };
+    try {
+      ensureStateDir(deep);
+    } finally {
+      fs.openSync = origOpen;
+      fs.fsyncSync = origFsync;
+    }
+    assert.ok(synced2.includes(path.resolve(root)), 'new-parent entry not persisted');
+    assert.ok(synced2.includes(path.resolve(root, 'new-parent')), 'mid entry not persisted');
+    assert.ok(
+      synced2.includes(path.resolve(root, 'new-parent', 'mid')),
+      'state2 entry not persisted',
+    );
+    assert.equal(fs.statSync(deep).mode & 0o777, 0o700);
   },
 );
 
@@ -993,7 +1021,7 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
     'exec redis redis-cli -e FLUSHALL',
     "exec caddy sh -c [ -e '/var/log/access.log' ] && : > '/var/log/access.log'",
     'rm -sf app',
-    'up -d app',
+    'up -d --no-recreate app',
   ]);
   const curls = fs.readFileSync(path.join(dir, 'curl.log'), 'utf8').trim().split('\n');
   assert.equal(curls.length, 2);
@@ -1137,7 +1165,7 @@ test('env-purge: reconciliation reads the count, not a command tag — a rolled-
   assert.match(r.stderr, /left STOPPED/);
   assert.ok(!fs.existsSync(path.join(unknown, 'seed.ran')));
   assert.ok(
-    !composeLog(unknown).some((l) => l === 'start app' || l === 'up -d app'),
+    !composeLog(unknown).some((l) => l === 'start app' || l === 'up -d --no-recreate app'),
     'the app must stay stopped when the outcome is unknown',
   );
 
@@ -1261,7 +1289,7 @@ test("env-purge: --finish-runtime is bound to a committed attestation, to the in
     'stop app',
     'exec redis redis-cli -e FLUSHALL',
     'rm -sf app',
-    'up -d app',
+    'up -d --no-recreate app',
   ]);
   assert.deepEqual(stagesOf(ok, UUID), [
     'caddy',
@@ -1297,7 +1325,7 @@ test("env-purge: --finish-runtime is bound to a committed attestation, to the in
     'exec app pkill -TERM node',
     'stop app',
     'rm -sf app',
-    'up -d app',
+    'up -d --no-recreate app',
   ]);
   // removed-but-not-started (crash between `rm` and `up`, or between `up` and
   // its marker): recovery never removes the (possibly running) replacement —
@@ -1314,8 +1342,13 @@ test("env-purge: --finish-runtime is bound to a committed attestation, to the in
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(
     composeLog(removed),
-    ['up -d app'],
+    ['up -d --no-recreate app'],
     'a replacement container must never be removed again',
+  );
+  // --no-recreate: an existing replacement is kept even when the image or configuration changed (Codex R11)
+  assert.ok(
+    composeLog(removed).every((c) => !/^up -d app$/.test(c)),
+    'a plain `up -d` could recreate a running replacement',
   );
   assert.deepEqual(stagesOf(removed, UUID), [
     'caddy',
@@ -1350,7 +1383,7 @@ test("env-purge: --finish-runtime is bound to a committed attestation, to the in
     'stop app',
     'exec redis redis-cli -e FLUSHALL',
     'rm -sf app',
-    'up -d app',
+    'up -d --no-recreate app',
   ]);
 
   // A-unfinished / B-committed-and-completed / C-rolled-back (Codex R9):
