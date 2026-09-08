@@ -212,7 +212,7 @@ export async function withTenantContext<T>(
  * either way; the only loss is outer-scope nested context, which is acceptable
  * compared to the alternative of failing the whole `withTenantContext` call).
  */
-async function readCurrentTenantId(client: DbClient): Promise<string | null> {
+export async function readCurrentTenantId(client: DbClient): Promise<string | null> {
   // current_tenant_id() RAISES EXCEPTION `tenant_context_not_set` (migration
   // 003) when no binding exists for this backend. Inside an outer transaction
   // (the test harness wraps every test in a SAVEPOINT, and the production

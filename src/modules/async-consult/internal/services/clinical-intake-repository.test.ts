@@ -1,0 +1,365 @@
+import { EventEmitter } from 'node:events';
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  query: vi.fn(),
+  release: vi.fn(),
+  commitHang: false,
+  commitError: null as unknown,
+  rollbackHang: false,
+  cleanupHang: false,
+  cleanupError: null as unknown,
+  previousTenantId: null as string | null,
+  /** Emit a client 'error' event alongside the COMMIT rejection (pg does both). */
+  commitEmitsError: false,
+  client: null as unknown,
+  /** Emit a client 'error' synchronously the instant checkout hands over. */
+  emitOnCheckout: null as Error | null,
+  /** Exercise the harness-style promise-only connect(). */
+  promiseOnlyConnect: false,
+}));
+// A real EventEmitter, like pg.Client: an 'error' event with no listener
+// THROWS out of emit(), which is exactly the process-exit path the module
+// must prevent by owning the listener while it owns the client.
+vi.mock('../../../../lib/db.js', () => ({
+  getPool: () => ({
+    // Mirrors pg-pool: with a callback, hand the client over synchronously
+    // (returning undefined); without one, return a promise. The harness
+    // wrapper is promise-only and ignores the callback.
+    connect: (callback?: (error: Error | null, client?: unknown) => void) => {
+      const client = Object.assign(new EventEmitter(), {
+        query: mocks.query,
+        release: mocks.release,
+      });
+      mocks.client = client;
+      if (mocks.promiseOnlyConnect || !callback) return Promise.resolve(client);
+      callback(null, client);
+      // pg-pool has already dropped its own idle listener by now; a
+      // coalesced ReadyForQuery + FATAL read emits here, before any await
+      // in the caller can resume.
+      if (mocks.emitOnCheckout) client.emit('error', mocks.emitOnCheckout);
+      return undefined;
+    },
+  }),
+}));
+vi.mock('../../../../lib/logger.js', () => ({ logger: { error: vi.fn() } }));
+vi.mock('../../../../lib/rls.js', () => ({
+  readCurrentTenantId: async () => mocks.previousTenantId,
+}));
+vi.mock('../../../../lib/domain-events.js', () => ({ emitDomainEvent: vi.fn() }));
+vi.mock('../../../forms-intake/index.js', () => ({ resolveConsultIntakeDefinition: vi.fn() }));
+vi.mock('../../audit.js', () => ({
+  emitAsyncConsultIntakeDefinitionBoundAudit: vi.fn(),
+  emitAsyncConsultIntakeSubmittedAudit: vi.fn(),
+}));
+
+import { IdempotencyReplayError } from '../../../../lib/idempotency.js';
+import type { TenantContext } from '../../../../lib/tenant-context.js';
+
+import { careIntakeTransaction } from './clinical-intake-repository.js';
+
+const ctx = {
+  tenant: { tenantId: 'Telecheck-US', countryOfCare: 'US' } as TenantContext,
+  accountId: '01M1WQJRSCWYKQC9VBEQXWFG0T',
+  sessionId: '01M1WQJRSCWYKQC9VBEQXWFG0S',
+  actorNonce: '123e4567-e89b-42d3-a456-426614174000',
+};
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+const sqls = () => mocks.query.mock.calls.map(([sql]) => String(sql));
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.commitHang = false;
+  mocks.commitError = null;
+  mocks.rollbackHang = false;
+  mocks.cleanupHang = false;
+  mocks.cleanupError = null;
+  mocks.previousTenantId = null;
+  mocks.commitEmitsError = false;
+  mocks.client = null;
+  mocks.emitOnCheckout = null;
+  mocks.promiseOnlyConnect = false;
+  mocks.query.mockImplementation(async (sql: string) => {
+    if (sql === 'COMMIT') {
+      if (mocks.commitHang) return new Promise<never>(() => undefined);
+      if (mocks.commitError !== null) {
+        if (mocks.commitEmitsError) {
+          const err = mocks.commitError as Error;
+          setImmediate(() => (mocks.client as EventEmitter).emit('error', err));
+        }
+        throw mocks.commitError;
+      }
+      return { rows: [] };
+    }
+    if (sql === 'ROLLBACK') {
+      if (mocks.rollbackHang) return new Promise<never>(() => undefined);
+      return { rows: [] };
+    }
+    if (sql.includes('clear_tenant_context')) {
+      if (mocks.cleanupHang) return new Promise<never>(() => undefined);
+      if (mocks.cleanupError !== null) throw mocks.cleanupError;
+      return { rows: [] };
+    }
+    if (sql.includes('kms_current_actor_context'))
+      return {
+        rows: [
+          {
+            account_id: ctx.accountId,
+            session_id: ctx.sessionId,
+            tenant_id: ctx.tenant.tenantId,
+            actor_role: 'patient',
+            country_of_care: 'US',
+          },
+        ],
+      };
+    return { rows: [] };
+  });
+});
+
+describe('careIntakeTransaction — authority is enforced at the actual COMMIT', () => {
+  it('runs work inside BEGIN…COMMIT with both bindings live and never forces the triggers early', async () => {
+    const value = await careIntakeTransaction(ctx)(async () => 'done');
+    expect(value).toBe('done');
+    const q = sqls();
+    expect(q.some((x) => x.includes('SET CONSTRAINTS'))).toBe(false);
+    // The binding is set INSIDE the transaction, after the previous-binding
+    // probe (which needs a sub-savepoint); it is per-backend, so it still
+    // holds through COMMIT.
+    expect(q.findIndex((x) => x.includes('set_tenant_context'))).toBeGreaterThan(
+      q.indexOf('BEGIN'),
+    );
+    expect(q.indexOf('COMMIT')).toBeGreaterThan(q.indexOf('BEGIN'));
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+    expect(mocks.release).not.toHaveBeenCalledWith(true);
+  });
+
+  it('rejects with the COMMIT-time PT401 immediately even when ROLLBACK hangs', async () => {
+    vi.useFakeTimers();
+    try {
+      // pg server errors carry `severity`; that is what marks a real raise.
+      mocks.commitError = Object.assign(new Error('care_unauthenticated'), {
+        code: 'PT401',
+        severity: 'ERROR',
+      });
+      mocks.rollbackHang = true;
+      const pending = careIntakeTransaction(ctx)(async () => 'x');
+      const rejection = expect(pending).rejects.toMatchObject({ code: 'PT401' });
+      await vi.advanceTimersByTimeAsync(0);
+      await rejection;
+      expect(mocks.release).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(mocks.release).toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('surfaces a constraint violation raised at COMMIT as itself (a known rollback)', async () => {
+    mocks.commitError = Object.assign(new Error('care_intake_evidence_required'), {
+      code: '23514',
+      severity: 'ERROR',
+    });
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).rejects.toMatchObject({
+      code: '23514',
+    });
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+  });
+
+  it('bounds a stalled COMMIT, discards its own client, and reports PT503 — never signals a backend', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.commitHang = true;
+      const pending = careIntakeTransaction(ctx)(async () => 'x');
+      const rejection = expect(pending).rejects.toMatchObject({ code: 'PT503' });
+      await vi.advanceTimersByTimeAsync(3_900);
+      expect(mocks.release).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(200);
+      await rejection;
+      expect(mocks.release).toHaveBeenCalledWith(true);
+      expect(sqls().some((x) => x.includes('pg_cancel_backend'))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns an acknowledged COMMIT immediately even when cleanup hangs, then discards the client', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.cleanupHang = true;
+      const pending = careIntakeTransaction(ctx)(async () => 'ok');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await pending).toBe('ok');
+      expect(mocks.release).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(mocks.release).toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('re-checks the live actor before surfacing an idempotency replay', async () => {
+    const replay = new IdempotencyReplayError(200, {});
+    await expect(
+      careIntakeTransaction(ctx)(async () => {
+        throw replay;
+      }),
+    ).rejects.toBe(replay);
+    // Pre-work check + the re-check inside the catch.
+    expect(sqls().filter((x) => x.includes('kms_current_actor_context')).length).toBe(2);
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+  });
+
+  it('restores the binding that was in place when it took the client, and only clears when there was none', async () => {
+    // withTenantContext saves and restores; blindly clearing deleted the
+    // outer binding the shared harness client still relied on (CI, PR #303).
+    mocks.previousTenantId = 'Telecheck-Ghana';
+    await careIntakeTransaction(ctx)(async () => 'x');
+    await flush();
+    // The factory binds once; `actor()` re-binds before each of its two
+    // resolver reads; the LAST set restores what was there before.
+    const sets = mocks.query.mock.calls.filter(([sql]) =>
+      String(sql).includes('set_tenant_context'),
+    );
+    expect(sets[0]?.[1]).toEqual([ctx.tenant.tenantId]);
+    expect(sets[sets.length - 1]?.[1]).toEqual(['Telecheck-Ghana']);
+    expect(sqls().some((x) => x.includes('clear_tenant_context'))).toBe(false);
+    expect(mocks.release).toHaveBeenCalledWith();
+
+    vi.clearAllMocks();
+    mocks.previousTenantId = null;
+    await careIntakeTransaction(ctx)(async () => 'x');
+    await flush();
+    expect(sqls().some((x) => x.includes('clear_tenant_context'))).toBe(true);
+  });
+
+  it('treats a no-SQLSTATE rejection of an issued COMMIT as indeterminate: PT503 and discard', async () => {
+    // Codex review of PR #303: acknowledgement loss before the deadline
+    // reached the settled-failure branch and was rethrown unchanged, so the
+    // caller got a 500 with no instruction to check status before retrying
+    // — although the submission and its idempotency record may have
+    // committed.
+    mocks.commitError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).rejects.toMatchObject({
+      code: 'PT503',
+    });
+    expect(mocks.release).toHaveBeenCalledWith(true);
+  });
+
+  it('treats a class-08 SQLSTATE on an issued COMMIT as indeterminate: PT503 and discard', async () => {
+    for (const code of ['08007', '08006', '08000']) {
+      vi.clearAllMocks();
+      mocks.commitError = Object.assign(new Error('connection exception'), { code });
+      await expect(
+        careIntakeTransaction(ctx)(async () => 'x'),
+        code,
+      ).rejects.toMatchObject({
+        code: 'PT503',
+      });
+      expect(mocks.release).toHaveBeenCalledWith(true);
+    }
+  });
+
+  it('treats EPIPE on an issued COMMIT as indeterminate — a SQLSTATE shape is not a server raise', async () => {
+    // Codex round 2 on PR #303: EPIPE is five uppercase characters, so a
+    // shape-only SQLSTATE test read a socket error as a server raise and it
+    // fell through as a 500. pg server errors carry `severity`; transport
+    // errors never do — that is the discriminator.
+    mocks.commitError = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).rejects.toMatchObject({
+      code: 'PT503',
+    });
+    expect(mocks.release).toHaveBeenCalledWith(true);
+  });
+
+  it('survives the driver emitting a client error event alongside the COMMIT rejection', async () => {
+    // Codex round 3 on PR #303: pg-pool drops its idle 'error' listener at
+    // checkout, and on EPIPE pg emits a client 'error' event as well as
+    // rejecting the query. With no listener that emit() THROWS and Node
+    // exits with code 1 before the rejection handler runs. The module must
+    // own the listener for the whole ownership window.
+    mocks.commitError = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    mocks.commitEmitsError = true;
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).rejects.toMatchObject({
+      code: 'PT503',
+    });
+    // Let the scheduled emit fire; with no listener it would throw here and
+    // surface as an unhandled error in this test run.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mocks.release).toHaveBeenCalledWith(true);
+    // On DISCARD the listener is deliberately retained: a destroyed client
+    // may still emit a late 'error', and pg-pool only re-attaches its own
+    // idle listener when a client is RETURNED. Detaching here is exactly
+    // what let the scheduled emit above throw unlistened.
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBe(1);
+  });
+
+  it('is already listening when pool checkout hands the client over — no microtask gap', async () => {
+    // Codex round 4 on PR #303: pg-pool drops its idle listener before
+    // resolving connect(); a listener attached after `await` resumes is one
+    // microtask too late for a coalesced startup ReadyForQuery + FATAL
+    // 57P01, which pg parses synchronously. With no listener that emit
+    // throws and Node exits. Attaching inside the checkout callback closes
+    // the gap; this emit fires synchronously right after handover.
+    mocks.emitOnCheckout = Object.assign(new Error('terminating connection'), {
+      code: '57P01',
+      severity: 'FATAL',
+    });
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).resolves.toBe('x');
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBeGreaterThanOrEqual(0);
+  });
+
+  it('still works with a promise-only pool (the test harness wrapper)', async () => {
+    mocks.promiseOnlyConnect = true;
+    await expect(careIntakeTransaction(ctx)(async () => 'y')).resolves.toBe('y');
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+  });
+
+  it('listens for client errors for the whole ownership window, then lets go at release', async () => {
+    let duringWork = -1;
+    await careIntakeTransaction(ctx)(async () => {
+      duringWork = (mocks.client as EventEmitter).listenerCount('error');
+      return 'x';
+    });
+    expect(duringWork).toBe(1);
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBe(0);
+  });
+
+  it('does NOT treat a pre-COMMIT connection failure as indeterminate', async () => {
+    // Before COMMIT is issued nothing can have committed; the error passes
+    // through as itself and the client is returned normally.
+    const boom = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    await expect(
+      careIntakeTransaction(ctx)(async () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+    expect(mocks.release).not.toHaveBeenCalledWith(true);
+  });
+
+  it('never arms the COMMIT deadline for work that fails before COMMIT', async () => {
+    vi.useFakeTimers();
+    try {
+      const boom = new Error('work_failed');
+      const pending = careIntakeTransaction(ctx)(async () => {
+        throw boom;
+      });
+      const rejection = expect(pending).rejects.toBe(boom);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await rejection;
+      expect(sqls().includes('COMMIT')).toBe(false);
+      expect(mocks.release).toHaveBeenCalledWith();
+      expect(mocks.release).not.toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

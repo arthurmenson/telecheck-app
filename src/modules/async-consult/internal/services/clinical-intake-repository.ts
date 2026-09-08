@@ -1,12 +1,17 @@
-import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { withTransaction, type DbTransaction } from '../../../../lib/db.js';
+import {
+  getPool,
+  type DbClient,
+  type DbTransaction,
+  type withTransaction,
+} from '../../../../lib/db.js';
 import { emitDomainEvent } from '../../../../lib/domain-events.js';
 import {
   IdempotencyReplayError,
   IdempotencyBodyMismatchError,
   IdempotencyInFlightError,
 } from '../../../../lib/idempotency.js';
-import { withTenantContext } from '../../../../lib/rls.js';
+import { logger } from '../../../../lib/logger.js';
+import { readCurrentTenantId } from '../../../../lib/rls.js';
 import { ulid } from '../../../../lib/ulid.js';
 import type { CareConsentPatientContext } from '../../../consent/index.js';
 import { resolveConsultIntakeDefinition } from '../../../forms-intake/index.js';
@@ -55,32 +60,304 @@ async function actor(tx: DbTransaction, ctx: CareConsentPatientContext) {
 }
 
 /** Encloses reservation/replay, writes, audit/outbox and deferred proof checks. */
-export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof withTransaction {
-  return (work) =>
-    withTransaction((tx) =>
-      withTenantContext(tx, ctx.tenant.tenantId, () =>
-        withActorContext(tx, ctx.actorNonce, async () => {
-          await tx.query("SET LOCAL statement_timeout='10s'");
-          await tx.query("SET LOCAL lock_timeout='3s'");
-          await actor(tx, ctx);
-          try {
-            const result = await work(tx);
-            await actor(tx, ctx);
-            await tx.query('SET CONSTRAINTS care_intake_evidence,care_binding_evidence IMMEDIATE');
-            await actor(tx, ctx);
-            return result;
-          } catch (error) {
-            if (
-              error instanceof IdempotencyReplayError ||
-              error instanceof IdempotencyBodyMismatchError ||
-              error instanceof IdempotencyInFlightError
-            )
-              await actor(tx, ctx);
-            throw error;
-          }
-        }),
-      ),
+/**
+ * Wall-clock bound on the COMMIT statement only. PostgreSQL disables
+ * `statement_timeout` before running deferred constraint triggers inside
+ * COMMIT, so once the evidence triggers fire there their audit/outbox scans
+ * are unbounded server-side; this is the client-side bound. Deliberately
+ * below the transaction's 10 s statement_timeout.
+ */
+const COMMIT_DEADLINE_MS = 4_000;
+
+/** Bound on post-COMMIT ROLLBACK/cleanup, which run outside SET LOCAL timeouts. */
+const CLEANUP_DEADLINE_MS = 2_000;
+
+/**
+ * A pool client this module may return or DISCARD.
+ *
+ * `on`/`off` matter as much as `release`: pg-pool removes its idle 'error'
+ * listener when a client is checked out, and getPool() only handles POOL
+ * errors. On EPIPE/ECONNRESET pg both rejects the in-flight query AND emits
+ * a client 'error' event. An emitter error with no listener throws — Node
+ * exits with code 1 before any rejection handler runs, taking every other
+ * in-flight request with it. (Codex round 3 on PR #303, reproduced with the
+ * installed driver.) So this module listens for the whole time it owns the
+ * client, including asynchronous cleanup, and only lets go at release.
+ */
+interface RecordingClient extends DbClient {
+  release?: (destroy?: boolean) => void;
+  on?: (event: 'error', listener: (error: Error) => void) => unknown;
+  off?: (event: 'error', listener: (error: Error) => void) => unknown;
+}
+
+/** Attach the ownership-window error listener; returns the detach function. */
+function ownClientErrors(client: RecordingClient): () => void {
+  const listener = (): void => {
+    // The in-flight query rejects with the same failure; the outcome
+    // lifecycle classifies it there. Listening is what keeps the process up.
+  };
+  client.on?.('error', listener);
+  return () => client.off?.('error', listener);
+}
+
+type CheckoutCallback = (error: Error | null | undefined, client?: unknown) => void;
+interface CheckoutPool {
+  connect: (callback?: CheckoutCallback) => unknown;
+}
+
+/**
+ * Check a client out of the pool with the error listener attached BEFORE the
+ * acquisition promise resolves.
+ *
+ * `await pool.connect()` is not good enough: pg-pool removes its idle
+ * 'error' listener before resolving, and the listener attached after the
+ * `await` resumes only runs a microtask later. If one socket read carries
+ * the startup ReadyForQuery together with a FATAL (57P01, backend shutdown —
+ * PostgreSQL may terminate asynchronously), pg parses both synchronously and
+ * emits 'error' inside that gap with zero listeners: the process exits.
+ * Reproduced by Codex with the installed parser (round 4 on PR #303).
+ *
+ * The callback form of pg-pool's connect() invokes the callback
+ * synchronously with the client, so the listener is attached before anyone
+ * else can run. The test harness's pool wrapper is promise-only and ignores
+ * a callback; that path has no socket, so resolving through the promise is
+ * fine there.
+ */
+function checkoutRecordingClient(): Promise<{ client: RecordingClient; disown: () => void }> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const handOver: CheckoutCallback = (error, raw) => {
+      if (settled) return;
+      settled = true;
+      if (error) {
+        reject(error);
+        return;
+      }
+      const client = raw as RecordingClient;
+      const disown = ownClientErrors(client);
+      resolve({ client, disown });
+    };
+    const pool = getPool() as unknown as CheckoutPool;
+    const returned = pool.connect(handOver);
+    const thenable = returned as { then?: unknown } | null | undefined;
+    if (thenable && typeof thenable.then === 'function') {
+      (returned as Promise<unknown>).then(
+        (raw) => handOver(null, raw),
+        (error: unknown) => handOver(error instanceof Error ? error : new Error(String(error))),
+      );
+    }
+  });
+}
+
+/** Transaction outcome, captured the instant COMMIT resolves or rejects. */
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+let nextDiscardSignalAt = -Infinity;
+function signalRecordingClientDiscarded(): void {
+  if (performance.now() < nextDiscardSignalAt) return;
+  nextDiscardSignalAt = performance.now() + 60_000;
+  try {
+    logger.error(
+      { event: 'care_intake.recording_connection.discarded' },
+      'Care intake recording connection discarded: cleanup did not complete within its bound',
     );
+  } catch {
+    // Never let a logger failure replace the care response.
+  }
+}
+
+/**
+ * Consumed background work after the outcome has been published: roll back
+ * a failed transaction, clear the tenant binding, return the client — or
+ * discard it if that cannot finish inside its bound. I-023 holds either
+ * way: the binding is cleared, or the backend that held it is destroyed.
+ */
+function finalizeRecordingClient(
+  client: RecordingClient,
+  run: Promise<unknown>,
+  rollback: boolean,
+  previousTenantId: string | null,
+  disown: () => void,
+): void {
+  const settledRun = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  const rolledBack = rollback
+    ? settledRun
+        .then(() => client.query('ROLLBACK'))
+        .then(
+          () => undefined,
+          () => undefined,
+        )
+    : settledRun;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const bound = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('cleanup_deadline')), CLEANUP_DEADLINE_MS);
+  });
+  // Restore the binding that was in place when this factory took the client,
+  // exactly as withTenantContext does — never blindly clear. Under the test
+  // harness every factory shares one client with an outer binding; clearing
+  // it asynchronously, after the response, deleted the binding the rest of
+  // the suite still relied on (CI on PR #303: `No active tenant binding`).
+  const restore =
+    previousTenantId === null ? 'SELECT clear_tenant_context()' : 'SELECT set_tenant_context($1)';
+  const restoreParams = previousTenantId === null ? [] : [previousTenantId];
+  void Promise.race([rolledBack.then(() => client.query(restore, restoreParams)), bound])
+    .then(
+      () => {
+        disown();
+        client.release?.();
+      },
+      () => {
+        // Discard keeps the listener: a destroyed client may still emit.
+        client.release?.(true);
+        signalRecordingClientDiscarded();
+      },
+    )
+    .finally(() => {
+      if (timer !== null) clearTimeout(timer);
+    });
+}
+
+/**
+ * Runs `work` in a transaction whose COMMIT is itself authority-checked.
+ *
+ * The previous shape — `withTransaction(() => withTenantContext(() =>
+ * withActorContext(work)))` followed by `SET CONSTRAINTS
+ * care_intake_evidence,care_binding_evidence IMMEDIATE` — is the defect
+ * class fixed for the crisis path in PR #302. `withTenantContext` DELETES
+ * the per-backend tenant binding in its cleanup, before the outer COMMIT;
+ * `kms_current_actor_context()` needs `current_tenant_id()`, so at COMMIT
+ * nothing could re-validate authority, and forcing the triggers IMMEDIATE
+ * consumed their events — the real COMMIT ran with no authority check and
+ * an actor nonce expiring in that window was committed under expired
+ * authority (`kms_current_actor_context()` compares against
+ * `clock_timestamp()`).
+ *
+ * Now this module owns the client: it sets the tenant binding, runs
+ * BEGIN…COMMIT with both bindings live, and lets the deferred triggers —
+ * which call `consent_care_live_actor()` first and last — fire AT COMMIT as
+ * a genuine authority gate. The outcome is published the instant COMMIT
+ * settles; ROLLBACK and cleanup are bounded background work; a stalled
+ * COMMIT is bounded client-side and reported as PT503, with this module's
+ * own socket destroyed rather than any backend signalled by pid.
+ *
+ * Keeps `typeof withTransaction` so `withIdempotentExecution` can consume
+ * it unchanged.
+ */
+export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof withTransaction {
+  return async <T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> => {
+    const { client, disown } = await checkoutRecordingClient();
+    let previousTenantId: string | null = null;
+    let commitIssued = false;
+
+    let settled: Settled<T> | null = null;
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    let armDeadline: () => void = () => undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      armDeadline = () => {
+        deadlineTimer = setTimeout(() => {
+          reject(Object.assign(new Error('care_commit_unconfirmed'), { code: 'COMMIT_DEADLINE' }));
+        }, COMMIT_DEADLINE_MS);
+      };
+    });
+
+    const run = (async () => {
+      await client.query('BEGIN');
+      try {
+        // The probe needs a transaction (it uses a sub-savepoint), so it runs
+        // after BEGIN. The tenant binding is per-backend, not
+        // transaction-local, so setting it here still holds through COMMIT.
+        previousTenantId = await readCurrentTenantId(client);
+        await client.query('SELECT set_tenant_context($1)', [ctx.tenant.tenantId]);
+        await client.query("SET LOCAL statement_timeout='10s'");
+        await client.query("SET LOCAL lock_timeout='3s'");
+        await actor(client, ctx);
+        let result: T;
+        try {
+          result = await work(client);
+          await actor(client, ctx);
+        } catch (error) {
+          // An idempotency replay/mismatch/in-flight outcome is still only
+          // disclosed to a live, authorised actor.
+          if (
+            error instanceof IdempotencyReplayError ||
+            error instanceof IdempotencyBodyMismatchError ||
+            error instanceof IdempotencyInFlightError
+          )
+            await actor(client, ctx);
+          throw error;
+        }
+        armDeadline();
+        commitIssued = true;
+        // The deferred care_intake_evidence / care_binding_evidence triggers
+        // fire HERE, with tenant and actor bindings both still in scope.
+        await client.query('COMMIT');
+        settled = { ok: true, value: result };
+        return result;
+      } catch (error) {
+        settled = { ok: false, error };
+        throw error;
+      } finally {
+        if (deadlineTimer !== null) clearTimeout(deadlineTimer);
+      }
+    })();
+
+    const unconfirmed = () => {
+      // The COMMIT's fate is unknown: destroy THIS socket so it can never be
+      // re-borrowed mid-COMMIT; never signal a backend by pid. Surface as
+      // PT503 (503) so the caller is told to check status before retrying
+      // — never as a success and never as a definite failure.
+      run.catch(() => undefined);
+      // Keep listening: a destroyed client can still emit a late 'error'
+      // (pg-pool only re-attaches its own listener on RETURN, not destroy).
+      client.release?.(true);
+      return Object.assign(new Error('care_commit_unconfirmed'), { code: 'PT503' });
+    };
+
+    try {
+      const value = await Promise.race([run, deadline]);
+      finalizeRecordingClient(client, run, false, previousTenantId, disown);
+      const outcome = settled as Settled<T> | null;
+      return outcome?.ok ? outcome.value : value;
+    } catch (error) {
+      const outcome = settled as Settled<T> | null;
+      if (outcome?.ok) {
+        finalizeRecordingClient(client, run, false, previousTenantId, disown);
+        return outcome.value;
+      }
+      if (outcome && !outcome.ok) {
+        // A server RAISE during COMMIT (PT401, 23514, ...) is a definite
+        // rollback and passes through. A rejection with no SQLSTATE
+        // (ECONNRESET) or a class-08 connection exception (08007
+        // transaction_resolution_unknown) arriving AFTER COMMIT was issued is
+        // indeterminate — the submission and its idempotency record may have
+        // committed — and must not be rethrown as if it were a known failure.
+        // (Codex review of PR #303.)
+        // A SQLSTATE shape alone does not prove the server raised: EPIPE is
+        // five uppercase characters too. pg's server errors always carry
+        // `severity`; transport errors (EPIPE, ECONNRESET, ETIMEDOUT) never do.
+        // (Codex round 2 on PR #303.)
+        const failure = outcome.error as { code?: unknown; severity?: unknown } | null;
+        const code = failure?.code;
+        const sqlState =
+          typeof code === 'string' &&
+          /^[0-9A-Z]{5}$/.test(code) &&
+          typeof failure?.severity === 'string'
+            ? code
+            : null;
+        const indeterminate = commitIssued && (sqlState === null || sqlState.startsWith('08'));
+        if (indeterminate) throw unconfirmed();
+        // A known outcome always wins over the deadline.
+        finalizeRecordingClient(client, run, true, previousTenantId, disown);
+        throw outcome.error;
+      }
+      if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') throw unconfirmed();
+      finalizeRecordingClient(client, run, true, previousTenantId, disown);
+      throw error;
+    }
+  };
 }
 
 export function careIntakeRepository(ctx: CareConsentPatientContext): CareIntakeRepository {

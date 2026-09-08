@@ -45,6 +45,7 @@ export default defineConfig({
     // Explicit opt-in. Add a file here once it is confirmed to need no
     // database, no Redis, and no Fastify app instance.
     include: [
+      'src/modules/async-consult/internal/services/clinical-intake-repository.test.ts',
       'src/modules/crisis-response/internal/patient-care-admission.test.ts',
       'src/modules/consent/internal/services/care-policy-contract.test.ts',
       'src/lib/kms-aws.test.ts',
