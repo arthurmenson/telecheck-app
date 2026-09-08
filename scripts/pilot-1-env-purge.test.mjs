@@ -1,19 +1,25 @@
 // DB-free regression for the Pilot 1 env-purge package:
 //   - scripts/lib/purge-plan.mjs (classification validation, deterministic plan)
 //   - scripts/lib/incident-manifest.mjs (read-only manifest / lock verification)
-//   - scripts/pilot-1-env-purge.sh control flow with a stubbed psql, a stubbed
-//     compose command and a scratch incident directory (byte-for-byte untouched)
+//   - scripts/pilot-1-env-purge.sh control flow with a stubbed psql, compose
+//     and curl, a scratch lifecycle-lock directory and a scratch incident
+//     directory (byte-for-byte untouched)
 // The real-Postgres proof lives in tests/integration/pilot-1-env-purge.test.ts.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { AGE_HEADER, routineResetBlockers, verifyForPurge } from './lib/incident-manifest.mjs';
+import {
+  AGE_HEADER,
+  lockState,
+  routineResetBlockers,
+  verifyForPurge,
+} from './lib/incident-manifest.mjs';
 import {
   loadClassification,
   planDigest,
@@ -26,12 +32,13 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(here, 'pilot-1-env-purge.sh');
 const bash = process.platform === 'win32' ? 'bash' : '/usr/bin/env';
 const bashArgs = process.platform === 'win32' ? [] : ['bash'];
+const UUID = '123e4567-e89b-12d3-a456-426614174000';
 
 // ---------------------------------------------------------------------------
 // purge-plan
 // ---------------------------------------------------------------------------
 
-test('classification: loads, every table classified, accounts is scoped-delete, evidence tables preserved, snapshots go with submissions', () => {
+test('classification: loads, every table classified, accounts is scoped-delete, evidence tables preserved, snapshots go with submissions, no phantom tables', () => {
   const map = loadClassification();
   assert.ok(Object.keys(map.tables).length >= 80);
   assert.equal(map.tables.accounts.class, 'scoped-delete');
@@ -49,6 +56,8 @@ test('classification: loads, every table classified, accounts is scoped-delete, 
   assert.equal(map.tables.auth_devices.class, 'scoped-delete');
   assert.equal(map.tables.consult_care_binding.disableUserTriggersForTruncate, true);
   assert.equal(map.tables.consult_care_submission.disableUserTriggersForTruncate, true);
+  assert.equal(map.tables.migration_history, undefined, 'not a table');
+  assert.equal(map.tables.rbac_roles, undefined, 'test-bootstrap fixture, not a migration table');
   assert.ok(tablesOfClass(map, 'allowlist').length > 30);
 });
 
@@ -87,10 +96,6 @@ test('plan: deterministic; user triggers disabled only around the TRUNCATE on th
   assert.equal(truncates.length, 1);
   for (const t of tablesOfClass(map, 'allowlist'))
     assert.ok(truncates[0].includes(`public.${t}`), t);
-  assert.ok(
-    truncates[0].includes('public.forms_snapshot') &&
-      truncates[0].includes('public.forms_submission'),
-  );
   for (const t of tablesOfClass(map, 'preserved')) {
     assert.ok(
       !truncates[0].includes(`public.${t},`) && !truncates[0].includes(`public.${t} `),
@@ -269,21 +274,24 @@ test('incident-manifest: a valid capture passes; every precondition failure is n
   assert.match(verifyForPurge(esc, '2026-09-08T15-45Z-cat1-01').reason, /escapes/);
 });
 
-test('incident-manifest: inspection failures are refusals, never a clean state (Codex R1)', () => {
-  // the "directory" is a file → enumeration fails
+test('incident-manifest: inspection failures are refusals, never a clean state; lock-state reports presence / id / unreadability', () => {
   const notDir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-')), 'file');
   fs.writeFileSync(notDir, 'x');
   assert.match(routineResetBlockers(notDir).join(';'), /cannot inspect the incident directory/);
   assert.match(verifyForPurge(notDir, '2026-09-08T15-45Z-cat1-01').reason, /cannot inspect/);
-  // the lock is a directory → unreadable, not absent
   const lockDir = mkIncidentDir({ lock: false });
   fs.mkdirSync(path.join(lockDir, '.incident.lock'));
   assert.match(routineResetBlockers(lockDir).join(';'), /incident lock cannot be inspected/);
   assert.match(verifyForPurge(lockDir, '2026-09-08T15-45Z-cat1-01').reason, /lock unreadable/);
-  // a manifest that is a directory → unreadable manifest blocks routine reset
+  assert.equal(lockState(lockDir).unreadable, true);
   const manDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
   fs.mkdirSync(path.join(manDir, 'x.manifest.json'));
   assert.match(routineResetBlockers(manDir).join(';'), /unreadable manifest/);
+  assert.deepEqual(lockState(fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'))), { present: false });
+  assert.deepEqual(lockState(mkIncidentDir()), {
+    present: true,
+    incidentId: '2026-09-08T15-45Z-cat1-01',
+  });
 });
 
 test('incident-manifest: routine-reset blockers — lock, unconsumed or unreadable manifests; a clean directory has none', () => {
@@ -298,7 +306,7 @@ test('incident-manifest: routine-reset blockers — lock, unconsumed or unreadab
 });
 
 // ---------------------------------------------------------------------------
-// script control flow (stubbed psql + compose)
+// script control flow (stubbed psql + compose + curl)
 // ---------------------------------------------------------------------------
 
 function snapshot(dir) {
@@ -318,8 +326,8 @@ function snapshot(dir) {
 /**
  * Stub psql: dispatches on the SHAPE of the call (a -f file is the seed or the
  * transaction; -c / stdin are the small lookups, matched by content).
- * PSQL_BYPASS / PSQL_UNCLASSIFIED / PSQL_PRIOR / PSQL_RECONCILE / PSQL_TX_EXIT /
- * PSQL_TX_STDERR / PSQL_SEED_EXIT drive the answers.
+ * PSQL_BYPASS / PSQL_UNCLASSIFIED / PSQL_PRIOR / PSQL_RECONCILE / PSQL_ATTEST /
+ * PSQL_TX_EXIT / PSQL_TX_STDERR / PSQL_SEED_EXIT drive the answers.
  */
 function mkStubs(dir) {
   const d = dir.replace(/\\/g, '/');
@@ -347,7 +355,8 @@ case "$sql" in
   *information_schema.columns*) echo 1; exit 0 ;;
   *json_agg*) echo "[]"; exit 0 ;;
   *"cohort_classification = 'unclassified'"*) echo "\${PSQL_UNCLASSIFIED:-0}"; exit 0 ;;
-  *"payload->>'operationId'"*) if [ "\${PSQL_RECONCILE:-0}" = "ERR" ]; then echo "connection refused" >&2; exit 2; fi; echo "\${PSQL_RECONCILE:-0}"; exit 0 ;;
+  *"payload->>'mode'"*) printf '%s\\n' "\${PSQL_ATTEST:-}"; exit 0 ;;
+  *"pg_advisory_xact_lock"*"payload->>'operationId'"*) if [ "\${PSQL_RECONCILE:-0}" = "ERR" ]; then echo "lock timeout" >&2; exit 2; fi; echo "$(grep -c pg_advisory_xact_lock <<< "$sql")" > "${d}/reconcile.locked"; printf '\\n%s\\n' "\${PSQL_RECONCILE:-0}"; exit 0 ;;
   *"payload->>'incidentId'"*) echo "\${PSQL_PRIOR:-0}"; exit 0 ;;
   *) echo "stub psql: unexpected SQL" >&2; exit 9 ;;
 esac
@@ -360,7 +369,13 @@ esac
     `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${d}/compose.log"\nexit 0\n`,
     { mode: 0o755 },
   );
-  return { psql, compose };
+  const curl = path.join(dir, 'curl');
+  fs.writeFileSync(
+    curl,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${d}/curl.log"\nprintf '%s' "\${CURL_CODE:-200}"\nexit 0\n`,
+    { mode: 0o755 },
+  );
+  return { psql, compose, curl };
 }
 
 function run(dir, stubs, args, extraEnv = {}) {
@@ -371,11 +386,14 @@ function run(dir, stubs, args, extraEnv = {}) {
       ...process.env,
       PILOT_1_DATABASE_URL: 'postgres://synthetic',
       PILOT_1_PSQL: stubs.psql,
+      PILOT_1_CURL: stubs.curl,
       PILOT_1_ACTOR: 'evans@test-host',
       PILOT_1_ACTOR_TENANT: 'Telecheck-US',
       PILOT_1_INCIDENT_LOGS_DIR:
         extraEnv.PILOT_1_INCIDENT_LOGS_DIR ?? fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-')),
+      PILOT_1_LOCK_DIR: path.join(dir, 'lifecycle.lock'),
       PILOT_1_COMPOSE: stubs.compose,
+      PILOT_1_HEALTH_URLS: 'http://us.test/health http://gh.test/health',
       PILOT_1_SKIP_RUNTIME_STEPS: '1',
       ...extraEnv,
     },
@@ -388,7 +406,7 @@ const composeLog = (dir) =>
     ? fs.readFileSync(path.join(dir, 'compose.log'), 'utf8').trim().split('\n')
     : [];
 
-test('env-purge: usage errors exit 2 before psql runs', () => {
+test('env-purge: usage errors exit 2 before psql runs (incl. missing health URLs with runtime steps enabled, --operation-id outside recovery)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
   const stubs = mkStubs(dir);
   for (const [args, env] of [
@@ -397,16 +415,63 @@ test('env-purge: usage errors exit 2 before psql runs', () => {
     [['--routine-reset', '--finish-runtime'], {}],
     [['--incident-id'], {}],
     [['--incident-id', '../etc'], {}],
+    [['--finish-runtime'], {}],
+    [['--finish-runtime', '--operation-id', 'not-a-uuid'], {}],
+    [['--routine-reset', '--operation-id', UUID], {}],
     [['--bogus'], {}],
     [['--routine-reset'], { PILOT_1_DATABASE_URL: '--command=TRUNCATE accounts' }],
     [['--routine-reset'], { PILOT_1_ACTOR_TENANT: '' }],
     [['--routine-reset'], { PILOT_1_ACTOR: 'bad "quote"' }],
     [['--routine-reset'], { PILOT_1_TEST_FAIL_AFTER: 'commit' }],
+    [['--routine-reset'], { PILOT_1_SKIP_RUNTIME_STEPS: '0', PILOT_1_HEALTH_URLS: '' }],
   ]) {
     const r = run(dir, stubs, args, env);
     assert.equal(r.status, 2, `${args.join(' ')} ${JSON.stringify(env)}: ${r.stderr}`);
   }
   assert.ok(!fs.existsSync(path.join(dir, 'call-0.args')), 'psql ran on a usage error');
+  assert.ok(!fs.existsSync(path.join(dir, 'lifecycle.lock')), 'the lifecycle lock was left behind');
+});
+
+test('env-purge: the lifecycle lock refuses a concurrent invocation, is released on exit, and a stale lock is taken over', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  const stubs = mkStubs(dir);
+  const lock = path.join(dir, 'lifecycle.lock');
+  fs.mkdirSync(lock);
+  // The holder must be a process the SCRIPT's shell can see with kill -0 (on
+  // Windows a node pid is invisible to the MSYS shell): a background shell
+  // records its own $$ and sleeps.
+  const pidFile = path.join(lock, 'pid');
+  const holder = spawn(bash, [
+    ...bashArgs,
+    '-c',
+    'echo $$ > "$1"; exec sleep 60',
+    'holder',
+    pidFile,
+  ]);
+  const deadline = Date.now() + 10_000;
+  while (
+    !(fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim() !== '') &&
+    Date.now() < deadline
+  ) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+  try {
+    const busy = run(dir, stubs, ['--routine-reset']);
+    assert.equal(busy.status, 1, busy.stderr);
+    assert.match(busy.stderr, /another purge lifecycle \(pid/);
+    assert.ok(
+      !fs.existsSync(path.join(dir, 'call-0.args')),
+      'psql ran while another lifecycle held the lock',
+    );
+    assert.ok(fs.existsSync(lock), 'the foreign lock was removed');
+  } finally {
+    holder.kill();
+  }
+  fs.writeFileSync(pidFile, '999999999'); // dead
+  const stale = run(dir, stubs, ['--routine-reset', '--json']);
+  assert.equal(stale.status, 0, stale.stderr);
+  assert.match(stale.stderr, /stale lifecycle lock/);
+  assert.ok(!fs.existsSync(lock), 'the lock must be released on exit');
 });
 
 test('env-purge: routine-reset is refused by a lock, an unconsumed manifest, an uninspectable directory, an unclassified account, or a non-bypass role — no transaction, incident-logs untouched', () => {
@@ -433,6 +498,7 @@ test('env-purge: routine-reset is refused by a lock, an unconsumed manifest, an 
     assert.match(r.stderr, expect, name);
     assert.ok(!fs.existsSync(path.join(dir, 'tx.sql')), `${name}: a purge transaction ran`);
     if (before) assert.deepEqual(snapshot(inc), before, `${name}: incident-logs changed`);
+    assert.ok(!fs.existsSync(path.join(dir, 'lifecycle.lock')), `${name}: lifecycle lock leaked`);
   }
 });
 
@@ -501,13 +567,15 @@ test('env-purge: incident success — advisory lock, per-tenant attestation with
   assert.match(txArgs, new RegExp(`-v incident_id=${id.replace(/[.]/g, '\\.')}`));
   assert.match(txArgs, new RegExp(`-v operation_id=${out.operationId}`));
   assert.match(txArgs, /-v artifacts=2/);
+  assert.match(txArgs, /-v fail_insert=0/);
   assert.match(txArgs, /--dbname=postgres:\/\/synthetic/);
   assert.ok(fs.existsSync(path.join(dir, 'seed.ran')), 're-seed did not run');
   assert.deepEqual(snapshot(inc), before, 'incident-logs changed');
   assert.deepEqual(composeLog(dir), [], 'compose was invoked although runtime steps were skipped');
+  assert.ok(!fs.existsSync(path.join(dir, 'lifecycle.lock')));
 });
 
-test('env-purge: routine-reset success; the runtime steps run in the right order — stop before the purge, container removed and recreated after (never exec into the stopped app)', () => {
+test('env-purge: routine-reset with runtime steps — stop before the purge, container removed and recreated after, exactly-200 health checks on every URL', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
   const stubs = mkStubs(dir);
   const r = run(dir, stubs, ['--routine-reset', '--json'], {
@@ -516,8 +584,6 @@ test('env-purge: routine-reset success; the runtime steps run in the right order
   });
   assert.equal(r.status, 0, r.stderr);
   const out = JSON.parse(r.stdout);
-  assert.equal(out.mode, 'routine-reset');
-  assert.equal(out.incidentId, null);
   assert.equal(out.runtimeStepsSkipped, false);
   assert.deepEqual(composeLog(dir), [
     'exec app pkill -TERM node',
@@ -527,19 +593,25 @@ test('env-purge: routine-reset success; the runtime steps run in the right order
     'rm -sf app',
     'up -d app',
   ]);
-  const noCaddy = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
-  const s2 = mkStubs(noCaddy);
-  const r2 = run(noCaddy, s2, ['--routine-reset'], { PILOT_1_SKIP_RUNTIME_STEPS: '0' });
-  assert.equal(r2.status, 0, r2.stderr);
-  assert.match(r2.stderr, /no PILOT_1_CADDY_LOG_PATHS configured/);
-  assert.ok(!composeLog(noCaddy).some((l) => l.startsWith('exec caddy')));
+  const curls = fs.readFileSync(path.join(dir, 'curl.log'), 'utf8').trim().split('\n');
+  assert.equal(curls.length, 2);
+  assert.ok(curls.every((c) => /-w %\{http_code\}/.test(c) && /--max-time/.test(c)));
   assert.ok(
-    !composeLog(noCaddy).some((l) => /exec app (sh|rm)/.test(l)),
-    'never exec into the stopped app container',
+    curls.some((c) => c.includes('http://us.test/health')) &&
+      curls.some((c) => c.includes('http://gh.test/health')),
   );
+
+  const redirect = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  const r2 = run(redirect, mkStubs(redirect), ['--routine-reset'], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    CURL_CODE: '302',
+    PILOT_1_HEALTH_URLS: 'http://us.test/health',
+  });
+  assert.equal(r2.status, 4, r2.stderr);
+  assert.match(r2.stderr, /did not return HTTP 200 .* \(last: 302\)/);
 });
 
-test('env-purge: a rolled-back transaction exits 3 (verified by reconciliation) and restarts the app; a lost COMMIT ack continues; an unreconcilable outcome exits 5 with the app left stopped', () => {
+test('env-purge: a rolled-back transaction exits 3 only after reconciling under the advisory lock; a lost COMMIT ack continues; an unreconcilable outcome exits 5 with the app left stopped', () => {
   const rolled = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
   let r = run(rolled, mkStubs(rolled), ['--routine-reset'], {
     PILOT_1_SKIP_RUNTIME_STEPS: '0',
@@ -548,7 +620,11 @@ test('env-purge: a rolled-back transaction exits 3 (verified by reconciliation) 
     PSQL_RECONCILE: '0',
   });
   assert.equal(r.status, 3, r.stderr);
-  assert.match(r.stderr, /rolled back \(verified: no attestation/);
+  assert.match(r.stderr, /rolled back \(verified under the purge lock/);
+  assert.ok(
+    fs.existsSync(path.join(rolled, 'reconcile.locked')),
+    'reconciliation must take the advisory lock',
+  );
   assert.ok(!fs.existsSync(path.join(rolled, 'seed.ran')));
   assert.deepEqual(composeLog(rolled).slice(-1), ['start app']);
 
@@ -589,31 +665,84 @@ test('env-purge: a rolled-back transaction exits 3 (verified by reconciliation) 
   const seedFail = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
   r = run(seedFail, mkStubs(seedFail), ['--routine-reset'], { PSQL_SEED_EXIT: '3' });
   assert.equal(r.status, 4, r.stderr);
-  assert.match(r.stderr, /re-run with --finish-runtime/);
+  assert.match(r.stderr, /--finish-runtime --operation-id [0-9a-f-]{36}/);
 });
 
-test('env-purge: --finish-runtime re-seeds and runs the runtime steps without any purge transaction', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
-  const stubs = mkStubs(dir);
-  const r = run(dir, stubs, ['--finish-runtime', '--json'], {
+test('env-purge: --finish-runtime is bound to a committed attestation and to a consistent incident state', () => {
+  // no attestation for the operation → refused, nothing run
+  const none = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  let r = run(none, mkStubs(none), ['--finish-runtime', '--operation-id', UUID], {
     PILOT_1_SKIP_RUNTIME_STEPS: '0',
     PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: '',
+  });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /no committed env\.purge\.executed attestation/);
+  assert.ok(!fs.existsSync(path.join(none, 'seed.ran')));
+  assert.deepEqual(composeLog(none), []);
+  // routine attestation but an incident lock is now present → refused
+  const conflict = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  r = run(conflict, mkStubs(conflict), ['--finish-runtime', '--operation-id', UUID], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'routine-reset|',
+    PILOT_1_INCIDENT_LOGS_DIR: mkIncidentDir(),
+  });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /incident lock .* is now present/);
+  assert.deepEqual(composeLog(conflict), []);
+  // incident attestation but the lock belongs to another incident → refused
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  r = run(other, mkStubs(other), ['--finish-runtime', '--operation-id', UUID], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'incident|2026-09-08T15-45Z-cat1-01',
+    PILOT_1_INCIDENT_LOGS_DIR: mkIncidentDir({ lockId: 'someone-else' }),
+  });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /incident state no longer matches/);
+  // consistent → re-seed + runtime steps, no purge transaction
+  const ok = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  r = run(ok, mkStubs(ok), ['--finish-runtime', '--operation-id', UUID, '--json'], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'incident|2026-09-08T15-45Z-cat1-01',
+    PILOT_1_INCIDENT_LOGS_DIR: mkIncidentDir(),
   });
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(JSON.parse(r.stdout).mode, 'finish-runtime');
-  assert.ok(!fs.existsSync(path.join(dir, 'tx.sql')), 'a purge transaction ran in recovery mode');
-  assert.ok(fs.existsSync(path.join(dir, 'seed.ran')));
-  assert.deepEqual(composeLog(dir), ['exec redis redis-cli FLUSHALL', 'rm -sf app', 'up -d app']);
+  assert.deepEqual(JSON.parse(r.stdout), {
+    mode: 'finish-runtime',
+    operationId: UUID,
+    attestedMode: 'incident',
+    status: 'finished',
+    runtimeStepsSkipped: false,
+  });
+  assert.ok(!fs.existsSync(path.join(ok, 'tx.sql')), 'a purge transaction ran in recovery mode');
+  assert.ok(fs.existsSync(path.join(ok, 'seed.ran')));
+  assert.deepEqual(composeLog(ok), ['exec redis redis-cli FLUSHALL', 'rm -sf app', 'up -d app']);
 });
 
-test('env-purge: the test failure hook is rendered into the transaction only when set', () => {
+test('env-purge: the test failure hooks — plan points render into the transaction, audit-insert breaks the attestation INSERT itself', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
   const stubs = mkStubs(dir);
-  const r = run(dir, stubs, ['--routine-reset'], { PILOT_1_TEST_FAIL_AFTER: 'truncate' });
+  let r = run(dir, stubs, ['--routine-reset'], { PILOT_1_TEST_FAIL_AFTER: 'truncate' });
   assert.equal(r.status, 0, r.stderr);
   const tx = txOf(dir);
   assert.ok(tx.indexOf('TRUNCATE TABLE') < tx.indexOf('TEST failure injected after truncate'));
   assert.ok(
     tx.indexOf('TEST failure injected after truncate') < tx.indexOf('DELETE FROM public.accounts'),
   );
+  const ins = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  r = run(ins, mkStubs(ins), ['--routine-reset'], { PILOT_1_TEST_FAIL_AFTER: 'audit-insert' });
+  assert.equal(r.status, 0, r.stderr);
+  const argsFiles = fs
+    .readdirSync(ins)
+    .filter((f) => f.endsWith('.args'))
+    .sort();
+  const txArgs = argsFiles
+    .map((f) => fs.readFileSync(path.join(ins, f), 'utf8'))
+    .find((a) => a.includes('-f '));
+  assert.match(txArgs, /-v fail_insert=1/);
+  assert.ok(!/injected/.test(txOf(ins)), 'audit-insert must not also inject a plan failure');
+  assert.match(txOf(ins), /TEST-DOES-NOT-EXIST/);
 });

@@ -177,6 +177,15 @@ export function verifyForPurge(dir, incidentId, nowMs = Date.now()) {
   return { ok: true, artifacts: manifest.artifacts.length, capturedAt: manifest.capturedAt };
 }
 
+/** Lock state for recovery consistency checks: { present, incidentId } | { present: true, unreadable, code } | { present: true, malformed }. */
+export function lockState(dir) {
+  const lock = readLock(dir);
+  if (!lock.present) return { present: false };
+  if (lock.unreadable) return { present: true, unreadable: true, code: lock.code };
+  if (lock.malformed) return { present: true, malformed: true };
+  return { present: true, incidentId: lock.incidentId };
+}
+
 /** Routine-reset blockers: an incident lock, or ANY manifest not consumed: true (malformed counts). */
 export function routineResetBlockers(dir) {
   const blockers = [];
@@ -210,7 +219,7 @@ function cli(argv) {
   const dir = arg(rest, '--dir');
   if (!dir) {
     process.stderr.write(
-      'usage: incident-manifest.mjs verify-purge --dir D --incident-id ID | routine-blockers --dir D\n',
+      'usage: incident-manifest.mjs verify-purge --dir D --incident-id ID | routine-blockers --dir D | lock-state --dir D\n',
     );
     return 2;
   }
@@ -223,6 +232,11 @@ function cli(argv) {
     const result = verifyForPurge(dir, id);
     process.stdout.write(JSON.stringify(result) + '\n');
     return result.ok ? 0 : 1;
+  }
+  if (cmd === 'lock-state') {
+    const state = lockState(dir);
+    process.stdout.write(JSON.stringify(state) + '\n');
+    return state.unreadable ? 1 : 0;
   }
   if (cmd === 'routine-blockers') {
     const blockers = routineResetBlockers(dir);

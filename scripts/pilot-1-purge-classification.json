@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "spec": "docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Purge table classification policy — every table in public MUST be classified; new migrations that add tables MUST add their classification here in the same PR (CI schema-drift test).",
   "classes": {
     "allowlist": "participant-only — TRUNCATE (never CASCADE)",
@@ -296,10 +296,6 @@
       "class": "allowlist",
       "why": "participant medication data"
     },
-    "migration_history": {
-      "class": "preserved",
-      "why": "migrations tracker (scripts/migrate.mjs)"
-    },
     "notification_crisis_dispatch_ledger": {
       "class": "allowlist",
       "why": "participant crisis notifications"
@@ -319,10 +315,6 @@
     "product_catalog": {
       "class": "preserved",
       "why": "configuration"
-    },
-    "rbac_roles": {
-      "class": "preserved",
-      "why": "RBAC role configuration (migration 032)"
     },
     "refills": {
       "class": "allowlist",

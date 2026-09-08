@@ -2,12 +2,14 @@
  * Real-Postgres proof for Sprint 1.3 phase B (env-purge) per
  * docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Sprint 1.3 CI test suite.
  *
- * ISOLATION (Codex R1): this suite creates its OWN disposable database
- * (`telecheck_purge_<suffix>`), applies the full migration inventory to it
- * with the repo's migration runner, points every script at it, and drops it
- * afterwards. Nothing here touches the shared TEST_DATABASE_URL data. The
- * purge scripts are guarded: the DSN they receive must name that disposable
- * database.
+ * ISOLATION (Codex R1 / R2): this suite creates its OWN disposable database
+ * (`telecheck_purge_<suffix>`) as a schema-only CLONE of the shared, fully
+ * migrated test database (replaying the migration inventory into a second
+ * database of the same cluster collides on cluster-wide roles — migration 032
+ * CREATE ROLE → 42710). Roles, grants, RLS policies, triggers and SECURITY
+ * DEFINER owners come with the clone; the tenant baseline rows are copied.
+ * Every script receives a DSN that must name that database (guarded), and
+ * the database is dropped afterwards.
  *
  *   1. schema-drift: every live base table is classified; the map names only
  *      live tables;
@@ -18,12 +20,15 @@
  *      clinician / tenant_admin / platform_admin rows AND their credentials /
  *      devices INTACT; every allowlist table empty; preserved counts
  *      unchanged; one attestation per tenant sharing the operation id;
- *      baseline re-seeded; gate green;
+ *      baseline re-seeded; gate green; guarded triggers re-enabled;
  *   4. unclassified account → purge REFUSES naming it, nothing written;
- *   5. attestation-transaction rollback at three injection points;
+ *   5. attestation-transaction rollback: a failure INSIDE the attestation
+ *      INSERT, after the attestation, after TRUNCATE and after the scoped
+ *      DELETE — canaries restored, no attestation, exit 3;
  *   6. incident mode: preconditions, single use, two concurrent invocations →
- *      exactly one purge, directory byte-for-byte untouched; lock blocks
- *      routine-reset; the care-intake immutability triggers are re-enabled.
+ *      exactly one purge (the other refused by the lifecycle lock or the
+ *      single-use check), directory byte-for-byte untouched; lock blocks
+ *      routine-reset; --finish-runtime bound to the committed operation.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -65,6 +70,43 @@ const SEED_IDS = [
   '01JZZZ000000000000000P1F02',
   '01JZZZ000000000000000P1PA1',
 ];
+const GUARDED_TRIGGERS_DISABLED = `SELECT COUNT(*)::text AS n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid WHERE c.relname IN ('consult_care_binding','consult_care_submission') AND NOT tg.tgisinternal AND tg.tgenabled = 'D'`;
+
+function cloneSchema(fromDsn: string, toDsn: string) {
+  const opts = { encoding: 'utf8' as const, maxBuffer: 256 * 1024 * 1024 };
+  // rbac_roles is a test-bootstrap fixture (tests/setup.ts), not a migration
+  // table: it is excluded so the clone is exactly the migrated schema.
+  const schema = spawnSync(
+    'pg_dump',
+    ['--schema-only', '--no-comments', '-T', 'public.rbac_roles', `--dbname=${fromDsn}`],
+    opts,
+  );
+  if (schema.status !== 0) throw new Error(`pg_dump --schema-only failed: ${schema.stderr}`);
+  const restore = spawnSync('psql', [`--dbname=${toDsn}`, '-X', '-q', '-v', 'ON_ERROR_STOP=1'], {
+    ...opts,
+    input: schema.stdout,
+  });
+  if (restore.status !== 0) throw new Error(`schema restore failed: ${restore.stderr}`);
+  const data = spawnSync(
+    'pg_dump',
+    [
+      '--data-only',
+      '--no-comments',
+      '-t',
+      'public.tenants',
+      '-t',
+      'public.schema_migrations',
+      `--dbname=${fromDsn}`,
+    ],
+    opts,
+  );
+  if (data.status !== 0) throw new Error(`pg_dump --data-only failed: ${data.stderr}`);
+  const load = spawnSync('psql', [`--dbname=${toDsn}`, '-X', '-q', '-v', 'ON_ERROR_STOP=1'], {
+    ...opts,
+    input: data.stdout,
+  });
+  if (load.status !== 0) throw new Error(`baseline data load failed: ${load.stderr}`);
+}
 
 function snapshotDir(dir: string) {
   const out: Record<string, { size: number; sha: string }> = {};
@@ -109,6 +151,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
   const DB_NAME = `telecheck_purge_${suffix.toLowerCase()}`;
   const TENANT = `Telecheck-TP${suffix}`;
   const shared = new Client({ connectionString: SHARED_DSN });
+  const lockRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'p1lock-'));
   let DSN = '';
   let admin: Client;
 
@@ -123,6 +166,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
       PILOT_1_ACTOR: 'ci-operator@test',
       PILOT_1_ACTOR_TENANT: TENANT,
       PILOT_1_SKIP_RUNTIME_STEPS: '1',
+      PILOT_1_LOCK_DIR: path.join(lockRoot, 'lifecycle.lock'),
       PILOT_1_INCIDENT_LOGS_DIR:
         extraEnv['PILOT_1_INCIDENT_LOGS_DIR'] ?? fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-')),
       ...extraEnv,
@@ -236,6 +280,11 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     return Number(r.rows[0]!.n);
   }
 
+  async function guardedTriggersDisabled(): Promise<number> {
+    const r = await admin.query<{ n: string }>(GUARDED_TRIGGERS_DISABLED);
+    return Number(r.rows[0]!.n);
+  }
+
   async function attestations(): Promise<
     Array<{
       tenant_id: string;
@@ -281,15 +330,9 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     await shared.connect();
     await shared.query(`CREATE DATABASE ${DB_NAME}`);
     DSN = SHARED_DSN.replace(/\/[^/?]+(\?|$)/, `/${DB_NAME}$1`);
+    cloneSchema(SHARED_DSN, DSN);
     admin = new Client({ connectionString: DSN });
     await admin.connect();
-    // The migration runner is a plain ESM helper without a declaration file;
-    // a dynamic import keeps the suppression attached to the statement.
-    // @ts-expect-error — no types for scripts/migrate.mjs
-    const migrate = (await import('../../scripts/migrate.mjs')) as {
-      applyMigrations: (client: Client, directory: string) => Promise<void>;
-    };
-    await migrate.applyMigrations(admin, path.join(ROOT, 'migrations'));
     await admin.query(
       `INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain, country_of_care, kms_key_alias, status, activated_at)
        VALUES ($1, $1, $2, $3, $4, 'US', $5, 'active', NOW()) ON CONFLICT (id) DO NOTHING`,
@@ -353,23 +396,20 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     expect(fixed.status, fixed.stderr).toBe(0);
   });
 
-  it('attestation-transaction: an injected failure after the attestation, after TRUNCATE and after the scoped DELETE rolls everything back and re-enables the guarded triggers', async () => {
-    for (const stage of ['audit', 'truncate', 'delete']) {
+  it('attestation-transaction: a failure inside the attestation INSERT, after it, after TRUNCATE and after the scoped DELETE rolls everything back and re-enables the guarded triggers', async () => {
+    for (const stage of ['audit-insert', 'audit', 'truncate', 'delete']) {
       const c = await seedCanaries();
       const before = (await attestations()).length;
       const r = runPurge(['--routine-reset'], { PILOT_1_TEST_FAIL_AFTER: stage });
       expect(r.status, `${stage}: ${r.stderr}`).toBe(3);
-      expect(r.stderr).toMatch(/rolled back \(verified/);
+      expect(r.stderr).toMatch(/rolled back \(verified under the purge lock/);
       expect(await count('accounts', 'WHERE account_id = $1', [c.participantPatient])).toBe(1);
       expect(
         await count('account_pin_credentials', 'WHERE account_id = $1', [c.participantPatient]),
       ).toBe(1);
       expect(await count('idempotency_keys', 'WHERE key = $1', [c.key])).toBe(1);
       expect((await attestations()).length).toBe(before);
-      const disabled = await admin.query<{ n: string }>(
-        `SELECT COUNT(*)::text AS n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid WHERE c.relname IN ('consult_care_binding','consult_care_submission') AND NOT tg.tgisinternal AND tg.tgenabled = 'D'`,
-      );
-      expect(Number(disabled.rows[0]!.n)).toBe(0);
+      expect(await guardedTriggersDisabled()).toBe(0);
     }
   });
 
@@ -444,10 +484,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     for (const id of SEED_IDS)
       expect(await count('accounts', 'WHERE account_id = $1', [id]), id).toBe(1);
     expect(snapshotDir(inc)).toEqual(dirBefore);
-    const disabled = await admin.query<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid WHERE c.relname IN ('consult_care_binding','consult_care_submission') AND NOT tg.tgisinternal AND tg.tgenabled = 'D'`,
-    );
-    expect(Number(disabled.rows[0]!.n)).toBe(0);
+    expect(await guardedTriggersDisabled()).toBe(0);
     const gate = spawnSync(
       bash,
       [...bashArgs, path.join(ROOT, 'scripts', 'verify-pilot-1-baseline.sh')],
@@ -456,7 +493,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     expect(gate.status, gate.stderr).toBe(0);
   });
 
-  it('incident mode: preconditions, single-use attestation carrying the incident id, two concurrent invocations purge exactly once, directory byte-for-byte untouched; the lock blocks routine-reset', async () => {
+  it('incident mode: preconditions, single-use attestation carrying the incident id, two concurrent invocations purge exactly once, directory byte-for-byte untouched; the lock blocks routine-reset; --finish-runtime is bound to the committed operation', async () => {
     const id = `2026-09-08T16-00Z-cat1-${suffix.toLowerCase()}`;
     const inc = mkIncidentDir(id);
     const before = snapshotDir(inc);
@@ -475,23 +512,44 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     expect(statuses, `${a.stderr}\n${b.stderr}`).toEqual([0, 1]);
     const winner = a.status === 0 ? a : b;
     const loser = a.status === 0 ? b : a;
-    expect(loser.stderr).toMatch(/already attested/);
-    expect(JSON.parse(winner.stdout)).toMatchObject({
-      mode: 'incident',
-      incidentId: id,
-      artifacts: 1,
-    });
+    expect(loser.stderr).toMatch(/already attested|another purge lifecycle/);
+    const won = JSON.parse(winner.stdout) as Record<string, unknown>;
+    expect(won).toMatchObject({ mode: 'incident', incidentId: id, artifacts: 1 });
     expect(await count('accounts', 'WHERE account_id = $1', [c.participantPatient])).toBe(0);
     expect(await count('idempotency_keys', 'WHERE key = $1', [c.key])).toBe(0);
     const rows = (await attestations()).slice(attestBefore);
     expect(rows.length).toBe(await count('tenants'));
     for (const row of rows)
-      expect(row.payload).toMatchObject({ mode: 'incident', incidentId: id, artifacts: 1 });
+      expect(row.payload).toMatchObject({
+        mode: 'incident',
+        incidentId: id,
+        artifacts: 1,
+        operationId: won['operationId'],
+      });
     expect(snapshotDir(inc)).toEqual(before);
 
     const again = runPurge(['--incident-id', id], { PILOT_1_INCIDENT_LOGS_DIR: inc });
     expect(again.status).toBe(1);
     expect(again.stderr).toMatch(/already attested/);
+    expect(snapshotDir(inc)).toEqual(before);
+
+    // recovery is bound to the committed operation and the matching lock
+    const finish = runPurge(
+      ['--finish-runtime', '--operation-id', String(won['operationId']), '--json'],
+      { PILOT_1_INCIDENT_LOGS_DIR: inc },
+    );
+    expect(finish.status, finish.stderr).toBe(0);
+    expect(JSON.parse(finish.stdout)).toMatchObject({
+      mode: 'finish-runtime',
+      attestedMode: 'incident',
+      status: 'finished',
+    });
+    const bogus = runPurge(
+      ['--finish-runtime', '--operation-id', '123e4567-e89b-12d3-a456-426614174000'],
+      { PILOT_1_INCIDENT_LOGS_DIR: inc },
+    );
+    expect(bogus.status).toBe(1);
+    expect(bogus.stderr).toMatch(/no committed env\.purge\.executed attestation/);
     expect(snapshotDir(inc)).toEqual(before);
 
     const stale = mkIncidentDir(`${id}-stale`, 45);
