@@ -57,6 +57,9 @@ function run(args, input, { chunk = 0 } = {}) {
     child.stdout.setEncoding('utf8').on('data', (d) => (stdout += d));
     child.stderr.setEncoding('utf8').on('data', (d) => (stderr += d));
     child.on('close', (code) => resolve({ code, stdout, stderr }));
+    // A run that fails closed exits while input is still being written; the
+    // resulting EPIPE / EOF on stdin is expected, not a test failure.
+    child.stdin.on('error', () => {});
     if (chunk > 0) {
       // Feed the input in small pieces so values straddle chunk boundaries.
       let i = 0;
@@ -315,4 +318,29 @@ test('backup mode: a bare CR between literal fragments (Codex R8) fails closed',
     assert.equal(code, 4);
     assert.ok(!stdout.includes('example.com'));
   }
+});
+
+test('backup mode: block-comment semicolons and same-line statement boundaries (Codex R9)', async () => {
+  const a = await run(
+    ['--mode', 'backup'],
+    'COPY public.t (\n/* ; */\nbody) FROM stdin;\ntest.user@example.com\n\\.\n',
+  );
+  assert.equal(a.code, 0, a.stderr);
+  assert.ok(!a.stdout.includes('test.user@example.com'));
+  assert.match(a.stderr, /copyRows=1/);
+  const b = await run(
+    ['--mode', 'backup'],
+    'SELECT 1; COPY public.t (\nbody) FROM stdin;\ntest.user@example.com\n\\.\n',
+  );
+  assert.equal(b.code, 0, b.stderr);
+  assert.ok(!b.stdout.includes('test.user@example.com'));
+  const c = await run(['--mode', 'backup'], 'SELECT 1; /* open\ntest.user@example.com\n');
+  assert.equal(c.code, 4);
+});
+
+test('backup mode: an open identifier is budgeted before EOF (Codex R9)', async () => {
+  const input = 'COPY public.t ("\n' + ('y'.repeat(200_000) + '\n').repeat(8);
+  const { code, stderr } = await run(['--mode', 'backup', '--max-line-bytes', '2000000'], input);
+  assert.equal(code, 4);
+  assert.match(stderr, /exceeds/);
 });

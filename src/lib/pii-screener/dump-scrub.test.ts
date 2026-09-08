@@ -397,3 +397,53 @@ describe('Codex R8 in-scope closures — lexer-driven termination and CR handlin
     expect(() => scrubCopyRow('1\ta\rb\n')).toThrow(/carriage return/);
   });
 });
+
+describe('Codex R9 in-scope closures — block comments, semicolon-level boundaries, buffer budget', () => {
+  it('a block comment containing ";" inside a COPY header does not discard the header', () => {
+    const dump =
+      'COPY public.t (\n/* ; */\nbody) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+    expect(scrubText(dump)).not.toContain('test.user@example.com');
+  });
+  it('a nested block comment and a trailing block comment on the header line are whitespace', () => {
+    const dump =
+      'COPY public.t (id, /* a /* nested ; */ b */ body) FROM stdin; /* data */\n1\tmy SSN is 123-45-6789\n\\.\n';
+    expect(scrubText(dump)).not.toContain('123-45-6789');
+  });
+  it('an unterminated block comment at end of input fails closed', () => {
+    const s = createDumpScrubber();
+    s.push('SELECT 1; /* open\n');
+    s.push('1\treach me at test.user@example.com\n');
+    expect(() => s.end()).toThrow(/unterminated blockcomment/);
+  });
+  it('a COPY header that starts after a semicolon on the same line is kept', () => {
+    const dump =
+      'SELECT 1; COPY public.t (\nbody) FROM stdin;\nreach me at test.user@example.com\n\\.\n';
+    expect(scrubText(dump)).not.toContain('test.user@example.com');
+  });
+  it('a completed dollar block followed by a COPY header on the same line is kept', () => {
+    const dump =
+      'CREATE FUNCTION f() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql; COPY public.t (id, body) FROM stdin;\n1\tmy SSN is 123-45-6789\n\\.\n';
+    expect(scrubText(dump)).not.toContain('123-45-6789');
+  });
+  it('content after a COPY header on the same line is rejected', () => {
+    expect(() => scrubText('COPY public.t (id, body) FROM stdin; SELECT 1;\n1\tx\n\\.\n')).toThrow(
+      /after a COPY header/,
+    );
+  });
+  it('an open identifier that never closes is budgeted and rejected before EOF', () => {
+    const s = createDumpScrubber();
+    s.push('COPY public.t ("\n');
+    const chunk = 'y'.repeat(200_000) + '\n';
+    expect(() => {
+      for (let i = 0; i < 8; i++) s.push(chunk);
+    }).toThrow(/exceeds/);
+  });
+  it('an open literal that never closes is budgeted and rejected before EOF', () => {
+    const s = createDumpScrubber();
+    s.push("INSERT INTO t VALUES ('\n");
+    const chunk = 'y'.repeat(200_000) + '\n';
+    expect(() => {
+      for (let i = 0; i < 8; i++) s.push(chunk);
+    }).toThrow(/exceeds/);
+  });
+});

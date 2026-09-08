@@ -351,7 +351,9 @@ function encodeEscapeLiteral(value: string): string {
 }
 
 interface SqlState {
-  mode: 'code' | 'literal' | 'dollar' | 'identifier';
+  mode: 'code' | 'literal' | 'dollar' | 'identifier' | 'blockcomment';
+  /** Nesting depth while in a block comment (PostgreSQL nests them). */
+  commentDepth: number;
   escapeLiteral: boolean;
   literal: string;
   dollarTag: string;
@@ -372,8 +374,13 @@ interface SqlState {
    * are decided on THIS, never on raw lines. (Codex R8.)
    */
   stmt: string;
-  /** A real statement-terminating `;` was seen in code mode. */
-  stmtEnded: boolean;
+  /**
+   * Called with the finished statement text at its ACTUAL terminating `;`
+   * (code mode, outside quotes and comments) — the only place a statement
+   * boundary is decided. (Codex R9: per-line boundary handling dropped the
+   * start of a COPY header that followed a semicolon on the same line.)
+   */
+  onStatementEnd?: (stmt: string) => void;
 }
 
 function scrubLiteral(content: string, escapeLiteral: boolean, stats?: DumpScrubStats): string {
@@ -392,6 +399,29 @@ function scrubSqlText(text: string, st: SqlState): string {
   let i = 0;
   while (i < text.length) {
     const ch = text[i]!;
+    if (st.mode === 'blockcomment') {
+      // Nested block comment: whitespace to PostgreSQL. Passed through
+      // verbatim; contributes nothing to the statement text.
+      if (text.startsWith('/*', i)) {
+        st.commentDepth += 1;
+        out += '/*';
+        i += 2;
+        continue;
+      }
+      if (text.startsWith('*/', i)) {
+        st.commentDepth -= 1;
+        out += '*/';
+        i += 2;
+        if (st.commentDepth === 0) {
+          st.mode = 'code';
+          st.stmt += ' ';
+        }
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
     if (st.mode === 'dollar') {
       const end = text.indexOf(st.dollarTag, i);
       if (end === -1) {
@@ -457,6 +487,13 @@ function scrubSqlText(text: string, st: SqlState): string {
       continue;
     }
     // code
+    if (ch === '/' && text[i + 1] === '*') {
+      st.mode = 'blockcomment';
+      st.commentDepth = 1;
+      out += '/*';
+      i += 2;
+      continue;
+    }
     if (ch === '-' && text[i + 1] === '-') {
       // A line comment ends at LF or CR (PostgreSQL treats both as
       // newlines); it contributes nothing to the statement text.
@@ -535,7 +572,13 @@ function scrubSqlText(text: string, st: SqlState): string {
     }
     out += ch;
     st.stmt += ch;
-    if (ch === ';') st.stmtEnded = true;
+    if (ch === ';') {
+      // The statement ends HERE, not at the end of the physical line: decide
+      // it now and start accumulating the next one.
+      const finished = st.stmt;
+      st.stmt = '';
+      st.onStatementEnd?.(finished);
+    }
     i++;
   }
   return out;
@@ -573,7 +616,7 @@ export function createDumpScrubber(): DumpScrubber {
     stats,
     literalClosedAtLineEnd: false,
     stmt: '',
-    stmtEnded: false,
+    commentDepth: 0,
   };
   // Physical lines of the statement in progress while a quoted identifier,
   // literal or dollar block is open. A COPY header is recognised ONLY when
@@ -583,8 +626,18 @@ export function createDumpScrubber(): DumpScrubber {
   // activated COPY early, its embedded terminator ended it, and the real
   // rows bypassed scrubbing).
   // Beyond the cap a pending statement FAILS CLOSED — never a fallback to
-  // SQL passthrough (Codex R5).
+  // SQL passthrough (Codex R5). The budget covers EVERY pending buffer —
+  // statement text, an open identifier, an open literal — on every push, so
+  // nothing can grow unbounded before a closing quote or EOF (Codex R9).
   const STMT_CAP = 1024 * 1024;
+  let activateCopy = false;
+  let afterCopyHeader = false;
+  sql.onStatementEnd = (stmt) => {
+    // A statement completing after a pending COPY activation is content on
+    // the header line — it would otherwise be mis-lexed as the first row.
+    if (activateCopy) afterCopyHeader = true;
+    else if (COPY_START_MULTILINE.test(stmt.trim())) activateCopy = true;
+  };
   return {
     stats,
     push(line: string): string {
@@ -610,19 +663,26 @@ export function createDumpScrubber(): DumpScrubber {
         if (!/^\s*(?:--[^\n\r]*)?\s*$/.test(line)) sql.literalClosedAtLineEnd = false;
       }
       const out = scrubSqlText(line, sql);
-      if (sql.stmt.length > STMT_CAP) {
+      if (sql.stmt.length + sql.identifier.length + sql.literal.length > STMT_CAP) {
         const err = new Error(
           `dump-scrub: pending statement exceeds ${STMT_CAP} bytes before closing; aborting so no row is passed through unscreened`,
         );
         (err as { exitCode?: number }).exitCode = 4;
         throw err;
       }
-      if (sql.stmtEnded && sql.mode === 'code') {
-        // A REAL terminating semicolon (outside quotes and comments) closed
-        // the statement: decide on the comment-free, literal-masked text.
-        if (COPY_START_MULTILINE.test(sql.stmt.trim())) inCopy = true;
-        sql.stmt = '';
-        sql.stmtEnded = false;
+      if (activateCopy) {
+        activateCopy = false;
+        // A real dump puts nothing after `FROM stdin;` on the header line;
+        // anything else there would be mis-lexed as the first row.
+        if (afterCopyHeader || sql.mode !== 'code' || sql.stmt.trim().length > 0) {
+          afterCopyHeader = false;
+          const err = new Error(
+            'dump-scrub: unsupported content after a COPY header on the same line; aborting',
+          );
+          (err as { exitCode?: number }).exitCode = 4;
+          throw err;
+        }
+        inCopy = true;
       }
       return out;
     },
@@ -632,7 +692,12 @@ export function createDumpScrubber(): DumpScrubber {
         (err as { exitCode?: number }).exitCode = 4;
         throw err;
       }
-      if (sql.mode === 'literal' || sql.mode === 'dollar' || sql.mode === 'identifier') {
+      if (
+        sql.mode === 'literal' ||
+        sql.mode === 'dollar' ||
+        sql.mode === 'identifier' ||
+        sql.mode === 'blockcomment'
+      ) {
         // An unterminated literal / dollar block / identifier at end of
         // input is not a valid dump: fail closed rather than guess.
         const err = new Error(`dump-scrub: unterminated ${sql.mode} at end of input`);
