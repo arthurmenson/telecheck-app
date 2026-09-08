@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { withActorContext } from '../../../lib/actor-context-binding.js';
 import { crisisDetector } from '../../../lib/crisis-detection.js';
-import { withTenantBoundConnection, type DbTransaction } from '../../../lib/db.js';
+import { withTenantBoundConnection, type DbClient, type DbTransaction } from '../../../lib/db.js';
 import { emitDomainEvent } from '../../../lib/domain-events.js';
 import { logger } from '../../../lib/logger.js';
 import { withTenantContext } from '../../../lib/rls.js';
@@ -21,6 +21,18 @@ export interface PatientCareAdmissionContext {
   actorNonce: string;
   /** Retry selector only; never an actor, patient, event or signal identifier. */
   idempotencyKey?: string;
+  /**
+   * Caller-owned connection with a REAL transaction lifecycle. Test-only.
+   *
+   * The integration harness routes every app connection through one shared
+   * client that translates BEGIN/COMMIT into savepoints, and a deferred
+   * constraint trigger fires only at a real COMMIT — so COMMIT-time
+   * authority enforcement is invisible there. Integration tests pass their
+   * own connection here to observe it. Forwarded to
+   * `withTenantBoundConnection` as its caller-owned `externalTx`, which
+   * means the caller also owns the tenant binding. Refused outside test.
+   */
+  connection?: DbClient;
 }
 export interface PatientCrisisResources {
   country_of_care: string;
@@ -151,27 +163,34 @@ function patientTransaction<T>(
   work: (tx: DbTransaction) => Promise<T>,
   beforeCommit: () => void = () => undefined,
 ): Promise<T> {
-  return withTenantBoundConnection(ctx.tenant.tenantId, async (client) => {
-    await client.query('BEGIN');
-    try {
-      const result = await withActorContext(client, ctx.actorNonce, async () => {
-        await client.query("SET LOCAL statement_timeout='5s'");
-        await client.query("SET LOCAL lock_timeout='2s'");
-        await assertPatient(client, ctx);
-        const result = await work(client);
-        await assertPatient(client, ctx);
+  if (ctx.connection !== undefined && process.env['NODE_ENV'] !== 'test') {
+    throw new Error('patientTransaction: a caller-owned connection is test-only');
+  }
+  return withTenantBoundConnection(
+    ctx.tenant.tenantId,
+    async (client) => {
+      await client.query('BEGIN');
+      try {
+        const result = await withActorContext(client, ctx.actorNonce, async () => {
+          await client.query("SET LOCAL statement_timeout='5s'");
+          await client.query("SET LOCAL lock_timeout='2s'");
+          await assertPatient(client, ctx);
+          const result = await work(client);
+          await assertPatient(client, ctx);
+          return result;
+        });
+        beforeCommit();
+        // The deferred `crisis_care_evidence` trigger fires HERE, with the
+        // tenant and actor bindings both still in scope.
+        await client.query('COMMIT');
         return result;
-      });
-      beforeCommit();
-      // The deferred `crisis_care_evidence` trigger fires HERE, with the
-      // tenant and actor bindings both still in scope.
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      throw error;
-    }
-  }).catch((error: unknown) => {
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      }
+    },
+    ctx.connection,
+  ).catch((error: unknown) => {
     if ((error as { code?: unknown } | null)?.code === 'PT401')
       throw Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401', statusCode: 401 });
     throw error;
