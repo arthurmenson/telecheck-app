@@ -6,13 +6,16 @@ const mocks = vi.hoisted(() => ({
   outbox: vi.fn(),
   profile: vi.fn(),
   commitFailure: false,
+  commitError: null as unknown,
 }));
+// The seam is now `withTenantBoundConnection` with BEGIN/COMMIT issued
+// INSIDE the tenant scope, so COMMIT failure is simulated where it really
+// happens: on the `COMMIT` statement itself, via `mocks.query`.
 vi.mock('../../../lib/db.js', () => ({
-  withTransaction: async (work: (tx: unknown) => Promise<unknown>) => {
-    const result = await work({ query: mocks.query });
-    if (mocks.commitFailure) throw new Error('connection_lost');
-    return result;
-  },
+  withTenantBoundConnection: async (
+    _tenantId: string,
+    work: (client: unknown) => Promise<unknown>,
+  ) => work({ query: mocks.query }),
 }));
 vi.mock('../../../lib/rls.js', () => ({
   withTenantContext: (_tx: unknown, _tenant: string, work: () => Promise<unknown>) => work(),
@@ -45,6 +48,7 @@ const ctx = {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.commitFailure = false;
+  mocks.commitError = null;
   mocks.profile.mockResolvedValue({
     emergency_number: 'configured-emergency',
     crisis_helplines: [],
@@ -52,6 +56,13 @@ beforeEach(() => {
   mocks.audit.mockResolvedValue({ audit_id: '123e4567-e89b-42d3-a456-426614174001' });
   mocks.outbox.mockResolvedValue(undefined);
   mocks.query.mockImplementation(async (sql: string) => {
+    if (sql === 'COMMIT') {
+      // Acknowledgement loss: no SQLSTATE, outcome genuinely unknown.
+      if (mocks.commitFailure) throw new Error('connection_lost');
+      // Server RAISED during COMMIT (deferred trigger): a definite rollback.
+      if (mocks.commitError !== null) throw mocks.commitError;
+      return { rows: [] };
+    }
     if (sql.includes('crisis_care_live_patient'))
       return {
         rows: [
@@ -160,6 +171,56 @@ describe('patient crisis admission', () => {
       escalation_status: 'unconfirmed',
     });
     expect(result).not.toHaveProperty('crisis_event_id');
+  });
+
+  it('lets the deferred evidence trigger fire at COMMIT instead of forcing it early', async () => {
+    // The old code issued `SET CONSTRAINTS crisis_care_evidence IMMEDIATE`
+    // before the last assert, draining the trigger queue so COMMIT ran with
+    // no authority check. That is the window in which an expired nonce was
+    // committed. The trigger must fire on COMMIT itself.
+    await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    const sqls = mocks.query.mock.calls.map(([sql]) => String(sql));
+    expect(sqls.some((q) => q.includes('SET CONSTRAINTS'))).toBe(false);
+    const write = sqls.findIndex((q) => q.includes('crisis_care_record'));
+    const commit = sqls.indexOf('COMMIT');
+    expect(write).toBeGreaterThanOrEqual(0);
+    expect(commit).toBeGreaterThan(write);
+    expect(sqls.indexOf('BEGIN')).toBeLessThan(write);
+  });
+
+  it('rejects an admission whose nonce expired before COMMIT (PT401 raised by COMMIT)', async () => {
+    // `crisis_care_require_evidence()` calls `crisis_care_live_patient()`,
+    // which compares the nonce against clock_timestamp(). Fired at COMMIT,
+    // an expired nonce raises PT401 from the COMMIT statement and the
+    // transaction rolls back — nothing is recorded under expired authority.
+    mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' });
+    await expect(admitPatientCareInput(ctx, 'in crisis', 'messaging')).rejects.toMatchObject({
+      code: 'PT401',
+      statusCode: 401,
+    });
+    const sqls = mocks.query.mock.calls.map(([sql]) => String(sql));
+    expect(sqls.indexOf('ROLLBACK')).toBeGreaterThan(sqls.indexOf('COMMIT'));
+  });
+
+  it('treats a constraint violation raised at COMMIT as a definite rollback, not uncertainty', async () => {
+    // With the evidence trigger deferred, `crisis_evidence_required` can
+    // now arrive on COMMIT. A raise carries a SQLSTATE and is a guaranteed
+    // rollback; only acknowledgement loss (no SQLSTATE) is `unconfirmed`.
+    mocks.commitError = Object.assign(new Error('crisis_evidence_required'), { code: '23514' });
+    expect(await admitPatientCareInput(ctx, 'in crisis', 'messaging')).toMatchObject({
+      recording_status: 'not_recorded',
+      escalation_status: 'not_queued',
+    });
+  });
+
+  it('keeps a driver-level failure code (not a SQLSTATE) classified as uncertain', async () => {
+    // pg surfaces socket errors with codes like ECONNRESET. Those are not
+    // five-char SQLSTATEs and must not be mistaken for a server raise.
+    mocks.commitError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    expect(await admitPatientCareInput(ctx, 'in crisis', 'messaging')).toMatchObject({
+      recording_status: 'unconfirmed',
+      escalation_status: 'unconfirmed',
+    });
   });
 
   it('cannot turn a profile lookup failure into ordinary clinical continuation', async () => {

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { withActorContext } from '../../../lib/actor-context-binding.js';
 import { crisisDetector } from '../../../lib/crisis-detection.js';
-import { withTransaction, type DbTransaction } from '../../../lib/db.js';
+import { withTenantBoundConnection, type DbTransaction } from '../../../lib/db.js';
 import { emitDomainEvent } from '../../../lib/domain-events.js';
 import { logger } from '../../../lib/logger.js';
 import { withTenantContext } from '../../../lib/rls.js';
@@ -112,26 +112,65 @@ async function assertPatient(tx: DbTransaction, ctx: PatientCareAdmissionContext
     throw Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' });
 }
 
+/**
+ * Runs `work` in a transaction whose COMMIT is itself authority-checked.
+ *
+ * ## Why the nesting is tenant-scope OUTSIDE, BEGIN/COMMIT INSIDE
+ *
+ * The earlier shape was `withTransaction(() => withTenantContext(() =>
+ * withActorContext(work)))`. That looks right and is subtly wrong:
+ * `withTenantContext` DELETES the per-backend tenant binding in its
+ * cleanup, which runs when the callback returns — i.e. BEFORE the outer
+ * `withTransaction` issues COMMIT. The actor nonce (`set_config(...,
+ * true)`) is transaction-local and survives to COMMIT, but
+ * `kms_current_actor_context()` requires `current_tenant_id()` too, so at
+ * COMMIT time nothing could re-validate authority.
+ *
+ * The code worked around that by forcing the DEFERRABLE evidence trigger
+ * `crisis_care_evidence` IMMEDIATE while the bindings were still in scope.
+ * That drains the trigger queue, so the actual COMMIT ran with NO authority
+ * check at all. Between the last `assertPatient` and COMMIT the nonce can
+ * expire — `kms_current_actor_context()` compares against
+ * `clock_timestamp()`, not the frozen `NOW()` — and the admission was
+ * committed under expired authority. Reproduced by the clinical v1 review.
+ *
+ * Inverting the nesting fixes the root cause instead of the symptom: the
+ * tenant binding is set on the connection, BEGIN…COMMIT run inside that
+ * scope, and cleanup follows COMMIT. Both bindings are live when the
+ * deferred trigger fires, so `crisis_care_require_evidence()` —
+ * which calls `crisis_care_live_patient()` first and last — becomes a
+ * genuine COMMIT-time authority gate. An expired nonce now raises PT401
+ * from the COMMIT statement and the transaction rolls back.
+ *
+ * The IMMEDIATE forcing is therefore removed on purpose. Re-adding it
+ * would reopen the window. The two app-side `assertPatient` calls stay
+ * for fail-fast; they are no longer the last word.
+ */
 function patientTransaction<T>(
   ctx: PatientCareAdmissionContext,
   work: (tx: DbTransaction) => Promise<T>,
   beforeCommit: () => void = () => undefined,
 ): Promise<T> {
-  return withTransaction(async (tx) => {
-    const result = await withTenantContext(tx, ctx.tenant.tenantId, () =>
-      withActorContext(tx, ctx.actorNonce, async () => {
-        await tx.query("SET LOCAL statement_timeout='5s'");
-        await tx.query("SET LOCAL lock_timeout='2s'");
-        await assertPatient(tx, ctx);
-        const result = await work(tx);
-        await assertPatient(tx, ctx);
-        await tx.query('SET CONSTRAINTS crisis_care_evidence IMMEDIATE');
-        await assertPatient(tx, ctx);
+  return withTenantBoundConnection(ctx.tenant.tenantId, async (client) => {
+    await client.query('BEGIN');
+    try {
+      const result = await withActorContext(client, ctx.actorNonce, async () => {
+        await client.query("SET LOCAL statement_timeout='5s'");
+        await client.query("SET LOCAL lock_timeout='2s'");
+        await assertPatient(client, ctx);
+        const result = await work(client);
+        await assertPatient(client, ctx);
         return result;
-      }),
-    );
-    beforeCommit();
-    return result;
+      });
+      beforeCommit();
+      // The deferred `crisis_care_evidence` trigger fires HERE, with the
+      // tenant and actor bindings both still in scope.
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    }
   }).catch((error: unknown) => {
     if ((error as { code?: unknown } | null)?.code === 'PT401')
       throw Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401', statusCode: 401 });
@@ -238,7 +277,16 @@ export async function admitPatientCareInput(
     if (code === '42501' && !authenticated)
       throw Object.assign(new Error('crisis_forbidden'), { code: '42501', statusCode: 403 });
     signalAdmissionUnavailable();
-    recordingStatus = commitPossible ? 'unconfirmed' : 'not_recorded';
+    // `unconfirmed` is reserved for a genuinely unknowable outcome — the
+    // acknowledgement was lost. An error that carries a SQLSTATE was RAISED
+    // by the server, and a raise during COMMIT is a guaranteed rollback,
+    // not an uncertainty. Now that the evidence trigger fires at COMMIT
+    // rather than being forced early, its `crisis_evidence_required`
+    // (23514) can arrive on the COMMIT statement and must still classify
+    // as `not_recorded`. SQLSTATE is exactly five alphanumerics; driver
+    // codes such as `ECONNRESET` do not match and stay uncertain.
+    const definiteRollback = typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code);
+    recordingStatus = commitPossible && !definiteRollback ? 'unconfirmed' : 'not_recorded';
   }
 
   // Recording has already settled. Public configuration can neither prevent
