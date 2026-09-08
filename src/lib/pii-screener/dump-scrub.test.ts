@@ -237,10 +237,86 @@ describe('Codex R4 in-scope closure', () => {
     const s = createDumpScrubber();
     s.push('COPY public."a FROM stdin;\n');
     s.push('1\treach me at test.user@example.com\n');
-    expect(() => s.end()).toThrow(/unterminated identifier/);
+    expect(() => s.end()).toThrow(/unterminated (identifier|COPY statement)/);
   });
   it('a plain single-line COPY header still activates COPY', () => {
     const dump = 'COPY public.t (id, body) FROM stdin;\n1\tmy SSN is 123-45-6789\n\\.\n';
     expect(scrubText(dump)).not.toContain('123-45-6789');
+  });
+});
+
+describe('Codex R5 in-scope closure — statement-head cap fails closed', () => {
+  function wideHeader(columns: number): string {
+    // Legal PostgreSQL: many multi-line quoted column names.
+    const cols = Array.from({ length: columns }, (_, i) => `"c${i}\nx"`).join(', ');
+    return `COPY public.t (${cols}) FROM stdin;\n`;
+  }
+  it('a large but under-cap multi-line header still activates COPY and scrubs rows', () => {
+    const header = wideHeader(1_200); // ~10 KiB of header, many line breaks
+    const out = scrubText(header + '1\treach me at test.user@example.com\n\\.\n');
+    expect(out).not.toContain('test.user@example.com');
+  });
+  it('a pending statement beyond the cap aborts (exit 4) instead of passing rows through', () => {
+    // Fed as physical lines (as the CLI does). The pending COPY statement
+    // accumulates from the COPY line until a line ends with ';' in code mode.
+    const bigCol = '"' + 'y'.repeat(100_000) + '\nz"';
+    const text =
+      'COPY public.t (' +
+      Array.from({ length: 12 }, () => bigCol).join(',\n') +
+      ') FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+    expect(() => scrubText(text)).toThrow(/exceeds/);
+  });
+});
+
+describe('Codex R5 follow-through — header assembly across identifier boundaries', () => {
+  it('an identifier that closes on one line while the next opens on a later line is still assembled', () => {
+    const dump =
+      'COPY public."a\nb" (id,\n"c\nd") FROM stdin;\n' +
+      '1\treach me at test.user@example.com\n' +
+      '\\.\n';
+    expect(scrubText(dump)).not.toContain('test.user@example.com');
+  });
+  it('a COPY statement that never closes fails closed at end of input', () => {
+    const s = createDumpScrubber();
+    s.push('COPY public.t (id,\n');
+    s.push('1\treach me at test.user@example.com\n');
+    expect(() => s.end()).toThrow(/unterminated COPY statement/);
+  });
+  it('a non-COPY multi-line statement does not accumulate and DDL is untouched', () => {
+    const ddl = 'CREATE TABLE public."a\nb" (\n    id integer\n);\n';
+    expect(scrubText(ddl)).toBe(ddl);
+  });
+});
+
+describe('open identifiers are held, not emitted', () => {
+  it('an unterminated identifier at end of input emits nothing of its lines', () => {
+    const s = createDumpScrubber();
+    const first = s.push('CREATE TABLE public."a\n');
+    const second = s.push('1\treach me at test.user@example.com\n');
+    expect(first).toBe('CREATE TABLE public.');
+    expect(second).toBe('');
+    expect(() => s.end()).toThrow(/unterminated/);
+  });
+  it('a multi-line identifier that closes is emitted verbatim when it closes', () => {
+    const s = createDumpScrubber();
+    const a = s.push('CREATE TABLE public."a\n');
+    const b = s.push('b" (id integer);\n');
+    expect(a + b).toBe('CREATE TABLE public."a\nb" (id integer);\n');
+  });
+});
+
+describe('value-level accounting', () => {
+  it('counts redacted values and COPY rows, never held-line reshuffles', () => {
+    const s = createDumpScrubber();
+    const dump =
+      'COPY public."a\n\'neil" (id, body, n) FROM stdin;\n' +
+      '1\treach me at test.user@example.com\t42\n' +
+      '2\tclean\t3125551212\n' +
+      '\\.\n' +
+      "INSERT INTO t VALUES ('my SSN is 123-45-6789');\n";
+    for (const line of dump.split('\n').filter((l) => l.length > 0)) s.push(line + '\n');
+    s.end();
+    expect(s.stats.copyRows).toBe(2);
+    expect(s.stats.redactedValues).toBe(3);
   });
 });

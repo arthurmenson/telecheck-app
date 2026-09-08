@@ -206,7 +206,7 @@ function isPrintableUtf8(buf: Buffer): string | null {
   return text;
 }
 
-function scrubCopyField(raw: string): string {
+function scrubCopyField(raw: string, stats?: DumpScrubStats): string {
   if (raw === '\\N') return raw;
   const decoded = decodeCopyField(raw);
   if (/^\\x[0-9A-Fa-f]*$/.test(decoded)) {
@@ -217,18 +217,29 @@ function scrubCopyField(raw: string): string {
     if (text === null) return raw;
     const scrubbed = scrubValue(text);
     if (scrubbed === text) return raw;
+    if (stats) stats.redactedValues += 1;
     return encodeCopyField('\\x' + Buffer.from(scrubbed, 'utf8').toString('hex'));
   }
   const scrubbed = scrubValue(decoded);
-  return scrubbed === decoded ? raw : encodeCopyField(scrubbed);
+  if (scrubbed === decoded) return raw;
+  if (stats) stats.redactedValues += 1;
+  return encodeCopyField(scrubbed);
 }
 
-export function scrubCopyRow(line: string): string {
+export function scrubCopyRow(line: string, stats?: DumpScrubStats): string {
   const newline = line.endsWith('\n') ? '\n' : '';
   const body = newline ? line.slice(0, -1) : line;
   const cr = body.endsWith('\r') ? '\r' : '';
   const row = cr ? body.slice(0, -1) : body;
-  return row.split('\t').map(scrubCopyField).join('\t') + cr + newline;
+  if (stats) stats.copyRows += 1;
+  return (
+    row
+      .split('\t')
+      .map((f) => scrubCopyField(f, stats))
+      .join('\t') +
+    cr +
+    newline
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -335,15 +346,19 @@ interface SqlState {
   escapeLiteral: boolean;
   literal: string;
   dollarTag: string;
+  /** Raw text of an open quoted identifier, held until it closes. */
+  identifier: string;
+  stats?: DumpScrubStats;
 }
 
-function scrubLiteral(content: string, escapeLiteral: boolean): string {
+function scrubLiteral(content: string, escapeLiteral: boolean, stats?: DumpScrubStats): string {
   // Both literal kinds are decoded in ONE sequential pass: a regex
   // pre-replacement of '' overlapped a preceding \' and corrupted the
   // value (Codex R3).
   const decoded = escapeLiteral ? decodeEscapeLiteral(content) : content.replace(/''/g, "'");
   const scrubbed = scrubValue(decoded);
   if (scrubbed === decoded) return content;
+  if (stats) stats.redactedValues += 1;
   return escapeLiteral ? encodeEscapeLiteral(scrubbed) : scrubbed.replace(/'/g, "''");
 }
 
@@ -364,7 +379,8 @@ function scrubSqlText(text: string, st: SqlState): string {
       continue;
     }
     if (st.mode === 'identifier') {
-      // Continuation of a quoted identifier that spanned a line boundary.
+      // Continuation of a quoted identifier that spanned a line boundary:
+      // keep holding it; emit only when it closes.
       let j = i;
       while (j < text.length) {
         if (text[j] === '"') {
@@ -377,10 +393,11 @@ function scrubSqlText(text: string, st: SqlState): string {
         j++;
       }
       if (j >= text.length) {
-        out += text.slice(i);
+        st.identifier += text.slice(i);
         return out;
       }
-      out += text.slice(i, j + 1);
+      out += st.identifier + text.slice(i, j + 1);
+      st.identifier = '';
       i = j + 1;
       st.mode = 'code';
       continue;
@@ -398,7 +415,7 @@ function scrubSqlText(text: string, st: SqlState): string {
           i += 2;
           continue;
         }
-        out += scrubLiteral(st.literal, st.escapeLiteral) + "'";
+        out += scrubLiteral(st.literal, st.escapeLiteral, st.stats) + "'";
         st.mode = 'code';
         st.literal = '';
         i++;
@@ -430,9 +447,10 @@ function scrubSqlText(text: string, st: SqlState): string {
       }
     }
     if (ch === '"') {
-      // Quoted identifier: pass through verbatim up to the closing quote
-      // (a doubled quote is an escaped quote). Its content is a NAME, and
-      // an apostrophe inside it must not open a literal.
+      // Quoted identifier: its content is a NAME, passed through verbatim
+      // once it closes (a doubled quote is an escaped quote; an apostrophe
+      // inside must not open a literal). If it does not close on this line
+      // it is HELD, not emitted — an unterminated identifier leaks nothing.
       let j = i + 1;
       while (j < text.length) {
         if (text[j] === '"') {
@@ -446,7 +464,7 @@ function scrubSqlText(text: string, st: SqlState): string {
       }
       if (j >= text.length) {
         st.mode = 'identifier';
-        out += text.slice(i);
+        st.identifier = text.slice(i);
         return out;
       }
       out += text.slice(i, j + 1);
@@ -475,7 +493,16 @@ function scrubSqlText(text: string, st: SqlState): string {
 // Line-oriented scrubber with state across lines
 // ---------------------------------------------------------------------------
 
+export interface DumpScrubStats {
+  /** COPY fields and SQL literals whose scrubbed form differed from the decoded value. */
+  redactedValues: number;
+  /** COPY data rows seen. */
+  copyRows: number;
+}
+
 export interface DumpScrubber {
+  /** Live accounting for the run (value-level, never the values themselves). */
+  readonly stats: DumpScrubStats;
   /** Feed one line (with its trailing newline if it had one). Returns text to emit now. */
   push(line: string): string;
   /** Flush at end of input. */
@@ -484,7 +511,15 @@ export interface DumpScrubber {
 
 export function createDumpScrubber(): DumpScrubber {
   let inCopy = false;
-  const sql: SqlState = { mode: 'code', escapeLiteral: false, literal: '', dollarTag: '' };
+  const stats: DumpScrubStats = { redactedValues: 0, copyRows: 0 };
+  const sql: SqlState = {
+    mode: 'code',
+    escapeLiteral: false,
+    literal: '',
+    dollarTag: '',
+    identifier: '',
+    stats,
+  };
   // Physical lines of the statement in progress while a quoted identifier,
   // literal or dollar block is open. A COPY header is recognised ONLY when
   // the statement closes in code mode with `FROM stdin;` at its end — never
@@ -492,32 +527,57 @@ export function createDumpScrubber(): DumpScrubber {
   // (Codex R4: a table named public."a FROM stdin;<newline>\\.<newline>b"
   // activated COPY early, its embedded terminator ended it, and the real
   // rows bypassed scrubbing).
-  let statementHead = '';
-  const HEAD_CAP = 64 * 1024;
+  // Pending COPY statement: from a line that begins `COPY` in code mode
+  // until a line ENDS in code mode with `;`. The whole statement is then
+  // tested for the header. Quote state is scanned first, so an identifier
+  // containing `FROM stdin;` or a terminator line cannot activate COPY
+  // early (Codex R4), an identifier that closes on one line while the next
+  // opens on a later line is still assembled (Codex R5 follow-through), and
+  // beyond the cap the run FAILS CLOSED rather than falling back to SQL
+  // passthrough (Codex R5).
+  let pendingCopy = '';
+  let pendingCopyActive = false;
+  const HEAD_CAP = 1024 * 1024;
   return {
+    stats,
     push(line: string): string {
       if (inCopy) {
         if (COPY_END.test(line)) {
           inCopy = false;
           return line;
         }
-        return scrubCopyRow(line);
+        return scrubCopyRow(line, stats);
       }
+      const startsStatement = sql.mode === 'code' && !pendingCopyActive;
       const out = scrubSqlText(line, sql);
-      if (sql.mode !== 'code') {
-        // Statement still open across the line boundary: accumulate (bounded —
-        // a header cannot be that long) and decide when it closes.
-        if (statementHead.length <= HEAD_CAP) statementHead += line;
-        return out;
+      if (startsStatement && /^COPY\s/.test(line)) {
+        pendingCopyActive = true;
+        pendingCopy = '';
       }
-      const statement = statementHead.length > 0 ? statementHead + line : line;
-      statementHead = '';
-      if (statement.length <= HEAD_CAP + line.length && COPY_START_MULTILINE.test(statement)) {
-        inCopy = true;
+      if (!pendingCopyActive) return out;
+      pendingCopy += line;
+      if (pendingCopy.length > HEAD_CAP) {
+        const err = new Error(
+          `dump-scrub: pending COPY statement exceeds ${HEAD_CAP} bytes before closing; aborting so no row is passed through unscreened`,
+        );
+        (err as { exitCode?: number }).exitCode = 4;
+        throw err;
+      }
+      if (sql.mode === 'code' && /;\s*$/.test(line)) {
+        // Statement closed in code mode: decide now.
+        const statement = pendingCopy;
+        pendingCopy = '';
+        pendingCopyActive = false;
+        if (COPY_START_MULTILINE.test(statement)) inCopy = true;
       }
       return out;
     },
     end(): string {
+      if (pendingCopyActive) {
+        const err = new Error('dump-scrub: unterminated COPY statement at end of input');
+        (err as { exitCode?: number }).exitCode = 4;
+        throw err;
+      }
       if (sql.mode === 'literal' || sql.mode === 'dollar' || sql.mode === 'identifier') {
         // An unterminated literal / dollar block / identifier at end of
         // input is not a valid dump: fail closed rather than guess.

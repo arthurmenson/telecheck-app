@@ -107,16 +107,23 @@ export async function scrubStream(input, output, opts) {
   if (carry.length > 0) tail += emit(carry);
   if (dump) tail += dump.end();
   await write(tail);
-  return { lines, redactedLines };
+  return {
+    lines,
+    redactedLines,
+    redactedValues: dump ? dump.stats.redactedValues : null,
+    copyRows: dump ? dump.stats.copyRows : null,
+  };
 }
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   try {
     const summary = await scrubStream(process.stdin, process.stdout, opts);
-    process.stderr.write(
-      `pii-scrub: mode=${opts.mode} lines=${summary.lines} redactedLines=${summary.redactedLines}\n`,
-    );
+    const accounting =
+      summary.redactedValues === null
+        ? `redactedLines=${summary.redactedLines}`
+        : `copyRows=${summary.copyRows} redactedValues=${summary.redactedValues}`;
+    process.stderr.write(`pii-scrub: mode=${opts.mode} lines=${summary.lines} ${accounting}\n`);
     await new Promise((resolve) => process.stdout.write('', resolve));
     process.exitCode = 0;
   } catch (error) {

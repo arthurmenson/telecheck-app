@@ -31,17 +31,19 @@ function fixture() {
   const inserts = SAMPLES.map(
     ([, input], i) => `INSERT INTO public.free_text (id, body) VALUES (${i + 1}, '${input}');`,
   );
-  return [
-    '--',
-    '-- PostgreSQL database dump',
-    '--',
-    'COPY public.ai_mode1_conversation_turn_admission (id, tenant_id, user_message, meta, deleted_at) FROM stdin;',
-    ...rows,
-    '\\.',
-    '',
-    ...inserts,
-    '-- Completed on 2026-09-08',
-  ].join('\n') + '\n';
+  return (
+    [
+      '--',
+      '-- PostgreSQL database dump',
+      '--',
+      'COPY public.ai_mode1_conversation_turn_admission (id, tenant_id, user_message, meta, deleted_at) FROM stdin;',
+      ...rows,
+      '\\.',
+      '',
+      ...inserts,
+      '-- Completed on 2026-09-08',
+    ].join('\n') + '\n'
+  );
 }
 
 function run(args, input, { chunk = 0 } = {}) {
@@ -75,13 +77,14 @@ test('backup mode: 100% recall against the whole library on an adversarial dump,
   const input = fixture();
   const { code, stdout, stderr } = await run(['--mode', 'backup'], input);
   assert.equal(code, 0, stderr);
-  for (const [id, , expectMatch] of SAMPLES) assert.ok(!stdout.includes(expectMatch), `${id} leaked`);
+  for (const [id, , expectMatch] of SAMPLES)
+    assert.ok(!stdout.includes(expectMatch), `${id} leaked`);
   assert.ok(stdout.includes('[REDACTED:'));
   assert.equal(stdout.split('\n').length, input.split('\n').length, 'line count preserved');
   assert.ok(stdout.startsWith('--\n-- PostgreSQL database dump\n'));
   assert.ok(stdout.includes('\n\\.\n'), 'COPY terminator preserved');
   assert.ok(stdout.endsWith('-- Completed on 2026-09-08\n'));
-  assert.match(stderr, /lines=\d+ redactedLines=\d+/);
+  assert.match(stderr, /lines=\d+ copyRows=\d+ redactedValues=\d+/);
 });
 
 test('backup mode: PII hidden behind COPY / JSON / bytea encodings is caught after DECODING, and DDL is untouched', async () => {
@@ -93,7 +96,8 @@ test('backup mode: PII hidden behind COPY / JSON / bytea encodings is caught aft
     "    meta jsonb DEFAULT '{}'::jsonb NOT NULL",
     ');',
     'COPY public.t (id, note, phone, meta, blob) FROM stdin;',
-    '1\tMRN\\n1234567\t(415)\\t555-0123\t{"email":"te\\\\u0073t.user@example.com","n":3125551212}\t\\\\x' + hexEmail,
+    '1\tMRN\\n1234567\t(415)\\t555-0123\t{"email":"te\\\\u0073t.user@example.com","n":3125551212}\t\\\\x' +
+      hexEmail,
     '2\t3125551212\t\\N\t{"k":2}\t\\N',
     '\\.',
     "INSERT INTO public.free_text (id, body) VALUES (1, E'line\\nmy SSN is 123-45-6789');",
@@ -119,12 +123,18 @@ test('backup mode: PII hidden behind COPY / JSON / bytea encodings is caught aft
   assert.ok(!meta.email.includes('test.user@example.com'), 'JSON-escaped email leaked');
   const blob = dec(row1[4]);
   assert.ok(blob.startsWith('\\x'));
-  assert.ok(!Buffer.from(blob.slice(2), 'hex').toString('utf8').includes('test.user@example.com'), 'bytea email leaked');
+  assert.ok(
+    !Buffer.from(blob.slice(2), 'hex').toString('utf8').includes('test.user@example.com'),
+    'bytea email leaked',
+  );
   // COPY row 2: matching numeric field becomes 0 in place, \N kept, field count kept.
   assert.equal(lines[7], '2\t0\t\\N\t{"k":2}\t\\N');
   // INSERT E-literal: decoded SSN gone, statement still well-formed.
   assert.ok(!lines[9].includes('123-45-6789'));
-  assert.match(lines[9], /^INSERT INTO public\.free_text \(id, body\) VALUES \(1, E'line\\n[^']*'\);$/);
+  assert.match(
+    lines[9],
+    /^INSERT INTO public\.free_text \(id, body\) VALUES \(1, E'line\\n[^']*'\);$/,
+  );
 });
 
 test('values split across chunk boundaries are still caught (1-byte and 7-byte chunks)', async () => {
@@ -132,7 +142,8 @@ test('values split across chunk boundaries are still caught (1-byte and 7-byte c
   for (const chunk of [1, 7]) {
     const { code, stdout } = await run(['--mode', 'backup'], input, { chunk });
     assert.equal(code, 0);
-    for (const [id, , expectMatch] of SAMPLES) assert.ok(!stdout.includes(expectMatch), `${id} leaked at chunk=${chunk}`);
+    for (const [id, , expectMatch] of SAMPLES)
+      assert.ok(!stdout.includes(expectMatch), `${id} leaked at chunk=${chunk}`);
   }
 });
 
@@ -149,7 +160,10 @@ test('a trailing COPY row without a newline is redacted at end of input, not los
 
 test('an oversized line FAILS the run (exit 3) — never dropped, its PII never emitted', async () => {
   const huge = 'x'.repeat(2048) + ' my SSN is 123-45-6789 ' + 'y'.repeat(2048);
-  const { code, stdout, stderr } = await run(['--mode', 'backup', '--max-line-bytes', '1024'], `ok line\n${huge}\n`);
+  const { code, stdout, stderr } = await run(
+    ['--mode', 'backup', '--max-line-bytes', '1024'],
+    `ok line\n${huge}\n`,
+  );
   assert.equal(code, 3);
   assert.match(stderr, /exceeds --max-line-bytes/);
   assert.ok(!stdout.includes('123-45-6789'));
@@ -176,7 +190,8 @@ test('log mode delegates to the Layer 3 JSON-aware pass', async () => {
 });
 
 test('backup mode: quoted identifier with an apostrophe before a COPY block (Codex R2) is scrubbed', async () => {
-  const input = 'CREATE TABLE public."o\'neil" (id integer, body text);\nCOPY public."o\'neil" (id, body) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+  const input =
+    'CREATE TABLE public."o\'neil" (id integer, body text);\nCOPY public."o\'neil" (id, body) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
   const { code, stdout } = await run(['--mode', 'backup'], input);
   assert.equal(code, 0);
   assert.ok(!stdout.includes('test.user@example.com'));
@@ -189,7 +204,8 @@ test('backup mode: an unterminated literal at end of input fails closed (exit 4)
 });
 
 test('backup mode: a multi-line quoted identifier in a COPY header (Codex R3) does not hide the rows', async () => {
-  const input = 'COPY public."o\n\'neil" (id, body) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+  const input =
+    'COPY public."o\n\'neil" (id, body) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
   const { code, stdout } = await run(['--mode', 'backup'], input);
   assert.equal(code, 0);
   assert.ok(!stdout.includes('test.user@example.com'));
@@ -205,16 +221,51 @@ test('backup mode: mixed E-literal quote escapes around JSON (Codex R3) are deco
 });
 
 test('backup mode: a table name containing "FROM stdin;" and a terminator (Codex R4) cannot end COPY early', async () => {
-  const input = 'COPY public."a FROM stdin;\n\\.\nb" (id, body) FROM stdin;\n1\t"test.user@example.com\n\\.\n';
+  const input =
+    'COPY public."a FROM stdin;\n\\.\nb" (id, body) FROM stdin;\n1\t"test.user@example.com\n\\.\n';
   const { code, stdout, stderr } = await run(['--mode', 'backup'], input);
   assert.equal(code, 0, stderr);
   assert.ok(!stdout.includes('test.user@example.com'));
-  assert.match(stderr, /redactedLines=1/);
+  assert.match(stderr, /redactedValues=1/);
 });
 
 test('backup mode: an unclosed identifier containing "FROM stdin;" fails closed (exit 4)', async () => {
-  const { code, stderr } = await run(['--mode', 'backup'], 'COPY public."a FROM stdin;\n1\treach me at test.user@example.com\n');
+  const { code, stderr, stdout } = await run(
+    ['--mode', 'backup'],
+    'COPY public."a FROM stdin;\n1\treach me at test.user@example.com\n',
+  );
   assert.equal(code, 4);
-  assert.match(stderr, /unterminated identifier/);
+  // Whichever guard fires first (the pending COPY statement or the open
+  // identifier), the run fails closed and nothing is passed through.
+  assert.match(stderr, /unterminated (identifier|COPY statement)/);
+  assert.ok(!stdout.includes('test.user@example.com'));
 });
 
+test('backup mode: a legal 68 KiB multi-line COPY header (Codex R5) is scrubbed, and an over-cap header fails closed', async () => {
+  const cols = Array.from(
+    { length: 1_050 },
+    (_, i) => `"col_${String(i).padStart(4, '0')}_${'a'.repeat(40)}\nx"`,
+  ).join(', ');
+  const legal = `COPY public.t (${cols}) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n`;
+  const ok = await run(['--mode', 'backup'], legal);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.ok(!ok.stdout.includes('test.user@example.com'));
+  const huge =
+    'COPY public.t ("' +
+    'y'.repeat(600_000) +
+    '\n' +
+    'z'.repeat(600_000) +
+    '\nq") FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+  const bad = await run(['--mode', 'backup', '--max-line-bytes', '2000000'], huge);
+  assert.equal(bad.code, 4);
+  assert.match(bad.stderr, /exceeds/);
+  assert.ok(!bad.stdout.includes('test.user@example.com'));
+});
+
+test('backup mode: a header whose identifiers close and open on different lines is assembled (Codex R5 follow-through)', async () => {
+  const input =
+    'COPY public."a\nb" (id,\n"c\nd") FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+  const { code, stdout } = await run(['--mode', 'backup'], input);
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes('test.user@example.com'));
+});
