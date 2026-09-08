@@ -41,6 +41,12 @@
 #   <operation-id>/{meta,purged,reseeded,redis,caddy,recreated,completed}
 #   latest                       operation id of the most recent COMMITTED purge
 # Stage markers are written as each stage finishes; recovery resumes from them.
+# Every journal write goes through scripts/lib/runtime-state.mjs: the state
+# directory must be a real, privately owned directory (created 0700), no
+# component may be a symlink, and writes are atomic (temp + rename) so a
+# pre-planted link can never redirect a write onto incident evidence
+# (Codex R9). Supersession is decided from COMMITTED attestation history
+# under the purge advisory lock, never from `latest` alone.
 #
 # Purge modes:
 #   1. verify-pilot-1-baseline.sh must be green (no `unclassified` account).
@@ -166,7 +172,7 @@ fi
 if [ "${SKIP_RUNTIME}" != "1" ] && [ -z "${HEALTH_URLS}" ]; then
     echo "ERROR: PILOT_1_HEALTH_URLS is required when runtime steps run (both tenant hosts' health URLs); a purge that cannot prove the app came back is not complete" >&2; exit 2
 fi
-for f in "${HERE}/lib/purge-plan.mjs" "${HERE}/lib/incident-manifest.mjs" "${HERE}/verify-pilot-1-baseline.sh" "${HERE}/pilot-1-baseline-seed.sql" "${HERE}/pilot-1-purge-classification.json"; do
+for f in "${HERE}/lib/purge-plan.mjs" "${HERE}/lib/incident-manifest.mjs" "${HERE}/lib/runtime-state.mjs" "${HERE}/verify-pilot-1-baseline.sh" "${HERE}/pilot-1-baseline-seed.sql" "${HERE}/pilot-1-purge-classification.json"; do
     [ -r "$f" ] || { echo "ERROR: required file missing: $f" >&2; exit 2; }
 done
 command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is required for the lifecycle lock (PILOT_1_FLOCK='${FLOCK}' not found)" >&2; exit 2; }
@@ -235,11 +241,14 @@ if ! "${FLOCK}" -n 9; then
     echo "REFUSED: another purge lifecycle holds ${LOCK_FILE}; wait for it to finish (nothing written)" >&2
     exit 1
 fi
-mkdir -p "${STATE_DIR}" || { echo "ERROR: cannot create the runtime state directory ${STATE_DIR}" >&2; exit 2; }
+if ! ENSURE_ERR="$("${NODE}" "${HERE}/lib/runtime-state.mjs" ensure --dir "${STATE_DIR}" 2>&1)"; then
+    echo "ERROR: runtime state directory refused: ${ENSURE_ERR} (nothing written)" >&2; exit 2
+fi
 
 # --- runtime stage markers -------------------------------------------------------
-stage_done() { [ -e "${OP_STATE}/$1" ]; }
-mark_stage() { : > "${OP_STATE}/$1" || { echo "ERROR: purge COMMITTED; cannot write runtime marker ${OP_STATE}/$1 — fix ${STATE_DIR}, then $(recover_hint)" >&2; exit 4; }; }
+stage_done() { [ -f "${OP_STATE}/$1" ] && [ ! -L "${OP_STATE}/$1" ]; }
+journal_write() { "${NODE}" "${HERE}/lib/runtime-state.mjs" write --dir "${STATE_DIR}" --path "$1" --content "${2:-}"; }
+mark_stage() { journal_write "${OP_ID}/$1" || { echo "ERROR: purge COMMITTED; cannot write runtime marker ${OP_STATE}/$1 — fix ${STATE_DIR}, then $(recover_hint)" >&2; exit 4; }; }
 recover_hint() { echo "re-run with --finish-runtime --operation-id ${OP_ID}"; }
 
 run_stages() {
@@ -344,20 +353,29 @@ SQL
     if stage_done completed; then
         echo "REFUSED: operation ${OP_ID} already completed every runtime stage; a finished operation is not repeatable (nothing written)" >&2; exit 1
     fi
-    LATEST="$(cat "${STATE_DIR}/latest" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [ -n "${LATEST}" ] && [ "${LATEST}" != "${OP_ID}" ]; then
-        # A later journal supersedes this operation only if ITS purge committed.
-        if [[ "${LATEST}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-            LATEST_ATTESTED="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v op="${LATEST}" <<'SQL'
-SELECT COUNT(*) FROM audit_records WHERE action = 'env.purge.executed' AND payload->>'operationId' = :'op';
+    # Supersession is decided from COMMITTED history (Codex R9): any
+    # env.purge.executed attestation recorded after this operation's own —
+    # whatever `latest` says (a later rolled-back attempt must not hide an
+    # intervening committed purge). Read under the purge advisory lock so an
+    # in-flight commit settles first.
+    NEWER_RAW="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v op="${OP_ID}" <<'SQL'
+SET lock_timeout = '60s';
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('pilot-1-env-purge'));
+SELECT 'NEWER=' || COALESCE((
+    SELECT payload->>'operationId' FROM audit_records
+     WHERE action = 'env.purge.executed' AND payload->>'operationId' <> :'op'
+       AND recorded_at > (SELECT MIN(recorded_at) FROM audit_records WHERE action = 'env.purge.executed' AND payload->>'operationId' = :'op')
+     ORDER BY recorded_at DESC LIMIT 1), '');
+COMMIT;
 SQL
-)" || { echo "ERROR: could not look up the attestation for the later operation ${LATEST}" >&2; exit 3; }
-        else
-            LATEST_ATTESTED="unparseable"
-        fi
-        if [ "${LATEST_ATTESTED}" != "0" ]; then
-            echo "REFUSED: operation ${OP_ID} was superseded by a later committed purge (${LATEST}); finish or inspect that one instead (nothing written)" >&2; exit 1
-        fi
+)" || { echo "ERROR: could not read the committed purge history for supersession (nothing written)" >&2; exit 3; }
+    NEWER="$(printf '%s\n' "${NEWER_RAW}" | sed -n 's/^NEWER=\(.*\)$/\1/p' | tail -1 | tr -d '[:space:]')"
+    if ! printf '%s\n' "${NEWER_RAW}" | grep -q '^NEWER='; then
+        echo "ERROR: supersession could not be determined from the purge history (nothing written)" >&2; exit 3
+    fi
+    if [ -n "${NEWER}" ]; then
+        echo "REFUSED: operation ${OP_ID} was superseded by a later committed purge (${NEWER}); finish or inspect that one instead (nothing written)" >&2; exit 1
     fi
     run_stages
     if [ "${FORMAT}" = "json" ]; then
@@ -439,11 +457,8 @@ OP_STATE="${STATE_DIR}/${OP_ID}"
 # journal that cannot be written is a usage error with nothing mutated
 # (Codex R8). `latest` is reconciled against attestations by recovery: a
 # journal whose purge never committed does not supersede anything.
-if ! mkdir -p "${OP_STATE}" 2>/dev/null \
-   || ! printf '%s|%s\n' "${MODE}" "${INCIDENT_ID}" > "${OP_STATE}/meta" 2>/dev/null \
-   || ! : > "${OP_STATE}/pending" 2>/dev/null \
-   || ! printf '%s\n' "${OP_ID}" > "${STATE_DIR}/latest" 2>/dev/null; then
-    echo "ERROR: cannot write the operation journal under ${STATE_DIR} (nothing written to the database)" >&2; exit 2
+if ! JOURNAL_ERR="$( { journal_write "${OP_ID}/meta" "${MODE}|${INCIDENT_ID}" && journal_write "${OP_ID}/pending" && journal_write latest "${OP_ID}"; } 2>&1)"; then
+    echo "ERROR: cannot write the operation journal under ${STATE_DIR}: ${JOURNAL_ERR} (nothing written to the database)" >&2; exit 2
 fi
 FAIL_INSERT=0
 [ "${FAIL_AFTER}" = "audit-insert" ] && FAIL_INSERT=1
@@ -556,7 +571,7 @@ RECONCILED=false
 if [ "${STATUS}" -ne 0 ]; then
     if grep -q "PURGE_REFUSED" "${ERR}"; then
         echo "REFUSED: $(grep -o 'PURGE_REFUSED:[^"]*' "${ERR}" | head -1 | sed 's/PURGE_REFUSED: //') (transaction rolled back; nothing written)" >&2
-        : > "${OP_STATE}/rolled_back" 2>/dev/null || true
+        journal_write "${OP_ID}/rolled_back" 2>/dev/null || true
         restart_app_if_stopped
         exit 1
     fi
@@ -581,13 +596,13 @@ SQL
         echo "ERROR: outcome UNKNOWN — the purge transaction failed and its result could not be reconciled under the purge lock for operation ${OP_ID}:" >&2
         sed 's/^/    /' "${ERR}" >&2
         echo "       The app is left STOPPED. Inspect audit_records for payload->>'operationId' = '${OP_ID}'; if attested, run --finish-runtime --operation-id ${OP_ID}; otherwise re-run the purge." >&2
-        : > "${OP_STATE}/outcome_unknown" 2>/dev/null || true
+        journal_write "${OP_ID}/outcome_unknown" 2>/dev/null || true
         exit 5
     fi
     if [ "${FOUND}" = "0" ]; then
         echo "ERROR: the purge transaction failed and was rolled back (verified under the purge lock: no attestation for operation ${OP_ID}) — no deletion:" >&2
         sed 's/^/    /' "${ERR}" >&2
-        : > "${OP_STATE}/rolled_back" 2>/dev/null || true
+        journal_write "${OP_ID}/rolled_back" 2>/dev/null || true
         restart_app_if_stopped
         exit 3
     fi

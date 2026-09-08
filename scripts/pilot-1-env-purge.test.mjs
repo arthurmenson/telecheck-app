@@ -28,6 +28,7 @@ import {
   tablesOfClass,
   validateClassification,
 } from './lib/purge-plan.mjs';
+import { ensureStateDir, writeJournal } from './lib/runtime-state.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(here, 'pilot-1-env-purge.sh');
@@ -501,6 +502,7 @@ case "$sql" in
   *json_agg*) echo "[]"; exit 0 ;;
   *"cohort_classification = 'unclassified'"*) echo "\${PSQL_UNCLASSIFIED:-0}"; exit 0 ;;
   *"payload->>'mode'"*) op=$(printf '%s\\n' "$*" | sed -n 's/.*-v op=\\([^ ]*\\).*/\\1/p'); case " \${PSQL_NOATTEST_OPS:-} " in *" $op "*) exit 0 ;; esac; printf '%s\\n' "\${PSQL_ATTEST:-}"; exit 0 ;;
+  *"pg_advisory_xact_lock"*"NEWER="*) tags SET BEGIN; printf 'NEWER=%s\\n' "\${PSQL_NEWER_OP:-}"; tags COMMIT; exit 0 ;;
   *"pg_advisory_xact_lock"*"ATTESTED="*) if [ "\${PSQL_RECONCILE:-0}" = "ERR" ]; then echo "lock timeout" >&2; exit 2; fi; echo locked > "${d}/reconcile.locked"; tags SET BEGIN; printf '\\nATTESTED=%s\\n' "\${PSQL_RECONCILE:-0}"; tags COMMIT; exit 0 ;;
   *"payload->>'operationId' = :'op'"*) op=$(printf '%s\\n' "$*" | sed -n 's/.*-v op=\\([^ ]*\\).*/\\1/p'); case " \${PSQL_NOATTEST_OPS:-} " in *" $op "*) echo 0 ;; *) echo 1 ;; esac; exit 0 ;;
   *"payload->>'incidentId'"*) echo "\${PSQL_PRIOR:-0}"; exit 0 ;;
@@ -572,7 +574,7 @@ const latestOf = (dir) => {
 /** Prepares runtime state for an operation: which stages are done + whether it is the latest. */
 function mkState(dir, op, stages, { latest = true, mode = 'incident' } = {}) {
   const d = path.join(dir, 'state', op);
-  fs.mkdirSync(d, { recursive: true });
+  fs.mkdirSync(d, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(d, 'meta'), `${mode}|\n`);
   // the journal marker always exists in reality: it is written before the transaction
   fs.writeFileSync(path.join(d, 'pending'), '');
@@ -714,6 +716,98 @@ test(
     } finally {
       fs.chmodSync(ro, 0o755);
     }
+  },
+);
+
+test('runtime-state: private directory, no-follow atomic journal writes (Codex R9)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'p1rs-'));
+  const dir = path.join(root, 'state');
+  assert.equal(ensureStateDir(dir), path.resolve(dir));
+  if (process.platform !== 'win32') assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  writeJournal(dir, 'op-1/meta', 'routine-reset|');
+  writeJournal(dir, 'op-1/pending');
+  writeJournal(dir, 'latest', 'op-1\n');
+  assert.equal(fs.readFileSync(path.join(dir, 'latest'), 'utf8'), 'op-1\n');
+  writeJournal(dir, 'latest', 'op-2\n');
+  assert.equal(fs.readFileSync(path.join(dir, 'latest'), 'utf8'), 'op-2\n');
+  assert.deepEqual(
+    fs.readdirSync(dir).filter((f) => f.includes('.tmp-')),
+    [],
+    'no temp files left behind',
+  );
+  for (const bad of ['../x', '/abs', 'a/../b', 'op 1/meta', ''])
+    assert.throws(() => writeJournal(dir, bad), /journal path/);
+  // a pre-planted symlink destination is refused, its target untouched
+  const victim = path.join(root, 'victim.age');
+  fs.writeFileSync(victim, 'EVIDENCE');
+  let linked = true;
+  try {
+    fs.symlinkSync(victim, path.join(dir, 'planted'), 'file');
+  } catch (e) {
+    if (process.platform === 'win32' && e.code === 'EPERM') linked = false;
+    else throw e;
+  }
+  if (linked) {
+    assert.throws(() => writeJournal(dir, 'planted', 'x'), /symbolic link/);
+    assert.equal(fs.readFileSync(victim, 'utf8'), 'EVIDENCE');
+  }
+  // a symlinked intermediate directory is refused too (junction works on Windows)
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'p1rs-'));
+  fs.symlinkSync(elsewhere, path.join(dir, 'linked-op'), 'junction');
+  assert.throws(() => writeJournal(dir, 'linked-op/meta', 'x'), /symbolic link/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  // the state directory itself: symlink / file / (POSIX) group-writable → refused
+  const alias = path.join(root, 'alias');
+  fs.symlinkSync(dir, alias, 'junction');
+  assert.throws(() => ensureStateDir(alias), /symbolic link/);
+  const file = path.join(root, 'file');
+  fs.writeFileSync(file, '');
+  assert.throws(() => ensureStateDir(file), /not a directory/);
+  if (process.platform !== 'win32') {
+    const loose = path.join(root, 'loose');
+    fs.mkdirSync(loose, { mode: 0o777 });
+    fs.chmodSync(loose, 0o777);
+    assert.throws(() => ensureStateDir(loose), /group\/world-writable/);
+  }
+});
+
+test(
+  'env-purge: a pre-planted symlink at state/latest pointing at a verified incident artifact is refused before the app is stopped and the artifact keeps its bytes (Codex R9)',
+  { skip: process.platform === 'win32' },
+  () => {
+    const id = '2026-09-08T15-45Z-cat1-01';
+    const inc = mkIncidentDir();
+    const artifact = path.join(inc, `${id}-app.log.age`);
+    const before = snapshot(inc);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+    const stubs = mkStubs(dir);
+    fs.mkdirSync(path.join(dir, 'state'), { mode: 0o700 });
+    fs.symlinkSync(artifact, path.join(dir, 'state', 'latest'), 'file');
+    const r = run(dir, stubs, ['--incident-id', id], {
+      PILOT_1_INCIDENT_LOGS_DIR: inc,
+      PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    });
+    assert.equal(r.status, 2, r.stderr);
+    assert.match(r.stderr, /cannot write the operation journal .*symbolic link/);
+    assert.deepEqual(snapshot(inc), before, 'the incident artifact changed');
+    assert.deepEqual(composeLog(dir), [], 'the app must not be stopped');
+    assert.ok(!fs.existsSync(path.join(dir, 'tx.sql')), 'no transaction');
+  },
+);
+
+test(
+  'env-purge: a group-writable state directory is refused before anything runs (Codex R9)',
+  { skip: process.platform === 'win32' || process.getuid?.() === 0 },
+  () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+    const stubs = mkStubs(dir);
+    fs.mkdirSync(path.join(dir, 'state'));
+    fs.chmodSync(path.join(dir, 'state'), 0o777);
+    const r = run(dir, stubs, ['--routine-reset'], { PILOT_1_SKIP_RUNTIME_STEPS: '0' });
+    assert.equal(r.status, 2, r.stderr);
+    assert.match(r.stderr, /runtime state directory refused.*group\/world-writable/);
+    assert.ok(!fs.existsSync(path.join(dir, 'call-0.args')), 'psql ran');
+    assert.deepEqual(composeLog(dir), []);
   },
 );
 
@@ -1091,6 +1185,7 @@ test("env-purge: --finish-runtime is bound to a committed attestation, to the in
   mkState(superseded, UUID, ['purged'], { latest: false });
   mkState(superseded, '00000000-0000-4000-8000-000000000002', ['purged']);
   r = run(superseded, mkStubs(superseded), ['--finish-runtime', '--operation-id', UUID], {
+    PSQL_NEWER_OP: '00000000-0000-4000-8000-000000000002',
     PILOT_1_SKIP_RUNTIME_STEPS: '0',
     PILOT_1_ACTOR_TENANT: '',
     PSQL_ATTEST: 'incident|2026-09-08T15-45Z-cat1-01',
@@ -1218,6 +1313,32 @@ test("env-purge: --finish-runtime is bound to a committed attestation, to the in
     'rm -sf app',
     'up -d app',
   ]);
+
+  // A-unfinished / B-committed-and-completed / C-rolled-back (Codex R9):
+  // `latest` points at C (no attestation) — supersession still comes from the
+  // committed history, so recovering A is REFUSED without any runtime mutation
+  const abc = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  const opB = '00000000-0000-4000-8000-00000000000b';
+  const opC = '00000000-0000-4000-8000-00000000000c';
+  mkState(abc, UUID, ['pending', 'purged'], { latest: false, mode: 'routine-reset' });
+  mkState(
+    abc,
+    opB,
+    ['pending', 'purged', 'reseeded', 'redis', 'caddy', 'removed', 'recreated', 'completed'],
+    { latest: false, mode: 'routine-reset' },
+  );
+  mkState(abc, opC, ['pending', 'rolled_back'], { mode: 'routine-reset' });
+  r = run(abc, mkStubs(abc), ['--finish-runtime', '--operation-id', UUID], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'routine-reset|',
+    PSQL_NOATTEST_OPS: opC,
+    PSQL_NEWER_OP: opB,
+  });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, new RegExp(`superseded by a later committed purge \\(${opB}\\)`));
+  assert.deepEqual(composeLog(abc), [], 'no runtime mutation when superseded');
+  assert.ok(!fs.existsSync(path.join(abc, 'seed.ran')));
 });
 
 test('env-purge: the test failure hooks — plan points render into the transaction, audit-insert breaks the attestation INSERT itself', () => {
