@@ -10,11 +10,11 @@
 
 ## Named roles
 
-| Role | Person | Responsibilities |
-|---|---|---|
-| **Incident owner** | Evans | Sole decision-maker on: participant notification, session abort, participant removal, escalation to Pilot 1 pause |
-| **Technical responder** | Claude | Executes technical isolation + purge + audit-chain preservation on incident owner's authorization |
-| **Participant coordinator** | Evans (or delegate) | Communicates with participants; handles consent-violation ceremonies |
+| Role                        | Person              | Responsibilities                                                                                                  |
+| --------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **Incident owner**          | Evans               | Sole decision-maker on: participant notification, session abort, participant removal, escalation to Pilot 1 pause |
+| **Technical responder**     | Claude              | Executes technical isolation + purge + audit-chain preservation on incident owner's authorization                 |
+| **Participant coordinator** | Evans (or delegate) | Communicates with participants; handles consent-violation ceremonies                                              |
 
 ## Incident categories
 
@@ -139,8 +139,10 @@
 8. **Incident closure — explicit disposition** — after RCA + fix + Codex re-review, the incident owner (Evans) runs `scripts/incident-clear.sh --incident-id <id> --disposition RESOLVED`. Script preconditions: (a) verifies audit_records contains an `env.purge.executed` event with matching incidentId; (b) reads manifest and confirms consumed=false; (c) atomically writes manifest.consumed=true AND removes the incident-lock. Alternative: `--disposition ABANDONED --force-abandoned <reason>` records the reason as `env.incident.abandoned` audit event + writes manifest.consumed=true + removes lock without requiring env-purge to have run. Only this explicit action removes the incident-lock. Routine-reset then becomes available again.
 
 **Single-writer discipline for `/home/deploy/incident-logs/`:**
+
 - `incident-capture.sh` creates lock + manifest (consumed:false) + artifacts
 - `incident-clear.sh` atomically sets manifest.consumed=true + removes lock (only route)
+  - Shipped (Sprint 1.3 phase B part 3a): `scripts/incident-clear.sh`, `scripts/incident-log-gc.sh`, `scripts/pilot-1-close-wipe.sh` over `scripts/lib/incident-writers.mjs` (the only writers of the incident directory besides capture): lstat-based presence, no-follow atomic manifest rewrites, artifacts deleted only as regular files inside the real directory, the Pilot 1 lifecycle lock shared with env-purge, and — for ABANDONED — the per-tenant `env.incident.abandoned` attestation committed under the purge advisory lock BEFORE any file changes. `scripts/incident-capture.sh` follows as part 3b (its DB-snapshot artifact depends on the Layer 5 dump scrubber).
 - `incident-log-gc.sh` deletes aged consumed manifests + artifacts (≥30 days + consumed:true + no active lock referencing)
 - `pilot-1-close-wipe.sh` full incident-logs wipe on Pilot 1 exit (refuses if lock exists OR any consumed:false manifest)
 - `pilot-1-env-purge.sh` READS but writes zero, modifies zero, deletes zero under incident-logs; attestation lives in the append-only DB audit trail

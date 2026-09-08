@@ -183,6 +183,11 @@ command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is re
 # followed, complete path components compared, so `incident-logs/..lock` and
 # a symlinked alias are both caught). Single-writer discipline: nothing is
 # ever created, modified or deleted under the incident directory (Codex R3 / R4).
+# Configured paths may not contain `..` segments (lexical collapse vs. physical
+# resolution through a preceding symlink — Codex R3 on the lifecycle package).
+for pair in "PILOT_1_INCIDENT_LOGS_DIR=${INCIDENT_DIR}" "PILOT_1_LOCK_FILE=${LOCK_FILE}" "PILOT_1_RUNTIME_STATE_DIR=${STATE_DIR}" "TMPDIR=${TMPDIR:-/tmp}"; do
+    case "/${pair#*=}/" in */../*|*\\..\\*|*\\../*|*/..\\*) echo "ERROR: ${pair%%=*} must not contain '..' segments: ${pair#*=}" >&2; exit 2 ;; esac
+done
 inside_incident_tree() {
     ! "${NODE}" -e '
 const fs = require("node:fs"), p = require("node:path");

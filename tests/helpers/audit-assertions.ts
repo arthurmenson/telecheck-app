@@ -242,9 +242,12 @@ function rawRowToAuditRecord(row: RawRow): AuditRecordWithExpected {
  *
  * @param tenantId - Tenant whose audit records are walked.
  */
-export async function assertAuditChainIntact(tenantId: TenantId): Promise<void> {
-  const client = getTestClient();
-
+export async function assertAuditChainIntact(
+  tenantId: TenantId,
+  // Defaults to the shared test client; suites that run against a disposable
+  // database (env-purge, incident-clear) pass their own connection.
+  client = getTestClient(),
+): Promise<void> {
   const result = await client.query<RawRow>(
     `${ENVELOPE_SELECT} WHERE tenant_id = $1
      ORDER BY tenant_id || ':' || COALESCE(target_patient_id, 'PLATFORM'), sequence_number`,
