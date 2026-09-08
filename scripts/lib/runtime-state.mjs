@@ -20,6 +20,24 @@ import { fileURLToPath } from 'node:url';
 
 const POSIX = process.platform !== 'win32';
 
+/**
+ * Crash durability (Codex R10): a rename or a new directory entry is only
+ * durable once its PARENT directory is fsynced. Every created directory and
+ * every renamed marker is followed by an fsync of its parent, so a marker
+ * that writeJournal reported as written survives a host crash — recovery
+ * must never see `removed` vanish and remove a replacement container again.
+ * (Directory fsync is a POSIX facility; on Windows it is a no-op.)
+ */
+export function fsyncDir(dir) {
+  if (!POSIX) return;
+  const fd = fs.openSync(dir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0));
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /** The state directory must be a real, privately owned directory; created 0700 when absent. */
 export function ensureStateDir(dir) {
   const abs = path.resolve(dir);
@@ -29,6 +47,7 @@ export function ensureStateDir(dir) {
   } catch (error) {
     if (error && error.code === 'ENOENT') {
       fs.mkdirSync(abs, { recursive: true, mode: 0o700 });
+      fsyncDir(path.dirname(abs));
       st = fs.lstatSync(abs);
     } else {
       throw new Error(`state directory cannot be inspected (${error && error.code}): ${abs}`);
@@ -85,6 +104,7 @@ export function writeJournal(dir, rel, content = '') {
         throw new Error(`journal destination is not a regular file: ${cur}`);
     } else if (!last) {
       fs.mkdirSync(cur, { mode: 0o700 });
+      fsyncDir(path.dirname(cur));
     }
   }
   const target = cur;
@@ -108,6 +128,9 @@ export function writeJournal(dir, rel, content = '') {
     }
     throw error;
   }
+  // The rename is durable only once the directory entry is: fsync the parent
+  // before reporting success (Codex R10).
+  fsyncDir(path.dirname(target));
   return target;
 }
 

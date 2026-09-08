@@ -414,7 +414,7 @@ test('incident-manifest: inspection failures are refusals, never a clean state; 
     incidentId: '2026-09-08T15-45Z-cat1-01',
   });
   // a dangling incident lock (symlink to nothing) is PRESENT and uninspectable — a blocker, never absent (Codex R7)
-  const dangling = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  const dangling = mkIncidentDir({ lock: false }); // has a manifest, so verification reaches the lock check
   let linked = true;
   try {
     fs.symlinkSync(path.join(dangling, 'gone.json'), path.join(dangling, '.incident.lock'), 'file');
@@ -770,6 +770,45 @@ test('runtime-state: private directory, no-follow atomic journal writes (Codex R
     assert.throws(() => ensureStateDir(loose), /group\/world-writable/);
   }
 });
+
+test(
+  'runtime-state: crash durability — every created directory and every renamed marker is followed by an fsync of its parent (Codex R10)',
+  { skip: process.platform === 'win32' },
+  () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'p1rs-'));
+    const dir = path.join(root, 'state');
+    const opened = new Map();
+    const synced = [];
+    const origOpen = fs.openSync;
+    const origFsync = fs.fsyncSync;
+    fs.openSync = (p, ...rest) => {
+      const fd = origOpen(p, ...rest);
+      opened.set(fd, path.resolve(String(p)));
+      return fd;
+    };
+    fs.fsyncSync = (fd) => {
+      synced.push(opened.get(fd));
+      return origFsync(fd);
+    };
+    try {
+      writeJournal(dir, 'op-9/removed');
+    } finally {
+      fs.openSync = origOpen;
+      fs.fsyncSync = origFsync;
+    }
+    // order matters: the state dir's parent (state dir created), the state dir
+    // (op dir created), the temp file, then the op dir (marker renamed) — the
+    // op dir fsync must come AFTER the temp-file fsync
+    assert.ok(synced.includes(path.resolve(root)), 'state dir entry not persisted');
+    assert.ok(synced.includes(path.resolve(dir)), 'operation dir entry not persisted');
+    const opDir = path.resolve(dir, 'op-9');
+    const tmpIdx = synced.findIndex((x) => x && x.startsWith(path.join(opDir, 'removed.tmp-')));
+    const dirIdx = synced.lastIndexOf(opDir);
+    assert.ok(tmpIdx >= 0, 'temp file not fsynced');
+    assert.ok(dirIdx > tmpIdx, 'marker rename not persisted after the temp-file fsync');
+    assert.ok(fs.existsSync(path.join(opDir, 'removed')));
+  },
+);
 
 test(
   'env-purge: a pre-planted symlink at state/latest pointing at a verified incident artifact is refused before the app is stopped and the artifact keeps its bytes (Codex R9)',
