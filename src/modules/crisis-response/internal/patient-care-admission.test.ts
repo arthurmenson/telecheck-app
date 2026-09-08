@@ -7,15 +7,35 @@ const mocks = vi.hoisted(() => ({
   profile: vi.fn(),
   commitFailure: false,
   commitError: null as unknown,
+  cleanupError: null as unknown,
 }));
 // The seam is now `withTenantBoundConnection` with BEGIN/COMMIT issued
 // INSIDE the tenant scope, so COMMIT failure is simulated where it really
 // happens: on the `COMMIT` statement itself, via `mocks.query`.
+// Mirrors the real wrapper's shape: run `work`, then run tenant cleanup, and
+// if cleanup throws, surface that failure — wrapped with the callback error
+// in an AggregateError when both failed — exactly as src/lib/db.ts does.
 vi.mock('../../../lib/db.js', () => ({
   withTenantBoundConnection: async (
     _tenantId: string,
     work: (client: unknown) => Promise<unknown>,
-  ) => work({ query: mocks.query }),
+  ) => {
+    let result: unknown;
+    let cbError: unknown;
+    let failed = false;
+    try {
+      result = await work({ query: mocks.query });
+    } catch (error) {
+      cbError = error;
+      failed = true;
+    }
+    if (mocks.cleanupError !== null) {
+      if (failed) throw new AggregateError([cbError, mocks.cleanupError], 'cleanup failed');
+      throw new Error('withTenantBoundConnection: clear_tenant_context failed');
+    }
+    if (failed) throw cbError;
+    return result;
+  },
 }));
 vi.mock('../../../lib/rls.js', () => ({
   withTenantContext: (_tx: unknown, _tenant: string, work: () => Promise<unknown>) => work(),
@@ -49,6 +69,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.commitFailure = false;
   mocks.commitError = null;
+  mocks.cleanupError = null;
   mocks.profile.mockResolvedValue({
     emergency_number: 'configured-emergency',
     crisis_helplines: [],
@@ -210,6 +231,33 @@ describe('patient crisis admission', () => {
     expect(await admitPatientCareInput(ctx, 'in crisis', 'messaging')).toMatchObject({
       recording_status: 'not_recorded',
       escalation_status: 'not_queued',
+    });
+  });
+
+  it('keeps an acknowledged COMMIT recorded even when tenant cleanup fails afterwards', async () => {
+    // Codex finding on PR #302: after a successful COMMIT the wrapper still
+    // runs clear_tenant_context. If that cleanup loses its connection the
+    // wrapper throws a generic error with no SQLSTATE, and the acknowledged
+    // admission was being reported `unconfirmed` (503). The outcome is
+    // settled at COMMIT; bookkeeping afterwards must not rewrite it.
+    mocks.cleanupError = new Error('connection terminated during cleanup');
+    const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    expect(result).toMatchObject({
+      recording_status: 'recorded',
+      escalation_status: 'pending',
+      crisis_event_id: '123e4567-e89b-42d3-a456-426614174002',
+    });
+  });
+
+  it('keeps a PT401 raised by COMMIT as a 401 even when cleanup also fails', async () => {
+    // Same finding, other branch: PT401 at COMMIT followed by a cleanup
+    // failure became an AggregateError with no code, replacing the required
+    // 401 with `unconfirmed`. The primary transaction failure wins.
+    mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' });
+    mocks.cleanupError = new Error('connection terminated during cleanup');
+    await expect(admitPatientCareInput(ctx, 'in crisis', 'messaging')).rejects.toMatchObject({
+      code: 'PT401',
+      statusCode: 401,
     });
   });
 

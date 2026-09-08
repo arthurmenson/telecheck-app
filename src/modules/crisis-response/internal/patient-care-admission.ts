@@ -166,6 +166,16 @@ function patientTransaction<T>(
   if (ctx.connection !== undefined && process.env['NODE_ENV'] !== 'test') {
     throw new Error('patientTransaction: a caller-owned connection is test-only');
   }
+  // The transaction's outcome is SETTLED the moment COMMIT resolves or
+  // rejects. Everything that happens afterwards on the connection — the
+  // wrapper's clear_tenant_context cleanup, pool release — is bookkeeping
+  // and must not be allowed to rewrite that outcome. Without this capture,
+  // a cleanup failure after a successful COMMIT surfaced as a generic error
+  // with no SQLSTATE, so an acknowledged admission was reported
+  // `unconfirmed`; and a PT401 raised by COMMIT followed by a cleanup
+  // failure became an AggregateError with no code, replacing the required
+  // 401. (Codex review of PR #302, reproduced by fault injection.)
+  let settled: { ok: true; value: T } | { ok: false; error: unknown } | null = null;
   return withTenantBoundConnection(
     ctx.tenant.tenantId,
     async (client) => {
@@ -183,18 +193,33 @@ function patientTransaction<T>(
         // The deferred `crisis_care_evidence` trigger fires HERE, with the
         // tenant and actor bindings both still in scope.
         await client.query('COMMIT');
+        settled = { ok: true, value: result };
         return result;
       } catch (error) {
+        settled = { ok: false, error };
         await client.query('ROLLBACK').catch(() => undefined);
         throw error;
       }
     },
     ctx.connection,
-  ).catch((error: unknown) => {
-    if ((error as { code?: unknown } | null)?.code === 'PT401')
-      throw Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401', statusCode: 401 });
-    throw error;
-  });
+  )
+    .then(
+      (value) => (settled?.ok ? settled.value : value),
+      (error: unknown) => {
+        // Prefer the settled transaction outcome over whatever the wrapper
+        // threw during cleanup. If COMMIT succeeded, the admission stands.
+        if (settled?.ok) return settled.value;
+        throw settled && !settled.ok ? settled.error : error;
+      },
+    )
+    .catch((error: unknown) => {
+      if ((error as { code?: unknown } | null)?.code === 'PT401')
+        throw Object.assign(new Error('crisis_unauthenticated'), {
+          code: 'PT401',
+          statusCode: 401,
+        });
+      throw error;
+    });
 }
 
 /**
