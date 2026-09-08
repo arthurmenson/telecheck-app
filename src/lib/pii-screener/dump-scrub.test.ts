@@ -337,3 +337,24 @@ describe('Codex R6 in-scope closure — literal continuation across a newline', 
     expect(out.startsWith("INSERT INTO t VALUES ('a', 1);\n")).toBe(true);
   });
 });
+
+describe('Codex R7 in-scope closure — continuation across whitespace and comments', () => {
+  const cases: Array<[string, string]> = [
+    ['blank line', "SELECT 'test.user@'\n\n'example.com';\n"],
+    ['whitespace-only line', "SELECT 'test.user@'\n \t \n'example.com';\n"],
+    ['form-feed / vertical-tab line', "SELECT 'test.user@'\n\f\v\n'example.com';\n"],
+    ['comment line', "SELECT 'test.user@'\n-- joined by PostgreSQL\n'example.com';\n"],
+    ['trailing comment on the closing line', "SELECT 'test.user@' -- note\n'example.com';\n"],
+    ['E-literal with a blank line', "SELECT E'\"'\n\n'\\u0062@\\u0063.\\u0063\\u006f\"'::json;\n"],
+  ];
+  for (const [name, sql] of cases) {
+    it(`rejects a continuation separated by a ${name}`, () => {
+      expect(() => scrubText(sql)).toThrow(/continuation/);
+    });
+  }
+  it('a real token after the literal clears the continuation question', () => {
+    const sql = "SELECT 'a'\n\n;\nINSERT INTO t VALUES ('my SSN is 123-45-6789');\n";
+    const out = scrubText(sql);
+    expect(out).not.toContain('123-45-6789');
+  });
+});

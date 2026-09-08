@@ -426,9 +426,10 @@ function scrubSqlText(text: string, st: SqlState): string {
         st.mode = 'code';
         st.literal = '';
         i++;
-        // A literal that closes with only whitespace after it on this line may
-        // be continued by a literal on the next line (PostgreSQL joins them).
-        st.literalClosedAtLineEnd = /^[ \t\r]*\n?$/.test(text.slice(i));
+        // A literal that closes with only whitespace — or a line comment,
+        // which PostgreSQL treats as whitespace — after it on this line may
+        // be continued by a literal on a later line (PostgreSQL joins them).
+        st.literalClosedAtLineEnd = /^\s*(?:--[^\n]*)?\n?$/.test(text.slice(i));
         continue;
       }
       st.literal += ch;
@@ -560,16 +561,22 @@ export function createDumpScrubber(): DumpScrubber {
         return scrubCopyRow(line, stats);
       }
       if (sql.literalClosedAtLineEnd) {
-        sql.literalClosedAtLineEnd = false;
-        if (/^[ \t]*'/.test(line)) {
-          // `'a'<newline>'b'` is ONE literal to PostgreSQL. pg_dump never
-          // writes it; a hand-edited dump might. Not supported — fail closed.
+        // Whitespace-only lines (any \s, so \f and \v too) and `--` comment
+        // lines are whitespace to PostgreSQL: the continuation question stays
+        // open across them. It is settled only by a real token — a quote
+        // (rejected) or anything else (cleared). (Codex R7.)
+        if (/^\s*'/.test(line)) {
+          // `'a'<whitespace/comments/newlines>'b'` is ONE literal to
+          // PostgreSQL. pg_dump never writes it; a hand-edited dump might.
+          // Not supported — fail closed.
           const err = new Error(
             'dump-scrub: unsupported string-literal continuation across a newline; aborting',
           );
           (err as { exitCode?: number }).exitCode = 4;
           throw err;
         }
+        // Lines arrive with their trailing newline; a comment runs to it.
+        if (!/^\s*(?:--[^\n]*)?\s*$/.test(line)) sql.literalClosedAtLineEnd = false;
       }
       const startsStatement = sql.mode === 'code' && !pendingCopyActive;
       const out = scrubSqlText(line, sql);

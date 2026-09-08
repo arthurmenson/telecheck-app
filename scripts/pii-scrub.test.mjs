@@ -277,3 +277,15 @@ test('backup mode: a string-literal continuation across a newline (Codex R6) fai
   assert.match(stderr, /continuation/);
   assert.ok(!stdout.includes('b@c.co'));
 });
+
+test('backup mode: continuations separated by blank / comment lines (Codex R7) fail closed', async () => {
+  for (const input of [
+    "SELECT 'test.user@'\n\n'example.com';\n",
+    "SELECT 'test.user@'\n-- c\n'example.com';\n",
+  ]) {
+    const { code, stdout, stderr } = await run(['--mode', 'backup'], input);
+    assert.equal(code, 4, stderr);
+    assert.match(stderr, /continuation/);
+    assert.ok(!stdout.includes('example.com'));
+  }
+});
