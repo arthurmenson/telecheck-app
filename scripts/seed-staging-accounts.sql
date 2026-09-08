@@ -17,49 +17,57 @@
 --   01JZZZ00000000000000000P02  patient    (Staging Patient GH)
 --   01JZZZ00000000000000000C02  clinician  (Staging Clinician GH)
 --
+-- Every account row names cohort_classification = 'baseline' explicitly:
+-- these are E2E smoke fixtures, not Pilot 1 participants, so env-purge must
+-- preserve them (PII spec §Three-state cohort classification; CI test 4
+-- requires the classification in the same INSERT — scripts/pilot-1-remediation.test.mjs).
+--
 -- ULIDs use only Crockford base32 characters (no I, L, O, U) and are 26
 -- chars, matching the platform VARCHAR(26) identity shape.
+
+-- One transaction: if any guard below refuses, nothing is left behind.
+BEGIN;
 
 INSERT INTO accounts (
     account_id, tenant_id, phone_e164, email,
     first_name, last_name, date_of_birth, gender,
     country_of_residence, country_of_care, locale,
-    account_type, status, activated_at
+    account_type, status, activated_at, cohort_classification
 ) VALUES
     (
         '01JZZZ00000000000000000P01', 'Telecheck-US', '+15550100001',
         'staging-patient@example.invalid',
         'Staging', 'Patient', DATE '1990-01-01', 'prefer_not_to_say',
         'US', 'US', 'en-US',
-        'patient', 'active', NOW()
+        'patient', 'active', NOW(), 'baseline'
     ),
     (
         '01JZZZ00000000000000000C01', 'Telecheck-US', '+15550100002',
         'staging-clinician@example.invalid',
         'Staging', 'Clinician', DATE '1985-01-01', 'prefer_not_to_say',
         'US', 'US', 'en-US',
-        'clinician', 'active', NOW()
+        'clinician', 'active', NOW(), 'baseline'
     ),
     (
         '01JZZZ00000000000000000A02', 'Telecheck-US', '+15550100003',
         'staging-platform-admin@example.invalid',
         'Staging', 'Platform Admin', DATE '1980-01-01', 'prefer_not_to_say',
         'US', 'US', 'en-US',
-        'platform_admin', 'active', NOW()
+        'platform_admin', 'active', NOW(), 'baseline'
     ),
     (
         '01JZZZ00000000000000000P02', 'Telecheck-Ghana', '+233550100001',
         'staging-patient-gh@example.invalid',
         'Staging', 'Patient GH', DATE '1990-01-01', 'prefer_not_to_say',
         'GH', 'GH', 'en-GH',
-        'patient', 'active', NOW()
+        'patient', 'active', NOW(), 'baseline'
     ),
     (
         '01JZZZ00000000000000000C02', 'Telecheck-Ghana', '+233550100002',
         'staging-clinician-gh@example.invalid',
         'Staging', 'Clinician GH', DATE '1985-01-01', 'prefer_not_to_say',
         'GH', 'GH', 'en-GH',
-        'clinician', 'active', NOW()
+        'clinician', 'active', NOW(), 'baseline'
     )
 ON CONFLICT (account_id) DO NOTHING;
 
@@ -93,6 +101,7 @@ ON CONFLICT (template_id) DO NOTHING;
 DO $$
 DECLARE
     v_count INTEGER;
+    v_drift TEXT;
 BEGIN
     SELECT COUNT(*) INTO v_count
       FROM accounts
@@ -105,5 +114,24 @@ BEGIN
     IF v_count <> 5 THEN
         RAISE EXCEPTION 'seed-staging-accounts: expected 5 active seed accounts, found %', v_count;
     END IF;
+    -- Upgrade case: rows that pre-date the classification column (migration
+    -- 080 backfilled them 'unclassified') are untouched by ON CONFLICT DO
+    -- NOTHING and would still block Day-0 and purge. Fail loudly with the
+    -- offending ids; classification is an audited operator decision
+    -- (scripts/pilot-1-marker-remediation.sh), never a silent seed update.
+    SELECT string_agg(account_id || '=' || cohort_classification, ', ' ORDER BY account_id)
+      INTO v_drift
+      FROM accounts
+     WHERE account_id IN (
+               '01JZZZ00000000000000000P01', '01JZZZ00000000000000000C01',
+               '01JZZZ00000000000000000A02',
+               '01JZZZ00000000000000000P02', '01JZZZ00000000000000000C02'
+           )
+       AND cohort_classification <> 'baseline';
+    IF v_drift IS NOT NULL THEN
+        RAISE EXCEPTION 'seed-staging-accounts: seed fixture(s) are not baseline — % — classify each with scripts/pilot-1-marker-remediation.sh --classify-as baseline (audited) and re-run', v_drift;
+    END IF;
     RAISE NOTICE 'seed-staging-accounts: 5 active synthetic accounts present (US patient/clinician/platform_admin + Ghana patient/clinician)';
 END $$;
+
+COMMIT;
