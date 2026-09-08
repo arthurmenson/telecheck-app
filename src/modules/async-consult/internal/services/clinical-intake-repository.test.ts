@@ -275,8 +275,11 @@ describe('careIntakeTransaction — authority is enforced at the actual COMMIT',
     // surface as an unhandled error in this test run.
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mocks.release).toHaveBeenCalledWith(true);
-    // The listener is released with the client, never leaked.
-    expect((mocks.client as EventEmitter).listenerCount('error')).toBe(0);
+    // On DISCARD the listener is deliberately retained: a destroyed client
+    // may still emit a late 'error', and pg-pool only re-attaches its own
+    // idle listener when a client is RETURNED. Detaching here is exactly
+    // what let the scheduled emit above throw unlistened.
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBe(1);
   });
 
   it('listens for client errors for the whole ownership window, then lets go at release', async () => {

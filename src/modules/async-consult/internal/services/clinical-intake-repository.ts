@@ -161,7 +161,7 @@ function finalizeRecordingClient(
         client.release?.();
       },
       () => {
-        disown();
+        // Discard keeps the listener: a destroyed client may still emit.
         client.release?.(true);
         signalRecordingClientDiscarded();
       },
@@ -262,7 +262,8 @@ export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof wi
       // PT503 (503) so the caller is told to check status before retrying
       // — never as a success and never as a definite failure.
       run.catch(() => undefined);
-      disown();
+      // Keep listening: a destroyed client can still emit a late 'error'
+      // (pg-pool only re-attaches its own listener on RETURN, not destroy).
       client.release?.(true);
       return Object.assign(new Error('care_commit_unconfirmed'), { code: 'PT503' });
     };
