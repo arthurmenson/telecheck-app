@@ -41,8 +41,10 @@ MAX_LINE="${PII_SCRUB_MAX_LINE_BYTES:-67108864}"
 ALLOWED_LONG='^--(data-only|schema-only|no-comments|no-publications|no-subscriptions|no-security-labels|no-tablespaces|no-unlogged-table-data|no-sync|strict-names|if-exists|clean|create|serializable-deferrable|verbose|table|exclude-table|exclude-table-data|schema|exclude-schema|extension|lock-wait-timeout|snapshot)(=.*)?$'
 ALLOWED_SHORT='^-(a|s|c|C|v|t|T|n|N|e)$'
 prev_takes_value=0
+pending_option=''
 for arg in "$@"; do
-  if [ "$prev_takes_value" = "1" ]; then prev_takes_value=0; continue; fi
+  if [ "$prev_takes_value" = "1" ]; then prev_takes_value=0; pending_option=''; continue; fi
+  pending_option="$arg"
   case "$arg" in
     --inserts|--column-inserts|--attribute-inserts|--rows-per-insert|--rows-per-insert=*)
       echo "backup-redacted: refusing '$arg' — INSERT-serialised values are not type-aware-screened" >&2; exit 2 ;;
@@ -59,6 +61,12 @@ for arg in "$@"; do
   fi
   echo "backup-redacted: refusing positional argument '$arg' — the DSN comes from BACKUP_DATABASE_URL" >&2; exit 2
 done
+# A trailing value-taking option would swallow BACKUP_DATABASE_URL as its
+# value and let pg_dump fall back to libpq connection defaults — another
+# database's dump could then be published as this one's (Codex R14).
+if [ "$prev_takes_value" = "1" ]; then
+  echo "backup-redacted: refusing '$pending_option' — option requires a value" >&2; exit 2
+fi
 
 [ -r "$AGE_RECIPIENTS_FILE" ] || { echo "backup-redacted: recipients file not readable: $AGE_RECIPIENTS_FILE" >&2; exit 2; }
 command -v "$AGE_BIN" >/dev/null 2>&1 || { echo "backup-redacted: age binary not found ($AGE_BIN)" >&2; exit 2; }
