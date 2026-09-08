@@ -47,6 +47,7 @@ export default defineConfig({
     include: [
       'src/modules/async-consult/internal/services/clinical-intake-repository.test.ts',
       'src/lib/commit-authority-transaction.test.ts',
+      'src/modules/forms-intake/internal/handlers/commit-unconfirmed-envelope.test.ts',
       'src/modules/crisis-response/internal/patient-care-admission.test.ts',
       'src/modules/consent/internal/services/care-policy-contract.test.ts',
       'src/lib/kms-aws.test.ts',

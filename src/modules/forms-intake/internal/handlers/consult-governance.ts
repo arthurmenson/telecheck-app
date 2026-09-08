@@ -51,10 +51,21 @@ function readInput<T>(schema: z.ZodType<T>, value: unknown, req: FastifyRequest)
   return result.data;
 }
 
-function mapError(error: unknown, reply: FastifyReply): boolean {
+export function mapError(error: unknown, reply: FastifyReply): boolean {
   const code = (error as { code?: string })?.code;
-  // PT503: the COMMIT's fate is unknown (formsGovernanceTransaction) — tell
-  // the caller to check status before retrying, never a 500.
+  // PT503: the COMMIT's fate is unknown — it may have been applied
+  // (acknowledgement lost after COMMIT) or not (stalled past the deadline).
+  // A generic "unavailable" would invite a retry under a fresh idempotency
+  // key and a duplicate write; say so explicitly. (Codex R2 on PR #306.)
+  if (code === 'PT503') {
+    void reply.code(503).send({
+      error: {
+        code: 'forms.commit_unconfirmed',
+        message: 'The request may or may not have been applied. Check its status before retrying.',
+      },
+    });
+    return true;
+  }
   const status =
     code === '42501'
       ? 403
@@ -64,9 +75,7 @@ function mapError(error: unknown, reply: FastifyReply): boolean {
           ? 400
           : code === '23514'
             ? 409
-            : code === 'PT503'
-              ? 503
-              : undefined;
+            : undefined;
   if (status === undefined) return false;
   void reply.code(status).send({
     error: {
