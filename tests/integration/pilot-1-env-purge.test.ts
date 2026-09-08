@@ -308,11 +308,11 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
 
   async function insertCredentialAndDevice(accountId: string) {
     await admin.query(
-      `INSERT INTO account_pin_credentials (account_id, tenant_id, pin_hash, pin_salt) VALUES ($1, $2, 'hash', 'salt')`,
+      `INSERT INTO account_pin_credentials (account_id, tenant_id, pin_hash, pin_salt) VALUES ($1, $2, repeat('ab', 32), repeat('cd', 16))`,
       [accountId, TENANT],
     );
     await admin.query(
-      `INSERT INTO auth_devices (device_id, tenant_id, account_id, platform, device_public_key) VALUES ($1, $2, $3, 'web', 'pk')`,
+      `INSERT INTO auth_devices (device_id, tenant_id, account_id, platform, device_public_key) VALUES ($1, $2, $3, 'web', 'canary-public-key')`,
       [ulid(), TENANT, accountId],
     );
   }
@@ -365,7 +365,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     await insertCredentialAndDevice(ids.baselinePatient);
     const key = `canary-${ulid()}`;
     await admin.query(
-      `INSERT INTO idempotency_keys (tenant_id, key, response_status, endpoint, actor_id) VALUES ($1, $2, 200, '/ci/purge-canary', 'ci')`,
+      `INSERT INTO idempotency_keys (tenant_id, key, request_hash, response_status, endpoint, actor_id) VALUES ($1, $2, '\\x00', 200, '/ci/purge-canary', 'ci')`,
       [TENANT, key],
     );
     // Replay-cache entries: one for a RETAINED actor (baseline patient), one
@@ -375,11 +375,11 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     const participantKey = `participant-${ulid()}`;
     for (const table of ['idempotency_keys', 'identity_idempotency_keys']) {
       await admin.query(
-        `INSERT INTO ${table} (tenant_id, key, response_status, endpoint, actor_id) VALUES ($1, $2, 200, '/ci/purge-canary', $3)`,
+        `INSERT INTO ${table} (tenant_id, key, request_hash, response_status, endpoint, actor_id) VALUES ($1, $2, '\\x00', 200, '/ci/purge-canary', $3)`,
         [TENANT, retainedKey, ids.baselinePatient],
       );
       await admin.query(
-        `INSERT INTO ${table} (tenant_id, key, response_status, endpoint, actor_id) VALUES ($1, $2, 200, '/ci/purge-canary', $3)`,
+        `INSERT INTO ${table} (tenant_id, key, request_hash, response_status, endpoint, actor_id) VALUES ($1, $2, '\\x00', 200, '/ci/purge-canary', $3)`,
         [TENANT, participantKey, ids.participantPatient],
       );
     }
@@ -387,11 +387,29 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     // that the TRUNCATE actually removes and the rollback restores (Codex R5).
     const sessionCanary = ulid();
     await admin.query(
-      `INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash) VALUES ($1, $2, $3, repeat('a', 64))`,
+      `INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash, expires_at) VALUES ($1, $2, $3, repeat('a', 64), NOW() + INTERVAL '1 hour')`,
       [sessionCanary, TENANT, ids.participantPatient],
     );
     expect(await count('sessions', 'WHERE session_id = $1', [sessionCanary])).toBe(1);
-    return { ...ids, key, retainedKey, participantKey, sessionCanary };
+    // A RETAINED clinician's cached response for a PARTICIPANT medication_request
+    // carries that participant's clinical record (Codex R6): the row must
+    // survive (replay protection) with its body tombstoned.
+    const clinicianKey = `clinician-${ulid()}`;
+    await admin.query(
+      `INSERT INTO idempotency_keys (tenant_id, key, request_hash, response_status, response_body, endpoint, actor_id, processing_state)
+       VALUES ($1, $2, '\\x00', 200, $3::jsonb, '/ci/medication-requests/approve', $4, 'completed')`,
+      [
+        TENANT,
+        clinicianKey,
+        JSON.stringify({
+          patient_account_id: ids.participantPatient,
+          clinical_notes: 'CANARY-CLINICAL-NOTE',
+          dosing: '10mg',
+        }),
+        ids.clinician,
+      ],
+    );
+    return { ...ids, key, retainedKey, participantKey, sessionCanary, clinicianKey };
   }
 
   beforeAll(async () => {
@@ -489,6 +507,14 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
         await count('sessions', 'WHERE session_id = $1', [c.sessionCanary]),
         `${stage}: truncated allowlist row restored`,
       ).toBe(1);
+      expect(
+        await count(
+          'idempotency_keys',
+          `WHERE key = $1 AND response_body::text LIKE '%CANARY-CLINICAL-NOTE%'`,
+          [c.clinicianKey],
+        ),
+        `${stage}: cached body intact after rollback`,
+      ).toBe(1);
       expect((await attestations()).length).toBe(before);
       expect(await guardedTriggersDisabled()).toBe(0);
     }
@@ -551,6 +577,23 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
         0,
       );
       expect(await count(table, `WHERE actor_id = 'ci'`), `${table} non-account actors`).toBe(0);
+    }
+    // retained clinician row survives, its cached participant record does not
+    expect(await count('idempotency_keys', 'WHERE key = $1', [c.clinicianKey])).toBe(1);
+    const tomb = await admin.query<{ body: Record<string, unknown> }>(
+      `SELECT response_body AS body FROM idempotency_keys WHERE key = $1`,
+      [c.clinicianKey],
+    );
+    expect(tomb.rows[0]!.body).toEqual({ purged: true, by: 'scripts/pilot-1-env-purge.sh' });
+    for (const table of ['idempotency_keys', 'identity_idempotency_keys']) {
+      expect(
+        await count(
+          table,
+          `WHERE response_body::text LIKE '%' || $1 || '%' OR response_body::text LIKE '%CANARY-CLINICAL-NOTE%'`,
+          [c.participantPatient],
+        ),
+        `${table} still references the participant`,
+      ).toBe(0);
     }
     const rows = await attestations();
     expect(rows.length).toBe(attestBefore + tenantCount);

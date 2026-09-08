@@ -53,6 +53,29 @@ export function validateClassification(map) {
     } else if (entry.predicate !== undefined) {
       throw new Error(`classification: ${name} is ${entry.class} and must not carry a predicate`);
     }
+    if (entry.tombstone !== undefined) {
+      if (entry.class !== 'scoped-delete') {
+        throw new Error(
+          `classification: tombstone is only valid on a scoped-delete table (${name})`,
+        );
+      }
+      const tb = entry.tombstone;
+      if (
+        !tb ||
+        typeof tb !== 'object' ||
+        !IDENT.test(tb.column ?? '') ||
+        typeof tb.value !== 'string' ||
+        tb.value.trim() === ''
+      ) {
+        throw new Error(
+          `classification: tombstone for ${name} needs an identifier column and a value expression`,
+        );
+      }
+      if (/;|--|\/\*/.test(tb.value))
+        throw new Error(
+          `classification: tombstone value for ${name} may not contain ; or comments`,
+        );
+    }
     if (entry.disableUserTriggersForTruncate !== undefined) {
       if (entry.class !== 'allowlist' || entry.disableUserTriggersForTruncate !== true) {
         throw new Error(
@@ -153,6 +176,12 @@ export function renderPlan(map, { failAfter = null } = {}) {
   if (failAfter === 'truncate') sql += injectedFailure('truncate');
   for (const t of scoped) {
     sql += `DELETE FROM public.${t} WHERE ${map.tables[t].predicate};\n`;
+    const tb = map.tables[t].tombstone;
+    if (tb) {
+      // Surviving rows keep their identity (replay protection) but any cached
+      // payload is replaced by a non-sensitive tombstone (Codex R6).
+      sql += `UPDATE public.${t} SET ${tb.column} = ${tb.value} WHERE ${tb.column} IS DISTINCT FROM (${tb.value});\n`;
+    }
   }
   if (failAfter === 'delete') sql += injectedFailure('delete');
   // Stored projections are refreshed AFTER their sources are purged, inside
@@ -167,6 +196,11 @@ export function renderPlan(map, { failAfter = null } = {}) {
   }
   for (const t of scoped) {
     sql += `  SELECT COUNT(*) INTO v_n FROM public.${t} WHERE ${map.tables[t].predicate};\n  IF v_n <> 0 THEN RAISE EXCEPTION 'pilot-1-env-purge: % ${t} rows still match the scoped predicate', v_n; END IF;\n`;
+  }
+  for (const t of tablesOfClass(map, 'scoped-delete')) {
+    const tb = map.tables[t].tombstone;
+    if (!tb) continue;
+    sql += `  SELECT COUNT(*) INTO v_n FROM public.${t} WHERE ${tb.column} IS DISTINCT FROM (${tb.value});\n  IF v_n <> 0 THEN RAISE EXCEPTION 'pilot-1-env-purge: % ${t} rows still carry a cached ${tb.column}', v_n; END IF;\n`;
   }
   for (const v of matviewsOfClass(map, 'allowlist')) {
     sql += `  SELECT COUNT(*) INTO v_n FROM public.${v};\n  IF v_n <> 0 THEN RAISE EXCEPTION 'pilot-1-env-purge: % rows survived in materialized view ${v}', v_n; END IF;\n`;

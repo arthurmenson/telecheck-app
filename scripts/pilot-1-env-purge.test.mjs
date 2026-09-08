@@ -57,6 +57,8 @@ test('classification: loads, every table classified, accounts is scoped-delete, 
   assert.equal(map.tables.auth_devices.class, 'scoped-delete');
   assert.equal(map.tables.idempotency_keys.class, 'scoped-delete');
   assert.equal(map.tables.identity_idempotency_keys.class, 'scoped-delete');
+  assert.equal(map.tables.idempotency_keys.tombstone.column, 'response_body');
+  assert.equal(map.tables.identity_idempotency_keys.tombstone.column, 'response_body');
   assert.match(
     map.tables.idempotency_keys.predicate,
     /actor_id NOT IN \(SELECT account_id FROM public\.accounts WHERE cohort_classification <> 'participant'\)/,
@@ -99,6 +101,21 @@ test('classification: structural violations are build-time failures', () => {
   m = clone();
   m.tables.interaction_signal_current_state_mv = { class: 'allowlist', why: 'x' };
   assert.throws(() => validateClassification(m), /both as a table and as a materialized view/);
+  m = clone();
+  m.tables.sessions.tombstone = { column: 'x', value: 'NULL' };
+  assert.throws(
+    () => validateClassification(m),
+    /tombstone is only valid on a scoped-delete table/,
+  );
+  m = clone();
+  m.tables.idempotency_keys.tombstone = {
+    column: 'response_body',
+    value: 'NULL; DROP TABLE tenants',
+  };
+  assert.throws(() => validateClassification(m), /may not contain/);
+  m = clone();
+  m.tables.idempotency_keys.tombstone = { column: 'bad name', value: 'NULL' };
+  assert.throws(() => validateClassification(m), /identifier column/);
 });
 
 test('plan: deterministic; guarded truncate; one TRUNCATE ... RESTRICT; scoped DELETEs before accounts; materialized view refreshed after the deletes and post-checked; never CASCADE', () => {
@@ -142,6 +159,17 @@ test('plan: deterministic; guarded truncate; one TRUNCATE ... RESTRICT; scoped D
     'credential / device deletes must precede the accounts delete',
   );
   assert.ok(enable < pin, 'scoped deletes come after the TRUNCATE block');
+  const tomb = sql.indexOf(
+    "UPDATE public.idempotency_keys SET response_body = jsonb_build_object('purged', true, 'by', 'scripts/pilot-1-env-purge.sh') WHERE response_body IS DISTINCT FROM (jsonb_build_object('purged', true, 'by', 'scripts/pilot-1-env-purge.sh'));",
+  );
+  assert.ok(tomb > 0, 'the replay-cache body tombstone must be rendered');
+  assert.ok(
+    tomb > sql.indexOf('DELETE FROM public.idempotency_keys WHERE'),
+    'the tombstone follows the scoped delete',
+  );
+  assert.match(sql, /idempotency_keys rows still carry a cached response_body/);
+  assert.match(sql, /identity_idempotency_keys rows still carry a cached response_body/);
+  assert.ok(!/UPDATE public\.accounts/.test(sql), 'accounts is never updated');
   const refresh = sql.indexOf(
     'REFRESH MATERIALIZED VIEW public.interaction_signal_current_state_mv;',
   );
@@ -318,6 +346,52 @@ test('incident-manifest: a valid capture passes; every precondition failure is n
   em.artifacts[0].path = path.join(esc, '..', '2026-09-08T15-45Z-cat1-01-x.age');
   fs.writeFileSync(ef, JSON.stringify(em));
   assert.match(verifyForPurge(esc, '2026-09-08T15-45Z-cat1-01').reason, /escapes/);
+});
+
+test('incident-manifest: a symlink artifact, or one reached through a symlinked directory, cannot authorize a purge — containment is checked on real locations', () => {
+  const id = '2026-09-08T15-45Z-cat1-01';
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'p1out-'));
+  const external = path.join(outside, `${id}-db.sql.age`);
+  fs.writeFileSync(
+    external,
+    Buffer.concat([Buffer.from(AGE_HEADER, 'latin1'), Buffer.alloc(40, 7)]),
+  );
+  // (a) symlinked intermediate directory (junction on Windows, dir symlink elsewhere)
+  const viaDir = mkIncidentDir({ artifacts: [] });
+  fs.symlinkSync(outside, path.join(viaDir, 'sub'), 'junction');
+  const mf = path.join(viaDir, `${id}.manifest.json`);
+  const man = JSON.parse(fs.readFileSync(mf, 'utf8'));
+  man.artifacts = [
+    {
+      path: path.join(viaDir, 'sub', `${id}-db.sql.age`),
+      plaintextBytes: 10,
+      ciphertextBytes: AGE_HEADER.length + 40,
+    },
+  ];
+  fs.writeFileSync(mf, JSON.stringify(man));
+  assert.match(verifyForPurge(viaDir, id).reason, /resolves outside the incident directory/);
+  // (b) file symlink artifact (Windows needs a privilege for file symlinks; CI runs it)
+  const viaLink = mkIncidentDir({ artifacts: [] });
+  let linked = true;
+  try {
+    fs.symlinkSync(external, path.join(viaLink, `${id}-db.sql.age`), 'file');
+  } catch (e) {
+    if (process.platform === 'win32' && e.code === 'EPERM') linked = false;
+    else throw e;
+  }
+  if (linked) {
+    const mf2 = path.join(viaLink, `${id}.manifest.json`);
+    const man2 = JSON.parse(fs.readFileSync(mf2, 'utf8'));
+    man2.artifacts = [
+      {
+        path: path.join(viaLink, `${id}-db.sql.age`),
+        plaintextBytes: 10,
+        ciphertextBytes: AGE_HEADER.length + 40,
+      },
+    ];
+    fs.writeFileSync(mf2, JSON.stringify(man2));
+    assert.match(verifyForPurge(viaLink, id).reason, /symbolic link/);
+  }
 });
 
 test('incident-manifest: inspection failures are refusals, never a clean state; lock-state reports presence / id / unreadability', () => {

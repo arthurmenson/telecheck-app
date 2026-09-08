@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "spec": "docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Purge table classification policy — every table in public MUST be classified; new migrations that add tables MUST add their classification here in the same PR (CI schema-drift test).",
   "classes": {
     "allowlist": "participant-only — TRUNCATE (never CASCADE)",
@@ -255,12 +255,20 @@
     "idempotency_keys": {
       "class": "scoped-delete",
       "predicate": "actor_id NOT IN (SELECT account_id FROM public.accounts WHERE cohort_classification <> 'participant')",
-      "why": "replay cache keyed by (tenant, key, endpoint, actor); actors are account ids (src/lib/idempotency.ts). Entries of RETAINED accounts (baseline staff / admins) must survive so an unexpired administrative retry cannot re-execute after a reset (Codex R4); everything else — participant actors and non-account actors — goes"
+      "why": "replay cache keyed by (tenant, key, endpoint, actor); actors are account ids (src/lib/idempotency.ts). Entries of RETAINED accounts (baseline staff / admins) must survive so an unexpired administrative retry cannot re-execute after a reset (Codex R4); everything else — participant actors and non-account actors — goes; the surviving rows keep their key / endpoint / actor / request hash (replay protection) but the cached response BODY is replaced by a non-sensitive tombstone inside the purge transaction — a retained clinician's cached approval of a participant medication_request otherwise keeps that participant's clinical record replayable (Codex R6)",
+      "tombstone": {
+        "column": "response_body",
+        "value": "jsonb_build_object('purged', true, 'by', 'scripts/pilot-1-env-purge.sh')"
+      }
     },
     "identity_idempotency_keys": {
       "class": "scoped-delete",
       "predicate": "actor_id NOT IN (SELECT account_id FROM public.accounts WHERE cohort_classification <> 'participant')",
-      "why": "identity replay cache (migration 083, LIKE idempotency_keys); same rule as idempotency_keys — retained accounts' entries survive, participant and non-account actors' entries go (Codex R4)"
+      "why": "identity replay cache (migration 083, LIKE idempotency_keys); same rule as idempotency_keys — retained accounts' entries survive, participant and non-account actors' entries go (Codex R4); the surviving rows keep their key / endpoint / actor / request hash (replay protection) but the cached response BODY is replaced by a non-sensitive tombstone inside the purge transaction — a retained clinician's cached approval of a participant medication_request otherwise keeps that participant's clinical record replayable (Codex R6)",
+      "tombstone": {
+        "column": "response_body",
+        "value": "jsonb_build_object('purged', true, 'by', 'scripts/pilot-1-env-purge.sh')"
+      }
     },
     "identity_staff_enrollment": {
       "class": "preserved",

@@ -81,12 +81,28 @@ export function verifyArtifact(dir, incidentId, artifact) {
   if (!base.startsWith(`${incidentId}-`) || !base.endsWith('.age')) {
     return `artifact is not <incident-id>-*.age: ${base}`;
   }
-  let stat;
+  // Containment is checked on REAL locations: a symlink artifact (or a
+  // symlinked intermediate directory) must not let ciphertext outside the
+  // protected retention tree authorize a purge (Codex R6).
+  let lstat;
   try {
-    stat = fs.statSync(resolved);
+    lstat = fs.lstatSync(resolved);
   } catch {
     return `artifact missing: ${base}`;
   }
+  if (lstat.isSymbolicLink()) return `artifact is a symbolic link: ${base}`;
+  let realDir;
+  let realArtifact;
+  try {
+    realDir = fs.realpathSync(dir);
+    realArtifact = fs.realpathSync(resolved);
+  } catch {
+    return `artifact location cannot be resolved: ${base}`;
+  }
+  if (!realArtifact.startsWith(realDir + path.sep)) {
+    return `artifact resolves outside the incident directory: ${base}`;
+  }
+  const stat = lstat;
   if (!stat.isFile() || stat.size === 0) return `artifact empty: ${base}`;
   if (!Number.isInteger(artifact.plaintextBytes) || artifact.plaintextBytes < 0) {
     return `artifact plaintextBytes invalid: ${base}`;
