@@ -47,8 +47,8 @@ vi.mock('./actor-context-binding.js', () => ({
   withActorContext: async (_client: unknown, _nonce: string, fn: () => Promise<unknown>) => fn(),
 }));
 
-import { commitAuthorityTransaction } from './commit-authority-transaction.js';
-import type { DbTransaction } from './db.js';
+import { commitAuthorityTransaction, isCommitUnconfirmed } from './commit-authority-transaction.js';
+import type { DbClient, DbTransaction } from './db.js';
 import { IdempotencyReplayError } from './idempotency.js';
 
 const authority = {
@@ -177,6 +177,73 @@ describe('commitAuthorityTransaction — authority is enforced at the actual COM
     expect(mocks.release).toHaveBeenCalledWith();
   });
 
+  it('on a caller-owned client runs the full lifecycle but never checks out, binds, listens, or releases', async () => {
+    const calls: string[] = [];
+    const client = Object.assign(new EventEmitter(), {
+      query: vi.fn(async (sql: string) => {
+        calls.push(String(sql));
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    });
+    const value = await commitAuthorityTransaction({
+      ...authority,
+      callerOwnedClient: client as unknown as DbClient,
+    })(async () => 'owned-by-caller');
+    expect(value).toBe('owned-by-caller');
+    expect(calls[0]).toBe('BEGIN');
+    expect(calls.includes('COMMIT')).toBe(true);
+    expect(calls.some((x) => x.includes('set_tenant_context'))).toBe(false);
+    expect(calls.some((x) => x.includes('current_tenant_id'))).toBe(false);
+    expect(calls.some((x) => x.includes('statement_timeout'))).toBe(true);
+    expect(mocks.assertLive).toHaveBeenCalledTimes(2);
+    // Pool never touched; the caller's client never released or listened on.
+    expect(mocks.client).toBeNull();
+    await flush();
+    expect(client.release).not.toHaveBeenCalled();
+    expect(client.listenerCount('error')).toBe(0);
+  });
+
+  it('on a caller-owned client a failed work still rolls back, and a stalled COMMIT reports PT503 without destroying it', async () => {
+    vi.useFakeTimers();
+    try {
+      let hang = false;
+      const calls: string[] = [];
+      const client = {
+        query: vi.fn(async (sql: string) => {
+          calls.push(String(sql));
+          if (sql === 'COMMIT' && hang) return new Promise<never>(() => undefined);
+          return { rows: [] };
+        }),
+        release: vi.fn(),
+      };
+      const boom = new Error('work_failed');
+      await expect(
+        commitAuthorityTransaction({
+          ...authority,
+          callerOwnedClient: client as unknown as DbClient,
+        })(async () => {
+          throw boom;
+        }),
+      ).rejects.toBe(boom);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls.includes('ROLLBACK')).toBe(true);
+      expect(calls.some((x) => x.includes('clear_tenant_context'))).toBe(false);
+
+      hang = true;
+      const pending = commitAuthorityTransaction({
+        ...authority,
+        callerOwnedClient: client as unknown as DbClient,
+      })(async () => 'x');
+      const rejection = expect(pending).rejects.toMatchObject({ code: 'PT503' });
+      await vi.advanceTimersByTimeAsync(4_100);
+      await rejection;
+      expect(client.release).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('with an external transaction only guards the work — the caller owns BEGIN/COMMIT', async () => {
     const external = { query: vi.fn(async () => ({ rows: [] })) } as unknown as DbTransaction;
     const value = await run(async () => 'ext', external);
@@ -277,6 +344,30 @@ describe('commitAuthorityTransaction — authority is enforced at the actual COM
     await run(async () => 'x');
     await flush();
     expect(sqls().some((x) => x.includes('clear_tenant_context'))).toBe(true);
+  });
+
+  it('stamps only the errors it produces for an unknown COMMIT outcome — a server PT503 is not one', async () => {
+    // Codex R3 on the consolidation refactor: the database raises PT503 for
+    // definite pre-COMMIT failures too (migration 094 isolation guard), so
+    // callers must classify on the discriminator, never on the code.
+    mocks.commitError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    const unconfirmed = await run(async () => 'x').catch((e: unknown) => e);
+    expect(isCommitUnconfirmed(unconfirmed)).toBe(true);
+    expect((unconfirmed as { code?: string }).code).toBe('PT503');
+
+    vi.clearAllMocks();
+    mocks.commitError = null;
+    const serverPt503 = Object.assign(new Error('isolation_unavailable'), {
+      code: 'PT503',
+      severity: 'ERROR',
+    });
+    const definite = await run(async () => {
+      throw serverPt503;
+    }).catch((e: unknown) => e);
+    expect(definite).toBe(serverPt503);
+    expect(isCommitUnconfirmed(definite)).toBe(false);
+    expect(isCommitUnconfirmed(null)).toBe(false);
+    expect(isCommitUnconfirmed({ code: 'PT503' })).toBe(false);
   });
 
   it('treats a no-SQLSTATE rejection of an issued COMMIT as indeterminate: PT503 and discard', async () => {

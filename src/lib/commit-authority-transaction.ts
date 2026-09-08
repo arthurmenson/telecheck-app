@@ -33,6 +33,16 @@ export interface CommitAuthority {
    * through unchanged.
    */
   afterBegin?: (tx: DbTransaction) => Promise<void>;
+  /**
+   * A client the CALLER owns and has already tenant-bound (crisis-response's
+   * test-only `connection`). The full BEGIN / actor bind / timeouts / work /
+   * COMMIT / deadline / classifier lifecycle runs on it, and ROLLBACK still
+   * runs on failure — but nothing is checked out, no error listener is
+   * owned, the tenant binding is neither probed nor restored, and the
+   * client is never released or destroyed. Unlike `externalTx`, the
+   * primitive still owns BEGIN/COMMIT here.
+   */
+  callerOwnedClient?: DbClient;
   /** Transaction-local statement_timeout for the work, in ms (default 5000). */
   statementTimeoutMs?: number;
   /** Transaction-local lock_timeout for the work, in ms (default 2000). */
@@ -145,6 +155,30 @@ function checkoutRecordingClient(
 /** Transaction outcome, captured the instant COMMIT resolves or rejects. */
 type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
+/**
+ * Discriminator stamped on every error this primitive produces for an
+ * UNKNOWN COMMIT outcome (stalled past the deadline, or a transport /
+ * class-08 / FATAL failure after COMMIT was issued). `code: 'PT503'` alone
+ * is not that signal — the database raises PT503 for definite pre-COMMIT
+ * failures too (e.g. the isolation guard in migration 094), and those must
+ * stay definite failures. (Codex round 3 on the consolidation refactor.)
+ */
+const COMMIT_UNCONFIRMED = Symbol.for('telecheck.commit_unconfirmed');
+
+/** True only for errors the primitive produced for an unknown COMMIT outcome. */
+export function isCommitUnconfirmed(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { [COMMIT_UNCONFIRMED]?: unknown })[COMMIT_UNCONFIRMED] === true
+  );
+}
+
+function markCommitUnconfirmed(error: Error): Error {
+  Object.defineProperty(error, COMMIT_UNCONFIRMED, { value: true, enumerable: false });
+  return error;
+}
+
 const nextDiscardSignalAt = new Map<string, number>();
 function signalRecordingClientDiscarded(event: string): void {
   const now = performance.now();
@@ -174,6 +208,7 @@ function finalizeRecordingClient(
   previousTenantId: string | null,
   disown: () => void,
   discardEvent: string,
+  owned = true,
 ): void {
   const settledRun = run.then(
     () => undefined,
@@ -187,6 +222,12 @@ function finalizeRecordingClient(
           () => undefined,
         )
     : settledRun;
+  if (!owned) {
+    // Caller-owned: the caller owns the binding and the disposal. Only the
+    // ROLLBACK (bounded by the caller's own connection) is ours.
+    void rolledBack;
+    return;
+  }
   let timer: ReturnType<typeof setTimeout> | null = null;
   const bound = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error('cleanup_deadline')), CLEANUP_DEADLINE_MS);
@@ -280,7 +321,10 @@ export function commitAuthorityTransaction(
   ): Promise<T> => {
     if (externalTx !== undefined) return guarded(externalTx, work);
 
-    const { client, disown } = await checkoutRecordingClient(pool());
+    const owned = authority.callerOwnedClient === undefined;
+    const { client, disown } = owned
+      ? await checkoutRecordingClient(pool())
+      : { client: authority.callerOwnedClient as RecordingClient, disown: () => undefined };
     let previousTenantId: string | null = null;
     let commitIssued = false;
 
@@ -299,11 +343,14 @@ export function commitAuthorityTransaction(
       await client.query('BEGIN');
       try {
         if (authority.afterBegin !== undefined) await authority.afterBegin(client);
-        // The probe needs a transaction (it uses a sub-savepoint), so it runs
-        // after BEGIN. The tenant binding is per-backend, not
-        // transaction-local, so setting it here still holds through COMMIT.
-        previousTenantId = await readCurrentTenantId(client);
-        await client.query('SELECT set_tenant_context($1)', [authority.tenantId]);
+        if (owned) {
+          // The probe needs a transaction (it uses a sub-savepoint), so it
+          // runs after BEGIN. The tenant binding is per-backend, not
+          // transaction-local, so setting it here still holds through
+          // COMMIT. A caller-owned client arrives already bound.
+          previousTenantId = await readCurrentTenantId(client);
+          await client.query('SELECT set_tenant_context($1)', [authority.tenantId]);
+        }
         const result = await withActorContext(client, authority.nonce, async () => {
           // is_local=true: transaction-scoped, exactly like SET LOCAL.
           await client.query("SELECT set_config('statement_timeout', $1, true)", [
@@ -335,13 +382,22 @@ export function commitAuthorityTransaction(
       run.catch(() => undefined);
       // Keep listening: a destroyed client can still emit a late 'error'
       // (pg-pool only re-attaches its own listener on RETURN, not destroy).
-      client.release?.(true);
-      return authority.unconfirmed();
+      // A caller-owned client is the caller's to dispose of.
+      if (owned) client.release?.(true);
+      return markCommitUnconfirmed(authority.unconfirmed());
     };
 
     try {
       const value = await Promise.race([run, deadline]);
-      finalizeRecordingClient(client, run, false, previousTenantId, disown, authority.discardEvent);
+      finalizeRecordingClient(
+        client,
+        run,
+        false,
+        previousTenantId,
+        disown,
+        authority.discardEvent,
+        owned,
+      );
       const outcome = settled as Settled<T> | null;
       return outcome?.ok ? outcome.value : value;
     } catch (error) {
@@ -354,6 +410,7 @@ export function commitAuthorityTransaction(
           previousTenantId,
           disown,
           authority.discardEvent,
+          owned,
         );
         return outcome.value;
       }
@@ -392,11 +449,20 @@ export function commitAuthorityTransaction(
           previousTenantId,
           disown,
           authority.discardEvent,
+          owned,
         );
         throw outcome.error;
       }
       if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') throw unconfirmed();
-      finalizeRecordingClient(client, run, true, previousTenantId, disown, authority.discardEvent);
+      finalizeRecordingClient(
+        client,
+        run,
+        true,
+        previousTenantId,
+        disown,
+        authority.discardEvent,
+        owned,
+      );
       throw error;
     }
   };

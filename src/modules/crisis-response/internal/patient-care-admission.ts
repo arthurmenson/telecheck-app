@@ -1,11 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { withActorContext } from '../../../lib/actor-context-binding.js';
+import {
+  commitAuthorityTransaction,
+  isCommitUnconfirmed,
+} from '../../../lib/commit-authority-transaction.js';
 import { crisisDetector } from '../../../lib/crisis-detection.js';
-import { getPool, type DbClient, type DbTransaction } from '../../../lib/db.js';
+import { type DbClient, type DbTransaction } from '../../../lib/db.js';
 import { emitDomainEvent } from '../../../lib/domain-events.js';
 import { logger } from '../../../lib/logger.js';
-import { readCurrentTenantId, withTenantContext } from '../../../lib/rls.js';
+import { withTenantContext } from '../../../lib/rls.js';
 import type { TenantContext } from '../../../lib/tenant-context.js';
 import { withDbRole } from '../../../lib/with-db-role.js';
 import { getTenantCountryProfile } from '../../tenant-config/index.js';
@@ -125,348 +129,46 @@ async function assertPatient(tx: DbTransaction, ctx: PatientCareAdmissionContext
     throw Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' });
 }
 
-/**
- * Wall-clock bound on the COMMIT statement only.
- *
- * PostgreSQL disables `statement_timeout` before it runs deferred
- * constraint triggers inside COMMIT, so once the evidence trigger fires at
- * COMMIT (which it must — see patientTransaction) the evidence scan is no
- * longer covered by the transaction's 5-second `SET LOCAL
- * statement_timeout`. Without a client-side bound, a slow scan could hold
- * the recording connection and delay the patient's safety-resource
- * response. (Codex round 3 on PR #302.)
- *
- * Deliberately BELOW the 5-second statement_timeout so the integration
- * regression proves this bound, not the server's.
- */
-const COMMIT_DEADLINE_MS = 4_000;
-
-/**
- * Bound on the post-COMMIT `clear_tenant_context()` DELETE, which runs
- * outside the transaction and therefore outside its `SET LOCAL` timeouts.
- * A concurrent lock on `_session_tenant_context` could otherwise hold the
- * connection indefinitely after an acknowledged commit. (Codex round 4.)
- */
-const CLEANUP_DEADLINE_MS = 2_000;
-
-/**
- * A connection this module may dispose of. Pool clients expose `release`;
- * the test-only caller-owned connection may not, in which case the caller
- * owns disposal too.
- */
-interface RecordingClient extends DbClient {
-  release?: (destroy?: boolean) => void;
-  on?: (event: 'error', listener: (error: Error) => void) => unknown;
-  off?: (event: 'error', listener: (error: Error) => void) => unknown;
-}
-
-/**
- * Attach the ownership-window error listener; returns the detach function.
- *
- * pg-pool removes its idle 'error' listener when a client is checked out,
- * and getPool() only handles POOL errors. On EPIPE/ECONNRESET pg both
- * rejects the in-flight query AND emits a client 'error' event; an emitter
- * error with no listener throws, and Node exits before any rejection
- * handler runs. (Codex round 3 on PR #303; same class here.) The listener
- * is detached only when the client is RETURNED — pg-pool re-attaches its
- * own then — and deliberately retained on every discard, because a
- * destroyed client may still emit late.
- */
-function ownClientErrors(client: RecordingClient): () => void {
-  const listener = (): void => {
-    // The in-flight query rejects with the same failure; the outcome
-    // lifecycle classifies it there. Listening is what keeps the process up.
-  };
-  client.on?.('error', listener);
-  return () => client.off?.('error', listener);
-}
-
-type CheckoutCallback = (error: Error | null | undefined, client?: unknown) => void;
-interface CheckoutPool {
-  connect: (callback?: CheckoutCallback) => unknown;
-}
-
-/**
- * Check a client out of the pool with the error listener attached BEFORE the
- * acquisition promise resolves.
- *
- * `await pool.connect()` is not good enough: pg-pool removes its idle
- * 'error' listener before resolving, and a listener attached after the
- * `await` resumes only runs a microtask later. If one socket read carries
- * the startup ReadyForQuery together with a FATAL (57P01, backend shutdown),
- * pg parses both synchronously and emits 'error' inside that gap with zero
- * listeners: the process exits. (Codex round 4 on PR #303; same class here.)
- *
- * The callback form of pg-pool's connect() invokes the callback
- * synchronously with the client, so the listener is attached before anyone
- * else can run. The test harness's pool wrapper is promise-only and ignores
- * a callback; that path has no socket, so resolving through the promise is
- * fine there.
- */
-function checkoutRecordingClient(): Promise<{ client: RecordingClient; disown: () => void }> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const handOver: CheckoutCallback = (error, raw) => {
-      if (settled) return;
-      settled = true;
-      if (error) {
-        reject(error);
-        return;
-      }
-      const client = raw as RecordingClient;
-      const disown = ownClientErrors(client);
-      resolve({ client, disown });
-    };
-    const pool = getPool() as unknown as CheckoutPool;
-    const returned = pool.connect(handOver);
-    const thenable = returned as { then?: unknown } | null | undefined;
-    if (thenable && typeof thenable.then === 'function') {
-      (returned as Promise<unknown>).then(
-        (raw) => handOver(null, raw),
-        (error: unknown) => handOver(error instanceof Error ? error : new Error(String(error))),
-      );
-    }
-  });
-}
-
-/** Transaction outcome, captured the instant COMMIT resolves or rejects. */
-type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
-
-let nextDiscardSignalAt = -Infinity;
-function signalRecordingClientDiscarded(): void {
-  if (performance.now() < nextDiscardSignalAt) return;
-  nextDiscardSignalAt = performance.now() + 60_000;
-  try {
-    logger.error(
-      { event: 'crisis.recording_connection.discarded' },
-      'Crisis recording connection discarded: tenant cleanup did not complete within its bound',
-    );
-  } catch {
-    // Never let a logger failure replace the patient safety response.
-  }
-}
-
-/**
- * Acquire the connection the admission will record on.
- *
- * Owned path: a raw pool client with the tenant binding set here, so this
- * module — not a shared wrapper — controls when it is returned or
- * DISCARDED. That ownership is the point: on a stalled COMMIT the only safe
- * remedy is to destroy this exact socket. Signalling the backend by pid
- * from another connection was rejected in review because, under pool
- * saturation, the cancel can be delayed until after this client has been
- * released and re-borrowed by an unrelated request — same role, so
- * `pg_cancel_backend` would abort another tenant's transaction.
- *
- * Caller-owned path (test-only): the caller sets the tenant binding and
- * owns disposal; refused outside test.
- */
-async function acquireRecordingClient(
-  ctx: PatientCareAdmissionContext,
-): Promise<{ client: RecordingClient; owned: boolean; disown: () => void }> {
-  if (ctx.connection !== undefined) {
-    if (process.env['NODE_ENV'] !== 'test') {
-      throw new Error('patientTransaction: a caller-owned connection is test-only');
-    }
-    return { client: ctx.connection, owned: false, disown: () => undefined };
-  }
-  const { client, disown } = await checkoutRecordingClient();
-  return { client, owned: true, disown };
-}
-
-/**
- * Consumed background work: roll back a failed transaction, clear the
- * tenant binding, then return the client — or discard it if that cannot
- * finish inside its bound. Never awaited by the caller, so neither ROLLBACK
- * nor cleanup can delay the patient response. I-023 is preserved either
- * way: the binding is cleared, or the backend that held it is destroyed.
- *
- * ROLLBACK lives here, not on the response path, because the outcome is
- * already known the instant COMMIT rejects: the server has aborted the
- * transaction. Awaiting ROLLBACK before publishing that outcome let a
- * stalled connection run into the still-armed deadline and overwrite a
- * known PT401 (401) or 23514 (not_recorded) with `unconfirmed`. (Codex
- * round 5 on PR #302.)
- *
- * On a caller-owned connection the ROLLBACK is still issued — leaving the
- * transaction aborted would break the caller's next statement — but the
- * connection is never returned or destroyed by this module.
- */
-function finalizeRecordingClient(
-  client: RecordingClient,
-  owned: boolean,
-  run: Promise<unknown>,
-  rollback: boolean,
-  previousTenantId: string | null,
-  disown: () => void,
-): void {
-  const settledRun = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  const rolledBack = rollback
-    ? settledRun
-        .then(() => client.query('ROLLBACK'))
-        .then(
-          () => undefined,
-          () => undefined,
-        )
-    : settledRun;
-  if (!owned) {
-    void rolledBack;
-    return;
-  }
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const bound = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('cleanup_deadline')), CLEANUP_DEADLINE_MS);
-  });
-  // Restore the binding that was in place when this factory took the client,
-  // exactly as withTenantContext does — never blindly clear. (Same defect as
-  // PR #303's CI failure: under the harness every factory shares one client
-  // whose outer binding an unconditional clear deleted.)
-  const restore =
-    previousTenantId === null ? 'SELECT clear_tenant_context()' : 'SELECT set_tenant_context($1)';
-  const restoreParams = previousTenantId === null ? [] : [previousTenantId];
-  void Promise.race([rolledBack.then(() => client.query(restore, restoreParams)), bound])
-    .then(
-      () => {
-        // Returning to the pool: hand the error listener back to pg-pool.
-        disown();
-        client.release?.();
-      },
-      () => {
-        // Discard keeps the listener: a destroyed client may still emit.
-        client.release?.(true);
-        signalRecordingClientDiscarded();
-      },
-    )
-    .finally(() => {
-      if (timer !== null) clearTimeout(timer);
-    });
-}
-
 function mapUnauthenticated(error: unknown): unknown {
   if ((error as { code?: unknown } | null)?.code === 'PT401')
     return Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401', statusCode: 401 });
   return error;
 }
 
+/**
+ * Runs `work` in a transaction whose COMMIT is itself authority-checked.
+ *
+ * The owned-client lifecycle that PR #302 introduced here (and #303/#304/
+ * #305 copied) now lives in the shared primitive (PR #306), which also
+ * closes the FATAL/PANIC-after-COMMIT misclassification this copy inherited.
+ * The deferred `crisis_care_evidence` trigger fires AT COMMIT with tenant and
+ * actor bindings both still in scope. An unconfirmed COMMIT (stalled past
+ * the deadline, or a transport / class-08 / FATAL failure after COMMIT was
+ * issued) surfaces as PT503, which the caller reports as `unconfirmed` —
+ * never `not_recorded`, never a success.
+ *
+ * Caller-owned path (test-only): the caller supplies an already tenant-bound
+ * connection and owns its disposal; the primitive still runs BEGIN/COMMIT
+ * and the deadline on it. Refused outside test.
+ */
 async function patientTransaction<T>(
   ctx: PatientCareAdmissionContext,
   work: (tx: DbTransaction) => Promise<T>,
-  beforeCommit: () => void = () => undefined,
 ): Promise<T> {
-  const { client, owned, disown } = await acquireRecordingClient(ctx);
-
-  // The transaction's outcome is SETTLED the moment COMMIT resolves or
-  // rejects. Everything afterwards — tenant cleanup, pool release — is
-  // bookkeeping and must not be allowed to rewrite that outcome or delay
-  // its delivery. (Codex rounds 2 and 4 on PR #302.)
-  let settled: Settled<T> | null = null;
-
-  // Armed only when COMMIT is issued, so it bounds nothing else.
-  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
-  let armDeadline: () => void = () => undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    armDeadline = () => {
-      deadlineTimer = setTimeout(() => {
-        reject(Object.assign(new Error('crisis_commit_deadline'), { code: 'COMMIT_DEADLINE' }));
-      }, COMMIT_DEADLINE_MS);
-    };
+  if (ctx.connection !== undefined && process.env['NODE_ENV'] !== 'test') {
+    throw new Error('patientTransaction: a caller-owned connection is test-only');
+  }
+  const run = commitAuthorityTransaction({
+    tenantId: ctx.tenant.tenantId,
+    nonce: ctx.actorNonce,
+    assertLive: (tx) => assertPatient(tx, ctx),
+    unconfirmed: () => Object.assign(new Error('crisis_commit_unconfirmed'), { code: 'PT503' }),
+    discardEvent: 'crisis.recording_connection.discarded',
+    ...(ctx.connection !== undefined ? { callerOwnedClient: ctx.connection } : {}),
   });
-
-  let previousTenantId: string | null = null;
-  let commitIssued = false;
-  const run = (async () => {
-    await client.query('BEGIN');
-    try {
-      if (owned) {
-        // The probe needs a transaction (it uses a sub-savepoint), so it runs
-        // after BEGIN. The tenant binding is per-backend, not
-        // transaction-local, so setting it here still holds through COMMIT.
-        // A caller-owned (test) connection arrives already bound.
-        previousTenantId = await readCurrentTenantId(client);
-        await client.query('SELECT set_tenant_context($1)', [ctx.tenant.tenantId]);
-      }
-      const result = await withActorContext(client, ctx.actorNonce, async () => {
-        await client.query("SET LOCAL statement_timeout='5s'");
-        await client.query("SET LOCAL lock_timeout='2s'");
-        await assertPatient(client, ctx);
-        const result = await work(client);
-        await assertPatient(client, ctx);
-        return result;
-      });
-      beforeCommit();
-      armDeadline();
-      commitIssued = true;
-      // The deferred `crisis_care_evidence` trigger fires HERE, with the
-      // tenant and actor bindings both still in scope.
-      await client.query('COMMIT');
-      settled = { ok: true, value: result };
-      return result;
-    } catch (error) {
-      // Publish immediately. ROLLBACK is bounded background work — see
-      // finalizeRecordingClient — never something the response waits on.
-      settled = { ok: false, error };
-      throw error;
-    } finally {
-      if (deadlineTimer !== null) clearTimeout(deadlineTimer);
-    }
-  })();
-
   try {
-    const value = await Promise.race([run, deadline]);
-    finalizeRecordingClient(client, owned, run, false, previousTenantId, disown);
-    // `settled` is assigned inside the closure above; read it through a
-    // widened alias so control-flow narrowing does not freeze it at null.
-    const outcome = settled as Settled<T> | null;
-    return outcome?.ok ? outcome.value : value;
+    return await run(work);
   } catch (error) {
-    const outcome = settled as Settled<T> | null;
-    if (outcome?.ok) {
-      finalizeRecordingClient(client, owned, run, false, previousTenantId, disown);
-      return outcome.value;
-    }
-    if (outcome && !outcome.ok) {
-      // A server RAISE during COMMIT (PT401, 23514, ...) is a definite
-      // rollback: a KNOWN outcome always wins, even if the deadline also
-      // fired while ROLLBACK was pending. A rejection with no SQLSTATE
-      // (ECONNRESET) or a class-08 connection exception arriving AFTER
-      // COMMIT was issued is indeterminate — the recording may have
-      // committed — so THIS socket is destroyed rather than rolled back and
-      // returned to the pool, and the listener stays with it (a destroyed
-      // client may still emit late). A SQLSTATE shape alone does not prove
-      // the server raised: EPIPE is five uppercase characters too; pg's
-      // server errors always carry `severity`, transport errors never do.
-      // (Codex rounds 1–3 on PR #303; same classifier.)
-      const failure = outcome.error as { code?: unknown; severity?: unknown } | null;
-      const code = failure?.code;
-      const sqlState =
-        typeof code === 'string' &&
-        /^[0-9A-Z]{5}$/.test(code) &&
-        typeof failure?.severity === 'string'
-          ? code
-          : null;
-      const indeterminate = commitIssued && (sqlState === null || sqlState.startsWith('08'));
-      if (indeterminate) {
-        run.catch(() => undefined);
-        if (owned) client.release?.(true);
-        throw outcome.error;
-      }
-      finalizeRecordingClient(client, owned, run, true, previousTenantId, disown);
-      throw mapUnauthenticated(outcome.error);
-    }
-    if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') {
-      // The COMMIT is still in flight. Do not wait for it, and do not
-      // signal any backend: destroy THIS socket so it can never be handed
-      // to another request mid-COMMIT, and let the server resolve the
-      // transaction on disconnect. The outcome is genuinely unknown at this
-      // moment — the caller reports `unconfirmed`, never `not_recorded`.
-      run.catch(() => undefined);
-      if (owned) client.release?.(true);
-      throw error;
-    }
-    finalizeRecordingClient(client, owned, run, true, previousTenantId, disown);
     throw mapUnauthenticated(error);
   }
 }
@@ -496,73 +198,66 @@ export async function admitPatientCareInput(
     crisis_helplines: [],
     status: 'unavailable',
   };
-  let commitPossible = false;
   let authenticated = false;
   let crisisEventId: string | undefined;
   let recordingStatus: 'recorded' | 'not_recorded' | 'unconfirmed';
   try {
-    crisisEventId = await patientTransaction(
-      ctx,
-      async (tx) => {
-        authenticated = true;
-        const sourceSurface = source === 'form_response' ? 'forms' : 'messaging';
-        // Hash only the transport retry selector, never clinical text or body bytes.
-        const keyHash = createHash('sha256')
-          .update(ctx.idempotencyKey ?? randomUUID())
-          .digest('hex');
-        const result = await withDbRole(tx, 'crisis_care_patient', () =>
-          tx.query<{
-            result: { crisis_event_id: string; server_signal_id?: string; created: boolean };
-          }>('SELECT public.crisis_care_record($1,$2,$3) AS result', [
-            detection.crisisType,
+    crisisEventId = await patientTransaction(ctx, async (tx) => {
+      authenticated = true;
+      const sourceSurface = source === 'form_response' ? 'forms' : 'messaging';
+      // Hash only the transport retry selector, never clinical text or body bytes.
+      const keyHash = createHash('sha256')
+        .update(ctx.idempotencyKey ?? randomUUID())
+        .digest('hex');
+      const result = await withDbRole(tx, 'crisis_care_patient', () =>
+        tx.query<{
+          result: { crisis_event_id: string; server_signal_id?: string; created: boolean };
+        }>('SELECT public.crisis_care_record($1,$2,$3) AS result', [
+          detection.crisisType,
+          sourceSurface,
+          keyHash,
+        ]),
+      );
+      const record = result.rows[0]?.result;
+      if (!record) throw new Error('crisis_record_unavailable');
+      if (record.created) {
+        if (!record.server_signal_id) throw new Error('crisis_record_unavailable');
+        const audit = await emitCrisisDetectedAudit(
+          {
+            tenantId: ctx.tenant.tenantId,
+            crisisInitiatorIdentity: 'patient',
+            actorAccountId: ctx.accountId,
+            actorTenantId: ctx.tenant.tenantId,
+            countryOfCare: ctx.tenant.countryOfCare,
+            crisisEventId: asCrisisEventId(record.crisis_event_id),
+            targetPatientId: ctx.accountId,
+            serverSignalId: asServerSignalId(record.server_signal_id),
+            crisisType: detection.crisisType,
+            severity: 'unassessed',
+            regulatoryReportingEnabled: false,
             sourceSurface,
-            keyHash,
-          ]),
+            detectorVersion: 'keyword_engineering_v1',
+          },
+          tx,
         );
-        const record = result.rows[0]?.result;
-        if (!record) throw new Error('crisis_record_unavailable');
-        if (record.created) {
-          if (!record.server_signal_id) throw new Error('crisis_record_unavailable');
-          const audit = await emitCrisisDetectedAudit(
-            {
-              tenantId: ctx.tenant.tenantId,
-              crisisInitiatorIdentity: 'patient',
-              actorAccountId: ctx.accountId,
-              actorTenantId: ctx.tenant.tenantId,
-              countryOfCare: ctx.tenant.countryOfCare,
-              crisisEventId: asCrisisEventId(record.crisis_event_id),
-              targetPatientId: ctx.accountId,
-              serverSignalId: asServerSignalId(record.server_signal_id),
-              crisisType: detection.crisisType,
-              severity: 'unassessed',
-              regulatoryReportingEnabled: false,
-              sourceSurface,
-              detectorVersion: 'keyword_engineering_v1',
-            },
-            tx,
-          );
-          await emitDomainEvent(tx, {
-            tenant_id: ctx.tenant.tenantId,
-            aggregate_type: 'CrisisEvent',
-            aggregate_id: record.crisis_event_id,
-            event_type: 'crisis.detected.v1',
-            occurred_at: new Date().toISOString(),
-            payload: {
-              crisis_event_id: record.crisis_event_id,
-              audit_id: audit.audit_id,
-              severity: 'unassessed',
-              source_surface: sourceSurface,
-              detector_version: 'keyword_engineering_v1',
-              escalation_status: 'pending',
-            },
-          });
-        }
-        return record.crisis_event_id;
-      },
-      () => {
-        commitPossible = true;
-      },
-    );
+        await emitDomainEvent(tx, {
+          tenant_id: ctx.tenant.tenantId,
+          aggregate_type: 'CrisisEvent',
+          aggregate_id: record.crisis_event_id,
+          event_type: 'crisis.detected.v1',
+          occurred_at: new Date().toISOString(),
+          payload: {
+            crisis_event_id: record.crisis_event_id,
+            audit_id: audit.audit_id,
+            severity: 'unassessed',
+            source_surface: sourceSurface,
+            detector_version: 'keyword_engineering_v1',
+            escalation_status: 'pending',
+          },
+        });
+      }
+      return record.crisis_event_id;
+    });
     recordingStatus = 'recorded';
   } catch (error) {
     const code = (error as { code?: unknown } | null)?.code;
@@ -570,35 +265,13 @@ export async function admitPatientCareInput(
     if (code === '42501' && !authenticated)
       throw Object.assign(new Error('crisis_forbidden'), { code: '42501', statusCode: 403 });
     signalAdmissionUnavailable();
-    // `unconfirmed` is reserved for a genuinely unknowable outcome. An error
-    // the SERVER raised while processing the transaction — including one
-    // raised by the COMMIT statement itself, now that the evidence trigger
-    // fires there — means the transaction was aborted: a known rollback,
-    // so `crisis_evidence_required` (23514) at COMMIT classifies as
-    // `not_recorded`.
-    //
-    // The exception is SQLSTATE class 08 (connection exception). Those are
-    // not the server reporting a rollback; they are the client reporting
-    // that it does not know what the server did. 08007 is literally
-    // `transaction_resolution_unknown`. Treating class 08 as definite
-    // turned explicit uncertainty into a false absence claim: the
-    // admission may already be committed, and a retry under another key
-    // would duplicate it. (Codex verification round on PR #302.)
-    //
-    // Driver-level codes such as `ECONNRESET` are not five-char SQLSTATEs
-    // and stay uncertain for the same reason.
-    //
-    // A SQLSTATE SHAPE alone does not prove the server raised: EPIPE is five
-    // uppercase characters too. pg's server errors always carry `severity`;
-    // transport errors (EPIPE, ECONNRESET, ETIMEDOUT) never do. (Codex
-    // round 2 on PR #303; same classifier.)
-    const severity = (error as { severity?: unknown } | null)?.severity;
-    const sqlState =
-      typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && typeof severity === 'string'
-        ? code
-        : null;
-    const definiteRollback = sqlState !== null && !sqlState.startsWith('08');
-    recordingStatus = commitPossible && !definiteRollback ? 'unconfirmed' : 'not_recorded';
+    // The primitive already classified the COMMIT outcome and stamps the one
+    // shape that means "may have committed" (stalled past the deadline, or a
+    // transport / class-08 / FATAL failure after COMMIT was issued). The
+    // code alone is not that signal: the database raises PT503 for definite
+    // pre-COMMIT failures too (migration 094 isolation guard), which must
+    // report not_recorded / not_queued. (Codex R3 on the consolidation.)
+    recordingStatus = isCommitUnconfirmed(error) ? 'unconfirmed' : 'not_recorded';
   }
 
   // Recording has already settled. Public configuration can neither prevent
