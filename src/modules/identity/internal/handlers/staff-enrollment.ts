@@ -1,19 +1,16 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
-import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { requireActorContext } from '../../../../lib/auth-context.js';
-import type { DbTransaction } from '../../../../lib/db.js';
 import {
-  IdempotencyReplayError,
-  IdempotencyInFlightError,
-  IdempotencyBodyMismatchError,
-} from '../../../../lib/idempotency.js';
+  commitAuthorityTransaction,
+  type CheckoutPool,
+} from '../../../../lib/commit-authority-transaction.js';
+import type { DbTransaction } from '../../../../lib/db.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
-import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
-import { withIdentityTransaction } from '../database.js';
+import { assertIdentityConnection, identityPool } from '../database.js';
 import {
   StaffEnrollmentSchema,
   StaffEnrollmentReceiptSchema,
@@ -50,32 +47,39 @@ export async function assertStaffOperator(tx: DbTransaction, ctx: Context, lock:
   )
     throw Object.assign(new Error('staff_unauthenticated'), { code: 'PT401' });
 }
+/**
+ * Staff enrollment writes on the dedicated identity pool, with operator
+ * authority enforced before the work, after it, before disclosing an
+ * idempotency outcome — and AT COMMIT.
+ *
+ * The previous shape ran under withIdentityTransaction (which clears the
+ * tenant binding at start and end) with nested withTenantContext /
+ * withActorContext, then forced `identity_staff_enrollment_evidence`
+ * IMMEDIATE. That trigger calls `identity_staff_operator(FALSE)` first and
+ * last (migration 098), which reads `kms_current_actor_context()`; forcing it
+ * IMMEDIATE consumed its event and the real COMMIT ran with no operator
+ * re-validation — the deferred-authority-trigger defect class (PRs #302/#303/
+ * #304, consent, forms). The shared primitive now owns the identity-pool
+ * client: assertIdentityConnection() right after BEGIN, tenant + actor
+ * bindings held live through COMMIT, and the deferred trigger fires there.
+ * The operator check always takes its row share lock (the lock is idempotent
+ * within the transaction); an unconfirmed COMMIT surfaces as PT503, which
+ * staffFailure already maps to 503. Genuine SQL failures pass through
+ * without another query into an aborted transaction.
+ */
 export function staffTransaction(ctx: Context) {
-  return <T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> =>
-    withIdentityTransaction((tx) =>
-      withTenantContext(tx, ctx.tenant.tenantId, () =>
-        withActorContext(tx, ctx.nonce, async () => {
-          await assertStaffOperator(tx, ctx, true);
-          let result: T;
-          try {
-            result = await work(tx);
-          } catch (error) {
-            // These conflicts leave SQL usable. Preserve genuine SQL failures
-            // for rollback and safe mapping instead of issuing into an aborted TX.
-            if (
-              error instanceof IdempotencyReplayError ||
-              error instanceof IdempotencyInFlightError ||
-              error instanceof IdempotencyBodyMismatchError
-            )
-              await assertStaffOperator(tx, ctx, false);
-            throw error;
-          }
-          await tx.query('SET CONSTRAINTS identity_staff_enrollment_evidence IMMEDIATE');
-          await assertStaffOperator(tx, ctx, false);
-          return result;
-        }),
-      ),
-    );
+  return commitAuthorityTransaction(
+    {
+      tenantId: ctx.tenant.tenantId,
+      nonce: ctx.nonce,
+      afterBegin: (tx) => assertIdentityConnection(tx),
+      assertLive: (tx) => assertStaffOperator(tx, ctx, true),
+      unconfirmed: () =>
+        Object.assign(new Error('identity.staff.commit_unconfirmed'), { code: 'PT503' }),
+      discardEvent: 'identity.staff.recording_connection.discarded',
+    },
+    () => identityPool() as unknown as CheckoutPool,
+  );
 }
 export function staffFailure(error: unknown, reply: FastifyReply, requestId: string): boolean {
   const code = (error as { code?: string })?.code;
