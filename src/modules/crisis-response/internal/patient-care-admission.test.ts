@@ -1,3 +1,5 @@
+import { EventEmitter } from 'node:events';
+
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -12,6 +14,14 @@ const mocks = vi.hoisted(() => ({
   cleanupHang: false,
   rollbackHang: false,
   release: vi.fn(),
+  previousTenantId: null as string | null,
+  /** Emit a client 'error' event alongside the COMMIT rejection (pg does both). */
+  commitEmitsError: false,
+  client: null as unknown,
+  /** Emit a client 'error' synchronously the instant checkout hands over. */
+  emitOnCheckout: null as Error | null,
+  /** Exercise the harness-style promise-only connect(). */
+  promiseOnlyConnect: false,
 }));
 // The module now OWNS its recording client: it takes a raw pool client,
 // sets the tenant binding itself, runs BEGIN/COMMIT, and decides whether to
@@ -19,13 +29,33 @@ const mocks = vi.hoisted(() => ({
 // COMMIT/cleanup failures are simulated where they really happen — on the
 // `COMMIT` and `clear_tenant_context()` statements via `mocks.query` — and
 // disposal is observed via `mocks.release`.
+// A real EventEmitter, like pg.Client: an 'error' event with no listener
+// THROWS out of emit() — the process-exit path the module must prevent by
+// owning the listener while it owns the client.
 vi.mock('../../../lib/db.js', () => ({
   getPool: () => ({
-    connect: async () => ({ query: mocks.query, release: mocks.release }),
+    // Mirrors pg-pool: with a callback, hand the client over synchronously
+    // (returning undefined); without one, return a promise. The harness
+    // wrapper is promise-only and ignores the callback.
+    connect: (callback?: (error: Error | null, client?: unknown) => void) => {
+      const client = Object.assign(new EventEmitter(), {
+        query: mocks.query,
+        release: mocks.release,
+      });
+      mocks.client = client;
+      if (mocks.promiseOnlyConnect || !callback) return Promise.resolve(client);
+      callback(null, client);
+      // pg-pool has already dropped its own idle listener by now; a
+      // coalesced ReadyForQuery + FATAL read emits here, before any await
+      // in the caller can resume.
+      if (mocks.emitOnCheckout) client.emit('error', mocks.emitOnCheckout);
+      return undefined;
+    },
   }),
 }));
 vi.mock('../../../lib/rls.js', () => ({
   withTenantContext: (_tx: unknown, _tenant: string, work: () => Promise<unknown>) => work(),
+  readCurrentTenantId: async () => mocks.previousTenantId,
 }));
 vi.mock('../../../lib/actor-context-binding.js', () => ({
   withActorContext: (_tx: unknown, _nonce: string, work: () => Promise<unknown>) => work(),
@@ -62,6 +92,11 @@ beforeEach(() => {
   mocks.commitHang = false;
   mocks.cleanupHang = false;
   mocks.rollbackHang = false;
+  mocks.previousTenantId = null;
+  mocks.commitEmitsError = false;
+  mocks.client = null;
+  mocks.emitOnCheckout = null;
+  mocks.promiseOnlyConnect = false;
   mocks.profile.mockResolvedValue({
     emergency_number: 'configured-emergency',
     crisis_helplines: [],
@@ -87,7 +122,13 @@ beforeEach(() => {
       // Acknowledgement loss: no SQLSTATE, outcome genuinely unknown.
       if (mocks.commitFailure) throw new Error('connection_lost');
       // Server RAISED during COMMIT (deferred trigger): a definite rollback.
-      if (mocks.commitError !== null) throw mocks.commitError;
+      if (mocks.commitError !== null) {
+        if (mocks.commitEmitsError) {
+          const err = mocks.commitError as Error;
+          setImmediate(() => (mocks.client as EventEmitter).emit('error', err));
+        }
+        throw mocks.commitError;
+      }
       return { rows: [] };
     }
     if (sql.includes('crisis_care_live_patient'))
@@ -220,7 +261,10 @@ describe('patient crisis admission', () => {
     // which compares the nonce against clock_timestamp(). Fired at COMMIT,
     // an expired nonce raises PT401 from the COMMIT statement and the
     // transaction rolls back — nothing is recorded under expired authority.
-    mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' });
+    mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), {
+      code: 'PT401',
+      severity: 'ERROR',
+    });
     await expect(admitPatientCareInput(ctx, 'in crisis', 'messaging')).rejects.toMatchObject({
       code: 'PT401',
       statusCode: 401,
@@ -233,7 +277,10 @@ describe('patient crisis admission', () => {
     // With the evidence trigger deferred, `crisis_evidence_required` can
     // now arrive on COMMIT. A raise carries a SQLSTATE and is a guaranteed
     // rollback; only acknowledgement loss (no SQLSTATE) is `unconfirmed`.
-    mocks.commitError = Object.assign(new Error('crisis_evidence_required'), { code: '23514' });
+    mocks.commitError = Object.assign(new Error('crisis_evidence_required'), {
+      code: '23514',
+      severity: 'ERROR',
+    });
     expect(await admitPatientCareInput(ctx, 'in crisis', 'messaging')).toMatchObject({
       recording_status: 'not_recorded',
       escalation_status: 'not_queued',
@@ -263,7 +310,10 @@ describe('patient crisis admission', () => {
     // Same finding, other branch: PT401 at COMMIT followed by a cleanup
     // failure became an AggregateError with no code, replacing the required
     // 401 with `unconfirmed`. The primary transaction failure wins.
-    mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' });
+    mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), {
+      code: 'PT401',
+      severity: 'ERROR',
+    });
     mocks.cleanupError = new Error('connection terminated during cleanup');
     await expect(admitPatientCareInput(ctx, 'in crisis', 'messaging')).rejects.toMatchObject({
       code: 'PT401',
@@ -365,7 +415,10 @@ describe('patient crisis admission', () => {
     // background work and the wedged client is discarded.
     vi.useFakeTimers();
     try {
-      mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), { code: 'PT401' });
+      mocks.commitError = Object.assign(new Error('crisis_unauthenticated'), {
+        code: 'PT401',
+        severity: 'ERROR',
+      });
       mocks.rollbackHang = true;
       const pending = admitPatientCareInput(ctx, 'in crisis', 'messaging');
       // Attach the expectation BEFORE advancing the clock: the rejection
@@ -385,7 +438,10 @@ describe('patient crisis admission', () => {
   it('returns a 23514 raised by COMMIT as not_recorded immediately even when ROLLBACK hangs', async () => {
     vi.useFakeTimers();
     try {
-      mocks.commitError = Object.assign(new Error('crisis_evidence_required'), { code: '23514' });
+      mocks.commitError = Object.assign(new Error('crisis_evidence_required'), {
+        code: '23514',
+        severity: 'ERROR',
+      });
       mocks.rollbackHang = true;
       const pending = admitPatientCareInput(ctx, 'in crisis', 'messaging');
       await vi.advanceTimersByTimeAsync(0);
@@ -399,6 +455,90 @@ describe('patient crisis admission', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('keeps EPIPE on an issued COMMIT classified as uncertain — a SQLSTATE shape is not a raise', async () => {
+    // Codex round 2 on PR #303, same classifier: EPIPE is five uppercase
+    // characters, so a shape-only test read a socket error as a server
+    // raise and reported not_recorded. pg server errors carry `severity`;
+    // transport errors never do.
+    mocks.commitError = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    expect(result).toMatchObject({
+      recording_status: 'unconfirmed',
+      escalation_status: 'unconfirmed',
+    });
+    expect(result).not.toHaveProperty('crisis_event_id');
+  });
+
+  it('restores the tenant binding that was in place when it took the client, else clears', async () => {
+    mocks.previousTenantId = 'Telecheck-Ghana';
+    await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    await flush();
+    const sets = mocks.query.mock.calls.filter(([sql]) =>
+      String(sql).includes('set_tenant_context'),
+    );
+    expect(sets[0]?.[1]).toEqual([ctx.tenant.tenantId]);
+    expect(sets[sets.length - 1]?.[1]).toEqual(['Telecheck-Ghana']);
+    expect(
+      mocks.query.mock.calls.some(([sql]) => String(sql).includes('clear_tenant_context')),
+    ).toBe(false);
+
+    vi.clearAllMocks();
+    mocks.previousTenantId = null;
+    await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    await flush();
+    expect(
+      mocks.query.mock.calls.some(([sql]) => String(sql).includes('clear_tenant_context')),
+    ).toBe(true);
+  });
+
+  it('survives the driver emitting a client error event alongside the COMMIT rejection', async () => {
+    // Same class as Codex round 3 on PR #303: with no listener, the client
+    // 'error' emit that accompanies an EPIPE rejection throws and exits Node
+    // before any rejection handler runs.
+    mocks.commitError = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    mocks.commitEmitsError = true;
+    const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    expect(result).toMatchObject({ recording_status: 'unconfirmed' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // Retained after discard: a destroyed client may still emit late.
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBe(1);
+  });
+
+  it('listens for client errors for the whole ownership window, then lets go at release', async () => {
+    let duringWork = -1;
+    mocks.query.mockImplementationOnce(async (sql: string) => {
+      duringWork = (mocks.client as EventEmitter).listenerCount('error');
+      return sql === 'BEGIN' ? { rows: [] } : { rows: [] };
+    });
+    await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    expect(duringWork).toBe(1);
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBe(0);
+  });
+
+  it('is already listening when pool checkout hands the client over — no microtask gap', async () => {
+    // Codex round 4 on PR #303: a listener attached after `await` resumes is
+    // one microtask too late for a coalesced startup ReadyForQuery + FATAL
+    // 57P01, which pg parses synchronously. With no listener that emit
+    // throws and Node exits. This emit fires synchronously right after
+    // handover; a crisis message must still be admitted.
+    mocks.emitOnCheckout = Object.assign(new Error('terminating connection'), {
+      code: '57P01',
+      severity: 'FATAL',
+    });
+    const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    expect(result).toMatchObject({ recording_status: 'recorded' });
+  });
+
+  it('still works with a promise-only pool (the test harness wrapper)', async () => {
+    mocks.promiseOnlyConnect = true;
+    const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    expect(result).toMatchObject({ recording_status: 'recorded' });
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
   });
 
   it('keeps a class-08 connection exception at COMMIT classified as uncertain', async () => {
