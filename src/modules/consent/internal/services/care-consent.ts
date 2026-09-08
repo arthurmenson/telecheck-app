@@ -1,15 +1,13 @@
 import { z } from 'zod';
 
-import { withActorContext } from '../../../../lib/actor-context-binding.js';
-import { withTransaction, type DbTransaction } from '../../../../lib/db.js';
-import { IdempotencyReplayError } from '../../../../lib/idempotency.js';
-import { withTenantContext } from '../../../../lib/rls.js';
+import { type DbTransaction, type withTransaction } from '../../../../lib/db.js';
 import type { TenantContext } from '../../../../lib/tenant-context.js';
 import { ulid } from '../../../../lib/ulid.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { CCR_KEYS, getTenantCountryProfile, resolveCcrKey } from '../../../tenant-config/index.js';
 import { emitCareChoiceEvidence } from '../../audit.js';
 
+import { consentAuthorityTransaction } from './authority-transaction.js';
 import {
   CareConsentChoicesSchema,
   CarePolicyProposalSchema,
@@ -139,29 +137,17 @@ export async function assertCareConsentPatient(
     unavailable('PT401');
 }
 
-/** Includes cache reservation/replay/completion and outbox work in the live boundary. */
+/**
+ * Includes cache reservation/replay/completion and outbox work in the live
+ * boundary, and lets the deferred `consent_care_choice_evidence` trigger fire
+ * AT COMMIT with both bindings live — see consentAuthorityTransaction.
+ */
 export function careConsentTransaction(ctx: CareConsentPatientContext): typeof withTransaction {
-  return <T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> =>
-    withTransaction((tx) =>
-      withTenantContext(tx, ctx.tenant.tenantId, () =>
-        withActorContext(tx, ctx.actorNonce, async () => {
-          await tx.query("SET LOCAL statement_timeout='5s'");
-          await tx.query("SET LOCAL lock_timeout='2s'");
-          await assertCareConsentPatient(tx, ctx);
-          let result: T;
-          try {
-            result = await work(tx);
-          } catch (error) {
-            if (error instanceof IdempotencyReplayError) await assertCareConsentPatient(tx, ctx);
-            throw error;
-          }
-          await assertCareConsentPatient(tx, ctx);
-          await tx.query('SET CONSTRAINTS consent_care_choice_evidence IMMEDIATE');
-          await assertCareConsentPatient(tx, ctx);
-          return result;
-        }),
-      ),
-    );
+  return consentAuthorityTransaction({
+    tenantId: ctx.tenant.tenantId,
+    nonce: ctx.actorNonce,
+    assertLive: (tx) => assertCareConsentPatient(tx, ctx),
+  });
 }
 
 /** Caller supplies an already bound transaction; a policy ID is never a selector. */

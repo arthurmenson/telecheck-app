@@ -4,7 +4,6 @@ import { z } from 'zod';
 import { withActorContext } from '../../../../lib/actor-context-binding.js';
 import { requireActorContext } from '../../../../lib/auth-context.js';
 import { withTransaction, type DbTransaction } from '../../../../lib/db.js';
-import { IdempotencyReplayError } from '../../../../lib/idempotency.js';
 import { withIdempotentExecution } from '../../../../lib/idempotent-handler.js';
 import { withTenantContext } from '../../../../lib/rls.js';
 import { requireTenantContext } from '../../../../lib/tenant-context.js';
@@ -12,6 +11,7 @@ import { ulid } from '../../../../lib/ulid.js';
 import { withDbRole } from '../../../../lib/with-db-role.js';
 import { getTenantCountryProfile } from '../../../tenant-config/index.js';
 import { emitCarePolicyEvidence } from '../../audit.js';
+import { consentAuthorityTransaction } from '../services/authority-transaction.js';
 import { CarePolicyProposalSchema, hashCarePolicy } from '../services/care-policy-contract.js';
 
 const id = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
@@ -104,28 +104,14 @@ async function mutate(
 ) {
   const ctx = context(req);
   void reply.header('Cache-Control', 'no-store');
-  const run = <T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> =>
-    withTransaction((tx) =>
-      withTenantContext(tx, ctx.tenant.tenantId, () =>
-        withActorContext(tx, ctx.nonce, async () => {
-          await tx.query("SET LOCAL statement_timeout='5s'");
-          await tx.query("SET LOCAL lock_timeout='2s'");
-          await assertLive(tx, ctx, capability);
-          let result: T;
-          try {
-            result = await work(tx);
-          } catch (error) {
-            if (error instanceof IdempotencyReplayError) await assertLive(tx, ctx, capability);
-            throw error;
-          }
-          // Includes time spent writing the outbox and completing the response cache.
-          await assertLive(tx, ctx, capability);
-          await tx.query('SET CONSTRAINTS consent_care_policy_evidence IMMEDIATE');
-          await assertLive(tx, ctx, capability);
-          return result;
-        }),
-      ),
-    );
+  // Includes time spent writing the outbox and completing the response cache,
+  // and lets the deferred `consent_care_policy_evidence` trigger fire AT
+  // COMMIT with both bindings live — see consentAuthorityTransaction.
+  const run = consentAuthorityTransaction({
+    tenantId: ctx.tenant.tenantId,
+    nonce: ctx.nonce,
+    assertLive: (tx) => assertLive(tx, ctx, capability),
+  });
   return withIdempotentExecution(
     req,
     reply,
