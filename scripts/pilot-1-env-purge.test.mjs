@@ -500,8 +500,9 @@ case "$sql" in
   *information_schema.columns*) echo 1; exit 0 ;;
   *json_agg*) echo "[]"; exit 0 ;;
   *"cohort_classification = 'unclassified'"*) echo "\${PSQL_UNCLASSIFIED:-0}"; exit 0 ;;
-  *"payload->>'mode'"*) printf '%s\\n' "\${PSQL_ATTEST:-}"; exit 0 ;;
+  *"payload->>'mode'"*) op=$(printf '%s\\n' "$*" | sed -n 's/.*-v op=\\([^ ]*\\).*/\\1/p'); case " \${PSQL_NOATTEST_OPS:-} " in *" $op "*) exit 0 ;; esac; printf '%s\\n' "\${PSQL_ATTEST:-}"; exit 0 ;;
   *"pg_advisory_xact_lock"*"ATTESTED="*) if [ "\${PSQL_RECONCILE:-0}" = "ERR" ]; then echo "lock timeout" >&2; exit 2; fi; echo locked > "${d}/reconcile.locked"; tags SET BEGIN; printf '\\nATTESTED=%s\\n' "\${PSQL_RECONCILE:-0}"; tags COMMIT; exit 0 ;;
+  *"payload->>'operationId' = :'op'"*) op=$(printf '%s\\n' "$*" | sed -n 's/.*-v op=\\([^ ]*\\).*/\\1/p'); case " \${PSQL_NOATTEST_OPS:-} " in *" $op "*) echo 0 ;; *) echo 1 ;; esac; exit 0 ;;
   *"payload->>'incidentId'"*) echo "\${PSQL_PRIOR:-0}"; exit 0 ;;
   *) echo "stub psql: unexpected SQL" >&2; exit 9 ;;
 esac
@@ -573,6 +574,8 @@ function mkState(dir, op, stages, { latest = true, mode = 'incident' } = {}) {
   const d = path.join(dir, 'state', op);
   fs.mkdirSync(d, { recursive: true });
   fs.writeFileSync(path.join(d, 'meta'), `${mode}|\n`);
+  // the journal marker always exists in reality: it is written before the transaction
+  fs.writeFileSync(path.join(d, 'pending'), '');
   for (const st of stages) fs.writeFileSync(path.join(d, st), '');
   if (latest) fs.writeFileSync(path.join(dir, 'state', 'latest'), `${op}\n`);
 }
@@ -635,6 +638,15 @@ test('env-purge: containment: real filesystem locations — a `..`-prefixed chil
     ['TMPDIR via alias', { TMPDIR: alias }],
     ['state dir inside incident dir', { PILOT_1_RUNTIME_STATE_DIR: scratch }],
     ['state dir via alias', { PILOT_1_RUNTIME_STATE_DIR: alias }],
+    [
+      'state dir two missing components beneath alias',
+      { PILOT_1_RUNTIME_STATE_DIR: path.join(alias, 'new', 'state') },
+    ],
+    [
+      'lock two missing components beneath alias',
+      { PILOT_1_LOCK_FILE: path.join(alias, 'new', 'deeper', 'lifecycle.lock') },
+    ],
+    ['TMPDIR two missing components beneath alias', { TMPDIR: path.join(alias, 'new', 'tmp') }],
   ]) {
     const r = run(dir, stubs, ['--routine-reset'], { PILOT_1_INCIDENT_LOGS_DIR: inc, ...env });
     assert.equal(r.status, 2, `${name}: ${r.stderr}`);
@@ -683,6 +695,27 @@ test('env-purge: containment: real filesystem locations — a `..`-prefixed chil
   });
   assert.equal(ok.status, 0, ok.stderr);
 });
+
+test(
+  'env-purge: an unwritable state directory is a usage error before the app is stopped or any SQL runs (journal before the transaction, Codex R8)',
+  { skip: process.platform === 'win32' || process.getuid?.() === 0 },
+  () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+    const stubs = mkStubs(dir);
+    const ro = path.join(dir, 'state');
+    fs.mkdirSync(ro);
+    fs.chmodSync(ro, 0o555);
+    try {
+      const r = run(dir, stubs, ['--routine-reset'], { PILOT_1_SKIP_RUNTIME_STEPS: '0' });
+      assert.equal(r.status, 2, r.stderr);
+      assert.match(r.stderr, /cannot write the operation journal/);
+      assert.ok(!fs.existsSync(path.join(dir, 'tx.sql')), 'the transaction must not run');
+      assert.deepEqual(composeLog(dir), [], 'the app must not be stopped');
+    } finally {
+      fs.chmodSync(ro, 0o755);
+    }
+  },
+);
 
 test('env-purge: the lifecycle lock is a kernel lock on a file that is never unlinked; a held lock refuses before anything runs', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
@@ -835,9 +868,11 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   assert.deepEqual(stagesOf(dir, out.operationId), [
     'caddy',
     'completed',
+    'pending',
     'purged',
     'recreated',
     'redis',
+    'removed',
     'reseeded',
   ]);
   assert.equal(latestOf(dir), out.operationId);
@@ -860,9 +895,11 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   const opAfterHealth = fs.readdirSync(path.join(redirect, 'state')).find((f) => f !== 'latest');
   assert.deepEqual(stagesOf(redirect, opAfterHealth), [
     'caddy',
+    'pending',
     'purged',
     'recreated',
     'redis',
+    'removed',
     'reseeded',
   ]);
   const stubs2 = mkStubs(redirect);
@@ -887,9 +924,11 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   assert.deepEqual(stagesOf(redirect, opAfterHealth), [
     'caddy',
     'completed',
+    'pending',
     'purged',
     'recreated',
     'redis',
+    'removed',
     'reseeded',
   ]);
 
@@ -914,7 +953,7 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   const opRedis = fs.readdirSync(path.join(redisErr, 'state')).find((f) => f !== 'latest');
   assert.deepEqual(
     stagesOf(redisErr, opRedis),
-    ['purged', 'reseeded'],
+    ['pending', 'purged', 'reseeded'],
     'FLUSHALL must not be marked done',
   );
 });
@@ -975,6 +1014,10 @@ test('env-purge: reconciliation reads the count, not a command tag — a rolled-
     PSQL_TX_STDERR: 'ERROR:  PURGE_REFUSED: 1 unclassified account(s)',
   });
   assert.equal(r.status, 1, r.stderr);
+  // the journal exists before the transaction (Codex R8): pending + rolled_back, never `purged`
+  const refusedOp = fs.readdirSync(path.join(refused, 'state')).find((f) => f !== 'latest');
+  assert.deepEqual(stagesOf(refused, refusedOp), ['pending', 'rolled_back']);
+  assert.equal(latestOf(refused), refusedOp);
 
   const seedFail = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
   r = run(seedFail, mkStubs(seedFail), ['--routine-reset'], { PSQL_SEED_EXIT: '3' });
@@ -1089,9 +1132,11 @@ test("env-purge: --finish-runtime is bound to a committed attestation, to the in
   assert.deepEqual(stagesOf(ok, UUID), [
     'caddy',
     'completed',
+    'pending',
     'purged',
     'recreated',
     'redis',
+    'removed',
     'reseeded',
   ]);
   // and a second recovery of the now-completed operation is refused
@@ -1117,6 +1162,59 @@ test("env-purge: --finish-runtime is bound to a committed attestation, to the in
   assert.deepEqual(composeLog(partial), [
     'exec app pkill -TERM node',
     'stop app',
+    'rm -sf app',
+    'up -d app',
+  ]);
+  // removed-but-not-started (crash between `rm` and `up`, or between `up` and
+  // its marker): recovery never removes the (possibly running) replacement —
+  // an idempotent `up -d` only, no stop, no FLUSHALL (Codex R8)
+  const removed = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  mkState(removed, UUID, ['pending', 'purged', 'reseeded', 'redis', 'caddy', 'removed'], {
+    mode: 'routine-reset',
+  });
+  r = run(removed, mkStubs(removed), ['--finish-runtime', '--operation-id', UUID, '--json'], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'routine-reset|',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(
+    composeLog(removed),
+    ['up -d app'],
+    'a replacement container must never be removed again',
+  );
+  assert.deepEqual(stagesOf(removed, UUID), [
+    'caddy',
+    'completed',
+    'pending',
+    'purged',
+    'recreated',
+    'redis',
+    'removed',
+    'reseeded',
+  ]);
+
+  // a LATER journal whose purge never committed does not supersede (Codex R8)
+  const notSuperseded = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  const rolledBackOp = '00000000-0000-4000-8000-000000000003';
+  mkState(notSuperseded, UUID, ['pending', 'purged'], { latest: false, mode: 'routine-reset' });
+  mkState(notSuperseded, rolledBackOp, ['pending', 'rolled_back'], { mode: 'routine-reset' });
+  r = run(
+    notSuperseded,
+    mkStubs(notSuperseded),
+    ['--finish-runtime', '--operation-id', UUID, '--json'],
+    {
+      PILOT_1_SKIP_RUNTIME_STEPS: '0',
+      PILOT_1_ACTOR_TENANT: '',
+      PSQL_ATTEST: 'routine-reset|',
+      PSQL_NOATTEST_OPS: rolledBackOp,
+    },
+  );
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(composeLog(notSuperseded), [
+    'exec app pkill -TERM node',
+    'stop app',
+    'exec redis redis-cli -e FLUSHALL',
     'rm -sf app',
     'up -d app',
   ]);

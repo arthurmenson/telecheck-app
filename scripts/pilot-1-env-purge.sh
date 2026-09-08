@@ -179,13 +179,28 @@ command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is re
 inside_incident_tree() {
     ! "${NODE}" -e '
 const fs = require("node:fs"), p = require("node:path");
+// Walk up to the deepest EXISTING ancestor, resolve its real location and
+// append the missing components (Codex R8: alias/new/state with two absent
+// components must still resolve through the alias). Any inspection error
+// other than a missing path fails CLOSED (treated as inside).
 const real = (x) => {
-  try { return fs.realpathSync(x); } catch {}
-  try { return p.join(fs.realpathSync(p.dirname(x)), p.basename(x)); } catch {}
-  return p.resolve(x);
+  let cur = p.resolve(x);
+  const missing = [];
+  for (;;) {
+    try { return p.join(fs.realpathSync(cur), ...missing.slice().reverse()); }
+    catch (e) { if (e.code !== "ENOENT" && e.code !== "ENOTDIR") throw e; }
+    const parent = p.dirname(cur);
+    if (parent === cur) return p.join(cur, ...missing.slice().reverse());
+    missing.push(p.basename(cur));
+    cur = parent;
+  }
 };
-const [cand, inc] = process.argv.slice(1).map(real);
-process.exit(cand === inc || cand.startsWith(inc + p.sep) ? 1 : 0);
+let inside = true;
+try {
+  const [cand, inc] = process.argv.slice(1).map(real);
+  inside = cand === inc || cand.startsWith(inc + p.sep);
+} catch { inside = true; }
+process.exit(inside ? 1 : 0);
 ' "$1" "${INCIDENT_DIR}"
 }
 # A symlinked lock file (dangling or not) is refused outright: the append-open
@@ -224,7 +239,7 @@ mkdir -p "${STATE_DIR}" || { echo "ERROR: cannot create the runtime state direct
 
 # --- runtime stage markers -------------------------------------------------------
 stage_done() { [ -e "${OP_STATE}/$1" ]; }
-mark_stage() { : > "${OP_STATE}/$1"; }
+mark_stage() { : > "${OP_STATE}/$1" || { echo "ERROR: purge COMMITTED; cannot write runtime marker ${OP_STATE}/$1 — fix ${STATE_DIR}, then $(recover_hint)" >&2; exit 4; }; }
 recover_hint() { echo "re-run with --finish-runtime --operation-id ${OP_ID}"; }
 
 run_stages() {
@@ -245,7 +260,7 @@ run_stages() {
     # Destructive runtime stages still pending? Then live traffic is fenced
     # first: in a purge run the app is already stopped; in recovery it may have
     # come back after a failed health check (Codex R7).
-    if ! stage_done redis || ! stage_done caddy || ! stage_done recreated; then
+    if ! stage_done redis || ! stage_done caddy || ! stage_done removed; then
         if [ "${APP_STOPPED}" != "1" ]; then
             ${COMPOSE} exec app pkill -TERM node >/dev/null 2>&1 || true
             ${COMPOSE} stop app || { echo "ERROR: purge COMMITTED; could not stop the app before the remaining runtime stages — $(recover_hint)" >&2; exit 4; }
@@ -269,8 +284,16 @@ run_stages() {
         fi
         mark_stage caddy
     fi
-    if ! stage_done recreated; then
+    # Removal and start are SEPARATE stages: `removed` is marked before the
+    # start, so a crash or marker failure between the start and its marker
+    # never leads recovery to remove a replacement that already serves
+    # traffic — `up -d` is idempotent (a running container is left alone),
+    # the container is never removed twice (Codex R8).
+    if ! stage_done removed; then
         ${COMPOSE} rm -sf app >/dev/null || { echo "ERROR: purge COMMITTED; could not remove the app container — $(recover_hint)" >&2; exit 4; }
+        mark_stage removed
+    fi
+    if ! stage_done recreated; then
         ${COMPOSE} up -d app || { echo "ERROR: purge COMMITTED; app did not start — $(recover_hint)" >&2; exit 4; }
         mark_stage recreated
     fi
@@ -321,9 +344,20 @@ SQL
     if stage_done completed; then
         echo "REFUSED: operation ${OP_ID} already completed every runtime stage; a finished operation is not repeatable (nothing written)" >&2; exit 1
     fi
-    LATEST="$(cat "${STATE_DIR}/latest" 2>/dev/null || true)"
-    if [ "${LATEST}" != "${OP_ID}" ]; then
-        echo "REFUSED: operation ${OP_ID} was superseded by a later committed purge (${LATEST:-unknown}); finish or inspect that one instead (nothing written)" >&2; exit 1
+    LATEST="$(cat "${STATE_DIR}/latest" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "${LATEST}" ] && [ "${LATEST}" != "${OP_ID}" ]; then
+        # A later journal supersedes this operation only if ITS purge committed.
+        if [[ "${LATEST}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            LATEST_ATTESTED="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v op="${LATEST}" <<'SQL'
+SELECT COUNT(*) FROM audit_records WHERE action = 'env.purge.executed' AND payload->>'operationId' = :'op';
+SQL
+)" || { echo "ERROR: could not look up the attestation for the later operation ${LATEST}" >&2; exit 3; }
+        else
+            LATEST_ATTESTED="unparseable"
+        fi
+        if [ "${LATEST_ATTESTED}" != "0" ]; then
+            echo "REFUSED: operation ${OP_ID} was superseded by a later committed purge (${LATEST}); finish or inspect that one instead (nothing written)" >&2; exit 1
+        fi
     fi
     run_stages
     if [ "${FORMAT}" = "json" ]; then
@@ -400,6 +434,17 @@ CLS_VERSION="$(sed -n 's/^  "version": \([0-9]*\),$/\1/p' "${HERE}/pilot-1-purge
 [ -n "${CLS_VERSION}" ] || CLS_VERSION=0
 OP_ID="$("${NODE}" -e 'process.stdout.write(require("node:crypto").randomUUID())')"
 OP_STATE="${STATE_DIR}/${OP_ID}"
+# The operation JOURNAL is written now — before the app is stopped and before
+# the transaction — so recovery can always find the operation's state; a
+# journal that cannot be written is a usage error with nothing mutated
+# (Codex R8). `latest` is reconciled against attestations by recovery: a
+# journal whose purge never committed does not supersede anything.
+if ! mkdir -p "${OP_STATE}" 2>/dev/null \
+   || ! printf '%s|%s\n' "${MODE}" "${INCIDENT_ID}" > "${OP_STATE}/meta" 2>/dev/null \
+   || ! : > "${OP_STATE}/pending" 2>/dev/null \
+   || ! printf '%s\n' "${OP_ID}" > "${STATE_DIR}/latest" 2>/dev/null; then
+    echo "ERROR: cannot write the operation journal under ${STATE_DIR} (nothing written to the database)" >&2; exit 2
+fi
 FAIL_INSERT=0
 [ "${FAIL_AFTER}" = "audit-insert" ] && FAIL_INSERT=1
 
@@ -511,6 +556,7 @@ RECONCILED=false
 if [ "${STATUS}" -ne 0 ]; then
     if grep -q "PURGE_REFUSED" "${ERR}"; then
         echo "REFUSED: $(grep -o 'PURGE_REFUSED:[^"]*' "${ERR}" | head -1 | sed 's/PURGE_REFUSED: //') (transaction rolled back; nothing written)" >&2
+        : > "${OP_STATE}/rolled_back" 2>/dev/null || true
         restart_app_if_stopped
         exit 1
     fi
@@ -535,14 +581,13 @@ SQL
         echo "ERROR: outcome UNKNOWN — the purge transaction failed and its result could not be reconciled under the purge lock for operation ${OP_ID}:" >&2
         sed 's/^/    /' "${ERR}" >&2
         echo "       The app is left STOPPED. Inspect audit_records for payload->>'operationId' = '${OP_ID}'; if attested, run --finish-runtime --operation-id ${OP_ID}; otherwise re-run the purge." >&2
-        # The operation's runtime state is recorded so that recovery, once the
-        # operator has confirmed the attestation, knows no stage has run yet.
-        mkdir -p "${OP_STATE}" && printf '%s|%s\n' "${MODE}" "${INCIDENT_ID}" > "${OP_STATE}/meta" && printf '%s\n' "${OP_ID}" > "${STATE_DIR}/latest"
+        : > "${OP_STATE}/outcome_unknown" 2>/dev/null || true
         exit 5
     fi
     if [ "${FOUND}" = "0" ]; then
         echo "ERROR: the purge transaction failed and was rolled back (verified under the purge lock: no attestation for operation ${OP_ID}) — no deletion:" >&2
         sed 's/^/    /' "${ERR}" >&2
+        : > "${OP_STATE}/rolled_back" 2>/dev/null || true
         restart_app_if_stopped
         exit 3
     fi
@@ -550,11 +595,8 @@ SQL
     RECONCILED=true
 fi
 
-# --- committed: record the operation's runtime state, then run the stages -----
-mkdir -p "${OP_STATE}" || { echo "ERROR: purge COMMITTED; cannot create runtime state ${OP_STATE} — $(recover_hint) after fixing ${STATE_DIR}" >&2; exit 4; }
-printf '%s|%s\n' "${MODE}" "${INCIDENT_ID}" > "${OP_STATE}/meta"
+# --- committed: mark the journal, then run the stages ---------------------------
 mark_stage purged
-printf '%s\n' "${OP_ID}" > "${STATE_DIR}/latest"
 run_stages
 
 if [ "${FORMAT}" = "json" ]; then
