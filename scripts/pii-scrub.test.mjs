@@ -188,3 +188,19 @@ test('backup mode: an unterminated literal at end of input fails closed (exit 4)
   assert.match(stderr, /unterminated literal/);
 });
 
+test('backup mode: a multi-line quoted identifier in a COPY header (Codex R3) does not hide the rows', async () => {
+  const input = 'COPY public."o\n\'neil" (id, body) FROM stdin;\n1\treach me at test.user@example.com\n\\.\n';
+  const { code, stdout } = await run(['--mode', 'backup'], input);
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes('test.user@example.com'));
+});
+
+test('backup mode: mixed E-literal quote escapes around JSON (Codex R3) are decoded and scrubbed', async () => {
+  const input = "SELECT E'\"a\\''' \\u0062@\\u0063.\\u0063\\u006f\"'::json;\n";
+  const { code, stdout } = await run(['--mode', 'backup'], input);
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes('b@c.co'));
+  assert.ok(!stdout.includes('u0062@'));
+  assert.ok(stdout.endsWith("'::json;\n"));
+});
+

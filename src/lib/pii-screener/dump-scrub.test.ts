@@ -184,3 +184,33 @@ describe('Codex R2 in-scope closures', () => {
     expect(() => s.end()).toThrow(/unterminated literal/);
   });
 });
+
+describe('Codex R3 in-scope closures', () => {
+  it('a COPY header whose quoted identifier spans lines still activates COPY mode', () => {
+    const dump =
+      'COPY public."o\n\'neil" (id, body) FROM stdin;\n' +
+      '1\treach me at test.user@example.com\n' +
+      '\\.\n';
+    const out = scrubText(dump);
+    expect(out).not.toContain('test.user@example.com');
+    expect(out.startsWith('COPY public."o\n\'neil" (id, body) FROM stdin;\n')).toBe(true);
+    expect(out.endsWith('\\.\n')).toBe(true);
+  });
+  it('a COPY header whose quoted identifier contains doubled quotes across lines is handled too', () => {
+    const dump = 'COPY public."a""b\nc" (id, body) FROM stdin;\n1\tmy SSN is 123-45-6789\n\\.\n';
+    expect(scrubText(dump)).not.toContain('123-45-6789');
+  });
+  it("mixed E-literal escapes (\\' next to '', \\u escapes) decode in one pass and the JSON inside is scrubbed", () => {
+    const sql = "SELECT E'\"a\\''' \\u0062@\\u0063.\\u0063\\u006f\"'::json;\n";
+    const out = scrubText(sql);
+    expect(out).not.toContain('b@c.co');
+    expect(out).not.toMatch(/u0062@/);
+    expect(out.startsWith("SELECT E'")).toBe(true);
+    expect(out.endsWith("'::json;\n")).toBe(true);
+  });
+  it('decodes \\U escapes and leaves a lone backslash-u without hex as text', () => {
+    expect(scrubText("SELECT E'\\U0001F600 ok \\uZZ';\n")).toBe(
+      "SELECT E'\\U0001F600 ok \\uZZ';\n",
+    );
+  });
+});

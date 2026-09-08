@@ -45,6 +45,8 @@ import { redactForBackup } from './backup-redaction.js';
 import { redactLogLine } from './log-redaction.js';
 
 const COPY_START = /^COPY\s+\S.*\s+FROM\s+stdin;\s*$/;
+/** Same header when a quoted identifier carried it across physical lines. */
+const COPY_START_MULTILINE = /^COPY\s[\s\S]*?\sFROM\s+stdin;\s*$/;
 const COPY_END = /^\\\.\s*$/;
 const NUMERIC = /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 const DOLLAR_TAG = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/;
@@ -238,6 +240,13 @@ function decodeEscapeLiteral(content: string): string {
   let out = '';
   for (let i = 0; i < content.length; i++) {
     const ch = content[i]!;
+    if (ch === "'" && content[i + 1] === "'") {
+      // A doubled quote is a single quote in an E-literal too, decoded in
+      // the same pass as the backslash escapes.
+      out += "'";
+      i++;
+      continue;
+    }
     if (ch !== '\\') {
       out += ch;
       continue;
@@ -271,6 +280,17 @@ function decodeEscapeLiteral(content: string): string {
           out += String.fromCharCode(parseInt(hex, 16));
           i += hex.length;
         }
+        break;
+      }
+      case 'u':
+      case 'U': {
+        // PostgreSQL E-string unicode escapes: \uXXXX and \UXXXXXXXX.
+        const width = next === 'u' ? 4 : 8;
+        const hex = content.slice(i + 1, i + 1 + width);
+        if (hex.length === width && /^[0-9A-Fa-f]+$/.test(hex)) {
+          out += String.fromCodePoint(parseInt(hex, 16));
+          i += width;
+        } else out += next;
         break;
       }
       default: {
@@ -319,9 +339,10 @@ interface SqlState {
 }
 
 function scrubLiteral(content: string, escapeLiteral: boolean): string {
-  const decoded = escapeLiteral
-    ? decodeEscapeLiteral(content.replace(/''/g, "\\'"))
-    : content.replace(/''/g, "'");
+  // Both literal kinds are decoded in ONE sequential pass: a regex
+  // pre-replacement of '' overlapped a preceding \' and corrupted the
+  // value (Codex R3).
+  const decoded = escapeLiteral ? decodeEscapeLiteral(content) : content.replace(/''/g, "'");
   const scrubbed = scrubValue(decoded);
   if (scrubbed === decoded) return content;
   return escapeLiteral ? encodeEscapeLiteral(scrubbed) : scrubbed.replace(/'/g, "''");
@@ -465,6 +486,10 @@ export interface DumpScrubber {
 export function createDumpScrubber(): DumpScrubber {
   let inCopy = false;
   const sql: SqlState = { mode: 'code', escapeLiteral: false, literal: '', dollarTag: '' };
+  // Physical lines of a statement whose quoted identifier spans lines; when
+  // the identifier closes, the joined text is tested for a COPY header.
+  // (Codex R3: a table named public."o<newline>'neil" hid its COPY block.)
+  let statementHead = '';
   return {
     push(line: string): string {
       if (inCopy) {
@@ -474,11 +499,22 @@ export function createDumpScrubber(): DumpScrubber {
         }
         return scrubCopyRow(line);
       }
-      if (sql.mode === 'code' && COPY_START.test(line)) {
+      if (sql.mode === 'code' && statementHead.length === 0 && COPY_START.test(line)) {
         inCopy = true;
         return line;
       }
-      return scrubSqlText(line, sql);
+      const out = scrubSqlText(line, sql);
+      if (sql.mode === 'identifier') {
+        statementHead += line;
+        return out;
+      }
+      if (statementHead.length > 0) {
+        statementHead += line;
+        const joined = statementHead;
+        statementHead = '';
+        if (sql.mode === 'code' && COPY_START_MULTILINE.test(joined)) inCopy = true;
+      }
+      return out;
     },
     end(): string {
       if (sql.mode === 'literal' || sql.mode === 'dollar' || sql.mode === 'identifier') {
