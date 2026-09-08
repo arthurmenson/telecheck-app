@@ -565,6 +565,31 @@ describe('patient crisis admission', () => {
     }
   });
 
+  it('a server-raised PT503 before COMMIT is a definite failure: not_recorded / not_queued', async () => {
+    // Codex R3 on the consolidation refactor: migration 094's isolation
+    // guard raises PT503 pre-COMMIT. Classifying on the code alone reported
+    // the admission as unconfirmed although nothing was written and no
+    // COMMIT was issued — masking a confirmed failure to queue escalation.
+    const base = mocks.query.getMockImplementation()!;
+    mocks.query.mockImplementation(async (sql: string) => {
+      if (sql.includes('crisis_care_live_patient'))
+        throw Object.assign(new Error('crisis_isolation_unavailable'), {
+          code: 'PT503',
+          severity: 'ERROR',
+        });
+      return base(sql);
+    });
+    const result = await admitPatientCareInput(ctx, 'in crisis', 'messaging');
+    expect(result).toMatchObject({
+      recording_status: 'not_recorded',
+      escalation_status: 'not_queued',
+    });
+    expect(mocks.query.mock.calls.some(([sql]) => sql === 'COMMIT')).toBe(false);
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+    expect(mocks.release).not.toHaveBeenCalledWith(true);
+  });
+
   it('keeps a class-08 connection exception at COMMIT classified as uncertain', async () => {
     // Codex verification round on PR #302: a five-char SQLSTATE was being
     // read as "the server raised, so it rolled back". Class 08 is the

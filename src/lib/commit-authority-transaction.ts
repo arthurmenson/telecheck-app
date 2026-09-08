@@ -155,6 +155,30 @@ function checkoutRecordingClient(
 /** Transaction outcome, captured the instant COMMIT resolves or rejects. */
 type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
+/**
+ * Discriminator stamped on every error this primitive produces for an
+ * UNKNOWN COMMIT outcome (stalled past the deadline, or a transport /
+ * class-08 / FATAL failure after COMMIT was issued). `code: 'PT503'` alone
+ * is not that signal — the database raises PT503 for definite pre-COMMIT
+ * failures too (e.g. the isolation guard in migration 094), and those must
+ * stay definite failures. (Codex round 3 on the consolidation refactor.)
+ */
+const COMMIT_UNCONFIRMED = Symbol.for('telecheck.commit_unconfirmed');
+
+/** True only for errors the primitive produced for an unknown COMMIT outcome. */
+export function isCommitUnconfirmed(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { [COMMIT_UNCONFIRMED]?: unknown })[COMMIT_UNCONFIRMED] === true
+  );
+}
+
+function markCommitUnconfirmed(error: Error): Error {
+  Object.defineProperty(error, COMMIT_UNCONFIRMED, { value: true, enumerable: false });
+  return error;
+}
+
 const nextDiscardSignalAt = new Map<string, number>();
 function signalRecordingClientDiscarded(event: string): void {
   const now = performance.now();
@@ -360,7 +384,7 @@ export function commitAuthorityTransaction(
       // (pg-pool only re-attaches its own listener on RETURN, not destroy).
       // A caller-owned client is the caller's to dispose of.
       if (owned) client.release?.(true);
-      return authority.unconfirmed();
+      return markCommitUnconfirmed(authority.unconfirmed());
     };
 
     try {

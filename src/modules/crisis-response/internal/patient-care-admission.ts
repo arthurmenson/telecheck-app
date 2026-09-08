@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { withActorContext } from '../../../lib/actor-context-binding.js';
-import { commitAuthorityTransaction } from '../../../lib/commit-authority-transaction.js';
+import {
+  commitAuthorityTransaction,
+  isCommitUnconfirmed,
+} from '../../../lib/commit-authority-transaction.js';
 import { crisisDetector } from '../../../lib/crisis-detection.js';
 import { type DbClient, type DbTransaction } from '../../../lib/db.js';
 import { emitDomainEvent } from '../../../lib/domain-events.js';
@@ -262,11 +265,13 @@ export async function admitPatientCareInput(
     if (code === '42501' && !authenticated)
       throw Object.assign(new Error('crisis_forbidden'), { code: '42501', statusCode: 403 });
     signalAdmissionUnavailable();
-    // The primitive already classified the COMMIT outcome: PT503 is the one
+    // The primitive already classified the COMMIT outcome and stamps the one
     // shape that means "may have committed" (stalled past the deadline, or a
-    // transport / class-08 / FATAL failure after COMMIT was issued). Every
-    // other failure is a definite rollback or happened before COMMIT.
-    recordingStatus = code === 'PT503' ? 'unconfirmed' : 'not_recorded';
+    // transport / class-08 / FATAL failure after COMMIT was issued). The
+    // code alone is not that signal: the database raises PT503 for definite
+    // pre-COMMIT failures too (migration 094 isolation guard), which must
+    // report not_recorded / not_queued. (Codex R3 on the consolidation.)
+    recordingStatus = isCommitUnconfirmed(error) ? 'unconfirmed' : 'not_recorded';
   }
 
   // Recording has already settled. Public configuration can neither prevent

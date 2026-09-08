@@ -47,7 +47,7 @@ vi.mock('./actor-context-binding.js', () => ({
   withActorContext: async (_client: unknown, _nonce: string, fn: () => Promise<unknown>) => fn(),
 }));
 
-import { commitAuthorityTransaction } from './commit-authority-transaction.js';
+import { commitAuthorityTransaction, isCommitUnconfirmed } from './commit-authority-transaction.js';
 import type { DbClient, DbTransaction } from './db.js';
 import { IdempotencyReplayError } from './idempotency.js';
 
@@ -344,6 +344,30 @@ describe('commitAuthorityTransaction — authority is enforced at the actual COM
     await run(async () => 'x');
     await flush();
     expect(sqls().some((x) => x.includes('clear_tenant_context'))).toBe(true);
+  });
+
+  it('stamps only the errors it produces for an unknown COMMIT outcome — a server PT503 is not one', async () => {
+    // Codex R3 on the consolidation refactor: the database raises PT503 for
+    // definite pre-COMMIT failures too (migration 094 isolation guard), so
+    // callers must classify on the discriminator, never on the code.
+    mocks.commitError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    const unconfirmed = await run(async () => 'x').catch((e: unknown) => e);
+    expect(isCommitUnconfirmed(unconfirmed)).toBe(true);
+    expect((unconfirmed as { code?: string }).code).toBe('PT503');
+
+    vi.clearAllMocks();
+    mocks.commitError = null;
+    const serverPt503 = Object.assign(new Error('isolation_unavailable'), {
+      code: 'PT503',
+      severity: 'ERROR',
+    });
+    const definite = await run(async () => {
+      throw serverPt503;
+    }).catch((e: unknown) => e);
+    expect(definite).toBe(serverPt503);
+    expect(isCommitUnconfirmed(definite)).toBe(false);
+    expect(isCommitUnconfirmed(null)).toBe(false);
+    expect(isCommitUnconfirmed({ code: 'PT503' })).toBe(false);
   });
 
   it('treats a no-SQLSTATE rejection of an issued COMMIT as indeterminate: PT503 and discard', async () => {
