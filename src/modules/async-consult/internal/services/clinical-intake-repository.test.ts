@@ -1,3 +1,5 @@
+import { EventEmitter } from 'node:events';
+
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -9,10 +11,23 @@ const mocks = vi.hoisted(() => ({
   cleanupHang: false,
   cleanupError: null as unknown,
   previousTenantId: null as string | null,
+  /** Emit a client 'error' event alongside the COMMIT rejection (pg does both). */
+  commitEmitsError: false,
+  client: null as unknown,
 }));
+// A real EventEmitter, like pg.Client: an 'error' event with no listener
+// THROWS out of emit(), which is exactly the process-exit path the module
+// must prevent by owning the listener while it owns the client.
 vi.mock('../../../../lib/db.js', () => ({
   getPool: () => ({
-    connect: async () => ({ query: mocks.query, release: mocks.release }),
+    connect: async () => {
+      const client = Object.assign(new EventEmitter(), {
+        query: mocks.query,
+        release: mocks.release,
+      });
+      mocks.client = client;
+      return client;
+    },
   }),
 }));
 vi.mock('../../../../lib/logger.js', () => ({ logger: { error: vi.fn() } }));
@@ -48,10 +63,18 @@ beforeEach(() => {
   mocks.cleanupHang = false;
   mocks.cleanupError = null;
   mocks.previousTenantId = null;
+  mocks.commitEmitsError = false;
+  mocks.client = null;
   mocks.query.mockImplementation(async (sql: string) => {
     if (sql === 'COMMIT') {
       if (mocks.commitHang) return new Promise<never>(() => undefined);
-      if (mocks.commitError !== null) throw mocks.commitError;
+      if (mocks.commitError !== null) {
+        if (mocks.commitEmitsError) {
+          const err = mocks.commitError as Error;
+          setImmediate(() => (mocks.client as EventEmitter).emit('error', err));
+        }
+        throw mocks.commitError;
+      }
       return { rows: [] };
     }
     if (sql === 'ROLLBACK') {
@@ -235,6 +258,37 @@ describe('careIntakeTransaction — authority is enforced at the actual COMMIT',
       code: 'PT503',
     });
     expect(mocks.release).toHaveBeenCalledWith(true);
+  });
+
+  it('survives the driver emitting a client error event alongside the COMMIT rejection', async () => {
+    // Codex round 3 on PR #303: pg-pool drops its idle 'error' listener at
+    // checkout, and on EPIPE pg emits a client 'error' event as well as
+    // rejecting the query. With no listener that emit() THROWS and Node
+    // exits with code 1 before the rejection handler runs. The module must
+    // own the listener for the whole ownership window.
+    mocks.commitError = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    mocks.commitEmitsError = true;
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).rejects.toMatchObject({
+      code: 'PT503',
+    });
+    // Let the scheduled emit fire; with no listener it would throw here and
+    // surface as an unhandled error in this test run.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mocks.release).toHaveBeenCalledWith(true);
+    // The listener is released with the client, never leaked.
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBe(0);
+  });
+
+  it('listens for client errors for the whole ownership window, then lets go at release', async () => {
+    let duringWork = -1;
+    await careIntakeTransaction(ctx)(async () => {
+      duringWork = (mocks.client as EventEmitter).listenerCount('error');
+      return 'x';
+    });
+    expect(duringWork).toBe(1);
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+    expect((mocks.client as EventEmitter).listenerCount('error')).toBe(0);
   });
 
   it('does NOT treat a pre-COMMIT connection failure as indeterminate', async () => {

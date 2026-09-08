@@ -72,9 +72,32 @@ const COMMIT_DEADLINE_MS = 4_000;
 /** Bound on post-COMMIT ROLLBACK/cleanup, which run outside SET LOCAL timeouts. */
 const CLEANUP_DEADLINE_MS = 2_000;
 
-/** A pool client this module may return or DISCARD. */
+/**
+ * A pool client this module may return or DISCARD.
+ *
+ * `on`/`off` matter as much as `release`: pg-pool removes its idle 'error'
+ * listener when a client is checked out, and getPool() only handles POOL
+ * errors. On EPIPE/ECONNRESET pg both rejects the in-flight query AND emits
+ * a client 'error' event. An emitter error with no listener throws — Node
+ * exits with code 1 before any rejection handler runs, taking every other
+ * in-flight request with it. (Codex round 3 on PR #303, reproduced with the
+ * installed driver.) So this module listens for the whole time it owns the
+ * client, including asynchronous cleanup, and only lets go at release.
+ */
 interface RecordingClient extends DbClient {
   release?: (destroy?: boolean) => void;
+  on?: (event: 'error', listener: (error: Error) => void) => unknown;
+  off?: (event: 'error', listener: (error: Error) => void) => unknown;
+}
+
+/** Attach the ownership-window error listener; returns the detach function. */
+function ownClientErrors(client: RecordingClient): () => void {
+  const listener = (): void => {
+    // The in-flight query rejects with the same failure; the outcome
+    // lifecycle classifies it there. Listening is what keeps the process up.
+  };
+  client.on?.('error', listener);
+  return () => client.off?.('error', listener);
 }
 
 /** Transaction outcome, captured the instant COMMIT resolves or rejects. */
@@ -105,6 +128,7 @@ function finalizeRecordingClient(
   run: Promise<unknown>,
   rollback: boolean,
   previousTenantId: string | null,
+  disown: () => void,
 ): void {
   const settledRun = run.then(
     () => undefined,
@@ -132,8 +156,12 @@ function finalizeRecordingClient(
   const restoreParams = previousTenantId === null ? [] : [previousTenantId];
   void Promise.race([rolledBack.then(() => client.query(restore, restoreParams)), bound])
     .then(
-      () => client.release?.(),
       () => {
+        disown();
+        client.release?.();
+      },
+      () => {
+        disown();
         client.release?.(true);
         signalRecordingClientDiscarded();
       },
@@ -172,6 +200,7 @@ function finalizeRecordingClient(
 export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof withTransaction {
   return async <T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> => {
     const client = (await getPool().connect()) as unknown as RecordingClient;
+    const disown = ownClientErrors(client);
     let previousTenantId: string | null = null;
     let commitIssued = false;
 
@@ -233,19 +262,20 @@ export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof wi
       // PT503 (503) so the caller is told to check status before retrying
       // — never as a success and never as a definite failure.
       run.catch(() => undefined);
+      disown();
       client.release?.(true);
       return Object.assign(new Error('care_commit_unconfirmed'), { code: 'PT503' });
     };
 
     try {
       const value = await Promise.race([run, deadline]);
-      finalizeRecordingClient(client, run, false, previousTenantId);
+      finalizeRecordingClient(client, run, false, previousTenantId, disown);
       const outcome = settled as Settled<T> | null;
       return outcome?.ok ? outcome.value : value;
     } catch (error) {
       const outcome = settled as Settled<T> | null;
       if (outcome?.ok) {
-        finalizeRecordingClient(client, run, false, previousTenantId);
+        finalizeRecordingClient(client, run, false, previousTenantId, disown);
         return outcome.value;
       }
       if (outcome && !outcome.ok) {
@@ -271,11 +301,11 @@ export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof wi
         const indeterminate = commitIssued && (sqlState === null || sqlState.startsWith('08'));
         if (indeterminate) throw unconfirmed();
         // A known outcome always wins over the deadline.
-        finalizeRecordingClient(client, run, true, previousTenantId);
+        finalizeRecordingClient(client, run, true, previousTenantId, disown);
         throw outcome.error;
       }
       if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') throw unconfirmed();
-      finalizeRecordingClient(client, run, true, previousTenantId);
+      finalizeRecordingClient(client, run, true, previousTenantId, disown);
       throw error;
     }
   };
