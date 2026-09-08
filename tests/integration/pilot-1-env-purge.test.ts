@@ -324,7 +324,22 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
       `INSERT INTO idempotency_keys (tenant_id, key, response_status, endpoint, actor_id) VALUES ($1, $2, 200, '/ci/purge-canary', 'ci')`,
       [TENANT, key],
     );
-    return { ...ids, key };
+    // Replay-cache entries: one for a RETAINED actor (baseline patient), one
+    // for a participant actor, in both caches (Codex R4: an unexpired
+    // administrative retry must still be replay-protected after a reset).
+    const retainedKey = `retained-${ulid()}`;
+    const participantKey = `participant-${ulid()}`;
+    for (const table of ['idempotency_keys', 'identity_idempotency_keys']) {
+      await admin.query(
+        `INSERT INTO ${table} (tenant_id, key, response_status, endpoint, actor_id) VALUES ($1, $2, 200, '/ci/purge-canary', $3)`,
+        [TENANT, retainedKey, ids.baselinePatient],
+      );
+      await admin.query(
+        `INSERT INTO ${table} (tenant_id, key, response_status, endpoint, actor_id) VALUES ($1, $2, 200, '/ci/purge-canary', $3)`,
+        [TENANT, participantKey, ids.participantPatient],
+      );
+    }
+    return { ...ids, key, retainedKey, participantKey };
   }
 
   beforeAll(async () => {
@@ -473,6 +488,13 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     ).toBeGreaterThanOrEqual(baselineBefore);
     for (const t of tablesOf('allowlist')) expect(await count(t), t).toBe(0);
     for (const t of preserved) expect(await count(t), t).toBe(preservedBefore[t]);
+    for (const table of ['idempotency_keys', 'identity_idempotency_keys']) {
+      expect(await count(table, 'WHERE key = $1', [c.retainedKey]), `${table} retained`).toBe(1);
+      expect(await count(table, 'WHERE key = $1', [c.participantKey]), `${table} participant`).toBe(
+        0,
+      );
+      expect(await count(table, `WHERE actor_id = 'ci'`), `${table} non-account actors`).toBe(0);
+    }
     const rows = await attestations();
     expect(rows.length).toBe(attestBefore + tenantCount);
     const mine = rows.filter((x) => x.payload['operationId'] === out['operationId']);

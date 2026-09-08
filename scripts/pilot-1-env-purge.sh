@@ -154,16 +154,30 @@ for f in "${HERE}/lib/purge-plan.mjs" "${HERE}/lib/incident-manifest.mjs" "${HER
     [ -r "$f" ] || { echo "ERROR: required file missing: $f" >&2; exit 2; }
 done
 command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is required for the lifecycle lock (PILOT_1_FLOCK='${FLOCK}' not found)" >&2; exit 2; }
-# The lock file is a WRITE; it must never be inside the incident tree
-# (single-writer discipline) and must not be the incident directory itself.
-if ! "${NODE}" -e '
-const p = require("node:path");
-const [lock, inc] = process.argv.slice(1).map((x) => p.resolve(x));
-const rel = p.relative(inc, lock);
-const inside = lock === inc || (rel !== "" && !rel.startsWith("..") && !p.isAbsolute(rel));
-process.exit(inside ? 1 : 0);
-' "${LOCK_FILE}" "${INCIDENT_DIR}"; then
-    echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) must not be inside the incident directory (${INCIDENT_DIR})" >&2; exit 2
+# Every write this script performs — the lifecycle lock file and the scratch
+# directory mktemp creates under TMPDIR — must resolve to a REAL location
+# outside the incident tree (symlink aliases followed, complete path
+# components compared, so `incident-logs/..lock` and a symlinked alias are
+# both caught). Single-writer discipline: nothing is ever created, modified
+# or deleted under the incident directory (Codex R3 / R4).
+inside_incident_tree() {
+    ! "${NODE}" -e '
+const fs = require("node:fs"), p = require("node:path");
+const real = (x) => {
+  try { return fs.realpathSync(x); } catch {}
+  try { return p.join(fs.realpathSync(p.dirname(x)), p.basename(x)); } catch {}
+  return p.resolve(x);
+};
+const [cand, inc] = process.argv.slice(1).map(real);
+process.exit(cand === inc || cand.startsWith(inc + p.sep) ? 1 : 0);
+' "$1" "${INCIDENT_DIR}"
+}
+if inside_incident_tree "${LOCK_FILE}"; then
+    echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) resolves inside the incident directory (${INCIDENT_DIR}); nothing may be written there" >&2; exit 2
+fi
+SCRATCH_PARENT="${TMPDIR:-/tmp}"
+if inside_incident_tree "${SCRATCH_PARENT}"; then
+    echo "ERROR: TMPDIR (${SCRATCH_PARENT}) resolves inside the incident directory (${INCIDENT_DIR}); scratch files may not be created there" >&2; exit 2
 fi
 
 TMP="$(mktemp -d)"
@@ -180,7 +194,10 @@ runtime_post_steps() {
     # Runs after a COMMITTED purge (or in --finish-runtime). Any failure exits 4:
     # the purge is committed and attested; re-run with --finish-runtime.
     [ "${SKIP_RUNTIME}" != "1" ] || return 0
-    ${COMPOSE} exec redis redis-cli FLUSHALL >/dev/null || { echo "ERROR: purge COMMITTED; Redis FLUSHALL failed — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
+    # redis-cli exits 0 on an error reply unless -e is given; the reply itself
+    # must be OK before any further runtime mutation (Codex R4).
+    REDIS_REPLY="$(${COMPOSE} exec redis redis-cli -e FLUSHALL 2>&1)" || { echo "ERROR: purge COMMITTED; Redis FLUSHALL failed (${REDIS_REPLY}) — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
+    [ "$(printf '%s' "${REDIS_REPLY}" | tr -d '\r' | tail -n 1)" = "OK" ] || { echo "ERROR: purge COMMITTED; Redis did not acknowledge FLUSHALL (reply: ${REDIS_REPLY}) — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
     if [ -n "${CADDY_LOGS}" ]; then
         for f in ${CADDY_LOGS}; do
             ${COMPOSE} exec caddy sh -c "[ -e '${f}' ] && : > '${f}'" || { echo "ERROR: purge COMMITTED; Caddy log truncate failed for ${f} — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }

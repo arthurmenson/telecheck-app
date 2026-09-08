@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "spec": "docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Purge table classification policy — every table in public MUST be classified; new migrations that add tables MUST add their classification here in the same PR (CI schema-drift test).",
   "classes": {
     "allowlist": "participant-only — TRUNCATE (never CASCADE)",
@@ -253,12 +253,14 @@
       "why": "configuration"
     },
     "idempotency_keys": {
-      "class": "allowlist",
-      "why": "participant-scoped idempotency"
+      "class": "scoped-delete",
+      "predicate": "actor_id NOT IN (SELECT account_id FROM public.accounts WHERE cohort_classification <> 'participant')",
+      "why": "replay cache keyed by (tenant, key, endpoint, actor); actors are account ids (src/lib/idempotency.ts). Entries of RETAINED accounts (baseline staff / admins) must survive so an unexpired administrative retry cannot re-execute after a reset (Codex R4); everything else — participant actors and non-account actors — goes"
     },
     "identity_idempotency_keys": {
-      "class": "allowlist",
-      "why": "participant-scoped identity idempotency (migration 083)"
+      "class": "scoped-delete",
+      "predicate": "actor_id NOT IN (SELECT account_id FROM public.accounts WHERE cohort_classification <> 'participant')",
+      "why": "identity replay cache (migration 083, LIKE idempotency_keys); same rule as idempotency_keys — retained accounts' entries survive, participant and non-account actors' entries go (Codex R4)"
     },
     "identity_staff_enrollment": {
       "class": "preserved",

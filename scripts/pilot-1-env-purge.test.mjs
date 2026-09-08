@@ -55,6 +55,12 @@ test('classification: loads, every table classified, accounts is scoped-delete, 
   assert.equal(map.tables.forms_snapshot.class, 'allowlist');
   assert.equal(map.tables.account_pin_credentials.class, 'scoped-delete');
   assert.equal(map.tables.auth_devices.class, 'scoped-delete');
+  assert.equal(map.tables.idempotency_keys.class, 'scoped-delete');
+  assert.equal(map.tables.identity_idempotency_keys.class, 'scoped-delete');
+  assert.match(
+    map.tables.idempotency_keys.predicate,
+    /actor_id NOT IN \(SELECT account_id FROM public\.accounts WHERE cohort_classification <> 'participant'\)/,
+  );
   assert.equal(map.tables.consult_care_binding.disableUserTriggersForTruncate, true);
   assert.equal(map.tables.consult_care_submission.disableUserTriggersForTruncate, true);
   assert.equal(map.tables.migration_history, undefined, 'not a table');
@@ -331,6 +337,10 @@ function snapshot(dir) {
   for (const f of fs.readdirSync(dir).sort()) {
     const p = path.join(dir, f);
     const st = fs.statSync(p);
+    if (st.isDirectory()) {
+      out[f] = { dir: true, entries: fs.readdirSync(p).sort() };
+      continue;
+    }
     out[f] = {
       size: st.size,
       mtime: st.mtimeMs,
@@ -387,7 +397,7 @@ esac
   const compose = path.join(dir, 'compose');
   fs.writeFileSync(
     compose,
-    `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${d}/compose.log"\nexit 0\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${d}/compose.log"\ncase "$*" in *redis-cli*) printf '%s\\n' "\${REDIS_REPLY:-OK}" ;; esac\nexit 0\n`,
     { mode: 0o755 },
   );
   const curl = path.join(dir, 'curl');
@@ -469,6 +479,42 @@ test('env-purge: usage errors exit 2 before psql runs (incl. missing health URLs
     !fs.existsSync(path.join(inc, 'lifecycle.lock')),
     'a lock file was written inside the incident tree',
   );
+});
+
+test('env-purge: containment: real filesystem locations — a `..`-prefixed child, a symlinked alias of the incident directory and a TMPDIR inside it are all refused before any write (Codex R4)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  const stubs = mkStubs(dir);
+  const inc = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  const alias = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'p1alias-')), 'alias');
+  fs.symlinkSync(inc, alias, 'junction');
+  const scratch = path.join(inc, 'scratch');
+  fs.mkdirSync(scratch);
+  const before = snapshot(inc);
+  for (const [name, env] of [
+    ['..-prefixed child', { PILOT_1_LOCK_FILE: path.join(inc, '..lifecycle.lock') }],
+    ['symlinked alias', { PILOT_1_LOCK_FILE: path.join(alias, 'lifecycle.lock') }],
+    ['alias itself', { PILOT_1_LOCK_FILE: alias }],
+    ['TMPDIR = incident dir', { TMPDIR: inc }],
+    ['TMPDIR inside incident dir', { TMPDIR: scratch }],
+    ['TMPDIR via alias', { TMPDIR: alias }],
+  ]) {
+    const r = run(dir, stubs, ['--routine-reset'], { PILOT_1_INCIDENT_LOGS_DIR: inc, ...env });
+    assert.equal(r.status, 2, `${name}: ${r.stderr}`);
+    assert.match(r.stderr, /resolves inside the incident directory/, name);
+  }
+  assert.ok(!fs.existsSync(path.join(dir, 'call-0.args')), 'psql ran');
+  assert.deepEqual(snapshot(inc), before, 'the incident tree changed');
+  assert.deepEqual(
+    fs.readdirSync(scratch),
+    [],
+    'scratch files were created inside the incident tree',
+  );
+  // a lock beside (not inside) the incident directory is fine
+  const ok = run(dir, stubs, ['--routine-reset', '--json'], {
+    PILOT_1_INCIDENT_LOGS_DIR: inc,
+    PILOT_1_LOCK_FILE: path.join(path.dirname(inc), `${path.basename(inc)}.lock`),
+  });
+  assert.equal(ok.status, 0, ok.stderr);
 });
 
 test('env-purge: the lifecycle lock is a kernel lock on a file that is never unlinked; a held lock refuses before anything runs', () => {
@@ -611,7 +657,7 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   assert.deepEqual(composeLog(dir), [
     'exec app pkill -TERM node',
     'stop app',
-    'exec redis redis-cli FLUSHALL',
+    'exec redis redis-cli -e FLUSHALL',
     "exec caddy sh -c [ -e '/var/log/access.log' ] && : > '/var/log/access.log'",
     'rm -sf app',
     'up -d app',
@@ -632,6 +678,25 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   });
   assert.equal(r2.status, 4, r2.stderr);
   assert.match(r2.stderr, /did not return HTTP 200 .* \(last: 302\)/);
+
+  // redis-cli returns exit 0 on an error reply: the reply must be OK, and no
+  // later runtime mutation may run (Codex R4)
+  const redisErr = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  const r3 = run(redisErr, mkStubs(redisErr), ['--routine-reset'], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    REDIS_REPLY: '(error) NOAUTH Authentication required.',
+  });
+  assert.equal(r3.status, 4, r3.stderr);
+  assert.match(r3.stderr, /did not acknowledge FLUSHALL/);
+  assert.deepEqual(composeLog(redisErr), [
+    'exec app pkill -TERM node',
+    'stop app',
+    'exec redis redis-cli -e FLUSHALL',
+  ]);
+  assert.ok(
+    !fs.existsSync(path.join(redisErr, 'curl.log')),
+    'no health check after a failed FLUSHALL',
+  );
 });
 
 test('env-purge: reconciliation reads the count, not a command tag — a rolled-back transaction exits 3 only after reconciling under the advisory lock; a lost COMMIT ack continues; an unreconcilable outcome exits 5 with the app left stopped', () => {
@@ -751,7 +816,7 @@ test('env-purge: --finish-runtime is bound to a committed attestation and to the
   });
   assert.ok(!fs.existsSync(path.join(ok, 'tx.sql')), 'a purge transaction ran in recovery mode');
   assert.ok(fs.existsSync(path.join(ok, 'seed.ran')));
-  assert.deepEqual(composeLog(ok), ['exec redis redis-cli FLUSHALL', 'rm -sf app', 'up -d app']);
+  assert.deepEqual(composeLog(ok), ['exec redis redis-cli -e FLUSHALL', 'rm -sf app', 'up -d app']);
   const clean = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
   r = run(clean, mkStubs(clean), ['--finish-runtime', '--operation-id', UUID, '--json'], {
     PILOT_1_SKIP_RUNTIME_STEPS: '0',
