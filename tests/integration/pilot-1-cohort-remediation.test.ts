@@ -450,6 +450,12 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
   });
 
   it('the staging seed refuses when an existing fixture has drifted from baseline, naming it; every row it creates is baseline', async () => {
+    for (const id of STAGING_SEED_IDS) await deleteAccount(id);
+    for (const templateId of STAGING_TEMPLATE_IDS) {
+      await admin
+        .query('DELETE FROM forms_template WHERE template_id = $1', [templateId])
+        .catch(() => undefined);
+    }
     // Upgrade case (Codex R2): the fixture pre-exists as 'unclassified'.
     const drifted = STAGING_SEED_IDS[0]!;
     await deleteAccount(drifted);
@@ -497,6 +503,8 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
   });
 
   it('the baseline seed is idempotent, every row it creates is baseline, and every seeded id is a canonical ULID', async () => {
+    // Another suite (env-purge) re-seeds the same fixed ids; start from a clean slate.
+    for (const id of SEED_IDS) await deleteAccount(id);
     // An unrelated unclassified account must be left exactly as it is: a seed
     // never classifies existing rows (Codex R6).
     // Patient AND delegate canaries in every tenant (a delegate-only

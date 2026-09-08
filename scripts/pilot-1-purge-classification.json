@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "spec": "docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Purge table classification policy — every table in public MUST be classified; new migrations that add tables MUST add their classification here in the same PR (CI schema-drift test).",
+  "classes": {
+    "allowlist": "participant-only — TRUNCATE (never CASCADE)",
+    "preserved": "never touched by env-purge",
+    "scoped-delete": "mixed baseline + participant — DELETE with the recorded predicate"
+  },
+  "tables": {
+    "_session_actor_context": {
+      "class": "preserved",
+      "why": "session-context scaffolding (migration 031); transient at request scope"
+    },
+    "_session_tenant_context": {
+      "class": "preserved",
+      "why": "session-context scaffolding (migration 003)"
+    },
+    "account_pin_credentials": { "class": "allowlist", "why": "participant credentials" },
+    "accounts": {
+      "class": "scoped-delete",
+      "predicate": "cohort_classification = 'participant'",
+      "why": "mixed baseline (staff, baseline fixtures) + participants; the three-state cohort classification (migration 080) is the sole authority"
+    },
+    "adapter_configs": { "class": "preserved", "why": "tenant baseline" },
+    "admin_dashboard_query_execution": { "class": "preserved", "why": "admin-review artifact" },
+    "admin_template_decision_idempotency_key": {
+      "class": "preserved",
+      "why": "admin-review artifact"
+    },
+    "ai_mode1_conversation": { "class": "allowlist", "why": "participant Mode 1 data" },
+    "ai_mode1_conversation_archival_event": {
+      "class": "allowlist",
+      "why": "participant Mode 1 data"
+    },
+    "ai_mode1_conversation_turn_admission": {
+      "class": "allowlist",
+      "why": "participant Mode 1 data"
+    },
+    "ai_mode1_conversation_turn_detector_result": {
+      "class": "allowlist",
+      "why": "participant Mode 1 data"
+    },
+    "ai_mode1_conversation_turn_result": { "class": "allowlist", "why": "participant Mode 1 data" },
+    "ai_provider_credential": { "class": "preserved", "why": "configuration" },
+    "audit_dedupe_markers": {
+      "class": "preserved",
+      "why": "companion to audit_records (dedup discipline)"
+    },
+    "audit_records": {
+      "class": "preserved",
+      "why": "I-003 append-only; carries the env.purge.executed attestation"
+    },
+    "auth_devices": { "class": "allowlist", "why": "participant auth state" },
+    "billing_consult_price": { "class": "preserved", "why": "price configuration (migration 088)" },
+    "billing_consult_quote": { "class": "allowlist", "why": "participant quotes (migration 088)" },
+    "billing_payment_intent": {
+      "class": "allowlist",
+      "why": "participant payment intents (migration 088)"
+    },
+    "billing_provider_event": {
+      "class": "allowlist",
+      "why": "participant payment provider events (migration 088)"
+    },
+    "billing_refund_intent": { "class": "allowlist", "why": "participant refunds (migration 088)" },
+    "ccr_configs": { "class": "preserved", "why": "tenant baseline" },
+    "consent": {
+      "class": "allowlist",
+      "why": "participant consent records (schema consent_versions preserved)"
+    },
+    "consent_care_decision": {
+      "class": "allowlist",
+      "why": "participant consent receipts (migration 093)"
+    },
+    "consent_care_membership": {
+      "class": "preserved",
+      "why": "staff care-consent membership (migration 093)"
+    },
+    "consent_care_policy": {
+      "class": "preserved",
+      "why": "care-consent policy configuration (migration 093)"
+    },
+    "consent_care_policy_term": {
+      "class": "preserved",
+      "why": "policy ↔ consent-version mapping (migration 093)"
+    },
+    "consent_versions": { "class": "preserved", "why": "configuration" },
+    "consult": { "class": "allowlist", "why": "participant consults" },
+    "consult_care_binding": {
+      "class": "allowlist",
+      "why": "participant intake binding (migration 095)"
+    },
+    "consult_care_submission": {
+      "class": "allowlist",
+      "why": "participant protected intake (migration 095)"
+    },
+    "consult_clinical_summary": { "class": "allowlist", "why": "participant consult data" },
+    "consult_clinician_decision": { "class": "allowlist", "why": "participant consult data" },
+    "consult_events": { "class": "allowlist", "why": "participant consult data (legacy naming)" },
+    "consult_follow_up_message": { "class": "allowlist", "why": "participant consult data" },
+    "consult_intake_submission": { "class": "allowlist", "why": "participant intake" },
+    "consult_lifecycle_transition": { "class": "allowlist", "why": "participant consult data" },
+    "consult_review_claim": { "class": "allowlist", "why": "participant consult data" },
+    "consults": { "class": "allowlist", "why": "participant consult data (legacy naming)" },
+    "country_profiles": { "class": "preserved", "why": "tenant baseline" },
+    "crisis_care_admission": {
+      "class": "allowlist",
+      "why": "participant crisis admission (migration 094)"
+    },
+    "crisis_event": { "class": "allowlist", "why": "participant crisis data" },
+    "crisis_event_lifecycle_transition": { "class": "allowlist", "why": "participant crisis data" },
+    "crisis_sweep_execution": { "class": "allowlist", "why": "participant crisis data" },
+    "delegation_scopes": { "class": "allowlist", "why": "participant delegations" },
+    "delegations": { "class": "allowlist", "why": "participant delegations" },
+    "dispensings": { "class": "allowlist", "why": "participant pharmacy data" },
+    "domain_events_outbox": { "class": "preserved", "why": "event-emission ledger" },
+    "email_passcodes": { "class": "allowlist", "why": "participant auth state" },
+    "forms_deployment": { "class": "preserved", "why": "configuration" },
+    "forms_governance_artifact": {
+      "class": "preserved",
+      "why": "publication evidence (migration 090/092)"
+    },
+    "forms_governance_membership": {
+      "class": "preserved",
+      "why": "staff governance membership (migration 090)"
+    },
+    "forms_published_definition": {
+      "class": "preserved",
+      "why": "published form definitions (migration 090)"
+    },
+    "forms_resume_state": { "class": "allowlist", "why": "participant form state" },
+    "forms_snapshot": { "class": "preserved", "why": "configuration snapshot" },
+    "forms_submission": { "class": "allowlist", "why": "participant submissions" },
+    "forms_template": { "class": "preserved", "why": "configuration" },
+    "forms_template_admin_review": { "class": "preserved", "why": "admin-review artifact" },
+    "forms_template_admin_review_lifecycle_transition": {
+      "class": "preserved",
+      "why": "admin-review artifact"
+    },
+    "forms_variant": { "class": "preserved", "why": "configuration" },
+    "idempotency_keys": { "class": "allowlist", "why": "participant-scoped idempotency" },
+    "identity_idempotency_keys": {
+      "class": "allowlist",
+      "why": "participant-scoped identity idempotency (migration 083)"
+    },
+    "identity_staff_enrollment": {
+      "class": "preserved",
+      "why": "staff enrollment evidence (migration 098)"
+    },
+    "identity_staff_membership": {
+      "class": "preserved",
+      "why": "staff capability membership (migration 098)"
+    },
+    "interaction_engine_evaluation": {
+      "class": "allowlist",
+      "why": "participant interaction data"
+    },
+    "interaction_signal": { "class": "allowlist", "why": "participant interaction data" },
+    "interaction_signal_lifecycle_transition": {
+      "class": "allowlist",
+      "why": "participant interaction data"
+    },
+    "interaction_signal_override": { "class": "allowlist", "why": "participant interaction data" },
+    "kms_active_class_keys": {
+      "class": "preserved",
+      "why": "key material pointers (migration 085)"
+    },
+    "kms_dek_keyring": { "class": "preserved", "why": "key material (migration 085)" },
+    "medication_requests": { "class": "allowlist", "why": "participant medication data" },
+    "migration_history": {
+      "class": "preserved",
+      "why": "migrations tracker (scripts/migrate.mjs)"
+    },
+    "notification_crisis_dispatch_ledger": {
+      "class": "allowlist",
+      "why": "participant crisis notifications"
+    },
+    "notification_crisis_escalation_obligation": {
+      "class": "allowlist",
+      "why": "participant crisis notifications"
+    },
+    "notification_crisis_provider_attempt": {
+      "class": "allowlist",
+      "why": "participant crisis notifications"
+    },
+    "otp_challenges": { "class": "allowlist", "why": "participant auth state" },
+    "product_catalog": { "class": "preserved", "why": "configuration" },
+    "rbac_roles": {
+      "class": "preserved",
+      "why": "RBAC role configuration (migration 032)"
+    },
+    "refills": { "class": "allowlist", "why": "participant pharmacy data" },
+    "schema_migrations": { "class": "preserved", "why": "migrations tracker" },
+    "sessions": {
+      "class": "allowlist",
+      "why": "transient auth sessions (all identities; re-login after reset)"
+    },
+    "shipments": { "class": "allowlist", "why": "participant pharmacy data" },
+    "subscription_events": { "class": "allowlist", "why": "participant subscriptions" },
+    "subscriptions": { "class": "allowlist", "why": "participant subscriptions" },
+    "tenant_brands": { "class": "preserved", "why": "tenant baseline" },
+    "tenant_kms_bindings": { "class": "preserved", "why": "tenant key binding (migration 084)" },
+    "tenant_users": { "class": "preserved", "why": "tenant baseline" },
+    "tenants": { "class": "preserved", "why": "tenant baseline" }
+  }
+}
