@@ -289,3 +289,100 @@ describe('crisis admission — authority is enforced at the actual COMMIT', () =
     expect(await admissionRowCount(accountId)).toEqual({ events: 1, admissions: 1 });
   }, 20_000);
 });
+
+/**
+ * PostgreSQL disables `statement_timeout` before it runs deferred constraint
+ * triggers inside COMMIT. Now that the evidence trigger fires at COMMIT, its
+ * scan is unbounded server-side; the app enforces a 4-second client-side
+ * COMMIT deadline instead. This block installs a test-only deferred trigger
+ * that sleeps 8 s on `crisis_care_admission`, so the COMMIT genuinely stalls
+ * inside the server — the exact scenario, not a simulation.
+ *
+ * The recording connection here is the superuser pool, which the app pool's
+ * role is not permitted to `pg_cancel_backend`. The best-effort cancel is
+ * therefore denied and swallowed, the server finishes the sleep, and the
+ * COMMIT lands. That is precisely why the app must report `unconfirmed` and
+ * never `not_recorded`: the admission DID persist after the response.
+ */
+describe('crisis admission — a slow deferred trigger cannot stall the patient response', () => {
+  const SLOW_TRIGGER = 'zz_test_slow_deferred_commit';
+
+  beforeAll(async () => {
+    const c = await admin.connect();
+    try {
+      await c.query(
+        `CREATE OR REPLACE FUNCTION public.${SLOW_TRIGGER}() RETURNS trigger
+         LANGUAGE plpgsql AS $fn$ BEGIN PERFORM pg_sleep(8); RETURN NEW; END $fn$`,
+      );
+      await c.query(`DROP TRIGGER IF EXISTS ${SLOW_TRIGGER} ON public.crisis_care_admission`);
+      await c.query(
+        `CREATE CONSTRAINT TRIGGER ${SLOW_TRIGGER} AFTER INSERT ON public.crisis_care_admission
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.${SLOW_TRIGGER}()`,
+      );
+    } finally {
+      c.release();
+    }
+  });
+
+  afterAll(async () => {
+    const c = await admin.connect();
+    try {
+      await c.query(`DROP TRIGGER IF EXISTS ${SLOW_TRIGGER} ON public.crisis_care_admission`);
+      await c.query(`DROP FUNCTION IF EXISTS public.${SLOW_TRIGGER}()`);
+    } finally {
+      c.release();
+    }
+  });
+
+  it('returns unconfirmed within the deadline while the COMMIT keeps running server-side', async () => {
+    const { accountId, sessionId } = await seedPatientWithSession();
+    const nonce = await bindNonce(accountId, sessionId, LIVE_NONCE_TTL_SECONDS);
+    const record: CommitInterception = { intercepted: false, commitError: null };
+
+    const c = await admin.connect();
+    try {
+      await c.query('SELECT set_tenant_context($1)', [TENANT_US]);
+      const startedAt = Date.now();
+      const result = await admitPatientCareInput(
+        {
+          tenant,
+          accountId,
+          sessionId,
+          actorNonce: nonce,
+          idempotencyKey: `slow-commit-${ulid()}`,
+          connection: withCommitInterceptor(c, async () => undefined, record),
+        },
+        'I want to die',
+        'messaging',
+      );
+      const elapsedMs = Date.now() - startedAt;
+
+      // Bounded by the app's 4 s deadline, not by the 8 s trigger and not by
+      // the 5 s statement_timeout (which does not apply inside COMMIT).
+      expect(elapsedMs).toBeLessThan(5_500);
+      expect(record.intercepted).toBe(true);
+      expect(result).toMatchObject({
+        kind: 'crisis_interruption',
+        recording_status: 'unconfirmed',
+        escalation_status: 'unconfirmed',
+      });
+      expect(result).not.toHaveProperty('crisis_event_id');
+
+      // The server was still committing. Wait for it to finish and show
+      // the admission persisted — `unconfirmed` was the honest answer, and
+      // `not_recorded` would have invited a duplicating retry.
+      const deadline = Date.now() + 15_000;
+      let counts = await admissionRowCount(accountId);
+      while (counts.admissions === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        counts = await admissionRowCount(accountId);
+      }
+      expect(counts).toEqual({ events: 1, admissions: 1 });
+    } finally {
+      // This queues behind the in-flight COMMIT on the same client; by now
+      // it has completed, so cleanup is prompt.
+      await c.query('SELECT clear_tenant_context()').catch(() => undefined);
+      c.release();
+    }
+  }, 40_000);
+});

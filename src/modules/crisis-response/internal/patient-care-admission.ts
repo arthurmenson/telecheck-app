@@ -2,7 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { withActorContext } from '../../../lib/actor-context-binding.js';
 import { crisisDetector } from '../../../lib/crisis-detection.js';
-import { withTenantBoundConnection, type DbClient, type DbTransaction } from '../../../lib/db.js';
+import {
+  withConnection,
+  withTenantBoundConnection,
+  type DbClient,
+  type DbTransaction,
+} from '../../../lib/db.js';
 import { emitDomainEvent } from '../../../lib/domain-events.js';
 import { logger } from '../../../lib/logger.js';
 import { withTenantContext } from '../../../lib/rls.js';
@@ -125,6 +130,22 @@ async function assertPatient(tx: DbTransaction, ctx: PatientCareAdmissionContext
 }
 
 /**
+ * Wall-clock bound on the COMMIT statement only.
+ *
+ * PostgreSQL disables `statement_timeout` before it runs deferred
+ * constraint triggers inside COMMIT, so once the evidence trigger fires at
+ * COMMIT (which it must — see patientTransaction) the evidence scan is no
+ * longer covered by the transaction's 5-second `SET LOCAL
+ * statement_timeout`. Without a client-side bound, a slow scan could hold
+ * the recording connection and delay the patient's safety-resource
+ * response. (Codex round 3 on PR #302.)
+ *
+ * Deliberately BELOW the 5-second statement_timeout so the integration
+ * regression proves this bound, not the server's.
+ */
+const COMMIT_DEADLINE_MS = 4_000;
+
+/**
  * Runs `work` in a transaction whose COMMIT is itself authority-checked.
  *
  * ## Why the nesting is tenant-scope OUTSIDE, BEGIN/COMMIT INSIDE
@@ -176,11 +197,28 @@ function patientTransaction<T>(
   // failure became an AggregateError with no code, replacing the required
   // 401. (Codex review of PR #302, reproduced by fault injection.)
   let settled: { ok: true; value: T } | { ok: false; error: unknown } | null = null;
-  return withTenantBoundConnection(
+  let backendPid: number | null = null;
+
+  // Armed only when COMMIT is issued, so it bounds nothing else.
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  let armDeadline: () => void = () => undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    armDeadline = () => {
+      deadlineTimer = setTimeout(() => {
+        reject(Object.assign(new Error('crisis_commit_deadline'), { code: 'COMMIT_DEADLINE' }));
+      }, COMMIT_DEADLINE_MS);
+    };
+  });
+
+  const transaction = withTenantBoundConnection(
     ctx.tenant.tenantId,
     async (client) => {
       await client.query('BEGIN');
       try {
+        // Captured so a stalled COMMIT can be cancelled from another
+        // connection; DbClient exposes no way to destroy this socket.
+        const pidRow = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        backendPid = pidRow.rows[0]?.pid ?? null;
         const result = await withActorContext(client, ctx.actorNonce, async () => {
           await client.query("SET LOCAL statement_timeout='5s'");
           await client.query("SET LOCAL lock_timeout='2s'");
@@ -190,6 +228,7 @@ function patientTransaction<T>(
           return result;
         });
         beforeCommit();
+        armDeadline();
         // The deferred `crisis_care_evidence` trigger fires HERE, with the
         // tenant and actor bindings both still in scope.
         await client.query('COMMIT');
@@ -199,16 +238,39 @@ function patientTransaction<T>(
         settled = { ok: false, error };
         await client.query('ROLLBACK').catch(() => undefined);
         throw error;
+      } finally {
+        if (deadlineTimer !== null) clearTimeout(deadlineTimer);
       }
     },
     ctx.connection,
-  )
+  );
+
+  return Promise.race([transaction, deadline])
     .then(
       (value) => (settled?.ok ? settled.value : value),
-      (error: unknown) => {
+      async (error: unknown) => {
         // Prefer the settled transaction outcome over whatever the wrapper
         // threw during cleanup. If COMMIT succeeded, the admission stands.
         if (settled?.ok) return settled.value;
+        if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') {
+          // The COMMIT is still in flight on the recording connection. Do
+          // NOT wait for it — the patient's safety-resource response must
+          // not depend on server-side COMMIT work that statement_timeout
+          // cannot bound. Let the wrapper finish in the background (it
+          // will return or discard the connection), and cancel the backend
+          // best-effort so the connection frees promptly. The outcome is
+          // genuinely unknown at this moment, which the caller reports as
+          // `unconfirmed`; the cancel may land before or after the commit
+          // record, so it must never be read as evidence either way.
+          transaction.catch(() => undefined);
+          if (backendPid !== null) {
+            const pid = backendPid;
+            await withConnection((c) => c.query('SELECT pg_cancel_backend($1)', [pid])).catch(
+              () => undefined,
+            );
+          }
+          throw error;
+        }
         throw settled && !settled.ok ? settled.error : error;
       },
     )

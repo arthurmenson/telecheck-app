@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   commitFailure: false,
   commitError: null as unknown,
   cleanupError: null as unknown,
+  commitHang: false,
 }));
 // The seam is now `withTenantBoundConnection` with BEGIN/COMMIT issued
 // INSIDE the tenant scope, so COMMIT failure is simulated where it really
@@ -16,6 +17,8 @@ const mocks = vi.hoisted(() => ({
 // if cleanup throws, surface that failure — wrapped with the callback error
 // in an AggregateError when both failed — exactly as src/lib/db.ts does.
 vi.mock('../../../lib/db.js', () => ({
+  withConnection: async (work: (client: unknown) => Promise<unknown>) =>
+    work({ query: mocks.query }),
   withTenantBoundConnection: async (
     _tenantId: string,
     work: (client: unknown) => Promise<unknown>,
@@ -70,6 +73,7 @@ beforeEach(() => {
   mocks.commitFailure = false;
   mocks.commitError = null;
   mocks.cleanupError = null;
+  mocks.commitHang = false;
   mocks.profile.mockResolvedValue({
     emergency_number: 'configured-emergency',
     crisis_helplines: [],
@@ -78,12 +82,16 @@ beforeEach(() => {
   mocks.outbox.mockResolvedValue(undefined);
   mocks.query.mockImplementation(async (sql: string) => {
     if (sql === 'COMMIT') {
+      // A COMMIT that never acknowledges: deferred-trigger work the server's
+      // statement_timeout does not bound.
+      if (mocks.commitHang) return new Promise<never>(() => undefined);
       // Acknowledgement loss: no SQLSTATE, outcome genuinely unknown.
       if (mocks.commitFailure) throw new Error('connection_lost');
       // Server RAISED during COMMIT (deferred trigger): a definite rollback.
       if (mocks.commitError !== null) throw mocks.commitError;
       return { rows: [] };
     }
+    if (sql.includes('pg_backend_pid')) return { rows: [{ pid: 4242 }] };
     if (sql.includes('crisis_care_live_patient'))
       return {
         rows: [
@@ -259,6 +267,62 @@ describe('patient crisis admission', () => {
       code: 'PT401',
       statusCode: 401,
     });
+  });
+
+  it('bounds a stalled COMMIT with a client-side deadline and reports uncertainty', async () => {
+    // Codex round 3 on PR #302: PostgreSQL disables statement_timeout
+    // before running deferred triggers inside COMMIT, so once the evidence
+    // trigger fires at COMMIT its scan is unbounded server-side. A stalled
+    // COMMIT must not hold the patient's safety-resource response hostage.
+    vi.useFakeTimers();
+    try {
+      mocks.commitHang = true;
+      const pending = admitPatientCareInput(ctx, 'in crisis', 'messaging');
+      // Deadline is 4 s; nothing should have resolved before it.
+      await vi.advanceTimersByTimeAsync(3_900);
+      let resolvedEarly = false;
+      void pending.then(() => {
+        resolvedEarly = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(resolvedEarly).toBe(false);
+      await vi.advanceTimersByTimeAsync(200);
+      const result = await pending;
+      expect(result).toMatchObject({
+        recording_status: 'unconfirmed',
+        escalation_status: 'unconfirmed',
+      });
+      expect(result).not.toHaveProperty('crisis_event_id');
+      // The recording backend's pid was captured at BEGIN and cancelled
+      // best-effort so the stuck connection frees without waiting on it.
+      const sqls = mocks.query.mock.calls.map(([sql]) => String(sql));
+      expect(sqls.some((q) => q.includes('pg_backend_pid'))).toBe(true);
+      const cancel = mocks.query.mock.calls.find(([sql]) =>
+        String(sql).includes('pg_cancel_backend'),
+      );
+      expect(cancel?.[1]).toEqual([4242]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not arm the COMMIT deadline for work that never reaches COMMIT', async () => {
+    // A failure before COMMIT is a known rollback and must classify
+    // not_recorded — the deadline must not turn it into uncertainty.
+    vi.useFakeTimers();
+    try {
+      mocks.outbox.mockRejectedValue(new Error('synthetic_outbox_error'));
+      const pending = admitPatientCareInput(ctx, 'in crisis', 'messaging');
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await pending).toMatchObject({
+        recording_status: 'not_recorded',
+        escalation_status: 'not_queued',
+      });
+      const sqls = mocks.query.mock.calls.map(([sql]) => String(sql));
+      expect(sqls.some((q) => q.includes('pg_cancel_backend'))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps a class-08 connection exception at COMMIT classified as uncertain', async () => {
