@@ -84,16 +84,26 @@ for f in "${HERE}/lib/incident-manifest.mjs" "${HERE}/lib/incident-writers.mjs";
 done
 command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is required for the lifecycle lock" >&2; exit 2; }
 if [ -L "${LOCK_FILE}" ]; then echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) must not be a symbolic link" >&2; exit 2; fi
-case "$(cd "$(dirname "${LOCK_FILE}")" 2>/dev/null && pwd -P)/" in
-    "$(cd "${INCIDENT_DIR}" 2>/dev/null && pwd -P)/"*) echo "ERROR: PILOT_1_LOCK_FILE must not be inside the incident directory" >&2; exit 2 ;;
-esac
+# Containment is checked against the REAL incident directory; when it does
+# not exist (yet) there is nothing to be inside of — the later "not found"
+# refusal handles that case instead of a false containment match.
+INC_REAL="$(cd "${INCIDENT_DIR}" 2>/dev/null && pwd -P || true)"
+LOCK_DIR_REAL="$(cd "$(dirname "${LOCK_FILE}")" 2>/dev/null && pwd -P || true)"
+if [ -n "${INC_REAL}" ] && [ -n "${LOCK_DIR_REAL}" ]; then
+    case "${LOCK_DIR_REAL}/" in
+        "${INC_REAL}/"*) echo "ERROR: PILOT_1_LOCK_FILE must not be inside the incident directory" >&2; exit 2 ;;
+    esac
+fi
 
 # Scratch files (psql stderr) live in a private mktemp directory — never a
 # predictable path a pre-planted symlink could redirect onto evidence (Codex R1).
 SCRATCH_PARENT="${TMPDIR:-/tmp}"
-case "$(cd "${SCRATCH_PARENT}" 2>/dev/null && pwd -P)/" in
-    "$(cd "${INCIDENT_DIR}" 2>/dev/null && pwd -P)/"*) echo "ERROR: TMPDIR must not be inside the incident directory" >&2; exit 2 ;;
-esac
+SCRATCH_REAL="$(cd "${SCRATCH_PARENT}" 2>/dev/null && pwd -P || true)"
+if [ -n "${INC_REAL}" ] && [ -n "${SCRATCH_REAL}" ]; then
+    case "${SCRATCH_REAL}/" in
+        "${INC_REAL}/"*) echo "ERROR: TMPDIR must not be inside the incident directory" >&2; exit 2 ;;
+    esac
+fi
 SCRATCH="$(mktemp -d)" || { echo "ERROR: cannot create a scratch directory under ${SCRATCH_PARENT}" >&2; exit 2; }
 trap 'rm -rf "${SCRATCH}"' EXIT
 
@@ -151,7 +161,7 @@ if [ "${DISPOSITION}" = "ABANDONED" ] && [ "${ABANDON_ROWS}" != "0" ]; then
     # time, not this retry's arguments (Codex R1). Conflicting arguments are
     # reported, never written.
     COMMITTED="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v iid="${INCIDENT_ID}" <<'SQL'
-SELECT payload->>'clearedAt' || E'\t' || payload->>'actor' || E'\t' || payload->>'reason'
+SELECT (payload->>'clearedAt') || E'\t' || (payload->>'actor') || E'\t' || (payload->>'reason')
   FROM audit_records WHERE action = 'env.incident.abandoned' AND payload->>'incidentId' = :'iid'
  ORDER BY recorded_at LIMIT 1;
 SQL

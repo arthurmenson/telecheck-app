@@ -65,11 +65,19 @@ function lstatOrNull(p) {
 }
 
 function realDir(dir) {
-  const st = lstatOrNull(dir);
-  if (!st) throw new Error(`incident directory not found: ${dir}`);
-  if (st.isSymbolicLink()) throw new Error(`incident directory is a symbolic link: ${dir}`);
-  if (!st.isDirectory()) throw new Error(`incident directory is not a directory: ${dir}`);
-  return fs.realpathSync(dir);
+  // path.resolve strips trailing separators (lstat('link/') would follow the
+  // link — Codex R2); the resolved path must then be its own real path, i.e.
+  // no component anywhere in it may be a symbolic link.
+  const resolved = path.resolve(dir);
+  const st = lstatOrNull(resolved);
+  if (!st) throw new Error(`incident directory not found: ${resolved}`);
+  if (st.isSymbolicLink()) throw new Error(`incident directory is a symbolic link: ${resolved}`);
+  if (!st.isDirectory()) throw new Error(`incident directory is not a directory: ${resolved}`);
+  const real = fs.realpathSync(resolved);
+  if (real !== resolved) {
+    throw new Error(`incident directory path contains a symbolic link (${resolved} -> ${real})`);
+  }
+  return real;
 }
 
 function regularFileInside(realBase, p) {
@@ -99,8 +107,12 @@ export function validateLifecycleManifest(value, id) {
     return `incidentId ${JSON.stringify(value.incidentId ?? null)} does not match the file name`;
   if (typeof value.status !== 'string' || value.status === '') return 'status missing';
   if (!isIso(value.capturedAt)) return 'capturedAt missing or unparsable';
-  if (!Array.isArray(value.artifacts)) return 'artifacts is not an array';
-  for (const a of value.artifacts) {
+  // Runbook step 5: a FAILED capture writes the manifest WITHOUT an artifact
+  // list; every other status must inventory its artifacts (Codex R2).
+  const artifacts =
+    value.artifacts === undefined && value.status === 'FAILED' ? [] : value.artifacts;
+  if (!Array.isArray(artifacts)) return 'artifacts is not an array';
+  for (const a of artifacts) {
     if (!a || typeof a !== 'object' || typeof a.path !== 'string' || a.path === '')
       return 'artifact entry without a path';
   }
@@ -215,6 +227,10 @@ export function consume(dir, id, fields) {
   if (manifest.consumed !== false) throw new Error('manifest consumed is not exactly false');
   const next = {
     ...manifest,
+    // a FAILED capture carries no artifact list (runbook step 5): record an
+    // explicit empty inventory so GC / close-wipe can account for it
+    artifacts:
+      manifest.artifacts === undefined && manifest.status === 'FAILED' ? [] : manifest.artifacts,
     consumed: true,
     disposition: fields.disposition,
     clearedAt: fields.clearedAt ?? new Date().toISOString(),
@@ -250,7 +266,7 @@ export function removeLock(dir, id) {
  */
 function inventoriedArtifacts(base, id, manifest) {
   const out = [];
-  for (const a of manifest.artifacts) {
+  for (const a of manifest.artifacts ?? []) {
     const name = path.basename(a.path);
     if (!name.startsWith(`${id}-`) || !name.endsWith('.age')) {
       throw new Error(`artifact ${name} is not <${id}>-*.age`);
@@ -341,7 +357,14 @@ export function gcPlan(dir, { nowMs = Date.now(), minAgeDays = DEFAULT_GC_MIN_AG
       plan.skipped.push({ file, reason: `inventory refused: ${error.message}` });
       continue;
     }
-    plan.deletions.push({ id, manifest: file, artifacts });
+    // residual `<id>-*.age` files that the inventory does not name (e.g. a
+    // partial FAILED capture) are reported, never deleted by GC; close-wipe
+    // removes them with everything else once every incident is disposed
+    const residual = fs
+      .readdirSync(base)
+      .filter((f) => f.startsWith(`${id}-`) && f.endsWith('.age') && !artifacts.includes(f))
+      .sort();
+    plan.deletions.push({ id, manifest: file, artifacts, residual });
   }
   return plan;
 }

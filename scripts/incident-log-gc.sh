@@ -41,6 +41,16 @@ done
 [ -r "${HERE}/lib/incident-writers.mjs" ] || { echo "ERROR: required file missing: ${HERE}/lib/incident-writers.mjs" >&2; exit 2; }
 command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is required for the lifecycle lock" >&2; exit 2; }
 if [ -L "${LOCK_FILE}" ]; then echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) must not be a symbolic link" >&2; exit 2; fi
+# Containment is checked against the REAL incident directory; when it does
+# not exist (yet) there is nothing to be inside of — the later "not found"
+# refusal handles that case instead of a false containment match.
+INC_REAL="$(cd "${INCIDENT_DIR}" 2>/dev/null && pwd -P || true)"
+LOCK_DIR_REAL="$(cd "$(dirname "${LOCK_FILE}")" 2>/dev/null && pwd -P || true)"
+if [ -n "${INC_REAL}" ] && [ -n "${LOCK_DIR_REAL}" ]; then
+    case "${LOCK_DIR_REAL}/" in
+        "${INC_REAL}/"*) echo "ERROR: PILOT_1_LOCK_FILE must not be inside the incident directory" >&2; exit 2 ;;
+    esac
+fi
 
 exec 9>>"${LOCK_FILE}" || { echo "ERROR: cannot open the lifecycle lock file ${LOCK_FILE}" >&2; exit 2; }
 if [ -L "${LOCK_FILE}" ] || [ ! -f "${LOCK_FILE}" ]; then echo "ERROR: lifecycle lock file ${LOCK_FILE} is not a regular file" >&2; exit 2; fi

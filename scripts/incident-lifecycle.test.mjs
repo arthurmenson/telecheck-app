@@ -437,6 +437,97 @@ test('writers (Codex R1): a present lock without a valid identity blocks every G
   }
 });
 
+test('writers (Codex R2): a symlinked incident directory is refused even with a trailing separator; no component may be a link', () => {
+  const real = mkIncidentDir({ lock: false, consumed: true });
+  const alias = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'p1alias-')), 'alias');
+  fs.symlinkSync(real, alias, 'junction');
+  for (const d of [alias, alias + path.sep, alias + '/', alias + '//']) {
+    assert.throws(() => closeWipe(d), /symbolic link/, JSON.stringify(d));
+    assert.throws(() => gcPlan(d, { minAgeDays: 30 }), /symbolic link/, JSON.stringify(d));
+    assert.throws(
+      () => consume(d, ID, { disposition: 'RESOLVED', clearedBy: 'x' }),
+      /symbolic link/,
+      JSON.stringify(d),
+    );
+    assert.match(closeWipeBlockers(d).join(';'), /symbolic link/, JSON.stringify(d));
+  }
+  assert.equal(fs.readdirSync(real).length, 2, 'nothing behind the alias was touched');
+  // a symlinked PARENT component is refused as well
+  const nested = path.join(alias, 'sub');
+  fs.mkdirSync(path.join(real, 'sub'));
+  assert.match(closeWipeBlockers(nested).join(';'), /symbolic link/);
+  assert.throws(() => closeWipe(nested), /symbolic link/);
+  assert.throws(() => gcPlan(nested, { minAgeDays: 30 }), /symbolic link/);
+});
+
+test('writers (Codex R2): a FAILED capture (no artifact list) can be ABANDONED, collected by GC and does not block close-wipe; residual files are reported, never deleted by GC', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  const t = new Date(Date.now() - 40 * DAY);
+  // runbook step 5: FAILED manifest without `artifacts`; a partial artifact lingers
+  fs.writeFileSync(
+    path.join(dir, `${ID}.manifest.json`),
+    JSON.stringify({
+      incidentId: ID,
+      status: 'FAILED',
+      capturedAt: t.toISOString(),
+      consumed: false,
+    }),
+  );
+  fs.writeFileSync(path.join(dir, `${ID}-partial.age`), 'x');
+  fs.writeFileSync(
+    path.join(dir, '.incident.lock'),
+    JSON.stringify({ incidentId: ID, openedAt: t.toISOString(), openedBy: 't' }),
+  );
+  assert.equal(
+    validateLifecycleManifest(
+      JSON.parse(fs.readFileSync(path.join(dir, `${ID}.manifest.json`), 'utf8')),
+      ID,
+    ),
+    null,
+    'the documented FAILED shape validates',
+  );
+  const r = consume(dir, ID, {
+    disposition: 'ABANDONED',
+    clearedBy: 'x',
+    reason: 'capture failed',
+    clearedAt: t.toISOString(),
+  });
+  assert.equal(r.alreadyConsumed, false);
+  assert.deepEqual(manifestOf(dir).artifacts, [], 'an explicit empty inventory is recorded');
+  assert.equal(manifestOf(dir).status, 'FAILED', 'the failure information is preserved');
+  removeLock(dir, ID);
+  fs.utimesSync(path.join(dir, `${ID}.manifest.json`), t, t);
+  const plan = gcPlan(dir, { minAgeDays: 30 });
+  assert.deepEqual(
+    plan.deletions.map((d) => d.id),
+    [ID],
+  );
+  assert.deepEqual(plan.deletions[0].artifacts, []);
+  assert.deepEqual(plan.deletions[0].residual, [`${ID}-partial.age`]);
+  const deleted = gcExecute(dir, plan);
+  assert.deepEqual(deleted, [`${ID}.manifest.json`]);
+  assert.ok(
+    fs.existsSync(path.join(dir, `${ID}-partial.age`)),
+    'GC never deletes an uninventoried file',
+  );
+  // with the manifest gone the residual file is an ordinary regular file: close-wipe removes it
+  assert.deepEqual(closeWipeBlockers(dir), []);
+  assert.deepEqual(closeWipe(dir), [`${ID}-partial.age`]);
+  // and before GC, a consumed FAILED manifest is no close-wipe blocker either
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  fs.writeFileSync(
+    path.join(dir2, `${ID}.manifest.json`),
+    JSON.stringify({
+      incidentId: ID,
+      status: 'FAILED',
+      capturedAt: t.toISOString(),
+      consumed: false,
+    }),
+  );
+  consume(dir2, ID, { disposition: 'ABANDONED', clearedBy: 'x', reason: 'r' });
+  assert.deepEqual(closeWipeBlockers(dir2), []);
+});
+
 test('writers (Codex R1): manifest rewrites write every byte — a short write never publishes a truncated manifest', () => {
   const dir = mkIncidentDir();
   const before = fs.readFileSync(path.join(dir, `${ID}.manifest.json`), 'utf8');
@@ -899,6 +990,22 @@ test('incident-log-gc: dry run lists without deleting; execution deletes exactly
     PILOT_1_INCIDENT_LOGS_DIR: inc,
   });
   assert.match(human.stdout, /DRY RUN: incident-log-gc/);
+  // the lifecycle lock may not live inside the incident directory (Codex R2):
+  // neither an inventoried artifact nor an absent .incident.lock may be opened
+  for (const lockPath of [
+    path.join(inc, 'old-open-art0.age'),
+    path.join(inc, '.incident.lock.new'),
+    path.join(inc, 'x', '..', 'lifecycle.lock'),
+  ]) {
+    const beforeLock = snapshot(inc);
+    const bad = run('incident-log-gc.sh', dir, stubs, ['--dry-run'], {
+      PILOT_1_INCIDENT_LOGS_DIR: inc,
+      PILOT_1_LOCK_FILE: lockPath,
+    });
+    assert.equal(bad.status, 2, `${lockPath}: ${bad.stderr}`);
+    assert.match(bad.stderr, /must not be inside the incident directory/);
+    assert.deepEqual(snapshot(inc), beforeLock, `${lockPath}: the incident tree changed`);
+  }
 });
 
 test('pilot-1-close-wipe: --confirm required; refused while a lock or an unconsumed manifest exists (nothing changed); wipes every file otherwise and records the list', () => {
