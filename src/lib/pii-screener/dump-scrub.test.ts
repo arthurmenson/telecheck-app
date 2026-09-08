@@ -214,3 +214,33 @@ describe('Codex R3 in-scope closures', () => {
     );
   });
 });
+
+describe('Codex R4 in-scope closure', () => {
+  it('a table name containing "FROM stdin;" and a terminator line does not activate COPY early', () => {
+    const dump =
+      'COPY public."a FROM stdin;\n\\.\nb" (id, body) FROM stdin;\n' +
+      '1\t"test.user@example.com\n' +
+      '\\.\n';
+    const out = scrubText(dump);
+    expect(out).not.toContain('test.user@example.com');
+    expect(out.startsWith('COPY public."a FROM stdin;\n\\.\nb" (id, body) FROM stdin;\n')).toBe(
+      true,
+    );
+    expect(out.endsWith('\\.\n')).toBe(true);
+  });
+  it('the same trick inside the column list is handled', () => {
+    const dump =
+      'COPY public.t (id, "x FROM stdin;\n\\.\ny") FROM stdin;\n1\tmy SSN is 123-45-6789\n\\.\n';
+    expect(scrubText(dump)).not.toContain('123-45-6789');
+  });
+  it('an unclosed identifier containing "FROM stdin;" fails closed at end of input', () => {
+    const s = createDumpScrubber();
+    s.push('COPY public."a FROM stdin;\n');
+    s.push('1\treach me at test.user@example.com\n');
+    expect(() => s.end()).toThrow(/unterminated identifier/);
+  });
+  it('a plain single-line COPY header still activates COPY', () => {
+    const dump = 'COPY public.t (id, body) FROM stdin;\n1\tmy SSN is 123-45-6789\n\\.\n';
+    expect(scrubText(dump)).not.toContain('123-45-6789');
+  });
+});

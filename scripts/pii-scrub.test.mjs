@@ -204,3 +204,17 @@ test('backup mode: mixed E-literal quote escapes around JSON (Codex R3) are deco
   assert.ok(stdout.endsWith("'::json;\n"));
 });
 
+test('backup mode: a table name containing "FROM stdin;" and a terminator (Codex R4) cannot end COPY early', async () => {
+  const input = 'COPY public."a FROM stdin;\n\\.\nb" (id, body) FROM stdin;\n1\t"test.user@example.com\n\\.\n';
+  const { code, stdout, stderr } = await run(['--mode', 'backup'], input);
+  assert.equal(code, 0, stderr);
+  assert.ok(!stdout.includes('test.user@example.com'));
+  assert.match(stderr, /redactedLines=1/);
+});
+
+test('backup mode: an unclosed identifier containing "FROM stdin;" fails closed (exit 4)', async () => {
+  const { code, stderr } = await run(['--mode', 'backup'], 'COPY public."a FROM stdin;\n1\treach me at test.user@example.com\n');
+  assert.equal(code, 4);
+  assert.match(stderr, /unterminated identifier/);
+});
+

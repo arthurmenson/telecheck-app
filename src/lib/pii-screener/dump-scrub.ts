@@ -44,8 +44,7 @@
 import { redactForBackup } from './backup-redaction.js';
 import { redactLogLine } from './log-redaction.js';
 
-const COPY_START = /^COPY\s+\S.*\s+FROM\s+stdin;\s*$/;
-/** Same header when a quoted identifier carried it across physical lines. */
+/** COPY header, tested on the complete statement once it closes in code mode. */
 const COPY_START_MULTILINE = /^COPY\s[\s\S]*?\sFROM\s+stdin;\s*$/;
 const COPY_END = /^\\\.\s*$/;
 const NUMERIC = /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
@@ -486,10 +485,15 @@ export interface DumpScrubber {
 export function createDumpScrubber(): DumpScrubber {
   let inCopy = false;
   const sql: SqlState = { mode: 'code', escapeLiteral: false, literal: '', dollarTag: '' };
-  // Physical lines of a statement whose quoted identifier spans lines; when
-  // the identifier closes, the joined text is tested for a COPY header.
-  // (Codex R3: a table named public."o<newline>'neil" hid its COPY block.)
+  // Physical lines of the statement in progress while a quoted identifier,
+  // literal or dollar block is open. A COPY header is recognised ONLY when
+  // the statement closes in code mode with `FROM stdin;` at its end — never
+  // from a single-line shortcut that runs before the quote state is known
+  // (Codex R4: a table named public."a FROM stdin;<newline>\\.<newline>b"
+  // activated COPY early, its embedded terminator ended it, and the real
+  // rows bypassed scrubbing).
   let statementHead = '';
+  const HEAD_CAP = 64 * 1024;
   return {
     push(line: string): string {
       if (inCopy) {
@@ -499,20 +503,17 @@ export function createDumpScrubber(): DumpScrubber {
         }
         return scrubCopyRow(line);
       }
-      if (sql.mode === 'code' && statementHead.length === 0 && COPY_START.test(line)) {
-        inCopy = true;
-        return line;
-      }
       const out = scrubSqlText(line, sql);
-      if (sql.mode === 'identifier') {
-        statementHead += line;
+      if (sql.mode !== 'code') {
+        // Statement still open across the line boundary: accumulate (bounded —
+        // a header cannot be that long) and decide when it closes.
+        if (statementHead.length <= HEAD_CAP) statementHead += line;
         return out;
       }
-      if (statementHead.length > 0) {
-        statementHead += line;
-        const joined = statementHead;
-        statementHead = '';
-        if (sql.mode === 'code' && COPY_START_MULTILINE.test(joined)) inCopy = true;
+      const statement = statementHead.length > 0 ? statementHead + line : line;
+      statementHead = '';
+      if (statement.length <= HEAD_CAP + line.length && COPY_START_MULTILINE.test(statement)) {
+        inCopy = true;
       }
       return out;
     },
