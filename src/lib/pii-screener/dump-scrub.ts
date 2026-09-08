@@ -45,7 +45,9 @@ import { redactForBackup } from './backup-redaction.js';
 import { redactLogLine } from './log-redaction.js';
 
 /** COPY header, tested on the complete statement once it closes in code mode. */
-const COPY_START_MULTILINE = /^COPY\s[\s\S]*?\sFROM\s+stdin;\s*$/;
+const COPY_START_MULTILINE = /^COPY\s[\s\S]*?\sFROM\s+stdin\s*;\s*$/i;
+/** Any COPY statement at all — one that is not the header above is unsupported. */
+const COPY_ANY = /^COPY\s/i;
 const COPY_END = /^\\\.\s*$/;
 const NUMERIC = /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 const DOLLAR_TAG = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/;
@@ -256,72 +258,111 @@ export function scrubCopyRow(line: string, stats?: DumpScrubStats): string {
 // ---------------------------------------------------------------------------
 
 function decodeEscapeLiteral(content: string): string {
-  let out = '';
-  for (let i = 0; i < content.length; i++) {
+  // PostgreSQL's scanner: \ooo and \xhh yield BYTES (truncated to 8 bits),
+  // \uXXXX / \UXXXXXXXX yield code points, and the resulting byte sequence
+  // is read in the server encoding — UTF-8, which the wrapper forces. A
+  // character-level decode let `E'\542@\543.\543\557'` (an email) through
+  // and corrupted multibyte text around a redaction (Codex R10).
+  const bytes: number[] = [];
+  const pushText = (text: string) => {
+    for (const b of Buffer.from(text, 'utf8')) bytes.push(b);
+  };
+  let i = 0;
+  while (i < content.length) {
     const ch = content[i]!;
-    if (ch === "'" && content[i + 1] === "'") {
-      // A doubled quote is a single quote in an E-literal too, decoded in
-      // the same pass as the backslash escapes.
-      out += "'";
-      i++;
-      continue;
-    }
     if (ch !== '\\') {
-      out += ch;
+      if (ch === "'" && content[i + 1] === "'") {
+        bytes.push(0x27);
+        i += 2;
+        continue;
+      }
+      let j = i + 1;
+      while (j < content.length && content[j] !== '\\' && content[j] !== "'") j++;
+      pushText(content.slice(i, j));
+      i = j;
       continue;
     }
     const next = content[i + 1];
     if (next === undefined) {
-      out += '\\';
+      bytes.push(0x5c);
       break;
     }
-    i++;
+    i += 2;
     switch (next) {
       case 'n':
-        out += '\n';
+        bytes.push(0x0a);
         break;
       case 't':
-        out += '\t';
+        bytes.push(0x09);
         break;
       case 'r':
-        out += '\r';
+        bytes.push(0x0d);
         break;
       case 'b':
-        out += '\b';
+        bytes.push(0x08);
         break;
       case 'f':
-        out += '\f';
+        bytes.push(0x0c);
         break;
       case 'x': {
-        const hex = content.slice(i + 1, i + 3).match(/^[0-9A-Fa-f]{1,2}/)?.[0] ?? '';
-        if (hex.length === 0) out += 'x';
+        const hex = content.slice(i, i + 2).match(/^[0-9A-Fa-f]{1,2}/)?.[0] ?? '';
+        if (hex.length === 0) bytes.push(0x78);
         else {
-          out += String.fromCharCode(parseInt(hex, 16));
+          bytes.push(parseInt(hex, 16) & 0xff);
           i += hex.length;
         }
         break;
       }
       case 'u':
       case 'U': {
-        // PostgreSQL E-string unicode escapes: \uXXXX and \UXXXXXXXX.
         const width = next === 'u' ? 4 : 8;
-        const hex = content.slice(i + 1, i + 1 + width);
+        const hex = content.slice(i, i + width);
         if (hex.length === width && /^[0-9A-Fa-f]+$/.test(hex)) {
-          out += String.fromCodePoint(parseInt(hex, 16));
+          let code = parseInt(hex, 16);
           i += width;
-        } else out += next;
+          if (code >= 0xd800 && code <= 0xdbff) {
+            // PostgreSQL accepts a high surrogate only when the very next
+            // escape is its low half; a lone half is an error there and a
+            // silent U+FFFD here — so fail closed instead.
+            const low = content.slice(i, i + 6).match(/^\\u([Dd][C-Fc-f][0-9A-Fa-f]{2})/);
+            if (!low) throw invalidEscapeSequence();
+            code = 0x10000 + ((code - 0xd800) << 10) + (parseInt(low[1]!, 16) - 0xdc00);
+            i += 6;
+          } else if (code >= 0xdc00 && code <= 0xdfff) throw invalidEscapeSequence();
+          let cp: string;
+          try {
+            cp = String.fromCodePoint(code);
+          } catch {
+            throw invalidEscapeSequence();
+          }
+          pushText(cp);
+        } else pushText(next);
         break;
       }
       default: {
-        const oct = content.slice(i, i + 3).match(/^[0-7]{1,3}/)?.[0];
+        const oct = content.slice(i - 1, i + 2).match(/^[0-7]{1,3}/)?.[0];
         if (oct) {
-          out += String.fromCharCode(parseInt(oct, 8));
+          bytes.push(parseInt(oct, 8) & 0xff);
           i += oct.length - 1;
-        } else out += next; // `\\`, `\'`
+        } else pushText(next); // `\\`, `\'`, and any other char stands for itself
       }
     }
   }
-  return out;
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
+  } catch {
+    // PostgreSQL would have rejected this literal on a UTF8 database; a
+    // lossy decode here would corrupt the value on re-encode.
+    throw invalidEscapeSequence();
+  }
+}
+
+function invalidEscapeSequence(): Error {
+  const err = new Error(
+    'dump-scrub: E-string escapes decode to an invalid UTF-8 sequence; aborting',
+  );
+  (err as { exitCode?: number }).exitCode = 4;
+  return err;
 }
 
 function encodeEscapeLiteral(value: string): string {
@@ -637,6 +678,14 @@ export function createDumpScrubber(): DumpScrubber {
     // the header line — it would otherwise be mis-lexed as the first row.
     if (activateCopy) afterCopyHeader = true;
     else if (COPY_START_MULTILINE.test(stmt.trim())) activateCopy = true;
+    else if (COPY_ANY.test(stmt.trim())) {
+      // `COPY ... TO stdout`, `COPY ... FROM '/file'`, WITH options: pg_dump
+      // plain format never emits them; the rows that might follow would be
+      // lexed as SQL, so fail closed instead (Codex R10).
+      const err = new Error('dump-scrub: unsupported COPY statement form; aborting');
+      (err as { exitCode?: number }).exitCode = 4;
+      throw err;
+    }
   };
   return {
     stats,
@@ -662,14 +711,18 @@ export function createDumpScrubber(): DumpScrubber {
         }
         if (!/^\s*(?:--[^\n\r]*)?\s*$/.test(line)) sql.literalClosedAtLineEnd = false;
       }
-      const out = scrubSqlText(line, sql);
-      if (sql.stmt.length + sql.identifier.length + sql.literal.length > STMT_CAP) {
+      // Enforced BEFORE the line is accumulated or decoded: a line that
+      // closes a buffer, or a complete oversized literal, must not incur the
+      // allocation the guard exists to prevent (Codex R10).
+      const pending = sql.stmt.length + sql.identifier.length + sql.literal.length;
+      if (pending + line.length > STMT_CAP) {
         const err = new Error(
           `dump-scrub: pending statement exceeds ${STMT_CAP} bytes before closing; aborting so no row is passed through unscreened`,
         );
         (err as { exitCode?: number }).exitCode = 4;
         throw err;
       }
+      const out = scrubSqlText(line, sql);
       if (activateCopy) {
         activateCopy = false;
         // A real dump puts nothing after `FROM stdin;` on the header line;

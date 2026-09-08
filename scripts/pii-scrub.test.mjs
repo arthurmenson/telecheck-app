@@ -344,3 +344,31 @@ test('backup mode: an open identifier is budgeted before EOF (Codex R9)', async 
   assert.equal(code, 4);
   assert.match(stderr, /exceeds/);
 });
+
+test('backup mode: COPY header whitespace, byte-level E-string escapes, budget before accumulation (Codex R10)', async () => {
+  const a = await run(
+    ['--mode', 'backup'],
+    'COPY public.t (body) FROM stdin /* x */;\ntest.user@example.com\n\\.\n',
+  );
+  assert.equal(a.code, 0, a.stderr);
+  assert.ok(!a.stdout.includes('test.user@example.com'));
+  assert.match(a.stderr, /copyRows=1/);
+  const b = await run(
+    ['--mode', 'backup'],
+    'COPY public.t (body) TO stdout;\ntest.user@example.com\n',
+  );
+  assert.equal(b.code, 4);
+  assert.ok(!b.stdout.includes('test.user@example.com'));
+  const c = await run(['--mode', 'backup'], "SELECT E'\\542@\\543.\\543\\557';\n");
+  assert.equal(c.code, 0, c.stderr);
+  assert.ok(!c.stdout.includes('\\542@'));
+  assert.match(c.stderr, /redactedValues=1/);
+  const d = await run(['--mode', 'backup'], "SELECT E'\\377';\n");
+  assert.equal(d.code, 4);
+  const e = await run(
+    ['--mode', 'backup', '--max-line-bytes', '4000000'],
+    "INSERT INTO t VALUES ('" + 'y'.repeat(2 * 1024 * 1024) + "');\n",
+  );
+  assert.equal(e.code, 4);
+  assert.match(e.stderr, /exceeds/);
+});

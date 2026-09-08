@@ -447,3 +447,72 @@ describe('Codex R9 in-scope closures — block comments, semicolon-level boundar
     }).toThrow(/exceeds/);
   });
 });
+
+describe('Codex R10 in-scope closures — header whitespace, byte-level E-string escapes, budget before accumulation', () => {
+  for (const [name, header] of [
+    ['a block comment before the semicolon', 'COPY public.t (body) FROM stdin /* x */;'],
+    ['a space before the semicolon', 'COPY public.t (body) FROM stdin ;'],
+    ['a newline before the semicolon', 'COPY public.t (body) FROM stdin\n;'],
+    ['lowercase keywords', 'copy public.t (body) from stdin;'],
+  ] as const) {
+    it(`recognises a COPY header with ${name}`, () => {
+      const dump = `${header}\nreach me at test.user@example.com\n\\.\n`;
+      const s = createDumpScrubber();
+      const out =
+        dump
+          .split(/(?<=\n)/)
+          .map((l) => s.push(l))
+          .join('') + s.end();
+      expect(out).not.toContain('test.user@example.com');
+      expect(s.stats.copyRows).toBe(1);
+    });
+  }
+  it('any other COPY statement form fails closed', () => {
+    expect(() => scrubText('COPY public.t (body) TO stdout;\nx\n')).toThrow(/unsupported COPY/);
+    expect(() => scrubText("COPY public.t FROM '/tmp/x';\n")).toThrow(/unsupported COPY/);
+    expect(() => scrubText('COPY public.t (body) FROM stdin WITH (FORMAT csv);\nx\n')).toThrow(
+      /unsupported COPY/,
+    );
+  });
+  it('octal escapes decode as bytes, so an octal-encoded email is found', () => {
+    const s = createDumpScrubber();
+    const out = s.push("SELECT E'\\542@\\543.\\543\\557';\n") + s.end();
+    expect(out).not.toContain('\\542@');
+    expect(out).toContain('REDACTED');
+    expect(s.stats.redactedValues).toBe(1);
+  });
+  it('multibyte text encoded as octal bytes survives a redaction next to it', () => {
+    const out = scrubText("SELECT E'\\303\\251 test.user@example.com';\n");
+    expect(out).toContain('é');
+    expect(out).not.toContain('Ã©');
+    expect(out).not.toContain('test.user@example.com');
+  });
+  it('hex escapes decode as bytes too and a literal without PII is untouched', () => {
+    const sql = "SELECT E'\\xC3\\xA9 plain';\n";
+    expect(scrubText(sql)).toBe(sql);
+    const s = createDumpScrubber();
+    const out = s.push("SELECT E'\\x62@\\x63.\\x63\\x6f';\n") + s.end();
+    expect(out).toContain('REDACTED');
+    expect(s.stats.redactedValues).toBe(1);
+  });
+  it('escapes that form an invalid UTF-8 sequence fail closed', () => {
+    expect(() => scrubText("SELECT E'\\377\\376';\n")).toThrow(/invalid UTF-8/);
+    expect(() => scrubText("SELECT E'\\uD800';\n")).toThrow(/invalid UTF-8/);
+    expect(() => scrubText("SELECT E'\\uDC00';\n")).toThrow(/invalid UTF-8/);
+    expect(scrubText("SELECT E'\\uD83D\\uDE00 ok';\n")).toBe("SELECT E'\\uD83D\\uDE00 ok';\n");
+  });
+  it('a physical line that closes a buffer still counts toward the budget', () => {
+    const s = createDumpScrubber();
+    s.push("INSERT INTO t VALUES ('" + 'y'.repeat(700_000) + '\n');
+    expect(() => s.push('y'.repeat(700_000) + "');\n")).toThrow(/exceeds/);
+    const t = createDumpScrubber();
+    t.push('COPY public.t ("' + 'y'.repeat(700_000) + '\n');
+    expect(() => t.push('y'.repeat(700_000) + '") FROM stdin;\n')).toThrow(/exceeds/);
+  });
+  it('a complete oversized single-line literal is rejected before it is decoded', () => {
+    const s = createDumpScrubber();
+    expect(() => s.push("INSERT INTO t VALUES ('" + 'y'.repeat(2 * 1024 * 1024) + "');\n")).toThrow(
+      /exceeds/,
+    );
+  });
+});
