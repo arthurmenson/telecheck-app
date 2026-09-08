@@ -208,7 +208,8 @@ function mkIncidentDir({
         ]),
       );
     const entry = { path: p, plaintextBytes: a.plaintextBytes ?? 10 };
-    if (a.ciphertextBytes !== undefined) entry.ciphertextBytes = a.ciphertextBytes;
+    const realSize = (a.header ?? AGE_HEADER).length + (a.size ?? 40);
+    if (a.ciphertextBytes !== null) entry.ciphertextBytes = a.ciphertextBytes ?? realSize;
     list.push(entry);
   }
   const manifest = { incidentId: id, status, capturedAt, artifacts: list, consumed };
@@ -264,6 +265,28 @@ test('incident-manifest: a valid capture passes; every precondition failure is n
       }),
       undefined,
       /ciphertextBytes/,
+    ],
+    [
+      'missing ciphertextBytes',
+      mkIncidentDir({
+        artifacts: [{ name: '2026-09-08T15-45Z-cat1-01-db.sql.age', ciphertextBytes: null }],
+      }),
+      undefined,
+      /ciphertextBytes missing/,
+    ],
+    [
+      'truncated ciphertext',
+      mkIncidentDir({
+        artifacts: [
+          {
+            name: '2026-09-08T15-45Z-cat1-01-db.sql.age',
+            size: 20,
+            ciphertextBytes: AGE_HEADER.length + 40,
+          },
+        ],
+      }),
+      undefined,
+      /!= recorded ciphertextBytes/,
     ],
     [
       'foreign artifact name',
@@ -500,7 +523,11 @@ test('env-purge: containment: real filesystem locations — a `..`-prefixed chil
   ]) {
     const r = run(dir, stubs, ['--routine-reset'], { PILOT_1_INCIDENT_LOGS_DIR: inc, ...env });
     assert.equal(r.status, 2, `${name}: ${r.stderr}`);
-    assert.match(r.stderr, /resolves inside the incident directory/, name);
+    assert.match(
+      r.stderr,
+      /resolves inside the incident directory|must not be a symbolic link/,
+      name,
+    );
   }
   assert.ok(!fs.existsSync(path.join(dir, 'call-0.args')), 'psql ran');
   assert.deepEqual(snapshot(inc), before, 'the incident tree changed');
@@ -509,6 +536,31 @@ test('env-purge: containment: real filesystem locations — a `..`-prefixed chil
     [],
     'scratch files were created inside the incident tree',
   );
+  // a symlinked lock file — here a dangling one pointing INTO the incident
+  // tree — is refused before the append-open could create its target (Codex R5)
+  const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1link-'));
+  const dangling = path.join(linkDir, 'lifecycle.lock');
+  let canLinkFiles = true;
+  try {
+    fs.symlinkSync(path.join(inc, '.incident.lock'), dangling, 'file');
+  } catch (e) {
+    // Windows needs a privilege for file symlinks; CI (Linux) always runs this.
+    if (process.platform === 'win32' && e.code === 'EPERM') canLinkFiles = false;
+    else throw e;
+  }
+  if (canLinkFiles) {
+    const rl = run(dir, stubs, ['--routine-reset'], {
+      PILOT_1_INCIDENT_LOGS_DIR: inc,
+      PILOT_1_LOCK_FILE: dangling,
+    });
+    assert.equal(rl.status, 2, `dangling symlink: ${rl.stderr}`);
+    assert.match(rl.stderr, /must not be a symbolic link/);
+    assert.ok(
+      !fs.existsSync(path.join(inc, '.incident.lock')),
+      'the dangling link was followed and an incident lock created',
+    );
+    assert.deepEqual(snapshot(inc), before, 'the incident tree changed (dangling symlink)');
+  }
   // a lock beside (not inside) the incident directory is fine
   const ok = run(dir, stubs, ['--routine-reset', '--json'], {
     PILOT_1_INCIDENT_LOGS_DIR: inc,

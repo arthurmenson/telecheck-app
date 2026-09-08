@@ -83,6 +83,38 @@ function cloneSchema(fromDsn: string, toDsn: string) {
     opts,
   );
   if (schema.status !== 0) throw new Error(`pg_dump --schema-only failed: ${schema.stderr}`);
+  // Migration 026 runs `SET LOCAL search_path = pg_catalog, public` and then
+  // creates its trigger function UNQUALIFIED, so under a superuser migration
+  // runner (CI) the function lands in pg_catalog — which pg_dump never dumps,
+  // while the trigger definition references it bare. Carry every
+  // user-created function that lives in pg_catalog (oid >= 16384) across
+  // explicitly, before the schema restore. (Follow-up: fix-forward migration
+  // moving the function to public.)
+  const catalogFns = spawnSync(
+    'psql',
+    [
+      `--dbname=${fromDsn}`,
+      '-X',
+      '-A',
+      '-t',
+      '-v',
+      'ON_ERROR_STOP=1',
+      '-c',
+      "SELECT COALESCE(string_agg(pg_get_functiondef(oid) || ';', E'\n'), '') FROM pg_proc WHERE pronamespace = 'pg_catalog'::regnamespace AND oid >= 16384",
+    ],
+    opts,
+  );
+  if (catalogFns.status !== 0)
+    throw new Error(`pg_catalog function listing failed: ${catalogFns.stderr}`);
+  if (catalogFns.stdout.trim() !== '') {
+    const fnRestore = spawnSync(
+      'psql',
+      [`--dbname=${toDsn}`, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-f', '-'],
+      { ...opts, input: catalogFns.stdout },
+    );
+    if (fnRestore.status !== 0)
+      throw new Error(`pg_catalog function restore failed: ${fnRestore.stderr}`);
+  }
   // `-f -` makes psql label errors with the dump line (psql:<stdin>:N), so a
   // restore failure can quote the offending statement instead of a bare
   // ERROR line.
@@ -351,7 +383,15 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
         [TENANT, participantKey, ids.participantPatient],
       );
     }
-    return { ...ids, key, retainedKey, participantKey };
+    // Populated ALLOWLIST canary: the TRUNCATE rollback proof needs a row
+    // that the TRUNCATE actually removes and the rollback restores (Codex R5).
+    const sessionCanary = ulid();
+    await admin.query(
+      `INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash) VALUES ($1, $2, $3, repeat('a', 64))`,
+      [sessionCanary, TENANT, ids.participantPatient],
+    );
+    expect(await count('sessions', 'WHERE session_id = $1', [sessionCanary])).toBe(1);
+    return { ...ids, key, retainedKey, participantKey, sessionCanary };
   }
 
   beforeAll(async () => {
@@ -445,6 +485,10 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
         await count('account_pin_credentials', 'WHERE account_id = $1', [c.participantPatient]),
       ).toBe(1);
       expect(await count('idempotency_keys', 'WHERE key = $1', [c.key])).toBe(1);
+      expect(
+        await count('sessions', 'WHERE session_id = $1', [c.sessionCanary]),
+        `${stage}: truncated allowlist row restored`,
+      ).toBe(1);
       expect((await attestations()).length).toBe(before);
       expect(await guardedTriggersDisabled()).toBe(0);
     }
@@ -499,6 +543,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
       await count('accounts', `WHERE cohort_classification = 'baseline'`),
     ).toBeGreaterThanOrEqual(baselineBefore);
     for (const t of tablesOf('allowlist')) expect(await count(t), t).toBe(0);
+    expect(await count('sessions', 'WHERE session_id = $1', [c.sessionCanary])).toBe(0);
     for (const t of preserved) expect(await count(t), t).toBe(preservedBefore[t]);
     for (const table of ['idempotency_keys', 'identity_idempotency_keys']) {
       expect(await count(table, 'WHERE key = $1', [c.retainedKey]), `${table} retained`).toBe(1);

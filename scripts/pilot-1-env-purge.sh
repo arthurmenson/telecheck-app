@@ -172,6 +172,11 @@ const [cand, inc] = process.argv.slice(1).map(real);
 process.exit(cand === inc || cand.startsWith(inc + p.sep) ? 1 : 0);
 ' "$1" "${INCIDENT_DIR}"
 }
+# A symlinked lock file (dangling or not) is refused outright: the append-open
+# would follow it and create whatever it points at (Codex R5).
+if [ -L "${LOCK_FILE}" ]; then
+    echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) must not be a symbolic link" >&2; exit 2
+fi
 if inside_incident_tree "${LOCK_FILE}"; then
     echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) resolves inside the incident directory (${INCIDENT_DIR}); nothing may be written there" >&2; exit 2
 fi
@@ -185,6 +190,10 @@ trap 'rm -rf "${TMP}"' EXIT
 
 # --- lifecycle lock: kernel-managed, held on fd 9 until the process exits -----
 exec 9>>"${LOCK_FILE}" || { echo "ERROR: cannot open the lifecycle lock file ${LOCK_FILE}" >&2; exit 2; }
+# re-check after the open: the path must now be a regular file, not a link
+if [ -L "${LOCK_FILE}" ] || [ ! -f "${LOCK_FILE}" ]; then
+    echo "ERROR: lifecycle lock file ${LOCK_FILE} is not a regular file" >&2; exit 2
+fi
 if ! "${FLOCK}" -n 9; then
     echo "REFUSED: another purge lifecycle holds ${LOCK_FILE}; wait for it to finish (nothing written)" >&2
     exit 1

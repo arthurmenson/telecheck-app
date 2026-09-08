@@ -92,7 +92,12 @@ export function verifyArtifact(dir, incidentId, artifact) {
     return `artifact plaintextBytes invalid: ${base}`;
   }
   if (stat.size < artifact.plaintextBytes) return `artifact smaller than its plaintext: ${base}`;
-  if (artifact.ciphertextBytes !== undefined && artifact.ciphertextBytes !== stat.size) {
+  // The runbook records ciphertextBytes on every artifact entry; an entry
+  // without it is an incomplete manifest and counts as FAILED (Codex R5).
+  if (!Number.isInteger(artifact.ciphertextBytes) || artifact.ciphertextBytes <= 0) {
+    return `artifact ciphertextBytes missing or invalid: ${base}`;
+  }
+  if (artifact.ciphertextBytes !== stat.size) {
     return `artifact size ${stat.size} != recorded ciphertextBytes ${artifact.ciphertextBytes}: ${base}`;
   }
   const fd = fs.openSync(resolved, 'r');
