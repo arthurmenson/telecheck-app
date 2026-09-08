@@ -233,14 +233,21 @@ export function splitSqlStatements(sql) {
       continue;
     }
     if (ch === '\\' && cur.trim() === '') {
-      // psql meta-command (`\set`, `\.`): a whole line, terminated by the
-      // newline rather than a `;`.
+      // psql meta-command: the ONLY one a seed may contain is the exact
+      // `\set ON_ERROR_STOP on` line. psql resumes SQL after `\\` on the
+      // same line and `\i` includes arbitrary files, so anything else is
+      // rejected rather than skipped (Codex R6).
       let j = i;
       while (j < sql.length && sql[j] !== '\n') j++;
-      statements.push(sql.slice(i, j).trim());
+      const line = sql.slice(i, j).trim();
+      if (line !== '\\set ON_ERROR_STOP on') {
+        throw new Error(`unsupported psql meta-command in a seed: ${line.slice(0, 60)}`);
+      }
+      statements.push(line);
       i = j;
       continue;
     }
+    if (ch === '\\') throw new Error('backslash outside a literal is not supported in a seed');
     if (ch === '/' && sql[i + 1] === '*') {
       let depth = 1;
       i += 2;
@@ -296,11 +303,9 @@ export function splitSqlStatements(sql) {
       }
     }
     if (ch === '"') {
-      const j = sql.indexOf('"', i + 1);
-      if (j < 0) throw new Error('unterminated identifier');
-      cur += sql.slice(i, j + 1);
-      i = j + 1;
-      continue;
+      // A quoted identifier can name a callable ("set_config") that the
+      // allowlists would never see; seeds have no need for them (Codex R6).
+      throw new Error('quoted identifiers are not supported in a seed');
     }
     if (ch === ';') {
       if (cur.trim()) statements.push(cur.trim());
@@ -443,13 +448,7 @@ export function stripSqlNoise(text) {
       i = j + 1;
       continue;
     }
-    if (ch === '"') {
-      const j = text.indexOf('"', i + 1);
-      if (j < 0) throw new Error('unterminated identifier in DO body');
-      out += ' ';
-      i = j + 1;
-      continue;
-    }
+    if (ch === '"') throw new Error('quoted identifiers are not supported in a seed');
     out += ch;
     i++;
   }
@@ -474,6 +473,9 @@ export function assertReadOnlyDoBody(stmt) {
 
 const ACCOUNTS_INSERT =
   /^INSERT\s+INTO\s+(?:public\.)?accounts\s*\(([^)]*)\)\s*VALUES\s*([\s\S]*)$/i;
+/** A VALUES cell may only be a plain literal, DATE literal, NOW(), number, NULL or boolean — never a call. */
+const ALLOWED_VALUE =
+  /^(?:'(?:[^']|'')*'|DATE\s+'[^']*'|NOW\(\)|-?\d+(?:\.\d+)?|NULL|TRUE|FALSE)$/i;
 const DO_NOTHING_SUFFIX = /^ON\s+CONFLICT\s*\(\s*account_id\s*\)\s*DO\s+NOTHING$/i;
 
 /**
@@ -562,6 +564,15 @@ export function seedAccountInserts(sql) {
     if (!m) throw new Error(`unrecognised statement touching accounts: ${stmt.slice(0, 80)}`);
     const columns = m[1].split(',').map((c) => c.trim().toLowerCase());
     const tuples = parseValuesStrict(m[2]);
+    for (const tuple of tuples) {
+      for (const cell of tuple) {
+        if (!ALLOWED_VALUE.test(cell)) {
+          throw new Error(
+            `unsupported VALUES expression in an accounts INSERT: ${cell.slice(0, 40)}`,
+          );
+        }
+      }
+    }
     if (tuples.length === 0) throw new Error('accounts INSERT without VALUES tuples');
     found.push({ columns, tuples });
   }
@@ -747,6 +758,43 @@ test('seeds: the static check rejects DEFAULT, unclassified, missing column, a s
     ],
     ['top-level E-string', baseline + "\nSELECT E'x';\n"],
     ['unicode-escape string', baseline + "\nSELECT U&'x';\n"],
+  ]) {
+    assert.notEqual(mutated, baseline, `${name}: mutation did not apply`);
+    assert.equal(seedWritesOnlyBaseline(mutated), false, `${name} slipped through`);
+  }
+  // Codex R6 reproductions.
+  for (const [name, mutated] of [
+    [
+      'quoted set_config then a backslash-escaped UPDATE',
+      baseline.replace(
+        /\nCOMMIT;/,
+        "\nDO $$ DECLARE r TEXT; BEGIN r := \"set_config\"('standard_conforming_strings', 'off', true); END $$;\nDO $$ BEGIN RAISE NOTICE 'can\\'t'; UPDATE accounts SET cohort_classification='baseline' WHERE cohort_classification='unclassified'; RAISE NOTICE 'can\\'t'; END $$;\nCOMMIT;",
+      ),
+    ],
+    [
+      'set_config inside VALUES',
+      baseline.replace(
+        /NOW\(\), 'baseline'\)/,
+        "set_config('standard_conforming_strings', 'off', true), 'baseline')",
+      ),
+    ],
+    [
+      'any quoted identifier',
+      baseline.replace(/INSERT INTO accounts \(/, 'INSERT INTO "accounts" ('),
+    ],
+    [
+      'meta-command with a resumed UPDATE',
+      baseline.replace(
+        /\nCOMMIT;/,
+        "\n\\set ignored 1 \\\\ UPDATE accounts SET cohort_classification='baseline' WHERE cohort_classification='unclassified';\nCOMMIT;",
+      ),
+    ],
+    ['include meta-command', baseline.replace(/\nCOMMIT;/, '\n\\i other.sql\nCOMMIT;')],
+    ['echo meta-command', baseline.replace(/\\set ON_ERROR_STOP on/, '\\echo hi')],
+    [
+      'a function call as a VALUES cell',
+      baseline.replace(/'Pilot', 'Clinician US'/, "'Pilot', lower('Clinician US')"),
+    ],
   ]) {
     assert.notEqual(mutated, baseline, `${name}: mutation did not apply`);
     assert.equal(seedWritesOnlyBaseline(mutated), false, `${name} slipped through`);

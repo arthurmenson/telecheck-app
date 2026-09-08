@@ -409,6 +409,10 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     expect(leftover.rows[0]!.n).toBe(0);
     await deleteAccount(drifted);
 
+    // An unrelated unclassified account must be left exactly as it is: a seed
+    // never classifies existing rows (Codex R6).
+    const canary = ulid();
+    await rawInsert(TARGET_TENANT, canary, 'patient');
     const before = await allAccountIds();
     const ok = psqlFile('seed-staging-accounts.sql');
     expect(ok.status, ok.stderr).toBe(0);
@@ -420,9 +424,15 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
       [newIds],
     );
     for (const row of rows.rows) expect(row.c).toBe('baseline');
+    expect(await classificationOf(canary)).toBe('unclassified');
+    await deleteAccount(canary);
   });
 
   it('the baseline seed is idempotent, every row it creates is baseline, and every seeded id is a canonical ULID', async () => {
+    // An unrelated unclassified account must be left exactly as it is: a seed
+    // never classifies existing rows (Codex R6).
+    const canary = ulid();
+    await rawInsert(TARGET_TENANT, canary, 'patient');
     const before = await allAccountIds();
     const first = psqlFile('pilot-1-baseline-seed.sql');
     expect(first.status, first.stderr).toBe(0);
@@ -438,6 +448,8 @@ describe('Sprint 1.3 phase B — cohort remediation + baseline seed (real Postgr
     );
     expect(rows.rowCount).toBe(SEED_IDS.length);
     for (const row of rows.rows) expect(row.c).toBe('baseline');
+    expect(await classificationOf(canary)).toBe('unclassified');
+    await deleteAccount(canary);
     expect(rows.rows.map((r) => r.t).sort()).toEqual([
       'clinician',
       'clinician',
