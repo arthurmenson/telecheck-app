@@ -1,31 +1,31 @@
 /**
  * Real-Postgres proof for Sprint 1.3 phase B (env-purge) per
- * docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Sprint 1.3 CI test suite:
+ * docs/PII_SCREENING_AND_LOG_REDACTION_SPEC.md §Sprint 1.3 CI test suite.
  *
- *   1. schema-drift: every live base table in `public` is classified and the
- *      map names no table that does not exist;
- *   2. preserved-to-purged FK edges: none from a preserved table to an
- *      allowlist table; preserved → scoped-delete edges only target accounts;
- *   3. seeded-canary purge (routine-reset): participant canaries DELETED,
- *      baseline canaries of every identity type INTACT, every allowlist table
- *      empty, preserved row counts unchanged, one `env.purge.executed`
- *      attestation in the operator's tenant, baseline re-seeded, gate green;
+ * ISOLATION (Codex R1): this suite creates its OWN disposable database
+ * (`telecheck_purge_<suffix>`), applies the full migration inventory to it
+ * with the repo's migration runner, points every script at it, and drops it
+ * afterwards. Nothing here touches the shared TEST_DATABASE_URL data. The
+ * purge scripts are guarded: the DSN they receive must name that disposable
+ * database.
+ *
+ *   1. schema-drift: every live base table is classified; the map names only
+ *      live tables;
+ *   2. FK edges: no preserved table references an allowlist table; preserved →
+ *      scoped-delete edges only target accounts;
+ *   3. seeded-canary purge (routine-reset): participant patient/delegate rows
+ *      and their credentials / devices DELETED; baseline patient / delegate /
+ *      clinician / tenant_admin / platform_admin rows AND their credentials /
+ *      devices INTACT; every allowlist table empty; preserved counts
+ *      unchanged; one attestation per tenant sharing the operation id;
+ *      baseline re-seeded; gate green;
  *   4. unclassified account → purge REFUSES naming it, nothing written;
- *   5. attestation-transaction: an injected failure after the attestation,
- *      after TRUNCATE and after the scoped DELETE rolls everything back —
- *      canaries restored, no attestation row, non-zero exit;
- *   6. incident mode against a scratch incident directory: preconditions,
- *      single-use attestation with the incident id, directory byte-for-byte
- *      untouched in both modes; a lock blocks routine-reset.
- *
- * Runtime steps (docker compose) are skipped via PILOT_1_SKIP_RUNTIME_STEPS=1;
- * the DB purge, the attestation and the re-seed are the real thing. All
- * fixtures live in a disposable letters-only tenant which is also the
- * operator's home tenant, so the attestation never lands in a shared partition.
- * The purge itself truncates every allowlist table database-wide — each test
- * file owns its fixtures, so that is the intended blast radius.
+ *   5. attestation-transaction rollback at three injection points;
+ *   6. incident mode: preconditions, single use, two concurrent invocations →
+ *      exactly one purge, directory byte-for-byte untouched; lock blocks
+ *      routine-reset; the care-intake immutability triggers are re-enabled.
  */
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,7 +37,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ulid } from '../../src/lib/ulid.ts';
 
 const ROOT = path.resolve(import.meta.dirname ?? __dirname, '../..');
-const DSN = process.env['TEST_DATABASE_URL'] ?? '';
+const SHARED_DSN = process.env['TEST_DATABASE_URL'] ?? '';
 const bash = process.platform === 'win32' ? 'bash' : '/usr/bin/env';
 const bashArgs = process.platform === 'win32' ? [] : ['bash'];
 const AGE_HEADER = 'age-encryption.org/v1';
@@ -103,12 +103,31 @@ function mkIncidentDir(id: string, ageMin = 5) {
   return dir;
 }
 
-describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
-  const admin = new Client({ connectionString: DSN });
+describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)', () => {
   const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const suffix = Array.from(randomBytes(4), (b) => LETTERS[b % 26]).join('');
+  const DB_NAME = `telecheck_purge_${suffix.toLowerCase()}`;
   const TENANT = `Telecheck-TP${suffix}`;
-  const created: string[] = [];
+  const shared = new Client({ connectionString: SHARED_DSN });
+  let DSN = '';
+  let admin: Client;
+
+  function scriptEnv(extraEnv: Record<string, string> = {}) {
+    if (!DSN.includes(DB_NAME))
+      throw new Error(
+        'disposable-database guard: the purge must never run against the shared database',
+      );
+    return {
+      ...process.env,
+      PILOT_1_DATABASE_URL: DSN,
+      PILOT_1_ACTOR: 'ci-operator@test',
+      PILOT_1_ACTOR_TENANT: TENANT,
+      PILOT_1_SKIP_RUNTIME_STEPS: '1',
+      PILOT_1_INCIDENT_LOGS_DIR:
+        extraEnv['PILOT_1_INCIDENT_LOGS_DIR'] ?? fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-')),
+      ...extraEnv,
+    };
+  }
 
   function runPurge(args: string[], extraEnv: Record<string, string> = {}) {
     return spawnSync(
@@ -117,19 +136,24 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
       {
         cwd: ROOT,
         encoding: 'utf8',
-        env: {
-          ...process.env,
-          PILOT_1_DATABASE_URL: DSN,
-          PILOT_1_ACTOR: 'ci-operator@test',
-          PILOT_1_ACTOR_TENANT: TENANT,
-          PILOT_1_SKIP_RUNTIME_STEPS: '1',
-          PILOT_1_INCIDENT_LOGS_DIR:
-            extraEnv['PILOT_1_INCIDENT_LOGS_DIR'] ??
-            fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-')),
-          ...extraEnv,
-        },
+        env: scriptEnv(extraEnv),
       },
     );
+  }
+
+  function runPurgeAsync(args: string[], extraEnv: Record<string, string> = {}) {
+    return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn(
+        bash,
+        [...bashArgs, path.join(ROOT, 'scripts', 'pilot-1-env-purge.sh'), ...args],
+        { cwd: ROOT, env: scriptEnv(extraEnv) },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
+      child.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += d));
+      child.on('close', (status) => resolve({ status, stdout, stderr }));
+    });
   }
 
   function runRemediation(id: string) {
@@ -145,16 +169,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
         '--reason',
         'CI: purge suite',
       ],
-      {
-        cwd: ROOT,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          PILOT_1_DATABASE_URL: DSN,
-          PILOT_1_ACTOR: 'ci-operator@test',
-          PILOT_1_ACTOR_TENANT: TENANT,
-        },
-      },
+      { cwd: ROOT, encoding: 'utf8', env: scriptEnv() },
     );
   }
 
@@ -200,13 +215,16 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
       `INSERT INTO accounts (${cols.join(', ')}) VALUES (${vals.join(', ')})`,
       params,
     );
-    created.push(id);
   }
 
-  async function insertIdempotencyCanary(key: string) {
+  async function insertCredentialAndDevice(accountId: string) {
     await admin.query(
-      `INSERT INTO idempotency_keys (tenant_id, key, response_status, endpoint, actor_id) VALUES ($1, $2, 200, '/ci/purge-canary', 'ci')`,
-      [TENANT, key],
+      `INSERT INTO account_pin_credentials (account_id, tenant_id, pin_hash, pin_salt) VALUES ($1, $2, 'hash', 'salt')`,
+      [accountId, TENANT],
+    );
+    await admin.query(
+      `INSERT INTO auth_devices (device_id, tenant_id, account_id, platform, device_public_key) VALUES ($1, $2, $3, 'web', 'pk')`,
+      [ulid(), TENANT, accountId],
     );
   }
 
@@ -227,8 +245,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
     }>
   > {
     const r = await admin.query(
-      `SELECT tenant_id, payload, actor_tenant_id, target_patient_id FROM audit_records WHERE action = 'env.purge.executed' AND tenant_id = $1 ORDER BY recorded_at`,
-      [TENANT],
+      `SELECT tenant_id, payload, actor_tenant_id, target_patient_id FROM audit_records WHERE action = 'env.purge.executed' ORDER BY recorded_at, tenant_id`,
     );
     return r.rows as never;
   }
@@ -250,13 +267,29 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
     await insertAccount(ids.clinician, 'clinician', 'baseline');
     await insertAccount(ids.tenantAdmin, 'tenant_admin', 'baseline');
     await insertAccount(ids.platformAdmin, 'platform_admin', 'baseline');
+    await insertCredentialAndDevice(ids.participantPatient);
+    await insertCredentialAndDevice(ids.baselinePatient);
     const key = `canary-${ulid()}`;
-    await insertIdempotencyCanary(key);
+    await admin.query(
+      `INSERT INTO idempotency_keys (tenant_id, key, response_status, endpoint, actor_id) VALUES ($1, $2, 200, '/ci/purge-canary', 'ci')`,
+      [TENANT, key],
+    );
     return { ...ids, key };
   }
 
   beforeAll(async () => {
+    await shared.connect();
+    await shared.query(`CREATE DATABASE ${DB_NAME}`);
+    DSN = SHARED_DSN.replace(/\/[^/?]+(\?|$)/, `/${DB_NAME}$1`);
+    admin = new Client({ connectionString: DSN });
     await admin.connect();
+    // The migration runner is a plain ESM helper without a declaration file;
+    // a dynamic import keeps the suppression attached to the statement.
+    // @ts-expect-error — no types for scripts/migrate.mjs
+    const migrate = (await import('../../scripts/migrate.mjs')) as {
+      applyMigrations: (client: Client, directory: string) => Promise<void>;
+    };
+    await migrate.applyMigrations(admin, path.join(ROOT, 'migrations'));
     await admin.query(
       `INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain, country_of_care, kms_key_alias, status, activated_at)
        VALUES ($1, $1, $2, $3, $4, 'US', $5, 'active', NOW()) ON CONFLICT (id) DO NOTHING`,
@@ -268,13 +301,12 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
         `alias/telecheck-test-${suffix.toLowerCase()}-data-key`,
       ],
     );
-  });
+  }, 180_000);
 
   afterAll(async () => {
-    for (const id of [...created, ...SEED_IDS]) {
-      await admin.query('DELETE FROM accounts WHERE account_id = $1', [id]).catch(() => undefined);
-    }
-    await admin.end();
+    await admin?.end().catch(() => undefined);
+    await shared.query(`DROP DATABASE IF EXISTS ${DB_NAME} WITH (FORCE)`).catch(() => undefined);
+    await shared.end();
   });
 
   it('schema-drift: every live base table is classified, and the map names only live tables', async () => {
@@ -282,9 +314,8 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
       `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name`,
     );
     const live = r.rows.map((x) => x.table_name).sort();
-    const mapped = Object.keys(MAP.tables).sort();
     expect(live.filter((t) => !MAP.tables[t])).toEqual([]);
-    expect(mapped.filter((t) => !live.includes(t))).toEqual([]);
+    expect(Object.keys(MAP.tables).filter((t) => !live.includes(t))).toEqual([]);
   });
 
   it('FK edges: no preserved table references an allowlist table; preserved → scoped-delete edges only target accounts', async () => {
@@ -295,61 +326,62 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
         WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'`,
     );
     const cls = (t: string) => MAP.tables[t]?.class ?? 'UNCLASSIFIED';
-    const preservedToAllow = r.rows.filter(
-      (e) => cls(e.child) === 'preserved' && cls(e.parent) === 'allowlist',
-    );
-    expect(preservedToAllow).toEqual([]);
-    const preservedToScoped = r.rows.filter(
-      (e) => cls(e.child) === 'preserved' && cls(e.parent) === 'scoped-delete',
-    );
-    for (const e of preservedToScoped) expect(e.parent).toBe('accounts');
-    const unclassified = r.rows.filter(
-      (e) => cls(e.child) === 'UNCLASSIFIED' || cls(e.parent) === 'UNCLASSIFIED',
-    );
-    expect(unclassified).toEqual([]);
+    expect(
+      r.rows.filter((e) => cls(e.child) === 'preserved' && cls(e.parent) === 'allowlist'),
+    ).toEqual([]);
+    for (const e of r.rows.filter(
+      (x) => cls(x.child) === 'preserved' && cls(x.parent) === 'scoped-delete',
+    ))
+      expect(e.parent).toBe('accounts');
+    expect(
+      r.rows.filter((e) => cls(e.child) === 'UNCLASSIFIED' || cls(e.parent) === 'UNCLASSIFIED'),
+    ).toEqual([]);
   });
 
   it('an unclassified account makes the purge REFUSE, naming it, with nothing written', async () => {
     const c = await seedCanaries();
     const stray = ulid();
     await insertAccount(stray, 'patient');
-    const before = await attestations();
+    const before = (await attestations()).length;
     const r = runPurge(['--routine-reset']);
     expect(r.status).toBe(1);
     expect(r.stderr).toContain(stray);
     expect(await count('accounts', 'WHERE account_id = $1', [c.participantPatient])).toBe(1);
     expect(await count('idempotency_keys', 'WHERE key = $1', [c.key])).toBe(1);
-    expect((await attestations()).length).toBe(before.length);
+    expect((await attestations()).length).toBe(before);
     const fixed = runRemediation(stray);
     expect(fixed.status, fixed.stderr).toBe(0);
   });
 
-  it('attestation-transaction: an injected failure after the attestation, after TRUNCATE and after the scoped DELETE rolls everything back', async () => {
+  it('attestation-transaction: an injected failure after the attestation, after TRUNCATE and after the scoped DELETE rolls everything back and re-enables the guarded triggers', async () => {
     for (const stage of ['audit', 'truncate', 'delete']) {
       const c = await seedCanaries();
       const before = (await attestations()).length;
       const r = runPurge(['--routine-reset'], { PILOT_1_TEST_FAIL_AFTER: stage });
       expect(r.status, `${stage}: ${r.stderr}`).toBe(3);
-      expect(r.stderr).toMatch(/rolled back/);
+      expect(r.stderr).toMatch(/rolled back \(verified/);
       expect(await count('accounts', 'WHERE account_id = $1', [c.participantPatient])).toBe(1);
-      expect(await count('accounts', 'WHERE account_id = $1', [c.participantDelegate])).toBe(1);
+      expect(
+        await count('account_pin_credentials', 'WHERE account_id = $1', [c.participantPatient]),
+      ).toBe(1);
       expect(await count('idempotency_keys', 'WHERE key = $1', [c.key])).toBe(1);
       expect((await attestations()).length).toBe(before);
-      // leave the canaries for the next stage / the real purge
+      const disabled = await admin.query<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid WHERE c.relname IN ('consult_care_binding','consult_care_submission') AND NOT tg.tgisinternal AND tg.tgenabled = 'D'`,
+      );
+      expect(Number(disabled.rows[0]!.n)).toBe(0);
     }
   });
 
-  it('seeded-canary purge (routine-reset): participants deleted, every baseline identity intact, allowlist empty, preserved unchanged, one attestation, re-seeded, gate green', async () => {
+  it('seeded-canary purge (routine-reset): participants + their credentials/devices deleted, every baseline identity + credentials intact, allowlist empty, preserved unchanged, one attestation per tenant, re-seeded, gate green, triggers re-enabled', async () => {
     const c = await seedCanaries();
     const preserved = tablesOf('preserved').filter(
       (t) => !t.startsWith('_session') && t !== 'audit_records',
     );
     const preservedBefore: Record<string, number> = {};
     for (const t of preserved) preservedBefore[t] = await count(t);
-    const baselineAccountsBefore = await count(
-      'accounts',
-      `WHERE cohort_classification = 'baseline'`,
-    );
+    const baselineBefore = await count('accounts', `WHERE cohort_classification = 'baseline'`);
+    const tenantCount = await count('tenants');
     const attestBefore = (await attestations()).length;
     const inc = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
     const dirBefore = snapshotDir(inc);
@@ -362,11 +394,16 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
       incidentId: null,
       actorTenantId: TENANT,
       status: 'purged',
+      reconciled: false,
       runtimeStepsSkipped: true,
     });
 
     expect(await count('accounts', 'WHERE account_id = $1', [c.participantPatient])).toBe(0);
     expect(await count('accounts', 'WHERE account_id = $1', [c.participantDelegate])).toBe(0);
+    expect(
+      await count('account_pin_credentials', 'WHERE account_id = $1', [c.participantPatient]),
+    ).toBe(0);
+    expect(await count('auth_devices', 'WHERE account_id = $1', [c.participantPatient])).toBe(0);
     for (const id of [
       c.baselinePatient,
       c.baselineDelegate,
@@ -376,40 +413,50 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
     ]) {
       expect(await count('accounts', 'WHERE account_id = $1', [id]), id).toBe(1);
     }
+    expect(
+      await count('account_pin_credentials', 'WHERE account_id = $1', [c.baselinePatient]),
+    ).toBe(1);
+    expect(await count('auth_devices', 'WHERE account_id = $1', [c.baselinePatient])).toBe(1);
     expect(await count('accounts', `WHERE cohort_classification = 'participant'`)).toBe(0);
-    // no baseline account of ANY type deleted (the re-seed may add the 7 P1 rows)
     expect(
       await count('accounts', `WHERE cohort_classification = 'baseline'`),
-    ).toBeGreaterThanOrEqual(baselineAccountsBefore);
+    ).toBeGreaterThanOrEqual(baselineBefore);
     for (const t of tablesOf('allowlist')) expect(await count(t), t).toBe(0);
     for (const t of preserved) expect(await count(t), t).toBe(preservedBefore[t]);
     const rows = await attestations();
-    expect(rows.length).toBe(attestBefore + 1);
-    const last = rows.at(-1)!;
-    expect(last.actor_tenant_id).toBe(TENANT);
-    expect(last.target_patient_id).toBeNull();
-    expect(last.payload).toMatchObject({
-      mode: 'routine-reset',
-      incidentId: null,
-      actor: 'ci-operator@test',
-      actorTenantId: TENANT,
-      planDigest: out['planDigest'],
-      classificationVersion: MAP.version,
-    });
-    expect(Array.isArray(last.payload['tenants'])).toBe(true);
-    expect(last.payload['tenants']).toContain(TENANT);
+    expect(rows.length).toBe(attestBefore + tenantCount);
+    const mine = rows.filter((x) => x.payload['operationId'] === out['operationId']);
+    expect(mine.length).toBe(tenantCount);
+    expect(new Set(mine.map((x) => x.tenant_id)).size).toBe(tenantCount);
+    for (const row of mine) {
+      expect(row.actor_tenant_id).toBe(TENANT);
+      expect(row.target_patient_id).toBeNull();
+      expect(row.payload).toMatchObject({
+        mode: 'routine-reset',
+        incidentId: null,
+        actor: 'ci-operator@test',
+        actorTenantId: TENANT,
+        planDigest: out['planDigest'],
+        classificationVersion: MAP.version,
+      });
+      expect(row.payload['tenants']).toContain(row.tenant_id);
+    }
     for (const id of SEED_IDS)
       expect(await count('accounts', 'WHERE account_id = $1', [id]), id).toBe(1);
     expect(snapshotDir(inc)).toEqual(dirBefore);
+    const disabled = await admin.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid WHERE c.relname IN ('consult_care_binding','consult_care_submission') AND NOT tg.tgisinternal AND tg.tgenabled = 'D'`,
+    );
+    expect(Number(disabled.rows[0]!.n)).toBe(0);
     const gate = spawnSync(
       bash,
       [...bashArgs, path.join(ROOT, 'scripts', 'verify-pilot-1-baseline.sh')],
-      { cwd: ROOT, encoding: 'utf8', env: { ...process.env, PILOT_1_DATABASE_URL: DSN } },
+      { cwd: ROOT, encoding: 'utf8', env: scriptEnv() },
     );
     expect(gate.status, gate.stderr).toBe(0);
   });
 
-  it('incident mode: preconditions, single-use attestation carrying the incident id, directory byte-for-byte untouched; the lock blocks routine-reset', async () => {
+  it('incident mode: preconditions, single-use attestation carrying the incident id, two concurrent invocations purge exactly once, directory byte-for-byte untouched; the lock blocks routine-reset', async () => {
     const id = `2026-09-08T16-00Z-cat1-${suffix.toLowerCase()}`;
     const inc = mkIncidentDir(id);
     const before = snapshotDir(inc);
@@ -419,13 +466,27 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres)', () => {
     expect(blocked.status).toBe(1);
     expect(blocked.stderr).toMatch(/incident lock present/);
 
-    const r = runPurge(['--incident-id', id, '--json'], { PILOT_1_INCIDENT_LOGS_DIR: inc });
-    expect(r.status, r.stderr).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ mode: 'incident', incidentId: id, artifacts: 1 });
+    const attestBefore = (await attestations()).length;
+    const [a, b] = await Promise.all([
+      runPurgeAsync(['--incident-id', id, '--json'], { PILOT_1_INCIDENT_LOGS_DIR: inc }),
+      runPurgeAsync(['--incident-id', id, '--json'], { PILOT_1_INCIDENT_LOGS_DIR: inc }),
+    ]);
+    const statuses = [a.status, b.status].sort();
+    expect(statuses, `${a.stderr}\n${b.stderr}`).toEqual([0, 1]);
+    const winner = a.status === 0 ? a : b;
+    const loser = a.status === 0 ? b : a;
+    expect(loser.stderr).toMatch(/already attested/);
+    expect(JSON.parse(winner.stdout)).toMatchObject({
+      mode: 'incident',
+      incidentId: id,
+      artifacts: 1,
+    });
     expect(await count('accounts', 'WHERE account_id = $1', [c.participantPatient])).toBe(0);
     expect(await count('idempotency_keys', 'WHERE key = $1', [c.key])).toBe(0);
-    const last = (await attestations()).at(-1)!;
-    expect(last.payload).toMatchObject({ mode: 'incident', incidentId: id, artifacts: 1 });
+    const rows = (await attestations()).slice(attestBefore);
+    expect(rows.length).toBe(await count('tenants'));
+    for (const row of rows)
+      expect(row.payload).toMatchObject({ mode: 'incident', incidentId: id, artifacts: 1 });
     expect(snapshotDir(inc)).toEqual(before);
 
     const again = runPurge(['--incident-id', id], { PILOT_1_INCIDENT_LOGS_DIR: inc });

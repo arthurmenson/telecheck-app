@@ -29,8 +29,11 @@ function readJson(file) {
   let raw;
   try {
     raw = fs.readFileSync(file, 'utf8');
-  } catch {
-    return { error: 'missing' };
+  } catch (error) {
+    // Only a confirmed absence is "missing"; EACCES / EISDIR / I/O errors
+    // are inspection failures and must never read as a clean state (Codex R1).
+    if (error && error.code === 'ENOENT') return { error: 'missing' };
+    return { error: 'unreadable', code: error && error.code ? error.code : 'unknown' };
   }
   try {
     const value = JSON.parse(raw);
@@ -43,8 +46,9 @@ function readJson(file) {
 
 export function readLock(dir) {
   const file = path.join(dir, LOCK_NAME);
-  if (!fs.existsSync(file)) return { present: false };
-  const { value, error } = readJson(file);
+  const { value, error, code } = readJson(file);
+  if (error === 'missing') return { present: false };
+  if (error === 'unreadable') return { present: true, unreadable: true, code };
   if (error) return { present: true, malformed: true };
   return {
     present: true,
@@ -53,11 +57,14 @@ export function readLock(dir) {
 }
 
 export function listManifests(dir) {
+  // Throws on any enumeration failure: an unreadable directory is not an
+  // empty one (Codex R1).
   let entries;
   try {
     entries = fs.readdirSync(dir);
-  } catch {
-    return [];
+  } catch (error) {
+    const code = error && error.code ? error.code : 'unknown';
+    throw new Error(`cannot inspect the incident directory (${code}): ${dir}`);
   }
   return entries.filter((f) => f.endsWith('.manifest.json')).sort();
 }
@@ -108,9 +115,19 @@ export function verifyForPurge(dir, incidentId, nowMs = Date.now()) {
   if (typeof incidentId !== 'string' || !INCIDENT_ID.test(incidentId)) {
     return { ok: false, reason: 'incident id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' };
   }
-  const { value: manifest, error } = readJson(path.join(dir, `${incidentId}.manifest.json`));
+  let listing;
+  try {
+    listing = listManifests(dir);
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  if (!listing.includes(`${incidentId}.manifest.json`)) {
+    return { ok: false, reason: `manifest missing: ${incidentId}.manifest.json` };
+  }
+  const { value: manifest, error, code } = readJson(path.join(dir, `${incidentId}.manifest.json`));
   if (error === 'missing')
     return { ok: false, reason: `manifest missing: ${incidentId}.manifest.json` };
+  if (error === 'unreadable') return { ok: false, reason: `manifest unreadable (${code})` };
   if (error) return { ok: false, reason: 'manifest malformed (counts as FAILED)' };
   if (manifest.status !== 'SUCCESS')
     return {
@@ -149,6 +166,7 @@ export function verifyForPurge(dir, incidentId, nowMs = Date.now()) {
       ok: false,
       reason: 'incident lock is absent — capture did not run, or the incident was already cleared',
     };
+  if (lock.unreadable) return { ok: false, reason: `incident lock unreadable (${lock.code})` };
   if (lock.malformed) return { ok: false, reason: 'incident lock is malformed' };
   if (lock.incidentId !== incidentId) {
     return {
@@ -163,11 +181,20 @@ export function verifyForPurge(dir, incidentId, nowMs = Date.now()) {
 export function routineResetBlockers(dir) {
   const blockers = [];
   const lock = readLock(dir);
-  if (lock.present)
-    blockers.push(`incident lock present (${lock.malformed ? 'malformed' : lock.incidentId})`);
-  for (const file of listManifests(dir)) {
-    const { value, error } = readJson(path.join(dir, file));
-    if (error) blockers.push(`unreadable manifest ${file}`);
+  if (lock.present) {
+    if (lock.unreadable) blockers.push(`incident lock cannot be inspected (${lock.code})`);
+    else blockers.push(`incident lock present (${lock.malformed ? 'malformed' : lock.incidentId})`);
+  }
+  let files;
+  try {
+    files = listManifests(dir);
+  } catch (error) {
+    blockers.push(error instanceof Error ? error.message : String(error));
+    return blockers;
+  }
+  for (const file of files) {
+    const { value, error, code } = readJson(path.join(dir, file));
+    if (error) blockers.push(`unreadable manifest ${file}${code ? ` (${code})` : ''}`);
     else if (value.consumed !== true) blockers.push(`unconsumed manifest ${file}`);
   }
   return blockers;

@@ -53,6 +53,13 @@ export function validateClassification(map) {
     } else if (entry.predicate !== undefined) {
       throw new Error(`classification: ${name} is ${entry.class} and must not carry a predicate`);
     }
+    if (entry.disableUserTriggersForTruncate !== undefined) {
+      if (entry.class !== 'allowlist' || entry.disableUserTriggersForTruncate !== true) {
+        throw new Error(
+          `classification: disableUserTriggersForTruncate is only valid as true on an allowlist table (${name})`,
+        );
+      }
+    }
   }
   // Mixed-baseline safeguard (spec step 5): accounts is NEVER allowlist.
   const accounts = map.tables.accounts;
@@ -105,12 +112,22 @@ export function renderPlan(map, { failAfter = null } = {}) {
     throw new Error(`renderPlan: unknown fail point ${String(failAfter)}`);
   }
   const allow = tablesOfClass(map, 'allowlist');
-  const scoped = tablesOfClass(map, 'scoped-delete');
+  // Scoped deletes run BEFORE the accounts delete: their predicates select
+  // participant-bound rows via accounts, and their FKs reference it.
+  const scoped = tablesOfClass(map, 'scoped-delete').filter((t) => t !== 'accounts');
+  if (map.tables.accounts) scoped.push('accounts');
+  const guarded = allow.filter((t) => map.tables[t].disableUserTriggersForTruncate === true);
   let sql =
     '-- Pilot 1 env-purge plan — generated from scripts/pilot-1-purge-classification.json\n';
   sql += `-- classification version ${map.version}; ${allow.length} allowlist, ${scoped.length} scoped-delete, ${tablesOfClass(map, 'preserved').length} preserved\n`;
+  if (guarded.length) sql += `-- user triggers disabled for TRUNCATE on: ${guarded.join(', ')}\n`;
   if (failAfter === 'audit') sql += injectedFailure('audit');
+  // Migration 095's immutability triggers fire on TRUNCATE; USER triggers on
+  // those tables are disabled for the TRUNCATE only, re-enabled right after
+  // and post-checked, all inside the caller's transaction (Codex R1).
+  for (const t of guarded) sql += `ALTER TABLE public.${t} DISABLE TRIGGER USER;\n`;
   sql += 'TRUNCATE TABLE ' + allow.map((t) => `public.${t}`).join(', ') + ' RESTRICT;\n';
+  for (const t of guarded) sql += `ALTER TABLE public.${t} ENABLE TRIGGER USER;\n`;
   if (failAfter === 'truncate') sql += injectedFailure('truncate');
   for (const t of scoped) {
     sql += `DELETE FROM public.${t} WHERE ${map.tables[t].predicate};\n`;
@@ -124,6 +141,9 @@ export function renderPlan(map, { failAfter = null } = {}) {
   }
   for (const t of scoped) {
     sql += `  SELECT COUNT(*) INTO v_n FROM public.${t} WHERE ${map.tables[t].predicate};\n  IF v_n <> 0 THEN RAISE EXCEPTION 'pilot-1-env-purge: % ${t} rows still match the scoped predicate', v_n; END IF;\n`;
+  }
+  for (const t of guarded) {
+    sql += `  SELECT COUNT(*) INTO v_n FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = '${t}' AND NOT tg.tgisinternal AND tg.tgenabled = 'D';\n  IF v_n <> 0 THEN RAISE EXCEPTION 'pilot-1-env-purge: % user trigger(s) on ${t} still disabled', v_n; END IF;\n`;
   }
   sql += 'END $$;\n';
   return sql;
