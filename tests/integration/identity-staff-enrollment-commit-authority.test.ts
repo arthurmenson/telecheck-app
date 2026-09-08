@@ -40,13 +40,20 @@ import {
 import { StaffEnrollmentReceiptSchema } from '../../src/modules/identity/internal/services/staff-contract.ts';
 import { emitStaffEvidence } from '../../src/modules/identity/internal/services/staff-evidence.ts';
 import { configureBindRole } from '../helpers/configure-bind-role.ts';
-import { TENANT_US } from '../helpers/tenant-fixtures.ts';
 
 const BIND_ROLE_TEST_PASSWORD = 'telecheck_test_bind_pw';
 const IDENTITY_ROLE_TEST_PASSWORD = 'telecheck_test_identity_pw';
 const LIVE_NONCE_TTL_SECONDS = 300;
 
-const tenant = { tenantId: TENANT_US, countryOfCare: 'US' } as unknown as TenantContext;
+/**
+ * A dedicated tenant, committed once per file run. The positive control below
+ * COMMITS an enrollment — and with it an audit row and an outbox row — outside
+ * the harness rollback. In Telecheck-US that row would be counted by
+ * audit-chain-walker.test.ts (Codex R1 on PR #310), so nothing here touches a
+ * shared tenant. Append-only audit evidence stays intact inside this tenant.
+ */
+let tenantId = '';
+let tenant: TenantContext;
 
 let admin: pg.Pool;
 let bindPool: pg.Pool;
@@ -58,6 +65,35 @@ function syntheticPhone(): string {
   );
 }
 
+function randomLetters(n: number): string {
+  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ';
+  return Array.from(randomBytes(n), (b) => alphabet[b % alphabet.length]).join('');
+}
+
+/** Commit a uniquely named tenant (letters only, `Telecheck-T…`, like the shared fixture) through the admin pool. */
+async function seedTenant(): Promise<string> {
+  const suffix = randomLetters(4);
+  const id = `Telecheck-TI${suffix}`;
+  const c = await admin.connect();
+  try {
+    await c.query(
+      `INSERT INTO tenants (id, display_name, consumer_dba, legal_entity, consumer_subdomain,
+         country_of_care, kms_key_alias, status, activated_at)
+       VALUES ($1,$1,$2,$3,$4,'US',$5,'active',NOW())`,
+      [
+        id,
+        `Heros Health Test ${suffix}`,
+        `Telecheck Test ${suffix} Inc.`,
+        `test-${suffix.toLowerCase()}.heroshealth.com`,
+        `alias/telecheck-test-${suffix.toLowerCase()}-data-key`,
+      ],
+    );
+  } finally {
+    c.release();
+  }
+  return id;
+}
+
 /** Seed an active tenant_admin with a live clinician_enroller membership and a session, COMMITTED. */
 async function seedOperator(): Promise<{ accountId: string; sessionId: string }> {
   const accountId = ulid();
@@ -65,27 +101,22 @@ async function seedOperator(): Promise<{ accountId: string; sessionId: string }>
   const c = await admin.connect();
   try {
     await c.query('BEGIN');
-    await c.query('SELECT set_tenant_context($1)', [TENANT_US]);
+    await c.query('SELECT set_tenant_context($1)', [tenantId]);
     await c.query(
       `INSERT INTO accounts (account_id, tenant_id, phone_e164, first_name, last_name, date_of_birth,
          gender, country_of_residence, country_of_care, account_type, status, cohort_classification)
        VALUES ($1,$2,$3,'Synthetic','Enroller','1985-01-01','prefer_not_to_say','US','US','tenant_admin','active','baseline')`,
-      [accountId, TENANT_US, syntheticPhone()],
+      [accountId, tenantId, syntheticPhone()],
     );
     await c.query(
       `INSERT INTO identity_staff_membership (tenant_id, account_id, capability, granted_by, evidence_sha256, provisioning_reference)
        VALUES ($1,$2,'clinician_enroller',$2,$3,$4)`,
-      [
-        TENANT_US,
-        accountId,
-        randomBytes(32).toString('hex'),
-        `synthetic-provisioning-${accountId}`,
-      ],
+      [tenantId, accountId, randomBytes(32).toString('hex'), `synthetic-provisioning-${accountId}`],
     );
     await c.query(
       `INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash, expires_at)
        VALUES ($1,$2,$3,$4, clock_timestamp() + INTERVAL '1 hour')`,
-      [sessionId, TENANT_US, accountId, randomBytes(32).toString('hex')],
+      [sessionId, tenantId, accountId, randomBytes(32).toString('hex')],
     );
     await c.query('SELECT clear_tenant_context()');
     await c.query('COMMIT');
@@ -103,7 +134,7 @@ async function bindNonce(accountId: string, sessionId: string): Promise<string> 
   try {
     const bound = await bindActorContextForRequest(binder as unknown as DbClient, {
       actorAccountId: accountId,
-      actorAccountTenantId: TENANT_US,
+      actorAccountTenantId: tenantId,
       actorRole: 'tenant_admin',
       actorAdminHomeTenantId: null,
       sessionId,
@@ -166,9 +197,9 @@ async function enrollmentRows(clinicianAccountId: string): Promise<{
 }> {
   const c = await admin.connect();
   try {
-    await c.query('SELECT set_tenant_context($1)', [TENANT_US]);
+    await c.query('SELECT set_tenant_context($1)', [tenantId]);
     const count = async (sql: string) =>
-      Number((await c.query<{ n: string }>(sql, [TENANT_US, clinicianAccountId])).rows[0]?.n ?? 0);
+      Number((await c.query<{ n: string }>(sql, [tenantId, clinicianAccountId])).rows[0]?.n ?? 0);
     const accounts = await count(
       'SELECT count(*)::text AS n FROM accounts WHERE tenant_id=$1 AND account_id=$2',
     );
@@ -221,7 +252,7 @@ async function runEnrollment(
   try {
     // The caller-owned client arrives already tenant-bound — exactly what the
     // primitive's callerOwnedClient contract expects.
-    await c.query('SELECT set_tenant_context($1)', [TENANT_US]);
+    await c.query('SELECT set_tenant_context($1)', [tenantId]);
     const run = commitAuthorityTransaction({
       ...staffAuthority(ctx),
       callerOwnedClient: withCommitInterceptor(c, onCommit, record),
@@ -260,6 +291,9 @@ beforeAll(async () => {
   identityUrl.username = 'identity_service_role';
   identityUrl.password = IDENTITY_ROLE_TEST_PASSWORD;
   identityPool = new pg.Pool({ connectionString: identityUrl.toString(), max: 2 });
+
+  tenantId = await seedTenant();
+  tenant = { tenantId, countryOfCare: 'US' } as unknown as TenantContext;
 });
 
 afterAll(async () => {
