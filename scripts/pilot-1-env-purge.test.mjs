@@ -412,6 +412,23 @@ test('incident-manifest: inspection failures are refusals, never a clean state; 
     present: true,
     incidentId: '2026-09-08T15-45Z-cat1-01',
   });
+  // a dangling incident lock (symlink to nothing) is PRESENT and uninspectable — a blocker, never absent (Codex R7)
+  const dangling = fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-'));
+  let linked = true;
+  try {
+    fs.symlinkSync(path.join(dangling, 'gone.json'), path.join(dangling, '.incident.lock'), 'file');
+  } catch (e) {
+    if (process.platform === 'win32' && e.code === 'EPERM') linked = false;
+    else throw e;
+  }
+  if (linked) {
+    assert.deepEqual(lockState(dangling), { present: true, unreadable: true, code: 'SYMLINK' });
+    assert.match(
+      routineResetBlockers(dangling).join(';'),
+      /incident lock cannot be inspected \(SYMLINK\)/,
+    );
+    assert.match(verifyForPurge(dangling, '2026-09-08T15-45Z-cat1-01').reason, /lock unreadable/);
+  }
 });
 
 test('incident-manifest: routine-reset blockers — lock, unconsumed or unreadable manifests; a clean directory has none', () => {
@@ -528,6 +545,7 @@ function run(dir, stubs, args, extraEnv = {}) {
       PILOT_1_INCIDENT_LOGS_DIR:
         extraEnv.PILOT_1_INCIDENT_LOGS_DIR ?? fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-')),
       PILOT_1_LOCK_FILE: path.join(dir, 'lifecycle.lock'),
+      PILOT_1_RUNTIME_STATE_DIR: path.join(dir, 'state'),
       PILOT_1_COMPOSE: stubs.compose,
       PILOT_1_HEALTH_URLS: 'http://us.test/health http://gh.test/health',
       PILOT_1_SKIP_RUNTIME_STEPS: '1',
@@ -537,6 +555,27 @@ function run(dir, stubs, args, extraEnv = {}) {
 }
 
 const txOf = (dir) => fs.readFileSync(path.join(dir, 'tx.sql'), 'utf8');
+const stagesOf = (dir, op) => {
+  const d = path.join(dir, 'state', op);
+  return fs.existsSync(d)
+    ? fs
+        .readdirSync(d)
+        .filter((f) => f !== 'meta')
+        .sort()
+    : null;
+};
+const latestOf = (dir) => {
+  const f = path.join(dir, 'state', 'latest');
+  return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim() : null;
+};
+/** Prepares runtime state for an operation: which stages are done + whether it is the latest. */
+function mkState(dir, op, stages, { latest = true, mode = 'incident' } = {}) {
+  const d = path.join(dir, 'state', op);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'meta'), `${mode}|\n`);
+  for (const st of stages) fs.writeFileSync(path.join(d, st), '');
+  if (latest) fs.writeFileSync(path.join(dir, 'state', 'latest'), `${op}\n`);
+}
 const composeLog = (dir) =>
   fs.existsSync(path.join(dir, 'compose.log'))
     ? fs.readFileSync(path.join(dir, 'compose.log'), 'utf8').trim().split('\n')
@@ -594,6 +633,8 @@ test('env-purge: containment: real filesystem locations — a `..`-prefixed chil
     ['TMPDIR = incident dir', { TMPDIR: inc }],
     ['TMPDIR inside incident dir', { TMPDIR: scratch }],
     ['TMPDIR via alias', { TMPDIR: alias }],
+    ['state dir inside incident dir', { PILOT_1_RUNTIME_STATE_DIR: scratch }],
+    ['state dir via alias', { PILOT_1_RUNTIME_STATE_DIR: alias }],
   ]) {
     const r = run(dir, stubs, ['--routine-reset'], { PILOT_1_INCIDENT_LOGS_DIR: inc, ...env });
     assert.equal(r.status, 2, `${name}: ${r.stderr}`);
@@ -791,6 +832,15 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   const curls = fs.readFileSync(path.join(dir, 'curl.log'), 'utf8').trim().split('\n');
   assert.equal(curls.length, 2);
   assert.ok(curls.every((c) => /-w %\{http_code\}/.test(c) && /--max-time/.test(c)));
+  assert.deepEqual(stagesOf(dir, out.operationId), [
+    'caddy',
+    'completed',
+    'purged',
+    'recreated',
+    'redis',
+    'reseeded',
+  ]);
+  assert.equal(latestOf(dir), out.operationId);
   assert.ok(
     curls.some((c) => c.includes('http://us.test/health')) &&
       curls.some((c) => c.includes('http://gh.test/health')),
@@ -804,6 +854,44 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   });
   assert.equal(r2.status, 4, r2.stderr);
   assert.match(r2.stderr, /did not return HTTP 200 .* \(last: 302\)/);
+  // after a failed health check every destructive stage is marked done; the
+  // recovery retries the HEALTH CHECK ONLY — no stop, no FLUSHALL, no log
+  // truncation, no container recreation (Codex R7)
+  const opAfterHealth = fs.readdirSync(path.join(redirect, 'state')).find((f) => f !== 'latest');
+  assert.deepEqual(stagesOf(redirect, opAfterHealth), [
+    'caddy',
+    'purged',
+    'recreated',
+    'redis',
+    'reseeded',
+  ]);
+  const stubs2 = mkStubs(redirect);
+  fs.rmSync(path.join(redirect, 'compose.log'));
+  fs.rmSync(path.join(redirect, 'curl.log'));
+  fs.rmSync(path.join(redirect, 'seed.ran'));
+  const retry = run(
+    redirect,
+    stubs2,
+    ['--finish-runtime', '--operation-id', opAfterHealth, '--json'],
+    {
+      PILOT_1_SKIP_RUNTIME_STEPS: '0',
+      PILOT_1_ACTOR_TENANT: '',
+      PSQL_ATTEST: 'routine-reset|',
+      PILOT_1_HEALTH_URLS: 'http://us.test/health',
+    },
+  );
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.deepEqual(composeLog(redirect), [], 'a health-only retry must not touch compose');
+  assert.ok(fs.existsSync(path.join(redirect, 'curl.log')), 'the health check ran');
+  assert.ok(!fs.existsSync(path.join(redirect, 'seed.ran')), 'the re-seed must not repeat');
+  assert.deepEqual(stagesOf(redirect, opAfterHealth), [
+    'caddy',
+    'completed',
+    'purged',
+    'recreated',
+    'redis',
+    'reseeded',
+  ]);
 
   // redis-cli returns exit 0 on an error reply: the reply must be OK, and no
   // later runtime mutation may run (Codex R4)
@@ -822,6 +910,12 @@ test('env-purge: routine-reset with runtime steps — stop before the purge, con
   assert.ok(
     !fs.existsSync(path.join(redisErr, 'curl.log')),
     'no health check after a failed FLUSHALL',
+  );
+  const opRedis = fs.readdirSync(path.join(redisErr, 'state')).find((f) => f !== 'latest');
+  assert.deepEqual(
+    stagesOf(redisErr, opRedis),
+    ['purged', 'reseeded'],
+    'FLUSHALL must not be marked done',
   );
 });
 
@@ -888,7 +982,7 @@ test('env-purge: reconciliation reads the count, not a command tag — a rolled-
   assert.match(r.stderr, /--finish-runtime --operation-id [0-9a-f-]{36}/);
 });
 
-test('env-purge: --finish-runtime is bound to a committed attestation and to the incident state its mode requires', () => {
+test("env-purge: --finish-runtime is bound to a committed attestation, to the incident state its mode requires, and to this host's runtime state for an unfinished, latest operation", () => {
   const none = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
   let r = run(none, mkStubs(none), ['--finish-runtime', '--operation-id', UUID], {
     PILOT_1_SKIP_RUNTIME_STEPS: '0',
@@ -905,6 +999,7 @@ test('env-purge: --finish-runtime is bound to a committed attestation and to the
     ['unconsumed manifest', mkIncidentDir({ lock: false })],
   ]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+    mkState(dir, UUID, ['purged'], { mode: 'routine-reset' });
     r = run(dir, mkStubs(dir), ['--finish-runtime', '--operation-id', UUID], {
       PILOT_1_SKIP_RUNTIME_STEPS: '0',
       PILOT_1_ACTOR_TENANT: '',
@@ -917,6 +1012,7 @@ test('env-purge: --finish-runtime is bound to a committed attestation and to the
     assert.ok(!fs.existsSync(path.join(dir, 'seed.ran')), name);
   }
   const other = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  mkState(other, UUID, ['purged']);
   r = run(other, mkStubs(other), ['--finish-runtime', '--operation-id', UUID], {
     PILOT_1_SKIP_RUNTIME_STEPS: '0',
     PILOT_1_ACTOR_TENANT: '',
@@ -925,7 +1021,48 @@ test('env-purge: --finish-runtime is bound to a committed attestation and to the
   });
   assert.equal(r.status, 1, r.stderr);
   assert.match(r.stderr, /incident state no longer matches/);
+
+  // runtime-state binding (Codex R7): no state → refused; completed → refused; superseded → refused
+  const noState = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  r = run(noState, mkStubs(noState), ['--finish-runtime', '--operation-id', UUID], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'incident|2026-09-08T15-45Z-cat1-01',
+    PILOT_1_INCIDENT_LOGS_DIR: mkIncidentDir(),
+  });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /no runtime state for operation/);
+  assert.deepEqual(composeLog(noState), []);
+  const done = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  mkState(done, UUID, ['purged', 'reseeded', 'redis', 'caddy', 'recreated', 'completed']);
+  r = run(done, mkStubs(done), ['--finish-runtime', '--operation-id', UUID], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'incident|2026-09-08T15-45Z-cat1-01',
+    PILOT_1_INCIDENT_LOGS_DIR: mkIncidentDir(),
+  });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /already completed every runtime stage/);
+  assert.deepEqual(composeLog(done), [], 'a completed operation must not repeat any stage');
+  const superseded = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  mkState(superseded, UUID, ['purged'], { latest: false });
+  mkState(superseded, '00000000-0000-4000-8000-000000000002', ['purged']);
+  r = run(superseded, mkStubs(superseded), ['--finish-runtime', '--operation-id', UUID], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'incident|2026-09-08T15-45Z-cat1-01',
+    PILOT_1_INCIDENT_LOGS_DIR: mkIncidentDir(),
+  });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(
+    r.stderr,
+    /superseded by a later committed purge \(00000000-0000-4000-8000-000000000002\)/,
+  );
+  assert.deepEqual(composeLog(superseded), []);
+
+  // resume from `purged`: fence (stop app) first, then every remaining stage once
   const ok = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  mkState(ok, UUID, ['purged']);
   r = run(ok, mkStubs(ok), ['--finish-runtime', '--operation-id', UUID, '--json'], {
     PILOT_1_SKIP_RUNTIME_STEPS: '0',
     PILOT_1_ACTOR_TENANT: '',
@@ -942,14 +1079,47 @@ test('env-purge: --finish-runtime is bound to a committed attestation and to the
   });
   assert.ok(!fs.existsSync(path.join(ok, 'tx.sql')), 'a purge transaction ran in recovery mode');
   assert.ok(fs.existsSync(path.join(ok, 'seed.ran')));
-  assert.deepEqual(composeLog(ok), ['exec redis redis-cli -e FLUSHALL', 'rm -sf app', 'up -d app']);
-  const clean = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
-  r = run(clean, mkStubs(clean), ['--finish-runtime', '--operation-id', UUID, '--json'], {
+  assert.deepEqual(composeLog(ok), [
+    'exec app pkill -TERM node',
+    'stop app',
+    'exec redis redis-cli -e FLUSHALL',
+    'rm -sf app',
+    'up -d app',
+  ]);
+  assert.deepEqual(stagesOf(ok, UUID), [
+    'caddy',
+    'completed',
+    'purged',
+    'recreated',
+    'redis',
+    'reseeded',
+  ]);
+  // and a second recovery of the now-completed operation is refused
+  const again = run(ok, mkStubs(ok), ['--finish-runtime', '--operation-id', UUID], {
+    PILOT_1_SKIP_RUNTIME_STEPS: '0',
+    PILOT_1_ACTOR_TENANT: '',
+    PSQL_ATTEST: 'incident|2026-09-08T15-45Z-cat1-01',
+    PILOT_1_INCIDENT_LOGS_DIR: mkIncidentDir(),
+  });
+  assert.equal(again.status, 1, again.stderr);
+  assert.match(again.stderr, /already completed/);
+
+  // resume with redis + caddy done: no FLUSHALL / truncate repeated; the app is still fenced before recreation
+  const partial = fs.mkdtempSync(path.join(os.tmpdir(), 'p1p-'));
+  mkState(partial, UUID, ['purged', 'reseeded', 'redis', 'caddy'], { mode: 'routine-reset' });
+  r = run(partial, mkStubs(partial), ['--finish-runtime', '--operation-id', UUID, '--json'], {
     PILOT_1_SKIP_RUNTIME_STEPS: '0',
     PILOT_1_ACTOR_TENANT: '',
     PSQL_ATTEST: 'routine-reset|',
   });
   assert.equal(r.status, 0, r.stderr);
+  assert.ok(!fs.existsSync(path.join(partial, 'seed.ran')), 're-seed must not repeat');
+  assert.deepEqual(composeLog(partial), [
+    'exec app pkill -TERM node',
+    'stop app',
+    'rm -sf app',
+    'up -d app',
+  ]);
 });
 
 test('env-purge: the test failure hooks — plan points render into the transaction, audit-insert breaks the attestation INSERT itself', () => {

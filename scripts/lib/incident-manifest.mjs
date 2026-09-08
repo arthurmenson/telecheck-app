@@ -46,6 +46,18 @@ function readJson(file) {
 
 export function readLock(dir) {
   const file = path.join(dir, LOCK_NAME);
+  // Presence is established by lstat: only ENOENT means absent. A symlink
+  // (dangling or not) or any non-regular entry is an uninspectable lock —
+  // a blocker, never a clean state (Codex R7).
+  let st;
+  try {
+    st = fs.lstatSync(file);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { present: false };
+    return { present: true, unreadable: true, code: error && error.code ? error.code : 'unknown' };
+  }
+  if (st.isSymbolicLink()) return { present: true, unreadable: true, code: 'SYMLINK' };
+  if (!st.isFile()) return { present: true, unreadable: true, code: 'NOT_A_FILE' };
   const { value, error, code } = readJson(file);
   if (error === 'missing') return { present: false };
   if (error === 'unreadable') return { present: true, unreadable: true, code };

@@ -17,18 +17,30 @@
 #                         and the lock must belong to <id>; the purge must not
 #                         already be attested for <id> (single use).
 #   --finish-runtime --operation-id <uuid>
-#                         recovery ONLY, after exit 4 / 5: re-run the re-seed
-#                         (idempotent) and the runtime steps for a purge whose
-#                         attestation for <uuid> is COMMITTED, provided the
+#                         recovery ONLY, after exit 4 / 5: resume the
+#                         UNFINISHED runtime stages of a purge whose
+#                         attestation for <uuid> is COMMITTED, provided (a) the
 #                         incident state still permits it (an incident
 #                         attestation needs the matching lock; a routine one
-#                         needs the same clean state --routine-reset needs).
+#                         needs the same clean state --routine-reset needs),
+#                         (b) this host holds the operation's runtime state,
+#                         (c) the operation is not already completed, and
+#                         (d) no later purge has committed since (superseded).
+#                         Stages already done are never repeated: a failed
+#                         health check after the app restarted is retried as a
+#                         health check only — no FLUSHALL, no log truncation,
+#                         no container recreation (Codex R7).
 #
 # Every mode holds the LIFECYCLE LOCK — a kernel lock (flock) on a file that
 # is never unlinked and must lie outside the incident tree — from before the
 # app is stopped until the runtime steps are done, so two invocations can
 # never interleave: the second refuses immediately. The lock dies with the
 # process, so there is no stale-lock recovery and nothing to delete.
+#
+# RUNTIME STATE (outside the incident tree): ${PILOT_1_RUNTIME_STATE_DIR}/
+#   <operation-id>/{meta,purged,reseeded,redis,caddy,recreated,completed}
+#   latest                       operation id of the most recent COMMITTED purge
+# Stage markers are written as each stage finishes; recovery resumes from them.
 #
 # Purge modes:
 #   1. verify-pilot-1-baseline.sh must be green (no `unclassified` account).
@@ -38,20 +50,20 @@
 #      correlated by an operation id, PLATFORM partition) → the FK-aware plan
 #      rendered from scripts/pilot-1-purge-classification.json (user triggers
 #      disabled only around the TRUNCATE on the two care-intake tables; one
-#      TRUNCATE ... RESTRICT; scoped DELETEs with accounts last; stored
-#      projections REFRESHed; post-checks) → COMMIT. Any error rolls back
-#      everything — including the attestation. If psql fails WITHOUT a
-#      refusal, the outcome is RECONCILED: a fresh session takes the same
-#      advisory lock (so an in-flight COMMIT finishes first; bounded by
-#      lock_timeout) and looks the operation id up: found → committed, the
-#      run continues; absent → rolled back (exit 3); lookup impossible →
-#      exit 5 with the app left stopped (outcome unknown).
-#   3. Re-seed the synthetic baseline (scripts/pilot-1-baseline-seed.sql) in a
-#      separate transaction, then the runtime steps: Redis FLUSHALL, Caddy
-#      access-log truncate (configured paths only), app container REMOVED and
-#      RECREATED (the app logs to stdout; the Docker-retained log goes with
-#      it), and a health check requiring exactly HTTP 200 from every
-#      configured URL.
+#      TRUNCATE ... RESTRICT; scoped DELETEs with accounts last; replay-cache
+#      bodies tombstoned; stored projections REFRESHed; post-checks) → COMMIT.
+#      Any error rolls back everything — including the attestation. If psql
+#      fails WITHOUT a refusal, the outcome is RECONCILED: a fresh session
+#      takes the same advisory lock (so an in-flight COMMIT finishes first;
+#      bounded by lock_timeout) and looks the operation id up: found →
+#      committed, the run continues; absent → rolled back (exit 3); lookup
+#      impossible → exit 5 with the app left stopped (outcome unknown).
+#   3. Runtime stages: re-seed the synthetic baseline
+#      (scripts/pilot-1-baseline-seed.sql) in a separate transaction, Redis
+#      FLUSHALL (reply must be OK), Caddy access-log truncate (configured
+#      paths only), app container REMOVED and RECREATED (the app logs to
+#      stdout; the Docker-retained log goes with it), and a health check
+#      requiring exactly HTTP 200 from every configured URL.
 #
 # This script READS the incident directory and never writes, modifies or
 # deletes anything under it (single-writer discipline; CI asserts byte-for-
@@ -62,7 +74,7 @@
 #   1  refused by a precondition or by the lifecycle lock (nothing written)
 #   2  usage / environment error (nothing written)
 #   3  the purge transaction rolled back (verified under the advisory lock)
-#   4  a step AFTER the committed purge failed (re-seed / runtime step);
+#   4  a stage AFTER the committed purge failed (re-seed / runtime step);
 #      the purge is committed and attested — run --finish-runtime
 #   5  outcome UNKNOWN: the transaction's result could not be reconciled;
 #      the app is left stopped — inspect audit_records for the operation id,
@@ -76,6 +88,8 @@
 #   PILOT_1_ACTOR_TENANT         operator's home tenant (required for purge modes)
 #   PILOT_1_INCIDENT_LOGS_DIR    default /home/deploy/incident-logs
 #   PILOT_1_LOCK_FILE            lifecycle lock file (default /var/tmp/pilot-1-env-purge.lock;
+#                                regular file, must not be inside the incident directory)
+#   PILOT_1_RUNTIME_STATE_DIR    runtime stage markers (default /var/tmp/pilot-1-env-purge-state;
 #                                must not be inside the incident directory)
 #   PILOT_1_COMPOSE              compose command (default "docker compose")
 #   PILOT_1_CADDY_LOG_PATHS      space-separated in-container Caddy log files to truncate
@@ -100,6 +114,7 @@ ACTOR="${PILOT_1_ACTOR:-}"
 ACTOR_TENANT="${PILOT_1_ACTOR_TENANT:-}"
 INCIDENT_DIR="${PILOT_1_INCIDENT_LOGS_DIR:-/home/deploy/incident-logs}"
 LOCK_FILE="${PILOT_1_LOCK_FILE:-/var/tmp/pilot-1-env-purge.lock}"
+STATE_DIR="${PILOT_1_RUNTIME_STATE_DIR:-/var/tmp/pilot-1-env-purge-state}"
 COMPOSE="${PILOT_1_COMPOSE:-docker compose}"
 CADDY_LOGS="${PILOT_1_CADDY_LOG_PATHS:-}"
 HEALTH_URLS="${PILOT_1_HEALTH_URLS:-}"
@@ -108,10 +123,11 @@ FAIL_AFTER="${PILOT_1_TEST_FAIL_AFTER:-}"
 MODE=""
 INCIDENT_ID=""
 OP_ID=""
+OP_STATE=""
 FORMAT="human"
 APP_STOPPED=0
 
-usage() { sed -n '2,90p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,110p' "$0" | sed 's/^# \{0,1\}//'; }
 set_mode() { [ -z "${MODE}" ] || { echo "ERROR: --routine-reset, --incident-id and --finish-runtime are mutually exclusive" >&2; exit 2; }; MODE="$1"; }
 
 while [ $# -gt 0 ]; do
@@ -154,12 +170,12 @@ for f in "${HERE}/lib/purge-plan.mjs" "${HERE}/lib/incident-manifest.mjs" "${HER
     [ -r "$f" ] || { echo "ERROR: required file missing: $f" >&2; exit 2; }
 done
 command -v "${FLOCK}" >/dev/null 2>&1 || { echo "ERROR: flock (util-linux) is required for the lifecycle lock (PILOT_1_FLOCK='${FLOCK}' not found)" >&2; exit 2; }
-# Every write this script performs — the lifecycle lock file and the scratch
-# directory mktemp creates under TMPDIR — must resolve to a REAL location
-# outside the incident tree (symlink aliases followed, complete path
-# components compared, so `incident-logs/..lock` and a symlinked alias are
-# both caught). Single-writer discipline: nothing is ever created, modified
-# or deleted under the incident directory (Codex R3 / R4).
+# Every write this script performs — the lifecycle lock file, the runtime
+# state directory and the scratch directory mktemp creates under TMPDIR —
+# must resolve to a REAL location outside the incident tree (symlink aliases
+# followed, complete path components compared, so `incident-logs/..lock` and
+# a symlinked alias are both caught). Single-writer discipline: nothing is
+# ever created, modified or deleted under the incident directory (Codex R3 / R4).
 inside_incident_tree() {
     ! "${NODE}" -e '
 const fs = require("node:fs"), p = require("node:path");
@@ -180,6 +196,12 @@ fi
 if inside_incident_tree "${LOCK_FILE}"; then
     echo "ERROR: PILOT_1_LOCK_FILE (${LOCK_FILE}) resolves inside the incident directory (${INCIDENT_DIR}); nothing may be written there" >&2; exit 2
 fi
+if [ -L "${STATE_DIR}" ]; then
+    echo "ERROR: PILOT_1_RUNTIME_STATE_DIR (${STATE_DIR}) must not be a symbolic link" >&2; exit 2
+fi
+if inside_incident_tree "${STATE_DIR}"; then
+    echo "ERROR: PILOT_1_RUNTIME_STATE_DIR (${STATE_DIR}) resolves inside the incident directory (${INCIDENT_DIR}); nothing may be written there" >&2; exit 2
+fi
 SCRATCH_PARENT="${TMPDIR:-/tmp}"
 if inside_incident_tree "${SCRATCH_PARENT}"; then
     echo "ERROR: TMPDIR (${SCRATCH_PARENT}) resolves inside the incident directory (${INCIDENT_DIR}); scratch files may not be created there" >&2; exit 2
@@ -198,24 +220,61 @@ if ! "${FLOCK}" -n 9; then
     echo "REFUSED: another purge lifecycle holds ${LOCK_FILE}; wait for it to finish (nothing written)" >&2
     exit 1
 fi
+mkdir -p "${STATE_DIR}" || { echo "ERROR: cannot create the runtime state directory ${STATE_DIR}" >&2; exit 2; }
 
-runtime_post_steps() {
-    # Runs after a COMMITTED purge (or in --finish-runtime). Any failure exits 4:
-    # the purge is committed and attested; re-run with --finish-runtime.
-    [ "${SKIP_RUNTIME}" != "1" ] || return 0
-    # redis-cli exits 0 on an error reply unless -e is given; the reply itself
-    # must be OK before any further runtime mutation (Codex R4).
-    REDIS_REPLY="$(${COMPOSE} exec redis redis-cli -e FLUSHALL 2>&1)" || { echo "ERROR: purge COMMITTED; Redis FLUSHALL failed (${REDIS_REPLY}) — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
-    [ "$(printf '%s' "${REDIS_REPLY}" | tr -d '\r' | tail -n 1)" = "OK" ] || { echo "ERROR: purge COMMITTED; Redis did not acknowledge FLUSHALL (reply: ${REDIS_REPLY}) — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
-    if [ -n "${CADDY_LOGS}" ]; then
-        for f in ${CADDY_LOGS}; do
-            ${COMPOSE} exec caddy sh -c "[ -e '${f}' ] && : > '${f}'" || { echo "ERROR: purge COMMITTED; Caddy log truncate failed for ${f} — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
-        done
-    else
-        echo "    Caddy access log: no PILOT_1_CADDY_LOG_PATHS configured (the checked-in Caddyfile writes none) — nothing to truncate." >&2
+# --- runtime stage markers -------------------------------------------------------
+stage_done() { [ -e "${OP_STATE}/$1" ]; }
+mark_stage() { : > "${OP_STATE}/$1"; }
+recover_hint() { echo "re-run with --finish-runtime --operation-id ${OP_ID}"; }
+
+run_stages() {
+    # Resumes from the markers; every stage is done AT MOST ONCE per operation.
+    # Any failure exits 4: the purge is committed and attested.
+    if ! stage_done reseeded; then
+        if ! "${PSQL}" --dbname="${DSN}" -X -q -v ON_ERROR_STOP=1 -f "${HERE}/pilot-1-baseline-seed.sql" >/dev/null 2>"${TMP}/seed.err"; then
+            echo "ERROR: purge COMMITTED and attested, but re-seed failed — $(recover_hint):" >&2
+            sed 's/^/    /' "${TMP}/seed.err" >&2
+            exit 4
+        fi
+        mark_stage reseeded
     fi
-    ${COMPOSE} rm -sf app >/dev/null || { echo "ERROR: purge COMMITTED; could not remove the app container — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
-    ${COMPOSE} up -d app || { echo "ERROR: purge COMMITTED; app did not start — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
+    if [ "${SKIP_RUNTIME}" = "1" ]; then
+        mark_stage completed
+        return 0
+    fi
+    # Destructive runtime stages still pending? Then live traffic is fenced
+    # first: in a purge run the app is already stopped; in recovery it may have
+    # come back after a failed health check (Codex R7).
+    if ! stage_done redis || ! stage_done caddy || ! stage_done recreated; then
+        if [ "${APP_STOPPED}" != "1" ]; then
+            ${COMPOSE} exec app pkill -TERM node >/dev/null 2>&1 || true
+            ${COMPOSE} stop app || { echo "ERROR: purge COMMITTED; could not stop the app before the remaining runtime stages — $(recover_hint)" >&2; exit 4; }
+            APP_STOPPED=1
+        fi
+    fi
+    if ! stage_done redis; then
+        # redis-cli exits 0 on an error reply unless -e is given; the reply
+        # itself must be OK before any further runtime mutation (Codex R4).
+        REDIS_REPLY="$(${COMPOSE} exec redis redis-cli -e FLUSHALL 2>&1)" || { echo "ERROR: purge COMMITTED; Redis FLUSHALL failed (${REDIS_REPLY}) — $(recover_hint)" >&2; exit 4; }
+        [ "$(printf '%s' "${REDIS_REPLY}" | tr -d '\r' | tail -n 1)" = "OK" ] || { echo "ERROR: purge COMMITTED; Redis did not acknowledge FLUSHALL (reply: ${REDIS_REPLY}) — $(recover_hint)" >&2; exit 4; }
+        mark_stage redis
+    fi
+    if ! stage_done caddy; then
+        if [ -n "${CADDY_LOGS}" ]; then
+            for f in ${CADDY_LOGS}; do
+                ${COMPOSE} exec caddy sh -c "[ -e '${f}' ] && : > '${f}'" || { echo "ERROR: purge COMMITTED; Caddy log truncate failed for ${f} — $(recover_hint)" >&2; exit 4; }
+            done
+        else
+            echo "    Caddy access log: no PILOT_1_CADDY_LOG_PATHS configured (the checked-in Caddyfile writes none) — nothing to truncate." >&2
+        fi
+        mark_stage caddy
+    fi
+    if ! stage_done recreated; then
+        ${COMPOSE} rm -sf app >/dev/null || { echo "ERROR: purge COMMITTED; could not remove the app container — $(recover_hint)" >&2; exit 4; }
+        ${COMPOSE} up -d app || { echo "ERROR: purge COMMITTED; app did not start — $(recover_hint)" >&2; exit 4; }
+        mark_stage recreated
+    fi
+    # Health check: retried as a health check ONLY when everything above is done.
     for url in ${HEALTH_URLS}; do
         ok=0
         for _ in $(seq 1 30); do
@@ -223,16 +282,9 @@ runtime_post_steps() {
             if [ "${code}" = "200" ]; then ok=1; break; fi
             sleep 2
         done
-        [ "${ok}" = "1" ] || { echo "ERROR: purge COMMITTED; health check did not return HTTP 200 for ${url} (last: ${code}) — re-run with --finish-runtime --operation-id ${OP_ID}" >&2; exit 4; }
+        [ "${ok}" = "1" ] || { echo "ERROR: purge COMMITTED; health check did not return HTTP 200 for ${url} (last: ${code}) — $(recover_hint) (the health check alone is retried; no stage is repeated)" >&2; exit 4; }
     done
-}
-
-reseed() {
-    if ! "${PSQL}" --dbname="${DSN}" -X -q -v ON_ERROR_STOP=1 -f "${HERE}/pilot-1-baseline-seed.sql" >/dev/null 2>"${TMP}/seed.err"; then
-        echo "ERROR: purge COMMITTED and attested, but re-seed failed — re-run with --finish-runtime --operation-id ${OP_ID}:" >&2
-        sed 's/^/    /' "${TMP}/seed.err" >&2
-        exit 4
-    fi
+    mark_stage completed
 }
 
 restart_app_if_stopped() {
@@ -240,6 +292,7 @@ restart_app_if_stopped() {
 }
 
 # --- recovery mode: bound to a COMMITTED attestation + permitted incident state
+# --- + this host's runtime state for an UNFINISHED, not superseded operation
 if [ "${MODE}" = "finish-runtime" ]; then
     ATT="$("${PSQL}" --dbname="${DSN}" -X -q -A -t -v ON_ERROR_STOP=1 -v op="${OP_ID}" <<'SQL'
 SELECT payload->>'mode' || '|' || COALESCE(payload->>'incidentId', '')
@@ -263,12 +316,20 @@ SQL
             echo "REFUSED: operation ${OP_ID} was a routine-reset but incident state now blocks routine work under ${INCIDENT_DIR}: ${BLOCK} (nothing written)" >&2; exit 1
         fi
     fi
-    reseed
-    runtime_post_steps
+    OP_STATE="${STATE_DIR}/${OP_ID}"
+    [ -d "${OP_STATE}" ] || { echo "REFUSED: no runtime state for operation ${OP_ID} under ${STATE_DIR}; this host did not run that purge, or its state was removed — recovery cannot tell which stages remain (nothing written)" >&2; exit 1; }
+    if stage_done completed; then
+        echo "REFUSED: operation ${OP_ID} already completed every runtime stage; a finished operation is not repeatable (nothing written)" >&2; exit 1
+    fi
+    LATEST="$(cat "${STATE_DIR}/latest" 2>/dev/null || true)"
+    if [ "${LATEST}" != "${OP_ID}" ]; then
+        echo "REFUSED: operation ${OP_ID} was superseded by a later committed purge (${LATEST:-unknown}); finish or inspect that one instead (nothing written)" >&2; exit 1
+    fi
+    run_stages
     if [ "${FORMAT}" = "json" ]; then
         printf '{"mode":"finish-runtime","operationId":"%s","attestedMode":"%s","status":"finished","runtimeStepsSkipped":%s}\n' "${OP_ID}" "${ATT_MODE}" "$([ "${SKIP_RUNTIME}" = "1" ] && echo true || echo false)"
     else
-        echo "OK: re-seed and runtime steps completed for committed operation ${OP_ID} (${ATT_MODE}); no database purge was performed in this mode."
+        echo "OK: remaining runtime stages completed for committed operation ${OP_ID} (${ATT_MODE}); no database purge was performed in this mode."
     fi
     exit 0
 fi
@@ -338,6 +399,7 @@ DIGEST="$("${NODE}" "${HERE}/lib/purge-plan.mjs" digest)"
 CLS_VERSION="$(sed -n 's/^  "version": \([0-9]*\),$/\1/p' "${HERE}/pilot-1-purge-classification.json" | head -1)"
 [ -n "${CLS_VERSION}" ] || CLS_VERSION=0
 OP_ID="$("${NODE}" -e 'process.stdout.write(require("node:crypto").randomUUID())')"
+OP_STATE="${STATE_DIR}/${OP_ID}"
 FAIL_INSERT=0
 [ "${FAIL_AFTER}" = "audit-insert" ] && FAIL_INSERT=1
 
@@ -473,6 +535,9 @@ SQL
         echo "ERROR: outcome UNKNOWN — the purge transaction failed and its result could not be reconciled under the purge lock for operation ${OP_ID}:" >&2
         sed 's/^/    /' "${ERR}" >&2
         echo "       The app is left STOPPED. Inspect audit_records for payload->>'operationId' = '${OP_ID}'; if attested, run --finish-runtime --operation-id ${OP_ID}; otherwise re-run the purge." >&2
+        # The operation's runtime state is recorded so that recovery, once the
+        # operator has confirmed the attestation, knows no stage has run yet.
+        mkdir -p "${OP_STATE}" && printf '%s|%s\n' "${MODE}" "${INCIDENT_ID}" > "${OP_STATE}/meta" && printf '%s\n' "${OP_ID}" > "${STATE_DIR}/latest"
         exit 5
     fi
     if [ "${FOUND}" = "0" ]; then
@@ -481,13 +546,16 @@ SQL
         restart_app_if_stopped
         exit 3
     fi
-    echo "WARNING: psql reported a failure but the attestation for operation ${OP_ID} is durable — the COMMIT acknowledgement was lost; continuing with re-seed and runtime steps." >&2
+    echo "WARNING: psql reported a failure but the attestation for operation ${OP_ID} is durable — the COMMIT acknowledgement was lost; continuing with the runtime stages." >&2
     RECONCILED=true
 fi
 
-# --- step H + I: re-seed, then runtime steps -----------------------------------
-reseed
-runtime_post_steps
+# --- committed: record the operation's runtime state, then run the stages -----
+mkdir -p "${OP_STATE}" || { echo "ERROR: purge COMMITTED; cannot create runtime state ${OP_STATE} — $(recover_hint) after fixing ${STATE_DIR}" >&2; exit 4; }
+printf '%s|%s\n' "${MODE}" "${INCIDENT_ID}" > "${OP_STATE}/meta"
+mark_stage purged
+printf '%s\n' "${OP_ID}" > "${STATE_DIR}/latest"
+run_stages
 
 if [ "${FORMAT}" = "json" ]; then
     printf '{"mode":"%s","incidentId":%s,"operationId":"%s","actor":"%s","actorTenantId":"%s","planDigest":"%s","classificationVersion":%s,"artifacts":%s,"reconciled":%s,"runtimeStepsSkipped":%s,"status":"purged","auditAction":"env.purge.executed"}\n' \

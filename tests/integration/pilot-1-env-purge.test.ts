@@ -212,6 +212,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
       PILOT_1_ACTOR_TENANT: TENANT,
       PILOT_1_SKIP_RUNTIME_STEPS: '1',
       PILOT_1_LOCK_FILE: path.join(lockRoot, 'lifecycle.lock'),
+      PILOT_1_RUNTIME_STATE_DIR: path.join(lockRoot, 'state'),
       PILOT_1_INCIDENT_LOGS_DIR:
         extraEnv['PILOT_1_INCIDENT_LOGS_DIR'] ?? fs.mkdtempSync(path.join(os.tmpdir(), 'p1inc-')),
       ...extraEnv,
@@ -386,6 +387,9 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     // Populated ALLOWLIST canary: the TRUNCATE rollback proof needs a row
     // that the TRUNCATE actually removes and the rollback restores (Codex R5).
     const sessionCanary = ulid();
+    // migration 098's identity_staff_session_guard (BEFORE INSERT) reads the
+    // bound tenant context, so bind it for this backend first.
+    await admin.query('SELECT set_tenant_context($1)', [TENANT]);
     await admin.query(
       `INSERT INTO sessions (session_id, tenant_id, account_id, refresh_token_hash, expires_at) VALUES ($1, $2, $3, repeat('a', 64), NOW() + INTERVAL '1 hour')`,
       [sessionCanary, TENANT, ids.participantPatient],
@@ -670,7 +674,18 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
     expect(again.stderr).toMatch(/already attested/);
     expect(snapshotDir(inc)).toEqual(before);
 
-    // recovery is bound to the committed operation and the matching lock
+    // recovery is bound to the committed operation, the matching lock and this
+    // host's runtime state: the completed operation is refused; after the
+    // `completed` marker is removed (as a failure after re-seed would leave
+    // it) recovery resumes and completes it once.
+    const opDir = path.join(lockRoot, 'state', String(won['operationId']));
+    expect(fs.existsSync(path.join(opDir, 'completed'))).toBe(true);
+    const refused = runPurge(['--finish-runtime', '--operation-id', String(won['operationId'])], {
+      PILOT_1_INCIDENT_LOGS_DIR: inc,
+    });
+    expect(refused.status).toBe(1);
+    expect(refused.stderr).toMatch(/already completed every runtime stage/);
+    fs.rmSync(path.join(opDir, 'completed'));
     const finish = runPurge(
       ['--finish-runtime', '--operation-id', String(won['operationId']), '--json'],
       { PILOT_1_INCIDENT_LOGS_DIR: inc },
@@ -681,6 +696,7 @@ describe('Sprint 1.3 phase B — env-purge (real Postgres, disposable database)'
       attestedMode: 'incident',
       status: 'finished',
     });
+    expect(fs.existsSync(path.join(opDir, 'completed'))).toBe(true);
     const bogus = runPurge(
       ['--finish-runtime', '--operation-id', '123e4567-e89b-12d3-a456-426614174000'],
       { PILOT_1_INCIDENT_LOGS_DIR: inc },
