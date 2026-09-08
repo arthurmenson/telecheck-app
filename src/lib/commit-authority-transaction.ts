@@ -33,10 +33,23 @@ export interface CommitAuthority {
    * through unchanged.
    */
   afterBegin?: (tx: DbTransaction) => Promise<void>;
-  /** SET LOCAL statement_timeout for the work (default 5s). */
-  statementTimeout?: string;
-  /** SET LOCAL lock_timeout for the work (default 2s). */
-  lockTimeout?: string;
+  /** Transaction-local statement_timeout for the work, in ms (default 5000). */
+  statementTimeoutMs?: number;
+  /** Transaction-local lock_timeout for the work, in ms (default 2000). */
+  lockTimeoutMs?: number;
+}
+
+/**
+ * Timeouts are module constants, never request-derived; they are still
+ * validated as bounded positive integers and applied through parameterized
+ * set_config() rather than interpolated into SET LOCAL. (Codex round 1 on
+ * PR #306.)
+ */
+function timeoutMs(value: number | undefined, fallback: number): string {
+  const ms = value ?? fallback;
+  if (!Number.isSafeInteger(ms) || ms <= 0 || ms > 600_000)
+    throw new Error('commit_authority_invalid_timeout');
+  return String(ms);
 }
 
 /**
@@ -239,8 +252,8 @@ export function commitAuthorityTransaction(
   authority: CommitAuthority,
   pool: () => CheckoutPool = () => getPool() as unknown as CheckoutPool,
 ): typeof withTransaction {
-  const statementTimeout = authority.statementTimeout ?? '5s';
-  const lockTimeout = authority.lockTimeout ?? '2s';
+  const statementTimeout = timeoutMs(authority.statementTimeoutMs, 5_000);
+  const lockTimeout = timeoutMs(authority.lockTimeoutMs, 2_000);
   const guarded = async <T>(tx: DbTransaction, work: (tx: DbTransaction) => Promise<T>) => {
     await authority.assertLive(tx);
     let value: T;
@@ -292,8 +305,11 @@ export function commitAuthorityTransaction(
         previousTenantId = await readCurrentTenantId(client);
         await client.query('SELECT set_tenant_context($1)', [authority.tenantId]);
         const result = await withActorContext(client, authority.nonce, async () => {
-          await client.query(`SET LOCAL statement_timeout='${statementTimeout}'`);
-          await client.query(`SET LOCAL lock_timeout='${lockTimeout}'`);
+          // is_local=true: transaction-scoped, exactly like SET LOCAL.
+          await client.query("SELECT set_config('statement_timeout', $1, true)", [
+            statementTimeout,
+          ]);
+          await client.query("SELECT set_config('lock_timeout', $1, true)", [lockTimeout]);
           return guarded(client, work);
         });
         armDeadline();
@@ -342,25 +358,32 @@ export function commitAuthorityTransaction(
         return outcome.value;
       }
       if (outcome && !outcome.ok) {
-        // A server RAISE during COMMIT (PT401, 42501, 23514, ...) is a
-        // definite rollback and passes through. A rejection with no SQLSTATE
-        // (ECONNRESET) or a class-08 connection exception (08007
-        // transaction_resolution_unknown) arriving AFTER COMMIT was issued is
-        // indeterminate — the write and its idempotency record may have
-        // committed — and must not be rethrown as if it were a known failure.
-        // A SQLSTATE shape alone does not prove the server raised: EPIPE is
-        // five uppercase characters too. pg's server errors always carry
-        // `severity`; transport errors never do. (Codex rounds 1–2, PR #303.)
+        // Only a server RAISE of severity ERROR during COMMIT (PT401, 42501,
+        // 23514, ... from the deferred triggers) establishes a rollback and
+        // passes through. Everything else that arrives AFTER COMMIT was
+        // issued is indeterminate — the write and its idempotency record may
+        // have committed — and must not be rethrown as a known failure:
+        //  - no SQLSTATE at all (ECONNRESET, EPIPE: five uppercase characters
+        //    too, but transport errors never carry `severity`) — Codex R1–R2
+        //    on PR #303;
+        //  - class 08 connection exceptions (08007
+        //    transaction_resolution_unknown);
+        //  - severity FATAL / PANIC: PostgreSQL may send an ErrorResponse
+        //    while the client awaits ReadyForQuery, so CommandComplete(COMMIT)
+        //    followed by FATAL 57P01 (backend termination) rejects the COMMIT
+        //    promise although the transaction committed. A SQLSTATE plus
+        //    severity proves server origin, not rollback. (Codex R1 on
+        //    PR #306, reproduced against pg 8.20.)
         const failure = outcome.error as { code?: unknown; severity?: unknown } | null;
         const code = failure?.code;
+        const severity = failure?.severity;
         const sqlState =
-          typeof code === 'string' &&
-          /^[0-9A-Z]{5}$/.test(code) &&
-          typeof failure?.severity === 'string'
+          typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && typeof severity === 'string'
             ? code
             : null;
-        const indeterminate = commitIssued && (sqlState === null || sqlState.startsWith('08'));
-        if (indeterminate) throw unconfirmed();
+        const establishesRollback =
+          sqlState !== null && !sqlState.startsWith('08') && severity === 'ERROR';
+        if (commitIssued && !establishesRollback) throw unconfirmed();
         // A known outcome always wins over the deadline.
         finalizeRecordingClient(
           client,

@@ -108,7 +108,9 @@ describe('commitAuthorityTransaction — authority is enforced at the actual COM
       q.indexOf('BEGIN'),
     );
     expect(q.indexOf('COMMIT')).toBeGreaterThan(q.indexOf('BEGIN'));
-    expect(q.some((x) => x.includes("statement_timeout='5s'"))).toBe(true);
+    const st = mocks.query.mock.calls.find(([sql]) => String(sql).includes('statement_timeout'));
+    expect(st?.[1]).toEqual(['5000']);
+    expect(q.some((x) => x.includes('SET LOCAL'))).toBe(false);
     // Live check before the work and again after it.
     expect(mocks.assertLive).toHaveBeenCalledTimes(2);
     await flush();
@@ -116,12 +118,26 @@ describe('commitAuthorityTransaction — authority is enforced at the actual COM
     expect(mocks.release).not.toHaveBeenCalledWith(true);
   });
 
-  it('honours the configured timeouts', async () => {
-    await commitAuthorityTransaction({ ...authority, statementTimeout: '10s', lockTimeout: '3s' })(
-      async () => 'x',
+  it('honours the configured timeouts, parameterized and validated', async () => {
+    await commitAuthorityTransaction({
+      ...authority,
+      statementTimeoutMs: 10_000,
+      lockTimeoutMs: 3_000,
+    })(async () => 'x');
+    const st = mocks.query.mock.calls.find(([sql]) => String(sql).includes('statement_timeout'));
+    const lt = mocks.query.mock.calls.find(([sql]) => String(sql).includes('lock_timeout'));
+    expect(st?.[1]).toEqual(['10000']);
+    expect(lt?.[1]).toEqual(['3000']);
+    // Validation is fail-fast at construction, before any client is taken.
+    expect(() => commitAuthorityTransaction({ ...authority, statementTimeoutMs: 0 })).toThrow(
+      'commit_authority_invalid_timeout',
     );
-    expect(sqls().some((x) => x.includes("statement_timeout='10s'"))).toBe(true);
-    expect(sqls().some((x) => x.includes("lock_timeout='3s'"))).toBe(true);
+    expect(() => commitAuthorityTransaction({ ...authority, lockTimeoutMs: 1.5 })).toThrow(
+      'commit_authority_invalid_timeout',
+    );
+    expect(() => commitAuthorityTransaction({ ...authority, lockTimeoutMs: 700_000 })).toThrow(
+      'commit_authority_invalid_timeout',
+    );
   });
 
   it('runs afterBegin inside the transaction before any binding is set', async () => {
@@ -282,6 +298,42 @@ describe('commitAuthorityTransaction — authority is enforced at the actual COM
       ).rejects.toMatchObject({ code: 'PT503' });
       expect(mocks.release).toHaveBeenCalledWith(true);
     }
+  });
+
+  it('treats a FATAL/PANIC after an issued COMMIT as indeterminate — termination is not rollback', async () => {
+    // Codex R1 on PR #306: PostgreSQL may send an ErrorResponse while the
+    // client awaits ReadyForQuery, so CommandComplete(COMMIT) followed by
+    // FATAL 57P01 rejects the COMMIT promise although the transaction
+    // committed. SQLSTATE + severity proves server origin, not rollback.
+    for (const [code, severity] of [
+      ['57P01', 'FATAL'],
+      ['57P02', 'FATAL'],
+      ['XX000', 'PANIC'],
+    ] as const) {
+      vi.clearAllMocks();
+      mocks.commitError = Object.assign(new Error('terminating connection'), { code, severity });
+      await expect(
+        run(async () => 'x'),
+        `${code} ${severity}`,
+      ).rejects.toMatchObject({
+        code: 'PT503',
+      });
+      expect(mocks.release).toHaveBeenCalledWith(true);
+      expect(sqls().includes('ROLLBACK')).toBe(false);
+    }
+  });
+
+  it('a FATAL before COMMIT is issued is a definite failure, not indeterminate', async () => {
+    const boom = Object.assign(new Error('terminating connection'), {
+      code: '57P01',
+      severity: 'FATAL',
+    });
+    await expect(
+      run(async () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+    expect(sqls().includes('COMMIT')).toBe(false);
   });
 
   it('treats EPIPE on an issued COMMIT as indeterminate — a SQLSTATE shape is not a server raise', async () => {
