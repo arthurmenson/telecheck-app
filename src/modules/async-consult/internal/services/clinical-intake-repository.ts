@@ -11,6 +11,7 @@ import {
   IdempotencyInFlightError,
 } from '../../../../lib/idempotency.js';
 import { logger } from '../../../../lib/logger.js';
+import { readCurrentTenantId } from '../../../../lib/rls.js';
 import { ulid } from '../../../../lib/ulid.js';
 import type { CareConsentPatientContext } from '../../../consent/index.js';
 import { resolveConsultIntakeDefinition } from '../../../forms-intake/index.js';
@@ -103,6 +104,7 @@ function finalizeRecordingClient(
   client: RecordingClient,
   run: Promise<unknown>,
   rollback: boolean,
+  previousTenantId: string | null,
 ): void {
   const settledRun = run.then(
     () => undefined,
@@ -120,7 +122,15 @@ function finalizeRecordingClient(
   const bound = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error('cleanup_deadline')), CLEANUP_DEADLINE_MS);
   });
-  void Promise.race([rolledBack.then(() => client.query('SELECT clear_tenant_context()')), bound])
+  // Restore the binding that was in place when this factory took the client,
+  // exactly as withTenantContext does — never blindly clear. Under the test
+  // harness every factory shares one client with an outer binding; clearing
+  // it asynchronously, after the response, deleted the binding the rest of
+  // the suite still relied on (CI on PR #303: `No active tenant binding`).
+  const restore =
+    previousTenantId === null ? 'SELECT clear_tenant_context()' : 'SELECT set_tenant_context($1)';
+  const restoreParams = previousTenantId === null ? [] : [previousTenantId];
+  void Promise.race([rolledBack.then(() => client.query(restore, restoreParams)), bound])
     .then(
       () => client.release?.(),
       () => {
@@ -162,12 +172,8 @@ function finalizeRecordingClient(
 export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof withTransaction {
   return async <T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> => {
     const client = (await getPool().connect()) as unknown as RecordingClient;
-    try {
-      await client.query('SELECT set_tenant_context($1)', [ctx.tenant.tenantId]);
-    } catch (error) {
-      client.release?.(true);
-      throw error;
-    }
+    let previousTenantId: string | null = null;
+    let commitIssued = false;
 
     let settled: Settled<T> | null = null;
     let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
@@ -183,6 +189,11 @@ export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof wi
     const run = (async () => {
       await client.query('BEGIN');
       try {
+        // The probe needs a transaction (it uses a sub-savepoint), so it runs
+        // after BEGIN. The tenant binding is per-backend, not
+        // transaction-local, so setting it here still holds through COMMIT.
+        previousTenantId = await readCurrentTenantId(client);
+        await client.query('SELECT set_tenant_context($1)', [ctx.tenant.tenantId]);
         await client.query("SET LOCAL statement_timeout='10s'");
         await client.query("SET LOCAL lock_timeout='3s'");
         await actor(client, ctx);
@@ -202,6 +213,7 @@ export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof wi
           throw error;
         }
         armDeadline();
+        commitIssued = true;
         // The deferred care_intake_evidence / care_binding_evidence triggers
         // fire HERE, with tenant and actor bindings both still in scope.
         await client.query('COMMIT');
@@ -215,32 +227,45 @@ export function careIntakeTransaction(ctx: CareConsentPatientContext): typeof wi
       }
     })();
 
+    const unconfirmed = () => {
+      // The COMMIT's fate is unknown: destroy THIS socket so it can never be
+      // re-borrowed mid-COMMIT; never signal a backend by pid. Surface as
+      // PT503 (503) so the caller is told to check status before retrying
+      // — never as a success and never as a definite failure.
+      run.catch(() => undefined);
+      client.release?.(true);
+      return Object.assign(new Error('care_commit_unconfirmed'), { code: 'PT503' });
+    };
+
     try {
       const value = await Promise.race([run, deadline]);
-      finalizeRecordingClient(client, run, false);
+      finalizeRecordingClient(client, run, false, previousTenantId);
       const outcome = settled as Settled<T> | null;
       return outcome?.ok ? outcome.value : value;
     } catch (error) {
       const outcome = settled as Settled<T> | null;
       if (outcome?.ok) {
-        finalizeRecordingClient(client, run, false);
+        finalizeRecordingClient(client, run, false, previousTenantId);
         return outcome.value;
       }
       if (outcome && !outcome.ok) {
+        // A server RAISE during COMMIT (PT401, 23514, ...) is a definite
+        // rollback and passes through. A rejection with no SQLSTATE
+        // (ECONNRESET) or a class-08 connection exception (08007
+        // transaction_resolution_unknown) arriving AFTER COMMIT was issued is
+        // indeterminate — the submission and its idempotency record may have
+        // committed — and must not be rethrown as if it were a known failure.
+        // (Codex review of PR #303.)
+        const code = (outcome.error as { code?: unknown } | null)?.code;
+        const sqlState = typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null;
+        const indeterminate = commitIssued && (sqlState === null || sqlState.startsWith('08'));
+        if (indeterminate) throw unconfirmed();
         // A known outcome always wins over the deadline.
-        finalizeRecordingClient(client, run, true);
+        finalizeRecordingClient(client, run, true, previousTenantId);
         throw outcome.error;
       }
-      if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') {
-        // COMMIT still in flight: destroy THIS socket so it can never be
-        // re-borrowed mid-COMMIT; never signal a backend by pid. The
-        // outcome is unknown — surface as PT503 (503), never as a success
-        // or a definite failure.
-        run.catch(() => undefined);
-        client.release?.(true);
-        throw Object.assign(new Error('care_commit_unconfirmed'), { code: 'PT503' });
-      }
-      finalizeRecordingClient(client, run, true);
+      if ((error as { code?: unknown } | null)?.code === 'COMMIT_DEADLINE') throw unconfirmed();
+      finalizeRecordingClient(client, run, true, previousTenantId);
       throw error;
     }
   };

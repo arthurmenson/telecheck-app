@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   rollbackHang: false,
   cleanupHang: false,
   cleanupError: null as unknown,
+  previousTenantId: null as string | null,
 }));
 vi.mock('../../../../lib/db.js', () => ({
   getPool: () => ({
@@ -15,6 +16,9 @@ vi.mock('../../../../lib/db.js', () => ({
   }),
 }));
 vi.mock('../../../../lib/logger.js', () => ({ logger: { error: vi.fn() } }));
+vi.mock('../../../../lib/rls.js', () => ({
+  readCurrentTenantId: async () => mocks.previousTenantId,
+}));
 vi.mock('../../../../lib/domain-events.js', () => ({ emitDomainEvent: vi.fn() }));
 vi.mock('../../../forms-intake/index.js', () => ({ resolveConsultIntakeDefinition: vi.fn() }));
 vi.mock('../../audit.js', () => ({
@@ -43,6 +47,7 @@ beforeEach(() => {
   mocks.rollbackHang = false;
   mocks.cleanupHang = false;
   mocks.cleanupError = null;
+  mocks.previousTenantId = null;
   mocks.query.mockImplementation(async (sql: string) => {
     if (sql === 'COMMIT') {
       if (mocks.commitHang) return new Promise<never>(() => undefined);
@@ -80,8 +85,11 @@ describe('careIntakeTransaction — authority is enforced at the actual COMMIT',
     expect(value).toBe('done');
     const q = sqls();
     expect(q.some((x) => x.includes('SET CONSTRAINTS'))).toBe(false);
-    expect(q.indexOf('BEGIN')).toBeGreaterThan(
-      q.findIndex((x) => x.includes('set_tenant_context')),
+    // The binding is set INSIDE the transaction, after the previous-binding
+    // probe (which needs a sub-savepoint); it is per-backend, so it still
+    // holds through COMMIT.
+    expect(q.findIndex((x) => x.includes('set_tenant_context'))).toBeGreaterThan(
+      q.indexOf('BEGIN'),
     );
     expect(q.indexOf('COMMIT')).toBeGreaterThan(q.indexOf('BEGIN'));
     await flush();
@@ -160,6 +168,70 @@ describe('careIntakeTransaction — authority is enforced at the actual COMMIT',
     expect(sqls().filter((x) => x.includes('kms_current_actor_context')).length).toBe(2);
     await flush();
     expect(mocks.release).toHaveBeenCalledWith();
+  });
+
+  it('restores the binding that was in place when it took the client, and only clears when there was none', async () => {
+    // withTenantContext saves and restores; blindly clearing deleted the
+    // outer binding the shared harness client still relied on (CI, PR #303).
+    mocks.previousTenantId = 'Telecheck-Ghana';
+    await careIntakeTransaction(ctx)(async () => 'x');
+    await flush();
+    // The factory binds once; `actor()` re-binds before each of its two
+    // resolver reads; the LAST set restores what was there before.
+    const sets = mocks.query.mock.calls.filter(([sql]) =>
+      String(sql).includes('set_tenant_context'),
+    );
+    expect(sets[0]?.[1]).toEqual([ctx.tenant.tenantId]);
+    expect(sets[sets.length - 1]?.[1]).toEqual(['Telecheck-Ghana']);
+    expect(sqls().some((x) => x.includes('clear_tenant_context'))).toBe(false);
+    expect(mocks.release).toHaveBeenCalledWith();
+
+    vi.clearAllMocks();
+    mocks.previousTenantId = null;
+    await careIntakeTransaction(ctx)(async () => 'x');
+    await flush();
+    expect(sqls().some((x) => x.includes('clear_tenant_context'))).toBe(true);
+  });
+
+  it('treats a no-SQLSTATE rejection of an issued COMMIT as indeterminate: PT503 and discard', async () => {
+    // Codex review of PR #303: acknowledgement loss before the deadline
+    // reached the settled-failure branch and was rethrown unchanged, so the
+    // caller got a 500 with no instruction to check status before retrying
+    // — although the submission and its idempotency record may have
+    // committed.
+    mocks.commitError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    await expect(careIntakeTransaction(ctx)(async () => 'x')).rejects.toMatchObject({
+      code: 'PT503',
+    });
+    expect(mocks.release).toHaveBeenCalledWith(true);
+  });
+
+  it('treats a class-08 SQLSTATE on an issued COMMIT as indeterminate: PT503 and discard', async () => {
+    for (const code of ['08007', '08006', '08000']) {
+      vi.clearAllMocks();
+      mocks.commitError = Object.assign(new Error('connection exception'), { code });
+      await expect(
+        careIntakeTransaction(ctx)(async () => 'x'),
+        code,
+      ).rejects.toMatchObject({
+        code: 'PT503',
+      });
+      expect(mocks.release).toHaveBeenCalledWith(true);
+    }
+  });
+
+  it('does NOT treat a pre-COMMIT connection failure as indeterminate', async () => {
+    // Before COMMIT is issued nothing can have committed; the error passes
+    // through as itself and the client is returned normally.
+    const boom = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    await expect(
+      careIntakeTransaction(ctx)(async () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+    await flush();
+    expect(mocks.release).toHaveBeenCalledWith();
+    expect(mocks.release).not.toHaveBeenCalledWith(true);
   });
 
   it('never arms the COMMIT deadline for work that fails before COMMIT', async () => {
