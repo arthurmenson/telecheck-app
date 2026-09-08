@@ -258,6 +258,16 @@ export function splitSqlStatements(sql) {
       continue;
     }
     if (ch === "'") {
+      const prev = sql[i - 1];
+      const prevPrev = sql[i - 2];
+      if (
+        prev === '&' ||
+        (prev !== undefined &&
+          /[EeBbXxNn]/.test(prev) &&
+          (prevPrev === undefined || !/[A-Za-z0-9_]/.test(prevPrev)))
+      ) {
+        throw new Error('escape-string / unicode / bit-string literals are not supported in seeds');
+      }
       let j = i + 1;
       for (;;) {
         if (j >= sql.length) throw new Error('unterminated string literal');
@@ -340,36 +350,6 @@ function splitTopLevel(text) {
   return parts;
 }
 
-function parseTuples(body) {
-  const tuples = [];
-  let depth = 0;
-  let start = -1;
-  let quote = false;
-  for (let i = 0; i < body.length; i++) {
-    const ch = body[i];
-    if (quote) {
-      if (ch === "'") {
-        if (body[i + 1] === "'") i++;
-        else quote = false;
-      }
-      continue;
-    }
-    if (ch === "'") quote = true;
-    else if (ch === '(') {
-      if (depth === 0) start = i + 1;
-      depth++;
-    } else if (ch === ')') {
-      depth--;
-      if (depth === 0 && start >= 0) {
-        tuples.push(splitTopLevel(body.slice(start, i)));
-        start = -1;
-      }
-    }
-  }
-  if (depth !== 0) throw new Error('unbalanced VALUES tuple');
-  return tuples;
-}
-
 /**
  * A DO block in a seed is a GUARD: it may read and RAISE, nothing else. The
  * dollar-quoted body is stripped of comments, string literals and quoted
@@ -437,6 +417,16 @@ export function stripSqlNoise(text) {
       continue;
     }
     if (ch === "'") {
+      const prev = text[i - 1];
+      const prevPrev = text[i - 2];
+      if (
+        prev === '&' ||
+        (prev !== undefined &&
+          /[EeBbXxNn]/.test(prev) &&
+          (prevPrev === undefined || !/[A-Za-z0-9_]/.test(prevPrev)))
+      ) {
+        throw new Error('escape-string / unicode / bit-string literals are not supported in seeds');
+      }
       let j = i + 1;
       for (;;) {
         if (j >= text.length) throw new Error('unterminated string literal in DO body');
@@ -483,7 +473,63 @@ export function assertReadOnlyDoBody(stmt) {
 }
 
 const ACCOUNTS_INSERT =
-  /^INSERT\s+INTO\s+(?:public\.)?accounts\s*\(([^)]*)\)\s*VALUES\s*([\s\S]*?)(?:\s+ON\s+CONFLICT\s*\(\s*account_id\s*\)\s*DO\s+NOTHING)?$/i;
+  /^INSERT\s+INTO\s+(?:public\.)?accounts\s*\(([^)]*)\)\s*VALUES\s*([\s\S]*)$/i;
+const DO_NOTHING_SUFFIX = /^ON\s+CONFLICT\s*\(\s*account_id\s*\)\s*DO\s+NOTHING$/i;
+
+/**
+ * Consumes the complete VALUES expression: `( ... )` tuples separated by
+ * commas, then either nothing or exactly the supported DO NOTHING suffix.
+ * Any other remainder — `ON CONFLICT ... DO UPDATE`, a named constraint,
+ * trailing SQL — is a failure, never absorbed (Codex R5).
+ */
+function parseValuesStrict(body) {
+  const tuples = [];
+  let i = 0;
+  const skipWs = () => {
+    while (i < body.length && /\s/.test(body[i])) i++;
+  };
+  for (;;) {
+    skipWs();
+    if (body[i] !== '(') throw new Error(`expected a VALUES tuple at: ${body.slice(i, i + 40)}`);
+    let depth = 0;
+    let quote = false;
+    const start = i + 1;
+    let end = -1;
+    for (let j = i; j < body.length; j++) {
+      const ch = body[j];
+      if (quote) {
+        if (ch === "'") {
+          if (body[j + 1] === "'") j++;
+          else quote = false;
+        }
+        continue;
+      }
+      if (ch === "'") quote = true;
+      else if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        if (depth === 0) {
+          end = j;
+          break;
+        }
+      }
+    }
+    if (end < 0) throw new Error('unbalanced VALUES tuple');
+    tuples.push(splitTopLevel(body.slice(start, end)));
+    i = end + 1;
+    skipWs();
+    if (body[i] === ',') {
+      i++;
+      continue;
+    }
+    break;
+  }
+  const remainder = body.slice(i).trim();
+  if (remainder !== '' && !DO_NOTHING_SUFFIX.test(remainder)) {
+    throw new Error(`unsupported clause after VALUES: ${remainder.slice(0, 60)}`);
+  }
+  return tuples;
+}
 
 /**
  * Returns the parsed account inserts of a seed. Throws on any statement that
@@ -515,7 +561,7 @@ export function seedAccountInserts(sql) {
     const m = stmt.match(ACCOUNTS_INSERT);
     if (!m) throw new Error(`unrecognised statement touching accounts: ${stmt.slice(0, 80)}`);
     const columns = m[1].split(',').map((c) => c.trim().toLowerCase());
-    const tuples = parseTuples(m[2]);
+    const tuples = parseValuesStrict(m[2]);
     if (tuples.length === 0) throw new Error('accounts INSERT without VALUES tuples');
     found.push({ columns, tuples });
   }
@@ -666,6 +712,44 @@ test('seeds: the static check rejects DEFAULT, unclassified, missing column, a s
       false,
       `${name} slipped through`,
     );
+  }
+  // Codex R5 reproductions.
+  const baseline = fs.readFileSync(path.join(here, 'pilot-1-baseline-seed.sql'), 'utf8');
+  assert.equal(seedWritesOnlyBaseline(baseline), true);
+  for (const [name, mutated] of [
+    [
+      'named-constraint DO UPDATE',
+      baseline.replace(
+        /ON CONFLICT \(account_id\) DO NOTHING;/g,
+        "ON CONFLICT ON CONSTRAINT accounts_pkey DO UPDATE SET cohort_classification = 'baseline';",
+      ),
+    ],
+    [
+      'DO UPDATE on the column',
+      baseline.replace(
+        /ON CONFLICT \(account_id\) DO NOTHING;/,
+        "ON CONFLICT (account_id) DO UPDATE SET cohort_classification = 'baseline';",
+      ),
+    ],
+    [
+      'trailing SQL after DO NOTHING',
+      baseline.replace(
+        /ON CONFLICT \(account_id\) DO NOTHING;/,
+        'ON CONFLICT (account_id) DO NOTHING RETURNING account_id;',
+      ),
+    ],
+    [
+      'E-string hiding an UPDATE inside a DO block',
+      baseline.replace(
+        /\nCOMMIT;/,
+        "\nDO $$ BEGIN RAISE NOTICE E'can\\'t'; UPDATE accounts SET cohort_classification='baseline' WHERE cohort_classification='unclassified'; RAISE NOTICE E'can\\'t'; END $$;\nCOMMIT;",
+      ),
+    ],
+    ['top-level E-string', baseline + "\nSELECT E'x';\n"],
+    ['unicode-escape string', baseline + "\nSELECT U&'x';\n"],
+  ]) {
+    assert.notEqual(mutated, baseline, `${name}: mutation did not apply`);
+    assert.equal(seedWritesOnlyBaseline(mutated), false, `${name} slipped through`);
   }
   // The real guards are accepted as read-only.
   for (const file of ['pilot-1-baseline-seed.sql', 'seed-staging-accounts.sql']) {
