@@ -300,6 +300,19 @@ function mapServiceError(err: unknown, reply: FastifyReply, requestId: string): 
   const code = (err as { code?: unknown }).code;
   // All envelopes are GENERIC — they MUST NOT echo tenant ids or wrapper
   // detail text per I-025 tenant-blind discipline.
+  // PT503: the COMMIT's fate is unknown (formsGovernanceTransaction bounded
+  // it, or the connection failed after COMMIT was issued). The caller must
+  // check status before retrying — never a 500, never a definite failure.
+  if (code === 'PT503') {
+    void reply.code(503).send({
+      error: {
+        code: 'admin.commit_unconfirmed',
+        message: 'The request may or may not have been applied. Check its status before retrying.',
+        request_id: requestId,
+      },
+    });
+    return true;
+  }
   if (code === '42501') {
     void reply.code(403).send({
       error: {
